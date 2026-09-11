@@ -32,6 +32,11 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
      b. 把脚本打印的授权链接以可点击形式展示给用户，说明"请登录富途账号并点确认"。
      c. 脚本完成后，提醒用户重启 harness 会话使 token 生效；若脚本超时/失败，
         再降级到 b 选项。
+   - **OAuth 始终失败的备选：富途 OpenAPI 密钥方式**（官方 RSA 密钥 + 本地 OpenD 网关）：
+     告知用户可安装 OpenD 并在富途 App 开通 API 权限（见
+     https://github.com/FutunnOpen/py-futu-api ），OpenD 起来后本机 127.0.0.1:11111
+     即可用 futu-api Python SDK 取行情/公司资料/交易（经 shell 执行 Python 脚本）。
+     该路线重（需常驻 OpenD），仅在 OAuth 不可用时作为兜底。
    - 用户不想现在授权 → **继续降级分析**：用 web 搜索/AKShare/Yahoo 获取公开数据，
      并在报告中标注"数据源：公开网络，非实时行情"。
    - 不要在未提示的情况下默默降级；也不要因为缺工具而拒绝分析。
@@ -79,6 +84,17 @@ https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL&region=US&lang=en-US
 
 - 返回该标的最新新闻（标题/链接/发布时间），港股/美股代码通用（如 `s=0700.HK`）。
 - Yahoo 的 quote/chart 非官方接口不稳定（实测常被拒），**行情 K 线一律以富途为准**，Yahoo 只做资讯补充与交叉验证；均不可用则 web 搜索降级。
+
+**X (Twitter) 渠道（社交舆情补充）**：舆情分析师可用仓库脚本经用户已登录浏览器抓取 X 讨论（cookie 留在浏览器内，脚本不接触明文）：
+
+```bash
+python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/x_search.py" "贵州茅台 OR 600519" --count 10 --live
+```
+
+- 前置：本机 Chrome/Edge 已登录 x.com + `pip install playwright`（只需库，无需下载浏览器）；
+- 运行前用户需关闭所有 Chrome/Edge 窗口（脚本要用调试端口复用默认登录配置）；
+- 返回 JSON（推文文本+时间），失败时返回带 hint 的错误信息——按 hint 提示用户后可降级其他渠道；
+- 主要用于港美股/热门话题的实时情绪；A 股讨论仍优先富途社区/AKShare。
 
 - 子代理不可用时（无 subagent 工具或派发失败），退回主会话内逐个完成四份报告。
 - 收齐四份报告后，向用户简要展示各报告要点表格，再进入辩论阶段。

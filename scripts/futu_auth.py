@@ -112,9 +112,10 @@ def main():
         "client_id": client_id,
         "redirect_uri": REDIRECT_URI,
         "scope": scopes,
+        "state": secrets.token_urlsafe(16),
         "code_challenge": challenge,
         "code_challenge_method": "S256",
-    })
+    }, safe=":", quote_via=urllib.parse.quote)  # 用 %20/%2A 精确编码，避免 + 和 * 在浏览器跳转中损坏
     say("请在浏览器中完成富途账号授权（5分钟内有效）：")
     print(f"\n    {auth_url}\n")
     try:
