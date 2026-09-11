@@ -35,14 +35,12 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
         继续正常分析；仍未出现（少数环境）再提示用户新建会话。
    - 授权方式只有这一种（OAuth，脚本全自动），没有其他授权兜底，也不需要。
    - **特殊情形：token 文件已存在（~/.dsh/futu-token）但本会话没有 mcp__futu__ 工具**
-     → 最常见原因是 access token 已过期。**自动续期 + 重载，无需重新授权**：
-     ```bash
-     python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py" --refresh
-     ```
-     （脚本会用 refresh_token 换新 token 并自动触碰组合文件触发会话内重载）
-     等待 5 秒后重新检查工具列表。mcp__futu__ 出现 → 直接继续正常分析；
-     若脚本报"续期失败"（refresh_token 也失效）→ 提示用户跑一次完整授权脚本；
-     若续期成功但工具仍未出现（罕见）→ 再提示用户新建会话。
+     → 说明本会话创建于授权之前、客户端重试已耗尽，**会话内无法恢复，直接明确告知用户：
+     "富途 token 已就绪，请新建一个会话（选本模式），工具即可用"，并结束本次流程**。
+     不要让用户重新授权（token 是好的），也不要反复 touch 重试（实测无效）。
+     顺手可帮用户跑一次续期保证 token 新鲜：
+     `python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py" --refresh`
+     （新会话将持有新 token；正常情况下用户在安装阶段就已完成授权，不会遇到此情形。）
    - **用户不想现在授权** → **继续降级分析**：用 web 搜索/AKShare/Yahoo 获取公开数据，
      并在报告中标注"数据源：公开网络，非实时行情"。
    - 不要在未提示的情况下默默降级；也不要因为缺工具而拒绝分析。

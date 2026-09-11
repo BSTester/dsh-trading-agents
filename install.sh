@@ -47,21 +47,14 @@ else
   warn "未找到 python3：AKShare（A股新闻舆情）与 X 渠道不可用，其余功能正常。"
 fi
 
-# 4. 富途 token（可选；不设置则行情/交易工具不可用，会话内会提示授权，其余功能正常）
-if [[ -z "${FUTU_MCP_TOKEN:-}" ]]; then
-  warn "未检测到 FUTU_MCP_TOKEN（富途远程 MCP 的 Bearer token）。"
-  echo "   授权步骤见仓库 README「获取富途 token」（OAuth + PKCE，建议先只授只读 scope）。"
-  read -r -p "   现在输入 token（留空跳过，之后可在会话内按提示授权）: " TOKEN || true
-  if [[ -n "${TOKEN:-}" ]]; then
-    for RC in "$HOME/.zshrc" "$HOME/.bashrc"; do
-      if [[ -f "$RC" ]] && ! grep -q "FUTU_MCP_TOKEN" "$RC"; then
-        printf '\nexport FUTU_MCP_TOKEN="%s"\n' "$TOKEN" >> "$RC"
-        say "已写入 $RC（新开的终端生效）"
-      fi
-    done
-  else
-    warn "跳过。首次会话会提示如何授权。"
-  fi
+# 4. 富途授权（在安装阶段完成，确保第一次会话就能用全部工具）
+if [[ -s "$DSH_HOME/futu-token" ]]; then
+  say "检测到已有富途 token，跳过授权（过期时可用 --refresh 续期）"
+elif [[ -x "$VENV/bin/python" ]]; then
+  say "发起富途授权（浏览器将打开授权页，登录并确认即可）…"
+  "$VENV/bin/python" "$PRESET_DST/scripts/futu_auth.py" || warn "授权未完成：第一个会话会再次提示，或稍后重跑本脚本"
+else
+  warn "无 python 环境，跳过授权。第一个会话内会提示如何授权。"
 fi
 
 say "启动：dsh web → 新建会话 → 选择「交易智囊模式」→ 说「分析一下 00700.HK」"
