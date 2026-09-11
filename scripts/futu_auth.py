@@ -100,10 +100,51 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
         pass
 
 
+def touch_preset():
+    """触碰 preset 组合文件，触发 harness 原位重载 futu-mcp 行。"""
+    preset_yml = Path(__file__).resolve().parent.parent / "agent.cordis.yml"
+    if preset_yml.exists():
+        os.utime(preset_yml, None)
+        say("已触发当前会话的组合重载，富途工具应已在本会话就绪。")
+        warn("若本会话仍未见 mcp__futu__* 工具，请新建会话（选本模式）。")
+    else:
+        warn("重启 harness 会话后，富途工具（mcp__futu__*）即可用。")
+
+
+def refresh_tokens():
+    """用 refresh_token 换新 access_token（token 过期时免重新授权）。"""
+    if not REFRESH_FILE.exists():
+        warn("无 refresh_token，请直接运行完整授权（不带 --refresh）。")
+        return 1
+    say("使用 refresh_token 续期…")
+    resp = http_json(TOKEN_URL, form={
+        "grant_type": "refresh_token",
+        "refresh_token": REFRESH_FILE.read_text().strip(),
+        "client_id": CLIENT_FILE.read_text().strip(),
+    })
+    access = resp.get("access_token", "")
+    if not access:
+        warn(f"续期失败（refresh_token 可能已失效，请重新完整授权）：{json.dumps(resp, ensure_ascii=False)[:200]}")
+        return 1
+    TOKEN_FILE.write_text(access)
+    try:
+        os.chmod(TOKEN_FILE, 0o600)
+    except OSError:
+        pass
+    if resp.get("refresh_token"):
+        REFRESH_FILE.write_text(resp["refresh_token"])
+    say("续期成功，token 已更新。")
+    touch_preset()
+    return 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--write", action="store_true", help="额外申请交易写权限 trade:write")
+    ap.add_argument("--refresh", action="store_true", help="用 refresh_token 续期，免重新授权")
     args = ap.parse_args()
+    if args.refresh:
+        return refresh_tokens()
     scopes = "quote:read accid:* trade:read" + (" trade:write" if args.write else "")
 
     # 端口占用快速失败：残留的旧监听会用错误的 PKCE verifier 接走授权码，必须避免
@@ -190,15 +231,7 @@ def main():
             pass
     say(f"授权完成！token 已存入 {TOKEN_FILE}")
 
-    # 原位重载：触碰 preset 组合文件，触发 harness 重载 futu-mcp 行，
-    # 当前会话无需新建即可获得 mcp__futu__* 工具
-    preset_yml = Path(__file__).resolve().parent.parent / "agent.cordis.yml"
-    if preset_yml.exists():
-        os.utime(preset_yml, None)
-        say("已触发当前会话的组合重载，富途工具应已在本会话就绪。")
-        warn("若本会话仍未见 mcp__futu__* 工具，请新建会话（选本模式）。")
-    else:
-        warn("重启 harness 会话后，富途工具（mcp__futu__*）即可用。")
+    touch_preset()
     return 0
 
 
