@@ -46,6 +46,19 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
 
 **基本面分析师**（官方提示词核心）："你是研究员，负责分析该公司过去一周的基本面信息。请尽可能详尽地写出公司画像、财务报表、基本财务数据与财务历史的全面报告，让交易者获得公司基本面的完整图景。"
 
+**AKShare 渠道（A股新闻与舆情补充）**：标的为 A 股（6 位代码）时，新闻与舆情分析师可经 bash 调用 AKShare：
+
+```bash
+# 个股新闻（东财源）：标题/内容/发布时间/来源/链接
+python -c "import akshare as ak; print(ak.stock_news_em(symbol='600519').to_string())"
+# 千股千评（全市场扫描后本地按代码过滤，含关注指数/综合评分，约8秒，按需使用）
+python -c "import akshare as ak; print(ak.stock_comment_em().query('代码==\"600519\"').to_string())"
+```
+
+- 环境未装 AKShare 时：`pip install akshare`（PEP 668 受限系统建议先建 venv）；安装失败则降级 web 搜索，不要阻塞分析。
+- AKShare 主要覆盖 A 股；港美股的新闻/舆情仍以富途 MCP 为准。
+- 富途与 AKShare 都取得到时，优先富途（与交易账户同源），AKShare 作交叉验证与补充。
+
 - 子代理不可用时（无 subagent 工具或派发失败），退回主会话内逐个完成四份报告。
 - 收齐四份报告后，向用户简要展示各报告要点表格，再进入辩论阶段。
 - 后续辩论/裁决阶段引用报告时引用要点，不要把全文重复贴出。
