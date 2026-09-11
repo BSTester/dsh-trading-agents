@@ -18,12 +18,12 @@ jobs:
           node - <<'EOF'
           const fs = require('fs');
           // 轻量结构检查：真实方言（!!js 标签）由运行时挂载校验兜底
-          const src = fs.readFileSync('preset/agent.cordis.yml', 'utf8');
+          const src = fs.readFileSync('agent.cordis.yml', 'utf8');
           if (!/- id: persona/.test(src)) throw new Error('missing persona row');
           if (!/- id: futu-mcp/.test(src)) throw new Error('missing futu-mcp row');
           if (!/serverName: futu/.test(src)) throw new Error('futu-mcp: bad serverName');
           if (!/url: https:\/\/mcp\.futunn\.com\/mcp/.test(src)) throw new Error('futu-mcp: bad url');
-          for (const f of ['preset/preset.yml', 'skills/trading-agents/SKILL.md']) {
+          for (const f of ['preset.yml', 'skills/trading-agents/SKILL.md']) {
             if (!fs.existsSync(f)) throw new Error(`missing ${f}`);
           }
           const skill = fs.readFileSync('skills/trading-agents/SKILL.md', 'utf8');

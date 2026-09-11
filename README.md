@@ -10,15 +10,19 @@ DeepSeek Harness 对话模式：把 [TradingAgents](https://github.com/TauricRes
         ↓ 决策写入记忆，下次分析同标的自动注入历史教训
 ```
 
-## 一键安装
+## 一键安装（官方方式）
+
+preset 就是本仓库根目录，放进 Harness 的 preset 目录即被自动发现（无需重启）：
 
 ```bash
-git clone https://github.com/BSTester/dsh-trading-agents.git
-cd dsh-trading-agents
-./install.sh
+git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-presets/dsh-trading-agents"
 ```
 
-脚本做三件事：安装对话模式（preset + 技能）到 `~/.dsh/.agent-presets/dsh-trading-agents` → 可选录入富途 token → 打印启动命令。
+或者用安装脚本（同样一行 clone，外加富途 token 录入向导）：
+
+```bash
+git clone https://github.com/BSTester/dsh-trading-agents && cd dsh-trading-agents && ./install.sh
+```
 
 ## 一键启动
 
@@ -56,13 +60,14 @@ dsh web
 
 ## 目录结构
 
+仓库根目录即 preset 目录（放入 `~/.dsh/.agent-presets/` 即完成安装）：
+
 ```
-├── preset/
-│   ├── agent.cordis.yml   # 对话模式组合：persona + 工具 + 富途 MCP 桥
-│   └── preset.yml
-├── skills/trading-agents/ # TradingAgents 六角色工作流技能（v1 引擎）
+├── agent.cordis.yml       # 对话模式组合：persona + 工具 + 富途 MCP 桥
+├── preset.yml             # 模式元数据（名称/介绍）
+├── skills/trading-agents/ # TradingAgents 六角色工作流技能（v1 引擎，含首次授权提示）
 ├── plugins/trading-agents/ # v2 确定性编排插件（脚手架，见 docs/architecture.md）
-├── install.sh             # 一键安装
+├── install.sh             # 更新 + 富途 token 录入向导
 └── docs/architecture.md   # 架构与路线图
 ```
 
