@@ -33,7 +33,7 @@ REDIRECT_URI = f"http://127.0.0.1:{CALLBACK_PORT}/callback"
 REGISTER_URL = "https://webapi.futunn.com/oauth2/register"
 AUTHORIZE_URL = "https://webapi.futunn.com/oauth2/authorize/confirm"
 TOKEN_URL = "https://webapi.futunn.com/oauth2/token"
-TIMEOUT_SECONDS = 300
+TIMEOUT_SECONDS = 600
 
 
 def say(msg): print(f"\033[1;36m==>\033[0m {msg}", flush=True)
@@ -81,7 +81,13 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
         CallbackHandler.code = query.get("code", [""])[0]
         self.send_response(200)
         self.end_headers()
-        self.wfile.write("授权成功！请回到终端查看结果，可以关闭此页面。".encode("utf-8"))
+        # 授权完成后自动关闭该 127.0.0.1 标签页
+        html = ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
+                "<script>window.close();</script></head>"
+                "<body style='font-family:sans-serif'><h3>✅ 授权成功</h3>"
+                "<p>token 已保存，本页面将自动关闭。若未关闭可手动关闭。</p>"
+                "</body></html>")
+        self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, *a):
         pass
