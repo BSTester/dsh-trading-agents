@@ -32,12 +32,8 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
      b. 把脚本打印的授权链接以可点击形式展示给用户，说明"请登录富途账号并点确认"。
      c. 脚本完成后，提醒用户重启 harness 会话使 token 生效；若脚本超时/失败，
         再降级到 b 选项。
-   - **OAuth 始终失败的备选：富途 OpenAPI 密钥方式**（官方 RSA 密钥 + 本地 OpenD 网关）：
-     告知用户可安装 OpenD 并在富途 App 开通 API 权限（见
-     https://github.com/FutunnOpen/py-futu-api ），OpenD 起来后本机 127.0.0.1:11111
-     即可用 futu-api Python SDK 取行情/公司资料/交易（经 shell 执行 Python 脚本）。
-     该路线重（需常驻 OpenD），仅在 OAuth 不可用时作为兜底。
-   - 用户不想现在授权 → **继续降级分析**：用 web 搜索/AKShare/Yahoo 获取公开数据，
+   - 授权方式只有这一种（OAuth，脚本全自动），没有其他授权兜底，也不需要。
+   - **用户不想现在授权** → **继续降级分析**：用 web 搜索/AKShare/Yahoo 获取公开数据，
      并在报告中标注"数据源：公开网络，非实时行情"。
    - 不要在未提示的情况下默默降级；也不要因为缺工具而拒绝分析。
 4. 读取 `.tradingagents/memory.md`（若存在），摘出该标的的历史决策与教训，供后续阶段注入。
@@ -89,14 +85,15 @@ https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL&region=US&lang=en-US
 **X (Twitter) 渠道（社交舆情补充）**：舆情分析师可用仓库脚本经用户已登录浏览器抓取 X 讨论（cookie 留在浏览器内，脚本不接触明文）：
 
 ```bash
-# Linux/macOS（Windows 用 ~/.dsh/trading-venv/Scripts/python.exe）
 "$HOME/.dsh/trading-venv/bin/python" "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/x_search.py" "贵州茅台 OR 600519" --count 10 --live
+# Windows: ~/.dsh/trading-venv/Scripts/python.exe
 ```
 
-- 前置：本机 Chrome/Edge 已登录 x.com + playwright 库（安装器已装进 trading-venv；缺失时 `venv的python -m pip install playwright`，只需库，无需下载浏览器）；
-- 运行前用户需关闭所有 Chrome/Edge 窗口（脚本要用调试端口复用默认登录配置）；
-- 返回 JSON（推文文本+时间），失败时返回带 hint 的错误信息——按 hint 提示用户后可降级其他渠道；
-- 主要用于港美股/热门话题的实时情绪；A 股讨论仍优先富途社区/AKShare。
+- **可达性预检（脚本内置，必须遵守）**：脚本启动前会先探测 x.com 可达性，不可达时直接返回 `{"skip":true}`——此时**跳过 X 渠道，静默继续其他渠道**，不要重试、不要提示用户、不要阻塞流程；脚本返回 error（如未登录）时同样直接跳过。
+- 用途定位：①**情绪信息**——散户与 KOL 对标的的多空倾向、恐慌或狂热信号；②**信息挖掘**——围绕财报关键词、异常波动、行业事件搜第一手讨论，作为交易员与风控辩论的辅助判断素材。搜索词用英文（覆盖面更广），可组合 `$代码`（如 `$AAPL`）与公司名。
+- 前置：本机 Chrome/Edge 已登录 x.com（一次即可，`--login` 模式，登录态持久保存在 ~/.dsh/x-profile）+ playwright 库（安装器已装进 trading-venv）。
+- 每次搜索完成后脚本自动关闭专用浏览器。
+- 主要用于港美股/热门话题；A 股讨论仍优先富途社区/AKShare。
 
 - 子代理不可用时（无 subagent 工具或派发失败），退回主会话内逐个完成四份报告。
 - 收齐四份报告后，向用户简要展示各报告要点表格，再进入辩论阶段。

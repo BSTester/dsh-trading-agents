@@ -19,7 +19,12 @@ import subprocess
 import sys
 import time
 import urllib.request
+from pathlib import Path
 
+import urllib.parse
+import urllib.error
+
+DSH_HOME = Path(os.environ.get("DSH_HOME", Path.home() / ".dsh"))
 DEBUG_PORT = 9222
 # 专属持久配置目录：登录态保存在这里，与日常浏览器互不干扰
 PROFILE_DIR = os.path.join(os.environ.get("DSH_HOME", os.path.expanduser("~/.dsh")), "x-profile")
@@ -125,6 +130,19 @@ def close_by_port_best_effort():
         pass
 
 
+def x_reachable():
+    """快速预检 x.com 可达性（不可达时整体跳过，不启动浏览器）。"""
+    try:
+        req = urllib.request.Request("https://x.com", method="HEAD",
+                                     headers={"User-Agent": "Mozilla/5.0"})
+        urllib.request.urlopen(req, timeout=8)
+        return True
+    except urllib.error.HTTPError:
+        return True  # 有响应（哪怕4xx/5xx）说明网络可达
+    except Exception:
+        return False
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("query", nargs="?", default=None)
@@ -139,6 +157,10 @@ def main():
     except ImportError:
         print(json.dumps({"error": "缺少 playwright 库", "fix": "pip install playwright"}))
         return 1
+
+    if not x_reachable():
+        print(json.dumps({"skip": True, "reason": "x.com 不可达，跳过 X 渠道"}))
+        return 0
 
     try:
         if not ensure_browser():
