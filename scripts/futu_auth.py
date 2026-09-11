@@ -189,7 +189,16 @@ def main():
         except OSError:
             pass
     say(f"授权完成！token 已存入 {TOKEN_FILE}")
-    warn("重启 harness 会话后，富途工具（mcp__futu__*）即可用。")
+
+    # 原位重载：触碰 preset 组合文件，触发 harness 重载 futu-mcp 行，
+    # 当前会话无需新建即可获得 mcp__futu__* 工具
+    preset_yml = Path(__file__).resolve().parent.parent / "agent.cordis.yml"
+    if preset_yml.exists():
+        os.utime(preset_yml, None)
+        say("已触发当前会话的组合重载，富途工具应已在本会话就绪。")
+        warn("若本会话仍未见 mcp__futu__* 工具，请新建会话（选本模式）。")
+    else:
+        warn("重启 harness 会话后，富途工具（mcp__futu__*）即可用。")
     return 0
 
 
