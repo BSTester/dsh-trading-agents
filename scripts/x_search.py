@@ -122,7 +122,7 @@ def main():
                 page.close()
                 return 0
 
-            page.wait_for_selector("article", timeout=20000)
+            page.wait_for_selector("article", timeout=30000, state="attached")
             time.sleep(2)  # 等懒加载
             items = page.evaluate(
                 """(n) => Array.from(document.querySelectorAll('article')).slice(0, n).map(a => {
