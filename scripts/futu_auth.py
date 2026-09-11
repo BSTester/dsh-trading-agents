@@ -99,6 +99,18 @@ def main():
     args = ap.parse_args()
     scopes = "quote:read accid:* trade:read" + (" trade:write" if args.write else "")
 
+    # 端口占用快速失败：残留的旧监听会用错误的 PKCE verifier 接走授权码，必须避免
+    import socket
+    probe = socket.socket()
+    try:
+        probe.bind(("127.0.0.1", CALLBACK_PORT))
+    except OSError:
+        warn(f"端口 {CALLBACK_PORT} 已被占用（可能是残留的旧授权脚本）。")
+        warn("请先结束旧进程再重试：  pkill -f futu_auth.py   （Windows：任务管理器结束 python）")
+        return 1
+    finally:
+        probe.close()
+
     client_id = register_client()
 
     verifier = secrets.token_urlsafe(48)

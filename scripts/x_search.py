@@ -72,12 +72,14 @@ def ensure_browser():
         return False
     # 专属配置目录：不需要关闭日常浏览器窗口
     os.makedirs(PROFILE_DIR, exist_ok=True)
-    subprocess.Popen(
+    proc = subprocess.Popen(
         [exe, f"--remote-debugging-port={DEBUG_PORT}",
          f"--user-data-dir={PROFILE_DIR}", "--restore-last-session=false",
          "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
+    # 记录 PID：搜索完成后自动关闭该浏览器
+    (DSH_HOME / "x-chrome.pid").write_text(str(proc.pid))
     for _ in range(20):
         time.sleep(0.5)
         if debug_port_alive():
@@ -86,12 +88,50 @@ def ensure_browser():
     return False
 
 
+def close_browser_if_we_launched_it():
+    pid_file = DSH_HOME / "x-chrome.pid"
+    if not pid_file.exists():
+        return
+    try:
+        pid = int(pid_file.read_text().strip())
+        if sys.platform == "win32":
+            subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
+                           capture_output=True)
+        else:
+            os.kill(pid, 15)
+        pid_file.unlink()
+    except (ValueError, ProcessLookupError, OSError):
+        pass
+
+
+def close_by_port_best_effort():
+    """兜底：关闭仍占用调试端口的浏览器进程（处理历史遗留实例）。"""
+    import signal
+    try:
+        if sys.platform == "win32":
+            out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True).stdout
+            pids = {line.split()[-1] for line in out.splitlines()
+                    if f":{DEBUG_PORT}" in line and "LISTENING" in line.upper()}
+            for pid in pids:
+                subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
+        else:
+            out = subprocess.run(["fuser", f"{DEBUG_PORT}/tcp"], capture_output=True, text=True).stdout
+            for pid in out.split():
+                try:
+                    os.kill(int(pid), signal.SIGKILL)
+                except (ValueError, ProcessLookupError, PermissionError):
+                    pass
+    except Exception:
+        pass
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("query", nargs="?", default=None)
     ap.add_argument("--count", type=int, default=10)
     ap.add_argument("--live", action="store_true", help="按最新排序（默认热门）")
     ap.add_argument("--login", action="store_true", help="首次登录：打开 x.com 让用户登录，登录态持久保存")
+    ap.add_argument("--keep-browser", action="store_true", help="完成后保持浏览器打开（默认自动关闭）")
     args = ap.parse_args()
 
     try:
@@ -100,13 +140,14 @@ def main():
         print(json.dumps({"error": "缺少 playwright 库", "fix": "pip install playwright"}))
         return 1
 
-    if not ensure_browser():
-        return 1
-
-    url = "https://x.com/login" if args.login else (
-        f"https://x.com/search?q={urllib.parse.quote(args.query)}" + ("&f=live" if args.live else ""))
-
     try:
+        if not ensure_browser():
+            return 1
+
+        url = "https://x.com/login" if args.login else (
+            f"https://x.com/search?q={urllib.parse.quote(args.query)}"
+            + ("&f=live" if args.live else ""))
+
         with sync_playwright() as pw:
             browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
             context = browser.contexts[0]
@@ -116,7 +157,7 @@ def main():
             if args.login:
                 print(json.dumps({"status": "请在弹出的浏览器窗口中登录 x.com",
                                   "profile": PROFILE_DIR}, ensure_ascii=False))
-                page.wait_for_url("**/home**", timeout=300000)  # 登录成功后跳到 /home
+                page.wait_for_url("**/home**", timeout=300000)
                 print(json.dumps({"status": "登录成功，登录态已保存到专属配置，下次直接搜索即可"},
                                  ensure_ascii=False))
                 page.close()
@@ -141,8 +182,16 @@ def main():
         print(json.dumps({"error": str(e)[:300],
                           "hint": "若提示登录/无内容：先运行 python scripts/x_search.py --login 在专属浏览器窗口登录 x.com（一次即可，登录态持久保存）"}))
         return 1
+    finally:
+        # 完成后自动关闭专用浏览器（--keep-browser 可保留）
+        if not args.keep_browser:
+            close_browser_if_we_launched_it()
+            close_by_port_best_effort()
 
 
+if __name__ == "__main__":
+    import urllib.parse
+    sys.exit(main())
 if __name__ == "__main__":
     import urllib.parse
     sys.exit(main())
