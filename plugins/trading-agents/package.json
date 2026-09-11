@@ -1,0 +1,17 @@
+{
+  "name": "@bstester/dsh-trading-agents-plugin",
+  "description": "TradingAgents orchestration plugin for DeepSeek Harness: six-role investment research pipeline with memory (v2, deterministic engine)",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "src"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "cordis",
+    "tradingagents",
+    "futu"
+  ],
+  "license": "MIT"
+}

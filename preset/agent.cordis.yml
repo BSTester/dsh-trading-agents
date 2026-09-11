@@ -1,0 +1,70 @@
+# dsh-trading-agents 预设：TradingAgents 多角色投研对话模式。
+#
+# 结构（三层）：
+#   1. 数据与交易能力 —— 官方 dsh-mcp-client 桥接富途远程 MCP（免 OpenD），
+#      工具以 mcp__futu__* 形式出现；未配置 token 时其余能力照常可用。
+#   2. 工作流知识 —— skills/trading-agents/SKILL.md 教模型按 TradingAgents
+#      六角色流水线执行投研（分析师 → 多空辩论 → 裁决 → 交易提案 → 风控辩论 → 终审）。
+#   3. 记忆 —— 决策日志落在工作区 .tradingagents/memory.md，下次分析同标的时注入。
+
+# ── persona ────────────────────────────────────────────────────────────────
+
+- id: persona
+  name: '@deepseek-ai/dsh-persona'
+  config:
+    text: |-
+      You are 交易智囊 (Trading Agents), a multi-role investment research assistant powered by the {{model}} model, running on the DeepSeek Harness. Working directory: {{cwd}}.
+
+      You operate a TradingAgents-style pipeline: analysts → bull/bear debate → research manager → trader → risk debate → portfolio manager. The `trading-agents` skill defines the full workflow; load it with the skill tool before running any analysis.
+
+      Ground rules:
+      - Data comes first from the Futu MCP tools (mcp__futu__*) when available; fall back to web search/fetch when they are absent or fail. Never fabricate quotes, financials, or news.
+      - Always label uncertainty and data timestamps. Analysis is research, not investment advice; say so in the final output.
+      - Trading actions default to simulation. A real (live) order requires the user's explicit confirmation of the full order summary, twice, before any call. Never place a live order without that confirmation.
+      - Persist every final decision to .tradingagents/memory.md in the workspace, and read past lessons for the same ticker before concluding a new analysis.
+    complete: false
+
+- id: agent-instructions
+  name: '@deepseek-ai/dsh-agent-instructions'
+  config:
+    maxBytes: 65536
+
+# ── 基础工具（消费宿主注册表，不提供服务，无需 realm） ────────────────────
+
+- id: tool-fs
+  name: '@deepseek-ai/dsh-tool-fs'
+
+- id: tool-fs-search
+  name: '@deepseek-ai/dsh-tool-fs-search'
+
+- id: tool-web
+  name: '@deepseek-ai/dsh-tool-web'
+  config:
+    fetch: true
+    searchTimeoutMs: 60000
+
+# ── 技能：TradingAgents 工作流 ─────────────────────────────────────────────
+
+- id: skill-filesystem
+  name: '@deepseek-ai/dsh-skill-filesystem'
+  config:
+    customSkillDirs:
+      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
+
+- id: tool-skill
+  name: '@deepseek-ai/dsh-tool-skill'
+
+# ── 富途远程 MCP（数据与交易能力） ──────────────────────────────────────────
+# 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README）。
+# token 未设置时该行工具不会出现，其余能力不受影响（failOnStartupError: false）。
+
+- id: futu-mcp
+  name: '@deepseek-ai/dsh-mcp-client'
+  config:
+    serverName: futu
+    transport: streamable-http
+    url: https://mcp.futunn.com/mcp
+    headers:
+      Authorization: !!js `Bearer ${process.env.FUTU_MCP_TOKEN ?? ''}`
+    failOnStartupError: false
+    toolCallTimeoutMs: 60000
