@@ -29,6 +29,42 @@
   config:
     maxBytes: 65536
 
+# ── 持久 shell（跨平台双栈，随平台门控；AKShare 等数据脚本经此执行） ─────────
+
+- id: persistent-shell
+  name: cordis:group
+  group: true
+  isolate:
+    terminals: true
+  config:
+    - id: pty
+      name: '@deepseek-ai/dsh-terminal'
+
+    - id: terminal-bash
+      name: '@deepseek-ai/dsh-terminal-bash'
+      disabled: !!js process.platform === 'win32'
+      config:
+        timeoutMs: 300000
+
+    - id: persistent-bash
+      name: '@deepseek-ai/dsh-tool-bash-persistent'
+      disabled: !!js process.platform === 'win32'
+      config:
+        timeoutMs: 300000
+
+    - id: terminal-pwsh
+      name: '@deepseek-ai/dsh-terminal-bash'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        shellDialect: pwsh
+        timeoutMs: 300000
+
+    - id: persistent-pwsh
+      name: '@deepseek-ai/dsh-tool-pwsh-persistent'
+      disabled: !!js process.platform !== 'win32'
+      config:
+        timeoutMs: 300000
+
 # ── 基础工具（消费宿主注册表，不提供服务，无需 realm） ────────────────────
 
 - id: tool-fs
@@ -81,8 +117,8 @@
     transport: streamable-http
     url: https://mcp.futunn.com/mcp
     headers:
-      # token 优先读 ~/.dsh/futu-token（scripts/futu-auth.sh 授权后写入），
-      # 其次回退环境变量 FUTU_MCP_TOKEN
-      Authorization: !!js "(() => { try { const fs = process.getBuiltinModule('node:fs'); const t = fs.readFileSync(process.env.HOME + '/.dsh/futu-token', 'utf8').trim(); if (t) return 'Bearer ' + t; } catch (e) {} return 'Bearer ' + (process.env.FUTU_MCP_TOKEN ?? ''); })()"
+      # token 优先读 ~/.dsh/futu-token（scripts/futu_auth.py 授权后写入），
+      # 其次回退环境变量 FUTU_MCP_TOKEN；路径用 os.homedir() 兼容 Windows
+      Authorization: !!js "(() => { try { const om = process.getBuiltinModule('node:os'); const fs = process.getBuiltinModule('node:fs'); const t = fs.readFileSync(om.homedir() + '/.dsh/futu-token', 'utf8').trim(); if (t) return 'Bearer ' + t; } catch (e) {} return 'Bearer ' + (process.env.FUTU_MCP_TOKEN ?? ''); })()"
     failOnStartupError: false
     toolCallTimeoutMs: 60000

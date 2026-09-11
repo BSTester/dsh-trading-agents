@@ -20,22 +20,37 @@ DeepSeek Harness 对话模式：把 [TradingAgents](https://github.com/TauricRes
 **方式 A · 一行命令**
 
 ```bash
+# Linux / macOS
 git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-presets/dsh-trading-agents"
 ```
 
-**方式 B · 安装脚本**（方式 A + 富途 token 录入向导）
+```powershell
+# Windows (PowerShell)
+git clone https://github.com/BSTester/dsh-trading-agents "$env:USERPROFILE\.dsh\.agent-presets\dsh-trading-agents"
+```
+
+**方式 B · 安装脚本**（方式 A + 富途授权向导）
 
 ```bash
+# Linux / macOS
 git clone https://github.com/BSTester/dsh-trading-agents && cd dsh-trading-agents && ./install.sh
+```
+
+```powershell
+# Windows (PowerShell)
+git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents; .\install.ps1
 ```
 
 **方式 C · 让 AI 帮你装**——把下面这段话直接发给你正在使用的 DeepSeek Harness 会话即可：
 
 ```text
 请帮我安装 dsh-trading-agents 对话模式：
-1. git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-presets/dsh-trading-agents"（已存在则 git pull 更新）
-2. 检查 $HOME/.dsh/.agent-presets/dsh-trading-agents 下是否有 agent.cordis.yml、preset.yml 和 skills/trading-agents/SKILL.md，逐一确认存在
-3. 检查环境变量 FUTU_MCP_TOKEN 是否已设置，没设置的话告诉我如何完成富途 OAuth 授权（见仓库 README「获取富途 token」），并说明可以先跳过、以降级模式使用
+1. 把 https://github.com/BSTester/dsh-trading-agents 克隆到本机的 Harness 用户 preset 目录
+   （$HOME/.dsh/.agent-presets/dsh-trading-agents，Windows 为 %USERPROFILE%\.dsh\.agent-presets\...；已存在则 git pull 更新）
+2. 检查该目录下是否有 agent.cordis.yml、preset.yml 和 skills/trading-agents/SKILL.md，逐一确认存在
+3. 检查是否已有富途 token（~/.dsh/futu-token 文件或 FUTU_MCP_TOKEN 环境变量）；
+   没有的话运行仓库里的 scripts/futu_auth.py 向导（会打开浏览器完成富途 OAuth 授权），
+   或者告诉我可以先跳过、以降级模式使用
 4. 完成后告诉我如何启动（dsh web → 新建会话 → 选「交易智囊模式」）
 ```
 
@@ -56,16 +71,17 @@ dsh web
 没有 token 也能用——行情/新闻自动降级到 web 搜索；配了 token 才有富途的 K 线、财务、研报与交易工具。
 
 ```bash
-bash "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu-auth.sh"
+# Linux / macOS（Windows 用 python 运行同一脚本即可）
+python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py"
 ```
 
-脚本会自动完成整个 OAuth（Authorization Code + PKCE）：注册客户端 → **弹出/打印富途授权页链接** → 你登录富途账号点确认 → 自动换取 token 存入 `~/.dsh/futu-token`（权限 600）。默认只申请只读 scope；要开通交易功能加 `--write`。
+脚本（纯 Python 标准库，跨平台）会自动完成整个 OAuth（Authorization Code + PKCE）：注册客户端 → **弹出/打印富途授权页链接** → 你登录富途账号点确认 → 自动换取 token 存入 `~/.dsh/futu-token`（权限 600）。默认只申请只读 scope；要开通交易功能加 `--write`。
 
 会话内也可以：直接对 AI 说"帮我接通富途授权"，它会自己运行这个脚本并把授权链接展示给你。
 
 > 技术细节：富途远程 MCP 是标准 OAuth2（Authorization Code + PKCE，支持 RFC7591
 > 动态客户端注册），token 走 refresh_token 刷新、`/oauth2/revoke` 吊销。token 文件
-> 只存本机 `~/.dsh/futu-token`，预设组合在加载时自动读取，不进任何代码或仓库。
+> 只存本机，预设组合在加载时自动读取，不进任何代码或仓库。
 
 **安全说明**：交易默认模拟盘；真实下单强制双重人工确认；日常建议只授权只读 scope。
 

@@ -23,9 +23,11 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
 3. **富途授权检查（首次运行必须做）**：检查工具列表里是否有 `mcp__futu__` 前缀的工具。
    - 有 → 直接使用，数据注明来源与时间。
    - 没有 → 这是 OAuth 授权问题，**直接帮用户发起授权**（不要只让用户去看文档）：
-     a. 运行仓库自带脚本：`bash "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu-auth.sh"`
-        （脚本会自动注册客户端、弹出富途授权页面链接、等待用户在浏览器确认、
-        自动换取 token 存入 ~/.dsh/futu-token）。默认只申请只读 scope；
+     a. 运行仓库自带脚本（跨平台 Python，Linux/macOS/Windows 通用）：
+        `python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py"`
+        （Windows 路径：`%USERPROFILE%\.dsh\.agent-presets\dsh-trading-agents\scripts\futu_auth.py`）
+        脚本会自动注册客户端、弹出富途授权页面、等待用户在浏览器确认、
+        自动换取 token 存入 ~/.dsh/futu-token。默认只申请只读 scope；
         用户明确要交易功能时加 `--write` 参数。
      b. 把脚本打印的授权链接以可点击形式展示给用户，说明"请登录富途账号并点确认"。
      c. 脚本完成后，提醒用户重启 harness 会话使 token 生效；若脚本超时/失败，
