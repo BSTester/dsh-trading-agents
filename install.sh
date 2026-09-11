@@ -30,7 +30,24 @@ else
 fi
 say "完成。DeepSeek Harness 会自动发现新 preset（无需重启）。"
 
-# 富途 token（可选；不设置则行情/交易工具不可用，会话内会提示授权，其余功能正常）
+# 3. 环境初始化：持久 venv + 数据渠道依赖（AKShare/playwright）
+VENV="$DSH_HOME/trading-venv"
+if command -v python3 >/dev/null 2>&1; then
+  if [[ ! -x "$VENV/bin/python" ]]; then
+    say "创建 Python 虚拟环境 $VENV …"
+    python3 -m venv "$VENV" 2>/dev/null || warn "venv 创建失败，AKShare/X 渠道将降级为会话内提示安装"
+  fi
+  if [[ -x "$VENV/bin/python" ]]; then
+    say "安装数据渠道依赖（akshare、playwright，约1-2分钟）…"
+    "$VENV/bin/pip" install -q --upgrade pip 2>/dev/null || true
+    "$VENV/bin/pip" install -q akshare playwright && say "依赖安装完成（$VENV）" \
+      || warn "依赖安装失败：会话内使用时 AI 会提示重试，不影响其他功能"
+  fi
+else
+  warn "未找到 python3：AKShare（A股新闻舆情）与 X 渠道不可用，其余功能正常。"
+fi
+
+# 4. 富途 token（可选；不设置则行情/交易工具不可用，会话内会提示授权，其余功能正常）
 if [[ -z "${FUTU_MCP_TOKEN:-}" ]]; then
   warn "未检测到 FUTU_MCP_TOKEN（富途远程 MCP 的 Bearer token）。"
   echo "   授权步骤见仓库 README「获取富途 token」（OAuth + PKCE，建议先只授只读 scope）。"

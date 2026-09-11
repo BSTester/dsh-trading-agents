@@ -66,13 +66,14 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
 **AKShare 渠道（A股新闻与舆情补充）**：标的为 A 股（6 位代码）时，新闻与舆情分析师可经 bash 调用 AKShare：
 
 ```bash
-# 个股新闻（东财源）：标题/内容/发布时间/来源/链接
+# 优先用安装器建好的持久 venv（Linux/macOS: ~/.dsh/trading-venv/bin/python，Windows: ~/.dsh/trading-venv/Scripts/python.exe）
 python -c "import akshare as ak; print(ak.stock_news_em(symbol='600519').to_string())"
 # 千股千评（全市场扫描后本地按代码过滤，含关注指数/综合评分，约8秒，按需使用）
 python -c "import akshare as ak; print(ak.stock_comment_em().query('代码==\"600519\"').to_string())"
 ```
 
-- 环境未装 AKShare 时：`pip install akshare`（PEP 668 受限系统建议先建 venv）；安装失败则降级 web 搜索，不要阻塞分析。
+- `import akshare` 失败时：先用 venv python（路径见上），再尝试 `pip install akshare`
+  （PEP 668 受限系统建议先建 venv）；仍失败则降级 web 搜索，不要阻塞分析。
 - AKShare 主要覆盖 A 股；港美股的新闻/舆情仍以富途 MCP 为准。
 - 富途与 AKShare 都取得到时，优先富途（与交易账户同源），AKShare 作交叉验证与补充。
 
@@ -88,10 +89,11 @@ https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL&region=US&lang=en-US
 **X (Twitter) 渠道（社交舆情补充）**：舆情分析师可用仓库脚本经用户已登录浏览器抓取 X 讨论（cookie 留在浏览器内，脚本不接触明文）：
 
 ```bash
-python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/x_search.py" "贵州茅台 OR 600519" --count 10 --live
+# Linux/macOS（Windows 用 ~/.dsh/trading-venv/Scripts/python.exe）
+"$HOME/.dsh/trading-venv/bin/python" "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/x_search.py" "贵州茅台 OR 600519" --count 10 --live
 ```
 
-- 前置：本机 Chrome/Edge 已登录 x.com + `pip install playwright`（只需库，无需下载浏览器）；
+- 前置：本机 Chrome/Edge 已登录 x.com + playwright 库（安装器已装进 trading-venv；缺失时 `venv的python -m pip install playwright`，只需库，无需下载浏览器）；
 - 运行前用户需关闭所有 Chrome/Edge 窗口（脚本要用调试端口复用默认登录配置）；
 - 返回 JSON（推文文本+时间），失败时返回带 hint 的错误信息——按 hint 提示用户后可降级其他渠道；
 - 主要用于港美股/热门话题的实时情绪；A 股讨论仍优先富途社区/AKShare。

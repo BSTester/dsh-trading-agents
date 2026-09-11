@@ -29,6 +29,27 @@ if (Test-Path (Join-Path $presetDst ".git")) {
 }
 Say "完成。DeepSeek Harness 会自动发现新 preset（无需重启）。"
 
+# 环境初始化：持久 venv + 数据渠道依赖（AKShare/playwright）
+$py = Get-Command python -ErrorAction SilentlyContinue
+if (-not $py) { $py = Get-Command python3 -ErrorAction SilentlyContinue }
+$venv = Join-Path $dshHome "trading-venv"
+$venvPython = Join-Path $venv "Scripts\python.exe"
+if ($py) {
+    if (-not (Test-Path $venvPython)) {
+        Say "创建 Python 虚拟环境 $venv …"
+        & $py.Source -m venv $venv
+    }
+    if (Test-Path $venvPython) {
+        Say "安装数据渠道依赖（akshare、playwright，约1-2分钟）…"
+        & $venvPython -m pip install -q --upgrade pip
+        & $venvPython -m pip install -q akshare playwright
+        if ($LASTEXITCODE -eq 0) { Say "依赖安装完成（$venv）" }
+        else { Warn "依赖安装失败：会话内使用时 AI 会提示重试，不影响其他功能" }
+    }
+} else {
+    Warn "未找到 python：AKShare（A股新闻舆情）与 X 渠道不可用，其余功能正常。"
+}
+
 # 富途 token（可选）
 if (-not $env:FUTU_MCP_TOKEN -and -not (Test-Path (Join-Path $dshHome "futu-token"))) {
     Warn "未检测到富途 token。"
