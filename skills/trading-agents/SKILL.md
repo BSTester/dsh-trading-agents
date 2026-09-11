@@ -35,9 +35,13 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
         继续正常分析；仍未出现（少数环境）再提示用户新建会话。
    - 授权方式只有这一种（OAuth，脚本全自动），没有其他授权兜底，也不需要。
    - **特殊情形：token 文件已存在（~/.dsh/futu-token）但本会话没有 mcp__futu__ 工具**
-     → 说明本会话创建于授权完成之前，MCP 客户端重试已耗尽。此时不要走降级分析，
-     直接提示用户："token 已就绪，请新建一个会话（选本模式）即可加载富途工具"，
-     并结束本次流程让用户重建会话。
+     → **自动重载，无需重新授权、无需新建会话**。执行：
+     ```bash
+     touch "$HOME/.dsh/.agent-presets/dsh-trading-agents/agent.cordis.yml"
+     ```
+     （Windows: `Get-Item "$env:USERPROFILE\.dsh\.agent-presets\dsh-trading-agents\agent.cordis.yml" | % LastWriteTime = Get-Date`）
+     等待 5 秒后重新检查工具列表。mcp__futu__ 出现 → 直接继续正常分析；
+     仍未出现（罕见）→ 再提示用户新建会话。
    - **用户不想现在授权** → **继续降级分析**：用 web 搜索/AKShare/Yahoo 获取公开数据，
      并在报告中标注"数据源：公开网络，非实时行情"。
    - 不要在未提示的情况下默默降级；也不要因为缺工具而拒绝分析。
