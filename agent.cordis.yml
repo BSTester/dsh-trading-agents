@@ -56,6 +56,20 @@
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
 
+# ── 子代理：四位分析师并行执行 ──────────────────────────────────────────────
+# 工具本身不提供服务，解析宿主的子代理注册表，无需 realm。
+
+- id: tool-subagent-control
+  name: '@deepseek-ai/dsh-tool-subagent-control'
+
+- id: tool-subagent
+  name: '@deepseek-ai/dsh-tool-subagent'
+  config:
+    provider: spawn
+    toolName: subagent
+    modelSelectionSettings: true
+    backgroundMode: continuable
+
 # ── 富途远程 MCP（数据与交易能力） ──────────────────────────────────────────
 # 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README）。
 # token 未设置时该行工具不会出现，其余能力不受影响（failOnStartupError: false）。

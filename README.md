@@ -10,18 +10,33 @@ DeepSeek Harness 对话模式：把 [TradingAgents](https://github.com/TauricRes
         ↓ 决策写入记忆，下次分析同标的自动注入历史教训
 ```
 
-## 一键安装（官方方式）
+## 一键安装
 
-preset 就是本仓库根目录，放进 Harness 的 preset 目录即被自动发现（无需重启）：
+本仓库根目录就是一个 Harness preset（对话模式），放入 Harness 的 preset 目录即被自动发现，无需重启。
+
+> 说明：`dsh plugin add` 命令用于安装 profile 级插件包，对话模式（preset）的官方
+> 安装方式就是放入 `~/.dsh/.agent-presets/` 目录。以下三种方式任选其一。
+
+**方式 A · 一行命令**
 
 ```bash
 git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-presets/dsh-trading-agents"
 ```
 
-或者用安装脚本（同样一行 clone，外加富途 token 录入向导）：
+**方式 B · 安装脚本**（方式 A + 富途 token 录入向导）
 
 ```bash
 git clone https://github.com/BSTester/dsh-trading-agents && cd dsh-trading-agents && ./install.sh
+```
+
+**方式 C · 让 AI 帮你装**——把下面这段话直接发给你正在使用的 DeepSeek Harness 会话即可：
+
+```text
+请帮我安装 dsh-trading-agents 对话模式：
+1. git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-presets/dsh-trading-agents"（已存在则 git pull 更新）
+2. 检查 $HOME/.dsh/.agent-presets/dsh-trading-agents 下是否有 agent.cordis.yml、preset.yml 和 skills/trading-agents/SKILL.md，逐一确认存在
+3. 检查环境变量 FUTU_MCP_TOKEN 是否已设置，没设置的话告诉我如何完成富途 OAuth 授权（见仓库 README「获取富途 token」），并说明可以先跳过、以降级模式使用
+4. 完成后告诉我如何启动（dsh web → 新建会话 → 选「交易智囊模式」）
 ```
 
 ## 一键启动
