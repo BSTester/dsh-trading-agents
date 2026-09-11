@@ -50,15 +50,16 @@ if ($py) {
     Warn "未找到 python：AKShare（A股新闻舆情）与 X 渠道不可用，其余功能正常。"
 }
 
-# 富途 token（可选）
-if (-not $env:FUTU_MCP_TOKEN -and -not (Test-Path (Join-Path $dshHome "futu-token"))) {
-    Warn "未检测到富途 token。"
-    $ans = Read-Host "现在运行授权向导吗？会打开浏览器进行富途授权 (y/N)"
-    if ($ans -match '^[Yy]') {
-        python (Join-Path $presetDst "scripts\futu_auth.py")
-    } else {
-        Warn "跳过。之后可在会话内让 AI 运行 scripts\futu_auth.py，或手动设置 FUTU_MCP_TOKEN。"
-    }
+# 富途授权（token 已存在则跳过；过期时可用 --refresh 续期）
+$tokenFile = Join-Path $dshHome "futu-token"
+if (Test-Path $tokenFile) {
+    Say "检测到已有富途 token，跳过授权"
+} else {
+    Say "发起富途授权（浏览器将打开授权页，登录并确认即可）…"
+    $py = Join-Path $venv "Scripts\python.exe"
+    if (-not (Test-Path $py)) { $py = "python" }
+    & $py (Join-Path $presetDst "scripts\futu_auth.py")
+    if ($LASTEXITCODE -ne 0) { Warn "授权未完成：第一个会话会再次提示，或稍后重跑 .\install.ps1" }
 }
 
 Say "启动：dsh web → 新建会话 → 选择「交易智囊模式」→ 说「分析一下 00700.HK」"

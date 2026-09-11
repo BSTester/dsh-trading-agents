@@ -37,8 +37,11 @@
 
 ## 路线图
 
-- [x] v0.1 仓库脚手架：preset + skill + install.sh
-- [ ] v0.2 端到端验证（无 token 降级模式 → 有 token 全量模式）
+- [x] v0.1 仓库脚手架：preset + skill + install.sh（Linux/Windows 双平台）
+- [x] v0.1.5 富途 OAuth 全自动（动态注册+PKCE+本地回调+原位重载+--refresh 续期）
+- [x] v0.1.6 数据渠道：富途 91 工具 + AKShare + Yahoo RSS + X（CDP 复用登录态）+ web 降级
+- [x] v0.1.7 持仓/交易频率感知 + 交易员七组决策因素清单
+- [ ] v0.2 端到端验证收尾（降级模式已验证；富途全量待真实持仓复核）
 - [ ] v0.3 记忆复盘闭环打磨（pending → 真实涨跌幅 → reflection）
 - [ ] v0.4 v2 插件：确定性编排引擎 + 双模型配置
 - [ ] v0.5 Client UI：流水线进度卡片、辩论折叠视图
