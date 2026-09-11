@@ -19,6 +19,7 @@ import os
 import secrets
 import sys
 import threading
+import time
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -75,10 +76,16 @@ def register_client():
 
 class CallbackHandler(http.server.BaseHTTPRequestHandler):
     code = ""
+    seen = False
 
     def do_GET(self):
+        if not self.path.startswith("/callback"):
+            self.send_response(404)
+            self.end_headers()
+            return  # 无关探针：忽略并继续监听
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         CallbackHandler.code = query.get("code", [""])[0]
+        CallbackHandler.seen = True
         self.send_response(200)
         self.end_headers()
         # 授权完成后自动关闭该 127.0.0.1 标签页
@@ -117,11 +124,15 @@ def main():
     challenge = base64.urlsafe_b64encode(
         hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
 
-    received = threading.Event()
     server = http.server.HTTPServer(("127.0.0.1", CALLBACK_PORT), CallbackHandler)
+    server.timeout = 2  # 循环接收：每个请求都处理，直到拿到有效授权码
+    say(f"本地回调监听已启动：http://127.0.0.1:{CALLBACK_PORT}/callback")
 
     def serve():
-        server.handle_request()  # 单请求即返回
+        deadline = time.time() + TIMEOUT_SECONDS
+        while time.time() < deadline and not CallbackHandler.seen:
+            server.handle_request()  # 每次处理一个请求，循环直到成功
+        # 处理完授权回调后关闭监听，避免残留
 
     threading.Thread(target=serve, daemon=True).start()
 
@@ -134,21 +145,23 @@ def main():
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }, safe=":", quote_via=urllib.parse.quote)  # 用 %20/%2A 精确编码，避免 + 和 * 在浏览器跳转中损坏
-    say("请在浏览器中完成富途账号授权（5分钟内有效）：")
+    say(f"请在浏览器中完成富途账号授权（{TIMEOUT_SECONDS // 60} 分钟内有效）：")
     print(f"\n    {auth_url}\n")
     try:
         webbrowser.open(auth_url)
     except Exception:
         warn("未能自动打开浏览器，请手动复制上方链接。")
 
-    warn("等待授权回调…")
-    if not received.wait(TIMEOUT_SECONDS) or not CallbackHandler.code:
+    warn(f"等待授权回调（最长 {TIMEOUT_SECONDS // 60} 分钟）…")
+    deadline = time.time() + TIMEOUT_SECONDS
+    while time.time() < deadline and not CallbackHandler.seen:
+        time.sleep(1)
+    server.server_close()
+    if not CallbackHandler.seen or not CallbackHandler.code:
         warn("超时未收到授权回调，请重试。")
-        server.server_close()
         return 1
     code = CallbackHandler.code
     say("收到授权码，换取 token…")
-    server.server_close()
 
     resp = http_json(TOKEN_URL, form={
         "grant_type": "authorization_code",
