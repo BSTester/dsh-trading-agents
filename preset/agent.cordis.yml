@@ -36,6 +36,8 @@
 
 - id: tool-fs-search
   name: '@deepseek-ai/dsh-tool-fs-search'
+  config:
+    sampleOverCapGlobResults: false
 
 - id: tool-web
   name: '@deepseek-ai/dsh-tool-web'
@@ -65,6 +67,6 @@
     transport: streamable-http
     url: https://mcp.futunn.com/mcp
     headers:
-      Authorization: !!js `Bearer ${process.env.FUTU_MCP_TOKEN ?? ''}`
+      Authorization: !!js '`Bearer ${process.env.FUTU_MCP_TOKEN ?? ""}`'
     failOnStartupError: false
     toolCallTimeoutMs: 60000
