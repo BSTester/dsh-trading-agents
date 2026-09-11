@@ -51,27 +51,23 @@ dsh web
 
 几分钟后你会得到：四位分析师报告、多空辩论实录、结构化终审结论（Buy/Overweight/Hold/Underweight/Sell 五档评级 + 参考入场价 + 止损 + 仓位建议）。
 
-## 获取富途 token（可选，推荐）
+## 获取富途 token（可选，推荐）——一条命令，弹出授权页
 
 没有 token 也能用——行情/新闻自动降级到 web 搜索；配了 token 才有富途的 K 线、财务、研报与交易工具。
 
-富途远程 MCP 采用标准 OAuth2（Authorization Code + PKCE），元数据见
-`https://mcp.futunn.com/.well-known/oauth-authorization-server`：
+```bash
+bash "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu-auth.sh"
+```
 
-1. 确认你有富途/牛牛账号；
-2. （首次）在 `https://webapi.futunn.com/oauth2/register` 完成动态客户端注册，
-   或直接使用富途 Agent 插件文档提供的授权入口
-   （[futu-agent-plugin](https://github.com/FutunnOpen/futu-agent-plugin)）；
-3. 浏览器打开授权页 `https://webapi.futunn.com/oauth2/authorize/confirm` 并用富途账号
-   确认授权，**建议只勾选只读范围**：`quote:read`、`trade:read`（后续需要交易再补
-   `trade:write`）；
-4. 用授权码在 `https://webapi.futunn.com/oauth2/token` 换取 access token；
-5. `export FUTU_MCP_TOKEN=<access token>` 后再启动 dsh（install.sh 可代写入 shell rc）。
+脚本会自动完成整个 OAuth（Authorization Code + PKCE）：注册客户端 → **弹出/打印富途授权页链接** → 你登录富途账号点确认 → 自动换取 token 存入 `~/.dsh/futu-token`（权限 600）。默认只申请只读 scope；要开通交易功能加 `--write`。
 
-> token 有效期与刷新遵循富途 OAuth 的 refresh_token 机制；吊销入口为
-> `/oauth2/revoke`。token 只存你自己的环境变量，不进任何代码或仓库。
+会话内也可以：直接对 AI 说"帮我接通富途授权"，它会自己运行这个脚本并把授权链接展示给你。
 
-**安全说明**：交易默认模拟盘；真实下单强制双重人工确认；建议日常只授权只读 scopes。
+> 技术细节：富途远程 MCP 是标准 OAuth2（Authorization Code + PKCE，支持 RFC7591
+> 动态客户端注册），token 走 refresh_token 刷新、`/oauth2/revoke` 吊销。token 文件
+> 只存本机 `~/.dsh/futu-token`，预设组合在加载时自动读取，不进任何代码或仓库。
+
+**安全说明**：交易默认模拟盘；真实下单强制双重人工确认；日常建议只授权只读 scope。
 
 ## 目录结构
 

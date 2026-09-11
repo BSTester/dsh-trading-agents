@@ -81,6 +81,8 @@
     transport: streamable-http
     url: https://mcp.futunn.com/mcp
     headers:
-      Authorization: !!js '`Bearer ${process.env.FUTU_MCP_TOKEN ?? ""}`'
+      # token 优先读 ~/.dsh/futu-token（scripts/futu-auth.sh 授权后写入），
+      # 其次回退环境变量 FUTU_MCP_TOKEN
+      Authorization: !!js "(() => { try { const fs = process.getBuiltinModule('node:fs'); const t = fs.readFileSync(process.env.HOME + '/.dsh/futu-token', 'utf8').trim(); if (t) return 'Bearer ' + t; } catch (e) {} return 'Bearer ' + (process.env.FUTU_MCP_TOKEN ?? ''); })()"
     failOnStartupError: false
     toolCallTimeoutMs: 60000
