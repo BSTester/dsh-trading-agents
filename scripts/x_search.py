@@ -130,16 +130,13 @@ def close_by_port_best_effort():
         pass
 
 
-def x_reachable():
-    """快速预检 x.com 可达性（不可达时整体跳过，不启动浏览器）。"""
+def x_reachable(timeout=3):
+    """快速预检 x.com 连通性：仅 TCP 连 443 端口，3秒超时，不开浏览器不加载页面。"""
+    import socket
     try:
-        req = urllib.request.Request("https://x.com", method="HEAD",
-                                     headers={"User-Agent": "Mozilla/5.0"})
-        urllib.request.urlopen(req, timeout=8)
-        return True
-    except urllib.error.HTTPError:
-        return True  # 有响应（哪怕4xx/5xx）说明网络可达
-    except Exception:
+        with socket.create_connection(("x.com", 443), timeout=timeout):
+            return True
+    except OSError:
         return False
 
 
