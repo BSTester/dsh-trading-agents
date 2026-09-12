@@ -1,5 +1,7 @@
 # dsh-trading-agents
 
+> 📋 [交接与复审文档](docs/HANDOVER.md)：已完成总结、验证结论、未验证项、下一份计划、复审清单。
+
 DeepSeek Harness 对话模式：把 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 多角色投研流水线装进你的 AI 助手，数据与交易能力来自[富途远程 MCP](https://github.com/FutunnOpen/futu-agent-plugin)（免 OpenD、一次 OAuth 授权）。
 
 ```
