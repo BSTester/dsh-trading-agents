@@ -81,6 +81,15 @@ if command -v dsh >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   fi
 fi
 
+# 5c. 工作台 Client UI（dsh.client 扫描加载，无需组合行）
+if command -v dsh >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  say "安装工作台 Client UI…"
+  TGZ="$( (cd "$PRESET_DST/plugins/workbench" && npm pack --pack-destination /tmp 2>/dev/null) | tail -1)"
+  if [[ -n "$TGZ" ]] && [[ "$TGZ" == /* ]]; then
+    dsh plugin --profile web add "$TGZ" 2>/dev/null && say "workbench UI 已安装（重启+dev:web 构建后生效）"       || warn "workbench UI 安装失败（跳过，不影响其余功能）"
+  fi
+fi
+
 # 6. 账户模式开关默认 sim（安全），文件不存在时补齐
 [[ -s "$DSH_HOME/trading-account-mode" ]] || printf 'sim\n' > "$DSH_HOME/trading-account-mode"
 

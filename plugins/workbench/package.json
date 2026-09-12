@@ -1,0 +1,16 @@
+{
+  "name": "@bstester/dsh-trading-workbench",
+  "description": "Trading workbench Client UI for DeepSeek Harness: pipeline card for run_trading_analysis tool",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "src"
+  ],
+  "dsh": {
+    "client": {
+      "platform": "web"
+    }
+  },
+  "license": "MIT"
+}
