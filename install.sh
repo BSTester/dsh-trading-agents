@@ -57,4 +57,16 @@ else
   warn "无 python 环境，跳过授权。第一个会话内会提示如何授权。"
 fi
 
+# 5. 统一金融数据插件（fin_news/fin_sentiment 工具）
+if command -v dsh >/dev/null 2>&1; then
+  say "安装统一金融数据插件（fin_news/fin_sentiment）…"
+  if dsh plugin --profile web add "github:BSTester/dsh-trading-agents#path=plugins/fin-data" 2>/dev/null; then
+    # 包已就位 → 启用 preset 中的 fin-data 行
+    sed -i '/^- id: fin-data$/,/^  disabled: true$/ s/^  disabled: true$//' "$PRESET_DST/agent.cordis.yml"
+    say "fin-data 插件已安装并启用（新会话生效）"
+  else
+    warn "fin-data 插件安装失败（跳过）。快讯/舆情仍可用脚本手动方式；重跑本脚本可重试。"
+  fi
+fi
+
 say "启动：dsh web → 新建会话 → 选择「交易智囊模式」→ 说「分析一下 00700.HK」"

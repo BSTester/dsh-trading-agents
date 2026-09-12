@@ -65,41 +65,18 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
 - **新闻分析师**：覆盖公司特定新闻与宏观经济，写"当前世界状态"的全面报告；
 - **基本面分析师**：尽可能详尽地覆盖公司画像、财务报表、基本财务数据与财务历史，给出完整基本面图景。
 
-**AKShare 渠道（A股新闻与舆情补充）**：标的为 A 股（6 位代码）时，新闻与舆情分析师可经 bash 调用 AKShare：
+**统一数据工具（首选）**：有 `fin_news` / `fin_sentiment` 工具时直接调用（多源自动路由与降级已内置于代码）：
+- `fin_news(ticker, name, count, lang)` —— 富途快讯 → AKShare(A股) → Yahoo RSS(港美)
+- `fin_sentiment(ticker, x_query, count)` —— X 情绪 + A股千股千评
 
-```bash
-# 优先用安装器建好的持久 venv（Linux/macOS: ~/.dsh/trading-venv/bin/python，Windows: ~/.dsh/trading-venv/Scripts/python.exe）
-python -c "import akshare as ak; print(ak.stock_news_em(symbol='600519').to_string())"
-# 千股千评（全市场扫描后本地按代码过滤，含关注指数/综合评分，约8秒，按需使用）
-python -c "import akshare as ak; print(ak.stock_comment_em().query('代码==\"600519\"').to_string())"
-```
+**手动降级路径（工具不可用时，经 bash + trading-venv）**：
+- A股新闻：`"$HOME/.dsh/trading-venv/bin/python" -c "import akshare as ak; print(ak.stock_news_em(symbol='600519').to_string())"`
+- 千股千评：`... -c "import akshare as ak; print(ak.stock_comment_em().query('代码==\"600519\"').to_string())"`
+- Yahoo RSS：web 抓取 `https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL&region=US&lang=en-US`（港美通用）
 
-- `import akshare` 失败时：先用 venv python（路径见上），再尝试 `pip install akshare`
-  （PEP 668 受限系统建议先建 venv）；仍失败则降级 web 搜索，不要阻塞分析。
-- AKShare 主要覆盖 A 股；港美股的新闻/舆情仍以富途 MCP 为准。
-- 富途与 AKShare 都取得到时，优先富途（与交易账户同源），AKShare 作交叉验证与补充。
-
-**Yahoo 财经渠道（港美股资讯补充）**：新闻/舆情分析师可经 web 抓取 Yahoo Finance RSS（已实测，需带浏览器 User-Agent）：
-
-```
-https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL&region=US&lang=en-US
-```
-
-- 返回该标的最新新闻（标题/链接/发布时间），港股/美股代码通用（如 `s=0700.HK`）。
-- Yahoo 的 quote/chart 非官方接口不稳定（实测常被拒），**行情 K 线一律以富途为准**，Yahoo 只做资讯补充与交叉验证；均不可用则 web 搜索降级。
-
-**X (Twitter) 渠道（社交舆情补充）**：舆情分析师可用仓库脚本经用户已登录浏览器抓取 X 讨论（cookie 留在浏览器内，脚本不接触明文）：
-
-```bash
-"$HOME/.dsh/trading-venv/bin/python" "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/x_search.py" "贵州茅台 OR 600519" --count 10 --live
-# Windows: ~/.dsh/trading-venv/Scripts/python.exe
-```
-
-- **可达性预检（脚本内置，必须遵守）**：脚本启动前会先探测 x.com 可达性，不可达时直接返回 `{"skip":true}`——此时**跳过 X 渠道，静默继续其他渠道**，不要重试、不要提示用户、不要阻塞流程；脚本返回 error（如未登录）时同样直接跳过。
-- 用途定位：①**情绪信息**——散户与 KOL 对标的的多空倾向、恐慌或狂热信号；②**信息挖掘**——围绕财报关键词、异常波动、行业事件搜第一手讨论，作为交易员与风控辩论的辅助判断素材。搜索词用英文（覆盖面更广），可组合 `$代码`（如 `$AAPL`）与公司名。
-- 前置：本机 Chrome/Edge 已登录 x.com（一次即可，`--login` 模式，登录态持久保存在 ~/.dsh/x-profile）+ playwright 库（安装器已装进 trading-venv）。
-- 每次搜索完成后脚本自动关闭专用浏览器。
-- 主要用于港美股/热门话题；A 股讨论仍优先富途社区/AKShare。
+**X 情绪说明**：`fin_sentiment` 内置 X 渠道（不可达自动跳过，无需处理）。首次使用 X 需一次性登录：
+`"$HOME/.dsh/trading-venv/bin/python" "$HOME/.dsh/.agent-presets/dsh-trading-agents/plugins/fin-data/python/x_search.py" --login`
+（登录态持久保存在 ~/.dsh/x-profile；搜索词用英文，可组合 `$代码`）。X 用途：情绪倾向 + 财报/异动/行业事件的第一手讨论，辅助交易员与风控判断。
 
 - 子代理不可用时（无 subagent 工具或派发失败），退回主会话内逐个完成四份报告。
 - 收齐四份报告后，向用户简要展示各报告要点表格，再进入辩论阶段。

@@ -1,0 +1,30 @@
+{
+  "name": "@bstester/dsh-fin-data",
+  "description": "Unified financial data plugin for DeepSeek Harness: fin_news (Futu flash news → AKShare → Yahoo RSS routing) and fin_sentiment (X + AKShare) as native model tools",
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "src",
+    "python"
+  ],
+  "keywords": [
+    "deepseek-harness",
+    "cordis",
+    "finance",
+    "tradingagents"
+  ],
+  "peerDependencies": {
+    "@deepseek-ai/cordis": "^4.0.2",
+    "@deepseek-ai/dsh-tools": "*"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/cordis": {
+      "optional": true
+    },
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "license": "MIT"
+}

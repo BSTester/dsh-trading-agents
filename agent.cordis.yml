@@ -106,6 +106,15 @@
     modelSelectionSettings: true
     backgroundMode: continuable
 
+# ── 统一金融数据插件（fin_news/fin_sentiment 原生工具） ──────────────────────
+# 需先安装包：install.sh 会自动执行
+#   dsh plugin --profile web add "github:BSTester/dsh-trading-agents#path=plugins/fin-data"
+# 未安装时保持 disabled（不激活不报错）；安装器装好后会自动启用本行。
+
+- id: fin-data
+  name: '@bstester/dsh-fin-data'
+  disabled: true
+
 # ── 富途远程 MCP（数据与交易能力） ──────────────────────────────────────────
 # 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README）。
 # token 未设置时该行工具不会出现，其余能力不受影响（failOnStartupError: false）。
