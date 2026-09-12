@@ -69,6 +69,18 @@ if command -v dsh >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   fi
 fi
 
+# 5b. 投研确定性引擎（run_trading_analysis 工具）
+if command -v dsh >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
+  say "安装投研确定性引擎…"
+  TGZ="$( (cd "$PRESET_DST/plugins/engine" && npm pack --pack-destination /tmp 2>/dev/null) | tail -1)"
+  if [[ -n "$TGZ" ]] && [[ "$TGZ" == /* ]] && dsh plugin --profile web add "$TGZ" 2>/dev/null; then
+    sed -i '/^- id: trading-engine$/,/^  disabled: true$/ s/^  disabled: true$//' "$PRESET_DST/agent.cordis.yml"
+    say "trading-engine 已安装并启用（重启 harness 后新会话生效）"
+  else
+    warn "trading-engine 安装失败（跳过），仍可用 skill 驱动方式。"
+  fi
+fi
+
 # 6. 账户模式开关默认 sim（安全），文件不存在时补齐
 [[ -s "$DSH_HOME/trading-account-mode" ]] || printf 'sim\n' > "$DSH_HOME/trading-account-mode"
 

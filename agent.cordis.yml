@@ -106,6 +106,13 @@
     modelSelectionSettings: true
     backgroundMode: continuable
 
+# ── 投研确定性引擎（run_trading_analysis 工具，v2） ──────────────────────────
+# 安装器装包后自动启用。
+
+- id: trading-engine
+  name: '@bstester/dsh-trading-engine'
+  disabled: true
+
 # ── 统一金融数据插件（fin_news/fin_sentiment 原生工具） ──────────────────────
 # 需先安装包：install.sh 会自动执行
 #   dsh plugin --profile web add "github:BSTester/dsh-trading-agents#path=plugins/fin-data"
