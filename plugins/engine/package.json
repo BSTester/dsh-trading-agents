@@ -1,11 +1,12 @@
 {
   "name": "@bstester/dsh-trading-engine",
   "description": "Deterministic TradingAgents investment-research engine for DeepSeek Harness: run_trading_analysis tool driving the 12-role pipeline with direct llm calls and append-only decision memory",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "type": "module",
   "main": "src/index.js",
   "files": [
-    "src"
+    "src",
+    "python"
   ],
   "dependencies": {
     "@deepseek-ai/dsh-tools": "0.1.2-rc.1"

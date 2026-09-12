@@ -7,6 +7,30 @@ import { defineTool } from "@deepseek-ai/dsh-tools";
 import os from "node:os";
 import path from "node:path";
 import { readFile, mkdir, appendFile } from "node:fs/promises";
+import { execFile } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
+
+const run = promisify(execFile);
+const pkgRoot = path.dirname(fileURLToPath(new URL(".", import.meta.url)));
+
+function venvPython() {
+  return path.join(os.homedir(), ".dsh", "trading-venv",
+    process.platform === "win32" ? "Scripts\\python.exe" : "bin/python");
+}
+
+async function runQuant(script, args) {
+  try {
+    const { stdout } = await run(venvPython(),
+      [path.join(pkgRoot, "python", script), ...args],
+      { timeout: 240_000, maxBuffer: 8 * 1024 * 1024 });
+    return JSON.parse(stdout.slice(stdout.indexOf("{")));
+  } catch (e) {
+    throw new Error(`quant ${script} failed: ${e.stderr ? String(e.stderr).slice(0, 300) : e.message}`);
+  }
+}
+
+function jsonRender(_a, v) { return [{ type: "text", text: JSON.stringify(v) }]; }
 
 const MEMORY_PATH = path.join(os.homedir(), ".dsh", "trading-memory.md");
 
@@ -154,6 +178,67 @@ ${pm}
 > 本分析为 AI 研究输出，不构成投资建议。`
 
       return { report, rating, phases: { reports, debate, plan, proposal, riskDebate } };
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "quant_signal",
+    description: "计算某标的当前量化信号（RSI/双均线），基于真实A股日线（新浪源）。返回 signal/price/atr。",
+    parameters: {
+      ticker: { type: "string", required: true, description: "A股代码，如 600519" },
+      strategy: { type: "string", description: "rsi 或 ma_cross，默认 rsi" },
+    },
+    output: { schema: { type: "object", additionalProperties: true }, render: jsonRender },
+    async execute(args) {
+      const a = ["signal", "--ticker", String(args.ticker), "--strategy", String(args.strategy ?? "rsi")];
+      return await runQuant("engine.py", a);
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "quant_backtest",
+    description: "回测策略（双均线/RSI）并输出绩效指标（总收益/年化/夏普/最大回撤/胜率），含佣金/印花税/滑点建模。",
+    parameters: {
+      ticker: { type: "string", required: true, description: "A股代码，如 600519" },
+      strategy: { type: "string", description: "ma_cross 或 rsi，默认 ma_cross" },
+      fast: { type: "number", description: "快均线周期（ma_cross），默认5" },
+      slow: { type: "number", description: "慢均线周期（ma_cross），默认20" },
+      start: { type: "string", description: "起始日期 YYYY-MM-DD，默认2023-01-01" },
+    },
+    output: { schema: { type: "object", additionalProperties: true }, render: jsonRender },
+    async execute(args) {
+      const a = ["--ticker", String(args.ticker), "--source", "sina",
+        "--strategy", String(args.strategy ?? "ma_cross"),
+        "--start", String(args.start ?? "2023-01-01")];
+      if (args.fast) a.push("--fast", String(args.fast));
+      if (args.slow) a.push("--slow", String(args.slow));
+      return await runQuant("backtest.py", a);
+    },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "quant_report",
+    description: "查看量化台账：账户模式(sim/live)、现金/权益/总收益、持仓、交易次数与胜率。",
+    parameters: {},
+    output: { schema: { type: "object", additionalProperties: true }, render: jsonRender },
+    async execute() { return await runQuant("engine.py", ["report"]); },
+  }));
+
+  ctx.tools.register(defineTool({
+    name: "quant_switch",
+    description: "切换模拟盘/实盘账户模式（互斥隔离）。切 live 前必须获用户明确确认。返回当前模式。",
+    parameters: {
+      mode: { type: "string", required: true, description: "sim 或 live" },
+    },
+    output: { schema: { type: "object", additionalProperties: true }, render: jsonRender },
+    async execute(args) {
+      const m = String(args.mode).toLowerCase();
+      if (m !== "sim" && m !== "live") throw new Error("mode must be sim or live");
+      if (m === "live") {
+        return { mode: "live", note: "实盘切换需由会话经用户二次确认后执行；本工具仅示意，安全起见请改用 scripts/trade_mode.py 并在确认后调用" };
+      }
+      await run(venvPython(), [path.join(os.homedir(), ".dsh", ".agent-presets", "dsh-trading-agents", "scripts", "trade_mode.py"), "sim"]);
+      return { mode: "sim" };
     },
   }));
 }
