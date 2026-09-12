@@ -57,15 +57,15 @@ else
   warn "无 python 环境，跳过授权。第一个会话内会提示如何授权。"
 fi
 
-# 5. 统一金融数据插件（fin_news/fin_sentiment 工具）
-if command -v dsh >/dev/null 2>&1; then
+# 5. 统一金融数据插件（fin_news/fin_sentiment 工具）——tarball 安装规避 pnpm 缓存坑
+if command -v dsh >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   say "安装统一金融数据插件（fin_news/fin_sentiment）…"
-  if dsh plugin --profile web add "github:BSTester/dsh-trading-agents#path=plugins/fin-data" 2>/dev/null; then
-    # 包已就位 → 启用 preset 中的 fin-data 行
+  TGZ="$( (cd "$PRESET_DST/plugins/fin-data" && npm pack --pack-destination /tmp 2>/dev/null) | tail -1)"
+  if [[ -n "$TGZ" ]] && [[ "$TGZ" == /* ]] && dsh plugin --profile web add "$TGZ" 2>/dev/null; then
     sed -i '/^- id: fin-data$/,/^  disabled: true$/ s/^  disabled: true$//' "$PRESET_DST/agent.cordis.yml"
-    say "fin-data 插件已安装并启用（新会话生效）"
+    say "fin-data 插件已安装并启用（重启 harness 后新会话生效）"
   else
-    warn "fin-data 插件安装失败（跳过）。快讯/舆情仍可用脚本手动方式；重跑本脚本可重试。"
+    warn "fin-data 安装失败（跳过）。快讯/舆情仍可用脚本手动方式；重跑本脚本可重试。"
   fi
 fi
 

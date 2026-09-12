@@ -1,25 +1,24 @@
 // @bstester/dsh-fin-data — unified financial data tools for DeepSeek Harness.
 //
 // Registers two native model tools backed by vendored Python scripts
-// (executed with the trading-venv interpreter when available):
+// (executed with the trading-venv interpreter):
 //
 //   fin_news(ticker, name?, count?, lang?)    Futu flash news → AKShare (A-share)
 //                                              → Yahoo RSS (HK/US), auto-routed
 //   fin_sentiment(ticker, x_query?, count?)   X via logged-in dedicated browser
 //                                              (CDP) + AKShare 千股千评 (A-share)
-//
-// Routing, degradation and error handling live in code — the model just calls.
 
 import { execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import os from "node:os";
+import { defineTool } from "@deepseek-ai/dsh-tools";
 import path from "node:path";
 
 const run = promisify(execFile);
+
 const pkgRoot = path.dirname(fileURLToPath(new URL(".", import.meta.url)));
 
-/** trading-venv 解释器路径（安装器创建；缺失则报可读错误）。 */
 function venvPython() {
   return path.join(
     os.homedir(), ".dsh", "trading-venv",
@@ -29,17 +28,15 @@ function venvPython() {
 
 async function runPython(script, args) {
   const scriptPath = path.join(pkgRoot, "python", script);
-  const py = venvPython();
   try {
-    const { stdout } = await run(py, [scriptPath, ...args], {
+    const { stdout } = await run(venvPython(), [scriptPath, ...args], {
       timeout: 200_000,
       maxBuffer: 8 * 1024 * 1024,
     });
-    const json = stdout.slice(stdout.indexOf("{"));
-    return JSON.parse(json);
+    return JSON.parse(stdout.slice(stdout.indexOf("{")));
   } catch (error) {
     const detail = error.stderr ? String(error.stderr).slice(0, 300) : error.message;
-    throw new Error(`fin-data ${script} failed（检查 ~/.dsh/trading-venv 是否已装依赖，或重跑仓库 install.sh）: ${detail}`);
+    throw new Error(`fin-data ${script} failed（检查 ~/.dsh/trading-venv，或重跑仓库 install.sh）: ${detail}`);
   }
 }
 
@@ -51,7 +48,7 @@ export const name = "fin-data";
 export const inject = ["tools"];
 
 export function apply(ctx) {
-  ctx.tools.register({
+  ctx.tools.register(defineTool({
     name: "fin_news",
     description:
       "获取财经快讯/新闻（多源自动路由：富途快讯 → AKShare(A股) → Yahoo RSS(港美股)，任一源失败自动降级并在 sources_status 标注）。返回 items[]（source/title/url/time）。",
@@ -61,16 +58,16 @@ export function apply(ctx) {
       count: { type: "number", description: "条数，默认 8，最大 20" },
       lang: { type: "string", description: "富途快讯语言：zh-CN/zh-HK/en，默认 zh-HK" },
     },
-    output: { render: renderJson },
+    output: { schema: { type: "object", additionalProperties: true }, render: renderJson },
     async execute(args) {
       const a = ["--ticker", String(args.ticker), "--count", String(Math.min(args.count ?? 8, 20))];
       if (args.name) a.push("--name", String(args.name));
       a.push("--lang", String(args.lang ?? "zh-HK"));
       return await runPython("fin_news.py", a);
     },
-  });
+  }));
 
-  ctx.tools.register({
+  ctx.tools.register(defineTool({
     name: "fin_sentiment",
     description:
       "获取标的市场情绪/舆情：X 实时讨论（经本机已登录的专属浏览器，不可达自动跳过）+ A股千股千评（综合得分/关注指数/机构参与度）。返回 x.items[] 与 a_share_comment。",
@@ -79,11 +76,11 @@ export function apply(ctx) {
       x_query: { type: "string", description: "X 搜索词（建议英文，如 '$TSLA OR Tesla'）；默认用 ticker" },
       count: { type: "number", description: "X 推文条数，默认 8" },
     },
-    output: { render: renderJson },
+    output: { schema: { type: "object", additionalProperties: true }, render: renderJson },
     async execute(args) {
       const a = ["--ticker", String(args.ticker), "--count", String(Math.min(args.count ?? 8, 20))];
       if (args.x_query) a.push("--x-query", String(args.x_query));
       return await runPython("fin_sentiment.py", a);
     },
-  });
+  }));
 }
