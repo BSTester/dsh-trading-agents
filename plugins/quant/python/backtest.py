@@ -53,7 +53,16 @@ def load_data(ticker, start, source):
                                 "Low": "low", "Close": "close", "Volume": "volume"})
         return df[["date", "open", "high", "low", "close", "volume"]].dropna()
     import akshare as ak
-    df = ak.stock_zh_a_hist(symbol=ticker.split(".")[0], period="daily",
+    code = ticker.split(".")[0]
+    if source == "sina":
+        prefix = {"6": "sh", "9": "sh", "4": "bj", "8": "bj"}.get(code[0], "sz")
+        df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}",
+                                 start_date=start.replace("-", ""), adjust="qfq")
+        df = df.rename(columns={"date": "date", "open": "open", "high": "high",
+                                "low": "low", "close": "close", "volume": "volume"})
+        df["date"] = df["date"].astype(str)
+        return df[["date", "open", "high", "low", "close", "volume"]].dropna()
+    df = ak.stock_zh_a_hist(symbol=code, period="daily",
                             start_date=start.replace("-", ""), adjust="qfq")
     df = df.rename(columns={"日期": "date", "开盘": "open", "最高": "high",
                             "最低": "low", "收盘": "close", "成交量": "volume"})
@@ -156,7 +165,7 @@ def main():
     ap.add_argument("--ticker", required=True)
     ap.add_argument("--start", default="2023-01-01")
     ap.add_argument("--strategy", default="ma_cross", choices=["ma_cross", "rsi"])
-    ap.add_argument("--source", default="stooq", choices=["stooq", "akshare", "yahoo", "synth"])
+    ap.add_argument("--source", default="sina", choices=["sina", "akshare", "stooq", "yahoo", "synth"])
     ap.add_argument("--fast", type=int, default=5)
     ap.add_argument("--slow", type=int, default=20)
     ap.add_argument("--rsi-buy", type=int, default=30)

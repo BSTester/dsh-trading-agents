@@ -17,8 +17,9 @@ python backtest.py --ticker 0700.HK --source stooq --strategy rsi
 
 | 源 | 状态 |
 |---|---|
+| `sina` | ✅ A股日线（新浪源，已验证：茅台/平安 896 根真实数据回测通过） |
 | `synth` | ✅ 合成数据，引擎逻辑单测用（已验证） |
-| `akshare`（A股日线） | ⚠️ 东财端点限流（RemoteDisconnected），需重试或换源 |
+| `akshare`（东财日线） | ⚠️ 东财端点限流；`sina` 为替代首选 |
 | `stooq` | ❌ 已上 JS 浏览器验证 |
 | `yahoo` | ❌ 后端 query2 本机不可达 |
 | 富途 MCP K线工具 | ⚠️ `quote_history_kline`/`quote_cur_kline` 裸 HTTP 返回 internal error；快照 `quote_stock_quote` 正常 |
