@@ -111,6 +111,11 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py live   # �
 └── docs/architecture.md   # 架构与路线图
 ```
 
+## 实盘交易（P4）
+
+实盘默认关闭。要启动，按 [docs/P4-live-trading.md](docs/P4-live-trading.md) 的
+顺序与风控参数执行——小额起步、人工确认、收工切回模拟盘。
+
 ## 免责声明
 
 本项目输出均为 AI 研究性质内容，不构成任何投资建议。市场有风险，决策需独立。
