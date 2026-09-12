@@ -69,4 +69,7 @@ if command -v dsh >/dev/null 2>&1 && command -v npm >/dev/null 2>&1; then
   fi
 fi
 
+# 6. 账户模式开关默认 sim（安全），文件不存在时补齐
+[[ -s "$DSH_HOME/trading-account-mode" ]] || printf 'sim\n' > "$DSH_HOME/trading-account-mode"
+
 say "启动：dsh web → 新建会话 → 选择「交易智囊模式」→ 说「分析一下 00700.HK」"

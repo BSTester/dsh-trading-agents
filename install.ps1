@@ -62,4 +62,8 @@ if (Test-Path $tokenFile) {
     if ($LASTEXITCODE -ne 0) { Warn "授权未完成：第一个会话会再次提示，或稍后重跑 .\install.ps1" }
 }
 
+# 账户模式开关默认 sim（安全）
+$modeFile = Join-Path $dshHome "trading-account-mode"
+if (-not (Test-Path $modeFile)) { Set-Content -Path $modeFile -Value "sim" -NoNewline }
+
 Say "启动：dsh web → 新建会话 → 选择「交易智囊模式」→ 说「分析一下 00700.HK」"

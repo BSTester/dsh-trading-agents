@@ -85,6 +85,19 @@ python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py"
 
 **安全说明**：交易默认模拟盘；真实下单强制双重人工确认；日常建议只授权只读 scope。
 
+## 模拟盘 / 实盘互斥开关
+
+账户类型通过一个状态文件严格隔离（默认模拟盘，绝不并存操作两个账户）：
+
+```bash
+python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py        # 查看（sim/live）
+python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # 切模拟盘
+python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py live   # 切实盘（须先获用户确认）
+```
+
+会话内 AI 每次交易前都会读取该开关，只用对应账户类型的工具；切换后立即按新模式操作。
+
+
 ## 目录结构
 
 仓库根目录即 preset 目录（放入 `~/.dsh/.agent-presets/` 即完成安装）：
