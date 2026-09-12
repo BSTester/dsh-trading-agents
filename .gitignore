@@ -2,3 +2,9 @@ node_modules/
 *.log
 .DS_Store
 .tradingagents/
+__pycache__/
+*.py[cod]
+.venv/
+.install-pack-*/
+.install-test-*/
+.install-write-*

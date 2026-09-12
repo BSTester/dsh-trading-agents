@@ -21,10 +21,41 @@ import sys
 COMMISSION = 0.0003   # 双边佣金
 STAMP_TAX = 0.001     # 卖出印花税（A股）
 SLIPPAGE = 0.001      # 双边滑点
+EXECUTION_SOURCE = "local_simulation"
+
+
+def validate_data(df):
+    """Reject unusable daily OHLCV instead of silently dropping bad observations."""
+    import numpy as np
+    import pandas as pd
+
+    required = ["date", "open", "high", "low", "close", "volume"]
+    if df.empty or any(column not in df.columns for column in required):
+        raise ValueError("Nonempty daily OHLCV data with date/open/high/low/close/volume required")
+    df = df[required].copy().reset_index(drop=True)
+    dates = pd.to_datetime(df["date"], errors="coerce")
+    days = dates.dt.normalize()
+    if dates.isna().any() or days.duplicated().any() or not days.is_monotonic_increasing:
+        raise ValueError("Daily dates must be valid, unique and strictly increasing")
+    numeric = df[required[1:]].apply(pd.to_numeric, errors="coerce")
+    if not np.isfinite(numeric.to_numpy(dtype=float)).all():
+        raise ValueError("OHLCV values must be finite numbers")
+    if (numeric[["open", "high", "low", "close"]] <= 0).any().any():
+        raise ValueError("OHLC prices must be positive")
+    if (numeric["volume"] < 0).any():
+        raise ValueError("Volume must be nonnegative")
+    if ((numeric["high"] < numeric[["open", "close", "low"]].max(axis=1)).any()
+            or (numeric["low"] > numeric[["open", "close"]].min(axis=1)).any()):
+        raise ValueError("OHLC high/low must enclose open and close")
+    df[required[1:]] = numeric
+    df["date"] = days.dt.strftime("%Y-%m-%d")
+    return df
 
 
 def load_data(ticker, start, source):
-    """加载日线 OHLCV。source: stooq(默认,港美+多市场) / akshare(A股) / yahoo。"""
+    """加载并校验日线 OHLCV；数据源错误向调用方传播。"""
+    if source not in ("stooq", "synth", "yahoo", "sina", "akshare"):
+        raise ValueError(f"Unsupported data source: {source}")
     if source == "stooq":
         import pandas as pd
         symbol = ticker.lower().replace("-", ".")
@@ -33,7 +64,7 @@ def load_data(ticker, start, source):
         df = df.rename(columns={"Date": "date", "Open": "open", "High": "high",
                                 "Low": "low", "Close": "close", "Volume": "volume"})
         df["date"] = df["date"].astype(str)
-        return df[["date", "open", "high", "low", "close", "volume"]].dropna()
+        return validate_data(df)
     if source == "synth":
         import pandas as pd, numpy as np
         n = 300
@@ -42,16 +73,21 @@ def load_data(ticker, start, source):
         close = 100 * np.cumprod(1 + rets)
         open_ = np.roll(close, 1); open_[0] = 100
         dates = pd.date_range("2024-01-01", periods=n, freq="B")
-        return pd.DataFrame({"date": dates.strftime("%Y-%m-%d"),
-                             "open": open_, "high": close * 1.01, "low": close * 0.99,
-                             "close": close, "volume": 1e6}).round(4)
+        return validate_data(pd.DataFrame({
+            "date": dates.strftime("%Y-%m-%d"), "open": open_,
+            "high": np.maximum(open_, close) * 1.01,
+            "low": np.minimum(open_, close) * 0.99,
+            "close": close, "volume": 1e6,
+        }).round(4))
     if source == "yahoo":
         import yfinance as yf
         df = yf.download(ticker, start=start, progress=False, auto_adjust=True)
+        if df.columns.nlevels > 1:
+            df.columns = df.columns.get_level_values(0)
         df = df.reset_index()
         df = df.rename(columns={"Date": "date", "Open": "open", "High": "high",
                                 "Low": "low", "Close": "close", "Volume": "volume"})
-        return df[["date", "open", "high", "low", "close", "volume"]].dropna()
+        return validate_data(df)
     import akshare as ak
     code = ticker.split(".")[0]
     if source == "sina":
@@ -61,13 +97,13 @@ def load_data(ticker, start, source):
         df = df.rename(columns={"date": "date", "open": "open", "high": "high",
                                 "low": "low", "close": "close", "volume": "volume"})
         df["date"] = df["date"].astype(str)
-        return df[["date", "open", "high", "low", "close", "volume"]].dropna()
+        return validate_data(df)
     df = ak.stock_zh_a_hist(symbol=code, period="daily",
                             start_date=start.replace("-", ""), adjust="qfq")
     df = df.rename(columns={"日期": "date", "开盘": "open", "最高": "high",
                             "最低": "low", "收盘": "close", "成交量": "volume"})
     df["date"] = df["date"].astype(str)
-    return df[["date", "open", "high", "low", "close", "volume"]]
+    return validate_data(df)
 
 
 def ma(series, n):
@@ -100,46 +136,62 @@ def rsi_signal(df, buy, sell):
 
 
 def run(df, signal_fn):
-    """单标的多头回测（A股 T+0 简化，纯信号驱动）。"""
+    """Long-only daily simulation: previous-bar signals fill at the next open.
+
+    Buy whole lots with costs included, enforce T+1, and mark remaining holdings
+    to the last close without inventing an end-of-test liquidation.
+    """
+    import pandas as pd
+
+    df = validate_data(df)
     sig = signal_fn(df)
-    trades, eq = [], []
+    if (not isinstance(sig, pd.Series) or len(sig) != len(df)
+            or not sig.index.equals(df.index) or not sig.isin([-1, 0, 1]).all()):
+        raise ValueError("Signals must align with data and contain only -1, 0, 1")
+    trades = []
     pos = 0
     cash = 1_000_000.0
-    entry_price = 0.0
+    entry_cost = 0.0
     entry_date = None
     equity_curve = []
 
     for i in range(len(df)):
-        price = float(df["close"].iloc[i])
+        price = float(df["open"].iloc[i])
+        close = float(df["close"].iloc[i])
         date = str(df["date"].iloc[i])
-        s = int(sig.iloc[i])
+        s = int(sig.iloc[i - 1]) if i else 0
+        signal_date = str(df["date"].iloc[i - 1]) if i else None
 
         if s == 1 and pos == 0:
-            lots = math.floor(cash / (price * 100))  # A股整手
+            lots = math.floor(cash / (price * 100 * (1 + COMMISSION + SLIPPAGE)))
             if lots > 0:
                 cost = price * 100 * lots
                 fee = cost * (COMMISSION + SLIPPAGE)
                 cash -= cost + fee
                 pos = lots * 100
-                entry_price = price
+                entry_cost = cost + fee
                 entry_date = date
                 trades.append({"type": "buy", "date": date, "price": price,
+                               "signal_date": signal_date, "status": "open",
+                               "execution_source": EXECUTION_SOURCE,
                                "shares": pos, "fee": round(fee, 2)})
-        elif s == -1 and pos > 0:
+        elif s == -1 and pos > 0 and date > entry_date:
             proceeds = price * pos
             fee = proceeds * (COMMISSION + STAMP_TAX + SLIPPAGE)
             cash += proceeds - fee
-            ret = (price - entry_price) / entry_price
+            ret = (proceeds - fee) / entry_cost - 1
+            trades[-1]["status"] = "closed"
             trades.append({"type": "sell", "date": date, "price": price,
+                           "signal_date": signal_date, "execution_source": EXECUTION_SOURCE,
                            "shares": pos, "fee": round(fee, 2), "return": round(ret, 4),
-                           "hold_days": None})
+                           "hold_days": (pd.Timestamp(date) - pd.Timestamp(entry_date)).days})
             pos = 0
-            entry_price = 0.0
+            entry_cost = 0.0
 
-        mv = cash + pos * price
+        mv = cash + pos * close
         equity_curve.append(mv)
 
-    # 期末平仓
+    # Mark to market only: an open buy remains explicitly open in the trade log.
     final = cash + pos * float(df["close"].iloc[-1])
     equity_curve[-1] = final
 
@@ -191,6 +243,16 @@ def main():
 
     out = {
         "ticker": args.ticker, "strategy": label, "source": args.source,
+        "execution_source": EXECUTION_SOURCE,
+        "execution_timing": "previous_bar_next_open",
+        "end_position_policy": "mark_to_market_no_liquidation",
+        "open_positions": [
+            {**trade, "ticker": args.ticker,
+             "mark_price": float(df["close"].iloc[-1]),
+             "mark_date": str(df["date"].iloc[-1]),
+             "market_value": round(trade["shares"] * float(df["close"].iloc[-1]), 2)}
+            for trade in trades if trade.get("status") == "open"
+        ],
         "bars": len(df),
         "summary": {**metrics(eq),
                     "trades": len(sells),

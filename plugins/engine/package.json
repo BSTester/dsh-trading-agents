@@ -1,14 +1,22 @@
 {
   "name": "@bstester/dsh-trading-engine",
-  "description": "Deterministic TradingAgents investment-research engine for DeepSeek Harness: run_trading_analysis tool driving the 12-role pipeline with direct llm calls and append-only decision memory",
-  "version": "0.2.0",
+  "description": "Harness-owned research workflow, publishing, quant previews and account-mode policy",
+  "version": "0.3.1",
   "type": "module",
   "main": "src/index.js",
   "files": [
     "src",
-    "python"
+    "python/*.py"
   ],
-  "dependencies": {
+  "peerDependencies": {
+    "@deepseek-ai/dsh-tools": "^0.1.2-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh-tools": {
+      "optional": true
+    }
+  },
+  "devDependencies": {
     "@deepseek-ai/dsh-tools": "0.1.2-rc.1"
   },
   "license": "MIT"

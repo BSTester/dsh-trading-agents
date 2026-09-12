@@ -21,7 +21,7 @@ const pkgRoot = path.dirname(fileURLToPath(new URL(".", import.meta.url)));
 
 function venvPython() {
   return path.join(
-    os.homedir(), ".dsh", "trading-venv",
+    process.env.DSH_HOME || path.join(os.homedir(), ".dsh"), "trading-venv",
     process.platform === "win32" ? "Scripts\\python.exe" : "bin/python",
   );
 }

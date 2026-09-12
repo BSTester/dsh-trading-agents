@@ -4,7 +4,7 @@
 #   1. 数据与交易能力 —— 官方 dsh-mcp-client 桥接富途远程 MCP（免 OpenD），
 #      工具以 mcp__futu__* 形式出现；未配置 token 时其余能力照常可用。
 #   2. 工作流知识 —— skills/trading-agents/SKILL.md 教模型按 TradingAgents
-#      六角色流水线执行投研（分析师 → 多空辩论 → 裁决 → 交易提案 → 风控辩论 → 终审）。
+#      十二角色、六阶段执行投研（分析师 → 多空辩论 → 裁决 → 交易提案 → 风控辩论 → 终审）。
 #   3. 记忆 —— 决策日志落在工作区 .tradingagents/memory.md，下次分析同标的时注入。
 
 # ── persona ────────────────────────────────────────────────────────────────
@@ -12,7 +12,7 @@
 - id: persona
   name: '@deepseek-ai/dsh-persona'
   config:
-    text: |-
+    prefix: |-
       You are 交易智囊 (Trading Agents), a twelve-role investment research assistant powered by the {{model}} model, running on the DeepSeek Harness. Working directory: {{cwd}}.
 
       You operate a TradingAgents-style pipeline: analysts → bull/bear debate → research manager → trader → risk debate → portfolio manager. The `trading-agents` skill defines the full workflow; load it with the skill tool before running any analysis.
@@ -22,6 +22,10 @@
       - Always label uncertainty and data timestamps. Analysis is research, not investment advice; say so in the final output.
       - Trading actions default to simulation. A real (live) order requires the user's explicit confirmation of the full order summary, twice, before any call. Never place a live order without that confirmation.
       - Persist every final decision to .tradingagents/memory.md in the workspace, and read past lessons for the same ticker before concluding a new analysis.
+      - Harness is the only conversation and instruction entry. The trading workbench displays reports, observed broker responses and quant previews; it has no chat or order-entry controls.
+      - When run_trading_analysis is available, call it to start a research record, then perform the trading-agents skill workflow with Harness tools and subagents. It does not generate a report for you. Publish the completed, sourced report with research_publish using the returned run id.
+      - Read trading_status before account operations. Only the user may enable live mode in the workbench. Switching mode does not authorize an order. Never bypass the native tool policy by invoking broker endpoints through shell or HTTP.
+      - Quant previews and local simulation ledgers are not broker positions or fills. For current broker state, use the matching Futu account query tools in this Harness conversation.
     complete: false
 
 - id: agent-instructions
@@ -106,12 +110,12 @@
     modelSelectionSettings: true
     backgroundMode: continuable
 
-# ── 投研确定性引擎（run_trading_analysis 工具，v2） ──────────────────────────
+# ── Harness 投研记录、发布、量化预览及账户策略 ─────────────────────────────
 # 安装器装包后自动启用。
 
 - id: trading-engine
   name: '@bstester/dsh-trading-engine'
-  disabled: true
+  disabled: false
 
 # ── 统一金融数据插件（fin_news/fin_sentiment 原生工具） ──────────────────────
 # 需先安装包：install.sh 会自动执行
@@ -120,7 +124,7 @@
 
 - id: fin-data
   name: '@bstester/dsh-fin-data'
-  disabled: true
+  disabled: false
 
 # ── 富途远程 MCP（数据与交易能力） ──────────────────────────────────────────
 # 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README）。
@@ -135,6 +139,6 @@
     headers:
       # token 优先读 ~/.dsh/futu-token（scripts/futu_auth.py 授权后写入），
       # 其次回退环境变量 FUTU_MCP_TOKEN；路径用 os.homedir() 兼容 Windows
-      Authorization: !!js "(() => { try { const om = process.getBuiltinModule('node:os'); const fs = process.getBuiltinModule('node:fs'); const t = fs.readFileSync(om.homedir() + '/.dsh/futu-token', 'utf8').trim(); if (t) return 'Bearer ' + t; } catch (e) {} return 'Bearer ' + (process.env.FUTU_MCP_TOKEN ?? ''); })()"
+      Authorization: !!js "(() => { try { const om = process.getBuiltinModule('node:os'); const fs = process.getBuiltinModule('node:fs'); const home = process.env.DSH_HOME || om.homedir() + '/.dsh'; const t = fs.readFileSync(home + '/futu-token', 'utf8').trim(); if (t) return 'Bearer ' + t; } catch (e) { if (e.code !== 'ENOENT') throw e; } return 'Bearer ' + (process.env.FUTU_MCP_TOKEN ?? ''); })()"
     failOnStartupError: false
     toolCallTimeoutMs: 60000

@@ -1,104 +1,130 @@
 # 交接与复审文档
 
-> 本文档供接手人或复审者快速建立全局认知：做了什么、验证到什么程度、哪些未验证、
-> 有哪些坑、下一步怎么走。所有结论以仓库代码与实测记录为准。
+## 一、目标与不可改变的边界
 
-## 一、项目概述
+本项目是 **DeepSeek Harness 的新对话模式 + 原生插件**：
 
-在 DeepSeek Harness 上构建「金融分析交易工作台」，目标 = **投研出建议**（TradingAgents
-十二角色流水线）+ **短期量化交易能力**（信号→回测→模拟盘闭环→实盘），并以
-**模拟盘/实盘互斥开关**隔离账户。
+- Harness 负责全部 AI 对话、投研/量化指令、交易指令和逐笔人工确认。
+- 工作台嵌在 Harness 中，展示研报、最近交易响应、量化预览，并提供 sim/live 切换。
+- 不另建聊天入口，不在工作台提供下单、撤单或任意工具执行接口。
+- 模式切换不授权交易；本地模拟台账不代表富途模拟账户或真实账户。
 
-- 仓库：https://github.com/BSTester/dsh-trading-agents （public）
-- 形态：一个 agent preset（对话模式）+ 多个 DSH 插件包 + 一组 Python 脚本
-- 交付原则：DSH 原生机制（插件包 + preset 组合 + MCP 桥 + 子代理），不硬编码不绕路
+框架目标是投研与量化交易能力，但当前不能描述为“只差重启/用户确认就能实盘”。
+详细组件、数据协议、权限边界见 [architecture.md](architecture.md)。
 
-## 二、已实现内容
+## 二、本轮框架调整
 
-### 2.1 对话模式（preset，仓库根目录）
-
-| 文件 | 内容 |
+| 部分 | 当前实现 |
 |---|---|
-| `agent.cordis.yml` | 组合：persona + 持久shell双栈 + fs/web/技能 + 子代理 + 富途MCP桥 + fin-data行 + trading-engine行（两行默认 disabled，安装器装包后启用） |
-| `preset.yml` | 模式元数据 |
-| `skills/trading-agents/SKILL.md` | v1 工作流：12角色6阶段、各角色官方提示词核心、五类数据渠道、持仓/交易频率感知、交易员七组因素清单、模拟/实盘开关、记忆闭环 |
+| preset / skill | 明确 Harness 单入口、12 角色 6 阶段、发布步骤与模式边界 |
+| 研究引擎 | 不再私建无取数能力的 LLM 循环；`run_trading_analysis` 启动记录，Harness 完成研究，`research_publish` 发布 |
+| 发布约束 | 校验 run、会话、标的、当前模式、五档评级、报告与带时间的来源；不猜测评级 |
+| 工作台 Host | 根级 `tradingWorkbench` 服务，持久报告/预览/响应；认证后的 Harness Connection RPC |
+| 工作台 Client | 正确的 Host/Client 双入口、宿主 React module factory；结果卡片与面板，不需重建 Harness Web |
+| 交易动态 | 观察原生账户工具最终响应；打开面板时每 3 秒刷新快照；不伪装券商成交推送 |
+| 模式切换 | 用户在面板明确确认 live，携带预期旧模式；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |
+| 执行策略 | 账户工具按 sim/live 拒绝不匹配调用；真实写工具经 Harness 原生审批；不允许模型走其他通道绕过 |
+| 量化 | 修正风险/成本/成交时序；本地模拟与券商数据分离，失败不能回退为零价格或虚构资产 |
+| 安装 | Bash/PowerShell 共用插件安装流程，包路径、失败退出、幂等启用与更新行为可重复核对 |
 
-### 2.2 插件包（plugins/）
+工作台通过包内 `dsh.bundle.patch` 加载一次根级 Host；安装普通插件包不会自动启用 Host。
+fin-data/engine 只在 preset 中启用。安装器保留内容寻址的 tarball 供 pnpm 后续更新，
+不初始化、不重置账户模式，也不自动修复非法模式文件。
 
-| 包 | 工具/能力 | 验证状态 |
-|---|---|---|
-| `@bstester/dsh-fin-data` | `fin_news`（富途快讯→AKShare→Yahoo RSS 路由降级）、`fin_sentiment`（X CDP + A股千股千评） | ✅ 脚本三市场实测；插件注册形状经沙箱验证 |
-| `@bstester/dsh-trading-engine` | `run_trading_analysis`（12角色直调llm+记忆）、`quant_signal`/`quant_backtest`/`quant_report`/`quant_switch` | ✅ 回测/信号/台账脚本实测；llm 直调待重启验证 |
-| `@bstester/dsh-trading-workbench` | Client 投研结果卡片（`tool.call.toolview`） | ⚠️ 待 dev:web 构建+重启 |
-| `plugins/quant` | `backtest.py`（策略+成本+绩效）、`engine.py`（信号→风控→下单意图→台账） | ✅ 真实A股数据全流程实测 |
+**行为变化**：`run_trading_analysis` 不再一次返回完整报告，它返回待执行的研究记录。
+调用方必须继续 skill 流程并 `research_publish`；工作台不会自动运行 LLM。
+`trade_mode.py live` 不再可用；实盘模式由工作台的用户确认入口启用。
 
-### 2.3 脚本（scripts/）
+## 三、版本与运行依赖
 
-| 文件 | 功能 | 验证 |
-|---|---|---|
-| `futu_auth.py` | 富途 OAuth 全自动（动态注册+PKCE+本地回调+自动关窗+`--refresh`续期） | ✅ 真实授权成功、token 落盘 |
-| `trade_mode.py` | 模拟盘/实盘互斥开关（`~/.dsh/trading-account-mode`） | ✅ 切换/隔离实测 |
-| `install.sh` / `install.ps1` | 一键安装：克隆+venv+依赖+授权+插件安装+启用行 | ✅ install.sh 端到端实测 |
+- 工具接口：`@deepseek-ai/dsh-tools@0.1.2-rc.1`。
+- API 参考：官方 Harness 源码 `c291e7961a515f6d7af9304e7fd1d257929aef26`，
+  使用 `ctx.tools.guard`、`tools/pre-execute`、`tools/execute`、`tools/result`、
+  Connection RPC、客户端 `./client` 和 `window.__ModuleLoader__.load`。
+- 数据根目录：`DSH_HOME`，默认 `~/.dsh`；前后端不传输 OAuth token。
+- 模式文件持久化，**重启不会自动回到模拟盘**。
+- `plugins/trading-agents` 为未启用旧脚手架；当前工具实现位于 `plugins/engine`。
 
-### 2.4 文档
+## 四、验证分层
 
-- `README.md`：安装/授权/开关/实盘入口
-- `docs/architecture.md`：架构与路线图
-- `docs/P4-live-trading.md`：实盘操作手册（小额/风控/逐字确认流）
+仓库提供可重复的本地测试，而不是依赖上一会话的口头“已跑通”结论：
 
-## 三、关键实测结论（数据源）
+```bash
+# 安装 engine 的开发/运行依赖后
+npm install --prefix plugins/engine --ignore-scripts
+node --test tests/*.test.mjs
 
-| 源 | 结论 |
+# 使用已安装 pandas/numpy 的量化 Python 环境
+python -B -m unittest discover -s tests -p 'test_*.py' -v
+```
+
+Node 用内置测试运行器，包括真实 Cordis + 钉版工具服务组合、账户守卫与结果事件、
+工作台持久状态和模式切换、客户端入口及 RPC 白名单。
+Python 用标准库 unittest，行情与账户使用隔离样本/临时目录，不发真实交易请求。
+
+本轮本地基线：17 项 Node、52 项 Python 用例通过，覆盖包内根级 patch、模拟台账提交与
+模式锁的串行化、安装失败及模式文件不变性。Bash 语法检查通过；当前环境未运行
+PowerShell 安装器，也未启动完整 Harness Web。后续券商模拟订单实测见下节。
+
+本地合约成立不等于完整部署验收。仍需在目标 Harness 版本、实际操作系统和新会话中
+确认 preset 发现、插件加载、原生审批、客户端加载及真实数据接口行为。
+
+### 2026-09-12：富途模拟账户实测
+
+使用本机已安装的 Harness `0.1.2-rc.1`，通过 headless profile、原生
+`dsh-mcp-client` 和 ToolRuntime 加载本项目 engine/workbench，额外限制为模拟账户及
+明确列出的查询工具。没有绕过 Harness 直接调用交易 HTTP，也没有调用实盘工具。
+本机 CLI 不在 PATH；实际入口为
+`~/.dsh/profiles/node_modules/@deepseek-ai/dsh/lib/bin.js`。
+
+| 项目 | 实测结果 |
 |---|---|
-| 富途 MCP 91 工具 | ✅ 鉴权/快照/财务/交易工具正常；**K线类工具**（history/cur_kline）裸 HTTP 返回 internal error（所有符号格式+完整握手均失败），需用 dsh-mcp-client 完整 SDK 复核是否我端问题 |
-| 富途公开快讯 `ai-news-search.moomoo.com` | ✅ 免鉴权，三市场新闻可用 |
-| AKShare（sina 源） | ✅ A股真实日线（回测已用）；东财源日线限流 |
-| AKShare 新闻/千股千评 | ✅ 可用 |
-| X（CDP 复用登录态） | ✅ 登录一次持久复用，真实推文实测 |
-| Yahoo RSS | ✅ 港美股新闻可用；**yfinance 后端本机不可达** |
-| Stooq | ❌ 已上 JS 验证 |
+| OAuth | 原凭据下账户和行情均报 `-32603 internal error`；用现有 refresh 凭据续期后，同一工具与参数恢复成功，没有扩大授权 |
+| 账户与基线 | 获取模拟账户列表、港股模拟资金、持仓、历史订单及腾讯行情和整手数量 |
+| 下单 | 两笔腾讯 `00700`、100 股、400 港元限价模拟买单均获得券商订单 ID，并查到 `status=2`、`cum_qty=0` |
+| 改单 | 仅传 `new_price` 返回业务错误且原价不变；另一笔同时传 `new_price=399`、`new_qty=100` 成功，查询确认新价 |
+| 撤单与恢复 | 两笔均查到 `status=5`、`cum_qty=0`；冻结资金为零，现金/购买力与持仓恢复到实测前状态 |
+| 收尾 | 模式保持 sim、在途调用为零；未留下测试挂单，原有持仓未变 |
 
-## 四、关键技术决策与坑（复审重点）
+这证明了券商模拟账户的查询、订单受理、改单、撤单及资金释放链路，
+**不证明成交、部分成交、卖出回补、自动对账或完整 Web 对话已完成验收**。
+实测日为周六，未通过追价或市价单强行制造成交。原始响应保留在本次会话的本地证据中，
+不将账户标识、资金明细或凭据写入仓库。
 
-1. **工具注册配方**：`defineTool` + `dsh-tools` 钉版 `0.1.2-rc.1`（`*` 会拉不兼容新版）；parameters 用短形式、output.schema 必须显式 `additionalProperties`。
-2. **tarball 安装**：pnpm 对 file: 依赖软链导致依赖解析失败，且按版本号缓存包内容——改代码必须升版本号 + `npm pack` + `dsh plugin --profile web add <tgz>`。
-3. **loader 模块缓存**：进程内按包名缓存首版模块，改代码后**必须重启 harness** 才能生效（本会话内无法自证插件的最终状态，这是最大未验证点）。
-4. **`!!js` 表达式**：loader 的 YAML 方言要求反引号表达式加引号（`!!js '...'`）。
-5. **preset 行默认 disabled**：插件未安装时 disabled 行不解析不报错；安装器装包后用 sed 启用。
+实测还发现：持仓接口虽将 `market` 标为可选，港股账户省略时返回 `ret_code=-5`，
+显式传 `market=1` 后成功；市场编号必须取实际账户响应，不能照抄静态示例。
+部分业务失败的 MCP 外层仍是 `isError=false`，必须检查文本 JSON 的 `ret_code`。
 
-## 五、未验证项（诚实清单）
+## 五、尚未完成的能力
 
-- [ ] 三个插件（fin-data/engine/workbench）在**重启后的真实会话**里的工具可见性；
-- [ ] Client UI 卡片经 `dev:web` 构建后的渲染；
-- [ ] `run_trading_analysis` 的 llm 直调端到端（依赖上述重启）；
-- [ ] 富途 K线工具在 dsh-mcp-client 完整 SDK 下的真实行为（可能修好回测的数据源）；
-- [ ] 实盘真实下单（需用户决策，非代码问题）。
+| 缺口 | 必须如何描述 |
+|---|---|
+| 富途 K 线历史数据问题 | 之前的裸 HTTP internal error 是历史记录；不能认定重启或完整 SDK 必然修复 |
+| 富途模拟盘订单生命周期 | 查询、受理、改单、撤单和资金释放已实测；成交/部分成交、断线后订单去重与自动对账仍需完善 |
+| 业务错误归一化 | `ret_code != 0` 可能包在 `isError=false` 内；工作台当前错误标记只跟随工具外层状态，不能把无错误标记视为业务成功 |
+| 授权续期 | 本轮显式续期恢复调用，尚无插件级自动续期；`internal error` 不能一概断定为网络或 token 问题 |
+| 实时交易推送 | 面板刷新已有工具响应，不自动查询券商，也未建立成交订阅 |
+| 多市场量化 | 首期为 A 股日线，港美历史数据、费用和交易规则需要独立完善 |
+| 生产级风控 | 本地风险公式/止损意图不等于券商托管止损、日内熔断、组合风险与紧急停机 |
+| 自动运行 | 没有生产级定时调度、监控告警、无人值守交易服务 |
+| 记忆复盘 | 旧工作区 memory 由 Harness skill 维护；工作台旧研报不自动变为复盘教训，不自动迁移旧全局 memory |
+| 审计保留 | 工作台各列表保留最近 100 项，不是完整审计档案；完整过程留在 Harness 会话 |
 
-## 六、下一份计划（供复审选择优先级）
+## 六、下一阶段优先级
 
-| 方向 | 内容 | 依赖 |
-|---|---|---|
-| **A. 收尾验收**（建议先做） | 重启 harness → `./install.sh` → 逐一验证三插件工具 + 投研端到端 | 重启 |
-| **B. 富途 K线排障** | 用会话内 MCP 工具验证 history_kline；若可用则回测接入富途源（港/美历史数据） | A |
-| **C. 回测深化** | 多策略、参数优化、样本外验证、HK/US 数据、防过拟合 | B |
-| **D. P5 可视化面板** | workbench 加 host RPC（`quant_report` shell）+ overlay Dashboard | A |
-| **E. 生产化** | timer 定时调度信号、监控告警、订单/日志审计、指标持久化 | A |
-| **F. P4 实盘启动** | 按 `docs/P4-live-trading.md`，用户决策小额试水 | A |
+1. 在目标 Harness 上完成完整安装与新会话端到端验收，明确版本与平台。
+2. 核对真实行情来源、时间、交易日历和回测假设，修复富途 K 线入口。
+3. 补齐业务错误归一化与授权续期，再于交易时段完成模拟成交、部分成交和自动对账。
+4. 完成告警、审计、日内熔断、账户/订单级限额和恢复流程。
+5. 策略做样本外/滚动评估，再由用户决定是否小额实盘。
 
-**建议顺序**：A → B → C（量化可信度）→ F（实盘）→ D/E（体验与运维）。
+工作台图表与体验可以逐步增强，但不能排在实盘之后才补交易状态与风控基础。
 
-## 七、复审清单（reviewer 逐项）
+## 七、接手操作注意
 
-1. `agent.cordis.yml`：两个 disabled 行的启用逻辑是否安全（安装器 sed 是否会误伤）；
-2. `futu_auth.py`：OAuth 流程与 token 文件权限（600）是否合规；
-3. `engine/src/index.js`：llm 调用参数（provider/model/messages 形状）是否正确；
-4. `backtest.py`：成本建模、T+1/整手、未来函数是否有漏洞；
-5. 风控参数默认值（单笔 1%、ATR 2×、最大持仓 5）是否合理；
-6. 实盘手册的确认流是否有可绕过的路径。
-
-## 八、交接事项
-
-- 本机已授权富途 token（`~/.dsh/futu-token`），refresh_token 可续期；
-- 本机 trading-venv 已装 akshare/playwright/yfinance；X 登录态在 `~/.dsh/x-profile`；
-- 当前账户模式 = sim（安全默认）；
-- 所有未验证项集中在「重启 harness 后一次性验收」。
+- 不读出或复制本机 token、refresh token、浏览器登录态。
+- 不以 token 文件存在断言授权有效；缺工具还可能是加载、网络或权限问题。
+- 不重新执行真实下单来“验证链路”，除非用户明确授权具体订单。
+- 有残留写锁/调用租约时，先确认进程已停止并核对券商状态，再清理具体文件；
+  未知在途状态不得自动清除。
+- 安装后的新会话必须检查能力，不能把旧会话缓存状态当当前源码表现。

@@ -1,0 +1,3 @@
+- insert:
+    - id: trading-workbench
+      name: '@bstester/dsh-trading-workbench'

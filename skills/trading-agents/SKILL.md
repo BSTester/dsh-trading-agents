@@ -16,13 +16,22 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
 
 分析师阶段每位分析师带工具循环（取数→写报告），辩论阶段辩手看得到完整辩论记录和对方最新发言。
 
+## Harness 与工作台的职责
+
+- **唯一指令入口是 Harness**。取数、子代理研究、复盘、下单与撤单都在当前对话中进行；不创建独立聊天、交易表单或绕过 MCP 的 HTTP/脚本下单路径。
+- 完整安装后，先调用 `run_trading_analysis(ticker)` 取得研究记录 `id`。该工具仅启动记录，不调用私有 LLM、不替你取数或完成分析。保留 `id`，继续执行下面的完整流程。
+- 完成终审后调用 `research_publish(run_id, ticker, rating, report, sources)`。`sources` 至少一项，每项含 `name`、`as_of`（数据时间）和 `reference`（URL 或 Harness 工具记录）。没有可靠数据时不得编造报告或用默认 Hold 掩盖失败。
+- `trading_status` 返回工作台快照；`quant_signal`、`quant_backtest`、`quant_report` 的结果自动保存为量化预览，均不下单。本地模拟台账不是富途模拟账户。
+- 工作台仅展示研报、最近的账户工具响应、量化预览和账户模式切换。动态来自 Harness 工具调用，不代表已经订阅券商成交推送。
+- 文中的默认数据根目录为 `~/.dsh`；配置了 `DSH_HOME` 时以它为准。无插件时仍可执行基础 skill 流程，但不宣称有工作台或代码级账户守卫。
+
 ## 阶段 0 · 准备
 
 1. 确定标的代码与市场（如 `00700.HK`、`AAPL.US`）。用户没给代码时先问，不要猜。
 2. 确定分析日期（默认今天）与持有视角（短线/中线，默认中线）。
 3. **富途授权检查（首次运行必须做）**：检查工具列表里是否有 `mcp__futu__` 前缀的工具。
    - 有 → 直接使用，数据注明来源与时间。
-   - 没有 → 这是 OAuth 授权问题，**直接帮用户发起授权**（不要只让用户去看文档）：
+   - 没有 → 可能未授权、token 过期、MCP 启动失败或插件未加载。先区分原因，用户愿意授权时使用向导：
      a. 运行仓库自带脚本（跨平台 Python，Linux/macOS/Windows 通用）：
         `python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py"`
         （Windows 路径：`%USERPROFILE%\.dsh\.agent-presets\dsh-trading-agents\scripts\futu_auth.py`）
@@ -34,13 +43,9 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
         是否出现了 mcp__futu__ 前缀的工具（可能需要几秒）；已出现则直接
         继续正常分析；仍未出现（少数环境）再提示用户新建会话。
    - 授权方式只有这一种（OAuth，脚本全自动），没有其他授权兜底，也不需要。
-   - **特殊情形：token 文件已存在（~/.dsh/futu-token）但本会话没有 mcp__futu__ 工具**
-     → 说明本会话创建于授权之前、客户端重试已耗尽，**会话内无法恢复，直接明确告知用户：
-     "富途 token 已就绪，请新建一个会话（选本模式），工具即可用"，并结束本次流程**。
-     不要让用户重新授权（token 是好的），也不要反复 touch 重试（实测无效）。
-     顺手可帮用户跑一次续期保证 token 新鲜：
+   - **token 文件存在但没有工具**：文件存在不能证明 token 有效。检查加载错误；需要时续期：
      `python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py" --refresh`
-     （新会话将持有新 token；正常情况下用户在安装阶段就已完成授权，不会遇到此情形。）
+     刷新后仍无工具时提示重建会话或重启 Harness；用户不愿排障时继续公开数据降级，不保证重启一定解决。
    - **用户不想现在授权** → **继续降级分析**：用 web 搜索/AKShare/Yahoo 获取公开数据，
      并在报告中标注"数据源：公开网络，非实时行情"。
    - 不要在未提示的情况下默默降级；也不要因为缺工具而拒绝分析。
@@ -49,8 +54,8 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
    `python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py"` 读取当前账户模式。
    - 输出 `sim` → 本次只使用模拟盘工具（`sim_trade_*`），**绝不**触碰真实账户工具；
    - 输出 `live` → 本次只使用真实账户工具（`account_*` / `trading_*`），**绝不**触碰模拟盘工具。
-   两种账户类型永不并存操作；切换需用户明确要求（切 live 必须用户确认后才执行
-   `... trade_mode.py live`）。然后按模式取当前持仓与可用资金，重点记录：是否已持有
+   两种账户类型永不并存操作；切 live 必须由用户在工作台输入「确认实盘」，模型不得用
+   脚本替代确认。切回 sim 可用 `quant_switch(mode="sim")`。然后按模式取当前持仓与可用资金，重点记录：是否已持有
    该标的及占比、成本价、账户集中度、剩余可用资金。查不到时在提案中注明"未考虑现有持仓"。
 6. **交易频率检查（有富途工具时必做）**：按第 5 步确定的账户模式，取该标的近期订单与成交记录
    （live：`account_orders_history`/成交记录；sim：`sim_trade_history_order_list`），
@@ -170,6 +175,10 @@ description: TradingAgents 多角色投研流水线——按分析师、多空�
 
 ## 阶段 7 · 记忆落盘（必须执行）
 
+完整插件模式下先调用 `research_publish` 发布报告到工作台。`run_trading_analysis` 返回的
+`previous_reports` 可补充历史上下文；它们是旧研报，不是经过结果检验的反思。
+下述工作区记忆继续用于复盘，不将 pending 论点当作已验证教训。
+
 把最终评级与核心论点以 pending 条目追加写入 `.tradingagents/memory.md`：
 
 ```
@@ -191,8 +200,9 @@ DECISION: <一句话论点>
 2. **读取账户模式开关**：`python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py"`。
    - `sim` → 只用模拟盘工具（`sim_trade_input_order` 等），拒绝任何真实账户操作；
    - `live` → 只用真实账户工具（`trading_order_place` 等），拒绝任何模拟盘操作；
-   - 两个账户类型永不并存操作。用户要求切换时：sim↔live 都要先运行 `trade_mode.py <目标模式>` 写盘，再按新模式操作；**切 live 前必须获得用户明确肯定**。
+   - 两个账户类型永不并存操作。切 live 由用户在工作台完成；切 sim 用 `quant_switch`。每次重新读取权威模式，不依赖对话里上一次模式。账户调用进行中不能切换。
 3. 展示完整订单摘要（账户类型=当前模式、标的、方向、数量、价格、有效期）。
 4. **必须**获得用户明确肯定回复后才可调用下单工具；模拟盘下单一次确认即可，
    真实盘额外遵守工具返回的 `need_order_confirm` 系统级二次确认。
 5. 真实盘下单前，无论用户之前说过什么，都要再次逐字复述订单并要求确认。
+6. 代码级守卫会拒绝与模式不符的账户工具，真实写操作还要经过 Harness 原生审批；不要通过 shell、私有 HTTP 或其他工具绕过。收到超时、拒单或未知状态时先查订单，不盲目重试下单。
