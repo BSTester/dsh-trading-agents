@@ -68,6 +68,54 @@ def debug_port_alive():
         return False
 
 
+def clear_stale_profile_locks():
+    """清理被强杀实例残留的 Singleton* 锁。
+
+    Chromium 被 SIGKILL 后会留下 SingletonLock，新实例据此判定 profile 仍被占用
+    而直接退出 —— 表现为“调试端口启动失败”。这里只在锁指向的进程已死时清理。
+    """
+    import re
+    for name in ("SingletonLock", "SingletonSocket", "SingletonCookie"):
+        path = os.path.join(PROFILE_DIR, name)
+        try:
+            if os.path.islink(path):
+                match = re.search(r"-(\d+)$", os.readlink(path))
+                pid = int(match.group(1)) if match else None
+                if pid is not None:
+                    try:
+                        os.kill(pid, 0)
+                        continue  # 持有者仍活着，不动
+                    except OSError:
+                        pass
+                os.unlink(path)
+            elif os.path.exists(path):
+                os.unlink(path)
+        except OSError:
+            pass
+
+
+def terminate_pid(pid):
+    """先 SIGTERM 优雅退出（会释放锁），超时再 SIGKILL，避免留下陈旧锁。"""
+    if sys.platform == "win32":
+        subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"], capture_output=True)
+        return
+    import signal
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except (ProcessLookupError, PermissionError):
+        return
+    for _ in range(6):
+        time.sleep(0.5)
+        try:
+            os.kill(pid, 0)
+        except OSError:
+            return
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError):
+        pass
+
+
 def ensure_browser():
     if debug_port_alive():
         return True
@@ -77,6 +125,7 @@ def ensure_browser():
         return False
     # 专属配置目录：不需要关闭日常浏览器窗口
     os.makedirs(PROFILE_DIR, exist_ok=True)
+    clear_stale_profile_locks()
     proc = subprocess.Popen(
         [exe, f"--remote-debugging-port={DEBUG_PORT}",
          f"--user-data-dir={PROFILE_DIR}", "--restore-last-session=false",
@@ -85,11 +134,12 @@ def ensure_browser():
     )
     # 记录 PID：搜索完成后自动关闭该浏览器
     (DSH_HOME / "x-chrome.pid").write_text(str(proc.pid))
-    for _ in range(20):
-        time.sleep(0.5)
+    # 冷启动（VNC/GPU 初始化）可能需要 10~30 秒，耐心轮询，避免误判为占用
+    for _ in range(60):
+        time.sleep(1)
         if debug_port_alive():
             return True
-    print(json.dumps({"error": "浏览器调试端口启动失败（检查端口 9222 是否被占用）"}))
+    print(json.dumps({"error": "浏览器调试端口启动失败（检查端口 9222 是否被占用或浏览器是否可用）"}))
     return False
 
 
@@ -103,8 +153,9 @@ def close_browser_if_we_launched_it():
             subprocess.run(["taskkill", "/PID", str(pid), "/T", "/F"],
                            capture_output=True)
         else:
-            os.kill(pid, 15)
+            terminate_pid(pid)
         pid_file.unlink()
+        clear_stale_profile_locks()
     except (ValueError, ProcessLookupError, OSError):
         pass
 
@@ -123,9 +174,10 @@ def close_by_port_best_effort():
             out = subprocess.run(["fuser", f"{DEBUG_PORT}/tcp"], capture_output=True, text=True).stdout
             for pid in out.split():
                 try:
-                    os.kill(int(pid), signal.SIGKILL)
-                except (ValueError, ProcessLookupError, PermissionError):
+                    terminate_pid(int(pid))
+                except ValueError:
                     pass
+            clear_stale_profile_locks()
     except Exception:
         pass
 
