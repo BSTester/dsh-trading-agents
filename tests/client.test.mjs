@@ -227,3 +227,45 @@ test("条件不满足时不把 provider 的原始报错抖到界面上", async (
   assert.match(source, /IC 需要 3\.\.8 个标的/, "IC 卡片缺友好提示");
   assert.match(source, /需要至少 2 个/, "相关性卡片缺友好提示");
 });
+
+test("Card 的 empty 只能在「确实没有内容」时才给值", async () => {
+  const plugin = await client();
+  const { Card, cardEmpty } = plugin.internals;
+
+  // 加载中 / 出错 / 无数据：三种情况各给各的文案
+  assert.equal(cardEmpty({ loading: true, error: "", count: 0, fallback: "无数据" }), "读取中…");
+  assert.equal(cardEmpty({ loading: false, error: "boom", count: 5, fallback: "无数据" }), "boom");
+  assert.equal(cardEmpty({ loading: false, error: "", count: 0, fallback: "无数据" }), "无数据");
+  // 关键：成功且有数据时必须返回 undefined，否则 Card 会用兜底文案替换掉内容
+  assert.equal(cardEmpty({ loading: false, error: "", count: 6, fallback: "不可用" }), undefined);
+
+  // 行为验证：empty 为 undefined 时渲染 children，为文案时替换掉 children
+  const withData = Card({ title: "x", count: 6, empty: undefined, children: "内容" });
+  const body = withData.children[1];   // 假 React 把 children 收成数组
+  assert.deepEqual(body.children, ["内容"], "有数据时不应被兜底文案替换");
+  const emptyCard = Card({ title: "x", count: 0, empty: "不可用", children: "内容" });
+  assert.match(JSON.stringify(emptyCard.children[1]), /不可用/);
+});
+
+test("全库不得再出现「error || 兜底文案」式的 empty", async () => {
+  // 反例：empty: loading ? "加载中…" : (x.error || "兜底")
+  // 成功时 error 是空串，"" || "兜底" 为真 → Card 用兜底替换已取到的内容，
+  // 表现为「徽标显示 N 条，正文写着不可用/暂无数据」，用户会以为没取到数据。
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const offenders = source.split("\n")
+    .map((line, index) => ({ line: line.trim(), number: index + 1 }))
+    .filter(({ line }) => !line.startsWith("*") && !line.startsWith("//"))
+    .filter(({ line }) => /loading \?.*:\s*\(.*error \|\|/.test(line));
+  assert.deepEqual(offenders, [], "仍有 empty 使用了会吞掉数据的写法");
+});
+
+test("error 只交给 cardEmpty 决定优先级，不得自己用 || 兜底", async () => {
+  // 这条规则不依赖写法格式：只要没有 `error ||`，就不可能把错误信息
+  // 与兜底文案的优先级写错（成功时 error 是空串，`||` 会选到兜底文案）。
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const offenders = source.split("\n")
+    .map((line, index) => ({ text: line, number: index + 1 }))
+    .filter(({ text }) => text.includes("error ||"))
+    .filter(({ text }) => !text.trim().startsWith("*") && !text.trim().startsWith("//"));
+  assert.deepEqual(offenders.map((row) => `${row.number}: ${row.text.trim()}`), []);
+});

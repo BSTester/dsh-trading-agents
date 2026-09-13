@@ -451,6 +451,19 @@ window.__ModuleLoader__.load({
           h("ul", { className: "tw-sources" }, (report.sources || []).map((s, i) => h(Source, { key: i, source: s })))));
     }
 
+    /**
+     * 计算 Card 的 empty：**只有"确实没有内容"时才返回文案**。
+     *
+     * 不要写成 `loading ? "加载中…" : (error || "兜底文案")`——成功时 error 是空串，
+     * `"" || "兜底文案"` 得到真值，于是 Card 会用兜底文案**替换掉已经取到的内容**：
+     * 徽标显示有 N 条，正文却是"不可用/暂无数据"。这类 bug 会让用户以为没取到数据。
+     */
+    function cardEmpty({ loading, error, count, fallback }) {
+      if (loading) return "读取中…";
+      if (error) return error;
+      return count > 0 ? undefined : fallback;
+    }
+
     function Card({ title, count, empty, children }) {
       return h("section", { className: "tw-card" },
         h("div", { className: "tw-card-head" }, title,
@@ -628,7 +641,8 @@ window.__ModuleLoader__.load({
 
       return h(React.Fragment, null,
         h(Card, { title: "券商持仓（富途真实数据）", count: counts.positions ?? 0,
-          empty: broker.loading ? "读取中…" : (broker.error || "当前账户无持仓") },
+          empty: cardEmpty({ loading: broker.loading, error: broker.error,
+            count: counts.positions ?? 0, fallback: "当前账户无持仓" }) },
           h("p", { className: "tw-meta" },
             `${snapshot.mode === "live" ? "实盘" : "模拟盘"} · 数据源 ${broker.data?.source ?? "—"}`
             + ` · 取数于 ${broker.data?.as_of ?? "—"}`
@@ -644,9 +658,9 @@ window.__ModuleLoader__.load({
         ...groups.map(accountCard),
 
         h(Card, { title: "账户权益（每日盯市）", count: (broker.data?.equity_marks ?? []).length,
-          empty: (broker.data?.equity_marks ?? []).length
-            ? undefined
-            : (broker.loading ? "读取中…" : "尚无盯市记录（首次取数当天开始累积）") },
+          empty: cardEmpty({ loading: broker.loading, error: broker.error,
+            count: (broker.data?.equity_marks ?? []).length,
+            fallback: "尚无盯市记录（首次取数当天开始累积）" }) },
           h("p", { className: "tw-meta" }, EQUITY_MARK_NOTE),
           h(Paged, { items: [...(broker.data?.equity_marks ?? [])].reverse(), pageSize: 6, empty: "",
             render: (mark) => h(EquityMarkRow, { key: mark.date, mark }) })),
@@ -666,7 +680,8 @@ window.__ModuleLoader__.load({
       const risk = useEndpoint(rpc, "risk", {}, [rpc]);
       const config = risk.data?.config;
       return h(Card, { title: "风控参数（引擎实际生效值）",
-        empty: config ? undefined : (risk.loading ? "加载中…" : (risk.error || "不可用")) },
+        empty: config ? undefined : cardEmpty({ loading: risk.loading, error: risk.error,
+          count: 0, fallback: "不可用" }) },
         config && h("div", { className: "tw-kv" }, Object.entries(config).map(([key, value]) =>
           h("div", { key, className: "tw-kv-item" },
             h("div", { className: "tw-kv-k" }, key),
@@ -705,8 +720,8 @@ window.__ModuleLoader__.load({
           empty: !canCorrelate
             ? `当前持仓只有 ${held.length} 个可识别标的，需要至少 2 个；`
               + "相关性矩阵由持仓自动带出，无需手工输入。"
-            : (correlation.data?.tickers?.length ?? 0) >= 2 ? undefined
-              : (correlation.loading ? "加载中…" : (correlation.error || "标的不足")) },
+            : cardEmpty({ loading: correlation.loading, error: correlation.error,
+              count: correlation.data?.tickers?.length ?? 0, fallback: "标的不足" }) },
           correlation.data && h(HeatmapChart, { tickers: correlation.data.tickers, matrix: correlation.data.matrix }),
           correlation.data && h("p", { className: "tw-meta" }, `窗口 ${correlation.data.window} 个共同交易日 · 截至 ${correlation.data.as_of}`)),
         h(RiskConfigCard, { rpc, mode: snapshot.mode }),
@@ -745,7 +760,8 @@ window.__ModuleLoader__.load({
           ? "—" : `${latest.net_profit_yoy.toFixed(2)}%`],
       ] : [];
       return h(Card, { title: `质量因子（${ticker}）`, count: periods.length,
-        empty: quality.loading ? "读取中…" : (quality.error || "富途未返回财报数据") },
+        empty: cardEmpty({ loading: quality.loading, error: quality.error,
+          count: periods.length, fallback: "富途未返回财报数据" }) },
         latest && h("p", { className: "tw-meta" },
           `最新期间 ${latest.period_end ?? "—"} · ${latest.fiscal_year ?? "—"} · `
           + `type=${latest.financial_type ?? "—"} · 币种 ${quality.data?.currency ?? "—"} · `
@@ -782,7 +798,8 @@ window.__ModuleLoader__.load({
           h("p", { className: "tw-hint" }, "因子：价量（7）+ 估值（PE/PB/PEG/PS，同花顺源）；横截面 z-score 合成打分，估值越低分越高。")),
         h(Card, { title: "因子打分与排序", count: rows.length,
           empty: !enough ? "有效标的不足：请在下方输入至少 2 个标的（如 00700.HK,AAPL）"
-            : (snap.loading ? "加载中…" : (snap.error || "暂无数据")) },
+            : cardEmpty({ loading: snap.loading, error: snap.error,
+              count: rows.length, fallback: "暂无数据" }) },
           rows.length > 0 && h("div", { className: "tw-kv" }, rows.map((row) =>
             h("div", { key: row.ticker, className: "tw-kv-item" },
               h("div", { className: "tw-kv-k" }, `#${row.rank} ${row.ticker}`),
@@ -794,7 +811,8 @@ window.__ModuleLoader__.load({
             && h("p", { className: "tw-meta" }, `跳过：${Object.entries(snap.data.failures).map(([k, v]) => `${k}(${v})`).join("；")}`)),
         h(Card, { title: "因子 IC / ICIR（横截面，forward 5 日）",
           empty: tickers.length < 3 ? "IC 需要 3..8 个标的（横截面相关）"
-            : (ic.loading ? "加载中…" : (ic.error || "样本不足")) },
+            : cardEmpty({ loading: ic.loading, error: ic.error,
+              count: icPoints.length, fallback: "样本不足" }) },
           h("div", { className: "tw-toolbar" }, Object.keys(IC_FACTORS).map((k) =>
             h("button", { key: k, type: "button", className: `tw-btn seg${factor === k ? " active" : ""}`,
               onClick: () => setFactor(k) }, FACTOR_LABELS[k] ?? k))),
@@ -917,8 +935,11 @@ window.__ModuleLoader__.load({
       const rows = trades.data?.trades ?? [];
       return h(React.Fragment, null,
         h(Card, { title: "成交记录（本地台账）", count: rows.length,
-          empty: trades.loading ? "加载中…" : (trades.error || "暂无成交记录") },
-          h(Paged, { items: rows, pageSize: 10, empty: trades.loading ? "加载中…" : (trades.error || "暂无成交记录"),
+          empty: cardEmpty({ loading: trades.loading, error: trades.error,
+            count: rows.length, fallback: "暂无成交记录" }) },
+          h(Paged, { items: rows, pageSize: 10,
+            empty: cardEmpty({ loading: trades.loading, error: trades.error,
+              count: rows.length, fallback: "暂无成交记录" }),
             render: (row, i) => h("div", { key: i, className: "tw-kv-item" },
               h("div", { className: "tw-kv-k" }, `${row.date} · ${row.ticker}`),
               h("div", { className: "tw-kv-v", style: { color: row.action === "BUY" ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
@@ -1004,7 +1025,8 @@ window.__ModuleLoader__.load({
       return h(React.Fragment, null,
         h(Card, { title: `即将发生的事件（${ticker}）`, count: upcoming.length },
           h(Paged, { items: upcoming, pageSize: 8,
-            empty: events.loading ? "加载中…" : (events.error || "窗口内无即将发生的事件"),
+            empty: cardEmpty({ loading: events.loading, error: events.error,
+              count: upcoming.length, fallback: "窗口内无即将发生的事件" }),
             render: (event, index) => line(event, index) }),
           events.data && h("p", { className: "tw-meta" },
             `来源状态：${Object.entries(events.data.sources_status || {}).map(([k, v]) => `${k}=${v}`).join(" · ")}`)),
@@ -1020,7 +1042,8 @@ window.__ModuleLoader__.load({
       const rows = sources.data?.sources ?? [];
       const icon = { ok: "✅", warn: "⚠️", fail: "❌" };
       return h(Card, { title: "数据源与授权状态", count: rows.length,
-        empty: sources.loading ? "自检中…" : (sources.error || "不可用") },
+        empty: cardEmpty({ loading: sources.loading, error: sources.error,
+          count: rows.length, fallback: "未返回渠道状态" }) },
         rows.map((row) => h("div", { key: row.key, className: "tw-item" },
           h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
             h("span", { className: `tw-tag ${row.status === "ok" ? "buy" : row.status === "fail" ? "sell" : "hold"}` },
@@ -1044,7 +1067,8 @@ window.__ModuleLoader__.load({
       const stats = audit.data?.stats;
       return h(React.Fragment, null,
         h(Card, { title: "链路统计",
-          empty: stats ? undefined : (audit.loading ? "加载中…" : (audit.error || "暂无链路数据")) },
+          empty: stats ? undefined : cardEmpty({ loading: audit.loading, error: audit.error,
+            count: 0, fallback: "暂无链路数据" }) },
           stats && h("div", { className: "tw-kv" },
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "信号"), h("div", { className: "tw-kv-v" }, String(stats.signals))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "下单响应"), h("div", { className: "tw-kv-v" }, String(stats.orders))),
@@ -1209,6 +1233,7 @@ window.__ModuleLoader__.load({
     // `internals` 仅供测试断言缓存与接口自检行为，不参与运行时逻辑
     return { inject: ["slots", "connection"], apply, request,
       internals: { readCache, writeCache, invalidateCaches, KNOWN_ENDPOINTS, CLIENT_TTL_MS,
+        Card, cardEmpty,
         servedEndpoints: () => servedEndpoints, cacheSize: () => endpointCache.size,
         missingEndpoints: () => [...missingEndpoints] } };
   },
