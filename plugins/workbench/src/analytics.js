@@ -119,6 +119,12 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
                    "--forward", String(forward), "--window", String(window)],
         `ic|${tickers.join(",")}|${factor}|${forward}|${window}`);
     },
+    async sources(payload = {}) {
+      if (Object.keys(payload).some((key) => key !== "no_probe")) throw new Error("Unexpected sources field");
+      const args = ["sources"];
+      if (payload.no_probe === true) args.push("--no-probe");
+      return call(args, `sources|${payload.no_probe === true ? "noprobe" : "probe"}`);
+    },
     async risk() {
       return call(["risk"], "risk");
     },

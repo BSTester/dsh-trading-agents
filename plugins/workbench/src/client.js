@@ -95,7 +95,7 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit"].includes(endpoint))
+      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources"].includes(endpoint))
         throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
@@ -637,6 +637,22 @@ window.__ModuleLoader__.load({
           || "事件来自公开披露源；港股/美股事件请用富途工具查询（quote_financials_* / quote_corporate_actions_* / quote_economic_calendar_search）。"));
     }
 
+    function SourcesCard({ rpc, revision }) {
+      const sources = useEndpoint(rpc, "sources", {}, [rpc, revision]);
+      const rows = sources.data?.sources ?? [];
+      const icon = { ok: "✅", warn: "⚠️", fail: "❌" };
+      return h(Card, { title: "数据源与授权状态", count: rows.length,
+        empty: sources.loading ? "自检中…" : (sources.error || "不可用") },
+        rows.map((row) => h("div", { key: row.key, className: "tw-item" },
+          h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
+            h("span", { className: `tw-tag ${row.status === "ok" ? "buy" : row.status === "fail" ? "sell" : "hold"}` },
+              `${icon[row.status] ?? ""} ${row.label}`),
+            h("div", { className: "tw-meta" }, row.detail),
+            row.status !== "ok" && row.fix && h("div", { className: "tw-meta" }, `修复：${row.fix}`)))),
+        sources.data && h("p", { className: "tw-meta" },
+          `自检时间 ${sources.data.checked_at} · 正常 ${sources.data.summary.ok} / 待配置 ${sources.data.summary.warn} / 异常 ${sources.data.summary.fail}`));
+    }
+
     const CHAIN_KIND = {
       signal: { label: "信号", cls: "" },
       order: { label: "下单", cls: "buy" },
@@ -677,6 +693,7 @@ window.__ModuleLoader__.load({
                         : " · ⚠ 未找到对应信号"),
                 h("div", { className: "tw-meta" }, `${entry.detail} · 来源 ${entry.source}`)));
           })),
+        h(SourcesCard, { rpc, revision: snapshot.generated_at }),
         h("p", { className: "tw-hint" }, "审计仅记录 Harness 观察到的响应与本地台账；实盘成交请以券商成交查询为准。"));
     }
 
@@ -692,6 +709,16 @@ window.__ModuleLoader__.load({
       const [market, setMarket] = React.useState({ ticker: "600519", period: "5m", bars: null, loading: false, error: "", meta: {} });
       const [watchlist, setWatchlist] = React.useState(["600519", "000001", "601318", "600036", "300750"]);
       const generation = React.useRef(0);
+      const [sources, setSources] = React.useState(null);
+      React.useEffect(() => {
+        if (!open) return;
+        let alive = true;
+        const controller = new AbortController();
+        request(rpc, "sources", {}, controller.signal)
+          .then((value) => { if (alive) setSources(value); })
+          .catch(() => { if (alive) setSources(null); });
+        return () => { alive = false; controller.abort(); };
+      }, [open, revision, rpc]);
 
       React.useEffect(() => {
         if (!open || switching) return;
@@ -733,6 +760,10 @@ window.__ModuleLoader__.load({
             h("h2", { className: "tw-title" }, "交易工作台"),
             snapshot && h("span", { className: `tw-badge${live ? " live" : ""}` }, live ? "实盘 LIVE" : "模拟盘 SIM"),
             snapshot && h("span", { className: "tw-meta" }, `更新 ${String(snapshot.generated_at).slice(11, 19)}`),
+            sources && h("span", { className: `tw-badge${sources.summary.fail > 0 ? " live" : ""}`,
+              title: sources.sources.map((s) => `${s.label}: ${s.detail}`).join("\n") },
+              sources.summary.fail > 0 ? `数据源 ${sources.summary.fail} 项异常`
+                : sources.summary.warn > 0 ? `数据源 ${sources.summary.warn} 项待配置` : "数据源正常"),
             h("button", { type: "button", className: "tw-close", onClick: () => setOpen(false), "aria-label": "关闭" }, "×")),
           h("div", { className: "tw-main" },
             h("nav", { className: "tw-nav" }, NAV.map((item) =>

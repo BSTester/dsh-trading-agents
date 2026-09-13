@@ -180,3 +180,36 @@ test("factors / ic providers enforce universe size, factor enum, and bounds", as
   await analytics.ic({ tickers: ["600519", "000001", "601318"] });
   assert.equal(executions, 2);
 });
+
+test("sources endpoint returns the self-check report and rejects unknown fields", async () => {
+  const report = { checked_at: "2026-09-13T13:07:08+08:00",
+    sources: [{ key: "futu", label: "富途", status: "ok", detail: "token 有效", fix: "-" }],
+    summary: { ok: 1, warn: 0, fail: 0 } };
+  const handle = handlerWith({ sources: async () => report });
+  const ok = await handle("sources", {});
+  assert.equal(ok.ok, true);
+  assert.equal(ok.value.summary.ok, 1);
+  assert.equal(ok.value.sources[0].key, "futu");
+  const withNoProbe = await handle("sources", { no_probe: true });
+  assert.equal(withNoProbe.ok, true);
+  const bad = await handle("sources", { probe: true });
+  assert.equal(bad.ok, false);
+  assert.equal(bad.error.code, "trading/invalid-operation");
+});
+
+test("sources provider passes --no-probe through and degrades on failure", async () => {
+  const seen = [];
+  const analytics = createAnalyticsProvider({
+    exec: async (_python, args) => { seen.push(args.join(" ")); return { stdout: JSON.stringify({ sources: [], summary: {} }) }; },
+    python: () => "/tmp/python", now: () => 0,
+  });
+  await analytics.sources({ no_probe: true });
+  assert.match(seen[0], /--no-probe/);
+  await assert.rejects(() => analytics.sources({ probe: true }), /Unexpected sources field/);
+
+  const failing = createAnalyticsProvider({
+    exec: async () => ({ stdout: JSON.stringify({ error: "探测失败" }) }),
+    python: () => "/tmp/python", now: () => 0,
+  });
+  await assert.rejects(() => failing.sources({}), /探测失败/);
+});
