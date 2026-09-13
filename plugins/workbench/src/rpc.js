@@ -55,10 +55,11 @@ export function createRpcHandler(store, deps = {}) {
             message: String(error?.message ?? error).slice(0, 300), details: {} } };
         }
       }
-      if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades") {
+      if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades" || endpoint === "events") {
         const allowed = endpoint === "sensitivity"
           ? ["ticker", "strategy", "metric", "fast_grid", "slow_grid", "buy_grid", "sell_grid", "start"]
-          : endpoint === "trades" ? ["mode", "limit"] : [];
+          : endpoint === "trades" ? ["mode", "limit"]
+          : endpoint === "events" ? ["ticker", "days"] : [];
         if (Object.keys(payload).some(key => !allowed.includes(key))) {
           throw new WorkbenchError(`Unexpected ${endpoint} field`);
         }

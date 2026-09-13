@@ -88,6 +88,12 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       if (payload.sell_grid) args.push("--sell-grid", payload.sell_grid);
       return call(args, `sensitivity|${args.join(" ")}`);
     },
+    async events(payload = {}) {
+      const ticker = payload.ticker;
+      if (typeof ticker !== "string" || !TICKER.test(ticker)) throw new Error("Invalid ticker");
+      const days = intInRange(payload.days, 180, 30, 2000, "days");
+      return call(["events", "--ticker", ticker, "--days", String(days)], `events|${ticker}|${days}`);
+    },
     async risk() {
       return call(["risk"], "risk");
     },

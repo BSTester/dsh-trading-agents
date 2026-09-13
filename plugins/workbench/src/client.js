@@ -95,7 +95,7 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades"].includes(endpoint))
+      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events"].includes(endpoint))
         throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
@@ -561,10 +561,29 @@ window.__ModuleLoader__.load({
             h("p", { className: "tw-hint" }, result.note))));
     }
 
-    function EventsView() {
-      return h(Card, { title: "事件与日历" },
-        h("p", { className: "tw-empty" }, "财报/分红/拆股/经济日历接入中（QW-6）。届时会与当前持仓和信号自动对齐告警。"),
-        h("p", { className: "tw-hint" }, "现可在 Harness 中用富途工具查询：quote_financials_*、quote_corporate_actions_*、quote_economic_calendar_search。"));
+    function EventsView({ rpc, ticker }) {
+      const events = useEndpoint(rpc, "events", { ticker, days: 400 }, [rpc, ticker]);
+      const rows = events.data?.events ?? [];
+      const upcoming = rows.filter((e) => (e.days_until ?? 0) >= 0);
+      const past = rows.filter((e) => (e.days_until ?? 0) < 0).reverse();
+      const line = (event, index) => h("div", { key: `${event.date}-${index}`, className: "tw-item" },
+        h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
+          h("span", { className: `tw-tag ${(event.days_until ?? 0) >= 0 && (event.days_until ?? 0) <= 14 ? "hold" : ""}` },
+            event.type),
+          ` ${event.date}`,
+          h("span", { className: "tw-meta" },
+            ` · ${(event.days_until ?? 0) >= 0 ? `${event.days_until} 天后` : `${-event.days_until} 天前`} · ${event.detail}`)));
+      return h(React.Fragment, null,
+        h(Card, { title: `即将发生的事件（${ticker}）`, count: upcoming.length,
+          empty: events.loading ? "加载中…" : (events.error || "窗口内无即将发生的事件") },
+          upcoming.map(line),
+          events.data && h("p", { className: "tw-meta" },
+            `来源状态：${Object.entries(events.data.sources_status || {}).map(([k, v]) => `${k}=${v}`).join(" · ")}`)),
+        h(Card, { title: "近期已发生", count: past.length,
+          empty: past.length ? undefined : "窗口内无历史事件" },
+          past.slice(0, 10).map(line)),
+        h("p", { className: "tw-hint" }, events.data?.note
+          || "事件来自公开披露源；港股/美股事件请用富途工具查询（quote_financials_* / quote_corporate_actions_* / quote_economic_calendar_search）。"));
     }
 
     function AuditView({ snapshot }) {
@@ -640,7 +659,7 @@ window.__ModuleLoader__.load({
               snapshot && tab === "risk" && h(RiskView, { rpc, snapshot }),
               snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
               snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker: market.ticker }),
-              tab === "events" && h(EventsView, null),
+              tab === "events" && h(EventsView, { rpc, ticker: market.ticker }),
               snapshot && tab === "audit" && h(AuditView, { snapshot }),
               snapshot && h("div", { className: "tw-row" },
                 snapshot.mode === "sim"

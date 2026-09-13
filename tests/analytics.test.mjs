@@ -121,3 +121,30 @@ test("sensitivity provider validates grids, metric, and start date", async () =>
   await assert.rejects(() => analytics.trades({ mode: "paper" }), /Invalid mode/);
   await assert.rejects(() => analytics.trades({ limit: 9999 }), /Invalid limit/);
 });
+
+test("events endpoint validates ticker and window, degrading on failure", async () => {
+  const handle = handlerWith({
+    events: async (payload) => ({ ticker: payload.ticker, events: [], sources_status: { dividend: "ok" } }),
+  });
+  const ok = await handle("events", { ticker: "600519", days: 180 });
+  assert.equal(ok.ok, true);
+  const badField = await handle("events", { ticker: "600519", mode: "sim" });
+  assert.equal(badField.ok, false);
+  const bad = await createRpcHandler({}, { analytics: { events: async () => { throw new Error("仅支持 A 股"); } } });
+  const failed = await bad("events", { ticker: "AAPL" });
+  assert.equal(failed.error.code, "trading/analytics-unavailable");
+  assert.match(failed.error.message, /仅支持 A 股/);
+});
+
+test("events provider validates ticker pattern and window bounds", async () => {
+  let executions = 0;
+  const analytics = createAnalyticsProvider({
+    exec: async () => { executions += 1; return { stdout: JSON.stringify({ ticker: "600519", events: [] }) }; },
+    python: () => "/tmp/python", now: () => 0,
+  });
+  await assert.rejects(() => analytics.events({ ticker: "600519; rm -rf /" }), /Invalid ticker/);
+  await assert.rejects(() => analytics.events({ ticker: "600519", days: 10 }), /Invalid days/);
+  assert.equal(executions, 0);
+  await analytics.events({ ticker: "600519" });
+  assert.equal(executions, 1);
+});
