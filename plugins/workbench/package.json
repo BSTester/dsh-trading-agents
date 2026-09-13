@@ -1,7 +1,7 @@
 {
   "name": "@bstester/dsh-trading-workbench",
   "description": "Harness-native research, activity and quant preview workbench; no chat or order entry",
-  "version": "0.27.0",
+  "version": "0.28.0",
   "type": "module",
   "main": "src/index.js",
   "exports": {
