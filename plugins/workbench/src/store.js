@@ -134,6 +134,49 @@ export class WorkbenchStore {
   }
 
   /**
+   * 显式取消一个仍在 running 的 run：标记为 cancelled 并保留记录。
+   *
+   * 与 pruneAbandonedRuns 的区别：取消是**用户主动操作**，保留记录可供追溯；
+   * 删除是清理。与派生的 abandoned 也不同——abandoned 是"会话死了"的推断，
+   * cancelled 是"人决定不做了"。
+   */
+  cancelRun(id) {
+    let settled = null;
+    this.update((state) => {
+      const run = (state.runs ?? []).find((row) => row.id === id);
+      if (!run) throw new WorkbenchError(`Unknown run: ${id}`);
+      if (run.status !== "running") {
+        throw new WorkbenchError(`Run is already settled: ${run.status}`);
+      }
+      run.status = "cancelled";
+      run.settled_at = new Date().toISOString();
+      this.event(state, { kind: "research_cancelled", mode: run.mode, ticker: run.ticker,
+        run_id: run.id, session_id: run.session_id });
+      settled = { ...run };
+    });
+    return settled;
+  }
+
+  /** 取消所有超过给定时长仍停留在 running 的 run，返回被取消的 id 列表。 */
+  cancelStaleRuns({ now = Date.now(), olderThanMs = ABANDONED_AFTER_MS } = {}) {
+    const cancelled = [];
+    this.update((state) => {
+      for (const run of state.runs ?? []) {
+        if (run.status !== "running") continue;
+        const started = Date.parse(run.started_at ?? "");
+        if (Number.isFinite(started) && now - started >= olderThanMs) {
+          run.status = "cancelled";
+          run.settled_at = new Date().toISOString();
+          this.event(state, { kind: "research_cancelled", mode: run.mode, ticker: run.ticker,
+            run_id: run.id, session_id: run.session_id });
+          cancelled.push(run.id);
+        }
+      }
+    });
+    return cancelled;
+  }
+
+  /**
    * 删除「被中断且从未发布过研报」的 run，返回被删除的 id 列表。
    *
    * 为什么需要：会话中断会在库里留下永远 running 的 run。展示层已用派生状态

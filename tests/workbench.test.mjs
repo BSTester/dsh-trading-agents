@@ -246,3 +246,43 @@ test("清理在没有任何孤儿时是空操作", async (t) => {
   assert.deepEqual(store.pruneAbandonedRuns(), []);
   assert.equal(store.read().runs.length, 1);
 });
+
+test("可以显式取消一条进行中的研究记录，且保留记录", async (t) => {
+  const { store } = await fixture(t);
+  const run = store.beginResearch({ ticker: "AAPL", session_id: "s1" });
+  assert.equal(store.snapshot().runs[0].status, "running");
+
+  const settled = store.cancelRun(run.id);
+  assert.equal(settled.status, "cancelled");
+  assert.ok(settled.settled_at, "应记录settle时间");
+  // 记录保留（不是删除），且处于可追溯的终态
+  const after = store.read().runs;
+  assert.equal(after.length, 1);
+  assert.equal(after[0].status, "cancelled");
+  // 面板只把 running 当"进行中"，取消后不再出现在那条提示里
+  assert.deepEqual(store.snapshot().runs.filter((row) => row.status === "running"), []);
+  // 留痕
+  assert.ok(store.read().activity.some((row) => row.kind === "research_cancelled"));
+});
+
+test("取消一个不存在的或已结算的 run 会明确报错", async (t) => {
+  const { store } = await fixture(t);
+  assert.throws(() => store.cancelRun("nope"), /Unknown run/);
+  const run = store.beginResearch({ ticker: "AAPL", session_id: "s1" });
+  store.cancelRun(run.id);
+  assert.throws(() => store.cancelRun(run.id), /already settled/);
+});
+
+test("cancel-stale 只取消超时的，不动新鲜的和已结算的", async (t) => {
+  const { store } = await fixture(t);
+  const stale = store.beginResearch({ ticker: "AAPL", session_id: "s1" });
+  const fresh = store.beginResearch({ ticker: "TSLA", session_id: "s1" });
+  const aged = new Date(Date.now() - ABANDONED_AFTER_MS - 3600_000).toISOString();
+  store.update((state) => { state.runs.find((row) => row.id === stale.id).started_at = aged; });
+
+  const cancelled = store.cancelStaleRuns();
+  assert.deepEqual(cancelled, [stale.id]);
+  const byId = Object.fromEntries(store.read().runs.map((row) => [row.id, row.status]));
+  assert.equal(byId[stale.id], "cancelled");
+  assert.equal(byId[fresh.id], "running");
+});

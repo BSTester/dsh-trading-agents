@@ -98,6 +98,24 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 （要装全部插件，不要只装 skill 基础模式），完成后运行安装器自检并把输出发我。
 ```
 
+## 维护：清掉"进行中"的研究记录
+
+被中断的会话会留下停在 `running` 的研究 run，面板「研究」页会一直显示"进行中"。
+两种处理方式：
+
+```bash
+ADMIN="$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/workbench_admin.mjs"
+node "$ADMIN" runs                                    # 列出全部 run 及其状态与年龄
+node "$ADMIN" cancel-run <run_id>                     # 取消指定 run（保留记录，标记 cancelled）
+node "$ADMIN" cancel-stale [--hours 2]                # 取消所有超时仍 running 的
+node "$ADMIN" prune-runs [--hours 2]                  # 删除孤儿 run（有研报的保留）
+```
+
+- **取消**（`cancelled`）：用户主动决定不做，**保留记录**供追溯，并写一条 `research_cancelled` 活动日志；
+- **自动判定**（`abandoned`）：超过 **2 小时**仍 `running` 的，面板按派生状态显示为已中断
+  （不改写磁盘数据）。阈值较宽是因为真实投研 run 可能跑较久；
+- **删除**（`prune-runs`）：只删无研报的孤儿，**有研报的一律保留**。
+
 ## 一键启动
 
 ```bash
