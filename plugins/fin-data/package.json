@@ -1,7 +1,7 @@
 {
   "name": "@bstester/dsh-fin-data",
   "description": "Unified financial data plugin for DeepSeek Harness: fin_news (Futu flash news → AKShare → Yahoo RSS routing) and fin_sentiment (X + AKShare) as native model tools",
-  "version": "0.6.0",
+  "version": "0.6.1",
   "type": "module",
   "main": "src/index.js",
   "files": [

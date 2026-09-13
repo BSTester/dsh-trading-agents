@@ -18,6 +18,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -31,6 +32,63 @@ LOGIN_URL = "https://www.reddit.com/login"
 # 注意：old.reddit.com 要求单独登录（与 www 不共享会话）；www 的搜索结果属性可直接读取。
 SEARCH_URL = "https://www.reddit.com/search/"
 
+
+
+DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh")
+REDDIT_COOKIE_FILE = DSH / "reddit-cookies.json"
+REDDIT_COOKIE_TTL = 3 * 24 * 3600
+USER_AGENT = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
+              "Chrome/152.0.0.0 Safari/537.36")
+
+
+def get_reddit_cookies(force=False):
+    """取 Reddit 登录态 cookie：缓存优先（3 天），未命中才开浏览器经 CDP 取。"""
+    from x_api import _read_json, _write_json, extract_cookies_via_browser
+    if not force:
+        cached = _read_json(REDDIT_COOKIE_FILE, REDDIT_COOKIE_TTL)
+        if cached and cached.get("cookies", {}).get("reddit_session"):
+            return cached["cookies"]
+    cookies = extract_cookies_via_browser(domains=("reddit",), required=("reddit_session",))
+    if cookies:
+        _write_json(REDDIT_COOKIE_FILE, {"cookies": cookies})
+    return cookies
+
+
+def try_api_http(query, count, sort, subreddit=None):
+    """纯 HTTP 走同源 /search.json（cookie 已缓存时**完全不需要浏览器**）。
+
+    失败返回 None，由调用方降级到浏览器 DOM 抓取。
+    """
+    cookies = get_reddit_cookies()
+    if not cookies:
+        return None
+    q = f"subreddit:{subreddit} {query}" if subreddit else query
+    params = urllib.parse.urlencode({"q": q, "limit": max(count * 2, 25),
+                                     "sort": sort, "type": "link", "raw_json": "1"})
+    request = urllib.request.Request(f"https://www.reddit.com/search.json?{params}", headers={
+        "user-agent": USER_AGENT,
+        "accept": "application/json",
+        "cookie": "; ".join(f"{k}={v}" for k, v in cookies.items()),
+    })
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8", "replace"))
+    except Exception:
+        return None
+    rows = []
+    for child in ((data.get("data") or {}).get("children") or []):
+        d = child.get("data") or {}
+        if not d.get("title"):
+            continue
+        rows.append({"title": d["title"],
+                     "subreddit": d.get("subreddit_name_prefixed") or "",
+                     "score": str(d.get("score", "")),
+                     "comments": str(d.get("num_comments", "")),
+                     "time": (time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(d["created_utc"]))
+                              if d.get("created_utc") else ""),
+                     "url": ("https://www.reddit.com" + d["permalink"]) if d.get("permalink")
+                            else (d.get("url") or "")})
+    return rows[:count] or None
 
 
 def try_api_search(page, query, count, sort, subreddit=None):
@@ -102,6 +160,17 @@ def main():
     if not args.login and not reddit_reachable():
         print(json.dumps({"skip": True, "reason": "reddit.com 不可达，跳过 Reddit 渠道"}))
         return 0
+
+    # ---- ① 纯 HTTP API 优先（cookie 有缓存时零浏览器开销）----
+    if not args.login and args.query:
+        http_items = try_api_http(args.query, args.count, args.sort, args.subreddit)
+        if http_items:
+            close_browser_if_we_launched_it()
+            close_by_port_best_effort()
+            print(json.dumps({"query": args.query, "count": len(http_items),
+                              "path": "api/json", "items": http_items},
+                             ensure_ascii=False, indent=1))
+            return 0
 
     try:
         if not ensure_browser():

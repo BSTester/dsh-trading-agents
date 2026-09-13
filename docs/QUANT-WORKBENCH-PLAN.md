@@ -226,7 +226,7 @@ python plugins/fin-data/python/reddit_search.py --login   # Reddit
 
 | 渠道 | 路径 | 结论 |
 |---|---|---|
-| **Reddit** | **API（同源 `/search.json`，走登录态）** | ✅ 采用。结构化返回（标题/子版/分数/评论数/时间），比 DOM 抓取快且字段完整 |
+| **Reddit** | **API（同源 `/search.json`，纯 HTTP + 缓存 cookie）** | ✅ 采用。结构化返回（标题/子版/分数/评论数/时间）。cookie 缓存到 `~/.dsh/reddit-cookies.json`（3 天），热路径**完全不启动浏览器**，约 3s（此前每次开浏览器约 37s） |
 | **X** | **API（GraphQL `SearchTimeline` + 社区 `x-client-transaction-id` 实现）** | ✅ 已打通。DOM 抓取保留为降级路径 |
 
 X 的 GraphQL 搜索此前返回 HTTP 404，原因不是鉴权缺失，而是缺少反爬头
@@ -235,15 +235,17 @@ X 的 GraphQL 搜索此前返回 HTTP 404，原因不是鉴权缺失，而是缺
 `x_client_transaction`），实现见 `plugins/fin-data/python/x_api.py`：
 
 1. **cookie 获取**：通过 CDP 从已登录的专属浏览器取 `auth_token`/`ct0`（浏览器已完成解密，
-   我们不接触密文），缓存到 `~/.dsh/x-cookies.json`，有效期 3 天；
+   我们不接触密文），缓存到 `~/.dsh/x-cookies.json`，有效期 3 天。取 cookie 的函数对域名与必需
+   cookie 名参数化（`extract_cookies_via_browser(domains=..., required=...)`），Reddit 复用同一套机制；
 2. **素材与 queryId**：抓 `x.com/home` → 从 `client-web/main.*.js` 里提取 `SearchTimeline` 的
    `queryId`（**注意：queryId 不在首页 HTML 中**），连同 ondemand 脚本缓存到
    `~/.dsh/x-client-material.json`，有效期 30 分钟；
 3. **请求**：`ClientTransaction.generate_transaction_id(method="GET", path=...)` 生成反爬头，
    以固定 Bearer 直连 GraphQL，解析 `SearchTimeline` 时间线。
 
-实测：HTTP 200，冷启动约 8.5s（含开浏览器取 cookie），热启动约 3s，单次约 20 条推文；
-对照组 DOM 抓取约 40-50s。
+实测（多次取中位）：X 冷启动约 8.5s（含开浏览器取 cookie）、热启动约 3.8s，单次约 20 条推文；
+Reddit 热启动约 3.7s；两渠道合并约 8s。对照组为 X DOM 抓取约 40-50s、Reddit 每次开浏览器约 37s。
+cookie 缓存命中后两个渠道都**不再启动浏览器**。
 
 脚本输出中的 `path` 字段标明本次实际路径：`api/graphql`（X）、`api/json`（Reddit）、`web/dom`（降级）。
 `fin_sentiment` 的 `sources_status` 会显示为 `ok:api/graphql` 形式，便于确认是否走了 API。

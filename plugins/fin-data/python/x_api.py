@@ -54,9 +54,12 @@ def _write_json(path, payload):
         pass
 
 
-def extract_cookies_via_browser():
-    """用 CDP 从专属浏览器取 x.com cookie（浏览器已完成解密）。"""
-    from x_search import (DEBUG_PORT, SCRATCH_BASE, acquire_scratch_page,  # 延迟导入避免循环
+def extract_cookies_via_browser(domains=("x.com", "twitter"), required=("auth_token", "ct0")):
+    """用 CDP 从专属浏览器取 cookie（浏览器已完成解密，我们不碰密文）。
+
+    domains: 域名关键字白名单；required: 必须齐备的 cookie 名，缺失即判定未登录。
+    """
+    from x_search import (SCRATCH_BASE, acquire_scratch_page,  # 延迟导入避免循环
                           close_scratch_pages, connect_browser, ensure_browser)
     from playwright.sync_api import sync_playwright
 
@@ -70,13 +73,12 @@ def extract_cookies_via_browser():
         try:
             session = context.new_cdp_session(page)
             for cookie in session.send("Network.getAllCookies").get("cookies", []):
-                if "x.com" in cookie.get("domain", "") or "twitter" in cookie.get("domain", ""):
+                if any(d in cookie.get("domain", "") for d in domains):
                     cookies[cookie["name"]] = cookie["value"]
         finally:
             close_scratch_pages(context)
-    if "auth_token" not in cookies or "ct0" not in cookies:
+    if any(name not in cookies for name in required):
         return None
-    _write_json(COOKIE_FILE, {"cookies": cookies})
     return cookies
 
 
@@ -85,7 +87,10 @@ def get_cookies(force=False):
         cached = _read_json(COOKIE_FILE, COOKIE_TTL_SECONDS)
         if cached and cached.get("cookies", {}).get("auth_token"):
             return cached["cookies"]
-    return extract_cookies_via_browser()
+    cookies = extract_cookies_via_browser()
+    if cookies:
+        _write_json(COOKIE_FILE, {"cookies": cookies})
+    return cookies
 
 
 def _http_get(url, cookies, extra_headers=None, timeout=30):
