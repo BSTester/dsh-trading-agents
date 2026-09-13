@@ -271,3 +271,20 @@ test("error 只交给 cardEmpty 决定优先级，不得自己用 || 兜底", as
     .filter(({ text }) => !text.trim().startsWith("*") && !text.trim().startsWith("//"));
   assert.deepEqual(offenders.map((row) => `${row.number}: ${row.text.trim()}`), []);
 });
+
+test("skill 与限制文档必须写明：券商能力限制以实测为准，账户不可混算", async () => {
+  const skill = await readFile(new URL("../skills/trading-agents/SKILL.md", import.meta.url), "utf8");
+  const limits = await readFile(new URL("../docs/TOOL-LIMITS.md", import.meta.url), "utf8");
+
+  for (const [name, text] of [["SKILL.md", skill], ["TOOL-LIMITS.md", limits]]) {
+    // account_orders_history 不传时间范围会静默返回 no data，属"看起来没数据"的坑
+    assert.match(text, /account_orders_history/, `${name} 未记录 account_orders_history 的陷阱`);
+    assert.match(text, /start.*end|start`\/`end/, `${name} 未写明必须传时间范围`);
+    // 券商能力限制不得写成长期规则
+    assert.match(text, /实际下单|实际下单结果/, `${name} 未写明"能力限制以实际下单为准"`);
+    // 账户模式必须区分
+    assert.match(text, /sim\s*[|\/]\s*live|sim\/live|sim.*live.*账户/, `${name} 未写明记忆需区分账户`);
+  }
+  // 记忆条目格式必须带账户字段
+  assert.match(skill, /\[<日期> \| <sim\|live>账户/, "记忆条目格式未包含账户字段");
+});

@@ -15,6 +15,7 @@
 | 取新闻 | `quote_news_search` | **`fin_news`** | 前者三种参数（`腾讯` / `00700` / `Tencent+lang=en`）均 `data: []`；后者走富途源 `sources_status.futu="ok"`，正常返回腾讯回购、南向资金等 |
 | 取机构评级 | `quote_research_rating_summary` | **`quote_research_analyst_consensus`** | 前者 `HK.00700` 返回 `analyst_rating_summary_list: null, pagination.total: 0`；后者同一标的返回 43 位分析师、目标均价 663.69、strong_buy 79.07% |
 | 改单 | 重试 `sim_trade_modify_order` | **撤单 + 重新下单** | 该接口间歇性 `ret_code:-5 backend business error`；同一天 7137731 成功、7137730 与 7137795 失败，与价格是否离谱无关，失败时改价未生效 |
+| 查历史订单 | `account_orders_history` **不传时间范围** | **必须传 `start`/`end`** | 不传时静默返回**纯文本** `no data`（不报错、不提示），极易误判成"无历史订单"；补上时间范围后正常返回 |
 
 ## 二、行情权限（按市场，不按标的）
 
@@ -63,7 +64,19 @@ for the requested market`。
 - `quote_referencefuture_list`：`HK.800000` 返回 `reference_list: []`；
   但 `quote_future_info`/`quote_order_book` 对期货代码正常。推测入参格式问题，未定论。
 
-## 六、按设计拦截的调用（不是故障）
+## 六、券商能力限制：以**实际下单**为准，不要写进规则
+
+不要在规则或记忆里预设"某地区 / 某账户不能交易"。券商的能力限制会随账户、
+地区、时间与监管变化，**唯一可靠的判据是实际发起一次委托并观察结果**。
+
+- 历史条目里出现过的拒单原文（例如某次 FAILED 订单的 `last_err_msg`）
+  只是**当时那一次**的观察，不是长期规则；
+- 要确认实盘能否下单，就在用户完成两次确认后**真下一个单**，以返回结果为准；
+- 被拒时把原始错误原文连同**日期与账户**记进记忆，供后续判断是否仍然成立；
+- 记忆条目必须标注账户模式（sim / live），**两个账户的持仓与盈亏不可混算**
+  ——同一个标的在两个账户里的成本与数量可以完全不同。
+
+## 七、按设计拦截的调用（不是故障）
 
 sim 模式下 9 个实盘账户查询工具与 4 个实盘下单工具会被 `policy.js` 与 Harness 审批拒绝。
 会话内审批被禁用时，实盘下单表现为 `the user rejected tool ...`——**这是预期行为**，
