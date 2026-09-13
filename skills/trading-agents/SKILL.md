@@ -100,6 +100,36 @@ description: TradingAgents 多角色投研流水线（12角色/6阶段）——�
 **Reddit 渠道**：`fin_sentiment` 同时聚合 Reddit 讨论（与 X 共用专属浏览器登录态）。首次使用需登录一次：
 `"$HOME/.dsh/trading-venv/bin/python" "$HOME/.dsh/.agent-presets/dsh-trading-agents/plugins/fin-data/python/reddit_search.py" --login`
 
+### 已知工具限制与规避（2026-09-13 全量体检结论）
+
+对 91 个富途工具 + 8 个非富途工具逐个实调后的结论。**这些坑看起来都像"没数据"，
+不会报错**，所以必须照下面的规避方式做，否则会静默拿到空结果：
+
+| 场景 | 不要用 | 改用 | 证据 |
+|---|---|---|---|
+| 取新闻 | `quote_news_search` | **`fin_news`** | 该工具三次不同参数（中文名/代码/英文+lang）均返回 `ret_code:0, data:[]`；而 `fin_news` 走富途源 `sources_status.futu="ok"` 能正常返回 |
+| 取机构评级 | `quote_research_rating_summary` | **`quote_research_analyst_consensus`** | 前者对 `HK.00700` 返回 `pagination.total=0`；后者同一标的返回 43 位分析师、目标均价 663.69 |
+| 改单 | 反复重试 `sim_trade_modify_order` | **撤单 + 重新下单** | 该接口间歇性 `ret_code:-5 backend business error`（同一天有成功也有失败，与价格是否离谱无关）；失败时价格与数量均未生效 |
+
+**A 股实时行情不可用（权限问题，不是故障）**：`order_book` / `rt_data` / `rt_ticker` /
+`stock_quote` / `market_snapshot` 对 A 股统一返回
+`-9 realtime quote permission required`（日股同理）。分析 A 股时**不要依赖实时报价/盘口/逐笔**，
+改用实测可用的路径：`history_kline`（日线/分钟 K 线）、`capital_flow`（分钟级资金流）、
+`stock_screen`、`market_state`。港股与美股有实时权限（港股 LV2 十档、美股 LV2），可正常使用。
+> 工作台的 A 股标的卡已按此降级：显示最近日线收盘并在 `note` 字段说明"实时快照不可用"。
+
+**上下文炸弹（无分页、单次返回极大）**：`quote_financials_earnings_price_history`
+（实测约 **336KB**）、`quote_financials_earnings_price_move`、`quote_corporate_actions_rehab`。
+不要随手调用；确有需要时先确认输出规模。
+
+**易错字段名**：`quote_combo_option_quote` 的腿字段是 `legs` 与 `quantity`（不是
+`leg_list`/`qty`，错误分两级才暴露）；`quote_option_screen` 必须传 `field_filter`，
+否则只返回 4 个默认字段其余全 `null`；`quote_company_executive_background` 用
+`leader_name`（如 `马化腾`）而非 `display_leader_name`。
+
+**不确定项（勿依赖）**：`quote_ipo_list_sg`（新加坡 IPO 列表恒为空）、
+`quote_referencefuture_list`（关联期货为空，疑似入参格式问题，未定论）。
+
 **渠道优先级**：凡富途 MCP 能提供的数据（行情/K线/盘口/公司资料/估值/财报/资金流/股东/分红/新闻/社区/板块）
 一律优先走富途；AKShare/Yahoo/公开快讯为备用；X 为必取情绪渠道，Reddit 为补充。
 

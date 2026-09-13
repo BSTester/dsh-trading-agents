@@ -4,7 +4,7 @@ import { mkdtemp, rm, writeFile, unlink } from "node:fs/promises";
 import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { WorkbenchStore } from "../plugins/workbench/src/store.js";
+import { WorkbenchStore, withRunStatus, ABANDONED_AFTER_MS } from "../plugins/workbench/src/store.js";
 import { createRpcHandler, createRpcFetchHandler, CACHE_TTL_MS } from "../plugins/workbench/src/rpc.js";
 import { ENDPOINTS } from "../plugins/workbench/src/endpoints.js";
 
@@ -200,4 +200,49 @@ test("_refresh 不参与各接口的字段校验", async (t) => {
   assert.equal(ok.ok, true);
   const bad = await handle("positions", { mode: "sim", unexpected: 1 });
   assert.equal(bad.ok, false, "其他多余字段仍必须被拒绝");
+});
+
+test("被中断的会话不会留下永远「进行中」的 run", async (t) => {
+  const { store } = await fixture(t);
+  const run = store.beginResearch({ ticker: "AAPL", session_id: "s1" });
+  // 刚发起：仍算进行中
+  assert.equal(store.snapshot().runs[0].status, "running");
+  // 超过阈值（模拟会话被中断）：派生为 abandoned，但原始数据不动
+  const later = Date.parse(run.started_at) + ABANDONED_AFTER_MS + 60_000;
+  assert.equal(withRunStatus(run, later).status, "abandoned");
+  assert.equal(store.read().runs[0].status, "running", "不得改写历史数据");
+});
+
+test("派生状态不会误伤已完成或无时间戳的 run", () => {
+  const old = { status: "running", started_at: new Date(Date.now() - 10 * 3600_000).toISOString() };
+  assert.equal(withRunStatus(old).status, "abandoned");
+  assert.equal(withRunStatus({ status: "completed", started_at: old.started_at }).status, "completed");
+  assert.equal(withRunStatus({ status: "running" }).status, "running", "无时间戳时无法判定，保持原状");
+});
+
+test("清理孤儿 run：有研报的保留，新鲜的不动", async (t) => {
+  const { store } = await fixture(t);
+  // 旧的孤儿（无研报）
+  const orphan = store.beginResearch({ ticker: "AAPL", session_id: "s1" });
+  // 旧的但有研报——是真实产物，不能当垃圾清掉
+  const kept = store.beginResearch({ ticker: "00700.HK", session_id: "s1" });
+  store.publishResearch({ ...published, run_id: kept.id }, "s1");
+  // 新鲜的 running
+  const fresh = store.beginResearch({ ticker: "TSLA", session_id: "s1" });
+
+  // 直接把这一个 run 调老。注意不能改用推后 now 的办法：那样"新鲜"的那条
+  // 相对同一个未来时刻也会超时，测试就失去了区分能力。
+  const aged = new Date(Date.now() - ABANDONED_AFTER_MS - 3600_000).toISOString();
+  store.update((state) => { state.runs.find((row) => row.id === orphan.id).started_at = aged; });
+  const removed = store.pruneAbandonedRuns();
+  assert.deepEqual(removed, [orphan.id]);
+  const ids = store.read().runs.map((row) => row.id).sort();
+  assert.deepEqual(ids, [kept.id, fresh.id].sort());
+});
+
+test("清理在没有任何孤儿时是空操作", async (t) => {
+  const { store } = await fixture(t);
+  store.beginResearch({ ticker: "AAPL", session_id: "s1" });
+  assert.deepEqual(store.pruneAbandonedRuns(), []);
+  assert.equal(store.read().runs.length, 1);
 });

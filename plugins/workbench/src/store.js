@@ -6,6 +6,10 @@ import path from "node:path";
 
 const RATINGS = new Set(["Buy", "Overweight", "Hold", "Underweight", "Sell"]);
 const LIMIT = 100;
+// 研究 run 超过这个时长仍是 running，就认为发起它的会话已中断。
+// 不这么做的话，被中断的会话会留下一个**永远显示"进行中"**的 run，
+// 在面板上看起来像还在跑。派生状态而不改写历史：原始数据保持不动。
+const ABANDONED_AFTER_MS = 2 * 60 * 60 * 1000;
 
 export class WorkbenchError extends Error {}
 class WorkbenchBusyError extends WorkbenchError {}
@@ -43,6 +47,20 @@ function sanitize(value) {
 function emptyState() {
   return { version: 1, runs: [], reports: [], previews: [], activity: [], broker: {} };
 }
+
+/**
+ * 给 run 补一个派生状态：running 且开始时间已超过阈值 → abandoned（会话已中断）。
+ * 只影响读出的视图，不写回磁盘——历史记录保持原样。
+ */
+export function withRunStatus(run, now = Date.now()) {
+  if (!run || run.status !== "running") return run;
+  const started = Date.parse(run.started_at ?? "");
+  if (!Number.isFinite(started)) return run;
+  if (now - started < ABANDONED_AFTER_MS) return run;
+  return { ...run, status: "abandoned" };
+}
+
+export { ABANDONED_AFTER_MS };
 
 export class WorkbenchStore {
   constructor(home = process.env.DSH_HOME || path.join(os.homedir(), ".dsh")) {
@@ -115,6 +133,31 @@ export class WorkbenchStore {
     return event;
   }
 
+  /**
+   * 删除「被中断且从未发布过研报」的 run，返回被删除的 id 列表。
+   *
+   * 为什么需要：会话中断会在库里留下永远 running 的 run。展示层已用派生状态
+   * 把它标成 abandoned，但数据本身也该能清掉，否则会一直占着 LIMIT 名额。
+   * **有研报的 run 一律保留**——那是真实产物，不能当垃圾清掉。
+   */
+  pruneAbandonedRuns({ now = Date.now(), olderThanMs = ABANDONED_AFTER_MS } = {}) {
+    const removed = [];
+    this.update((state) => {
+      // 报告的主键 id 就是 run id（publishResearch 用 run.id 作为报告 id），没有 run_id 字段
+      const published = new Set((state.reports ?? [])
+        .flatMap((row) => [row.id, row.run_id]).filter(Boolean));
+      state.runs = (state.runs ?? []).filter((run) => {
+        if (run.status !== "running") return true;
+        const started = Date.parse(run.started_at ?? "");
+        if (!Number.isFinite(started) || now - started < olderThanMs) return true;
+        if (published.has(run.id)) return true;
+        removed.push(run.id);
+        return false;
+      });
+    });
+    return removed;
+  }
+
   snapshot() {
     this.flushObservations();
     const mode = this.readMode();
@@ -122,7 +165,7 @@ export class WorkbenchStore {
     const activity = state.activity.filter(row => row.mode === mode).reverse();
     return {
       version: 1, mode, generated_at: new Date().toISOString(),
-      runs: state.runs.filter(row => row.mode === mode).reverse(),
+      runs: state.runs.filter(row => row.mode === mode).reverse().map(row => withRunStatus(row)),
       reports: state.reports.filter(row => row.mode === mode).reverse(),
       previews: state.previews.filter(row => row.mode === mode).reverse(),
       activity,

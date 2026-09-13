@@ -1,0 +1,70 @@
+# 富途工具与数据源：已知限制
+
+> 来源：2026-09-13 一次全量体检（91 个富途 MCP 工具 + 8 个非富途工具，逐个实调至少一次，
+> 判据为 `ret_code` 与接口级错误码，不依赖数据新鲜度）。
+> 本文件是**结论的落库版本**——原始报告在某个工作区的 `.tradingagents/` 下，
+> 不随仓库分发；把结论放进仓库是为了让后续会话不必重新发现同样的坑。
+
+## 一、最常见的错觉
+
+下面这些问题**都不报错**，只返回 `ret_code: 0` + 空数据。如果不知道，很容易
+把它当成"这个标的没有新闻/没有评级"，进而写出看起来正常但依据为空的分析。
+
+| 场景 | 不要用 | 改用 | 证据 |
+|---|---|---|---|
+| 取新闻 | `quote_news_search` | **`fin_news`** | 前者三种参数（`腾讯` / `00700` / `Tencent+lang=en`）均 `data: []`；后者走富途源 `sources_status.futu="ok"`，正常返回腾讯回购、南向资金等 |
+| 取机构评级 | `quote_research_rating_summary` | **`quote_research_analyst_consensus`** | 前者 `HK.00700` 返回 `analyst_rating_summary_list: null, pagination.total: 0`；后者同一标的返回 43 位分析师、目标均价 663.69、strong_buy 79.07% |
+| 改单 | 重试 `sim_trade_modify_order` | **撤单 + 重新下单** | 该接口间歇性 `ret_code:-5 backend business error`；同一天 7137731 成功、7137730 与 7137795 失败，与价格是否离谱无关，失败时改价未生效 |
+
+## 二、行情权限（按市场，不按标的）
+
+| 市场 | 实时 | 盘口 | 备注 |
+|---|---|---|---|
+| 港股 HK | ✅ | LV2 十档 | |
+| 美股 US | ✅ | LV2（NASDAQ/ARCA 双 book） | |
+| 沪深 A 股 | ❌ 仅延时 | ❌ | `order_book`/`rt_data`/`rt_ticker`/`stock_quote`/`market_snapshot` 统一 `-9` |
+| 日股 JP | ❌ 仅延时 | ❌ | 同上 |
+| 港股期货 | ✅ | ≥1 档 | `HK.MCAmain` 正常 |
+| 加密货币 | ✅ | 1 档 | `CC.BTC` 正常 |
+
+A 股错误原文：`-9 realtime quote permission required / user has only delayed quote permission
+for the requested market`。
+
+**A 股可用替代路径（实测通过）**：`history_kline`、`capital_flow`（分钟级资金流）、
+`stock_screen`（全市场 5639 只）、`market_state`。→ 日线与日内量化够用，
+**盘中实时报价/盘口/逐笔不可用**。
+
+工作台的 A 股标的卡已按此降级：`quote_stock_quote` 失败后回退到 `quote_stock_basicinfo`
+与日线收盘，并在 `note` 里写明"实时快照不可用"。
+
+## 三、上下文炸弹（无分页、单次返回极大）
+
+| 工具 | 规模 |
+|---|---|
+| `quote_financials_earnings_price_history` | 实测约 **336KB**，且无分页参数 |
+| `quote_financials_earnings_price_move` | 数十条重复结构 |
+| `quote_corporate_actions_rehab` | 全量复权因子，无分页 |
+
+不要随手调用；确有需要时先确认输出规模。
+
+## 四、易错字段名
+
+| 工具 | 正确 | 错误 | 后果 |
+|---|---|---|---|
+| `quote_combo_option_quote` | `legs` / `quantity` | `leg_list` / `qty` | 错误分两级才暴露，易写成错误请求 |
+| `quote_option_screen` | 必须传 `field_filter` | 省略 | 只返回 4 个默认字段，其余全 `null`，误以为数据缺失 |
+| `quote_company_executive_background` | `leader_name`（如 `马化腾`） | `display_leader_name` | 查不到 |
+| `quote_order_book` | 档数由权限决定 | 假定固定档数 | HK 10 / US 60 / A股 5 / 其余 1 |
+
+## 五、不确定项（勿依赖）
+
+- `quote_ipo_list_sg`：新加坡 IPO 列表恒为空（同日 hk/us/my/cn 均有数据）；
+  无法区分"确实无新股"与"接口无数据"，**判定为不确定**。
+- `quote_referencefuture_list`：`HK.800000` 返回 `reference_list: []`；
+  但 `quote_future_info`/`quote_order_book` 对期货代码正常。推测入参格式问题，未定论。
+
+## 六、按设计拦截的调用（不是故障）
+
+sim 模式下 9 个实盘账户查询工具与 4 个实盘下单工具会被 `policy.js` 与 Harness 审批拒绝。
+会话内审批被禁用时，实盘下单表现为 `the user rejected tool ...`——**这是预期行为**，
+要实测实盘需在工作台显式切换模式。
