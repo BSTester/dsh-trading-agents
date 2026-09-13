@@ -1,8 +1,10 @@
-// Native Harness module-factory entry: use the host's React, not a second copy.
+// 交易工作台 Client：抽屉式大盘面 + 分类导航 + canvas 动态图表（零依赖自绘）。
 //
-// 交易工作台 Client：右下角浮动入口 + 面板（研报 / 交易动态 / 量化预览 / 模式切换）。
-// 样式注入到 document.head 一次（带 id 守卫，随插件卸载移除），全部使用 Harness
-// 主题令牌 --dsw-alias-*，缺失时回退到系统色，保证浅色/深色模式都正常。
+// 分工：工作台只做信息展示（行情图表、信号、组合、风险、执行、研究、事件、审计）。
+// 研报生成与下单指令一律在 Harness 会话中完成（策略强制实盘审批）。
+//
+// 样式注入 document.head（id 守卫，随插件卸载移除），使用 Harness 主题令牌
+// --dsw-alias-*，缺失时回退系统色，浅/深色自适应。
 
 window.__ModuleLoader__.load({
   id: "@bstester/dsh-trading-workbench",
@@ -12,135 +14,72 @@ window.__ModuleLoader__.load({
 
     const STYLE_ID = "dsh-trading-workbench-style";
     const CSS = `
-.tw-fab {
-  position: fixed; right: 18px; bottom: 18px; z-index: 60;
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 10px 16px; border-radius: 999px; cursor: pointer;
-  font-size: 13px; font-weight: 600; letter-spacing: .2px;
-  color: var(--dsw-alias-label-primary, CanvasText);
-  background: var(--dsw-alias-button-elevated-fill, ButtonFace);
-  border: 1px solid var(--dsw-alias-border-l2, GrayText);
-  box-shadow: 0 6px 20px rgba(0,0,0,.18);
-  transition: transform .12s ease, background .12s ease;
-}
-.tw-fab:hover { transform: translateY(-1px); background: var(--dsw-alias-button-floating-hover, var(--dsw-alias-interactive-bg-hover, ButtonFace)); }
-.tw-fab:active { transform: translateY(0); }
-.tw-fab-dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dsw-alias-state-success-primary, #2ea043); }
-.tw-fab-dot.is-live { background: var(--dsw-alias-state-error-primary, #d1242f); }
-
-.tw-panel {
-  position: fixed; right: 18px; bottom: 68px; z-index: 60;
-  width: min(760px, calc(100vw - 36px)); max-height: 78vh;
-  display: flex; flex-direction: column; overflow: hidden;
-  border-radius: 14px;
-  background: var(--dsw-alias-bg-layer-2, Canvas);
-  color: var(--dsw-alias-label-primary, CanvasText);
-  border: 1px solid var(--dsw-alias-border-l2, GrayText);
-  box-shadow: 0 18px 48px rgba(0,0,0,.28);
-  font-size: 13px; line-height: 1.55;
-}
-.tw-header {
-  display: flex; align-items: center; gap: 10px;
-  padding: 14px 16px; border-bottom: 1px solid var(--dsw-alias-border-l1, GrayText);
-  background: var(--dsw-alias-bg-layer-3, Canvas);
-}
-.tw-title { font-size: 15px; font-weight: 700; margin: 0; }
-.tw-badge {
-  margin-left: auto; padding: 3px 10px; border-radius: 999px;
-  font-size: 11px; font-weight: 700; letter-spacing: .6px; text-transform: uppercase;
-  background: var(--dsw-alias-state-success-primary, #2ea043); color: #fff;
-}
-.tw-badge.is-live { background: var(--dsw-alias-state-error-primary, #d1242f); }
-.tw-body { padding: 14px 16px 18px; overflow: auto; display: flex; flex-direction: column; gap: 14px; }
-.tw-body::-webkit-scrollbar { width: 10px; }
-.tw-body::-webkit-scrollbar-thumb { background: var(--dsw-alias-scrollbar-hover-l1, rgba(128,128,128,.4)); border-radius: 6px; }
-
-.tw-hint { margin: 0; color: var(--dsw-alias-label-tertiary, GrayText); font-size: 12px; }
-.tw-meta { margin: 0; color: var(--dsw-alias-label-secondary, GrayText); font-size: 12px; }
-.tw-alert {
-  margin: 0; padding: 8px 10px; border-radius: 8px; font-size: 12px;
-  background: var(--dsw-alias-interactive-bg-hover-danger, rgba(209,36,47,.12));
-  color: var(--dsw-alias-label-error, #d1242f);
-  border: 1px solid var(--dsw-alias-state-error-primary, rgba(209,36,47,.4));
-}
-.tw-status {
-  margin: 0; padding: 8px 10px; border-radius: 8px; font-size: 12px;
-  background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.10));
-  color: var(--dsw-alias-label-secondary, GrayText);
-}
-
-.tw-card {
-  border: 1px solid var(--dsw-alias-border-l1, GrayText); border-radius: 10px;
-  background: var(--dsw-alias-bg-layer-1, Canvas); overflow: hidden;
-}
-.tw-card-head {
-  display: flex; align-items: center; gap: 8px;
-  padding: 10px 12px; font-weight: 600; font-size: 13px;
-  border-bottom: 1px solid var(--dsw-alias-border-l1, GrayText);
-  background: var(--dsw-alias-bg-layer-2, Canvas);
-}
-.tw-count {
-  margin-left: auto; font-weight: 600; font-size: 11px; padding: 1px 8px; border-radius: 999px;
-  color: var(--dsw-alias-label-secondary, GrayText);
-  background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.14));
-}
-.tw-card-body { padding: 10px 12px; display: flex; flex-direction: column; gap: 8px; }
-
-.tw-item { border: 1px solid var(--dsw-alias-border-l1, GrayText); border-radius: 8px; background: var(--dsw-alias-bg-base, Canvas); }
-.tw-item > summary {
-  cursor: pointer; padding: 8px 10px; font-size: 12px; font-weight: 600;
-  list-style: none; display: flex; align-items: center; gap: 8px;
-}
-.tw-item > summary::-webkit-details-marker { display: none; }
-.tw-item > summary::before { content: "▸"; color: var(--dsw-alias-label-tertiary, GrayText); transition: transform .12s ease; }
-.tw-item[open] > summary::before { transform: rotate(90deg); }
-.tw-item > summary:hover { background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.10)); }
-.tw-item-body { padding: 0 10px 10px; }
-.tw-tag {
-  font-size: 10px; font-weight: 700; padding: 1px 6px; border-radius: 4px;
-  background: var(--dsw-alias-interactive-bg-hover, rgba(128,128,128,.16));
-  color: var(--dsw-alias-label-secondary, GrayText);
-}
-.tw-tag.rating-buy { background: var(--dsw-alias-state-success-primary, #2ea043); color: #fff; }
-.tw-tag.rating-sell { background: var(--dsw-alias-state-error-primary, #d1242f); color: #fff; }
-.tw-tag.rating-hold { background: var(--dsw-alias-state-warn-label, #9a6700); color: #fff; }
-
-.tw-pre {
-  margin: 6px 0 0; padding: 10px; border-radius: 8px; font-size: 12px;
-  white-space: pre-wrap; overflow-wrap: anywhere;
-  font-family: var(--ds-font-family-code, ui-monospace, SFMono-Regular, Menlo, monospace);
-  background: var(--dsw-alias-bg-base, Canvas);
-  border: 1px solid var(--dsw-alias-border-l1, GrayText);
-  max-height: 320px; overflow: auto;
-}
-.tw-sources { margin: 8px 0 0; padding-left: 18px; font-size: 12px; color: var(--dsw-alias-label-secondary, GrayText); }
-.tw-sources a { color: var(--dsw-alias-label-primary-bluish, LinkText); }
-
-.tw-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-.tw-input {
-  flex: 1 1 200px; min-width: 180px; padding: 7px 10px; border-radius: 8px; font-size: 12px;
-  color: var(--dsw-alias-label-primary, CanvasText);
-  background: var(--dsw-alias-bg-base, Field);
-  border: 1px solid var(--dsw-alias-border-l2, GrayText);
-}
-.tw-input:focus { outline: 2px solid var(--dsw-alias-button-info-fill, Highlight); outline-offset: 1px; }
-.tw-btn {
-  padding: 7px 14px; border-radius: 8px; cursor: pointer; font-size: 12px; font-weight: 600;
-  color: var(--dsw-alias-label-primary, ButtonText);
-  background: var(--dsw-alias-button-tool-bar-fill, ButtonFace);
-  border: 1px solid var(--dsw-alias-border-l2, GrayText);
-  transition: background .12s ease;
-}
-.tw-btn:hover:not(:disabled) { background: var(--dsw-alias-button-tool-bar-hover, var(--dsw-alias-interactive-bg-hover, ButtonFace)); }
-.tw-btn:disabled { opacity: .45; cursor: not-allowed; }
-.tw-btn.is-primary { background: var(--dsw-alias-button-info-fill, Highlight); color: var(--dsw-alias-label-primary-foreground, HighlightText); border-color: transparent; }
-.tw-btn.is-danger { background: var(--dsw-alias-state-error-primary, #d1242f); color: #fff; border-color: transparent; }
-.tw-btn.is-ghost { background: transparent; }
-.tw-empty { margin: 0; color: var(--dsw-alias-label-tertiary, GrayText); font-size: 12px; }
-
-.tw-toolcard { border: 1px solid var(--dsw-alias-border-l1, GrayText); border-left: 3px solid var(--dsw-alias-button-info-fill, Highlight); border-radius: 8px; background: var(--dsw-alias-bg-layer-1, Canvas); }
-.tw-toolcard > summary { cursor: pointer; padding: 8px 10px; font-size: 12px; font-weight: 600; }
-.tw-toolcard.is-error { border-left-color: var(--dsw-alias-state-error-primary, #d1242f); }
+.tw-fab{position:fixed;right:18px;bottom:18px;z-index:60;display:inline-flex;align-items:center;gap:8px;padding:10px 16px;border-radius:999px;cursor:pointer;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,CanvasText);background:var(--dsw-alias-button-elevated-fill,ButtonFace);border:1px solid var(--dsw-alias-border-l2,GrayText);box-shadow:0 6px 20px rgba(0,0,0,.18);transition:transform .12s ease,background .12s ease}
+.tw-fab:hover{transform:translateY(-1px);background:var(--dsw-alias-interactive-bg-hover,ButtonFace)}
+.tw-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-success-primary,#2ea043)}
+.tw-dot.live{background:var(--dsw-alias-state-error-primary,#d1242f)}
+.tw-scrim{position:fixed;inset:0;z-index:70;background:rgba(0,0,0,.42);opacity:0;pointer-events:none;transition:opacity .18s ease}
+.tw-scrim.open{opacity:1;pointer-events:auto}
+.tw-drawer{position:fixed;top:0;right:0;bottom:0;z-index:71;width:min(1180px,94vw);display:flex;flex-direction:column;background:var(--dsw-alias-bg-layer-1,Canvas);color:var(--dsw-alias-label-primary,CanvasText);border-left:1px solid var(--dsw-alias-border-l2,GrayText);box-shadow:-18px 0 48px rgba(0,0,0,.32);transform:translateX(102%);transition:transform .22s ease;font-size:13px;line-height:1.5}
+.tw-drawer.open{transform:translateX(0)}
+.tw-top{display:flex;align-items:center;gap:10px;padding:14px 18px;border-bottom:1px solid var(--dsw-alias-border-l1,GrayText);background:var(--dsw-alias-bg-layer-2,Canvas)}
+.tw-title{font-size:16px;font-weight:700;margin:0}
+.tw-badge{padding:3px 10px;border-radius:999px;font-size:11px;font-weight:700;letter-spacing:.5px;background:var(--dsw-alias-state-success-primary,#2ea043);color:#fff}
+.tw-badge.live{background:var(--dsw-alias-state-error-primary,#d1242f)}
+.tw-close{margin-left:auto;background:transparent;border:none;color:var(--dsw-alias-label-secondary,GrayText);font-size:20px;cursor:pointer;line-height:1;padding:4px 8px;border-radius:6px}
+.tw-close:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.15))}
+.tw-main{flex:1;display:flex;min-height:0}
+.tw-nav{width:132px;flex:0 0 132px;border-right:1px solid var(--dsw-alias-border-l1,GrayText);background:var(--dsw-alias-bg-layer-2,Canvas);padding:10px 8px;display:flex;flex-direction:column;gap:2px;overflow:auto}
+.tw-nav-item{display:flex;align-items:center;gap:8px;padding:9px 10px;border-radius:8px;cursor:pointer;font-size:13px;font-weight:600;color:var(--dsw-alias-label-secondary,GrayText);border:none;background:transparent;text-align:left;width:100%}
+.tw-nav-item:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.12));color:var(--dsw-alias-label-primary,CanvasText)}
+.tw-nav-item.active{background:var(--dsw-alias-interactive-bg-active,var(--dsw-alias-button-info-fill,Highlight));color:var(--dsw-alias-label-primary-foreground,HighlightText)}
+.tw-nav-dot{width:6px;height:6px;border-radius:50%;background:currentColor;opacity:.5}
+.tw-content{flex:1;min-width:0;overflow:auto;padding:16px 18px 24px;display:flex;flex-direction:column;gap:14px}
+.tw-content::-webkit-scrollbar{width:10px}
+.tw-content::-webkit-scrollbar-thumb{background:var(--dsw-alias-scrollbar-hover-l1,rgba(128,128,128,.4));border-radius:6px}
+.tw-hint{margin:0;color:var(--dsw-alias-label-tertiary,GrayText);font-size:12px}
+.tw-meta{margin:0;color:var(--dsw-alias-label-secondary,GrayText);font-size:12px}
+.tw-alert{margin:0;padding:8px 10px;border-radius:8px;font-size:12px;background:var(--dsw-alias-interactive-bg-hover-danger,rgba(209,36,47,.12));color:var(--dsw-alias-label-error,#d1242f);border:1px solid var(--dsw-alias-state-error-primary,rgba(209,36,47,.4))}
+.tw-status{margin:0;padding:8px 10px;border-radius:8px;font-size:12px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.1));color:var(--dsw-alias-label-secondary,GrayText)}
+.tw-toolbar{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tw-input{padding:7px 10px;border-radius:8px;font-size:12px;color:var(--dsw-alias-label-primary,CanvasText);background:var(--dsw-alias-bg-base,Field);border:1px solid var(--dsw-alias-border-l2,GrayText);width:120px}
+.tw-input:focus{outline:2px solid var(--dsw-alias-button-info-fill,Highlight);outline-offset:1px}
+.tw-btn{padding:6px 12px;border-radius:8px;cursor:pointer;font-size:12px;font-weight:600;color:var(--dsw-alias-label-primary,ButtonText);background:var(--dsw-alias-button-tool-bar-fill,ButtonFace);border:1px solid var(--dsw-alias-border-l2,GrayText)}
+.tw-btn:hover:not(:disabled){background:var(--dsw-alias-button-tool-bar-hover,var(--dsw-alias-interactive-bg-hover,ButtonFace))}
+.tw-btn:disabled{opacity:.45;cursor:not-allowed}
+.tw-btn.primary{background:var(--dsw-alias-button-info-fill,Highlight);color:var(--dsw-alias-label-primary-foreground,HighlightText);border-color:transparent}
+.tw-btn.danger{background:var(--dsw-alias-state-error-primary,#d1242f);color:#fff;border-color:transparent}
+.tw-btn.seg{padding:5px 10px;font-size:11px}
+.tw-btn.seg.active{background:var(--dsw-alias-interactive-bg-active,var(--dsw-alias-button-info-fill,Highlight));color:var(--dsw-alias-label-primary-foreground,HighlightText)}
+.tw-card{border:1px solid var(--dsw-alias-border-l1,GrayText);border-radius:10px;background:var(--dsw-alias-bg-layer-2,Canvas);overflow:hidden}
+.tw-card-head{display:flex;align-items:center;gap:8px;padding:10px 12px;font-weight:600;font-size:13px;border-bottom:1px solid var(--dsw-alias-border-l1,GrayText)}
+.tw-count{margin-left:auto;font-size:11px;font-weight:600;padding:1px 8px;border-radius:999px;color:var(--dsw-alias-label-secondary,GrayText);background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}
+.tw-card-body{padding:12px;display:flex;flex-direction:column;gap:10px}
+.tw-chart{width:100%;height:360px;display:block;border-radius:8px;background:var(--dsw-alias-bg-base,Canvas)}
+.tw-chart.small{height:150px}
+.tw-kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
+.tw-kv-item{padding:8px 10px;border-radius:8px;background:var(--dsw-alias-bg-base,Canvas);border:1px solid var(--dsw-alias-border-l1,GrayText)}
+.tw-kv-k{font-size:11px;color:var(--dsw-alias-label-tertiary,GrayText)}
+.tw-kv-v{font-size:14px;font-weight:700;margin-top:2px}
+.tw-item{border:1px solid var(--dsw-alias-border-l1,GrayText);border-radius:8px;background:var(--dsw-alias-bg-base,Canvas)}
+.tw-item>summary{cursor:pointer;padding:8px 10px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;list-style:none}
+.tw-item>summary::-webkit-details-marker{display:none}
+.tw-item>summary::before{content:"▸";color:var(--dsw-alias-label-tertiary,GrayText);transition:transform .12s ease}
+.tw-item[open]>summary::before{transform:rotate(90deg)}
+.tw-item>summary:hover{background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.1))}
+.tw-item-body{padding:0 10px 10px}
+.tw-tag{font-size:10px;font-weight:700;padding:1px 6px;border-radius:4px;background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.16));color:var(--dsw-alias-label-secondary,GrayText)}
+.tw-tag.buy{background:var(--dsw-alias-state-success-primary,#2ea043);color:#fff}
+.tw-tag.sell{background:var(--dsw-alias-state-error-primary,#d1242f);color:#fff}
+.tw-tag.hold{background:var(--dsw-alias-state-warn-label,#9a6700);color:#fff}
+.tw-pre{margin:6px 0 0;padding:10px;border-radius:8px;font-size:12px;white-space:pre-wrap;overflow-wrap:anywhere;font-family:var(--ds-font-family-code,ui-monospace,Menlo,monospace);background:var(--dsw-alias-bg-base,Canvas);border:1px solid var(--dsw-alias-border-l1,GrayText);max-height:300px;overflow:auto}
+.tw-sources{margin:8px 0 0;padding-left:18px;font-size:12px;color:var(--dsw-alias-label-secondary,GrayText)}
+.tw-sources a{color:var(--dsw-alias-label-primary-bluish,LinkText)}
+.tw-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.tw-empty{margin:0;color:var(--dsw-alias-label-tertiary,GrayText);font-size:12px}
+.tw-toolcard{border:1px solid var(--dsw-alias-border-l1,GrayText);border-left:3px solid var(--dsw-alias-button-info-fill,Highlight);border-radius:8px;background:var(--dsw-alias-bg-layer-1,Canvas)}
+.tw-toolcard>summary{cursor:pointer;padding:8px 10px;font-size:12px;font-weight:600}
+.tw-toolcard.err{border-left-color:var(--dsw-alias-state-error-primary,#d1242f)}
 `;
 
     function injectStyles(ctx) {
@@ -156,22 +95,179 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode"].includes(endpoint)) throw new Error("Unsupported workbench operation");
+      if (!["snapshot", "switch-mode", "series"].includes(endpoint)) throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
       return result.value;
     }
 
-    const RATING_CLASS = { Buy: "rating-buy", Overweight: "rating-buy", Sell: "rating-sell", Underweight: "rating-sell", Hold: "rating-hold" };
+    // ── 主题色读取（图表绘制用）────────────────────────────────────────────
+    function themeColors() {
+      const fallback = { up: "#2ea043", down: "#d1242f", line: "#4a9eff", text: "#888", grid: "rgba(128,128,128,.25)", bg: "transparent" };
+      if (typeof document === "undefined") return fallback;
+      const s = getComputedStyle(document.documentElement);
+      const read = (name, fb) => (s.getPropertyValue(name) || "").trim() || fb;
+      return {
+        up: read("--dsw-alias-state-success-primary", fallback.up),
+        down: read("--dsw-alias-state-error-primary", fallback.down),
+        line: read("--dsw-alias-button-info-fill", fallback.line),
+        text: read("--dsw-alias-label-secondary", fallback.text),
+        grid: read("--dsw-alias-border-l1", fallback.grid),
+        bg: read("--dsw-alias-bg-base", fallback.bg),
+      };
+    }
 
-    function ToolCard({ block }) {
-      const settled = Array.isArray(block?.content);
-      const content = settled
-        ? block.content.filter(item => item.type === "text").map(item => item.text).join("\n")
-        : "Harness 正在处理…";
-      return h("details", { className: `tw-toolcard${block?.isError ? " is-error" : ""}` },
-        h("summary", null, block?.isError ? "交易工作台 · 操作失败" : "交易工作台 · 结果"),
-        h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, content)));
+    // ── canvas 绘制原语 ──────────────────────────────────────────────────
+    function useCanvasChart(draw, deps) {
+      const ref = React.useRef(null);
+      React.useEffect(() => {
+        const canvas = ref.current;
+        if (!canvas || typeof canvas.getContext !== "function") return;
+        const dpr = (typeof window !== "undefined" && window.devicePixelRatio) || 1;
+        const rect = canvas.getBoundingClientRect();
+        const width = Math.max(rect.width, 200);
+        const height = Math.max(rect.height, 80);
+        canvas.width = Math.round(width * dpr);
+        canvas.height = Math.round(height * dpr);
+        const ctx = canvas.getContext("2d");
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        ctx.clearRect(0, 0, width, height);
+        try {
+          draw(ctx, width, height, themeColors());
+        } catch (error) {
+          ctx.fillStyle = themeColors().down;
+          ctx.font = "12px sans-serif";
+          ctx.fillText(`绘图失败：${String(error.message).slice(0, 80)}`, 10, 20);
+        }
+      }, deps);
+      return ref;
+    }
+
+    function movingAverage(bars, n) {
+      const out = new Array(bars.length).fill(null);
+      let sum = 0;
+      for (let i = 0; i < bars.length; i += 1) {
+        sum += bars[i].c;
+        if (i >= n) sum -= bars[i - n].c;
+        if (i >= n - 1) out[i] = sum / n;
+      }
+      return out;
+    }
+
+    function KLineChart({ bars }) {
+      const ref = useCanvasChart((ctx, width, height, color) => {
+        if (!bars || bars.length < 2) {
+          ctx.fillStyle = color.text;
+          ctx.font = "12px sans-serif";
+          ctx.fillText("暂无K线数据", 12, 22);
+          return;
+        }
+        const padL = 46, padR = 12, padT = 10, volH = Math.round(height * 0.22), gap = 8;
+        const priceH = height - padT - volH - gap - 18;
+        const ma5 = movingAverage(bars, 5), ma20 = movingAverage(bars, 20);
+        const values = bars.flatMap((b) => [b.h, b.l]).concat(ma5.filter((v) => v !== null), ma20.filter((v) => v !== null));
+        let min = Math.min(...values), max = Math.max(...values);
+        if (max - min < 1e-9) { max += 1; min -= 1; }
+        const span = max - min;
+        min -= span * 0.04; max += span * 0.04;
+        const maxVol = Math.max(...bars.map((b) => b.v || 0), 1);
+        const innerW = width - padL - padR;
+        const step = innerW / bars.length;
+        const cw = Math.max(1, Math.min(step * 0.65, 12));
+        const y = (price) => padT + priceH * (1 - (price - min) / (max - min));
+
+        // 网格 + 价格刻度
+        ctx.strokeStyle = color.grid; ctx.lineWidth = 1;
+        ctx.fillStyle = color.text; ctx.font = "10px sans-serif";
+        for (let i = 0; i <= 4; i += 1) {
+          const price = min + (max - min) * (i / 4);
+          const gy = Math.round(y(price)) + 0.5;
+          ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(width - padR, gy); ctx.stroke();
+          ctx.fillText(price.toFixed(2), 4, gy + 3);
+        }
+        // 蜡烛 + 成交量
+        bars.forEach((b, i) => {
+          const cx = padL + step * i + step / 2;
+          const up = b.c >= b.o;
+          ctx.strokeStyle = up ? color.up : color.down;
+          ctx.fillStyle = up ? color.up : color.down;
+          ctx.beginPath(); ctx.moveTo(cx, y(b.h)); ctx.lineTo(cx, y(b.l)); ctx.stroke();
+          const top = y(Math.max(b.o, b.c)), bottom = y(Math.min(b.o, b.c));
+          ctx.fillRect(cx - cw / 2, top, cw, Math.max(1, bottom - top));
+          const vh = (b.v || 0) / maxVol * volH;
+          ctx.globalAlpha = 0.55;
+          ctx.fillRect(cx - cw / 2, height - 16 - vh, cw, Math.max(0.5, vh));
+          ctx.globalAlpha = 1;
+        });
+        // 均线
+        const line = (series, color2) => {
+          ctx.strokeStyle = color2; ctx.lineWidth = 1.4; ctx.beginPath();
+          let started = false;
+          series.forEach((value, i) => {
+            if (value === null) return;
+            const cx = padL + step * i + step / 2;
+            if (!started) { ctx.moveTo(cx, y(value)); started = true; } else ctx.lineTo(cx, y(value));
+          });
+          ctx.stroke();
+        };
+        line(ma5, color.line);
+        line(ma20, "#c9a227");
+        // 时间刻度
+        ctx.fillStyle = color.text;
+        const ticks = 4;
+        for (let i = 0; i < ticks; i += 1) {
+          const index = Math.floor((bars.length - 1) * (i / (ticks - 1)));
+          const label = String(bars[index].t).slice(5, 16);
+          const lx = padL + step * index + step / 2;
+          ctx.fillText(label, Math.min(lx, width - padR - 62), height - 3);
+        }
+        // 图例
+        ctx.fillStyle = color.line; ctx.fillRect(padL, padT - 6, 10, 2);
+        ctx.fillStyle = color.text; ctx.fillText("MA5", padL + 14, padT - 2);
+        ctx.fillStyle = "#c9a227"; ctx.fillRect(padL + 48, padT - 6, 10, 2);
+        ctx.fillStyle = color.text; ctx.fillText("MA20", padL + 62, padT - 2);
+      }, [bars]);
+      return h("canvas", { ref, className: "tw-chart" });
+    }
+
+    function LineChart({ points, label = "" }) {
+      const ref = useCanvasChart((ctx, width, height, color) => {
+        if (!points || points.length < 2) {
+          ctx.fillStyle = color.text; ctx.font = "12px sans-serif";
+          ctx.fillText("暂无序列数据", 12, 22); return;
+        }
+        const padL = 46, padR = 12, padT = 10, padB = 18;
+        const values = points.map((p) => p.v);
+        let min = Math.min(...values), max = Math.max(...values);
+        if (max - min < 1e-9) { max += 1; min -= 1; }
+        const span = max - min; min -= span * 0.06; max += span * 0.06;
+        const y = (v) => padT + (height - padT - padB) * (1 - (v - min) / (max - min));
+        const x = (i) => padL + (width - padL - padR) * (i / (points.length - 1));
+        ctx.strokeStyle = color.grid; ctx.fillStyle = color.text; ctx.font = "10px sans-serif";
+        for (let i = 0; i <= 4; i += 1) {
+          const v = min + (max - min) * (i / 4);
+          const gy = Math.round(y(v)) + 0.5;
+          ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(width - padR, gy); ctx.stroke();
+          ctx.fillText(v.toFixed(2), 4, gy + 3);
+        }
+        const rising = values[values.length - 1] >= values[0];
+        ctx.strokeStyle = rising ? color.up : color.down; ctx.lineWidth = 1.8; ctx.beginPath();
+        points.forEach((p, i) => { if (i === 0) ctx.moveTo(x(i), y(p.v)); else ctx.lineTo(x(i), y(p.v)); });
+        ctx.stroke();
+        ctx.globalAlpha = 0.12; ctx.fillStyle = ctx.strokeStyle;
+        ctx.lineTo(x(points.length - 1), height - padB); ctx.lineTo(x(0), height - padB); ctx.closePath(); ctx.fill();
+        ctx.globalAlpha = 1;
+        if (label) { ctx.fillStyle = color.text; ctx.fillText(label, padL, height - 4); }
+      }, [points, label]);
+      return h("canvas", { ref, className: "tw-chart small" });
+    }
+
+    // ── 展示组件 ────────────────────────────────────────────────────────
+    function Card({ title, count, empty, children }) {
+      return h("section", { className: "tw-card" },
+        h("div", { className: "tw-card-head" }, title,
+          count !== undefined && h("span", { className: "tw-count" }, String(count))),
+        h("div", { className: "tw-card-body" }, empty ? h("p", { className: "tw-empty" }, empty) : children));
     }
 
     function Source({ source }) {
@@ -180,64 +276,160 @@ window.__ModuleLoader__.load({
         link ? h("a", { href: source.reference, target: "_blank", rel: "noreferrer" }, source.reference) : source.reference);
     }
 
-    function Card({ title, count, empty, children }) {
-      return h("section", { className: "tw-card" },
-        h("div", { className: "tw-card-head" }, title,
-          count !== undefined && h("span", { className: "tw-count" }, String(count))),
-        h("div", { className: "tw-card-body" }, empty ? h("p", { className: "tw-empty" }, empty) : children));
+    const RATING_CLASS = { Buy: "buy", Overweight: "buy", Sell: "sell", Underweight: "sell", Hold: "hold" };
+
+    function ToolCard({ block }) {
+      const settled = Array.isArray(block?.content);
+      const content = settled ? block.content.filter((i) => i.type === "text").map((i) => i.text).join("\n")
+        : "Harness 正在处理…";
+      return h("details", { className: `tw-toolcard${block?.isError ? " err" : ""}` },
+        h("summary", null, block?.isError ? "交易工作台 · 操作失败" : "交易工作台 · 结果"),
+        h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, content)));
     }
 
-    function Reports({ snapshot }) {
-      const running = snapshot.runs.filter(run => run.status === "running");
-      const hasContent = running.length > 0 || snapshot.reports.length > 0;
-      return h(Card, { title: "研报结果", count: snapshot.reports.length,
-        empty: hasContent ? undefined : "暂无研报。在 Harness 中提出分析请求，完成后会在这里展示。" },
-        running.map(run => h("div", { key: run.id, className: "tw-item" },
-          h("div", { className: "tw-item-body" },
-            h("span", { className: "tw-tag" }, "进行中"),
-            ` ${run.ticker} · 待 Harness 完成并发布 · ${run.started_at}`))),
-        snapshot.reports.map(report => h("details", { key: report.id, className: "tw-item" },
-          h("summary", null,
-            h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
-            `${report.ticker}`,
-            h("span", { className: "tw-meta" }, report.published_at)),
-          h("div", { className: "tw-item-body" },
-            h("pre", { className: "tw-pre" }, report.report),
-            h("ul", { className: "tw-sources" }, report.sources.map((source, index) => h(Source, { key: index, source })))))));
+    const PERIODS = ["1m", "5m", "15m", "30m", "60m", "1d"];
+    const NAV = [
+      { id: "market", label: "行情" }, { id: "signal", label: "信号" },
+      { id: "portfolio", label: "组合" }, { id: "risk", label: "风险" },
+      { id: "execution", label: "执行" }, { id: "research", label: "研究" },
+      { id: "events", label: "事件" }, { id: "audit", label: "审计" },
+    ];
+
+    function MarketView({ rpc, state, setState }) {
+      const { ticker, period, bars, loading, error, meta } = state;
+      React.useEffect(() => {
+        let alive = true;
+        const controller = new AbortController();
+        setState((s) => ({ ...s, loading: true, error: "" }));
+        request(rpc, "series", { ticker, period, limit: 300 }, controller.signal)
+          .then((value) => { if (alive) setState((s) => ({ ...s, bars: value.bars, meta: { source: value.source, as_of: value.as_of }, loading: false })); })
+          .catch((failure) => { if (alive) setState((s) => ({ ...s, error: failure.message, loading: false })); });
+        return () => { alive = false; controller.abort(); };
+      }, [ticker, period]);
+
+      const last = bars && bars.length ? bars[bars.length - 1] : null;
+      const prev = bars && bars.length > 1 ? bars[bars.length - 2] : null;
+      const change = last && prev ? ((last.c - prev.c) / prev.c) * 100 : 0;
+      return h(React.Fragment, null,
+        h("div", { className: "tw-toolbar" },
+          h("input", { className: "tw-input", value: ticker, "aria-label": "标的代码",
+            onChange: (e) => setState((s) => ({ ...s, ticker: e.target.value.toUpperCase() })) }),
+          PERIODS.map((p) => h("button", { key: p, type: "button",
+            className: `tw-btn seg${p === period ? " active" : ""}`,
+            onClick: () => setState((s) => ({ ...s, period: p })) }, p)),
+          h("span", { className: "tw-meta" }, loading ? "加载中…" : meta.as_of ? `数据截至 ${meta.as_of} · ${meta.source}` : "")),
+        error && h("p", { className: "tw-alert" }, `行情获取失败：${error}`),
+        h("div", { className: "tw-kv" },
+          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最新价"),
+            h("div", { className: "tw-kv-v" }, last ? last.c.toFixed(2) : "—")),
+          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "涨跌（周期）"),
+            h("div", { className: "tw-kv-v", style: { color: change >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
+              `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`)),
+          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最高/最低（区间）"),
+            h("div", { className: "tw-kv-v" }, bars && bars.length ? `${Math.max(...bars.map((b) => b.h)).toFixed(2)} / ${Math.min(...bars.map((b) => b.l)).toFixed(2)}` : "—")),
+          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交量（末根）"),
+            h("div", { className: "tw-kv-v" }, last ? Math.round(last.v).toLocaleString() : "—"))),
+        h(Card, { title: "K线 · MA5/MA20 · 成交量" }, h(KLineChart, { bars })),
+        h("p", { className: "tw-hint" }, "分钟级数据来自新浪源（A股）；港股/美股当前的分钟K线数据源受富途接口限制，暂以快照单点降级显示。"));
     }
 
-    function Activity({ snapshot }) {
-      return h(Card, { title: "交易动态", count: snapshot.activity.length },
-        h("p", { className: "tw-meta" }, snapshot.broker
-          ? `最近响应：${snapshot.broker.at}。响应不等于成交，状态以券商查询为准。`
-          : "暂无该模式的券商响应；未连接不表示资产为零。"),
-        snapshot.activity.slice(0, 30).map(row => h("details", { key: row.id, className: "tw-item" },
+    function SignalView({ snapshot, series }) {
+      const previews = snapshot.previews.filter((p) => p.kind === "signal" || p.kind === "backtest");
+      return h(React.Fragment, null,
+        h(Card, { title: "量化信号与回测（由 Harness 计算）", count: previews.length,
+          empty: "暂无信号。请在 Harness 会话中请求（如“看下 600519 的信号”），结果显示在这里。" },
+          previews.slice(0, 10).map((p) => h("details", { key: p.id, className: "tw-item" },
+            h("summary", null,
+              h("span", { className: `tw-tag ${p.value?.signal === "BUY" ? "buy" : p.value?.signal === "SELL" ? "sell" : "hold"}` },
+                p.value?.signal ?? p.kind),
+              `${p.value?.ticker ?? ""}`,
+              h("span", { className: "tw-meta" }, p.at)),
+            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(p.value, null, 2)))))),
+        series && series.length > 1 && h(Card, { title: "价格走势（当前标的）" },
+          h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })),
+        h("p", { className: "tw-hint" }, "工作台只展示结果；信号计算、回测与下单请在 Harness 会话中发起。"));
+    }
+
+    function PortfolioView({ snapshot, series }) {
+      const broker = snapshot.broker;
+      const ledger = snapshot.previews.find((p) => p.kind === "ledger");
+      return h(React.Fragment, null,
+        h(Card, { title: "账户与权益" },
+          h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "账户模式"),
+              h("div", { className: "tw-kv-v" }, snapshot.mode === "live" ? "实盘 LIVE" : "模拟盘 SIM")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "本地台账权益"),
+              h("div", { className: "tw-kv-v" }, ledger?.value?.equity?.toLocaleString?.() ?? "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "总收益"),
+              h("div", { className: "tw-kv-v" }, ledger?.value?.total_return !== undefined ? `${(ledger.value.total_return * 100).toFixed(2)}%` : "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "胜率 / 交易数"),
+              h("div", { className: "tw-kv-v" }, ledger?.value ? `${((ledger.value.win_rate ?? 0) * 100).toFixed(0)}% / ${ledger.value.trades ?? 0}` : "—"))),
+          h("p", { className: "tw-meta" }, ledger ? "来源：本地模拟台账（非券商资产）" : "尚未读取台账；请在 Harness 中调用 quant_report"),
+          broker && h("p", { className: "tw-meta" }, `最近券商响应：${broker.at}`)),
+        series && series.length > 1 && h(Card, { title: "价格序列（当前标的）" }, h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })),
+        h("p", { className: "tw-hint" }, "持仓与资金请用富途账户查询工具；本面板不提供下单入口。"));
+    }
+
+    function RiskView({ snapshot }) {
+      const latest = snapshot.previews.find((p) => p.kind === "backtest");
+      const s = latest?.value?.summary;
+      return h(React.Fragment, null,
+        h(Card, { title: "回测风险指标（最近一次）",
+          empty: s ? undefined : "暂无回测结果。在 Harness 中请求“跑个回测”后显示。" },
+          s && h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最大回撤"), h("div", { className: "tw-kv-v" }, `${(s.max_drawdown * 100).toFixed(2)}%`)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "夏普"), h("div", { className: "tw-kv-v" }, String(s.sharpe))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "年化"), h("div", { className: "tw-kv-v" }, `${(s.annualized * 100).toFixed(2)}%`)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "样本数"), h("div", { className: "tw-kv-v" }, String(s.bars))))),
+        h("p", { className: "tw-hint" }, "相关性矩阵、VaR、敞口分析等依赖序列数据接入（QW-4）；当前仅展示已采集的回测风险指标。"));
+    }
+
+    function ExecutionView({ snapshot }) {
+      return h(Card, { title: "交易动态（Harness 观察到的券商响应）", count: snapshot.activity.length },
+        h("p", { className: "tw-meta" }, "响应不等于成交；状态以券商查询为准。下单请在 Harness 会话中完成并确认。"),
+        snapshot.activity.slice(0, 30).map((row) => h("details", { key: row.id, className: "tw-item" },
           h("summary", null, `${row.at} · ${row.tool ?? row.kind}`,
-            row.is_error ? h("span", { className: "tw-tag", style: { background: "var(--dsw-alias-state-error-primary, #d1242f)", color: "#fff" } }, "失败") : null),
-          h("div", { className: "tw-item-body" },
-            h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2))))));
+            row.is_error ? h("span", { className: "tw-tag sell" }, "失败") : null),
+          h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2))))));
     }
 
-    function Previews({ snapshot }) {
-      return h(Card, { title: "量化预览", count: snapshot.previews.length,
-        empty: snapshot.previews.length ? undefined : "暂无量化预览" },
-        h("p", { className: "tw-meta" }, "本地计算／模拟结果，不代表券商资产或成交。请在 Harness 请求信号、回测或台账。"),
-        snapshot.previews.slice(0, 20).map(row => h("details", { key: row.id, className: "tw-item" },
-          h("summary", null, `${row.kind}`, h("span", { className: "tw-tag" }, row.value?.ticker ?? "-"),
-            h("span", { className: "tw-meta" }, row.at)),
-          h("div", { className: "tw-item-body" },
-            h("pre", { className: "tw-pre" }, JSON.stringify(row.value, null, 2))))));
+    function ResearchView({ snapshot }) {
+      const running = snapshot.runs.filter((run) => run.status === "running");
+      return h(Card, { title: "研报结果", count: snapshot.reports.length,
+        empty: snapshot.reports.length || running.length ? undefined : "暂无研报。在 Harness 中要求完整投研后，发布结果会显示在这里。" },
+        running.map((run) => h("div", { key: run.id, className: "tw-item" },
+          h("div", { className: "tw-item-body" }, h("span", { className: "tw-tag" }, "进行中"), ` ${run.ticker} · ${run.started_at}`))),
+        snapshot.reports.map((report) => h("details", { key: report.id, className: "tw-item" },
+          h("summary", null, h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
+            report.ticker, h("span", { className: "tw-meta" }, report.published_at)),
+          h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, report.report),
+            h("ul", { className: "tw-sources" }, report.sources.map((s, i) => h(Source, { key: i, source: s })))))));
+    }
+
+    function EventsView() {
+      return h(Card, { title: "事件与日历" },
+        h("p", { className: "tw-empty" }, "财报/分红/拆股/经济日历接入中（QW-6）。届时会与当前持仓和信号自动对齐告警。"),
+        h("p", { className: "tw-hint" }, "现可在 Harness 中用富途工具查询：quote_financials_*、quote_corporate_actions_*、quote_economic_calendar_search。"));
+    }
+
+    function AuditView({ snapshot }) {
+      return h(Card, { title: "审计：响应与预览记录", count: snapshot.activity.length + snapshot.previews.length },
+        h("p", { className: "tw-meta" }, `账户模式 ${snapshot.mode}；进行中的账户调用 ${snapshot.in_flight}；暂存响应 ${snapshot.pending_observations}。`),
+        h("p", { className: "tw-hint" }, "信号→订单→成交的完整链路审计（含审批记录）在 QW-6 交付；当前记录观察到的工具响应与量化预览。"));
     }
 
     function Dashboard({ rpc }) {
       const [open, setOpen] = React.useState(false);
+      const [tab, setTab] = React.useState("market");
       const [snapshot, setSnapshot] = React.useState(null);
       const [error, setError] = React.useState("");
       const [switchError, setSwitchError] = React.useState("");
       const [confirmation, setConfirmation] = React.useState("");
       const [switching, setSwitching] = React.useState(false);
       const [revision, setRevision] = React.useState(0);
+      const [market, setMarket] = React.useState({ ticker: "600519", period: "5m", bars: null, loading: false, error: "", meta: {} });
       const generation = React.useRef(0);
+
       React.useEffect(() => {
         if (!open || switching) return;
         const controller = new AbortController();
@@ -246,10 +438,7 @@ window.__ModuleLoader__.load({
         const refresh = async () => {
           try {
             const next = await request(rpc, "snapshot", {}, controller.signal);
-            if (!controller.signal.aborted && generation.current === current) {
-              setSnapshot(next);
-              setError("");
-            }
+            if (!controller.signal.aborted && generation.current === current) { setSnapshot(next); setError(""); }
           } catch (failure) {
             if (!controller.signal.aborted && generation.current === current) setError(failure.message);
           } finally {
@@ -262,70 +451,62 @@ window.__ModuleLoader__.load({
 
       const switchMode = async (mode) => {
         const expected = snapshot.mode;
-        generation.current += 1;
-        setSwitching(true);
-        setSnapshot(null);
-        setError("");
-        setSwitchError("");
+        generation.current += 1; setSwitching(true); setSnapshot(null); setError(""); setSwitchError("");
         try {
-          await request(rpc, "switch-mode", { mode, expected_mode: expected,
-            ...(mode === "live" ? { confirmation } : {}) });
+          await request(rpc, "switch-mode", { mode, expected_mode: expected, ...(mode === "live" ? { confirmation } : {}) });
           setConfirmation("");
-        } catch (failure) {
-          setSwitchError(failure.message);
-        } finally {
-          setSwitching(false);
-          setRevision(value => value + 1);
-        }
+        } catch (failure) { setSwitchError(failure.message); }
+        finally { setSwitching(false); setRevision((v) => v + 1); }
       };
 
       const live = snapshot?.mode === "live";
       return h(React.Fragment, null,
-        h("button", { type: "button", className: "tw-fab", onClick: () => setOpen(value => !value),
-          "aria-expanded": open, title: "交易工作台" },
-          h("span", { className: `tw-fab-dot${live ? " is-live" : ""}` }),
-          open ? "收起交易工作台" : "交易工作台"),
-        open && h("section", { role: "dialog", "aria-label": "交易工作台", className: "tw-panel" },
-          h("header", { className: "tw-header" },
+        h("button", { type: "button", className: "tw-fab", "aria-expanded": open, title: "交易工作台",
+          onClick: () => setOpen((v) => !v) },
+          h("span", { className: `tw-dot${live ? " live" : ""}` }), open ? "收起工作台" : "交易工作台"),
+        h("div", { className: `tw-scrim${open ? " open" : ""}`, onClick: () => setOpen(false) }),
+        h("aside", { className: `tw-drawer${open ? " open" : ""}`, role: "dialog", "aria-label": "交易工作台", "aria-hidden": !open },
+          h("header", { className: "tw-top" },
             h("h2", { className: "tw-title" }, "交易工作台"),
-            snapshot && h("span", { className: `tw-badge${live ? " is-live" : ""}` }, live ? "实盘 LIVE" : "模拟盘 SIM")),
-          h("div", { className: "tw-body" },
-            h("p", { className: "tw-hint" }, "这里只展示结果与切换账户模式；所有对话、分析请求及交易指令仍在 Harness 中下达。"),
-            switchError && h("p", { role: "alert", className: "tw-alert" }, `模式切换失败：${switchError}`),
-            error && h("p", { role: "alert", className: "tw-alert" }, `更新失败：${error}。下方如有数据，为上次快照。`),
-            !snapshot && h("p", { className: "tw-status" }, switching ? "正在切换模式…" : "正在读取工作台…"),
-            snapshot && h(React.Fragment, null,
-              snapshot.recording_error && h("p", { role: "alert", className: "tw-alert" }, snapshot.recording_error),
-              snapshot.pending_observations > 0 && h("p", { role: "status", className: "tw-status" },
-                `${snapshot.pending_observations} 条响应已暂存，等待写锁释放后更新；不要因此重试下单。`),
-              h("p", { className: "tw-meta" },
-                `快照时间：${snapshot.generated_at} · 每 3 秒刷新 · 进行中的账户调用：${snapshot.in_flight}`),
-              h("p", { className: "tw-meta" }, "切换模式不授权下单；重启会保留当前模式。"),
-              h("div", { className: "tw-row" },
+            snapshot && h("span", { className: `tw-badge${live ? " live" : ""}` }, live ? "实盘 LIVE" : "模拟盘 SIM"),
+            snapshot && h("span", { className: "tw-meta" }, `更新 ${String(snapshot.generated_at).slice(11, 19)}`),
+            h("button", { type: "button", className: "tw-close", onClick: () => setOpen(false), "aria-label": "关闭" }, "×")),
+          h("div", { className: "tw-main" },
+            h("nav", { className: "tw-nav" }, NAV.map((item) =>
+              h("button", { key: item.id, type: "button", className: `tw-nav-item${tab === item.id ? " active" : ""}`,
+                onClick: () => setTab(item.id) }, h("span", { className: "tw-nav-dot" }), item.label))),
+            h("div", { className: "tw-content" },
+              switchError && h("p", { role: "alert", className: "tw-alert" }, `模式切换失败：${switchError}`),
+              error && h("p", { role: "alert", className: "tw-alert" }, `更新失败：${error}`),
+              !snapshot && h("p", { className: "tw-status" }, switching ? "正在切换模式…" : "正在读取工作台…"),
+              tab === "market" && h(MarketView, { rpc, state: market, setState: setMarket }),
+              snapshot && tab === "signal" && h(SignalView, { snapshot, series: market.bars }),
+              snapshot && tab === "portfolio" && h(PortfolioView, { snapshot, series: market.bars }),
+              snapshot && tab === "risk" && h(RiskView, { snapshot }),
+              snapshot && tab === "execution" && h(ExecutionView, { snapshot }),
+              snapshot && tab === "research" && h(ResearchView, { snapshot }),
+              tab === "events" && h(EventsView, null),
+              snapshot && tab === "audit" && h(AuditView, { snapshot }),
+              snapshot && h("div", { className: "tw-row" },
                 snapshot.mode === "sim"
                   ? h(React.Fragment, null,
-                    h("input", { className: "tw-input", value: confirmation, placeholder: "切换实盘前输入「确认实盘」",
-                      onChange: event => setConfirmation(event.target.value), autoComplete: "off", "aria-label": "确认实盘" }),
-                    h("button", { type: "button", className: "tw-btn is-danger",
+                    h("input", { className: "tw-input", value: confirmation, placeholder: "输入「确认实盘」以切换",
+                      onChange: (e) => setConfirmation(e.target.value), autoComplete: "off", "aria-label": "确认实盘" }),
+                    h("button", { type: "button", className: "tw-btn danger",
                       disabled: confirmation !== "确认实盘" || snapshot.in_flight > 0,
                       onClick: () => switchMode("live") }, "切换到实盘"))
-                  : h("button", { type: "button", className: "tw-btn is-primary", disabled: snapshot.in_flight > 0,
-                      onClick: () => switchMode("sim") }, "切回模拟盘"),
-                h("button", { type: "button", className: "tw-btn is-ghost",
-                  onClick: () => setRevision(value => value + 1) }, "刷新")),
-              h(Reports, { snapshot }), h(Activity, { snapshot }), h(Previews, { snapshot }),
-              h("p", { className: "tw-hint" }, snapshot.notice)))));
+                  : h("button", { type: "button", className: "tw-btn primary",
+                      disabled: snapshot.in_flight > 0, onClick: () => switchMode("sim") }, "切回模拟盘"),
+                h("button", { type: "button", className: "tw-btn", onClick: () => setRevision((v) => v + 1) }, "刷新")),
+              snapshot && h("p", { className: "tw-hint" }, snapshot.notice)))));
     }
 
     function apply(ctx) {
       const disposeStyles = injectStyles(ctx);
-      if (typeof ctx.effect === "function" && typeof disposeStyles === "function") {
-        ctx.effect(() => disposeStyles);
-      }
+      if (typeof ctx.effect === "function" && typeof disposeStyles === "function") ctx.effect(() => disposeStyles);
       const rpc = ctx.connection.rpc;
       ctx.slots.inject("shell.overlay", () => ctx.slots.register(
-        { name: "shell.overlay", id: "trading-workbench" },
-        () => h(Dashboard, { rpc })));
+        { name: "shell.overlay", id: "trading-workbench" }, () => h(Dashboard, { rpc })));
       for (const key of ["research_publish", "run_trading_analysis", "quant_signal", "quant_backtest", "quant_report"]) {
         ctx.slots.inject("tool.call.toolview", () => ctx.slots.register(
           { name: "tool.call.toolview", key }, ToolCard));

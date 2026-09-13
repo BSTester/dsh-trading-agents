@@ -1,8 +1,8 @@
 import { WorkbenchError } from "./store.js";
 
 // Exact Connection Fetch routes share Harness authentication and its RPC envelope.
-export function createRpcFetchHandler(store, endpoint) {
-  const handle = createRpcHandler(store);
+export function createRpcFetchHandler(store, endpoint, deps = {}) {
+  const handle = createRpcHandler(store, deps);
   return async (request) => {
     if (request.headers.get("content-type")?.split(";")[0].trim() !== "application/json") {
       return new Response("Expected application/json", { status: 415 });
@@ -24,7 +24,7 @@ export function createRpcFetchHandler(store, endpoint) {
   };
 }
 
-export function createRpcHandler(store) {
+export function createRpcHandler(store, deps = {}) {
   return async (endpoint, payload) => {
     try {
       if (!payload || typeof payload !== "object" || Array.isArray(payload)) {
@@ -38,6 +38,19 @@ export function createRpcHandler(store) {
           throw new WorkbenchError("Unexpected switch-mode field");
         }
         return { ok: true, value: store.switchMode(payload) };
+      }
+      if (endpoint === "series") {
+        if (Object.keys(payload).some(key => !["ticker", "period", "limit"].includes(key))) {
+          throw new WorkbenchError("Unexpected series field");
+        }
+        if (typeof deps.fetchSeries !== "function") throw new WorkbenchError("Series provider unavailable");
+        try {
+          return { ok: true, value: await deps.fetchSeries(payload) };
+        } catch (error) {
+          // 取数失败以可读原因返回，不抛出：面板需显示降级状态而不是空白。
+          return { ok: false, error: { code: "trading/series-unavailable",
+            message: String(error?.message ?? error).slice(0, 300), details: {} } };
+        }
       }
       throw new WorkbenchError("Unknown workbench operation");
     } catch (error) {
