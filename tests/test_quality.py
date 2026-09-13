@@ -239,6 +239,38 @@ class ReturnsFallbackTests(unittest.TestCase):
         self.assertIn("未做任何估算", payload["note"])
 
 
+class FutuSymbolTests(unittest.TestCase):
+    """调用富途前必须归一化成 MARKET.CODE。
+
+    实测：直接传 "TSLA" 会被富途参数校验拒绝
+    （`ret=-3 parameter 'symbol' does not match pattern '^[A-Z0-9_]+\\.[...]$'`），
+    而用户输入与 K 线页传过来的往往就是裸代码，表现为质量因子整卡报错。
+    """
+
+    CASES = [("TSLA", "US.TSLA"), ("US.TSLA", "US.TSLA"), ("aapl", "US.AAPL"),
+             ("600519", "SH.600519"), ("600519.SH", "SH.600519"),
+             ("700", "HK.00700"), ("HK.00700", "HK.00700"), ("00700.HK", "HK.00700")]
+
+    def test_normalizes_before_calling_futu(self):
+        module = load_quality()
+        seen = []
+
+        def call(name, arguments, **kwargs):
+            seen.append((name, arguments["symbol"]))
+            return {"report_list": [report(2026, 3, 1782489600000, INCOME)]}
+
+        for raw, expected in self.CASES:
+            seen.clear()
+            with patch.object(module, "call_tool", side_effect=call), \
+                 patch.object(module, "load_returns",
+                              return_value={"available": False, "roe": None, "roa": None,
+                                            "reason": "测试"}):
+                payload = module.collect(raw)
+            self.assertEqual(seen, [("quote_financials_statements", expected)], raw)
+            self.assertEqual(payload["symbol"], expected, raw)
+            self.assertEqual(payload["ticker"], raw, "对外仍保留用户输入的原写法")
+
+
 class YahooSymbolTests(unittest.TestCase):
     """符号映射错了会静默取到别的公司的数据，比取不到更危险。"""
 

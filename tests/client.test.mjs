@@ -344,3 +344,45 @@ test("K 线图接上了鼠标事件，且只在跨根时才重绘", async () => 
   assert.match(text, /geometry\.current = \{/, "绘制时须记录几何量，命中判定才能与绘制对齐");
   assert.match(source, /function drawKLineHover\(/, "缺少悬停绘制");
 });
+
+test("数值展示：字段缺失时显示「—」，不得出现 NaN/undefined", async () => {
+  const plugin = await client();
+  const { internals } = plugin;
+  assert.equal(typeof internals.numeric, "function", "缺少统一数值展示函数");
+  const { numeric } = internals;
+  // 注意：numeric 不做 ×100，调用方传入已换算好的百分数
+  assert.equal(numeric(12.34, 2, "%"), "12.34%");
+  assert.equal(numeric(0.1234, 2), "0.12");
+  assert.equal(numeric(1.5, 2, "%"), "1.50%");
+  assert.equal(numeric(0, 2, "%"), "0.00%", "0 是有效数值");
+  assert.equal(numeric(undefined), "—");
+  assert.equal(numeric(null), "—");
+  assert.equal(numeric(NaN), "—");
+  assert.equal(numeric(Infinity), "—");
+  assert.equal(numeric(undefined, 2, "%"), "—");
+});
+
+test("台账为空时风险卡片不得显示 NaN% / undefined", async () => {
+  // 实测 analytics.py 在台账为空时返回 {mode, points:[], count:0, note}，
+  // **没有 max_drawdown / sharpe**；客户端曾用"对象是否存在"判断，于是显示 NaN%/undefined。
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const risky = source.split("\n")
+    .map((line, index) => ({ text: line, number: index + 1 }))
+    .filter(({ text }) => !text.trim().startsWith("//") && !text.trim().startsWith("*"))
+    .filter(({ text }) => /\.(max_drawdown|sharpe|annualized)\s*\*/.test(text)
+      || /String\([a-z]+\.data\.(sharpe|max_drawdown)\)/.test(text))
+    .filter(({ text }) => !text.includes("numeric("));
+  assert.deepEqual(risky.map((row) => `${row.number}: ${row.text.trim()}`), [],
+    "存在未经 numeric() 包裹的数值展示");
+});
+
+test("风险卡片的空态按字段判断，而不是按对象是否存在", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function RiskView("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /Number\.isFinite\(equity\.data\?\.max_drawdown\)/,
+    "空态应按字段是否为有限数判断——equity.data 在无数据时仍是对象");
+  assert.doesNotMatch(text, /empty: \(s \|\| equity\.data\)/,
+    "不得再用「对象存在」当作「有数据」");
+});

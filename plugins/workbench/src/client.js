@@ -192,6 +192,17 @@ window.__ModuleLoader__.load({
       }
     }
 
+    /**
+     * 数值展示：非有限数一律显示 "—"。
+     *
+     * 不要写成 `x ? \`${(x.y * 100).toFixed(2)}%\` : "—"`——对象存在不等于字段存在。
+     * 实测 analytics.py 在台账为空时返回 {points:[],count:0,note:...}，
+     * 没有 max_drawdown/sharpe，于是界面会显示 "NaN%" 和 "undefined"。
+     */
+    function numeric(value, digits = 2, suffix = "") {
+      return Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : "—";
+    }
+
     /** 当前客户端缓存条目数（仅用于界面显示，让"是否在缓存"可见）。 */
     const cacheSize = () => endpointCache.size;
 
@@ -779,7 +790,9 @@ window.__ModuleLoader__.load({
             + (ledgerPreview ? ` · 最近台账预览 ${ledgerPreview.at}` : "")),
           h(LineChart, { points: points.map((p) => ({ v: p.equity })), label: equity.data?.note || "" }),
           equity.data && h("p", { className: "tw-meta" },
-            `区间 ${points[0]?.t} → ${points[points.length - 1]?.t} · 最大回撤 ${(equity.data.max_drawdown * 100).toFixed(2)}% · 夏普 ${equity.data.sharpe}`)));
+            `区间 ${points[0]?.t} → ${points[points.length - 1]?.t}`
+            + ` · 最大回撤 ${numeric(equity.data.max_drawdown * 100)}%`
+            + ` · 夏普 ${numeric(equity.data.sharpe)}`)));
     }
 
     function RiskConfigCard({ rpc, mode }) {
@@ -796,6 +809,13 @@ window.__ModuleLoader__.load({
         h("p", { className: "tw-hint" }, "参数由 scripts/risk_config 管理；引擎每次决策前读取，非法配置直接拒绝交易。"));
     }
 
+    /** 风险指标的一格：标签 + 数值。抽成组件是因为内联写法的括号极易数错。 */
+    function RiskMetricItem({ label, value }) {
+      return h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" }, label),
+        h("div", { className: "tw-kv-v" }, String(value)));
+    }
+
     function RiskView({ rpc, snapshot }) {
       const latest = snapshot.previews.find((p) => p.kind === "backtest");
       const s = latest?.value?.summary;
@@ -809,16 +829,24 @@ window.__ModuleLoader__.load({
       const ddPoints = (equity.data?.points ?? []).map((p) => ({ v: (p.dd ?? 0) * 100 }));
       return h(React.Fragment, null,
         h(Card, { title: "风险指标",
-          empty: (s || equity.data) ? undefined : "暂无风险数据" },
+          // 注意：equity.data 在台账为空时**仍然是个对象**（只有 points/note），
+          // 用对象是否存在判断"有没有风险数据"会误判成有。
+          empty: cardEmpty({
+            loading: equity.loading && !s,
+            error: s ? "" : equity.error,
+            count: (Number.isFinite(equity.data?.max_drawdown) ? 1 : 0)
+              + (Number.isFinite(s?.max_drawdown) ? 1 : 0),
+            fallback: "暂无策略层风险数据：本地台账还没有成交记录，也没有回测预览",
+          }) },
           h("div", { className: "tw-kv" },
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最大回撤（台账回放）"),
-              h("div", { className: "tw-kv-v" }, equity.data ? `${(equity.data.max_drawdown * 100).toFixed(2)}%` : "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "夏普（台账回放）"),
-              h("div", { className: "tw-kv-v" }, equity.data ? String(equity.data.sharpe) : "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "回测最大回撤"),
-              h("div", { className: "tw-kv-v" }, s ? `${(s.max_drawdown * 100).toFixed(2)}%` : "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "回测夏普 / 年化"),
-              h("div", { className: "tw-kv-v" }, s ? `${s.sharpe} / ${(s.annualized * 100).toFixed(1)}%` : "—")))),
+            h(RiskMetricItem, { label: "最大回撤（台账回放）",
+              value: `${numeric(equity.data?.max_drawdown * 100)}%` }),
+            h(RiskMetricItem, { label: "夏普（台账回放）",
+              value: numeric(equity.data?.sharpe) }),
+            h(RiskMetricItem, { label: "回测最大回撤",
+              value: `${numeric(s?.max_drawdown * 100)}%` }),
+            h(RiskMetricItem, { label: "回测夏普 / 年化",
+              value: `${numeric(s?.sharpe)} / ${numeric(s?.annualized * 100, 1)}%` }))),
         h(Card, { title: "回撤曲线（水下图，%）",
           empty: ddPoints.length > 1 ? undefined : "需要成交记录才能回放回撤" },
           h(LineChart, { points: ddPoints, label: "drawdown %" })),
@@ -937,7 +965,7 @@ window.__ModuleLoader__.load({
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "IC 标准差"), h("div", { className: "tw-kv-v" }, String(ic.data.ic_std))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "ICIR"), h("div", { className: "tw-kv-v" }, String(ic.data.icir))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "正 IC 占比"), h("div", { className: "tw-kv-v" }, String(ic.data.positive_ratio))),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "样本期数"), h("div", { className: "tw-kv-v" }, String(ic.data.count)))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "样本期数"), h("div", { className: "tw-kv-v" }, numeric(ic.data.count, 0)))),
           icPoints.length > 1 && h(LineChart, { points: icPoints, label: "IC 序列" }),
           ic.data && h("p", { className: "tw-hint" }, ic.data.note)),
         ticker && h(QualityCard, { rpc, ticker }));
@@ -1350,7 +1378,7 @@ window.__ModuleLoader__.load({
     // `internals` 仅供测试断言缓存与接口自检行为，不参与运行时逻辑
     return { inject: ["slots", "connection"], apply, request,
       internals: { readCache, writeCache, invalidateCaches, KNOWN_ENDPOINTS, CLIENT_TTL_MS,
-        Card, cardEmpty,
+        Card, cardEmpty, numeric,
         barIndexAt, tooltipLeft, compactNumber,
         servedEndpoints: () => servedEndpoints, cacheSize: () => endpointCache.size,
         missingEndpoints: () => [...missingEndpoints] } };

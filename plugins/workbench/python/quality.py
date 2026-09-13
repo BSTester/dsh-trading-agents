@@ -30,6 +30,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trading_datasource.fundamentals import load_returns  # noqa: E402
+from trading_datasource.market import to_futu_symbol  # noqa: E402
 from trading_datasource.futu_mcp import FutuUnavailable, call_tool  # noqa: E402
 
 # 富途科目名按市场不同（实测）：
@@ -118,7 +119,9 @@ def period_row(report):
 
 
 def collect(ticker):
-    symbol = ticker
+    # 富途要求 MARKET.CODE 格式（^[A-Z0-9_]+\.[...]$）；直接传 "TSLA" 会被拒
+    # 参数校验（ret=-3），而用户输入与 K 线页传过来的往往就是裸代码。
+    symbol = to_futu_symbol(ticker)
     data = call_tool("quote_financials_statements", {"symbol": symbol}, timeout=30) or {}
     reports = data.get("report_list") or []
     periods = [period_row(report) for report in reports]
@@ -143,6 +146,7 @@ def collect(ticker):
 
     return {
         "ticker": ticker,
+        "symbol": symbol,
         "as_of": datetime.now().isoformat(timespec="seconds"),
         "source": "futu/quote_financials_statements",
         "currency": periods[0].get("currency"),
