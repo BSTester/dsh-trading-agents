@@ -69,6 +69,12 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       if (options.refresh) args.push("--refresh");
       return call(args, `positions|${mode}`, { skipCache: options.refresh, script: "positions.py" });
     },
+    /** 质量因子：从富途财报原文计算；ROE/ROA 不可得时明确返回 unavailable。 */
+    async quality(payload = {}) {
+      const tickerValue = payload.ticker;
+      if (typeof tickerValue !== "string" || !TICKER.test(tickerValue)) throw new Error("Invalid ticker");
+      return call(["--ticker", tickerValue], `quality|${tickerValue}`, { script: "quality.py" });
+    },
     async sensitivity(payload = {}) {
       const tickerList = payload.ticker;
       if (typeof tickerList !== "string" || !TICKER.test(tickerList)) throw new Error("Invalid ticker");

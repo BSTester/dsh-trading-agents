@@ -32,6 +32,49 @@ from trading_datasource.futu_mcp import FutuUnavailable, call_tool, reset_sessio
 
 DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
 CACHE_TTL_SECONDS = 300  # 5 分钟：面板是查看用途，不必每次进页面都问券商
+EQUITY_MARKS_KEPT = 400  # 约一年半的交易日
+
+
+def equity_path(mode):
+    return DSH / f"trading-equity-{mode}.json"
+
+
+def read_marks(mode):
+    try:
+        data = json.loads(equity_path(mode).read_text())
+    except (OSError, ValueError):
+        return []
+    marks = data.get("marks")
+    return marks if isinstance(marks, list) else []
+
+
+def append_mark(mode, accounts, positions_count):
+    """记录当日盯市。
+
+    **只从今天开始累积，不回溯伪造历史**：我们没有历史持仓快照，用当前持仓反推
+    过去的权益曲线会得到一个从未真实存在过的数字。
+    同一天重复取数时覆盖当天，不产生重复点。
+    """
+    today = datetime.now().strftime("%Y-%m-%d")
+    mark = {
+        "date": today,
+        "at": datetime.now().isoformat(timespec="seconds"),
+        "accounts": accounts,
+        "positions": positions_count,
+    }
+    marks = [row for row in read_marks(mode) if row.get("date") != today]
+    marks.append(mark)
+    marks.sort(key=lambda row: row.get("date") or "")
+    marks = marks[-EQUITY_MARKS_KEPT:]
+    try:
+        DSH.mkdir(parents=True, exist_ok=True)
+        path = equity_path(mode)
+        temp = path.with_suffix(".tmp")
+        temp.write_text(json.dumps({"mode": mode, "marks": marks}, ensure_ascii=False))
+        temp.replace(path)
+    except OSError:
+        pass
+    return marks
 
 
 def cache_path(mode):
@@ -91,6 +134,21 @@ def sim_groups(errors):
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(accounts)))) as pool:
         fetched = list(pool.map(fetch, accounts))
 
+    # 只为**有持仓**的账户补一次资金，用于盯市记总资产（9 个账户里通常只有 2-3 个）
+    held = [str(a["account_id"]) for a, data in fetched
+            if not isinstance(data, Exception) and (data.get("positions") or [])]
+
+    def fetch_cash(acc_id):
+        try:
+            return acc_id, call_tool("sim_trade_cash_info", {"acc_id": acc_id}, timeout=30) or {}
+        except FutuUnavailable:
+            return acc_id, {}
+
+    cash_by_account = {}
+    if held:
+        with ThreadPoolExecutor(max_workers=min(8, len(held))) as pool:
+            cash_by_account = dict(pool.map(fetch_cash, held))
+
     for account, data in fetched:
         acc_id = str(account.get("account_id") or "")
         title = str(account.get("account_title") or "模拟账户")
@@ -118,6 +176,7 @@ def sim_groups(errors):
             })
         if not positions:
             continue
+        cash = cash_by_account.get(acc_id) or {}
         groups.append({
             "account": title,
             "acc_id": acc_id,
@@ -127,6 +186,9 @@ def sim_groups(errors):
             # 单账户本身即单一市场，小计不涉及跨币种合并
             "market_value": round_or_none(sum(p["market_value"] or 0 for p in positions)),
             "pl_val": round_or_none(sum(p["pl_val"] or 0 for p in positions)),
+            "cash": round_or_none(number(cash.get("balance"))),
+            "total_asset": round_or_none(number(cash.get("total_asset"))),
+            "currency": None,  # 响应未提供，不推断
         })
     return groups, len(accounts)
 
@@ -195,6 +257,14 @@ def collect(mode):
     errors = []
     groups, accounts_checked = (sim_groups(errors) if mode == "sim" else live_groups(errors))
     positions = sum(len(group["positions"]) for group in groups)
+    # 记录当日盯市（真实数据；只从今天开始累积）
+    marks = append_mark(mode, [{
+        "account": group["account"],
+        "market_value": group["market_value"],
+        "cash": group.get("cash"),
+        "total_asset": group.get("total_asset"),
+        "currency": group.get("currency"),
+    } for group in groups], positions)
     return {
         "mode": mode,
         "as_of": datetime.now().isoformat(timespec="seconds"),
@@ -207,7 +277,9 @@ def collect(mode):
             "positions": positions,
         },
         "errors": errors,
+        "equity_marks": marks,
         "note": "券商返回的真实持仓（按账户小计，不跨账户/币种合并）；"
+                "权益盯市从首次取数当日起累积，**不回溯伪造历史**；"
                 "本地面板按 TTL 缓存以避免频繁调用，as_of 为实际取数时间。",
     }
 

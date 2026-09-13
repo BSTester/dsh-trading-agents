@@ -18,6 +18,7 @@ export const CACHE_TTL_MS = {
   ic: 10 * 60_000,
   audit: 60_000,
   sources: 2 * 60_000,
+  quality: 30 * 60_000,  // 财报变动不频繁
 };
 
 /** 稳定序列化：键顺序不影响缓存命中。 */
@@ -139,7 +140,7 @@ export function createRpcHandler(store, deps = {}) {
         }
         return { ok: true, value: buildAuditChain({ snapshot: store.snapshot(), trades }) };
       }
-      if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades" || endpoint === "events" || endpoint === "factors" || endpoint === "ic" || endpoint === "sources" || endpoint === "instrument") {
+      if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades" || endpoint === "events" || endpoint === "factors" || endpoint === "ic" || endpoint === "sources" || endpoint === "instrument" || endpoint === "quality") {
         const allowed = endpoint === "sensitivity"
           ? ["ticker", "strategy", "metric", "fast_grid", "slow_grid", "buy_grid", "sell_grid", "start"]
           : endpoint === "trades" ? ["mode", "limit"]
@@ -147,7 +148,8 @@ export function createRpcHandler(store, deps = {}) {
           : endpoint === "factors" ? ["tickers", "window"]
           : endpoint === "ic" ? ["tickers", "factor", "forward", "window"]
           : endpoint === "sources" ? ["no_probe"]
-          : endpoint === "instrument" ? ["ticker"] : [];
+          : endpoint === "instrument" ? ["ticker"]
+          : endpoint === "quality" ? ["ticker"] : [];
         if (Object.keys(payload).some(key => !allowed.includes(key))) {
           throw new WorkbenchError(`Unexpected ${endpoint} field`);
         }

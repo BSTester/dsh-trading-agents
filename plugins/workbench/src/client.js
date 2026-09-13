@@ -99,7 +99,7 @@ window.__ModuleLoader__.load({
 
     const KNOWN_ENDPOINTS = ["snapshot", "switch-mode", "series", "equity", "positions",
       "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit",
-      "sources", "instrument"];
+      "sources", "instrument", "quality"];
 
     // 面板是查看用途，不需要实时。结果缓存在内存里，切页签/重开面板不再重复请求；
     // Host 侧另有 TTL 缓存，两层都命中时连 python 子进程都不会启动。
@@ -107,7 +107,7 @@ window.__ModuleLoader__.load({
       instrument: 5 * 60_000, series: 5 * 60_000, equity: 2 * 60_000, positions: 2 * 60_000,
       correlation: 10 * 60_000, sensitivity: 30 * 60_000, risk: 5 * 60_000, trades: 60_000,
       events: 30 * 60_000, factors: 10 * 60_000, ic: 10 * 60_000, audit: 60_000,
-      sources: 2 * 60_000,
+      sources: 2 * 60_000, quality: 30 * 60_000,
     };
     const CACHE_MAX_ENTRIES = 60;
     /** 兜底轮询间隔：面板是查看用途，切页签有缓存，不需要秒级刷新。 */
@@ -586,6 +586,19 @@ window.__ModuleLoader__.load({
     }
 
     /** 券商真实持仓：按账户分组，从不跨账户/币种合并。 */
+    const EQUITY_MARK_NOTE = "从首次取数当日起累积，不回溯伪造历史——"
+      + "用当前持仓反推过去会得到一个从未真实存在过的数字。不跨账户合计（币种不同）。";
+
+    /** 一行每日盯市：列出各账户总资产，不做跨账户合计。 */
+    function EquityMarkRow({ mark }) {
+      const accounts = mark.accounts ?? [];
+      return h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" }, `${mark.date} · ${mark.positions ?? "—"} 笔持仓`),
+        h("div", { className: "tw-kv-v" }, accounts.length
+          ? accounts.map((row) => `${row.account} 总资产 ${row.total_asset ?? "—"}`).join(" · ")
+          : "该日无持仓记录"));
+    }
+
     function PortfolioView({ rpc, snapshot }) {
       const ledgerPreview = snapshot.previews.find((p) => p.kind === "ledger");
       const broker = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
@@ -622,6 +635,14 @@ window.__ModuleLoader__.load({
           h("p", { className: "tw-meta" }, broker.data?.note ?? ""),
         ),
         ...groups.map(accountCard),
+
+        h(Card, { title: "账户权益（每日盯市）", count: (broker.data?.equity_marks ?? []).length,
+          empty: (broker.data?.equity_marks ?? []).length
+            ? undefined
+            : (broker.loading ? "读取中…" : "尚无盯市记录（首次取数当天开始累积）") },
+          h("p", { className: "tw-meta" }, EQUITY_MARK_NOTE),
+          h(Paged, { items: [...(broker.data?.equity_marks ?? [])].reverse(), pageSize: 6, empty: "",
+            render: (mark) => h(EquityMarkRow, { key: mark.date, mark }) })),
 
         h(Card, { title: "本地策略台账（不是券商资产）", count: points.length,
           empty: points.length > 1 ? undefined : (equity.loading ? "加载中…" : "暂无本地策略成交记录") },
@@ -688,6 +709,40 @@ window.__ModuleLoader__.load({
       pe_ttm: "PE(TTM)", pb: "PB", peg: "PEG", ps: "PS",
     };
 
+    /** 质量因子（财报原文计算）。ROE/ROA 不可得时如实说明，不估算。 */
+    function QualityCard({ rpc, ticker }) {
+      const quality = useEndpoint(rpc, "quality", { ticker }, [rpc, ticker]);
+      const latest = quality.data?.latest;
+      const periods = quality.data?.periods ?? [];
+      const pct = (value) => (value === null || value === undefined ? "—" : `${value}%`);
+      const metrics = latest ? [
+        ["毛利率", pct(latest.gross_margin)],
+        ["营业利润率", pct(latest.operating_margin)],
+        ["净利率", pct(latest.net_margin)],
+        ["研发占比", pct(latest.rd_ratio)],
+        ["实际税率", pct(latest.effective_tax_rate)],
+        ["稀释 EPS", latest.diluted_eps ?? "—"],
+        ["每股股息", latest.dividend_per_share ?? "—"],
+        ["营收同比", latest.revenue_yoy === null || latest.revenue_yoy === undefined
+          ? "—" : `${latest.revenue_yoy.toFixed(2)}%`],
+        ["净利同比", latest.net_profit_yoy === null || latest.net_profit_yoy === undefined
+          ? "—" : `${latest.net_profit_yoy.toFixed(2)}%`],
+      ] : [];
+      return h(Card, { title: `质量因子（${ticker}）`, count: periods.length,
+        empty: quality.loading ? "读取中…" : (quality.error || "富途未返回财报数据") },
+        latest && h("p", { className: "tw-meta" },
+          `最新期间 ${latest.period_end ?? "—"} · ${latest.fiscal_year ?? "—"} · `
+          + `type=${latest.financial_type ?? "—"} · 币种 ${quality.data?.currency ?? "—"} · `
+          + `${periods.length} 个期间`),
+        latest && h("div", { className: "tw-kv" }, metrics.map(([label, value]) =>
+          h("div", { key: label, className: "tw-kv-item" },
+            h("div", { className: "tw-kv-k" }, label),
+            h("div", { className: "tw-kv-v" }, String(value))))),
+        (quality.data?.unavailable ?? []).length > 0 && h("p", { className: "tw-hint" },
+          "无法提供：" + quality.data.unavailable.map((row) => `${row.label}（${row.reason}）`).join("；")),
+        h("p", { className: "tw-hint" }, quality.data?.note ?? ""));
+    }
+
     function FactorsView({ rpc, ticker, watchlist, setWatchlist }) {
       const [factor, setFactor] = React.useState("mom_20");
       const tickers = watchlist;
@@ -728,7 +783,8 @@ window.__ModuleLoader__.load({
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "正 IC 占比"), h("div", { className: "tw-kv-v" }, String(ic.data.positive_ratio))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "样本期数"), h("div", { className: "tw-kv-v" }, String(ic.data.count)))),
           icPoints.length > 1 && h(LineChart, { points: icPoints, label: "IC 序列" }),
-          ic.data && h("p", { className: "tw-hint" }, ic.data.note)));
+          ic.data && h("p", { className: "tw-hint" }, ic.data.note)),
+        ticker && h(QualityCard, { rpc, ticker }));
     }
 
     /** 交易概要：把「调了哪些工具」归纳成「发生了什么交易」。 */

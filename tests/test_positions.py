@@ -163,6 +163,64 @@ class LivePositionsTests(unittest.TestCase):
         self.assertTrue(payload["groups"][0]["account"].endswith(acc_id[-4:]))
 
 
+class EquityMarkTests(unittest.TestCase):
+    """每日盯市：只从今天开始累积，不回溯伪造历史。"""
+
+    def setUp(self):
+        self.module = load_positions()
+        self.scratch = Path(__file__).resolve().parents[1] / ".install-test-equity"
+        self.scratch.mkdir(exist_ok=True)
+        self.addCleanup(lambda: __import__("shutil").rmtree(self.scratch, ignore_errors=True))
+        self.patch = patch.object(self.module, "equity_path",
+                                  side_effect=lambda mode: self.scratch / f"equity-{mode}.json")
+        self.patch.start()
+        self.addCleanup(self.patch.stop)
+
+    def test_first_mark_is_recorded(self):
+        marks = self.module.append_mark("sim", [{"account": "A", "total_asset": 100.0}], 3)
+        self.assertEqual(len(marks), 1)
+        self.assertEqual(marks[0]["positions"], 3)
+        self.assertEqual(marks[0]["accounts"][0]["total_asset"], 100.0)
+
+    def test_same_day_overwrites_instead_of_duplicating(self):
+        self.module.append_mark("sim", [{"account": "A", "total_asset": 100.0}], 3)
+        marks = self.module.append_mark("sim", [{"account": "A", "total_asset": 250.0}], 5)
+        self.assertEqual(len(marks), 1, "同一天不应出现两个点")
+        self.assertEqual(marks[0]["accounts"][0]["total_asset"], 250.0)
+        self.assertEqual(marks[0]["positions"], 5)
+
+    def test_history_is_capped_and_sorted(self):
+        for day in range(1, 8):
+            marks = self.module.append_mark("sim", [{"account": "A"}], day)
+        self.assertEqual([row["date"] for row in marks], sorted(row["date"] for row in marks))
+
+    def test_marks_survive_across_reads(self):
+        self.module.append_mark("sim", [{"account": "A", "total_asset": 1.0}], 1)
+        self.assertEqual(len(self.module.read_marks("sim")), 1)
+        self.assertEqual(self.module.read_marks("live"), [], "两种模式分开存储")
+
+    def test_corrupt_marks_file_is_ignored(self):
+        (self.scratch / "equity-sim.json").write_text("{not json")
+        self.assertEqual(self.module.read_marks("sim"), [])
+
+    def test_collect_records_a_mark_and_returns_it(self):
+        with patch.object(self.module, "call_tool", side_effect=self._fake_call()), \
+             patch.object(self.module, "append_mark", wraps=self.module.append_mark):
+            payload = self.module.collect("sim")
+        self.assertIn("equity_marks", payload)
+        self.assertEqual(len(payload["equity_marks"]), 1)
+        self.assertIn("不回溯", payload["note"])
+
+    def _fake_call(self):
+        def call(name, arguments, **kwargs):
+            if name == "sim_trade_account_list":
+                return SIM_ACCOUNTS
+            if name == "sim_trade_cash_info":
+                return {"balance": "100", "total_asset": "250"}
+            return SIM_POSITIONS[str(arguments["acc_id"])]
+        return call
+
+
 class CacheTests(unittest.TestCase):
     def setUp(self):
         self.module = load_positions()

@@ -87,3 +87,89 @@ test("配置项有合理默认值（未配置也能工作）", async () => {
   // 未配置 python 时走 ~/.dsh/trading-venv；存在则成功、不存在则警告，都不应抛
   assert.ok(logs.length >= 0);
 });
+
+test("续期成功后触碰组合文件并请求热重载", async () => {
+  const { readFileSync, writeFileSync, utimesSync, statSync, mkdtempSync } = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "keepalive-"));
+  const preset = path.join(dir, "agent.cordis.yml");
+  writeFileSync(preset, "- id: x\n");
+  const before = statSync(preset).mtimeMs;
+
+  const calls = [];
+  const logs = [];
+  const ctx = {
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), debug: () => {} },
+    get: (name) => (name === "agentPresets"
+      ? { recompose: async (_ctx, id) => { calls.push(id); } }
+      : undefined),
+    effect: (fn) => { ctx.disposer = fn(); },
+  };
+
+  // 用一个真的会 "REFRESHED" 的桩 python
+  const stub = path.join(dir, "python");
+  writeFileSync(stub, "#!/bin/sh\necho 'REFRESHED|已续期'\n");
+  const { chmodSync } = await import("node:fs");
+  chmodSync(stub, 0o755);
+
+  apply(ctx, { checkIntervalMs: 999999, python: stub, presetFile: preset, presetId: "demo" });
+  await settle(1500);
+  ctx.disposer();
+
+  assert.equal(calls.length, 1, "必须请求一次 recompose");
+  assert.equal(calls[0], "demo");
+  assert.ok(statSync(preset).mtimeMs > before, "必须触碰组合文件以改变印章");
+  assert.match(logs.join("\n"), /热重载/);
+});
+
+test("hotReload:false 时退回人工路径，不触碰文件", async () => {
+  const { mkdtempSync, writeFileSync, statSync, chmodSync } = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "keepalive-off-"));
+  const preset = path.join(dir, "agent.cordis.yml");
+  writeFileSync(preset, "- id: x\n");
+  const before = statSync(preset).mtimeMs;
+
+  const logs = [];
+  const calls = [];
+  const ctx = {
+    logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), debug: () => {} },
+    get: () => ({ recompose: async () => { calls.push(1); } }),
+    effect: (fn) => { ctx.disposer = fn(); },
+  };
+  const stub = path.join(dir, "python");
+  writeFileSync(stub, "#!/bin/sh\necho 'REFRESHED|已续期'\n");
+  chmodSync(stub, 0o755);
+
+  apply(ctx, { checkIntervalMs: 999999, python: stub, presetFile: preset, hotReload: false });
+  await settle(1500);
+  ctx.disposer();
+  assert.equal(calls.length, 0, "关闭时不得调用 recompose");
+  assert.equal(statSync(preset).mtimeMs, before, "关闭时不得触碰文件");
+  assert.match(logs.join("\n"), /新建会话/);
+});
+
+test("agentPresets 缺失或 recompose 抛错时都不崩，只提示新建会话", async () => {
+  for (const getter of [() => undefined, () => ({ recompose: async () => { throw new Error("locked"); } })]) {
+    const { mkdtempSync, writeFileSync, chmodSync } = await import("node:fs");
+    const os = await import("node:os");
+    const path = await import("node:path");
+    const dir = mkdtempSync(path.join(os.tmpdir(), "keepalive-fail-"));
+    const stub = path.join(dir, "python");
+    writeFileSync(stub, "#!/bin/sh\necho 'REFRESHED|已续期'\n");
+    chmodSync(stub, 0o755);
+    const logs = [];
+    const ctx = {
+      logger: { info: (m) => logs.push(m), warn: (m) => logs.push(m), debug: () => {} },
+      get: getter,
+      effect: (fn) => { ctx.disposer = fn(); },
+    };
+    apply(ctx, { checkIntervalMs: 999999, python: stub,
+      presetFile: path.join(dir, "agent.cordis.yml") });
+    await settle(1200);
+    ctx.disposer();
+    assert.match(logs.join("\n"), /新建会话/, "必须给出可执行的退路");
+  }
+});

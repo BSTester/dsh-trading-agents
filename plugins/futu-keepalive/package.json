@@ -1,9 +1,12 @@
 {
   "name": "@bstester/dsh-futu-keepalive",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "富途 access_token 到期前自动续期（access_token 官方有效期仅 2 小时）",
   "type": "module",
   "main": "src/index.js",
-  "files": ["src", "README.md"],
+  "files": [
+    "src",
+    "README.md"
+  ],
   "license": "MIT"
 }

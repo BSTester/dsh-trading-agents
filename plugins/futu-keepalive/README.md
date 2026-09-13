@@ -31,13 +31,46 @@
 
 配置项（都可不填）：`checkIntervalMs`、`renewWithinSeconds`、`python`。
 
-## 它不能解决什么
+## 热重载：让**已在运行**的会话也换上新 token
 
-**已挂载的会话仍持有旧 token。** 实测 preset 目录**没有任何 watcher**，组合是在会话挂载时
-读取的，因此 `touch` preset 文件只对**之后新建的会话**生效。要拿到新 token，必须
-**新建会话**（仍选「交易智囊模式」）。插件在续期成功时会明确把这一点写进日志。
+关键在于读 `dsh-agent-presets` 的源码：
+
+```js
+async function compositionStamp(path) {
+  const { mtimeMs, size } = await stat(path);
+  return { mtimeMs, size };            // ← 印章只由 mtime 和大小决定
+}
+async ensureStanding(preset) {
+  const current = await compositionStamp(preset.path);
+  if (sameStamp(mounted.stamp, current)) return mounted;
+  this.standing.delete(preset.id);     // ← 印章变了就销毁共享挂载
+  return this.ensureStanding(preset);  // ← 重建：重新读组合、重新求值 !!js 头
+}
+```
+
+触发 `ensureStanding` 的入口有两个：新会话的 `mount()`，以及现有会话的
+`agentPresets.recompose(agentCtx, id)`。所以续期后只要：
+
+1. `utimesSync(presetFile)` 改变印章；
+2. 调 `agentPresets.recompose(ctx, presetId)`；
+
+就能让**当前会话**重建 futu-mcp 那一行，拿到新的 Authorization 头。
+
+`hotReload: false` 可关闭，退回「新建会话」的人工路径。无论成功与否，
+日志都会说明结果，失败时给出可执行的退路，绝不静默。
+
+> ⚠️ **验证状态**：这条路径是**基于源码证据实现的，尚未在运行时验证**——
+> 验证它需要一个交易模式会话，而我在非交易会话里创建不了。
+> 因此判断逻辑、改印章、调用 recompose、失败回退都有离线测试，
+> 但「recompose 之后工具真的用上了新 token」需要在交易会话里实测。
+> 在此之前，"新建会话"仍是确定可行的路径。
+
+> 另注：热重载只会在**续期确实发生**后触发（默认会话开始约 90 分钟后）。
+> 短会话不会碰到它。
 
 ## 测试
 
-`tests/futu-keepalive.test.mjs`（离线，7 例）锁住：返回 disposer、无 `ctx.effect` 时回退到
-dispose 事件、续期失败只警告不抛、不叠加执行、不硬依赖任何服务。
+`tests/futu-keepalive.test.mjs`（离线，10 例）锁住：返回 disposer、无 `ctx.effect` 时回退到
+dispose 事件、续期失败只警告不抛、不叠加执行、不硬依赖任何服务、续期后触碰组合文件并
+请求一次 recompose、`hotReload:false` 时不触碰文件、`agentPresets` 缺失或 recompose 抛错
+时只提示新建会话。

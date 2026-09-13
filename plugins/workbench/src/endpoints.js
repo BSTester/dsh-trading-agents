@@ -25,4 +25,5 @@ export const ENDPOINTS = [
   "audit",
   "sources",
   "instrument",
+  "quality",
 ];
