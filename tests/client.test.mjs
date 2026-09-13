@@ -408,3 +408,26 @@ test("风险页说明了策略层与持仓层口径不同", async () => {
   assert.match(source, /那是\*\*策略层\*\*的指标/,
     "必须写明回撤/夏普是策略层指标，不是这个账户的实际表现");
 });
+
+test("策略层指标必须点名标的与策略，不能只显示无主数字", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function RiskView("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  // 曾出现「回测最大回撤」却不写是哪个标的、哪套策略，指标无法归因
+  assert.match(text, /equity\.data\?\.tickers/, "RiskView 未读取台账回放的标的列表");
+  assert.match(text, /equity\.data\?\.strategies/, "RiskView 未读取台账回放的策略列表");
+  assert.match(text, /bt\?\.strategy/, "RiskView 未读取回测预览的策略");
+  assert.match(text, /label\("最大回撤 · 回测", btSubject\)/, "回测回撤的标签未附带主语");
+  assert.match(text, /label\("夏普 · 台账回放", replaySubject\)/, "台账回放的标签未附带主语");
+  assert.match(text, /tw-meta/, "缺少口径说明行");
+});
+
+test("信号预览必须显示策略名，且优先用带参数的标签", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function SignalView("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /strategy_label \?\? p\.value\?\.strategy/, "信号条目未显示策略");
+  assert.match(text, /p\.value\?\.ticker/, "信号条目未显示标的");
+});

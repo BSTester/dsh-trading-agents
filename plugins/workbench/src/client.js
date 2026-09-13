@@ -706,7 +706,9 @@ window.__ModuleLoader__.load({
               h("summary", null,
                 h("span", { className: `tw-tag ${p.value?.signal === "BUY" ? "buy" : p.value?.signal === "SELL" ? "sell" : "hold"}` },
                   p.value?.signal ?? p.kind),
-                `${p.value?.ticker ?? ""}`,
+                // 策略层就必须看得见「哪个标的、哪套策略」，否则条目无法归因
+                [p.value?.ticker, p.value?.strategy_label ?? p.value?.strategy]
+                  .filter(Boolean).join(" · "),
                 h("span", { className: "tw-meta" }, p.at)),
               h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(p.value, null, 2)))) })),
         h("p", { className: "tw-hint" }, "工作台只展示结果；信号计算、回测与下单请在 Harness 会话中发起。"));
@@ -853,8 +855,10 @@ window.__ModuleLoader__.load({
     }
 
     function RiskView({ rpc, snapshot }) {
-      const latest = snapshot.previews.find((p) => p.kind === "backtest");
-      const s = latest?.value?.summary;
+      const backtests = snapshot.previews.filter((p) => p.kind === "backtest");
+      const latest = backtests[0]; // 预览按新→旧存储，第一条就是最近一次
+      const bt = latest?.value;
+      const s = bt?.summary;
       const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
       const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
       // 券商持仓用的字段是 symbol（早期本地台账是 ticker），两种都认，避免又对不上
@@ -863,6 +867,19 @@ window.__ModuleLoader__.load({
       const canCorrelate = held.length >= 2;
       const correlation = useEndpoint(rpc, "correlation", { tickers: held, window: 120 }, [rpc, held.join(",")]);
       const ddPoints = (equity.data?.points ?? []).map((p) => ({ v: (p.dd ?? 0) * 100 }));
+
+      // 指标必须点名主语：同一个「最大回撤」究竟是台账回放还是某次回测、
+      // 覆盖哪些标的与策略，不写清楚就只是一串没有归属的数字。
+      const joinParts = (parts) => parts.filter(Boolean).join(" · ");
+      const replaySubject = joinParts([(equity.data?.tickers ?? []).join("、"),
+        (equity.data?.strategies ?? []).join("、")]);
+      const btSubject = joinParts([bt?.ticker, bt?.strategy]);
+      const label = (base, subject) => (subject ? `${base}（${subject}）` : base);
+      const btDetail = joinParts([btSubject,
+        Number.isFinite(bt?.bars) ? `${bt.bars} 根日线` : "",
+        bt?.source ? `数据源 ${bt.source}` : "",
+        latest?.at ? String(latest.at).slice(0, 16).replace("T", " ") : ""]);
+
       return h(React.Fragment, null,
         h(Card, { title: "风险指标",
           // 注意：equity.data 在台账为空时**仍然是个对象**（只有 points/note），
@@ -874,14 +891,18 @@ window.__ModuleLoader__.load({
               + (Number.isFinite(s?.max_drawdown) ? 1 : 0),
             fallback: "暂无策略层风险数据：本地台账还没有成交记录，也没有回测预览",
           }) },
+          h("p", { className: "tw-meta" },
+            `台账回放：${replaySubject || "无标的"}`
+            + `　｜　最近回测：${btDetail || "尚无回测预览"}`
+            + (backtests.length > 1 ? `（共 ${backtests.length} 次回测记录，此处为最新一次）` : "")),
           h("div", { className: "tw-kv" },
-            h(RiskMetricItem, { label: "最大回撤（台账回放）",
+            h(RiskMetricItem, { label: label("最大回撤 · 台账回放", replaySubject),
               value: `${numeric(equity.data?.max_drawdown * 100)}%` }),
-            h(RiskMetricItem, { label: "夏普（台账回放）",
+            h(RiskMetricItem, { label: label("夏普 · 台账回放", replaySubject),
               value: numeric(equity.data?.sharpe) }),
-            h(RiskMetricItem, { label: "回测最大回撤",
+            h(RiskMetricItem, { label: label("最大回撤 · 回测", btSubject),
               value: `${numeric(s?.max_drawdown * 100)}%` }),
-            h(RiskMetricItem, { label: "回测夏普 / 年化",
+            h(RiskMetricItem, { label: label("夏普 / 年化 · 回测", btSubject),
               value: `${numeric(s?.sharpe)} / ${numeric(s?.annualized * 100, 1)}%` }))),
         h(Card, { title: "回撤曲线（水下图，%）",
           empty: ddPoints.length > 1 ? undefined : "需要成交记录才能回放回撤" },

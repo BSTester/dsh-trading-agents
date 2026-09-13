@@ -64,9 +64,14 @@ def equity_curve(mode="sim", window=250):
         except Exception:
             closes[ticker] = {}
 
+    # 界面上必须能说清这些指标是「谁的」——否则只是一串无主数字
+    subject = {"tickers": tickers,
+               "strategies": sorted({h.get("strategy") for h in history if h.get("strategy")})}
+
     dates = sorted({d for series in closes.values() for d in series})
     if not dates:
-        return {"mode": mode, "points": [], "count": 0, "note": "无可用于盯市的日线数据"}
+        return {"mode": mode, "points": [], "count": 0, **subject,
+                "note": "无可用于盯市的日线数据"}
 
     # 只保留首个成交日之后的日期（之前无权益变化）
     first_trade = history[0]["date"] if history else dates[0]
@@ -122,7 +127,7 @@ def equity_curve(mode="sim", window=250):
             sharpe = mean / std * math.sqrt(TRADING_DAYS)
 
     current = points[-1]["equity"]
-    return {"mode": mode, "count": len(points), "points": points,
+    return {"mode": mode, "count": len(points), "points": points, **subject,
             "initial": INITIAL_CASH, "current": current,
             "total_return": round(current / INITIAL_CASH - 1, 5),
             "max_drawdown": round(max_dd, 5), "sharpe": round(sharpe, 3),

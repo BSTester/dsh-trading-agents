@@ -149,3 +149,13 @@ test("research_cancel 不影响已发布的研报", async (t) => {
     /already settled/);
   assert.equal(store.read().reports.length, 1);
 });
+
+test("signal output carries a strategy_label with its parameters", async (t) => {
+  const { ctx, tools, exec } = await setup(t);
+  registerEngineTools(ctx, value => value);
+  const result = await tools.get("quant_signal").execute({ ticker: "600519", strategy: "rsi" }, exec);
+  if (result.error) return; // 离线环境无数据
+  // 裸名 "rsi" 无法区分参数，界面上必须能看出用了哪套参数
+  assert.match(result.strategy_label, /^rsi\(\d+,\d+\)$/);
+  assert.equal(result.ticker, "600519");
+});

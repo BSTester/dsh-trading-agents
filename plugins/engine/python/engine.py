@@ -174,7 +174,11 @@ def compute_signal(ticker, strategy, fast=5, slow=20, rsi_buy=25, rsi_sell=75,
     ], axis=1).max(axis=1)
     atr = float(true_range.tail(14).mean())
     label = "BUY" if last == 1 else ("SELL" if last == -1 else "HOLD")
-    result = {"ticker": ticker, "strategy": strategy, "date": date, "price": price,
+    # 裸名 "rsi" 无法区分参数，界面上必须能看出用的是哪套参数
+    strategy_label = (f"ma_cross({fast},{slow})" if strategy == "ma_cross"
+                      else f"rsi({rsi_buy},{rsi_sell})")
+    result = {"ticker": ticker, "strategy": strategy, "strategy_label": strategy_label,
+              "date": date, "price": price,
               "signal": label, "atr": atr, "execution_source": EXECUTION_SOURCE}
     if include_sentiment:
         result["sentiment"] = read_sentiment(ticker)
@@ -209,7 +213,7 @@ def _decide(ticker, strategy, apply_fill, **kw):
             blocked_reason = "T+1: acquisition date missing or not before the fill date"
         else:
             order = {"action": "SELL", "ticker": ticker, "shares": pos["shares"],
-                     "price": price, "stop": None,
+                     "price": price, "stop": None, "strategy": s["strategy"],
                      "reason": "ATR stop triggered" if price <= pos.get("stop", 0)
                                else f"{s['strategy']} sell signal"}
     elif sig == "BUY" and pos is None and len(ledger["positions"]) < risk["max_positions"]:
@@ -221,7 +225,7 @@ def _decide(ticker, strategy, apply_fill, **kw):
         shares = min(risk_lots, cash_lots) * 100
         if shares >= 100 and 0 < stop < price:
             order = {"action": "BUY", "ticker": ticker, "shares": shares,
-                     "price": price, "stop": stop,
+                     "price": price, "stop": stop, "strategy": s["strategy"],
                      "reason": f"{s['strategy']} 信号，ATR止损 2x"}
 
     if order:
