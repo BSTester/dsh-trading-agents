@@ -155,7 +155,10 @@ python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py"
 
 现在的处理方式：
 
-- 任何富途调用遇到该特征时会**自动用 refresh_token 续期并重试一次**，通常无需人工干预；
+- **MCP 通道**：preset 里的 `futu-keepalive` 行每 10 分钟检查一次，剩余不足 30 分钟时
+  自动续期（复用同一份续期实现）。**但它只能让新会话拿到新 token**——已挂载的会话
+  仍持有旧的那份，需**新建会话**才会重新读取组合；
+- **脚本通道**：任何调用遇到该特征时会**自动用 refresh_token 续期并重试一次**，无需人工干预；
 - 渠道状态页显示**剩余有效期**，剩余不足 10 分钟时给出预警；
 - 自动续期也失败才需要 `--refresh`；refresh_token 失效才需重新完整授权。
 

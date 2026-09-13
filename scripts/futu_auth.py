@@ -102,14 +102,20 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
 
 
 def touch_preset():
-    """触碰 preset 组合文件，触发 harness 原位重载 futu-mcp 行。"""
+    """触碰 preset 组合文件。
+
+    注意：**实测 preset 目录没有任何 watcher**，组合是在会话挂载时读取的，
+    因此 touch 只对**之后新建的会话**生效，不会让当前已挂载的会话重新求值
+    Authorization 头。此处保留 touch 是为了让后续会话读到最新状态。
+    """
     preset_yml = Path(__file__).resolve().parent.parent / "agent.cordis.yml"
     if preset_yml.exists():
         os.utime(preset_yml, None)
-        say("已触发当前会话的组合重载，富途工具应已在本会话就绪。")
-        warn("若本会话仍未见 mcp__futu__* 工具，请新建会话（选本模式）。")
+        say("token 已就绪。")
+        warn("富途工具只在**新建会话**时读取本组合，请新建会话（仍选本模式）后再使用；"
+             "在当前会话里等待不会生效。")
     else:
-        warn("重启 harness 会话后，富途工具（mcp__futu__*）即可用。")
+        warn("未找到 preset 组合文件；新建会话后富途工具（mcp__futu__*）即可用。")
 
 
 def record_expiry(resp):

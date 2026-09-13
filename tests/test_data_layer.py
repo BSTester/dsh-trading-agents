@@ -322,6 +322,66 @@ class TokenLifecycleTests(unittest.TestCase):
             self.assertEqual((tmp / "futu-token").read_text(), "brand-new")
 
 
+class EnsureFreshTests(unittest.TestCase):
+    """保活判断：只在确实快过期时才换 token。
+
+    换发新 token 可能让仍在被使用的旧 token 失效，所以"无条件续期"是有害的——
+    这组测试锁住"不该续期时绝不续期"。
+    """
+
+    def test_skips_when_plenty_of_time_left(self):
+        with patch.object(futu_mcp, "seconds_until_expiry", return_value=5400), \
+             patch.object(futu_mcp, "refresh_access_token") as refresh:
+            refreshed, detail = futu_mcp.ensure_fresh(1800)
+        self.assertFalse(refreshed)
+        self.assertIn("90", detail.replace("分钟", ""))
+        refresh.assert_not_called()
+
+    def test_refreshes_when_near_expiry(self):
+        with patch.object(futu_mcp, "seconds_until_expiry", return_value=300), \
+             patch.object(futu_mcp, "refresh_access_token", return_value=True) as refresh:
+            refreshed, detail = futu_mcp.ensure_fresh(1800)
+        self.assertTrue(refreshed)
+        refresh.assert_called_once()
+        self.assertIn("已续期", detail)
+
+    def test_reports_failure_without_raising(self):
+        with patch.object(futu_mcp, "seconds_until_expiry", return_value=-60), \
+             patch.object(futu_mcp, "refresh_access_token", return_value=False):
+            refreshed, detail = futu_mcp.ensure_fresh(1800)
+        self.assertFalse(refreshed)
+        self.assertIn("重新完整授权", detail)
+
+    def test_force_refreshes_regardless(self):
+        with patch.object(futu_mcp, "seconds_until_expiry", return_value=999999), \
+             patch.object(futu_mcp, "refresh_access_token", return_value=True) as refresh:
+            refreshed, _ = futu_mcp.ensure_fresh(1800, force=True)
+        self.assertTrue(refreshed)
+        refresh.assert_called_once()
+
+    def test_estimate_falls_back_to_file_age(self):
+        """缺少到期记录时用 token 文件写入时间 + 官方 TTL 估算（老安装也能保活）。"""
+        import tempfile
+        import time as _time
+        with tempfile.TemporaryDirectory() as tmp:
+            token = Path(tmp) / "futu-token"
+            token.write_text("x")
+            with patch.object(futu_mcp, "EXPIRY_FILE", Path(tmp) / "missing-expiry"), \
+                 patch.object(futu_mcp, "token_path", return_value=token):
+                remaining = futu_mcp.estimated_remaining_seconds()
+        self.assertIsNotNone(remaining)
+        # 刚写入的文件 → 剩余应接近完整 TTL
+        self.assertGreater(remaining, futu_mcp.ACCESS_TOKEN_TTL_SECONDS - 60)
+
+    def test_estimate_is_none_without_any_signal(self):
+        with patch.object(futu_mcp, "seconds_until_expiry", return_value=None), \
+             patch.object(futu_mcp, "token_path", return_value=Path("/nonexistent/token")):
+            self.assertIsNone(futu_mcp.estimated_remaining_seconds())
+
+    def test_official_ttl_constant_matches_measurement(self):
+        self.assertEqual(futu_mcp.ACCESS_TOKEN_TTL_SECONDS, 7200)
+
+
 class LocateTests(unittest.TestCase):
     """跨插件定位：找不到就返回 None，让调用方明确降级。"""
 
@@ -434,6 +494,42 @@ def _synthetic_frame():
         "low": [value - 0.4 for value in closes],
         "volume": [1000] * len(days),
     })
+
+
+class SkillGuidanceTests(unittest.TestCase):
+    """skill 里的富途自检必须真调工具。
+
+    历史教训：自检原先只看「工具列表里有没有 mcp__futu__ 前缀」，而 token 过期时
+    工具**仍然在列表里**、只是每次调用返回 internal error —— 于是自检通过、数据全取不到。
+    """
+
+    def _skill(self):
+        return (ROOT / "skills" / "trading-agents" / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_requires_an_actual_tool_call(self):
+        text = self._skill()
+        self.assertIn("必须真调一次工具", text)
+        self.assertIn("工具在列表里 **不等于** 能用", text)
+
+    def test_documents_the_two_hour_token_and_internal_error_symptom(self):
+        text = self._skill()
+        self.assertIn("2 小时", text)
+        self.assertIn("expires_in=7200", text)
+        self.assertIn("internal error", text)
+
+    def test_names_a_concrete_probe_tool(self):
+        self.assertIn("mcp__futu__quote_trading_days", self._skill())
+
+    def test_does_not_claim_the_current_session_hot_reloads(self):
+        """实测 preset 目录无 watcher；不能再宣称 touch 会让当前会话生效。"""
+        text = self._skill()
+        self.assertNotIn("会自动触发当前会话的组合重载", text)
+        self.assertIn("新建会话", text)
+
+    def test_auth_script_message_matches_reality(self):
+        script = (ROOT / "scripts" / "futu_auth.py").read_text(encoding="utf-8")
+        self.assertNotIn("已触发当前会话的组合重载", script)
+        self.assertIn("没有任何 watcher", script)
 
 
 if __name__ == "__main__":

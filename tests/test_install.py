@@ -23,6 +23,9 @@ PRESET = """# keep comments and unrelated disabled rows
 - id: trading-engine
   name: '@bstester/dsh-trading-engine'
   disabled: true
+- id: futu-keepalive
+  name: '@bstester/dsh-futu-keepalive'
+  disabled: true
 """
 
 
@@ -31,6 +34,7 @@ PACKAGE_PYTHON = {
     "fin-data": ["python/fin_sentiment.py"],
     "engine": ["python/engine.py"],
     "workbench": ["python/bars.py"],
+    "futu-keepalive": ["src/index.js"],
 }
 
 
@@ -60,7 +64,7 @@ class InstallerTests(unittest.TestCase):
         self.repo.mkdir()
         self.home = self.root / "custom dsh home"
         (self.repo / "agent.cordis.yml").write_text(PRESET)
-        for directory in ("workbench", "fin-data", "engine"):
+        for directory in ("workbench", "fin-data", "engine", "futu-keepalive"):
             package = self.repo / "plugins" / directory
             package.mkdir(parents=True)
             manifest = {"name": directory, "version": "0.2.0"}
@@ -72,7 +76,8 @@ class InstallerTests(unittest.TestCase):
     def test_activation_is_idempotent_and_preserves_other_rows_and_crlf(self):
         original = PRESET.replace("\n", "\r\n")
         result = self.installer.activate_preset(original)
-        self.assertEqual(result.count("  disabled: false\r\n"), 2)
+        self.assertEqual(result.count("  disabled: false\r\n"),
+                         len(self.installer.PRESET_PACKAGES))
         self.assertIn("  name: other\r\n  disabled: true\r\n", result)
         self.assertIn("    disabled: true\r\n", result)
         self.assertNotIn("workbench", result)
@@ -122,9 +127,10 @@ class InstallerTests(unittest.TestCase):
         # 归档是内容寻址的 <plugin>-<sha256>.tgz；按文件名还原插件顺序
         names = [re.fullmatch(r"([a-z-]+)-[0-9a-f]{64}\.tgz", path.name).group(1)
                  for path in self.added]
-        self.assertEqual(names, ["workbench", "fin-data", "engine"] * 2)
+        self.assertEqual(names, list(self.installer.PLUGINS) * 2)
         self.assertTrue(all(not path.exists() for path in self.packed))
-        self.assertEqual(len(list((self.home / "trading-plugin-packages").glob("*.tgz"))), 4)
+        self.assertEqual(len(list((self.home / "trading-plugin-packages").glob("*.tgz"))),
+                         len(self.installer.PLUGINS) + len(self.installer.LIBRARIES))
         self.assertEqual((self.repo / "agent.cordis.yml").read_text(),
                          self.installer.activate_preset(PRESET))
 
@@ -144,7 +150,7 @@ class InstallerTests(unittest.TestCase):
         with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
                 patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
             self.installer.install_plugins(self.repo, self.home)
-        self.assertEqual(len(self.added), 3)
+        self.assertEqual(len(self.added), len(self.installer.PLUGINS))
 
     def test_reinstall_refreshes_unified_tree(self):
         """重装即刷新，因此统一目录不可能与仓库版本漂移。"""

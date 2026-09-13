@@ -131,6 +131,18 @@
   name: '@bstester/dsh-fin-data'
   disabled: false
 
+# ── 富途 token 保活（access_token 官方有效期仅 2 小时） ────────────────────────
+# 为什么需要：该 MCP 行的 Authorization 头是在本行**挂载时求值一次**的固定字符串
+# （Zod 会把 getter 压平，重连也复用同一份 config），而 token 过期时服务端对所有
+# 工具返回 internal error 而不是 401 —— 表现为「工具还在、调用全失败」。
+# 本插件按节奏调用共享实现 trading_datasource.futu_mcp.ensure_fresh() 续期，
+# 不重写 OAuth；缺 venv 或 token 时安静跳过，不影响其他能力。
+# 注意：已挂载的会话仍持有旧 token，需新建会话才会重新求值本组合。
+
+- id: futu-keepalive
+  name: '@bstester/dsh-futu-keepalive'
+  disabled: true
+
 # ── 富途远程 MCP（数据与交易能力） ──────────────────────────────────────────
 # 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README）。
 # token 未设置时该行工具不会出现，其余能力不受影响（failOnStartupError: false）。

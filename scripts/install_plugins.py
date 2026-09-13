@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 
-PLUGINS = ("workbench", "fin-data", "engine")
+PLUGINS = ("workbench", "fin-data", "engine", "futu-keepalive")
 # 统一数据层：不是 Harness 插件（没有 cordis 行），只作为 python 库被各插件共用。
 LIBRARIES = ("datasource",)
 # 需要出现在"统一 python 目录"里、可被其他插件 import 或调用的包：
@@ -25,6 +25,7 @@ DATA_LAYER_PTH_NAME = "dsh-trading-python.pth"
 PRESET_PACKAGES = {
     "fin-data": "@bstester/dsh-fin-data",
     "trading-engine": "@bstester/dsh-trading-engine",
+    "futu-keepalive": "@bstester/dsh-futu-keepalive",
 }
 
 

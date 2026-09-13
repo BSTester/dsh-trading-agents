@@ -257,6 +257,38 @@ def refresh_access_token(timeout=30):
     return True
 
 
+# access_token 的官方有效期（expires_in=7200）。仅在缺少到期记录时用于估算。
+ACCESS_TOKEN_TTL_SECONDS = 7200
+
+
+def estimated_remaining_seconds():
+    """距到期还剩多少秒；没有到期记录时按 token 文件写入时间 + 官方 TTL 估算。"""
+    recorded = seconds_until_expiry()
+    if recorded is not None:
+        return recorded
+    try:
+        age = time.time() - token_path().stat().st_mtime
+    except OSError:
+        return None
+    return ACCESS_TOKEN_TTL_SECONDS - age
+
+
+def ensure_fresh(within_seconds=1800, force=False):
+    """距到期不足 within_seconds 时续期一次。返回 (refreshed, detail)。
+
+    刻意**不无条件续期**：换发新 token 可能让仍被使用中的旧 token 失效，
+    因此在确认"确实快过期"之前不动它。
+    """
+    remaining = None if force else estimated_remaining_seconds()
+    if remaining is not None and remaining > within_seconds:
+        return False, f"仍有效 {remaining / 60:.0f} 分钟，无需续期"
+    if refresh_access_token():
+        left = estimated_remaining_seconds()
+        suffix = f"，新 token 剩余 {left / 60:.0f} 分钟" if left else ""
+        return True, f"已续期（续期前剩余 {max(remaining or 0, 0) / 60:.0f} 分钟）{suffix}"
+    return False, "续期失败：refresh_token 可能已失效，需重新完整授权"
+
+
 def _looks_like_auth_failure(message):
     """服务端在凭证失效时返回 internal error（不是 401），因此按特征识别。"""
     lowered = str(message).lower()
