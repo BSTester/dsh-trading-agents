@@ -2,6 +2,7 @@ import { WorkbenchStore } from "./store.js";
 import { createRpcFetchHandler } from "./rpc.js";
 import { createSeriesProvider } from "./series.js";
 import { createAnalyticsProvider } from "./analytics.js";
+import { ENDPOINTS } from "./endpoints.js";
 
 export const name = "trading-workbench";
 export const inject = [];
@@ -14,7 +15,7 @@ export function apply(ctx) {
   const deps = { fetchSeries: createSeriesProvider(), analytics: createAnalyticsProvider() };
 
   ctx.inject(["connection"], (apiCtx) => {
-    for (const endpoint of ["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources", "instrument"]) {
+    for (const endpoint of ENDPOINTS) {
       apiCtx.connection.fetch.register({
         path: `/api/trading-workbench/${endpoint}`,
         methods: ["POST"], requestBody: "buffered",

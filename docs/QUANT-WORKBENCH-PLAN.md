@@ -244,6 +244,25 @@ python plugins/fin-data/python/reddit_search.py --login   # Reddit
 方向取 schema 明文；成交情况由数量推导；`status` 码原样附上而不猜枚举含义；
 「已撤单」只依据我们记录到的、券商返回 success 的撤单动作。
 
+### 缓存策略（不追求实时）
+
+面板不需要实时数据，因此**两层缓存**避免频繁取数：
+
+| 层 | TTL | 说明 |
+|---|---|---|
+| 客户端内存 | 与 Host 同量级 | 切页签/重开面板直接复用，不再发请求 |
+| Host RPC | instrument/series/risk 5 分钟；equity/positions/sources 2 分钟；factors/ic/correlation 10 分钟；sensitivity/events 30 分钟；trades/audit 1 分钟 | 客户端重新请求也不会重跑 python 子进程与富途调用 |
+
+快照兜底轮询从 3 秒放宽到 **60 秒**；「刷新」按钮清客户端缓存并让随后 5 秒的请求
+穿透 Host 缓存。切换模拟/实盘会清缓存。界面明确提示"数据按 TTL 本地缓存，
+不追求实时行情；实时价格请用富途行情工具查询"。
+
+### 接口自检（解决"404 一片"）
+
+Host 在 snapshot 里声明实际提供的接口；客户端据此跳过缺失接口并给出可读原因
+（"当前 dsh web 进程早于插件更新，重启后可用"），而不是抛一句 `HTTP 404`。
+对不声明清单的旧 Host，客户端从 404 反推并记住，同样停止重试。
+
 ## 十一、社交渠道的浏览器与 API 策略
 
 **资源策略（复用 + 及时关闭）**

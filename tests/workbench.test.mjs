@@ -4,7 +4,8 @@ import { mkdtemp, rm, writeFile, unlink } from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { WorkbenchStore } from "../plugins/workbench/src/store.js";
-import { createRpcHandler, createRpcFetchHandler } from "../plugins/workbench/src/rpc.js";
+import { createRpcHandler, createRpcFetchHandler, CACHE_TTL_MS } from "../plugins/workbench/src/rpc.js";
+import { ENDPOINTS } from "../plugins/workbench/src/endpoints.js";
 
 async function fixture(t) {
   const home = await mkdtemp(path.join(os.tmpdir(), "trading-workbench-"));
@@ -108,4 +109,80 @@ test("native RPC envelope rejects endpoint mismatch before any mutation", async 
   }));
   assert.equal(response.status, 400);
   assert.equal(store.readMode(), "sim");
+});
+
+test("snapshot 声明 Host 实际提供的接口清单", async (t) => {
+  const { store } = await fixture(t);
+  const handle = createRpcHandler(store);
+  const result = await handle("snapshot", {});
+  assert.equal(result.ok, true);
+  assert.deepEqual(result.value.endpoints, ENDPOINTS);
+  // 客户端据此识别"进程陈旧"，因此清单必须与注册的路由同源
+  assert.ok(result.value.endpoints.includes("positions"));
+});
+
+test("重复请求命中 Host 缓存，不再重跑取数", async (t) => {
+  const { store } = await fixture(t);
+  let calls = 0;
+  const handle = createRpcHandler(store, {
+    analytics: { async positions() { calls += 1; return { positions: [] }; } },
+  });
+  const first = await handle("positions", { mode: "sim" });
+  const second = await handle("positions", { mode: "sim" });
+  assert.equal(calls, 1, "同一请求不应重复调用 provider");
+  assert.equal(first.cached, false);
+  assert.equal(second.cached, true);
+  assert.equal(typeof second.cached_at, "string");
+  assert.deepEqual(second.value, first.value);
+});
+
+test("_refresh 绕过缓存但仍是合法请求", async (t) => {
+  const { store } = await fixture(t);
+  let calls = 0;
+  const handle = createRpcHandler(store, {
+    analytics: { async positions() { calls += 1; return { positions: [], n: calls }; } },
+  });
+  await handle("positions", { mode: "sim" });
+  const forced = await handle("positions", { mode: "sim", _refresh: true });
+  assert.equal(calls, 2);
+  assert.equal(forced.cached, false);
+  assert.equal(forced.value.n, 2);
+});
+
+test("不同参数各自缓存，互不串味", async (t) => {
+  const { store } = await fixture(t);
+  const seen = [];
+  const handle = createRpcHandler(store, {
+    analytics: { async instrument(payload) { seen.push(payload.ticker); return { ticker: payload.ticker }; } },
+  });
+  await handle("instrument", { ticker: "600519" });
+  await handle("instrument", { ticker: "00700.HK" });
+  await handle("instrument", { ticker: "600519" });
+  assert.deepEqual(seen, ["600519", "00700.HK"], "第三个请求应命中缓存");
+});
+
+test("缓存过期后重新取数", async (t) => {
+  const { store } = await fixture(t);
+  let calls = 0;
+  let clock = 1_000_000;
+  const handle = createRpcHandler(store, {
+    now: () => clock,
+    analytics: { async positions() { calls += 1; return { n: calls }; } },
+  });
+  await handle("positions", { mode: "sim" });
+  clock += CACHE_TTL_MS.positions - 1;
+  assert.equal((await handle("positions", { mode: "sim" })).cached, true);
+  clock += 2;
+  const after = await handle("positions", { mode: "sim" });
+  assert.equal(after.cached, false);
+  assert.equal(calls, 2);
+});
+
+test("_refresh 不参与各接口的字段校验", async (t) => {
+  const { store } = await fixture(t);
+  const handle = createRpcHandler(store, { analytics: { async positions() { return {}; } } });
+  const ok = await handle("positions", { mode: "sim", _refresh: true });
+  assert.equal(ok.ok, true);
+  const bad = await handle("positions", { mode: "sim", unexpected: 1 });
+  assert.equal(bad.ok, false, "其他多余字段仍必须被拒绝");
 });

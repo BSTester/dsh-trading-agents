@@ -97,11 +97,89 @@ window.__ModuleLoader__.load({
       return () => { tag.remove(); };
     }
 
-    async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources", "instrument"].includes(endpoint))
-        throw new Error("Unsupported workbench operation");
-      const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
+    const KNOWN_ENDPOINTS = ["snapshot", "switch-mode", "series", "equity", "positions",
+      "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit",
+      "sources", "instrument"];
+
+    // 面板是查看用途，不需要实时。结果缓存在内存里，切页签/重开面板不再重复请求；
+    // Host 侧另有 TTL 缓存，两层都命中时连 python 子进程都不会启动。
+    const CLIENT_TTL_MS = {
+      instrument: 5 * 60_000, series: 5 * 60_000, equity: 2 * 60_000, positions: 2 * 60_000,
+      correlation: 10 * 60_000, sensitivity: 30 * 60_000, risk: 5 * 60_000, trades: 60_000,
+      events: 30 * 60_000, factors: 10 * 60_000, ic: 10 * 60_000, audit: 60_000,
+      sources: 2 * 60_000,
+    };
+    const CACHE_MAX_ENTRIES = 60;
+    /** 兜底轮询间隔：面板是查看用途，切页签有缓存，不需要秒级刷新。 */
+    const SNAPSHOT_POLL_MS = 60_000;
+    const endpointCache = new Map();
+    // Host 在 snapshot 里声明它实际提供哪些接口；null 表示尚未获知（旧版 Host 不声明）
+    let servedEndpoints = null;
+    // 撞过 404 的接口：即使 Host 没声明，也能据此停止重试并说明原因
+    const missingEndpoints = new Set();
+    // 用户在 5 秒内点击过刷新：期间发出的请求都绕过缓存
+    let forceUntil = 0;
+
+    function cacheKey(endpoint, payload) {
+      return `${endpoint}|${JSON.stringify(Object.keys(payload ?? {}).sort()
+        .map((key) => [key, payload[key]]))}`;
+    }
+
+    function readCache(endpoint, payload) {
+      const hit = endpointCache.get(cacheKey(endpoint, payload));
+      const ttl = CLIENT_TTL_MS[endpoint] ?? 0;
+      if (!hit || ttl <= 0 || Date.now() - hit.at >= ttl) return null;
+      return hit;
+    }
+
+    function writeCache(endpoint, payload, value) {
+      if ((CLIENT_TTL_MS[endpoint] ?? 0) <= 0) return;
+      endpointCache.set(cacheKey(endpoint, payload), { value, at: Date.now() });
+      while (endpointCache.size > CACHE_MAX_ENTRIES) {
+        endpointCache.delete(endpointCache.keys().next().value);
+      }
+    }
+
+    /** 用户主动刷新：清掉客户端缓存，并让随后 5 秒内的请求强制穿透 Host 缓存。 */
+    function invalidateCaches() {
+      endpointCache.clear();
+      forceUntil = Date.now() + 5000;
+      // 用户可能刚重启过 Host：清掉"缺失"记忆，给它一次机会
+      missingEndpoints.clear();
+    }
+
+    /** Host 未提供该接口时的可读原因（而不是一句 HTTP 404）。 */
+    function missingEndpointMessage(endpoint) {
+      return `Host 未提供 ${endpoint} 接口：当前 dsh web 进程早于插件更新，`
+        + "重启 dsh web（或重开工作台）后可用。";
+    }
+
+    /** 传输层 404 说明该路由在 Host 里根本不存在（而不是业务失败）。 */
+    function isRouteMissing(message) {
+      return /HTTP 404|transport failure|not found/i.test(String(message));
+    }
+
+    async function request(rpc, endpoint, payload, signal, options = {}) {
+      if (!KNOWN_ENDPOINTS.includes(endpoint)) throw new Error("Unsupported workbench operation");
+      if (missingEndpoints.has(endpoint)) throw new Error(missingEndpointMessage(endpoint));
+      if (servedEndpoints && !servedEndpoints.has(endpoint)) throw new Error(missingEndpointMessage(endpoint));
+      const force = options.force === true || Date.now() < forceUntil;
+      const body = force ? { ...payload, _refresh: true } : payload;
+      let result;
+      try {
+        result = await rpc.call("/api", `trading-workbench/${endpoint}`, body, signal);
+      } catch (failure) {
+        // 旧版 Host 不声明清单，只能从 404 反推：记下来，避免每次切页签都重复撞墙
+        if (isRouteMissing(failure?.message)) {
+          missingEndpoints.add(endpoint);
+          throw new Error(missingEndpointMessage(endpoint));
+        }
+        throw failure;
+      }
       if (!result.ok) throw new Error(result.error.message);
+      if (endpoint === "snapshot" && Array.isArray(result.value?.endpoints)) {
+        servedEndpoints = new Set(result.value.endpoints);
+      }
       return result.value;
     }
 
@@ -193,14 +271,29 @@ window.__ModuleLoader__.load({
     // ── 展示组件 ────────────────────────────────────────────────────────
     /** 按需拉取只读端点：切换分类或刷新时取数，失败降级为可读错误。 */
     function useEndpoint(rpc, endpoint, payload, deps) {
-      const [state, setState] = React.useState({ data: null, error: "", loading: true });
+      const [state, setState] = React.useState(
+        () => { const hit = readCache(endpoint, payload); return { data: hit?.value ?? null, error: "", loading: !hit }; });
       React.useEffect(() => {
         let alive = true;
         const controller = new AbortController();
-        setState((s) => ({ ...s, loading: true }));
-        request(rpc, endpoint, payload, controller.signal)
-          .then((value) => { if (alive) setState({ data: value, error: "", loading: false }); })
-          .catch((failure) => { if (alive) setState({ data: null, error: failure.message, loading: false }); });
+        const hit = readCache(endpoint, payload);
+        const force = Date.now() < forceUntil;
+        if (hit && !force) {
+          // 命中缓存：直接展示，不再发请求
+          setState({ data: hit.value, error: "", loading: false });
+          return () => { alive = false; };
+        }
+        setState({ data: hit?.value ?? null, error: "", loading: !hit });
+        request(rpc, endpoint, payload, controller.signal, { force })
+          .then((value) => {
+            if (!alive) return;
+            writeCache(endpoint, payload, value);
+            setState({ data: value, error: "", loading: false });
+          })
+          .catch((failure) => {
+            // 失败时若有旧数据就继续展示旧数据，只把错误说明挂上去
+            if (alive) setState({ data: hit?.value ?? null, error: failure.message, loading: false });
+          });
         return () => { alive = false; controller.abort(); };
       }, deps);
       return state;
@@ -822,7 +915,8 @@ window.__ModuleLoader__.load({
           } catch (failure) {
             if (!controller.signal.aborted && generation.current === current) setError(failure.message);
           } finally {
-            if (!controller.signal.aborted) timer = setTimeout(refresh, 3000);
+            // 面板不需要实时：默认 60 秒一次兜底刷新；用户可点「刷新」即时更新
+            if (!controller.signal.aborted) timer = setTimeout(refresh, SNAPSHOT_POLL_MS);
           }
         };
         refresh();
@@ -836,10 +930,13 @@ window.__ModuleLoader__.load({
           await request(rpc, "switch-mode", { mode, expected_mode: expected, ...(mode === "live" ? { confirmation } : {}) });
           setConfirmation("");
         } catch (failure) { setSwitchError(failure.message); }
-        finally { setSwitching(false); setRevision((v) => v + 1); }
+        finally { setSwitching(false); invalidateCaches(); setRevision((v) => v + 1); }
       };
 
       const live = snapshot?.mode === "live";
+      // Host 会声明它实际提供哪些接口（stale 进程会缺一批）
+      const served = Array.isArray(snapshot?.endpoints) ? snapshot.endpoints : null;
+      const missing = served ? KNOWN_ENDPOINTS.filter((name) => !served.includes(name)) : [];
       return h(React.Fragment, null,
         h("button", { type: "button", className: "tw-fab", "aria-expanded": open, title: "交易工作台",
           onClick: () => setOpen((v) => !v) },
@@ -850,6 +947,8 @@ window.__ModuleLoader__.load({
             h("h2", { className: "tw-title" }, "交易工作台"),
             snapshot && h("span", { className: `tw-badge${live ? " live" : ""}` }, live ? "实盘 LIVE" : "模拟盘 SIM"),
             snapshot && h("span", { className: "tw-meta" }, `更新 ${String(snapshot.generated_at).slice(11, 19)}`),
+            h("button", { type: "button", className: "tw-btn seg", title: "清除本地缓存并重新取数",
+              onClick: () => { invalidateCaches(); setError(""); setRevision((v) => v + 1); } }, "刷新"),
             sources && h("span", { className: `tw-badge${sources.summary.fail > 0 ? " live" : ""}`,
               title: sources.sources.map((s) => `${s.label}: ${s.detail}`).join("\n") },
               sources.summary.fail > 0 ? `数据源 ${sources.summary.fail} 项异常`
@@ -860,6 +959,10 @@ window.__ModuleLoader__.load({
               h("button", { key: item.id, type: "button", className: `tw-nav-item${tab === item.id ? " active" : ""}`,
                 onClick: () => setTab(item.id) }, h("span", { className: "tw-nav-dot" }), item.label))),
             h("div", { className: "tw-content" },
+              missing.length > 0 && h("p", { role: "alert", className: "tw-alert" },
+                `当前 Harness 进程未加载 ${missing.length} 个工作台接口（${missing.join("、")}）：`
+                + "该进程启动早于插件更新，Host 半边只在启动时加载一次。"
+                + "重启 dsh web 后即可用；在此之前这些页签不会发起请求。"),
               switchError && h("p", { role: "alert", className: "tw-alert" }, `模式切换失败：${switchError}`),
               error && h("p", { role: "alert", className: "tw-alert" }, `更新失败：${error}`),
               !snapshot && h("p", { className: "tw-status" }, switching ? "正在切换模式…" : "正在读取工作台…"),
@@ -872,8 +975,11 @@ window.__ModuleLoader__.load({
               !detail && snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
               !detail && snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker, onOpenReport: setDetail }),
               !detail && tab === "events" && h(EventsView, { rpc, ticker }),
-              !detail && snapshot && tab === "audit" && h(AuditView, { snapshot }),
+              !detail && snapshot && tab === "audit" && h(AuditView, { rpc, snapshot }),
               snapshot && h("div", { className: "tw-row" },
+                h("p", { className: "tw-hint" },
+                  "面板数据按 TTL 本地缓存（分钟级），不追求实时行情；"
+                  + "点「刷新」可清除缓存并重新取数。实时价格请用富途行情工具查询。"),
                 snapshot.mode === "sim"
                   ? h(React.Fragment, null,
                     h("input", { className: "tw-input", value: confirmation, placeholder: "输入「确认实盘」以切换",
@@ -899,6 +1005,10 @@ window.__ModuleLoader__.load({
       }
     }
 
-    return { inject: ["slots", "connection"], apply, request };
+    // `internals` 仅供测试断言缓存与接口自检行为，不参与运行时逻辑
+    return { inject: ["slots", "connection"], apply, request,
+      internals: { readCache, writeCache, invalidateCaches, KNOWN_ENDPOINTS, CLIENT_TTL_MS,
+        servedEndpoints: () => servedEndpoints, cacheSize: () => endpointCache.size,
+        missingEndpoints: () => [...missingEndpoints] } };
   },
 });
