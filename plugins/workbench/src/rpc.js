@@ -70,14 +70,15 @@ export function createRpcHandler(store, deps = {}) {
         }
         return { ok: true, value: buildAuditChain({ snapshot: store.snapshot(), trades }) };
       }
-      if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades" || endpoint === "events" || endpoint === "factors" || endpoint === "ic" || endpoint === "sources") {
+      if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades" || endpoint === "events" || endpoint === "factors" || endpoint === "ic" || endpoint === "sources" || endpoint === "instrument") {
         const allowed = endpoint === "sensitivity"
           ? ["ticker", "strategy", "metric", "fast_grid", "slow_grid", "buy_grid", "sell_grid", "start"]
           : endpoint === "trades" ? ["mode", "limit"]
           : endpoint === "events" ? ["ticker", "days"]
           : endpoint === "factors" ? ["tickers", "window"]
           : endpoint === "ic" ? ["tickers", "factor", "forward", "window"]
-          : endpoint === "sources" ? ["no_probe"] : [];
+          : endpoint === "sources" ? ["no_probe"]
+          : endpoint === "instrument" ? ["ticker"] : [];
         if (Object.keys(payload).some(key => !allowed.includes(key))) {
           throw new WorkbenchError(`Unexpected ${endpoint} field`);
         }

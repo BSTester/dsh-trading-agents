@@ -25,7 +25,8 @@ from x_search import (DEBUG_PORT, PROFILE_DIR, close_browser_if_we_launched_it, 
                       close_by_port_best_effort, debug_port_alive, ensure_browser)
 
 LOGIN_URL = "https://www.reddit.com/login"
-SEARCH_URL = "https://old.reddit.com/search"
+# 注意：old.reddit.com 要求单独登录（与 www 不共享会话）；www 的搜索结果属性可直接读取。
+SEARCH_URL = "https://www.reddit.com/search/"
 
 
 def reddit_reachable(timeout=3):
@@ -83,36 +84,74 @@ def main():
                 print(json.dumps({"error": "缺少搜索词（或用 --login 登录）"}))
                 return 1
 
-            params = {"q": args.query, "sort": args.sort, "t": "month"}
+            params = {"q": args.query, "sort": args.sort, "type": "posts"}
             if args.subreddit:
                 params["q"] = f"subreddit:{args.subreddit} {args.query}"
             url = f"{SEARCH_URL}?{urllib.parse.urlencode(params)}"
             page.goto(url, timeout=60000, wait_until="domcontentloaded")
-            time.sleep(1.5)
-            if "/login" in page.url or "login" in page.url.split("?")[0]:
-                print(json.dumps({"error": "Reddit 需要登录（old.reddit.com 要求账号）",
+            time.sleep(4)  # 新 Reddit 为 Web Component，需等其挂载
+            if "/login" in page.url:
+                print(json.dumps({"error": "Reddit 需要登录",
                                   "fix": "python plugins/fin-data/python/reddit_search.py --login"},
                                  ensure_ascii=False))
                 page.close()
                 return 0
-            page.wait_for_selector("div.search-result, div.thing", timeout=30000, state="attached")
-            time.sleep(1.5)
+            try:
+                page.wait_for_selector('a[href*="/comments/"]', timeout=25000, state="attached")
+            except Exception:
+                print(json.dumps({"error": "搜索页未返回结果（可能未登录或被限流）",
+                                  "fix": "python plugins/fin-data/python/reddit_search.py --login"}))
+                page.close()
+                return 0
+            page.mouse.wheel(0, 1200)  # 触发懒加载
+            time.sleep(2)
 
             items = page.evaluate(
-                """(limit) => Array.from(document.querySelectorAll('div.search-result, div.thing'))
-                     .slice(0, limit).map((node) => {
-                       const pick = (sel) => { const e = node.querySelector(sel); return e ? e.innerText.trim() : ''; };
-                       const link = node.querySelector('a.search-title, a.title');
-                       const attr = (sel, name) => { const e = node.querySelector(sel); return e ? e.getAttribute(name) : null; };
-                       return {
-                         title: pick('a.search-title, a.title'),
-                         subreddit: pick('a.search-subreddit-link, a.subreddit'),
-                         score: pick('.search-score, .score.unvoted'),
-                         comments: pick('a.search-comments, a.comments'),
-                         time: attr('time', 'datetime'),
-                         url: link ? link.getAttribute('href') : null,
-                       };
-                     }).filter((row) => row.title)""",
+                """(limit) => {
+                  const seenUrl = new Set();
+                  const rows = [];
+                  for (const link of document.querySelectorAll('a[href*="/comments/"]')) {
+                    const href = link.getAttribute('href') || '';
+                    const title = (link.innerText || '').replace(/\\s+/g, ' ').trim();
+                    if (!title || title.length < 8 || !href) continue;
+                    if (seenUrl.has(href)) continue;   // 同一帖子有多个链接（标题/缩略图），按 URL 去重
+                    seenUrl.add(href);
+
+                    // 帖子级容器：优先 search-telemetry-tracker，其次向上最多 4 层，
+                    // 并要求文本长度合理（避免误取整个结果列表容器）。
+                    const candidateOf = (start) => {
+                      const byTracker = start.closest('search-telemetry-tracker');
+                      if (byTracker && (byTracker.innerText || '').length < 1500) return byTracker;
+                      let node = start;
+                      for (let i = 0; i < 4 && node; i += 1) {
+                        node = node.parentElement;
+                        if (!node) break;
+                        const text = node.innerText || '';
+                        if (/comment/i.test(text) && text.length < 1500) return node;
+                      }
+                      return null;
+                    };
+                    const container = candidateOf(link);
+                    let score = '', comments = '';
+                    if (container) {
+                      const nums = Array.from(container.querySelectorAll('faceplate-number'))
+                        .map((el) => el.getAttribute('number') || el.innerText || '')
+                        .filter((value) => value && /[0-9]/.test(value));
+                      if (nums.length >= 2) { score = nums[0]; comments = nums[1]; }
+                      else if (nums.length === 1) { comments = nums[0]; }
+                      const text = container.innerText || '';
+                      if (!score) score = (text.match(/([\\d.,]+[KM]?)\\s*(upvote|vote)/i) || [])[1] || '';
+                      if (!comments) comments = (text.match(/([\\d.,]+[KM]?)\\s*comment/i) || [])[1] || '';
+                    }
+                    const sub = href.match(/\\/r\\/([^\\/]+)\\//);
+                    const time = (link.closest('search-telemetry-tracker') || container || link)
+                      .querySelector('time')?.getAttribute('datetime') || '';
+                    rows.push({ title, subreddit: sub ? 'r/' + sub[1] : '', score, comments, time,
+                                url: href.startsWith('/') ? 'https://www.reddit.com' + href : href });
+                    if (rows.length >= limit) break;
+                  }
+                  return rows;
+                }""",
                 args.count,
             )
             page.close()

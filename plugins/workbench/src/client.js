@@ -98,7 +98,7 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources"].includes(endpoint))
+      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources", "instrument"].includes(endpoint))
         throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
@@ -156,82 +156,6 @@ window.__ModuleLoader__.load({
         if (i >= n - 1) out[i] = sum / n;
       }
       return out;
-    }
-
-    function KLineChart({ bars }) {
-      const ref = useCanvasChart((ctx, width, height, color) => {
-        if (!bars || bars.length < 2) {
-          ctx.fillStyle = color.text;
-          ctx.font = "12px sans-serif";
-          ctx.fillText("暂无K线数据", 12, 22);
-          return;
-        }
-        const padL = 46, padR = 12, padT = 10, volH = Math.round(height * 0.22), gap = 8;
-        const priceH = height - padT - volH - gap - 18;
-        const ma5 = movingAverage(bars, 5), ma20 = movingAverage(bars, 20);
-        const values = bars.flatMap((b) => [b.h, b.l]).concat(ma5.filter((v) => v !== null), ma20.filter((v) => v !== null));
-        let min = Math.min(...values), max = Math.max(...values);
-        if (max - min < 1e-9) { max += 1; min -= 1; }
-        const span = max - min;
-        min -= span * 0.04; max += span * 0.04;
-        const maxVol = Math.max(...bars.map((b) => b.v || 0), 1);
-        const innerW = width - padL - padR;
-        const step = innerW / bars.length;
-        const cw = Math.max(1, Math.min(step * 0.65, 12));
-        const y = (price) => padT + priceH * (1 - (price - min) / (max - min));
-
-        // 网格 + 价格刻度
-        ctx.strokeStyle = color.grid; ctx.lineWidth = 1;
-        ctx.fillStyle = color.text; ctx.font = "10px sans-serif";
-        for (let i = 0; i <= 4; i += 1) {
-          const price = min + (max - min) * (i / 4);
-          const gy = Math.round(y(price)) + 0.5;
-          ctx.beginPath(); ctx.moveTo(padL, gy); ctx.lineTo(width - padR, gy); ctx.stroke();
-          ctx.fillText(price.toFixed(2), 4, gy + 3);
-        }
-        // 蜡烛 + 成交量
-        bars.forEach((b, i) => {
-          const cx = padL + step * i + step / 2;
-          const up = b.c >= b.o;
-          ctx.strokeStyle = up ? color.up : color.down;
-          ctx.fillStyle = up ? color.up : color.down;
-          ctx.beginPath(); ctx.moveTo(cx, y(b.h)); ctx.lineTo(cx, y(b.l)); ctx.stroke();
-          const top = y(Math.max(b.o, b.c)), bottom = y(Math.min(b.o, b.c));
-          ctx.fillRect(cx - cw / 2, top, cw, Math.max(1, bottom - top));
-          const vh = (b.v || 0) / maxVol * volH;
-          ctx.globalAlpha = 0.55;
-          ctx.fillRect(cx - cw / 2, height - 16 - vh, cw, Math.max(0.5, vh));
-          ctx.globalAlpha = 1;
-        });
-        // 均线
-        const line = (series, color2) => {
-          ctx.strokeStyle = color2; ctx.lineWidth = 1.4; ctx.beginPath();
-          let started = false;
-          series.forEach((value, i) => {
-            if (value === null) return;
-            const cx = padL + step * i + step / 2;
-            if (!started) { ctx.moveTo(cx, y(value)); started = true; } else ctx.lineTo(cx, y(value));
-          });
-          ctx.stroke();
-        };
-        line(ma5, color.line);
-        line(ma20, "#c9a227");
-        // 时间刻度
-        ctx.fillStyle = color.text;
-        const ticks = 4;
-        for (let i = 0; i < ticks; i += 1) {
-          const index = Math.floor((bars.length - 1) * (i / (ticks - 1)));
-          const label = String(bars[index].t).slice(5, 16);
-          const lx = padL + step * index + step / 2;
-          ctx.fillText(label, Math.min(lx, width - padR - 62), height - 3);
-        }
-        // 图例
-        ctx.fillStyle = color.line; ctx.fillRect(padL, padT - 6, 10, 2);
-        ctx.fillStyle = color.text; ctx.fillText("MA5", padL + 14, padT - 2);
-        ctx.fillStyle = "#c9a227"; ctx.fillRect(padL + 48, padT - 6, 10, 2);
-        ctx.fillStyle = color.text; ctx.fillText("MA20", padL + 62, padT - 2);
-      }, [bars]);
-      return h("canvas", { ref, className: "tw-chart" });
     }
 
     function LineChart({ points, label = "" }) {
@@ -389,7 +313,6 @@ window.__ModuleLoader__.load({
         h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, content)));
     }
 
-    const PERIODS = ["1m", "5m", "15m", "30m", "60m", "1d"];
     const NAV = [
       { id: "market", label: "行情" }, { id: "signal", label: "信号" },
       { id: "portfolio", label: "组合" }, { id: "risk", label: "风险" },
@@ -398,45 +321,63 @@ window.__ModuleLoader__.load({
       { id: "events", label: "事件" }, { id: "audit", label: "审计" },
     ];
 
-    function MarketView({ rpc, state, setState }) {
-      const { ticker, period, bars, loading, error, meta } = state;
-      React.useEffect(() => {
-        let alive = true;
-        const controller = new AbortController();
-        setState((s) => ({ ...s, loading: true, error: "" }));
-        request(rpc, "series", { ticker, period, limit: 300 }, controller.signal)
-          .then((value) => { if (alive) setState((s) => ({ ...s, bars: value.bars, meta: { source: value.source, as_of: value.as_of }, loading: false })); })
-          .catch((failure) => { if (alive) setState((s) => ({ ...s, error: failure.message, loading: false })); });
-        return () => { alive = false; controller.abort(); };
-      }, [ticker, period]);
+    function MarketView({ rpc, onResolved }) {
+      const [ticker, setTicker] = React.useState("");
+      const [submitted, setSubmitted] = React.useState("");
+      const [card, setCard] = React.useState(null);
+      const [error, setError] = React.useState("");
+      const [loading, setLoading] = React.useState(false);
 
-      const last = bars && bars.length ? bars[bars.length - 1] : null;
-      const prev = bars && bars.length > 1 ? bars[bars.length - 2] : null;
-      const change = last && prev ? ((last.c - prev.c) / prev.c) * 100 : 0;
+      const lookup = async () => {
+        const value = ticker.trim().toUpperCase();
+        if (!value) { setError("请输入标的代码（如 00700.HK / AAPL / 600519）"); return; }
+        setLoading(true); setError("");
+        try {
+          const data = await request(rpc, "instrument", { ticker: value });
+          setCard(data); setSubmitted(value); onResolved(value);
+        } catch (failure) {
+          setCard(null); setError(failure.message);
+        } finally { setLoading(false); }
+      };
+
+      const changeColor = (card?.change_pct ?? 0) >= 0
+        ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)";
       return h(React.Fragment, null,
-        h("div", { className: "tw-toolbar" },
-          h("input", { className: "tw-input", value: ticker, "aria-label": "标的代码",
-            onChange: (e) => setState((s) => ({ ...s, ticker: e.target.value.toUpperCase() })) }),
-          PERIODS.map((p) => h("button", { key: p, type: "button",
-            className: `tw-btn seg${p === period ? " active" : ""}`,
-            onClick: () => setState((s) => ({ ...s, period: p })) }, p)),
-          h("span", { className: "tw-meta" }, loading ? "加载中…" : meta.as_of ? `数据截至 ${meta.as_of} · ${meta.source}` : "")),
-        error && h("p", { className: "tw-alert" }, `行情获取失败：${error}`),
-        h("div", { className: "tw-kv" },
-          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最新价"),
-            h("div", { className: "tw-kv-v" }, last ? last.c.toFixed(2) : "—")),
-          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "涨跌（周期）"),
-            h("div", { className: "tw-kv-v", style: { color: change >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
-              `${change >= 0 ? "+" : ""}${change.toFixed(2)}%`)),
-          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最高/最低（区间）"),
-            h("div", { className: "tw-kv-v" }, bars && bars.length ? `${Math.max(...bars.map((b) => b.h)).toFixed(2)} / ${Math.min(...bars.map((b) => b.l)).toFixed(2)}` : "—")),
-          h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交量（末根）"),
-            h("div", { className: "tw-kv-v" }, last ? Math.round(last.v).toLocaleString() : "—"))),
-        h(Card, { title: "K线 · MA5/MA20 · 成交量" }, h(KLineChart, { bars })),
-        h("p", { className: "tw-hint" }, "分钟级数据来自新浪源（A股）；港股/美股当前的分钟K线数据源受富途接口限制，暂以快照单点降级显示。"));
+        h(Card, { title: "标的查询" },
+          h("div", { className: "tw-toolbar" },
+            h("input", { className: "tw-input", value: ticker, placeholder: "00700.HK / AAPL / 600519",
+              "aria-label": "标的代码", onChange: (e) => setTicker(e.target.value),
+              onKeyDown: (e) => { if (e.key === "Enter") lookup(); } }),
+            h("button", { type: "button", className: "tw-btn primary", disabled: loading, onClick: lookup },
+              loading ? "查询中…" : "查询")),
+          error && h("p", { className: "tw-alert" }, error),
+          !card && !error && h("p", { className: "tw-empty" }, "输入标的代码查询名称/价格/区间与富途跳转。")),
+        card && h(Card, { title: `${card.name ?? card.symbol}${card.name_en ? ` · ${card.name_en}` : ""}` },
+          h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最新价"),
+              h("div", { className: "tw-kv-v" }, card.price ?? "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "涨跌幅"),
+              h("div", { className: "tw-kv-v", style: { color: changeColor } },
+                card.change_pct === null || card.change_pct === undefined ? "—" : `${card.change_pct >= 0 ? "+" : ""}${card.change_pct}%`)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "今开 / 昨收"),
+              h("div", { className: "tw-kv-v" }, `${card.open ?? "—"} / ${card.prev_close ?? "—"}`)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最高 / 最低"),
+              h("div", { className: "tw-kv-v" }, `${card.high ?? "—"} / ${card.low ?? "—"}`)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交量"),
+              h("div", { className: "tw-kv-v" }, card.volume ? Number(card.volume).toLocaleString() : "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交额"),
+              h("div", { className: "tw-kv-v" }, card.turnover ? Number(card.turnover).toLocaleString() : "—")),
+            card.lot_size && h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "每手股数"),
+              h("div", { className: "tw-kv-v" }, String(card.lot_size)))),
+          h("div", { className: "tw-toolbar", style: { marginTop: "4px" } },
+            h("a", { className: "tw-btn primary", href: card.futu_url, target: "_blank", rel: "noreferrer" },
+              "在富途查看K线 ↗"),
+            h("span", { className: "tw-meta" }, `${card.symbol} · 数据 ${card.as_of ?? "—"} · ${card.source ?? "—"}`)),
+          card.note && h("p", { className: "tw-hint" }, card.note),
+          h("p", { className: "tw-hint" }, "工作台不内置行情图表；K线请点击上方链接在富途查看。")));
     }
 
-    function SignalView({ snapshot, series }) {
+    function SignalView({ snapshot }) {
       const previews = snapshot.previews.filter((p) => p.kind === "signal" || p.kind === "backtest");
       return h(React.Fragment, null,
         h(Card, { title: "量化信号与回测（由 Harness 计算）", count: previews.length,
@@ -449,12 +390,10 @@ window.__ModuleLoader__.load({
                 `${p.value?.ticker ?? ""}`,
                 h("span", { className: "tw-meta" }, p.at)),
               h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(p.value, null, 2)))) })),
-        series && series.length > 1 && h(Card, { title: "价格走势（当前标的）" },
-          h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })),
         h("p", { className: "tw-hint" }, "工作台只展示结果；信号计算、回测与下单请在 Harness 会话中发起。"));
     }
 
-    function PortfolioView({ rpc, snapshot, series }) {
+    function PortfolioView({ rpc, snapshot }) {
       const ledgerPreview = snapshot.previews.find((p) => p.kind === "ledger");
       const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
       const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
@@ -489,9 +428,7 @@ window.__ModuleLoader__.load({
               h("div", { className: "tw-kv-k" }, `${row.ticker} · ${row.shares} 股 · 止损 ${row.stop ?? "—"}`),
               h("div", { className: "tw-kv-v", style: { color: (row.pnl ?? 0) >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
                 `${row.price ?? "—"}（${row.pnl >= 0 ? "+" : ""}${row.pnl} / ${row.pnl_pct ?? "—"}%）`)))),
-          ledgerPreview && h("p", { className: "tw-meta" }, `最近台账预览：${ledgerPreview.at}`)),
-        series && series.length > 1 && h(Card, { title: "当前标的走势" },
-          h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })));
+          ledgerPreview && h("p", { className: "tw-meta" }, `最近台账预览：${ledgerPreview.at}`)));
     }
 
     function RiskConfigCard({ rpc, mode }) {
@@ -512,10 +449,8 @@ window.__ModuleLoader__.load({
       const s = latest?.value?.summary;
       const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
       const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
-      const held = (positions.data?.positions ?? []).map((p) => p.ticker);
-      const basket = (held.length >= 2 ? held : ["600519", "000001", "601318", "600036"]).slice(0, 6);
-      const correlation = useEndpoint(rpc, "correlation", { tickers: basket, window: 120 },
-        [rpc, basket.join(",")]);
+      const held = (positions.data?.positions ?? []).map((p) => p.ticker).slice(0, 6);
+      const correlation = useEndpoint(rpc, "correlation", { tickers: held, window: 120 }, [rpc, held.join(",")]);
       const ddPoints = (equity.data?.points ?? []).map((p) => ({ v: (p.dd ?? 0) * 100 }));
       return h(React.Fragment, null,
         h(Card, { title: "风险指标",
@@ -553,12 +488,14 @@ window.__ModuleLoader__.load({
     function FactorsView({ rpc, ticker, watchlist, setWatchlist }) {
       const [factor, setFactor] = React.useState("mom_20");
       const tickers = watchlist;
-      const snap = useEndpoint(rpc, "factors", { tickers, window: 250 }, [rpc, tickers.join(",")]);
-      const ic = useEndpoint(rpc, "ic", { tickers, factor, forward: 5, window: 250 }, [rpc, tickers.join(","), factor]);
+      const enough = tickers.length >= 2;
+      const snap = useEndpoint(rpc, "factors", enough ? { tickers, window: 250 } : {}, [rpc, tickers.join(",")]);
+      const ic = useEndpoint(rpc, "ic", tickers.length >= 3 ? { tickers, factor, forward: 5, window: 250 } : {},
+        [rpc, tickers.join(","), factor]);
       const rows = snap.data?.rows ?? [];
       const icPoints = (ic.data?.points ?? []).map((p) => ({ v: p.ic }));
       return h(React.Fragment, null,
-        h(Card, { title: "标的池", count: tickers.length },
+        h(Card, { title: "标的池（默认空，需自行输入）", count: tickers.length },
           h("div", { className: "tw-toolbar" },
             h("input", { className: "tw-input", value: tickers.join(","), "aria-label": "标的池（逗号分隔，2..8个）",
               onChange: (e) => setWatchlist(e.target.value.toUpperCase().split(",").map((t) => t.trim()).filter(Boolean).slice(0, 8)) }),
@@ -761,8 +698,8 @@ window.__ModuleLoader__.load({
       const [confirmation, setConfirmation] = React.useState("");
       const [switching, setSwitching] = React.useState(false);
       const [revision, setRevision] = React.useState(0);
-      const [market, setMarket] = React.useState({ ticker: "600519", period: "5m", bars: null, loading: false, error: "", meta: {} });
-      const [watchlist, setWatchlist] = React.useState(["600519", "000001", "601318", "600036", "300750"]);
+      const [ticker, setTicker] = React.useState("");  // 无默认标的：未查询时留空
+      const [watchlist, setWatchlist] = React.useState([]);  // 标的池默认空，由用户输入
       const [detail, setDetail] = React.useState(null);
       const generation = React.useRef(0);
       const [sources, setSources] = React.useState(null);
@@ -830,14 +767,14 @@ window.__ModuleLoader__.load({
               error && h("p", { role: "alert", className: "tw-alert" }, `更新失败：${error}`),
               !snapshot && h("p", { className: "tw-status" }, switching ? "正在切换模式…" : "正在读取工作台…"),
               detail && h(ReportDetail, { report: detail, onBack: () => setDetail(null) }),
-              !detail && tab === "market" && h(MarketView, { rpc, state: market, setState: setMarket }),
-              !detail && snapshot && tab === "signal" && h(SignalView, { snapshot, series: market.bars }),
-              !detail && snapshot && tab === "portfolio" && h(PortfolioView, { rpc, snapshot, series: market.bars }),
+              !detail && tab === "market" && h(MarketView, { rpc, onResolved: setTicker }),
+              !detail && snapshot && tab === "signal" && h(SignalView, { snapshot }),
+              !detail && snapshot && tab === "portfolio" && h(PortfolioView, { rpc, snapshot }),
               !detail && snapshot && tab === "risk" && h(RiskView, { rpc, snapshot }),
-              !detail && tab === "factors" && h(FactorsView, { rpc, ticker: market.ticker, watchlist, setWatchlist }),
+              !detail && tab === "factors" && h(FactorsView, { rpc, ticker, watchlist, setWatchlist }),
               !detail && snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
-              !detail && snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker: market.ticker, onOpenReport: setDetail }),
-              !detail && tab === "events" && h(EventsView, { rpc, ticker: market.ticker }),
+              !detail && snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker, onOpenReport: setDetail }),
+              !detail && tab === "events" && h(EventsView, { rpc, ticker }),
               !detail && snapshot && tab === "audit" && h(AuditView, { snapshot }),
               snapshot && h("div", { className: "tw-row" },
                 snapshot.mode === "sim"

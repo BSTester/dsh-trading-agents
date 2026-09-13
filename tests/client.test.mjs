@@ -57,3 +57,16 @@ test("workbench client ships pagination, report detail, and drawer UI", async ()
     assert.match(text, /h\(Paged,/, `${view} 未使用分页`);
   }
 });
+
+test("workbench shows a Futu instrument card, not charts, and ships no sample data", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.doesNotMatch(source, /KLineChart/, "不应再内置 K 线图组件");
+  assert.match(source, /在富途查看K线/, "缺少跳转富途看 K 线的入口");
+  assert.match(source, /instrument/, "未使用标的卡片接口");
+  // 不得内置示例标的（默认标的池/默认行情标的）
+  for (const code of ["600519", "000001", "601318", "600036", "300750"]) {
+    assert.ok(!source.includes(`"${code}"`), `仍存在示例标的 ${code}`);
+  }
+  assert.match(source, /useState\(""\)/, "行情标的默认值应为空");
+  assert.match(source, /useState\(\[\]\)/, "标的池默认值应为空");
+});

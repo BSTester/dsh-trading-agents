@@ -14,7 +14,7 @@ export function apply(ctx) {
   const deps = { fetchSeries: createSeriesProvider(), analytics: createAnalyticsProvider() };
 
   ctx.inject(["connection"], (apiCtx) => {
-    for (const endpoint of ["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources"]) {
+    for (const endpoint of ["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources", "instrument"]) {
       apiCtx.connection.fetch.register({
         path: `/api/trading-workbench/${endpoint}`,
         methods: ["POST"], requestBody: "buffered",

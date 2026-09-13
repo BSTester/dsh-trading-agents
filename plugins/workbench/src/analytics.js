@@ -125,6 +125,20 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       if (payload.no_probe === true) args.push("--no-probe");
       return call(args, `sources|${payload.no_probe === true ? "noprobe" : "probe"}`);
     },
+    async instrument(payload = {}) {
+      const ticker = payload.ticker;
+      if (typeof ticker !== "string" || !TICKER.test(ticker)) throw new Error("Invalid ticker");
+      const hit = cache.get(`instrument|${ticker}`);
+      if (hit && now() - hit.at < CACHE_TTL_MS) return hit.value;
+      const { stdout } = await exec(python(), [path.join(pythonDir, "instruments.py"), "--ticker", ticker],
+        { timeout: 120_000, maxBuffer: 4 * 1024 * 1024 });
+      const start = stdout.indexOf("{");
+      if (start < 0) throw new Error("instruments.py returned no JSON");
+      const value = JSON.parse(stdout.slice(start));
+      if (value.error) throw new Error(value.error);
+      cache.set(`instrument|${ticker}`, { at: now(), value });
+      return value;
+    },
     async risk() {
       return call(["risk"], "risk");
     },
