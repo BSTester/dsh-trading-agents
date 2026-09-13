@@ -21,6 +21,14 @@ LIBRARIES = ("datasource",)
 #   fin-data   —— 被量化侧以子进程调用（共用同一套新闻/情绪渠道）
 UNIFIED_PYTHON = ("datasource", "fin-data")
 UNIFIED_ROOT_NAME = "trading-python"
+# 目录名 → npm 包名（自检用；工作台没有 preset 行，故不放进 PRESET_PACKAGES）
+PACKAGE_NAMES = {
+    "workbench": "@bstester/dsh-trading-workbench",
+    "fin-data": "@bstester/dsh-fin-data",
+    "engine": "@bstester/dsh-trading-engine",
+    "futu-keepalive": "@bstester/dsh-futu-keepalive",
+    "datasource": "@bstester/dsh-datasource",
+}
 DATA_LAYER_PTH_NAME = "dsh-trading-python.pth"
 PRESET_PACKAGES = {
     "fin-data": "@bstester/dsh-fin-data",
@@ -174,6 +182,77 @@ def write_data_layer_pth(dsh_home):
     return site, target
 
 
+def check_install(repo, dsh_home):
+    """自检安装完整性。返回 0 表示无问题。
+
+    存在的意义：**统一数据层必须由安装器解出**，只跑 `dsh plugin add` 装不出它，
+    而缺了它的表现是一句 `ModuleNotFoundError: No module named 'trading_datasource'`，
+    很难一眼看出该做什么。
+    """
+    repo, dsh_home = Path(repo).resolve(), Path(dsh_home).expanduser().resolve()
+    problems, notes = [], []
+
+    preset = repo / "agent.cordis.yml"
+    if preset.is_file():
+        notes.append(f"对话模式(preset): {preset}")
+        # 注意：这里必须看**文件当前状态**，不能先过一遍 activate_preset ——
+        # 那会把所有行强制改成启用，于是永远查不出"该启用但没启用"。
+        for row_id in PRESET_PACKAGES:
+            block = next((b for b in re.split(r"(?=^- )", read_text(preset), flags=re.MULTILINE)
+                          if re.match(rf"- id: {re.escape(row_id)}[ \t]*\r?$", b, re.MULTILINE)), None)
+            if block is None:
+                problems.append(f"preset 缺少 {row_id} 行")
+            elif re.search(r"^  disabled: true", block, re.MULTILINE):
+                problems.append(f"preset 行 {row_id} 仍是 disabled: true（安装器未启用它）")
+    else:
+        problems.append(f"找不到 preset 组合文件：{preset}")
+
+    for plugin, package in PACKAGE_NAMES.items():
+        if plugin == "datasource":
+            continue
+        manifest = dsh_home / "profiles" / "web" / "node_modules" / package / "package.json"
+        if manifest.is_file():
+            try:
+                version = json.loads(read_text(manifest)).get("version", "?")
+            except ValueError:
+                version = "?"
+            notes.append(f"插件 {plugin}: {version}")
+        else:
+            problems.append(f"插件 {plugin} 未安装（缺 {manifest}）")
+
+    root = unified_python_root(dsh_home)
+    for plugin, expect in (("datasource", "trading_datasource"), ("fin-data", "fin_sentiment.py")):
+        if (root / plugin / expect).exists():
+            notes.append(f"统一数据层 {plugin}: {root / plugin}")
+        else:
+            problems.append(f"统一数据层缺少 {plugin}（{root / plugin / expect}）")
+
+    site = site_packages_dir(dsh_home)
+    if site is None:
+        problems.append(f"找不到交易 venv 的 site-packages（{dsh_home / 'trading-venv'}）")
+    else:
+        pth = site / DATA_LAYER_PTH_NAME
+        expected = str(root / "datasource") + "\n"
+        if not pth.is_file():
+            problems.append(f"未写入 .pth：{pth}（跑 `link` 动作）")
+        elif read_text(pth) != expected:
+            problems.append(f".pth 内容不对：期望 {expected.strip()}，实际 {read_text(pth).strip()}")
+
+    print("安装自检：")
+    for line in notes:
+        print(f"  · {line}")
+    if problems:
+        print("\n发现问题：")
+        for line in problems:
+            print(f"  ✗ {line}")
+        print("\n修复：python scripts/install_plugins.py install "
+              f"--repo {repo} --dsh-home {dsh_home}"
+              "\n（顺序很重要：install 会重新解出统一数据层并写 .pth）")
+        return 1
+    print("\n✅ 安装完整。")
+    return 0
+
+
 def install_plugins(repo, dsh_home):
     repo, dsh_home = Path(repo).resolve(), Path(dsh_home).expanduser().resolve()
     commands = {}
@@ -245,7 +324,7 @@ def install_plugins(repo, dsh_home):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "update", "link"))
+    parser.add_argument("action", choices=("install", "update", "link", "check"))
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--dsh-home", type=Path,
                         default=Path(os.environ.get("DSH_HOME", str(Path.home() / ".dsh"))))
@@ -253,6 +332,8 @@ def main():
     try:
         if args.action == "update":
             update_checkout(args.repo)
+        elif args.action == "check":
+            return check_install(args.repo, args.dsh_home)
         elif args.action == "link":
             result = write_data_layer_pth(args.dsh_home)
             if result is None:

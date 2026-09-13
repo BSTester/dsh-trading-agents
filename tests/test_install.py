@@ -5,6 +5,7 @@ from pathlib import Path
 import subprocess
 import tempfile
 import re
+import shutil
 import unittest
 from unittest.mock import patch
 
@@ -113,6 +114,13 @@ class InstallerTests(unittest.TestCase):
             self.assertTrue(archive.is_file())
             self.assertEqual(kwargs["env"]["DSH_HOME"], str(self.home))
             self.added.append(archive)
+            # 假 dsh 也要像真的那样把包放进 profile 的 node_modules，
+            # 否则「自检」类测试会因为环境不真实而误报。
+            plugin = re.fullmatch(r"([a-z-]+)-[0-9a-f]{64}\.tgz", archive.name).group(1)
+            package = self.installer.PACKAGE_NAMES.get(plugin, plugin)
+            target = self.home / "profiles" / "web" / "node_modules" / package
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "package.json").write_text(json.dumps({"name": package, "version": "0.2.0"}))
             if fail == "add":
                 raise subprocess.CalledProcessError(7, args)
             return subprocess.CompletedProcess(args, 0)
@@ -185,6 +193,47 @@ class InstallerTests(unittest.TestCase):
                 patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
             self.installer.install_plugins(self.repo, self.home)
         self.assertIsNone(self.installer.write_data_layer_pth(self.home))
+
+    def _install_once(self, with_venv=True):
+        """跑一次安装；自检需要 venv 存在（否则会正确地报"找不到 site-packages"）。"""
+        if with_venv:
+            (self.home / "trading-venv" / "lib" / "python3.13" / "site-packages").mkdir(
+                parents=True, exist_ok=True)
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+
+    def test_check_passes_on_a_complete_install(self):
+        self._install_once()
+        self.assertEqual(self.installer.check_install(self.repo, self.home), 0)
+
+    def test_check_detects_missing_pth(self):
+        """统一数据层装上了但 .pth 没写时，脚本会报 ModuleNotFoundError —— 必须能被自检抓到。"""
+        self._install_once()
+        self.installer.write_data_layer_pth(self.home)
+        site = self.home / "trading-venv" / "lib" / "python3.13" / "site-packages"
+        (site / "dsh-trading-python.pth").unlink()
+        self.assertEqual(self.installer.check_install(self.repo, self.home), 1)
+
+    def test_check_detects_missing_plugin(self):
+        self._install_once()
+        self.installer.write_data_layer_pth(self.home)
+        shutil.rmtree(self.home / "trading-python" / "datasource")
+        self.assertEqual(self.installer.check_install(self.repo, self.home), 1)
+
+    def test_check_detects_disabled_row(self):
+        """行没被启用时插件装了也不会加载。"""
+        self._install_once()
+        self.installer.write_data_layer_pth(self.home)
+        preset = self.repo / "agent.cordis.yml"
+        preset.write_text(preset.read_text().replace(
+            "- id: futu-keepalive\n  name: '@bstester/dsh-futu-keepalive'\n  disabled: false",
+            "- id: futu-keepalive\n  name: '@bstester/dsh-futu-keepalive'\n  disabled: true"))
+        self.assertEqual(self.installer.check_install(self.repo, self.home), 1)
+
+    def test_check_reports_missing_venv_instead_of_crashing(self):
+        self._install_once(with_venv=False)
+        self.assertEqual(self.installer.check_install(self.repo, self.home), 1)
 
     def test_required_command_failures_keep_preset_disabled_and_clean_staging(self):
         for failure in ("pack", "add"):

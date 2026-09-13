@@ -283,6 +283,33 @@ cd /home/penn/workspace/Harness && npx @deepseek-ai/dsh web
 
 ---
 
+## 六之二、安装（标准路径实测）
+
+2026-09-13 用临时 `DSH_HOME` 做了一次**真实全新安装**（`git clone` → 建 venv → 安装器）：
+
+| 检查项 | 结果 |
+|---|---|
+| preset 克隆到 `.agent-presets/dsh-trading-agents` | ✅ |
+| 4 个插件装进 profile 的 node_modules | ✅ workbench 0.20.0 / fin-data 0.6.1 / engine 0.4.1 / keepalive 0.2.0 |
+| 统一数据层解到 `trading-python/{datasource,fin-data}` | ✅ |
+| `.pth` 写入交易 venv，指向 datasource | ✅ |
+| preset 三行（fin-data / trading-engine / futu-keepalive）被启用 | ✅ |
+| 仅标准库的 venv 能 `import trading_datasource` | ✅ 四个模块全通 |
+
+**发现的一个限制**：只跑 `dsh plugin add` 单独装插件**装不出统一数据层**。
+实测：单独装 workbench 后跑它的脚本 → `ModuleNotFoundError: No module named 'trading_datasource'`。
+涉及的脚本：workbench **9/9**、engine **2/3**；fin-data **0/5**（它不依赖统一数据层，
+所以按预设注释里那条单独安装 fin-data 是可以的）。
+
+为此给安装器加了 `check` 动作：
+
+```bash
+python scripts/install_plugins.py check --repo <preset 目录> --dsh-home ~/.dsh
+```
+
+它逐项核对 preset 行是否启用、4 个插件是否装上、统一数据层与 `.pth` 是否就位，
+发现问题时给出确切的修复命令。已覆盖测试（含"行被禁用""`.pth` 缺失""插件缺失""无 venv"）。
+
 ## 七、回滚方式
 
 ```bash

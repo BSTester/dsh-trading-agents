@@ -23,6 +23,17 @@ DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://githu
 > 安装方式就是放入 `~/.dsh/.agent-presets/` 目录。仅克隆得到 **skill 基础模式**；
 > 要使用工作台、研报发布、量化工具与账户守卫，请运行方式 B 的完整安装器。
 
+> ⚠️ **方式 A 只装对话模式（skill 基础模式），不装插件。**
+> 工作台的 9 个脚本与量化引擎的 2 个脚本都 `import trading_datasource`（统一数据层），
+> 而**统一数据层只有安装器会解出**——只跑 `dsh plugin add` 装不出它，
+> 表现是一句 `ModuleNotFoundError: No module named 'trading_datasource'`。
+> 装完可用自检验证：
+
+```bash
+python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/install_plugins.py" check \
+  --repo "$HOME/.dsh/.agent-presets/dsh-trading-agents" --dsh-home "$HOME/.dsh"
+```
+
 **方式 A · 一行命令**
 
 ```bash
@@ -35,7 +46,7 @@ git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-pres
 git clone https://github.com/BSTester/dsh-trading-agents "$env:USERPROFILE\.dsh\.agent-presets\dsh-trading-agents"
 ```
 
-**方式 B · 完整安装脚本**（preset + Python 依赖 + 富途授权向导 + 三个插件）
+**方式 B · 完整安装脚本**（preset + Python 依赖 + 富途授权向导 + 四个插件）
 
 ```bash
 # Linux / macOS
