@@ -40,3 +40,20 @@ test("RPC client sends only the narrow workbench channel and surfaces host error
   await assert.rejects(plugin.request(rpc, "execute-order", {}), /Unsupported/);
   assert.equal(calls.length, 1);
 });
+
+test("workbench client ships pagination, report detail, and drawer UI", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /function Paged\(/, "缺少通用分页组件");
+  assert.match(source, /function ReportDetail\(/, "缺少研报详情视图");
+  assert.match(source, /onOpenReport/, "研报标题未接线到详情");
+  assert.match(source, /tw-pager/, "分页样式缺失");
+  assert.match(source, /tw-drawer/, "抽屉容器缺失");
+  assert.match(source, /在新标签打开/, "缺少新标签打开入口");
+  // 所有列表类视图必须走 Paged，避免出现无分页的超长列表
+  for (const view of ["ResearchView", "SignalView", "ExecutionView", "AuditView", "EventsView"]) {
+    const body = source.slice(source.indexOf(`function ${view}(`));
+    const end = body.indexOf("\n    function ", 10);
+    const text = end === -1 ? body : body.slice(0, end);
+    assert.match(text, /h\(Paged,/, `${view} 未使用分页`);
+  }
+});

@@ -1,7 +1,7 @@
 {
   "name": "@bstester/dsh-trading-engine",
   "description": "Harness-owned research workflow, publishing, quant previews and account-mode policy",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "type": "module",
   "main": "src/index.js",
   "files": [

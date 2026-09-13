@@ -77,6 +77,9 @@ window.__ModuleLoader__.load({
 .tw-sources a{color:var(--dsw-alias-label-primary-bluish,LinkText)}
 .tw-row{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
 .tw-empty{margin:0;color:var(--dsw-alias-label-tertiary,GrayText);font-size:12px}
+.tw-link{background:none;border:none;padding:0;cursor:pointer;font:inherit;font-weight:600;color:var(--dsw-alias-label-primary-bluish,LinkText);text-align:left}
+.tw-link:hover{text-decoration:underline}
+.tw-pager{display:flex;align-items:center;gap:10px;justify-content:center;padding-top:6px;border-top:1px solid var(--dsw-alias-border-l1,GrayText);margin-top:4px}
 .tw-toolcard{border:1px solid var(--dsw-alias-border-l1,GrayText);border-left:3px solid var(--dsw-alias-button-info-fill,Highlight);border-radius:8px;background:var(--dsw-alias-bg-layer-1,Canvas)}
 .tw-toolcard>summary{cursor:pointer;padding:8px 10px;font-size:12px;font-weight:600}
 .tw-toolcard.err{border-left-color:var(--dsw-alias-state-error-primary,#d1242f)}
@@ -315,6 +318,53 @@ window.__ModuleLoader__.load({
       return h("canvas", { ref, className: "tw-chart" });
     }
 
+    /** 通用分页：所有列表统一分页展示（页码、上下页、总数）。 */
+    function Paged({ items, pageSize = 8, empty, render }) {
+      const list = items ?? [];
+      const [page, setPage] = React.useState(0);
+      React.useEffect(() => { setPage(0); }, [list.length]);
+      if (list.length === 0) return h("p", { className: "tw-empty" }, empty ?? "暂无数据");
+      const pages = Math.max(1, Math.ceil(list.length / pageSize));
+      const current = Math.min(page, pages - 1);
+      const slice = list.slice(current * pageSize, current * pageSize + pageSize);
+      return h(React.Fragment, null,
+        slice.map((item, index) => render(item, current * pageSize + index)),
+        pages > 1 && h("div", { className: "tw-pager" },
+          h("button", { type: "button", className: "tw-btn seg", disabled: current === 0,
+            onClick: () => setPage(current - 1) }, "‹ 上一页"),
+          h("span", { className: "tw-meta" }, `第 ${current + 1} / ${pages} 页 · 共 ${list.length} 条`),
+          h("button", { type: "button", className: "tw-btn seg", disabled: current >= pages - 1,
+            onClick: () => setPage(current + 1) }, "下一页 ›")));
+    }
+
+    /** 研报详情页：抽屉内全幅展示 + 可新标签打开。 */
+    function ReportDetail({ report, onBack }) {
+      const openInTab = () => {
+        try {
+          const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${report.ticker} 研报</title>`
+            + `<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:32px auto;padding:0 20px;line-height:1.6}`
+            + `pre{white-space:pre-wrap;background:#f6f8fa;padding:16px;border-radius:8px}`
+            + `h1{font-size:20px}ul{color:#555}</style></head><body>`
+            + `<h1>${report.ticker} · ${report.rating} · ${report.published_at}</h1>`
+            + `<pre>${String(report.report).replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))}</pre>`
+            + `<h3>来源</h3><ul>${(report.sources || []).map((s) => `<li>${s.name} · ${s.as_of} · ${s.reference}</li>`).join("")}</ul>`
+            + `</body></html>`;
+          const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
+          if (typeof window !== "undefined") window.open(url, "_blank", "noopener");
+        } catch (error) { /* 浏览器限制时忽略，抽屉内仍可查看 */ }
+      };
+      return h(React.Fragment, null,
+        h("div", { className: "tw-toolbar" },
+          h("button", { type: "button", className: "tw-btn", onClick: onBack }, "‹ 返回列表"),
+          h("button", { type: "button", className: "tw-btn primary", onClick: openInTab }, "在新标签打开"),
+          h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
+          h("span", { className: "tw-meta" }, `${report.ticker} · ${report.published_at}`)),
+        h(Card, { title: "研报正文" }, h("pre", { className: "tw-pre" }, report.report)),
+        h(Card, { title: "数据来源", count: (report.sources || []).length,
+          empty: (report.sources || []).length ? undefined : "未记录来源" },
+          h("ul", { className: "tw-sources" }, (report.sources || []).map((s, i) => h(Source, { key: i, source: s })))));
+    }
+
     function Card({ title, count, empty, children }) {
       return h("section", { className: "tw-card" },
         h("div", { className: "tw-card-head" }, title,
@@ -391,13 +441,14 @@ window.__ModuleLoader__.load({
       return h(React.Fragment, null,
         h(Card, { title: "量化信号与回测（由 Harness 计算）", count: previews.length,
           empty: "暂无信号。请在 Harness 会话中请求（如“看下 600519 的信号”），结果显示在这里。" },
-          previews.slice(0, 10).map((p) => h("details", { key: p.id, className: "tw-item" },
-            h("summary", null,
-              h("span", { className: `tw-tag ${p.value?.signal === "BUY" ? "buy" : p.value?.signal === "SELL" ? "sell" : "hold"}` },
-                p.value?.signal ?? p.kind),
-              `${p.value?.ticker ?? ""}`,
-              h("span", { className: "tw-meta" }, p.at)),
-            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(p.value, null, 2)))))),
+          h(Paged, { items: previews, pageSize: 8, empty: "暂无信号预览",
+            render: (p) => h("details", { key: p.id, className: "tw-item" },
+              h("summary", null,
+                h("span", { className: `tw-tag ${p.value?.signal === "BUY" ? "buy" : p.value?.signal === "SELL" ? "sell" : "hold"}` },
+                  p.value?.signal ?? p.kind),
+                `${p.value?.ticker ?? ""}`,
+                h("span", { className: "tw-meta" }, p.at)),
+              h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(p.value, null, 2)))) })),
         series && series.length > 1 && h(Card, { title: "价格走势（当前标的）" },
           h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })),
         h("p", { className: "tw-hint" }, "工作台只展示结果；信号计算、回测与下单请在 Harness 会话中发起。"));
@@ -546,24 +597,25 @@ window.__ModuleLoader__.load({
       return h(React.Fragment, null,
         h(Card, { title: "成交记录（本地台账）", count: rows.length,
           empty: trades.loading ? "加载中…" : (trades.error || "暂无成交记录") },
-          rows.length > 0 && h("div", { className: "tw-kv" }, rows.slice(0, 20).map((row, i) =>
-            h("div", { key: i, className: "tw-kv-item" },
+          h(Paged, { items: rows, pageSize: 10, empty: trades.loading ? "加载中…" : (trades.error || "暂无成交记录"),
+            render: (row, i) => h("div", { key: i, className: "tw-kv-item" },
               h("div", { className: "tw-kv-k" }, `${row.date} · ${row.ticker}`),
               h("div", { className: "tw-kv-v", style: { color: row.action === "BUY" ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
                 `${row.action} ${row.shares} @ ${row.price}`),
               h("div", { className: "tw-meta" },
-                `费用 ${row.fee ?? "—"}${row.return !== undefined && row.return !== null ? ` · 收益 ${(row.return * 100).toFixed(2)}%` : ""}${row.reason ? ` · ${row.reason}` : ""}`)))),
+                `费用 ${row.fee ?? "—"}${row.return !== undefined && row.return !== null ? ` · 收益 ${(row.return * 100).toFixed(2)}%` : ""}${row.reason ? ` · ${row.reason}` : ""}`)) }),
           trades.data && h("p", { className: "tw-meta" },
             `共 ${trades.data.total} 笔 · 胜率 ${trades.data.win_rate === null ? "—" : `${(trades.data.win_rate * 100).toFixed(0)}%`} · 累计费用 ${trades.data.total_fees}`)),
         h(Card, { title: "交易动态（Harness 观察到的券商响应）", count: snapshot.activity.length },
           h("p", { className: "tw-meta" }, "响应不等于成交；下单请在 Harness 会话中完成并确认。"),
-          snapshot.activity.slice(0, 30).map((row) => h("details", { key: row.id, className: "tw-item" },
+          h(Paged, { items: snapshot.activity, pageSize: 10, empty: "暂无券商响应记录",
+          render: (row) => h("details", { key: row.id, className: "tw-item" },
             h("summary", null, `${row.at} · ${row.tool ?? row.kind}`,
               row.is_error ? h("span", { className: "tw-tag sell" }, "失败") : null),
-            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2)))))));
+            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2)))) })));
     }
 
-    function ResearchView({ rpc, snapshot, ticker }) {
+    function ResearchView({ rpc, snapshot, ticker, onOpenReport }) {
       const running = snapshot.runs.filter((run) => run.status === "running");
       const [strategy, setStrategy] = React.useState("ma_cross");
       const [metric, setMetric] = React.useState("total_return");
@@ -581,15 +633,16 @@ window.__ModuleLoader__.load({
       };
 
       return h(React.Fragment, null,
-        h(Card, { title: "研报结果", count: snapshot.reports.length,
-          empty: snapshot.reports.length || running.length ? undefined : "暂无研报。在 Harness 中要求完整投研后，发布结果会显示在这里。" },
-          running.map((run) => h("div", { key: run.id, className: "tw-item" },
-            h("div", { className: "tw-item-body" }, h("span", { className: "tw-tag" }, "进行中"), ` ${run.ticker} · ${run.started_at}`))),
-          snapshot.reports.map((report) => h("details", { key: report.id, className: "tw-item" },
-            h("summary", null, h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
-              report.ticker, h("span", { className: "tw-meta" }, report.published_at)),
-            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, report.report),
-              h("ul", { className: "tw-sources" }, report.sources.map((s, i) => h(Source, { key: i, source: s }))))))),
+        h(Card, { title: "研报列表（点击标题查看详情）", count: snapshot.reports.length },
+          running.length > 0 && h("p", { className: "tw-meta" },
+            `进行中：${running.map((run) => `${run.ticker} (${run.started_at})`).join("、")}`),
+          h(Paged, { items: snapshot.reports, pageSize: 8,
+            empty: "暂无研报。在 Harness 中要求完整投研后，发布结果会显示在这里。",
+            render: (report) => h("div", { key: report.id, className: "tw-item" },
+              h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
+                h("button", { type: "button", className: "tw-link", onClick: () => onOpenReport(report) },
+                  `📄 ${report.ticker} · ${report.rating} · ${report.published_at}`),
+                h("div", { className: "tw-meta" }, (report.report || "").replace(/\s+/g, " ").slice(0, 120) + "…"))) })),
         h(Card, { title: "参数敏感性（样本内网格）" },
           h("div", { className: "tw-toolbar" },
             h("span", { className: "tw-meta" }, `标的 ${ticker}`),
@@ -625,14 +678,15 @@ window.__ModuleLoader__.load({
           h("span", { className: "tw-meta" },
             ` · ${(event.days_until ?? 0) >= 0 ? `${event.days_until} 天后` : `${-event.days_until} 天前`} · ${event.detail}`)));
       return h(React.Fragment, null,
-        h(Card, { title: `即将发生的事件（${ticker}）`, count: upcoming.length,
-          empty: events.loading ? "加载中…" : (events.error || "窗口内无即将发生的事件") },
-          upcoming.map(line),
+        h(Card, { title: `即将发生的事件（${ticker}）`, count: upcoming.length },
+          h(Paged, { items: upcoming, pageSize: 8,
+            empty: events.loading ? "加载中…" : (events.error || "窗口内无即将发生的事件"),
+            render: (event, index) => line(event, index) }),
           events.data && h("p", { className: "tw-meta" },
             `来源状态：${Object.entries(events.data.sources_status || {}).map(([k, v]) => `${k}=${v}`).join(" · ")}`)),
-        h(Card, { title: "近期已发生", count: past.length,
-          empty: past.length ? undefined : "窗口内无历史事件" },
-          past.slice(0, 10).map(line)),
+        h(Card, { title: "近期已发生", count: past.length },
+          h(Paged, { items: past, pageSize: 8, empty: "窗口内无历史事件",
+            render: (event, index) => line(event, index) })),
         h("p", { className: "tw-hint" }, events.data?.note
           || "事件来自公开披露源；港股/美股事件请用富途工具查询（quote_financials_* / quote_corporate_actions_* / quote_economic_calendar_search）。"));
     }
@@ -677,9 +731,10 @@ window.__ModuleLoader__.load({
               h("div", { className: "tw-kv-v", style: { color: stats.unlinked > 0 ? "var(--dsw-alias-state-warn-label,#9a6700)" : "inherit" } }, String(stats.unlinked)))),
           stats && h("p", { className: "tw-meta" }, `关联规则：${stats.link_rule}`),
           h("p", { className: "tw-meta" }, `账户模式 ${snapshot.mode} · 进行中调用 ${snapshot.in_flight} · 暂存响应 ${snapshot.pending_observations}`)),
-        h(Card, { title: "审计时间线（信号 → 下单 → 成交）", count: entries.length,
-          empty: entries.length ? undefined : "暂无记录：先在 Harness 中产生信号，再下单/成交后这里会出现链路。" },
-          entries.slice(0, 40).map((entry) => {
+        h(Card, { title: "审计时间线（信号 → 下单 → 成交）", count: entries.length },
+          h(Paged, { items: entries, pageSize: 12,
+            empty: "暂无记录：先在 Harness 中产生信号，再下单/成交后这里会出现链路。",
+            render: (entry) => {
             const meta = CHAIN_KIND[entry.kind] ?? { label: entry.kind, cls: "" };
             return h("div", { key: entry.id, className: "tw-item" },
               h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
@@ -692,7 +747,7 @@ window.__ModuleLoader__.load({
                         ? ` · 依据信号 ${entry.signal_id}（滞后 ${entry.lag_hours}h）`
                         : " · ⚠ 未找到对应信号"),
                 h("div", { className: "tw-meta" }, `${entry.detail} · 来源 ${entry.source}`)));
-          })),
+            } })),
         h(SourcesCard, { rpc, revision: snapshot.generated_at }),
         h("p", { className: "tw-hint" }, "审计仅记录 Harness 观察到的响应与本地台账；实盘成交请以券商成交查询为准。"));
     }
@@ -708,6 +763,7 @@ window.__ModuleLoader__.load({
       const [revision, setRevision] = React.useState(0);
       const [market, setMarket] = React.useState({ ticker: "600519", period: "5m", bars: null, loading: false, error: "", meta: {} });
       const [watchlist, setWatchlist] = React.useState(["600519", "000001", "601318", "600036", "300750"]);
+      const [detail, setDetail] = React.useState(null);
       const generation = React.useRef(0);
       const [sources, setSources] = React.useState(null);
       React.useEffect(() => {
@@ -773,15 +829,16 @@ window.__ModuleLoader__.load({
               switchError && h("p", { role: "alert", className: "tw-alert" }, `模式切换失败：${switchError}`),
               error && h("p", { role: "alert", className: "tw-alert" }, `更新失败：${error}`),
               !snapshot && h("p", { className: "tw-status" }, switching ? "正在切换模式…" : "正在读取工作台…"),
-              tab === "market" && h(MarketView, { rpc, state: market, setState: setMarket }),
-              snapshot && tab === "signal" && h(SignalView, { snapshot, series: market.bars }),
-              snapshot && tab === "portfolio" && h(PortfolioView, { rpc, snapshot, series: market.bars }),
-              snapshot && tab === "risk" && h(RiskView, { rpc, snapshot }),
-              tab === "factors" && h(FactorsView, { rpc, ticker: market.ticker, watchlist, setWatchlist }),
-              snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
-              snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker: market.ticker }),
-              tab === "events" && h(EventsView, { rpc, ticker: market.ticker }),
-              snapshot && tab === "audit" && h(AuditView, { snapshot }),
+              detail && h(ReportDetail, { report: detail, onBack: () => setDetail(null) }),
+              !detail && tab === "market" && h(MarketView, { rpc, state: market, setState: setMarket }),
+              !detail && snapshot && tab === "signal" && h(SignalView, { snapshot, series: market.bars }),
+              !detail && snapshot && tab === "portfolio" && h(PortfolioView, { rpc, snapshot, series: market.bars }),
+              !detail && snapshot && tab === "risk" && h(RiskView, { rpc, snapshot }),
+              !detail && tab === "factors" && h(FactorsView, { rpc, ticker: market.ticker, watchlist, setWatchlist }),
+              !detail && snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
+              !detail && snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker: market.ticker, onOpenReport: setDetail }),
+              !detail && tab === "events" && h(EventsView, { rpc, ticker: market.ticker }),
+              !detail && snapshot && tab === "audit" && h(AuditView, { snapshot }),
               snapshot && h("div", { className: "tw-row" },
                 snapshot.mode === "sim"
                   ? h(React.Fragment, null,

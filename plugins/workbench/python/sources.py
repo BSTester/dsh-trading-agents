@@ -59,6 +59,33 @@ def probe_futu_token():
         return None, f"探测失败：{str(error)[:100]}"  # None = 未知（网络问题），不误报过期
 
 
+def session_cookies(profile):
+    """只读检查 cookie 库里的 (域, 名称) 对 —— 只读名称，不解密任何值。
+
+    用「会话 cookie 名称」判断登录态，比只看域可靠（访问登录墙也会种匿名 cookie）。
+    """
+    import shutil
+    import sqlite3
+    import tempfile
+    source = Path(profile) / "Default" / "Cookies"
+    if not source.exists():
+        return set()
+    pairs = set()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            copy = Path(tmp) / "Cookies"
+            shutil.copy2(source, copy)  # 运行中的浏览器会锁库，先复制再读
+            connection = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+            try:
+                for host, name in connection.execute("SELECT DISTINCT host_key, name FROM cookies"):
+                    pairs.add((str(host).lower(), str(name)))
+            finally:
+                connection.close()
+    except Exception:
+        return set()
+    return pairs
+
+
 def check(probe=True):
     sources = []
 
@@ -83,17 +110,25 @@ def check(probe=True):
                "refresh 也失效才需重新完整授权：python scripts/futu_auth.py",
     })
 
-    # 2) X 登录态（社交舆情）
+    # 2) 社交渠道登录态（X 必取；Reddit 同配置）
     profile = DSH / "x-profile"
-    cookies = profile / "Default" / "Cookies"
-    if cookies.exists():
-        sources.append({"key": "x", "label": "X / Twitter（社交舆情）", "status": "ok",
-                        "detail": f"专属浏览器登录态存在（{age_text(cookies)}）",
-                        "fix": "若抓取失败：python plugins/fin-data/python/x_search.py --login"})
-    else:
-        sources.append({"key": "x", "label": "X / Twitter（社交舆情）", "status": "warn",
-                        "detail": "未登录（首次使用需登录一次，登录态持久保存）",
-                        "fix": "python plugins/fin-data/python/x_search.py --login"})
+    cookies = session_cookies(profile)
+    x_names = {"auth_token", "ct0", "twid", "kdt"}
+    # 仅 reddit_session 代表已登录；token_v2/session_tracker 匿名访问也会被种下
+    reddit_names = {"reddit_session"}
+    has_x = any(("x.com" in host or "twitter" in host) and name in x_names for host, name in cookies)
+    has_reddit = any("reddit" in host and name in reddit_names for host, name in cookies)
+    sources.append({"key": "x", "label": "X / Twitter（社交舆情，必取渠道）",
+                    "status": "ok" if has_x else "warn",
+                    "detail": ("已登录（专属浏览器）" if has_x else "未登录：需登录一次，登录态持久保存")
+                              + (f" · 识别到会话 cookie" if has_x else " · 未发现 X 会话 cookie"),
+                    "fix": "python plugins/fin-data/python/x_search.py --login"})
+    sources.append({"key": "reddit", "label": "Reddit（社交舆情）",
+                    "status": "ok" if has_reddit else "warn",
+                    "detail": "已登录（与 X 共用专属浏览器）" if has_reddit
+                              else "未登录：old.reddit.com 强制要求账号，需登录一次"
+                                   + ("（已存在匿名 cookie）" if any("reddit" in h for h, _ in cookies) else ""),
+                    "fix": "python plugins/fin-data/python/reddit_search.py --login"})
 
     # 3) Python 数据环境
     python_bin = VENV / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")

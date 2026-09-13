@@ -27,7 +27,9 @@ from bars import load_bars  # noqa: E402
 FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
                "liq_ratio": 1, "mdd_60": 1,
                # 估值因子（同花顺源）：越低越便宜 → 方向取负
-               "pe_ttm": -1, "pb": -1, "peg": -1, "ps": -1}
+               "pe_ttm": -1, "pb": -1, "peg": -1, "ps": -1,
+               # 估值历史分位（富途）：分位越低越便宜 → 负向
+               "pe_ttm_pct": -1, "pb_pct": -1, "ps_pct": -1}
 TRADING_DAYS = 252
 
 
@@ -84,22 +86,58 @@ def factor_values(bars, index=None):
 
 
 def valuation_values(ticker):
-    """估值因子（同花顺源，取最近一行）。源不可用时返回空 dict，不阻塞其余因子。"""
-    import akshare as ak
-    df = ak.stock_value_em(symbol=str(ticker).split(".")[0])
-    if df is None or df.empty:
-        return {}
-    row = df.tail(1).to_dict("records")[0]
+    """估值因子：**优先富途**（PE/PB/PS + 历史分位，全市场），失败回退同花顺（A股）。
 
-    def pick(*names):
-        for name in names:
-            value = row.get(name)
-            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
-                return float(value)
-        return None
+    返回 (values, source)。
+    """
+    values, sources = {}, []
 
-    return {"pe_ttm": pick("PE(TTM)"), "pb": pick("市净率"),
-            "peg": pick("PEG值"), "ps": pick("市销率")}
+    # ① 富途 MCP（优先通道）
+    try:
+        from futu_client import call_tool  # 同目录共享客户端
+        from bars import to_futu_symbol
+        symbol = to_futu_symbol(ticker)
+        for vt, key in ((1, "pe_ttm"), (2, "pb"), (3, "ps")):
+            try:
+                data = call_tool("quote_valuation_detail",
+                                 {"symbol": symbol, "valuation_type": vt})
+                trend = data.get("trend") or {}
+                value, percentile = trend.get("current_value"), trend.get("valuation_percentile")
+                if isinstance(value, (int, float)) and value > 0:
+                    values[key] = round(float(value), 4)
+                if isinstance(percentile, (int, float)):
+                    values[f"{key}_pct"] = round(float(percentile), 2)
+            except Exception:
+                continue  # 单项失败不影响其余估值指标
+        if values:
+            sources.append("futu/quote_valuation_detail")
+    except Exception:
+        pass
+
+    # ② 同花顺备用（A股，含 PEG）
+    try:
+        import akshare as ak
+        df = ak.stock_value_em(symbol=str(ticker).split(".")[0])
+        if df is not None and not df.empty:
+            row = df.tail(1).to_dict("records")[0]
+
+            def pick(*names):
+                for name in names:
+                    value = row.get(name)
+                    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+                        return float(value)
+                return None
+
+            fallback = {"pe_ttm": pick("PE(TTM)"), "pb": pick("市净率"),
+                        "peg": pick("PEG值"), "ps": pick("市销率")}
+            added = {k: v for k, v in fallback.items() if v is not None and k not in values}
+            if added:
+                values.update(added)
+                sources.append("akshare/同花顺估值")
+    except Exception:
+        pass
+
+    return values, "+".join(sources) if sources else ""
 
 
 def zscores(rows, keys):
@@ -145,8 +183,10 @@ def snapshot(tickers, window):
                 raise RuntimeError("样本不足")
             sources.add(source)
             try:
-                values.update({k: v for k, v in valuation_values(ticker).items() if v is not None})
-                sources.add("akshare/同花顺估值")
+                valuation, valuation_source = valuation_values(ticker)
+                values.update({k: v for k, v in valuation.items() if v is not None})
+                if valuation_source:
+                    sources.add(valuation_source)
             except Exception:
                 pass  # 估值缺失不影响价量因子
             rows.append({"ticker": ticker, "factors": values, "as_of": bars[-1]["t"]})
@@ -161,7 +201,7 @@ def snapshot(tickers, window):
         row["factors"] = {k: (round(v, 5) if isinstance(v, float) else v) for k, v in row["factors"].items()}
     return {"tickers": [r["ticker"] for r in ranked], "rows": ranked, "factors": keys,
             "sources": sorted(sources), "failures": failures, "window": window,
-            "note": "价量 + 估值因子横截面 z-score 合成打分（估值源：同花顺；缺失时自动跳过估值维度）。"}
+            "note": "价量 + 估值因子横截面 z-score 合成打分；估值优先富途 MCP（PE/PB/PS + 历史分位），失败回退同花顺；缺失时自动跳过估值维度。"}
 
 
 def ic_series(tickers, factor, forward, window):

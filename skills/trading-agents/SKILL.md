@@ -81,6 +81,12 @@ description: TradingAgents 多角色投研流水线（12角色/6阶段）——�
 - 千股千评：`... -c "import akshare as ak; print(ak.stock_comment_em().query('代码==\"600519\"').to_string())"`
 - Yahoo RSS：web 抓取 `https://feeds.finance.yahoo.com/rss/2.0/headline?s=AAPL&region=US&lang=en-US`（港美通用）
 
+**Reddit 渠道**：`fin_sentiment` 同时聚合 Reddit 讨论（与 X 共用专属浏览器登录态）。首次使用需登录一次：
+`"$HOME/.dsh/trading-venv/bin/python" "$HOME/.dsh/.agent-presets/dsh-trading-agents/plugins/fin-data/python/reddit_search.py" --login`
+
+**渠道优先级**：凡富途 MCP 能提供的数据（行情/K线/盘口/公司资料/估值/财报/资金流/股东/分红/新闻/社区/板块）
+一律优先走富途；AKShare/Yahoo/公开快讯为备用；X 为必取情绪渠道，Reddit 为补充。
+
 **X 情绪说明**：`fin_sentiment` 内置 X 渠道（不可达自动跳过，无需处理）。首次使用 X 需一次性登录：
 `"$HOME/.dsh/trading-venv/bin/python" "$HOME/.dsh/.agent-presets/dsh-trading-agents/plugins/fin-data/python/x_search.py" --login`
 （登录态持久保存在 ~/.dsh/x-profile；搜索词用英文，可组合 `$代码`）。X 用途：情绪倾向 + 财报/异动/行业事件的第一手讨论，辅助交易员与风控判断。
