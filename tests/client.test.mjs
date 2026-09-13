@@ -386,3 +386,25 @@ test("风险卡片的空态按字段判断，而不是按对象是否存在", as
   assert.doesNotMatch(text, /empty: \(s \|\| equity\.data\)/,
     "不得再用「对象存在」当作「有数据」");
 });
+
+test("风险页包含按账户分组的持仓风险，且不跨账户合计", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /function PortfolioRiskCard\(/, "缺少持仓风险卡");
+  assert.match(source, /function AccountRiskRow\(/, "缺少账户风险行组件");
+  const view = source.slice(source.indexOf("function RiskView("));
+  assert.match(view.slice(0, view.indexOf("\n    function ", 10)), /h\(PortfolioRiskCard/,
+    "风险页未挂载持仓风险卡");
+  // 必须用 Paged（所有列表都要分页）
+  const card = source.slice(source.indexOf("function PortfolioRiskCard("));
+  assert.match(card.slice(0, card.indexOf("\n    function ", 10)), /h\(Paged,/);
+  // 两个占比口径都要出现，避免不同分母被混读
+  assert.match(source, /share_of_positions/);
+  assert.match(source, /share_of_assets/);
+  assert.match(source, /不跨账户合计/);
+});
+
+test("风险页说明了策略层与持仓层口径不同", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /那是\*\*策略层\*\*的指标/,
+    "必须写明回撤/夏普是策略层指标，不是这个账户的实际表现");
+});

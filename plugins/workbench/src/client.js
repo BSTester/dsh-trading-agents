@@ -809,6 +809,42 @@ window.__ModuleLoader__.load({
         h("p", { className: "tw-hint" }, "参数由 scripts/risk_config 管理；引擎每次决策前读取，非法配置直接拒绝交易。"));
     }
 
+    /**
+     * 持仓风险：按账户分组展示集中度与浮盈亏。
+     *
+     * **不跨账户合计**——不同账户可能不同币种，相加没有意义。
+     * 占比分母有两个口径，界面上一并写清，避免误读：
+     *   share_of_positions = 本账户持仓市值；share_of_assets = 本账户总资产（含现金）。
+     */
+    function AccountRiskRow({ group }) {
+      const risk = group.risk ?? {};
+      const top = risk.top ?? [];
+      return h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" },
+          `${group.account} · ${risk.positions ?? 0} 笔 · 持仓市值 ${tradeMoney(risk.market_value)}`),
+        h("div", { className: "tw-kv-v" },
+          `最大集中度 ${risk.max_share_symbol ?? "—"} ${numeric(risk.max_share_of_positions, 2)}%`),
+        h("div", { className: "tw-meta" },
+          `浮盈 ${risk.winners?.count ?? 0} 笔 ${tradeMoney(risk.winners?.pl_val)}`
+          + ` · 浮亏 ${risk.losers?.count ?? 0} 笔 ${tradeMoney(risk.losers?.pl_val)}`),
+        h("div", { className: "tw-meta" },
+          top.map((row) => `${row.symbol} ${numeric(row.share_of_positions, 1)}%`
+            + `（占总资产 ${numeric(row.share_of_assets, 1)}%）`).join(" · ")
+          || "无可用市值数据"));
+    }
+
+    function PortfolioRiskCard({ positions }) {
+      const groups = (positions.data?.groups ?? []).filter((group) => (group.risk?.positions ?? 0) > 0);
+      return h(Card, { title: "持仓风险（按账户，不跨账户合计）", count: groups.length,
+        empty: cardEmpty({ loading: positions.loading, error: positions.error,
+          count: groups.length, fallback: "当前账户无持仓" }) },
+        h("p", { className: "tw-meta" },
+          "占比分母：括号外为**本账户持仓市值**，括号内为**本账户总资产**（含现金）。"
+          + "不同账户的币种可能不同，因此不做跨账户合计。"),
+        h(Paged, { items: groups, pageSize: 3, empty: "当前账户无持仓",
+          render: (group) => h(AccountRiskRow, { key: group.acc_id, group }) }));
+    }
+
     /** 风险指标的一格：标签 + 数值。抽成组件是因为内联写法的括号极易数错。 */
     function RiskMetricItem({ label, value }) {
       return h("div", { className: "tw-kv-item" },
@@ -850,6 +886,7 @@ window.__ModuleLoader__.load({
         h(Card, { title: "回撤曲线（水下图，%）",
           empty: ddPoints.length > 1 ? undefined : "需要成交记录才能回放回撤" },
           h(LineChart, { points: ddPoints, label: "drawdown %" })),
+        h(PortfolioRiskCard, { positions }),
         h(Card, { title: "相关性矩阵（日收益，120 日）",
           empty: !canCorrelate
             ? `当前持仓只有 ${held.length} 个可识别标的，需要至少 2 个；`
@@ -859,7 +896,10 @@ window.__ModuleLoader__.load({
           correlation.data && h(HeatmapChart, { tickers: correlation.data.tickers, matrix: correlation.data.matrix }),
           correlation.data && h("p", { className: "tw-meta" }, `窗口 ${correlation.data.window} 个共同交易日 · 截至 ${correlation.data.as_of}`)),
         h(RiskConfigCard, { rpc, mode: snapshot.mode }),
-        h("p", { className: "tw-hint" }, "相关性基于**券商持仓**与公开日线计算；回撤/夏普基于本地策略台账，两者口径不同。"));
+        h("p", { className: "tw-hint" },
+          "**口径说明**：持仓风险与相关性矩阵基于券商真实持仓；"
+          + "「风险指标」里的回撤/夏普来自本地策略台账与回测预览——那是**策略层**的指标，"
+          + "不是这个账户的实际表现。两者不可混看。"));
     }
 
     /** IC 检验当前只覆盖价量因子（估值因子需历史估值序列，后续接入）。 */

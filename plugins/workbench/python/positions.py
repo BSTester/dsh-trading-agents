@@ -189,6 +189,7 @@ def sim_groups(errors):
             "cash": round_or_none(number(cash.get("balance"))),
             "total_asset": round_or_none(number(cash.get("total_asset"))),
             "currency": None,  # 响应未提供，不推断
+            "risk": account_risk(positions, round_or_none(number(cash.get("total_asset")))),
         })
     return groups, len(accounts)
 
@@ -236,8 +237,44 @@ def live_groups(errors):
             "subtotals": currency_subtotals(positions),
             "market_value": None,
             "pl_val": None,
+            "risk": account_risk(positions),
         })
     return groups, len(accounts)
+
+
+def account_risk(positions, total_asset=None):
+    """按**单个账户**算持仓风险。绝不跨账户合并——不同账户可能不同币种。
+
+    占比给两个口径（都带明确分母，避免误读）：
+      share_of_positions —— 占本账户**持仓市值**
+      share_of_assets    —— 占本账户**总资产**（含现金；取不到总资产时为 None）
+    """
+    valued = [row for row in positions if (row.get("market_value") or 0) > 0]
+    total = sum(row["market_value"] for row in valued)
+    ranked = sorted(valued, key=lambda row: row["market_value"], reverse=True)
+    top = [{
+        "symbol": row["symbol"], "name": row["name"], "market_value": row["market_value"],
+        "share_of_positions": round(row["market_value"] / total * 100, 2) if total > 0 else None,
+        "share_of_assets": (round(row["market_value"] / total_asset * 100, 2)
+                            if total_asset and total_asset > 0 else None),
+        "pl_ratio": row.get("pl_ratio"),
+    } for row in ranked[:3]]
+    winners = [row for row in positions if (row.get("pl_val") or 0) > 0]
+    losers = [row for row in positions if (row.get("pl_val") or 0) < 0]
+    return {
+        "positions": len(positions),
+        "valued_positions": len(valued),
+        "market_value": round_or_none(total),
+        "top": top,
+        "max_share_of_positions": top[0]["share_of_positions"] if top else None,
+        "max_share_symbol": top[0]["symbol"] if top else None,
+        "winners": {"count": len(winners),
+                    "pl_val": round_or_none(sum(row.get("pl_val") or 0 for row in winners))},
+        "losers": {"count": len(losers),
+                   "pl_val": round_or_none(sum(row.get("pl_val") or 0 for row in losers))},
+        "note": "占比分母：share_of_positions = 本账户持仓市值；"
+                "share_of_assets = 本账户总资产（含现金，取不到则为空）。不跨账户合并。",
+    }
 
 
 def currency_subtotals(positions):

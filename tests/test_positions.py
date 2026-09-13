@@ -163,6 +163,77 @@ class LivePositionsTests(unittest.TestCase):
         self.assertTrue(payload["groups"][0]["account"].endswith(acc_id[-4:]))
 
 
+class AccountRiskTests(unittest.TestCase):
+    """持仓风险按**单个账户**算。跨账户合并会得出没有意义的数字（币种可能不同）。"""
+
+    def setUp(self):
+        self.module = load_positions()
+
+    def _rows(self):
+        return [
+            {"symbol": "A", "name": "甲", "market_value": 600.0, "pl_val": 100.0, "pl_ratio": 20.0},
+            {"symbol": "B", "name": "乙", "market_value": 300.0, "pl_val": -50.0, "pl_ratio": -14.0},
+            {"symbol": "C", "name": "丙", "market_value": 100.0, "pl_val": -10.0, "pl_ratio": -9.0},
+        ]
+
+    def test_shares_and_concentration(self):
+        risk = self.module.account_risk(self._rows(), total_asset=2000.0)
+        self.assertEqual(risk["market_value"], 1000.0)
+        self.assertEqual(risk["max_share_symbol"], "A")
+        self.assertEqual(risk["max_share_of_positions"], 60.0)
+        # 两个口径分母不同，必须都给出
+        self.assertEqual(risk["top"][0]["share_of_positions"], 60.0)
+        self.assertEqual(risk["top"][0]["share_of_assets"], 30.0)
+
+    def test_top_is_sorted_and_capped_at_three(self):
+        rows = self._rows() + [{"symbol": "D", "name": "丁", "market_value": 50.0, "pl_val": 0.0}]
+        risk = self.module.account_risk(rows)
+        self.assertEqual([row["symbol"] for row in risk["top"]], ["A", "B", "C"])
+        self.assertEqual(risk["valued_positions"], 4, "计数应覆盖全部，不只是前三")
+
+    def test_winners_and_losers(self):
+        risk = self.module.account_risk(self._rows())
+        self.assertEqual(risk["winners"], {"count": 1, "pl_val": 100.0})
+        self.assertEqual(risk["losers"], {"count": 2, "pl_val": -60.0})
+
+    def test_no_total_asset_leaves_that_share_empty(self):
+        """取不到总资产时 share_of_assets 必须为空，不能拿持仓市值冒充。"""
+        risk = self.module.account_risk(self._rows())
+        self.assertIsNone(risk["top"][0]["share_of_assets"])
+
+    def test_does_not_double_count_unvalued_rows(self):
+        rows = self._rows() + [{"symbol": "Z", "market_value": None, "pl_val": None}]
+        risk = self.module.account_risk(rows)
+        self.assertEqual(risk["positions"], 4, "总条数含无市值的")
+        self.assertEqual(risk["valued_positions"], 3)
+        self.assertEqual(risk["market_value"], 1000.0, "无市值的不参与分母")
+
+    def test_zero_market_value_does_not_divide(self):
+        risk = self.module.account_risk([{"symbol": "X", "market_value": 0.0, "pl_val": 0.0}])
+        self.assertIsNone(risk["max_share_of_positions"])
+        self.assertEqual(risk["top"], [])
+
+    def test_empty_positions(self):
+        risk = self.module.account_risk([])
+        self.assertEqual(risk["positions"], 0)
+        self.assertIsNone(risk["max_share_symbol"])
+        self.assertEqual(risk["winners"]["count"], 0)
+
+    def test_group_payload_carries_risk(self):
+        def call(name, arguments, **kwargs):
+            if name == "sim_trade_account_list":
+                return SIM_ACCOUNTS
+            if name == "sim_trade_cash_info":
+                return {"balance": "100", "total_asset": "2000"}
+            return SIM_POSITIONS[str(arguments["acc_id"])]
+
+        with patch.object(self.module, "call_tool", side_effect=call), \
+             patch.object(self.module, "append_mark", return_value=[]):
+            payload = self.module.collect("sim")
+        for group in payload["groups"]:
+            self.assertIn("risk", group, "每个账户分组都应带 risk")
+
+
 class EquityMarkTests(unittest.TestCase):
     """每日盯市：只从今天开始累积，不回溯伪造历史。"""
 
