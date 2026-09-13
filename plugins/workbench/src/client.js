@@ -490,9 +490,13 @@ window.__ModuleLoader__.load({
         h("p", { className: "tw-hint" }, "持仓敞口与相关性均基于本地台账与公开日线；实盘口径请结合富途账户查询。"));
     }
 
+    /** IC 检验当前只覆盖价量因子（估值因子需历史估值序列，后续接入）。 */
+    const IC_FACTORS = { mom_20: 1, mom_60: 1, vol_20: 1, trend: 1, rsi_14: 1, liq_ratio: 1, mdd_60: 1 };
+
     const FACTOR_LABELS = {
       mom_20: "动量20", mom_60: "动量60", vol_20: "波动率", trend: "趋势偏离",
       rsi_14: "RSI14", liq_ratio: "量能比", mdd_60: "最大回撤",
+      pe_ttm: "PE(TTM)", pb: "PB", peg: "PEG", ps: "PS",
     };
 
     function FactorsView({ rpc, ticker, watchlist, setWatchlist }) {
@@ -509,7 +513,7 @@ window.__ModuleLoader__.load({
               onChange: (e) => setWatchlist(e.target.value.toUpperCase().split(",").map((t) => t.trim()).filter(Boolean).slice(0, 8)) }),
             h("button", { type: "button", className: "tw-btn", onClick: () => setWatchlist([ticker, ...tickers.filter((t) => t !== ticker)].slice(0, 8)) },
               `加入当前标的 ${ticker}`)),
-          h("p", { className: "tw-hint" }, "价量因子横截面打分；估值/质量因子待基本面源接入。")),
+          h("p", { className: "tw-hint" }, "因子：价量（7）+ 估值（PE/PB/PEG/PS，同花顺源）；横截面 z-score 合成打分，估值越低分越高。")),
         h(Card, { title: "因子打分与排序", count: rows.length,
           empty: snap.loading ? "加载中…" : (snap.error || "有效标的不足") },
           rows.length > 0 && h("div", { className: "tw-kv" }, rows.map((row) =>
@@ -523,9 +527,9 @@ window.__ModuleLoader__.load({
             && h("p", { className: "tw-meta" }, `跳过：${Object.entries(snap.data.failures).map(([k, v]) => `${k}(${v})`).join("；")}`)),
         h(Card, { title: "因子 IC / ICIR（横截面，forward 5 日）",
           empty: ic.loading ? "加载中…" : (ic.error || "样本不足") },
-          h("div", { className: "tw-toolbar" }, Object.entries(FACTOR_LABELS).map(([k, label]) =>
+          h("div", { className: "tw-toolbar" }, Object.keys(IC_FACTORS).map((k) =>
             h("button", { key: k, type: "button", className: `tw-btn seg${factor === k ? " active" : ""}`,
-              onClick: () => setFactor(k) }, label))),
+              onClick: () => setFactor(k) }, FACTOR_LABELS[k] ?? k))),
           ic.data && h("div", { className: "tw-kv" },
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "均值 IC"), h("div", { className: "tw-kv-v" }, String(ic.data.mean_ic))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "IC 标准差"), h("div", { className: "tw-kv-v" }, String(ic.data.ic_std))),

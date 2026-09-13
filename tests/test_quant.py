@@ -387,3 +387,35 @@ class BacktestRegression(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class FactorValuationTests(unittest.TestCase):
+    """估值因子接入后的因子库行为（离线，不访问网络）。"""
+
+    def _load(self):
+        spec = importlib.util.spec_from_file_location(
+            "wb_factors", Path(__file__).resolve().parent.parent / "plugins" / "workbench" / "python" / "factors.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_valuation_factors_use_negative_direction(self):
+        factors = self._load()
+        for key in ("pe_ttm", "pb", "peg", "ps"):
+            self.assertEqual(factors.FACTOR_SIGN[key], -1, f"{key} 应为负向（越便宜越好）")
+
+    def test_missing_valuation_does_not_block_price_factors(self):
+        factors = self._load()
+        rows = [
+            {"ticker": "A", "factors": {"mom_20": 0.1, "vol_20": 0.2, "trend": 0.05, "rsi_14": 60.0,
+                                        "mdd_60": -0.1, "liq_ratio": 1.1, "mom_60": 0.2}},
+            {"ticker": "B", "factors": {"mom_20": -0.1, "vol_20": 0.3, "trend": -0.05, "rsi_14": 40.0,
+                                        "mdd_60": -0.2, "liq_ratio": 0.9, "mom_60": -0.1}},
+        ]
+        keys = list(factors.FACTOR_SIGN)
+        factors.zscores(rows, keys)
+        ranked = factors.composite(rows, keys)
+        self.assertEqual(len(ranked), 2)
+        for row in ranked:
+            self.assertIsNotNone(row["score"], "估值缺失时价量因子仍应给出打分")
+        self.assertEqual(ranked[0]["ticker"], "A", "动量/趋势更优的 A 应排前")
+

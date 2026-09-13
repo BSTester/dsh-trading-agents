@@ -25,7 +25,9 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 from bars import fetch_a_share  # noqa: E402
 
 FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
-               "liq_ratio": 1, "mdd_60": 1}
+               "liq_ratio": 1, "mdd_60": 1,
+               # 估值因子（同花顺源）：越低越便宜 → 方向取负
+               "pe_ttm": -1, "pb": -1, "peg": -1, "ps": -1}
 TRADING_DAYS = 252
 
 
@@ -79,6 +81,25 @@ def factor_values(bars, index=None):
             "rsi_14": rsi_14, "liq_ratio": liq_ratio, "mdd_60": mdd, "close": latest}
 
 
+def valuation_values(ticker):
+    """估值因子（同花顺源，取最近一行）。源不可用时返回空 dict，不阻塞其余因子。"""
+    import akshare as ak
+    df = ak.stock_value_em(symbol=str(ticker).split(".")[0])
+    if df is None or df.empty:
+        return {}
+    row = df.tail(1).to_dict("records")[0]
+
+    def pick(*names):
+        for name in names:
+            value = row.get(name)
+            if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
+                return float(value)
+        return None
+
+    return {"pe_ttm": pick("PE(TTM)"), "pb": pick("市净率"),
+            "peg": pick("PEG值"), "ps": pick("市销率")}
+
+
 def zscores(rows, keys):
     """横截面 z-score（截断 ±3），用于合成打分。"""
     stats = {}
@@ -121,6 +142,11 @@ def snapshot(tickers, window):
             if values is None:
                 raise RuntimeError("样本不足")
             sources.add(source)
+            try:
+                values.update({k: v for k, v in valuation_values(ticker).items() if v is not None})
+                sources.add("akshare/同花顺估值")
+            except Exception:
+                pass  # 估值缺失不影响价量因子
             rows.append({"ticker": ticker, "factors": values, "as_of": bars[-1]["t"]})
         except Exception as error:
             failures[ticker] = str(error)[:80]
@@ -133,7 +159,7 @@ def snapshot(tickers, window):
         row["factors"] = {k: (round(v, 5) if isinstance(v, float) else v) for k, v in row["factors"].items()}
     return {"tickers": [r["ticker"] for r in ranked], "rows": ranked, "factors": keys,
             "sources": sorted(sources), "failures": failures, "window": window,
-            "note": "价量因子横截面 z-score 合成打分；估值/质量因子待基本面源接入后加入。"}
+            "note": "价量 + 估值因子横截面 z-score 合成打分（估值源：同花顺；缺失时自动跳过估值维度）。"}
 
 
 def ic_series(tickers, factor, forward, window):
