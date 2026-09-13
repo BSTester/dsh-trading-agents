@@ -58,9 +58,11 @@ test("workbench client ships pagination, report detail, and drawer UI", async ()
   }
 });
 
-test("workbench shows a Futu instrument card, not charts, and ships no sample data", async () => {
+test("workbench ships a Futu instrument card and a cached K-line chart, with no sample data", async () => {
   const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
-  assert.doesNotMatch(source, /KLineChart/, "不应再内置 K 线图组件");
+  // K 线图已于 2026-09-13 按用户要求加回（此前一度被移除）；标的卡片保留
+  assert.match(source, /function KLineChart\(/, "缺少 K 线图组件");
+  assert.match(source, /function KLineCard\(/, "缺少 K 线卡片");
   assert.match(source, /在富途查看K线/, "缺少跳转富途看 K 线的入口");
   assert.match(source, /instrument/, "未使用标的卡片接口");
   // 不得内置示例标的（默认标的池/默认行情标的）
@@ -160,4 +162,34 @@ test("刷新会清掉路由缺失记忆，允许重启后的 Host 恢复", async
   phase = "new";
   plugin.internals.invalidateCaches();
   assert.deepEqual((await plugin.request(rpc, "positions", { mode: "sim" })).positions, []);
+});
+
+test("K 线周期预设：默认日线，根数不超过富途单次上限", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const periods = [...source.matchAll(/\{ id: "([^"]+)", label: "([^"]+)", limit: (\d+) \}/g)]
+    .map(([, id, label, limit]) => ({ id, label, limit: Number(limit) }));
+  assert.ok(periods.length >= 3, "周期预设过少");
+  assert.equal(periods[0].id, "1d", "默认应为日线");
+  const defaultPeriod = source.match(/const KLINE_DEFAULT_PERIOD = "([^"]+)"/)?.[1];
+  assert.equal(defaultPeriod, "1d", "默认周期必须是日线");
+  for (const row of periods) {
+    assert.ok(row.limit >= 20 && row.limit <= 370,
+      `${row.id} 根数 ${row.limit} 超出富途单次上限（20..370）`);
+  }
+  assert.ok(periods.some((p) => p.id === "1d"), "缺少日线");
+  assert.ok(periods.some((p) => ["1m", "5m"].includes(p.id)), "缺少分钟级");
+});
+
+test("K 线按需挂载：未解析标的时不请求 series", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  // KLineCard 只在 submitted 非空时挂载，避免空 ticker 触发无意义请求
+  assert.match(source, /submitted && h\(KLineCard/,
+    "K 线卡片应在标的解析后才挂载");
+});
+
+test("K 线也会走缓存，不会因切页签重复取数", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const ttl = source.match(/series: (\d+) \* 60_000/);
+  assert.ok(ttl, "series 未配置客户端 TTL，切页签会重复取数");
+  assert.ok(Number(ttl[1]) >= 1, "series TTL 过短");
 });

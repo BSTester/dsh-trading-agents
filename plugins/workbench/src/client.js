@@ -112,6 +112,19 @@ window.__ModuleLoader__.load({
     const CACHE_MAX_ENTRIES = 60;
     /** 兜底轮询间隔：面板是查看用途，切页签有缓存，不需要秒级刷新。 */
     const SNAPSHOT_POLL_MS = 60_000;
+
+    // K 线周期预设。实测：一次富途往返无论周期都是约 2.8-5.1 秒、约 29 KB，
+    // 因此分钟级并不比日线贵——差别只在"一次调用能看多长"。
+    // 富途单次上限 370 根，故根数不得超过它。
+    const KLINE_PERIODS = [
+      { id: "1d", label: "日线", limit: 250 },   // 约 1 年
+      { id: "60m", label: "60分", limit: 200 },
+      { id: "15m", label: "15分", limit: 200 },
+      { id: "5m", label: "5分", limit: 240 },    // 约 20 小时
+      { id: "1m", label: "1分", limit: 240 },    // 约一个交易日
+    ];
+    const KLINE_DEFAULT_PERIOD = "1d";
+    const FUTU_MAX_BARS = 370;
     const endpointCache = new Map();
     // Host 在 snapshot 里声明它实际提供哪些接口；null 表示尚未获知（旧版 Host 不声明）
     let servedEndpoints = null;
@@ -299,6 +312,55 @@ window.__ModuleLoader__.load({
       return state;
     }
 
+    /** K 线蜡烛图：canvas 自绘，不引入依赖。 */
+    function KLineChart({ bars }) {
+      const ref = useCanvasChart((ctx, width, height, color) => {
+        if (!bars || bars.length < 2) {
+          ctx.fillStyle = color.text; ctx.font = "12px sans-serif";
+          ctx.fillText("暂无 K 线数据", 12, 22); return;
+        }
+        const padL = 54, padR = 12, padT = 10, padB = 18;
+        const plotW = width - padL - padR;
+        const plotH = height - padT - padB;
+        let min = Math.min(...bars.map((b) => b.l));
+        let max = Math.max(...bars.map((b) => b.h));
+        if (max - min < 1e-9) { max += 1; min -= 1; }
+        const span = max - min; min -= span * 0.05; max += span * 0.05;
+        const y = (value) => padT + plotH * (1 - (value - min) / (max - min));
+
+        ctx.strokeStyle = color.grid; ctx.fillStyle = color.text; ctx.font = "10px sans-serif";
+        for (let i = 0; i <= 4; i += 1) {
+          const gridY = Math.round(y(min + (max - min) * (i / 4))) + 0.5;
+          ctx.beginPath(); ctx.moveTo(padL, gridY); ctx.lineTo(width - padR, gridY); ctx.stroke();
+          ctx.fillText((min + (max - min) * (i / 4)).toFixed(2), 4, gridY + 3);
+        }
+
+        const step = plotW / bars.length;
+        const bodyW = Math.max(1, Math.min(step * 0.68, 9));
+        bars.forEach((bar, index) => {
+          const centerX = padL + step * (index + 0.5);
+          const rising = bar.c >= bar.o;
+          const tone = rising ? color.up : color.down;
+          ctx.strokeStyle = tone; ctx.fillStyle = tone; ctx.lineWidth = 1;
+          ctx.beginPath(); ctx.moveTo(centerX, y(bar.h)); ctx.lineTo(centerX, y(bar.l)); ctx.stroke();
+          const top = y(Math.max(bar.o, bar.c));
+          const bottom = y(Math.min(bar.o, bar.c));
+          ctx.fillRect(centerX - bodyW / 2, top, bodyW, Math.max(1, bottom - top));
+        });
+
+        // 最新收盘参考线
+        const last = bars[bars.length - 1];
+        ctx.setLineDash([4, 3]); ctx.strokeStyle = color.line; ctx.lineWidth = 1;
+        ctx.beginPath(); ctx.moveTo(padL, y(last.c)); ctx.lineTo(width - padR, y(last.c)); ctx.stroke();
+        ctx.setLineDash([]);
+        ctx.fillStyle = color.text;
+        ctx.fillText(String(bars[0].t).slice(0, 16), padL, height - 4);
+        const tail = String(last.t).slice(0, 16);
+        ctx.fillText(tail, width - padR - ctx.measureText(tail).width, height - 4);
+      }, [bars]);
+      return h("canvas", { ref, className: "tw-chart" });
+    }
+
     function HeatmapChart({ rowLabels, colLabels, tickers, matrix, unit = "" }) {
       const rows = rowLabels ?? tickers ?? [];
       const cols = colLabels ?? tickers ?? [];
@@ -414,6 +476,32 @@ window.__ModuleLoader__.load({
       { id: "events", label: "事件" }, { id: "audit", label: "审计" },
     ];
 
+    /** K 线卡片：周期切换 + 蜡烛图。按需取数，两层缓存（客户端 TTL + Host TTL）。 */
+    function KLineCard({ rpc, ticker }) {
+      const [period, setPeriod] = React.useState(KLINE_DEFAULT_PERIOD);
+      const preset = KLINE_PERIODS.find((row) => row.id === period) ?? KLINE_PERIODS[0];
+      const series = useEndpoint(rpc, "series",
+        { ticker, period: preset.id, limit: preset.limit }, [rpc, ticker, preset.id]);
+      const bars = series.data?.bars ?? [];
+      const span = period === "1d" ? "约 1 年" : period === "5m" ? "约 20 小时" : "一个交易日上下";
+      return h(Card, { title: `K 线（${preset.label}）`, count: bars.length },
+        h("div", { className: "tw-toolbar" }, KLINE_PERIODS.map((row) =>
+          h("button", { key: row.id, type: "button",
+            className: `tw-btn${row.id === period ? " primary" : " seg"}`,
+            onClick: () => setPeriod(row.id) }, row.label)),
+          h("span", { className: "tw-meta" }, `${preset.limit} 根 · ${span}`)),
+        h(KLineChart, { bars }),
+        h("p", { className: "tw-meta" },
+          series.loading ? "取数中…"
+            : series.error ? `取数失败：${series.error}`
+              : `来源 ${series.data?.source ?? "—"} · 截至 ${series.data?.as_of ?? "—"}`
+                + ` · ${bars.length} 根`
+                + (series.data?.stale ? " ⚠ 数据源不可用，展示本地缓存" : "")),
+        h("p", { className: "tw-hint" },
+          "K 线按周期缓存（客户端与 Host 各 5 分钟），切换页签不会重复取数。"
+          + "更细的逐笔/分时请在富途查看。"));
+    }
+
     function MarketView({ rpc, onResolved }) {
       const [ticker, setTicker] = React.useState("");
       const [submitted, setSubmitted] = React.useState("");
@@ -467,7 +555,8 @@ window.__ModuleLoader__.load({
               "在富途查看K线 ↗"),
             h("span", { className: "tw-meta" }, `${card.symbol} · 数据 ${card.as_of ?? "—"} · ${card.source ?? "—"}`)),
           card.note && h("p", { className: "tw-hint" }, card.note),
-          h("p", { className: "tw-hint" }, "工作台不内置行情图表；K线请点击上方链接在富途查看。")));
+          h("p", { className: "tw-hint" }, "点击上方链接可在富途查看更细的分时与逐笔。")),
+        submitted && h(KLineCard, { rpc, ticker: submitted }));;
     }
 
     function SignalView({ snapshot }) {
