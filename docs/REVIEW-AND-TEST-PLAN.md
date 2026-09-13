@@ -348,6 +348,46 @@ python scripts/install_plugins.py check --repo <preset 目录> --dsh-home ~/.dsh
 它逐项核对 preset 行是否启用、4 个插件是否装上、统一数据层与 `.pth` 是否就位，
 发现问题时给出确切的修复命令。已覆盖测试（含"行被禁用""`.pth` 缺失""插件缺失""无 venv"）。
 
+## 六之三、缓存：目录与策略
+
+面板是**查看用途**，不追求实时。缓存分三级，冷启动实测（`factors` 30.6s、
+`correlation` 9.7s、`positions` 10.8s、`instrument` 7.1s、`events` 5.7s、`series` 4.9s）：
+
+| 级 | 位置 | 生效范围 | 命中耗时 |
+|---|---|---|---|
+| 客户端内存 | 浏览器内存（`endpointCache`） | 切页签不重发请求 | 0 ms（连 RPC 都不发） |
+| Host 内存 | dsh 进程内 | 同进程内重复请求 | 0–1 ms |
+| **Host 磁盘** | **`~/.dsh/trading-workbench-cache/`** | **跨进程/重启** | 0–13 ms |
+
+**为什么加磁盘这一级**：原先只有内存，**进程一重启缓存全丢**——用户每次重启后
+第一次点每个页签都要重新等一遍（实测一次冷启动合计 **69.7 秒**）。
+加了磁盘后，新进程访问同样数据合计 **0.0 秒**（`positions` 13 ms，其余 0–1 ms）。
+
+TTL（`plugins/workbench/src/rpc.js` 的 `CACHE_TTL_MS`，已按"不追求实时"放宽）：
+
+| 接口 | TTL | 接口 | TTL |
+|---|---|---|---|
+| `instrument` `series` | 10 分钟 | `correlation` `factors` `ic` | 30 分钟 |
+| `equity` `positions` `trades` `sources` | 5 分钟 | `sensitivity` `events` `quality` | 60 分钟 |
+| `risk` | 15 分钟 | `audit` | 2 分钟 |
+
+其它磁盘缓存（不属于面板 RPC 缓存，但同属"本地缓存"）：
+
+| 路径 | 内容 | TTL |
+|---|---|---|
+| `~/.dsh/trading-series/` | K 线序列（按 标的-周期 一个文件） | 由取数逻辑使用，不按 TTL 失效 |
+| `~/.dsh/trading-positions-<mode>.json` | 券商持仓 | 5 分钟 |
+| `~/.dsh/trading-equity-<mode>.json` | 每日盯市 | 永久累积（保留 400 条） |
+| `~/.dsh/trading-workbench.json` | 研报/预览/交易动态 | 持久 |
+| `~/.dsh/trading-python/` | 统一数据层（安装产物，不是缓存） | — |
+
+**两点行为变化**：
+
+1. **切换模拟/实盘不再清空缓存**。缓存键里本来就带 `mode`，两套数据天然分开；
+   原先清空全部缓存导致每次切模式后所有页签都要重新取数（`factors` 冷启动 30 秒）。
+2. 面板顶部显示"本地缓存 N 项"，让"是否在缓存"这件事在界面上可见。
+   「刷新」按钮仍会清空客户端缓存，并让随后 5 秒内的请求穿透 Host 缓存。
+
 ## 七、回滚方式
 
 ```bash

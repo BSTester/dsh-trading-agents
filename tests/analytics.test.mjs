@@ -2,14 +2,23 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import { createRpcHandler } from "../plugins/workbench/src/rpc.js";
 import { createAnalyticsProvider } from "../plugins/workbench/src/analytics.js";
+import { mkdtempSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 
 const equity = { mode: "sim", count: 3, current: 1010000, total_return: 0.01, max_drawdown: -0.02,
   points: [{ t: "2026-09-09", equity: 1000000, dd: 0 }, { t: "2026-09-10", equity: 1010000, dd: 0 }] };
 const positions = { mode: "sim", cash: 100, market_value: 200, equity: 300, positions: [] };
 const correlation = { tickers: ["600519", "000001"], matrix: [[1, 0.4], [0.4, 1]], window: 120 };
 
+/**
+ * 每个 handler 用一次性磁盘缓存目录。
+ * 磁盘缓存跨进程共享：若沿用默认目录，本次运行会读到上一次运行留下的条目，
+ * 于是 provider 桩根本不会被调用，测试变得又脆弱又假通过。
+ */
 function handlerWith(analytics) {
-  return createRpcHandler({}, { analytics });
+  const dir = mkdtempSync(path.join(os.tmpdir(), "analytics-cache-"));
+  return createRpcHandler({}, { analytics, dir });
 }
 
 test("equity / positions / correlation return provider values", async () => {
@@ -31,7 +40,7 @@ test("analytics endpoints reject unexpected fields without calling the provider"
 });
 
 test("missing provider and provider failures degrade without throwing", async () => {
-  const noProvider = await createRpcHandler({}, {})("equity", {});
+  const noProvider = await createRpcHandler({}, { dir: mkdtempSync(path.join(os.tmpdir(), "analytics-cache-")) })("equity", {});
   assert.equal(noProvider.ok, false);
   assert.match(noProvider.error.message, /provider unavailable/i);
 
@@ -130,7 +139,7 @@ test("events endpoint validates ticker and window, degrading on failure", async 
   assert.equal(ok.ok, true);
   const badField = await handle("events", { ticker: "600519", mode: "sim" });
   assert.equal(badField.ok, false);
-  const bad = await createRpcHandler({}, { analytics: { events: async () => { throw new Error("仅支持 A 股"); } } });
+  const bad = await createRpcHandler({}, { dir: mkdtempSync(path.join(os.tmpdir(), "analytics-cache-")), analytics: { events: async () => { throw new Error("仅支持 A 股"); } } });
   const failed = await bad("events", { ticker: "AAPL" });
   assert.equal(failed.error.code, "trading/analytics-unavailable");
   assert.match(failed.error.message, /仅支持 A 股/);

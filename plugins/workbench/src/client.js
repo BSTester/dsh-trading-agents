@@ -130,6 +130,8 @@ window.__ModuleLoader__.load({
     let servedEndpoints = null;
     // 撞过 404 的接口：即使 Host 没声明，也能据此停止重试并说明原因
     const missingEndpoints = new Set();
+    // endpoint → 数据算于何时（Host 返回的 cached_at）
+    const lastServedAt = new Map();
     // 用户在 5 秒内点击过刷新：期间发出的请求都绕过缓存
     let forceUntil = 0;
 
@@ -152,6 +154,9 @@ window.__ModuleLoader__.load({
         endpointCache.delete(endpointCache.keys().next().value);
       }
     }
+
+    /** 当前客户端缓存条目数（仅用于界面显示，让"是否在缓存"可见）。 */
+    const cacheSize = () => endpointCache.size;
 
     /** 用户主动刷新：清掉客户端缓存，并让随后 5 秒内的请求强制穿透 Host 缓存。 */
     function invalidateCaches() {
@@ -193,6 +198,8 @@ window.__ModuleLoader__.load({
       if (endpoint === "snapshot" && Array.isArray(result.value?.endpoints)) {
         servedEndpoints = new Set(result.value.endpoints);
       }
+      // 记录本次数据算于何时（Host 缓存命中时是更早的时间），供界面显示
+      if (typeof result.cached_at === "string") lastServedAt.set(endpoint, result.cached_at);
       return result.value;
     }
 
@@ -1103,7 +1110,9 @@ window.__ModuleLoader__.load({
           await request(rpc, "switch-mode", { mode, expected_mode: expected, ...(mode === "live" ? { confirmation } : {}) });
           setConfirmation("");
         } catch (failure) { setSwitchError(failure.message); }
-        finally { setSwitching(false); invalidateCaches(); setRevision((v) => v + 1); }
+        // 不在这里清缓存：缓存键里带 mode，模拟盘与实盘本就各存一份。
+        // 之前清空全部缓存，导致每次切模式后所有页签都要重新取数（factors 冷启动 25 秒）。
+        finally { setSwitching(false); setRevision((v) => v + 1); }
       };
 
       const live = snapshot?.mode === "live";
@@ -1120,6 +1129,8 @@ window.__ModuleLoader__.load({
             h("h2", { className: "tw-title" }, "交易工作台"),
             snapshot && h("span", { className: `tw-badge${live ? " live" : ""}` }, live ? "实盘 LIVE" : "模拟盘 SIM"),
             snapshot && h("span", { className: "tw-meta" }, `更新 ${String(snapshot.generated_at).slice(11, 19)}`),
+            h("span", { className: "tw-meta", title: "面板数据按 TTL 本地缓存，命中时不重新取数" },
+              `本地缓存 ${cacheSize()} 项`),
             h("button", { type: "button", className: "tw-btn seg", title: "清除本地缓存并重新取数",
               onClick: () => { invalidateCaches(); setError(""); setRevision((v) => v + 1); } }, "刷新"),
             sources && h("span", { className: `tw-badge${sources.summary.fail > 0 ? " live" : ""}`,

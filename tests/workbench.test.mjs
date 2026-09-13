@@ -1,6 +1,7 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, unlink } from "node:fs/promises";
+import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { WorkbenchStore } from "../plugins/workbench/src/store.js";
@@ -11,6 +12,16 @@ async function fixture(t) {
   const home = await mkdtemp(path.join(os.tmpdir(), "trading-workbench-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   return { home, store: new WorkbenchStore(home) };
+}
+
+/**
+ * 磁盘缓存是跨进程共享的，测试若不注入独立目录，会读到上一次运行留下的条目。
+ * 这里统一给每个用例一个一次性目录。
+ */
+function isolatedCache(t) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "trading-cache-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return { dir };
 }
 
 const published = {
@@ -125,6 +136,7 @@ test("重复请求命中 Host 缓存，不再重跑取数", async (t) => {
   const { store } = await fixture(t);
   let calls = 0;
   const handle = createRpcHandler(store, {
+    ...isolatedCache(t),
     analytics: { async positions() { calls += 1; return { positions: [] }; } },
   });
   const first = await handle("positions", { mode: "sim" });
@@ -140,6 +152,7 @@ test("_refresh 绕过缓存但仍是合法请求", async (t) => {
   const { store } = await fixture(t);
   let calls = 0;
   const handle = createRpcHandler(store, {
+    ...isolatedCache(t),
     analytics: { async positions() { calls += 1; return { positions: [], n: calls }; } },
   });
   await handle("positions", { mode: "sim" });
@@ -153,6 +166,7 @@ test("不同参数各自缓存，互不串味", async (t) => {
   const { store } = await fixture(t);
   const seen = [];
   const handle = createRpcHandler(store, {
+    ...isolatedCache(t),
     analytics: { async instrument(payload) { seen.push(payload.ticker); return { ticker: payload.ticker }; } },
   });
   await handle("instrument", { ticker: "600519" });
@@ -166,6 +180,7 @@ test("缓存过期后重新取数", async (t) => {
   let calls = 0;
   let clock = 1_000_000;
   const handle = createRpcHandler(store, {
+    ...isolatedCache(t),
     now: () => clock,
     analytics: { async positions() { calls += 1; return { n: calls }; } },
   });

@@ -1,50 +1,36 @@
 import { WorkbenchError } from "./store.js";
 import { buildAuditChain } from "./audit.js";
 import { ENDPOINTS } from "./endpoints.js";
+import { createTtlCache } from "./cache.js";
 
 // 结果缓存：面板是查看用途，不需要实时。这些接口背后是 python 子进程与富途调用，
 // 每次切页签都重跑既慢又浪费额度，因此在本层做 TTL 缓存（默认值，按接口粒度）。
 export const CACHE_TTL_MS = {
-  instrument: 5 * 60_000,
-  series: 5 * 60_000,
-  equity: 2 * 60_000,
-  positions: 2 * 60_000,
-  correlation: 10 * 60_000,
-  sensitivity: 30 * 60_000,
-  risk: 5 * 60_000,
-  trades: 60_000,
-  events: 30 * 60_000,
-  factors: 10 * 60_000,
-  ic: 10 * 60_000,
-  audit: 60_000,
-  sources: 2 * 60_000,
-  quality: 30 * 60_000,  // 财报变动不频繁
+  // 面板是**查看用途**，不追求实时（用户明确要求"可以是本地缓存的数据，避免频繁调用"）。
+  // 这些数字直接决定"切页签会不会重新等"——冷启动实测 factors 25s、correlation 7s。
+  instrument: 10 * 60_000,
+  series: 10 * 60_000,
+  equity: 5 * 60_000,
+  positions: 5 * 60_000,
+  correlation: 30 * 60_000,
+  sensitivity: 60 * 60_000,
+  risk: 15 * 60_000,
+  trades: 5 * 60_000,
+  events: 60 * 60_000,
+  factors: 30 * 60_000,
+  ic: 30 * 60_000,
+  audit: 2 * 60_000,
+  sources: 5 * 60_000,
+  quality: 60 * 60_000,
 };
-
 /** 稳定序列化：键顺序不影响缓存命中。 */
 function stableKey(payload) {
   const keys = Object.keys(payload).sort();
   return JSON.stringify(keys.map((key) => [key, payload[key]]));
 }
 
-export function createTtlCache({ now = Date.now } = {}) {
-  const store = new Map();
-  return {
-    read(key, ttl) {
-      const hit = store.get(key);
-      if (!hit || ttl <= 0 || now() - hit.at >= ttl) return null;
-      return hit;
-    },
-    write(key, value) {
-      const entry = { value, at: now() };
-      store.set(key, entry);
-      return entry;
-    },
-    clear() { store.clear(); },
-  };
-}
+export { createTtlCache } from "./cache.js";
 
-// Exact Connection Fetch routes share Harness authentication and its RPC envelope.
 export function createRpcFetchHandler(store, endpoint, deps = {}) {
   const handle = createRpcHandler(store, deps);
   return async (request) => {
