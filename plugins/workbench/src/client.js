@@ -680,7 +680,10 @@ window.__ModuleLoader__.load({
       const s = latest?.value?.summary;
       const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
       const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
-      const held = (positions.data?.positions ?? []).map((p) => p.ticker).slice(0, 6);
+      // 券商持仓用的字段是 symbol（早期本地台账是 ticker），两种都认，避免又对不上
+      const held = (positions.data?.positions ?? [])
+        .map((p) => p.symbol ?? p.ticker).filter(Boolean).slice(0, 6);
+      const canCorrelate = held.length >= 2;
       const correlation = useEndpoint(rpc, "correlation", { tickers: held, window: 120 }, [rpc, held.join(",")]);
       const ddPoints = (equity.data?.points ?? []).map((p) => ({ v: (p.dd ?? 0) * 100 }));
       return h(React.Fragment, null,
@@ -699,12 +702,15 @@ window.__ModuleLoader__.load({
           empty: ddPoints.length > 1 ? undefined : "需要成交记录才能回放回撤" },
           h(LineChart, { points: ddPoints, label: "drawdown %" })),
         h(Card, { title: "相关性矩阵（日收益，120 日）",
-          empty: (correlation.data?.tickers?.length ?? 0) >= 2 ? undefined
-            : (correlation.loading ? "加载中…" : (correlation.error || "标的不足")) },
+          empty: !canCorrelate
+            ? `当前持仓只有 ${held.length} 个可识别标的，需要至少 2 个；`
+              + "相关性矩阵由持仓自动带出，无需手工输入。"
+            : (correlation.data?.tickers?.length ?? 0) >= 2 ? undefined
+              : (correlation.loading ? "加载中…" : (correlation.error || "标的不足")) },
           correlation.data && h(HeatmapChart, { tickers: correlation.data.tickers, matrix: correlation.data.matrix }),
           correlation.data && h("p", { className: "tw-meta" }, `窗口 ${correlation.data.window} 个共同交易日 · 截至 ${correlation.data.as_of}`)),
         h(RiskConfigCard, { rpc, mode: snapshot.mode }),
-        h("p", { className: "tw-hint" }, "持仓敞口与相关性均基于本地台账与公开日线；实盘口径请结合富途账户查询。"));
+        h("p", { className: "tw-hint" }, "相关性基于**券商持仓**与公开日线计算；回撤/夏普基于本地策略台账，两者口径不同。"));
     }
 
     /** IC 检验当前只覆盖价量因子（估值因子需历史估值序列，后续接入）。 */
@@ -775,7 +781,8 @@ window.__ModuleLoader__.load({
               `加入当前标的 ${ticker}`)),
           h("p", { className: "tw-hint" }, "因子：价量（7）+ 估值（PE/PB/PEG/PS，同花顺源）；横截面 z-score 合成打分，估值越低分越高。")),
         h(Card, { title: "因子打分与排序", count: rows.length,
-          empty: snap.loading ? "加载中…" : (snap.error || "有效标的不足") },
+          empty: !enough ? "有效标的不足：请在下方输入至少 2 个标的（如 00700.HK,AAPL）"
+            : (snap.loading ? "加载中…" : (snap.error || "暂无数据")) },
           rows.length > 0 && h("div", { className: "tw-kv" }, rows.map((row) =>
             h("div", { key: row.ticker, className: "tw-kv-item" },
               h("div", { className: "tw-kv-k" }, `#${row.rank} ${row.ticker}`),
@@ -786,7 +793,8 @@ window.__ModuleLoader__.load({
           snap.data?.failures && Object.keys(snap.data.failures).length > 0
             && h("p", { className: "tw-meta" }, `跳过：${Object.entries(snap.data.failures).map(([k, v]) => `${k}(${v})`).join("；")}`)),
         h(Card, { title: "因子 IC / ICIR（横截面，forward 5 日）",
-          empty: ic.loading ? "加载中…" : (ic.error || "样本不足") },
+          empty: tickers.length < 3 ? "IC 需要 3..8 个标的（横截面相关）"
+            : (ic.loading ? "加载中…" : (ic.error || "样本不足")) },
           h("div", { className: "tw-toolbar" }, Object.keys(IC_FACTORS).map((k) =>
             h("button", { key: k, type: "button", className: `tw-btn seg${factor === k ? " active" : ""}`,
               onClick: () => setFactor(k) }, FACTOR_LABELS[k] ?? k))),
@@ -972,7 +980,16 @@ window.__ModuleLoader__.load({
             h("p", { className: "tw-hint" }, result.note))));
     }
 
+    /** 未选标的时的事件页：给可操作提示，**不发请求**（否则 provider 会抛 Invalid ticker）。 */
     function EventsView({ rpc, ticker }) {
+      if (!ticker) {
+        return h(Card, { title: "事件", empty: "请先在「行情」页查询一个标的"
+          + "（如 00700.HK / AAPL / 600519）；事件、因子与质量因子等页签共用它。" });
+      }
+      return h(EventsBody, { rpc, ticker });
+    }
+
+    function EventsBody({ rpc, ticker }) {
       const events = useEndpoint(rpc, "events", { ticker, days: 400 }, [rpc, ticker]);
       const rows = events.data?.events ?? [];
       const upcoming = rows.filter((e) => (e.days_until ?? 0) >= 0);

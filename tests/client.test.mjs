@@ -50,7 +50,8 @@ test("workbench client ships pagination, report detail, and drawer UI", async ()
   assert.match(source, /tw-drawer/, "抽屉容器缺失");
   assert.match(source, /在新标签打开/, "缺少新标签打开入口");
   // 所有列表类视图必须走 Paged，避免出现无分页的超长列表
-  for (const view of ["ResearchView", "SignalView", "ExecutionView", "AuditView", "EventsView"]) {
+  // 注意 EventsView 只是"未选标的时给提示"的外壳，真正渲染列表的是 EventsBody
+  for (const view of ["ResearchView", "SignalView", "ExecutionView", "AuditView", "EventsBody"]) {
     const body = source.slice(source.indexOf(`function ${view}(`));
     const end = body.indexOf("\n    function ", 10);
     const text = end === -1 ? body : body.slice(0, end);
@@ -192,4 +193,37 @@ test("K 线也会走缓存，不会因切页签重复取数", async () => {
   const ttl = source.match(/series: (\d+) \* 60_000/);
   assert.ok(ttl, "series 未配置客户端 TTL，切页签会重复取数");
   assert.ok(Number(ttl[1]) >= 1, "series TTL 过短");
+});
+
+test("需要标的的页签在未选标的时给提示，而不是发请求报 Invalid ticker", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  // 事件页此前在 ticker 为空时仍发请求，provider 校验不过 → 界面显示 "Invalid ticker"
+  const body = source.slice(source.indexOf("function EventsView("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /if \(!ticker\)/, "EventsView 缺少空标的守卫");
+  assert.match(text, /先在「行情」页查询/, "缺少可操作的提示");
+  assert.doesNotMatch(text, /useEndpoint\(/, "守卫分支不应再发请求");
+  assert.match(source, /function EventsBody\(/, "实际渲染应移到 EventsBody");
+});
+
+test("质量因子卡片同样受空标的守卫保护", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /ticker && h\(QualityCard/, "QualityCard 应在有标的时才挂载");
+});
+
+test("从券商持仓取标的时字段名必须对齐（symbol 而非 ticker）", async () => {
+  // positions.py 输出的是 symbol；曾误读 p.ticker，导致 held 恒为空、相关性从未算出
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const line = source.slice(source.indexOf("const held ="), source.indexOf("const held =") + 220);
+  assert.match(line, /p\.symbol/, "应从 symbol 取标的");
+  assert.match(line, /filter\(Boolean\)/, "应过滤掉取不到标的的行");
+  assert.match(source, /const canCorrelate = held\.length >= 2/, "相关性应有前置条件判断");
+});
+
+test("条件不满足时不把 provider 的原始报错抖到界面上", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /有效标的不足：请在下方输入至少 2 个标的/, "因子页缺友好提示");
+  assert.match(source, /IC 需要 3\.\.8 个标的/, "IC 卡片缺友好提示");
+  assert.match(source, /需要至少 2 个/, "相关性卡片缺友好提示");
 });
