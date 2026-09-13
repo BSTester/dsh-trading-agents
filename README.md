@@ -4,7 +4,7 @@
 
 DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 多角色投研流水线装进 Harness，数据与交易能力来自[富途远程 MCP](https://github.com/FutunnOpen/futu-agent-plugin)（免 OpenD、OAuth 授权）。
 
-**Harness 是唯一对话与指令入口。** 工作台嵌在 Harness 内，只用于查看研报、交易动态、
+**Harness 是唯一对话与指令入口。** 工作台嵌在 Harness 内，只用于查看研报、交易概要、
 量化信息预览及切换模拟盘/实盘；没有独立聊天、下单或撤单入口。
 
 ```
@@ -80,7 +80,7 @@ Harness 会使用原生工具与子代理完成四位分析师报告、多空辩
 | 页面内容 | 数据从哪里来 |
 |---|---|
 | 研报结果与来源 | Harness 完成研究后经 `research_publish` 发布 |
-| 交易动态 | 当前模式下，Harness 最近收到的富途账户/交易工具响应 |
+| 交易概要 | 由富途工具响应归纳出的订单与下单/改单/撤单动作（按 order_id 去重；只读查询仅计数）|
 | 量化预览 | 在 Harness 请求 `quant_signal`、`quant_backtest`、`quant_report` 的结果 |
 | 模拟盘/实盘切换 | 面板内显式操作；实盘输入「确认实盘」，但不授权订单 |
 

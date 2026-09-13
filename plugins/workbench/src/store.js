@@ -1,3 +1,4 @@
+import { summarizeBrokerActivity } from "./broker_trades.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -118,12 +119,15 @@ export class WorkbenchStore {
     this.flushObservations();
     const mode = this.readMode();
     const state = this.read();
+    const activity = state.activity.filter(row => row.mode === mode).reverse();
     return {
       version: 1, mode, generated_at: new Date().toISOString(),
       runs: state.runs.filter(row => row.mode === mode).reverse(),
       reports: state.reports.filter(row => row.mode === mode).reverse(),
       previews: state.previews.filter(row => row.mode === mode).reverse(),
-      activity: state.activity.filter(row => row.mode === mode).reverse(),
+      activity,
+      // 派生视图：把工具调用归纳成交易事实（不写回磁盘，读时计算）
+      trade_summary: summarizeBrokerActivity(activity),
       broker: state.broker[mode] ?? null,
       in_flight: this.inFlight,
       pending_observations: this.pendingObservations().length,

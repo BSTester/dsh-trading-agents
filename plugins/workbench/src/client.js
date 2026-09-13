@@ -528,6 +528,109 @@ window.__ModuleLoader__.load({
           ic.data && h("p", { className: "tw-hint" }, ic.data.note)));
     }
 
+    /** 交易概要：把「调了哪些工具」归纳成「发生了什么交易」。 */
+    function tradeWhen(iso) {
+      return iso ? String(iso).replace("T", " ").slice(0, 16) : "时间未知";
+    }
+
+    function tradeMoney(value) {
+      return (value === null || value === undefined)
+        ? "—" : value.toLocaleString("en-US", { maximumFractionDigits: 2 });
+    }
+
+    /** 一行订单事实：数量/价格/成交情况全部来自券商原文，不重算。 */
+    function TradeOrderRow({ row }) {
+      const sideTag = row.side === "买入"
+        ? h("span", { className: "tw-tag buy" }, "买入")
+        : row.side === "卖出"
+          ? h("span", { className: "tw-tag sell" }, "卖出")
+          : h("span", { className: "tw-tag" }, `side=${row.side_code}`);
+      return h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" },
+          `${tradeWhen(row.ordered_at)} · ${row.symbol || "—"} ${row.name} `,
+          sideTag,
+          row.cancelled ? h("span", { className: "tw-tag sell" }, "已撤单") : null,
+          row.modified_count > 0 ? h("span", { className: "tw-tag" }, `改单${row.modified_count}次`) : null,
+          !row.cancelled && row.fill !== "全部成交" ? h("span", { className: "tw-tag hold" }, row.fill) : null),
+        h("div", { className: "tw-kv-v" },
+          `${row.qty ?? "—"} 股 @ 委托 ${tradeMoney(row.price)} · `
+          + `成交 ${row.filled_qty ?? "—"} 股 @ 均价 ${tradeMoney(row.avg_fill_price)}`),
+        h("div", { className: "tw-meta" },
+          `成交金额 ${tradeMoney(row.amount)} · 订单号 ${row.order_id} · status=${row.status_code ?? "—"}`));
+    }
+
+    /** 一行下单/改单/撤单动作。 */
+    function TradeActionRow({ row }) {
+      const failed = h("span", { style: { color: "var(--dsw-alias-state-error-primary,#d1242f)" } },
+        `失败：${row.detail}`);
+      return h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" }, `${tradeWhen(row.at)} · ${row.action}`),
+        h("div", { className: "tw-kv-v" },
+          row.ok ? `已提交${row.order_id ? ` · 订单号 ${row.order_id}` : ""}` : failed));
+    }
+
+    /** 原始响应：保留为可展开证据，但不再是主列表。 */
+    function RawResponseRow({ row }) {
+      return h("details", { className: "tw-item" },
+        h("summary", null, `${tradeWhen(row.at)} · ${row.tool ?? row.kind}`,
+          row.is_error ? h("span", { className: "tw-tag sell" }, "失败") : null),
+        h("div", { className: "tw-item-body" },
+          h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2))));
+    }
+
+    function TradeSummaryCard({ summary, activity }) {
+      const data = summary ?? {};
+      const orders = data.orders ?? [];
+      const actions = data.actions ?? [];
+      const queries = data.queries ?? { count: 0, tools: [] };
+      const counts = data.counts ?? {};
+      const responses = activity ?? [];
+
+      const stat = (label, value, tone) => h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" }, label),
+        h("div", { className: "tw-kv-v", style: tone ? { color: tone } : undefined }, String(value)));
+
+      if (orders.length === 0 && actions.length === 0) {
+        return h(Card, { title: "交易概要", empty: counts.responses
+          ? `观察到的 ${counts.responses} 条券商响应中没有交易事实（均为账户查询）`
+          : "暂无券商响应记录" });
+      }
+
+      const stats = h("div", { className: "tw-kv" },
+        stat("订单", `${orders.length} 笔`),
+        stat("下单/改单/撤单", `${actions.length} 次`),
+        stat("账户查询", `${queries.count} 次`),
+        counts.errors
+          ? stat("失败", `${counts.errors} 次`, "var(--dsw-alias-state-error-primary,#d1242f)")
+          : null);
+
+      const actionBlock = actions.length === 0 ? null : h(React.Fragment, null,
+        h("p", { className: "tw-meta" }, "下单/改单/撤单动作"),
+        h(Paged, { items: actions, pageSize: 6, render: (row) => h(TradeActionRow, {
+          key: row.entry_id ?? `${row.at}-${row.action}`, row }) }));
+
+      const queryBlock = queries.tools.length === 0 ? null
+        : h("p", { className: "tw-meta" },
+          `另有 ${queries.count} 次只读查询未列出：`
+          + queries.tools.map((row) => `${row.tool || "unknown"}×${row.count}`).join("、"));
+
+      const rawBlock = responses.length === 0 ? null : h("details", { className: "tw-item" },
+        h("summary", null, `原始券商响应（${responses.length} 条，审计核对用）`),
+        h("div", { className: "tw-item-body" },
+          h(Paged, { items: responses, pageSize: 10,
+            render: (row) => h(RawResponseRow, { key: row.id, row }) })));
+
+      return h(Card, { title: "交易概要", count: orders.length },
+        stats,
+        h("p", { className: "tw-meta" }, data.notice ?? ""),
+        h("p", { className: "tw-meta" }, "订单明细（券商返回，按 order_id 去重后保留最新状态）"),
+        h(Paged, { items: orders, pageSize: 8, empty: "暂无订单记录",
+          render: (row) => h(TradeOrderRow, { key: row.order_id, row }) }),
+        actionBlock,
+        queryBlock,
+        rawBlock);
+    }
+
     function ExecutionView({ rpc, snapshot }) {
       const trades = useEndpoint(rpc, "trades", { mode: snapshot.mode, limit: 50 }, [rpc, snapshot.mode]);
       const rows = trades.data?.trades ?? [];
@@ -543,13 +646,7 @@ window.__ModuleLoader__.load({
                 `费用 ${row.fee ?? "—"}${row.return !== undefined && row.return !== null ? ` · 收益 ${(row.return * 100).toFixed(2)}%` : ""}${row.reason ? ` · ${row.reason}` : ""}`)) }),
           trades.data && h("p", { className: "tw-meta" },
             `共 ${trades.data.total} 笔 · 胜率 ${trades.data.win_rate === null ? "—" : `${(trades.data.win_rate * 100).toFixed(0)}%`} · 累计费用 ${trades.data.total_fees}`)),
-        h(Card, { title: "交易动态（Harness 观察到的券商响应）", count: snapshot.activity.length },
-          h("p", { className: "tw-meta" }, "响应不等于成交；下单请在 Harness 会话中完成并确认。"),
-          h(Paged, { items: snapshot.activity, pageSize: 10, empty: "暂无券商响应记录",
-          render: (row) => h("details", { key: row.id, className: "tw-item" },
-            h("summary", null, `${row.at} · ${row.tool ?? row.kind}`,
-              row.is_error ? h("span", { className: "tw-tag sell" }, "失败") : null),
-            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2)))) })));
+        h(TradeSummaryCard, { summary: snapshot.trade_summary, activity: snapshot.activity }));
     }
 
     function ResearchView({ rpc, snapshot, ticker, onOpenReport }) {
