@@ -48,7 +48,7 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
     const { stdout } = await exec(python(), [path.join(pythonDir, script), ...args],
       { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
     const start = stdout.indexOf("{");
-    if (start < 0) throw new Error("analytics.py returned no JSON");
+    if (start < 0) throw new Error(`${script} returned no JSON`);
     const value = JSON.parse(stdout.slice(start));
     if (value.error) throw new Error(value.error);
     cache.set(key, { at: now(), value });
@@ -93,18 +93,19 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       }
       const start = payload.start ?? "2023-01-01";
       if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) throw new Error("Invalid start date");
-      const args = ["sensitivity", "--ticker", tickerList, "--strategy", strategy, "--metric", metric, "--start", start];
+      const args = ["--ticker", tickerList, "--strategy", strategy, "--metric", metric, "--start", start];
       if (payload.fast_grid) args.push("--fast-grid", payload.fast_grid);
       if (payload.slow_grid) args.push("--slow-grid", payload.slow_grid);
       if (payload.buy_grid) args.push("--buy-grid", payload.buy_grid);
       if (payload.sell_grid) args.push("--sell-grid", payload.sell_grid);
-      return call(args, `sensitivity|${args.join(" ")}`);
+      return call(args, `sensitivity|${args.join(" ")}`, { script: "sensitivity.py" });
     },
     async events(payload = {}) {
       const ticker = payload.ticker;
       if (typeof ticker !== "string" || !TICKER.test(ticker)) throw new Error("Invalid ticker");
       const days = intInRange(payload.days, 180, 30, 2000, "days");
-      return call(["events", "--ticker", ticker, "--days", String(days)], `events|${ticker}|${days}`);
+      return call(["--ticker", ticker, "--days", String(days)], `events|${ticker}|${days}`,
+        { script: "events.py" });
     },
     async factors(payload = {}) {
       const tickers = payload.tickers;
@@ -114,7 +115,7 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       if (tickers.some((t) => typeof t !== "string" || !TICKER.test(t))) throw new Error("Invalid ticker in list");
       const window = intInRange(payload.window, 250, 80, 1000, "window");
       return call(["snapshot", "--tickers", tickers.join(","), "--window", String(window)],
-        `factors|${tickers.join(",")}|${window}`);
+        `factors|${tickers.join(",")}|${window}`, { script: "factors.py" });
     },
     async ic(payload = {}) {
       const tickers = payload.tickers;
@@ -128,13 +129,14 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       const window = intInRange(payload.window, 250, 80, 1000, "window");
       return call(["ic", "--tickers", tickers.join(","), "--factor", factor,
                    "--forward", String(forward), "--window", String(window)],
-        `ic|${tickers.join(",")}|${factor}|${forward}|${window}`);
+        `ic|${tickers.join(",")}|${factor}|${forward}|${window}`, { script: "factors.py" });
     },
     async sources(payload = {}) {
       if (Object.keys(payload).some((key) => key !== "no_probe")) throw new Error("Unexpected sources field");
-      const args = ["sources"];
+      const args = [];
       if (payload.no_probe === true) args.push("--no-probe");
-      return call(args, `sources|${payload.no_probe === true ? "noprobe" : "probe"}`);
+      return call(args, `sources|${payload.no_probe === true ? "noprobe" : "probe"}`,
+        { script: "sources.py" });
     },
     async instrument(payload = {}) {
       const ticker = payload.ticker;

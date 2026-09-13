@@ -191,6 +191,8 @@ def check_install(repo, dsh_home):
     """
     repo, dsh_home = Path(repo).resolve(), Path(dsh_home).expanduser().resolve()
     problems, notes = [], []
+    # 说明：下面与 write_data_layer_pth 比对的路径都走 unified_python_root()，
+    # 两边必须用同一套归一化，否则会出现"写进去的串和比对的串不同"的假失败。
 
     preset = repo / "agent.cordis.yml"
     if preset.is_file():
@@ -232,7 +234,7 @@ def check_install(repo, dsh_home):
         problems.append(f"找不到交易 venv 的 site-packages（{dsh_home / 'trading-venv'}）")
     else:
         pth = site / DATA_LAYER_PTH_NAME
-        expected = str(root / "datasource") + "\n"
+        expected = str(Path(unified_python_root(dsh_home)) / "datasource") + "\n"
         if not pth.is_file():
             problems.append(f"未写入 .pth：{pth}（跑 `link` 动作）")
         elif read_text(pth) != expected:

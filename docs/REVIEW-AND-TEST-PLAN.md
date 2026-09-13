@@ -69,7 +69,45 @@
   A 股再退 AKShare（东方财富）。返回里带来源与两个报表期，两条都拿不到才标为不可得。
   实测：AAPL ROE 151.91% / 腾讯 19.48% / 阿里 9.76% / 茅台 33.65% / 平安银行 7.73%。
 
-### 6. 安全相关：授权范围实测
+### 6. 修掉五个"从来没成功过"的接口
+
+用户点面板时报出来的：
+
+```
+Command failed: .../analytics.py sources
+analytics.py: error: argument cmd: invalid choice: 'sources'
+```
+
+查下去发现**不止一个**：`analytics.py` 的子命令只有
+`{equity, positions, correlation, risk, trades}`，而另外五个 provider 一直在
+往它上面调：
+
+| 接口 | 原先调用 | 实际应该是 | 状态 |
+|---|---|---|---|
+| `sources` | `analytics.py sources` | `sources.py`（选项式，无子命令） | 已修 |
+| `events` | `analytics.py events …` | `events.py` | 已修 |
+| `factors` | `analytics.py snapshot …` | `factors.py snapshot …` | 已修 |
+| `ic` | `analytics.py ic …` | `factors.py ic …` | 已修 |
+| `sensitivity` | `analytics.py sensitivity …` | `sensitivity.py` | 已修 |
+
+**这几个接口从加入仓库那天起就没成功过**（`sources` 自 `c082963` 起），
+因为路由错误只在真跑一次时才暴露：argparse 报错发生在业务逻辑之前，
+而单元测试覆盖的是 python 脚本本身（直接跑 `sources.py` 是正常的），
+没有覆盖 JS 这一层的脚本选择。
+
+新增 `tests/analytics-routing.test.mjs`（6 例）把路由钉死：
+逐个 provider 断言它执行的脚本与首个参数、断言期望表覆盖了全部 provider
+（新增接口必须同步登记）、断言 `analytics.py` 的子命令集合没变、
+断言被执行的脚本真实存在、断言选项式脚本不得收到位置参数。
+
+修复后端到端实测：
+
+```
+sources      0.4s   events      5.8s   factors    24.3s
+ic          10.9s   sensitivity 12.5s   —— 全部返回真实数据
+```
+
+### 7. 安全相关：授权范围实测
 
 脚本请求 `quote:read accid:* trade:read`，服务端实际下发
 `quote:read quote:write trade:read **trade:write** accid:…`——**多授了交易写权限**。
