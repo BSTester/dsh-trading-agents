@@ -95,7 +95,8 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series"].includes(endpoint)) throw new Error("Unsupported workbench operation");
+      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation"].includes(endpoint))
+        throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
       return result.value;
@@ -263,6 +264,53 @@ window.__ModuleLoader__.load({
     }
 
     // ── 展示组件 ────────────────────────────────────────────────────────
+    /** 按需拉取只读端点：切换分类或刷新时取数，失败降级为可读错误。 */
+    function useEndpoint(rpc, endpoint, payload, deps) {
+      const [state, setState] = React.useState({ data: null, error: "", loading: true });
+      React.useEffect(() => {
+        let alive = true;
+        const controller = new AbortController();
+        setState((s) => ({ ...s, loading: true }));
+        request(rpc, endpoint, payload, controller.signal)
+          .then((value) => { if (alive) setState({ data: value, error: "", loading: false }); })
+          .catch((failure) => { if (alive) setState({ data: null, error: failure.message, loading: false }); });
+        return () => { alive = false; controller.abort(); };
+      }, deps);
+      return state;
+    }
+
+    function HeatmapChart({ tickers, matrix }) {
+      const ref = useCanvasChart((ctx, width, height, color) => {
+        if (!tickers || !matrix || matrix.length < 2) {
+          ctx.fillStyle = color.text; ctx.font = "12px sans-serif";
+          ctx.fillText("暂无相关性数据", 12, 22); return;
+        }
+        const padL = 62, padT = 24, padR = 10, padB = 10;
+        const cols = tickers.length;
+        const cell = Math.min((width - padL - padR) / cols, (height - padT - padB) / cols, 64);
+        ctx.font = "10px sans-serif";
+        tickers.forEach((t, i) => {
+          ctx.fillStyle = color.text;
+          ctx.fillText(String(t).slice(0, 8), 4, padT + cell * i + cell / 2 + 3);
+          ctx.fillText(String(t).slice(0, 8), padL + cell * i + 2, padT - 8);
+        });
+        matrix.forEach((row, i) => row.forEach((value, j) => {
+          const x = padL + cell * j, y = padT + cell * i;
+          if (value === null || value === undefined) {
+            ctx.fillStyle = color.grid; ctx.fillRect(x, y, cell - 2, cell - 2); return;
+          }
+          const strength = Math.min(Math.abs(value), 1);
+          ctx.fillStyle = value >= 0 ? color.up : color.down;
+          ctx.globalAlpha = 0.15 + strength * 0.75;
+          ctx.fillRect(x, y, cell - 2, cell - 2);
+          ctx.globalAlpha = 1;
+          ctx.fillStyle = strength > 0.55 ? "#fff" : color.text;
+          ctx.fillText(value.toFixed(2), x + 4, y + cell / 2 + 3);
+        }));
+      }, [tickers, matrix]);
+      return h("canvas", { ref, className: "tw-chart small" });
+    }
+
     function Card({ title, count, empty, children }) {
       return h("section", { className: "tw-card" },
         h("div", { className: "tw-card-head" }, title,
@@ -350,38 +398,77 @@ window.__ModuleLoader__.load({
         h("p", { className: "tw-hint" }, "工作台只展示结果；信号计算、回测与下单请在 Harness 会话中发起。"));
     }
 
-    function PortfolioView({ snapshot, series }) {
-      const broker = snapshot.broker;
-      const ledger = snapshot.previews.find((p) => p.kind === "ledger");
+    function PortfolioView({ rpc, snapshot, series }) {
+      const ledgerPreview = snapshot.previews.find((p) => p.kind === "ledger");
+      const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
+      const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
+      const rows = positions.data?.positions ?? [];
+      const points = equity.data?.points ?? [];
       return h(React.Fragment, null,
         h(Card, { title: "账户与权益" },
           h("div", { className: "tw-kv" },
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "账户模式"),
               h("div", { className: "tw-kv-v" }, snapshot.mode === "live" ? "实盘 LIVE" : "模拟盘 SIM")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "本地台账权益"),
-              h("div", { className: "tw-kv-v" }, ledger?.value?.equity?.toLocaleString?.() ?? "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "总收益"),
-              h("div", { className: "tw-kv-v" }, ledger?.value?.total_return !== undefined ? `${(ledger.value.total_return * 100).toFixed(2)}%` : "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "胜率 / 交易数"),
-              h("div", { className: "tw-kv-v" }, ledger?.value ? `${((ledger.value.win_rate ?? 0) * 100).toFixed(0)}% / ${ledger.value.trades ?? 0}` : "—"))),
-          h("p", { className: "tw-meta" }, ledger ? "来源：本地模拟台账（非券商资产）" : "尚未读取台账；请在 Harness 中调用 quant_report"),
-          broker && h("p", { className: "tw-meta" }, `最近券商响应：${broker.at}`)),
-        series && series.length > 1 && h(Card, { title: "价格序列（当前标的）" }, h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })),
-        h("p", { className: "tw-hint" }, "持仓与资金请用富途账户查询工具；本面板不提供下单入口。"));
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "现金"),
+              h("div", { className: "tw-kv-v" }, positions.data?.cash?.toLocaleString?.() ?? "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "持仓市值"),
+              h("div", { className: "tw-kv-v" }, positions.data?.market_value?.toLocaleString?.() ?? "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "总权益"),
+              h("div", { className: "tw-kv-v" }, positions.data?.equity?.toLocaleString?.() ?? "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "累计收益"),
+              h("div", { className: "tw-kv-v" }, equity.data?.total_return !== undefined ? `${(equity.data.total_return * 100).toFixed(2)}%` : "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交笔数"),
+              h("div", { className: "tw-kv-v" }, String(equity.data?.trades ?? positions.data?.trades ?? "—")))),
+          positions.error && h("p", { className: "tw-alert" }, `持仓读取失败：${positions.error}`),
+          h("p", { className: "tw-meta" }, "来源：本地模拟台账（非券商资产）；实盘持仓请用富途账户查询工具。")),
+        h(Card, { title: "权益曲线（按成交回放 + 日线盯市）",
+          empty: points.length > 1 ? undefined : (equity.loading ? "加载中…" : "暂无成交记录，无法回放权益曲线") },
+          h(LineChart, { points: points.map((p) => ({ v: p.equity })), label: equity.data?.note || "" }),
+          equity.data && h("p", { className: "tw-meta" },
+            `区间 ${points[0]?.t} → ${points[points.length - 1]?.t} · 最大回撤 ${(equity.data.max_drawdown * 100).toFixed(2)}% · 夏普 ${equity.data.sharpe}`)),
+        h(Card, { title: "持仓明细", count: rows.length,
+          empty: rows.length ? undefined : "当前无持仓" },
+          rows.length > 0 && h("div", { className: "tw-kv" }, rows.map((row) =>
+            h("div", { key: row.ticker, className: "tw-kv-item" },
+              h("div", { className: "tw-kv-k" }, `${row.ticker} · ${row.shares} 股 · 止损 ${row.stop ?? "—"}`),
+              h("div", { className: "tw-kv-v", style: { color: (row.pnl ?? 0) >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
+                `${row.price ?? "—"}（${row.pnl >= 0 ? "+" : ""}${row.pnl} / ${row.pnl_pct ?? "—"}%）`)))),
+          ledgerPreview && h("p", { className: "tw-meta" }, `最近台账预览：${ledgerPreview.at}`)),
+        series && series.length > 1 && h(Card, { title: "当前标的走势" },
+          h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })));
     }
 
-    function RiskView({ snapshot }) {
+    function RiskView({ rpc, snapshot }) {
       const latest = snapshot.previews.find((p) => p.kind === "backtest");
       const s = latest?.value?.summary;
+      const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
+      const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
+      const held = (positions.data?.positions ?? []).map((p) => p.ticker);
+      const basket = (held.length >= 2 ? held : ["600519", "000001", "601318", "600036"]).slice(0, 6);
+      const correlation = useEndpoint(rpc, "correlation", { tickers: basket, window: 120 },
+        [rpc, basket.join(",")]);
+      const ddPoints = (equity.data?.points ?? []).map((p) => ({ v: (p.dd ?? 0) * 100 }));
       return h(React.Fragment, null,
-        h(Card, { title: "回测风险指标（最近一次）",
-          empty: s ? undefined : "暂无回测结果。在 Harness 中请求“跑个回测”后显示。" },
-          s && h("div", { className: "tw-kv" },
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最大回撤"), h("div", { className: "tw-kv-v" }, `${(s.max_drawdown * 100).toFixed(2)}%`)),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "夏普"), h("div", { className: "tw-kv-v" }, String(s.sharpe))),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "年化"), h("div", { className: "tw-kv-v" }, `${(s.annualized * 100).toFixed(2)}%`)),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "样本数"), h("div", { className: "tw-kv-v" }, String(s.bars))))),
-        h("p", { className: "tw-hint" }, "相关性矩阵、VaR、敞口分析等依赖序列数据接入（QW-4）；当前仅展示已采集的回测风险指标。"));
+        h(Card, { title: "风险指标",
+          empty: (s || equity.data) ? undefined : "暂无风险数据" },
+          h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "最大回撤（台账回放）"),
+              h("div", { className: "tw-kv-v" }, equity.data ? `${(equity.data.max_drawdown * 100).toFixed(2)}%` : "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "夏普（台账回放）"),
+              h("div", { className: "tw-kv-v" }, equity.data ? String(equity.data.sharpe) : "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "回测最大回撤"),
+              h("div", { className: "tw-kv-v" }, s ? `${(s.max_drawdown * 100).toFixed(2)}%` : "—")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "回测夏普 / 年化"),
+              h("div", { className: "tw-kv-v" }, s ? `${s.sharpe} / ${(s.annualized * 100).toFixed(1)}%` : "—")))),
+        h(Card, { title: "回撤曲线（水下图，%）",
+          empty: ddPoints.length > 1 ? undefined : "需要成交记录才能回放回撤" },
+          h(LineChart, { points: ddPoints, label: "drawdown %" })),
+        h(Card, { title: "相关性矩阵（日收益，120 日）",
+          empty: (correlation.data?.tickers?.length ?? 0) >= 2 ? undefined
+            : (correlation.loading ? "加载中…" : (correlation.error || "标的不足")) },
+          correlation.data && h(HeatmapChart, { tickers: correlation.data.tickers, matrix: correlation.data.matrix }),
+          correlation.data && h("p", { className: "tw-meta" }, `窗口 ${correlation.data.window} 个共同交易日 · 截至 ${correlation.data.as_of}`)),
+        h("p", { className: "tw-hint" }, "持仓敞口与相关性均基于本地台账与公开日线；实盘口径请结合富途账户查询。"));
     }
 
     function ExecutionView({ snapshot }) {
@@ -481,8 +568,8 @@ window.__ModuleLoader__.load({
               !snapshot && h("p", { className: "tw-status" }, switching ? "正在切换模式…" : "正在读取工作台…"),
               tab === "market" && h(MarketView, { rpc, state: market, setState: setMarket }),
               snapshot && tab === "signal" && h(SignalView, { snapshot, series: market.bars }),
-              snapshot && tab === "portfolio" && h(PortfolioView, { snapshot, series: market.bars }),
-              snapshot && tab === "risk" && h(RiskView, { snapshot }),
+              snapshot && tab === "portfolio" && h(PortfolioView, { rpc, snapshot, series: market.bars }),
+              snapshot && tab === "risk" && h(RiskView, { rpc, snapshot }),
               snapshot && tab === "execution" && h(ExecutionView, { snapshot }),
               snapshot && tab === "research" && h(ResearchView, { snapshot }),
               tab === "events" && h(EventsView, null),
