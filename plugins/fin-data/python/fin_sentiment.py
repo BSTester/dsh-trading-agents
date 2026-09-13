@@ -53,7 +53,7 @@ def x_sentiment(query, count):
         return {"skipped": True, "reason": data.get("reason")}
     if data.get("error"):
         raise RuntimeError(data["error"][:80])
-    return {"skipped": False, "items": data.get("items", [])}
+    return {"skipped": False, "path": data.get("path"), "items": data.get("items", [])}
 
 
 def reddit_sentiment(query, count):
@@ -74,7 +74,7 @@ def reddit_sentiment(query, count):
         return {"skipped": True, "reason": data.get("reason")}
     if data.get("error"):
         raise RuntimeError(str(data.get("error"))[:90])
-    return {"skipped": False, "items": data.get("items", [])}
+    return {"skipped": False, "path": data.get("path"), "items": data.get("items", [])}
 
 
 def a_share_comment(ticker):
@@ -101,14 +101,16 @@ def main():
 
     try:
         result["x"] = x_sentiment(args.x_query or f"${args.ticker.split('.')[0]}", args.count)
-        result["sources_status"]["x"] = "skipped" if result["x"].get("skipped") else "ok"
+        result["sources_status"]["x"] = ("skipped" if result["x"].get("skipped")
+                                         else "ok:" + str(result["x"].get("path")))
     except Exception as e:
         result["x"] = None
         result["sources_status"]["x"] = f"fail: {str(e)[:80]}"
 
     try:
         result["reddit"] = reddit_sentiment(args.reddit_query or args.ticker, args.count)
-        result["sources_status"]["reddit"] = "skipped" if result["reddit"].get("skipped") else "ok"
+        result["sources_status"]["reddit"] = ("skipped" if result["reddit"].get("skipped")
+                                              else "ok:" + str(result["reddit"].get("path")))
     except Exception as e:
         result["reddit"] = None
         result["sources_status"]["reddit"] = f"fail: {str(e)[:80]}"

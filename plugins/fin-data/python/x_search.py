@@ -301,6 +301,24 @@ def main():
         print(json.dumps({"skip": True, "reason": "x.com 不可达，跳过 X 渠道"}))
         return 0
 
+    # ---- API 优先：走社区 XClientTransaction 生成反爬头，直接调 GraphQL ----
+    # 失败（未登录/风控/接口变更）自动降级到下面的 DOM 抓取，两条路径结果结构一致。
+    api_items = None
+    if not args.login:
+        try:
+            import x_api
+            api_items = x_api.search(args.query, args.count, live=args.live)
+        except Exception as e:
+            sys.stderr.write(f"[x_search] API 路径异常，降级 DOM：{str(e)[:160]}\n")
+            api_items = None
+        if api_items:
+            close_browser_if_we_launched_it()
+            close_by_port_best_effort()
+            print(json.dumps({"query": args.query, "count": len(api_items),
+                              "path": "api/graphql", "items": api_items},
+                             ensure_ascii=False, indent=1))
+            return 0
+
     try:
         if not ensure_browser():
             return 1
@@ -336,7 +354,8 @@ def main():
                 args.count,
             )
             close_scratch_pages(context)
-            print(json.dumps({"query": args.query, "count": len(items), "items": items},
+            print(json.dumps({"query": args.query, "count": len(items),
+                              "path": "web/dom", "items": items},
                              ensure_ascii=False, indent=1))
             return 0
     except Exception as e:

@@ -110,6 +110,19 @@ PowerShell 安装器，也未启动完整 Harness Web。后续券商模拟订单
 | 记忆复盘 | 旧工作区 memory 由 Harness skill 维护；工作台旧研报不自动变为复盘教训，不自动迁移旧全局 memory |
 | 审计保留 | 工作台各列表保留最近 100 项，不是完整审计档案；完整过程留在 Harness 会话 |
 
+### 社交渠道实测结论（X / Reddit）
+
+X 的 GraphQL 搜索此前 404，根因是缺反爬头 `x-client-transaction-id`，不是鉴权。采用社区实现
+`XClientTransaction`（PyPI 包，导入名 `x_client_transaction`）后打通：热启动约 3s、单次约 20 条，
+DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json`。
+
+两点必须在交接时说明：
+1. **queryId 不在首页 HTML 里**，要从 `client-web/main.*.js` 提取，否则解析必然失败；
+2. queryId 与混淆算法随 X 前端发版变化，属**已知脆弱点**；`x_api` 任一环节失败返回 `None`
+   并由 `x_search.py` 自动降级，因此渠道不会因上游变更整体不可用，但延迟会退化到 DOM 水平。
+
+脚本输出的 `path` 字段是判断本次走哪条路径的唯一依据，`sources_status` 会显示 `ok:api/graphql` 形式。
+
 ## 六、下一阶段优先级
 
 1. 在目标 Harness 上完成完整安装与新会话端到端验收，明确版本与平台。

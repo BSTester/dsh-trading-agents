@@ -98,6 +98,28 @@ Harness 会使用原生工具与子代理完成四位分析师报告、多空辩
 **工具响应不等于成交**，当前尚未接入券商实时成交推送。没有账户数据时显示未知，
 本地量化模拟资金也不会冒充富途账户余额。
 
+## 数据渠道优先级
+
+先富途 MCP，其余按需降级；社交舆情走 API，网页抓取仅作降级：
+
+| 优先级 | 渠道 | 路径 | 说明 |
+|---|---|---|---|
+| 1 | **富途 MCP** | 远程 MCP | 行情/K 线/财务/研报/交易，能取到的一律走这里 |
+| 2 | X（**必需**） | `api/graphql` | 社区 `x-client-transaction-id` 实现，热启动约 3s；DOM 抓取为降级 |
+| 3 | Reddit | `api/json` | 同源 `/search.json` 走登录态，结构化返回 |
+| 4 | AKShare | 本地库 | A 股日线/千股千评等补充 |
+| 5 | Yahoo / 网页搜索 | HTTP | 兜底 |
+
+X 与 Reddit 共用同一个专属浏览器登录态（`~/.dsh/x-profile`），**登录一次长期有效**：
+
+```bash
+python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/x_search.py --login
+```
+
+脚本输出的 `path` 字段标明本次实际路径（`api/graphql` / `api/json` / `web/dom`）。
+X 的前端 queryId 与混淆算法会随发版变化，`x_api` 任一环节失败即自动降级到 DOM 抓取，
+渠道不会整体不可用。详见 [docs/QUANT-WORKBENCH-PLAN.md](docs/QUANT-WORKBENCH-PLAN.md)。
+
 ## 获取富途 token（可选，推荐）——一条命令，弹出授权页
 
 没有 token 也能用——行情/新闻自动降级到 web 搜索；配了 token 才有富途的 K 线、财务、研报与交易工具。

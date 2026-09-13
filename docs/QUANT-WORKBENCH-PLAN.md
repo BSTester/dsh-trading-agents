@@ -227,6 +227,26 @@ python plugins/fin-data/python/reddit_search.py --login   # Reddit
 | 渠道 | 路径 | 结论 |
 |---|---|---|
 | **Reddit** | **API（同源 `/search.json`，走登录态）** | ✅ 采用。结构化返回（标题/子版/分数/评论数/时间），比 DOM 抓取快且字段完整 |
-| **X** | 网页 DOM 抓取 | ⚠️ 保留降级路径。同源 GraphQL 搜索被 X 的反爬头 `x-client-transaction-id` 拦截（HTTP 404，非鉴权问题），需逆向其混淆算法，脆弱性高，故不采用 |
+| **X** | **API（GraphQL `SearchTimeline` + 社区 `x-client-transaction-id` 实现）** | ✅ 已打通。DOM 抓取保留为降级路径 |
 
-脚本输出中的 `path` 字段会标明本次实际使用的路径（`api/json` 或 `web/dom`）。
+X 的 GraphQL 搜索此前返回 HTTP 404，原因不是鉴权缺失，而是缺少反爬头
+`x-client-transaction-id`——该值由客户端混淆算法现场生成。**不自行逆向**，直接采用社区实现
+[`XClientTransaction`](https://github.com/iSarabjitDhiman/XClientTransaction)（PyPI `XClientTransaction`，导入名
+`x_client_transaction`），实现见 `plugins/fin-data/python/x_api.py`：
+
+1. **cookie 获取**：通过 CDP 从已登录的专属浏览器取 `auth_token`/`ct0`（浏览器已完成解密，
+   我们不接触密文），缓存到 `~/.dsh/x-cookies.json`，有效期 3 天；
+2. **素材与 queryId**：抓 `x.com/home` → 从 `client-web/main.*.js` 里提取 `SearchTimeline` 的
+   `queryId`（**注意：queryId 不在首页 HTML 中**），连同 ondemand 脚本缓存到
+   `~/.dsh/x-client-material.json`，有效期 30 分钟；
+3. **请求**：`ClientTransaction.generate_transaction_id(method="GET", path=...)` 生成反爬头，
+   以固定 Bearer 直连 GraphQL，解析 `SearchTimeline` 时间线。
+
+实测：HTTP 200，冷启动约 8.5s（含开浏览器取 cookie），热启动约 3s，单次约 20 条推文；
+对照组 DOM 抓取约 40-50s。
+
+脚本输出中的 `path` 字段标明本次实际路径：`api/graphql`（X）、`api/json`（Reddit）、`web/dom`（降级）。
+`fin_sentiment` 的 `sources_status` 会显示为 `ok:api/graphql` 形式，便于确认是否走了 API。
+
+> 脆弱性提示：queryId 与混淆算法随 X 前端发版变更。x_api 任一环节失败即返回 `None`，
+> 由 `x_search.py` 自动降级到 DOM 抓取，因此渠道不会因上游变更而整体不可用。
