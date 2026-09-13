@@ -15,8 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bars import load_bars, to_futu_symbol  # noqa: E402
-from futu_client import FutuUnavailable, call_tool  # noqa: E402
+from trading_datasource.market import load_bars, to_futu_symbol  # noqa: E402
+from trading_datasource.futu_mcp import FutuUnavailable, call_tool  # noqa: E402
 
 FUTU_STOCK_URL = "https://www.futunn.com/stock/{code}-{market}"
 

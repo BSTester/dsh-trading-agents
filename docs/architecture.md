@@ -39,6 +39,7 @@ Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台嵌�
 | `plugins/workbench/src/store.js` | JSON 持久结果、原子替换、写锁、账户调用租约、模式隔离 |
 | `plugins/workbench/src/client.js` | Harness 原生 module factory，使用宿主 React；`shell.overlay` 面板及 `tool.call.toolview` 卡片 |
 | `plugins/engine/python` | 量化计算与本地模拟台账的权威实现 |
+| `plugins/datasource/python` | **统一数据层**：唯一的富途 MCP 客户端、行情路由与回测核心，被 engine/workbench 共同依赖（不是 Harness 插件） |
 
 `plugins/trading-agents` 是旧的未启用脚手架，不是当前执行引擎。
 workbench 包通过 `dsh.bundle.patch` 插入根级 Host 行；fin-data/engine 是普通插件包，
@@ -64,6 +65,29 @@ Host 校验会话归属、标的、模式、五档评级及来源。报告不会
 `quant_signal`、`quant_backtest`、`quant_report` 仅由 Harness 指令触发。
 结果保存到量化预览；工作台刷新只读取缓存，不自动重跑回测、不调 LLM、不下单。
 本地模拟台账与富途模拟账户、真实账户必须明确区分。
+
+### 统一数据层（研报与量化共用）
+
+研报路径与量化路径的**数据来源**本来就是同一套优先级（富途 MCP 优先，其余降级），
+但重构前**代码路径并不统一**：行情路由有 2 份实现、富途 MCP 客户端有 4 份、回测核心有 2 份。
+现在这些都收敛到 `plugins/datasource`：
+
+```text
+研报路径：Harness 会话 → mcp__futu__* 原生工具 ─┐
+                                            ├─→ 同一个富途远程 MCP 服务端
+量化路径：engine/workbench → trading_datasource.futu_mcp ─┘
+```
+
+- 行情（`market.load_bars`）与回测（`backtest`）在 engine 与 workbench 之间**只有一份实现**；
+- 新闻/情绪仍由 `fin-data` 独家提供，量化侧通过 `locate` 复用它，
+  因此两个路径的 `sources_status` 完全可比（如 `x: ok:api/graphql`）；
+- 量化侧的情绪是**可选并列输入**（`quant_signal(include_sentiment=true)`），
+  **不参与信号计算**——信号必须能由历史数据复现，否则回测结论不可验证；
+- 安装器把该包解到 `$DSH_HOME/trading-python/` 并写入 venv 的 `.pth`，
+  因此安装后无需 `PYTHONPATH`。
+
+渠道不可用时一律明确报「不可用」：`load_bars` 抛错、情绪返回 `available: false`、
+`locate` 返回 `None`。工作台因此宁可为空，也不显示占位数据。
 
 ## 交易动态与实时性
 

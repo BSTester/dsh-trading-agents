@@ -32,31 +32,9 @@ def age_text(path):
 
 
 def probe_futu_token():
-    """真正调一次 MCP initialize，判断 token 是否仍然有效。"""
-    token_path = DSH / "futu-token"
-    if not token_path.exists() or not token_path.read_text().strip():
-        return False, "未授权（无 token 文件）"
-    token = token_path.read_text().strip()
-    body = json.dumps({
-        "jsonrpc": "2.0", "id": 1, "method": "initialize",
-        "params": {"protocolVersion": "2025-03-26", "capabilities": {},
-                   "clientInfo": {"name": "workbench-sources", "version": "1"}},
-    }).encode()
-    request = urllib.request.Request("https://mcp.futunn.com/mcp", data=body, method="POST", headers={
-        "Content-Type": "application/json",
-        "Accept": "application/json, text/event-stream",
-        "Authorization": f"Bearer {token}",
-    })
-    try:
-        with urllib.request.urlopen(request, timeout=20) as response:
-            payload = response.read().decode()
-        if '"result"' in payload:
-            return True, "token 有效"
-        if "invalid_token" in payload or "401" in payload:
-            return False, "token 已过期或被吊销"
-        return False, payload[:120]
-    except Exception as error:
-        return None, f"探测失败：{str(error)[:100]}"  # None = 未知（网络问题），不误报过期
+    """真正调一次富途工具，判断通道是否可用（共享客户端实现，行为与取数一致）。"""
+    from trading_datasource import futu_mcp
+    return futu_mcp.probe(client_name="trading-datasource/sources-probe")
 
 
 def session_cookies(profile):

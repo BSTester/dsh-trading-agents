@@ -83,15 +83,20 @@ export function registerEngineTools(ctx, defineTool, quant = runQuant) {
   });
   register({
     name: "quant_signal",
-    description: "计算 A 股日线 RSI/双均线信号并保存到量化预览；仅预览，不下单。",
+    description: "计算 A 股日线 RSI/双均线信号并保存到量化预览；仅预览，不下单。"
+      + " include_sentiment 时附带情绪/舆情参考输入（与研报共用 fin-data 渠道，"
+      + " 只并列展示、不参与信号计算）。",
     parameters: {
       ticker: { type: "string", required: true },
       strategy: { type: "string", enum: ["rsi", "ma_cross"] },
+      include_sentiment: { type: "boolean" },
     },
     async execute(args, exec) {
       const mode = store.readMode();
-      const result = await quant("engine.py", ["signal", "--ticker", ticker(args.ticker),
-        "--strategy", strategy(args.strategy, "rsi")], exec.signal);
+      const argv = ["signal", "--ticker", ticker(args.ticker),
+        "--strategy", strategy(args.strategy, "rsi")];
+      if (args.include_sentiment === true) argv.push("--sentiment");
+      const result = await quant("engine.py", argv, exec.signal);
       store.recordPreview("signal", result, mode);
       return result;
     },

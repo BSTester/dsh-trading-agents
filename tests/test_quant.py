@@ -18,6 +18,9 @@ import numpy as np
 import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
+# 测试必须跑仓库里的统一数据层，而不是 ~/.dsh 下已安装的副本
+# （.pth 会让已安装副本可导入；这里把仓库版本插到最前，避免测到陈旧代码）。
+sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 PYTHON = ROOT / "plugins" / "engine" / "python"
 sys.path.insert(0, str(PYTHON))
 import backtest
@@ -298,7 +301,9 @@ class IsolatedLedger(unittest.TestCase):
                  "runpy.run_path(script,run_name='__main__')",
                  str(ROOT / "plugins" / package / "python" / "engine.py"),
                  "decide", "--ticker", "600519", "--apply"],
-                capture_output=True, text=True, env=os.environ.copy(), timeout=10,
+                capture_output=True, text=True,
+                env={**os.environ, "PYTHONPATH": str(ROOT / "plugins" / "datasource" / "python")},
+                timeout=10,
             )
             self.assertNotEqual(result.returncode, 0)
             self.assertIn("sim", result.stderr.lower())
@@ -420,14 +425,15 @@ class FactorValuationTests(unittest.TestCase):
         self.assertEqual(ranked[0]["ticker"], "A", "动量/趋势更优的 A 应排前")
 
 class BarsSymbolTests(unittest.TestCase):
-    """富途符号归一化（离线）。"""
+    """富途符号归一化（离线）—— 直接测统一数据层。"""
 
     def _load(self):
-        spec = importlib.util.spec_from_file_location(
-            "wb_bars", Path(__file__).resolve().parent.parent / "plugins" / "workbench" / "python" / "bars.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+        return self._data_layer()
+
+    def _data_layer(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins" / "datasource" / "python"))
+        from trading_datasource import market
+        return market
 
     def test_symbol_normalization(self):
         bars = self._load()
@@ -448,37 +454,35 @@ class BarsSymbolTests(unittest.TestCase):
 class UnifiedDataLayerTests(unittest.TestCase):
     """量化路径与工作台共用同一数据规则（富途优先，全市场）。"""
 
-    def _engine_module(self, name):
-        spec = importlib.util.spec_from_file_location(
-            name, Path(__file__).resolve().parent.parent / "plugins" / "engine" / "python" / f"{name}.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return module
+    def _shared(self):
+        sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "plugins" / "datasource" / "python"))
+        from trading_datasource import market
+        return market
 
-    def test_engine_market_data_symbol_normalization(self):
-        md = self._engine_module("market_data")
+    def test_shared_layer_symbol_normalization(self):
+        md = self._shared()
         cases = {"600519": "SH.600519", "000001": "SZ.000001", "00700.HK": "HK.00700",
                  "700": "HK.00700", "AAPL": "US.AAPL", "US.AAPL": "US.AAPL"}
         for raw, expected in cases.items():
             self.assertEqual(md.to_futu_symbol(raw), expected, raw)
 
-    def test_engine_supports_all_declared_periods(self):
-        md = self._engine_module("market_data")
+    def test_shared_layer_supports_all_declared_periods(self):
+        md = self._shared()
         for period in ("1m", "5m", "15m", "30m", "60m", "1d"):
             self.assertIn(period, md.PERIOD_TO_FUTU_KTYPE, period)
 
     def test_load_bars_rejects_unknown_period(self):
-        md = self._engine_module("market_data")
+        md = self._shared()
         with self.assertRaises(ValueError):
             md.load_bars("600519", "3s", 100)
 
     def test_backtest_auto_source_is_declared(self):
-        """两个包里的 backtest 都必须支持 auto（统一数据入口），避免路径不一致。"""
-        for package in ("engine", "workbench"):
-            path = Path(__file__).resolve().parent.parent / "plugins" / package / "python" / "backtest.py"
-            text = path.read_text(encoding="utf-8")
-            self.assertIn('source == "auto"', text, f"{package} backtest 缺少 auto 分支")
-            self.assertIn('default="auto"', text, f"{package} backtest 默认源不是 auto")
+        """回测实现只有一个，必须支持 auto（统一数据入口）。"""
+        path = (Path(__file__).resolve().parent.parent / "plugins" / "datasource"
+                / "python" / "trading_datasource" / "backtest.py")
+        text = path.read_text(encoding="utf-8")
+        self.assertIn('source == "auto"', text, "backtest 缺少 auto 分支")
+        self.assertIn('default="auto"', text, "backtest 默认源不是 auto")
 
     def test_engine_signal_uses_auto_source(self):
         path = Path(__file__).resolve().parent.parent / "plugins" / "engine" / "python" / "engine.py"

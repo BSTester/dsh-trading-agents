@@ -14,6 +14,14 @@ import tempfile
 
 
 PLUGINS = ("workbench", "fin-data", "engine")
+# 统一数据层：不是 Harness 插件（没有 cordis 行），只作为 python 库被各插件共用。
+LIBRARIES = ("datasource",)
+# 需要出现在"统一 python 目录"里、可被其他插件 import 或调用的包：
+#   datasource —— 被 engine/workbench 直接 import
+#   fin-data   —— 被量化侧以子进程调用（共用同一套新闻/情绪渠道）
+UNIFIED_PYTHON = ("datasource", "fin-data")
+UNIFIED_ROOT_NAME = "trading-python"
+DATA_LAYER_PTH_NAME = "dsh-trading-python.pth"
 PRESET_PACKAGES = {
     "fin-data": "@bstester/dsh-fin-data",
     "trading-engine": "@bstester/dsh-trading-engine",
@@ -108,6 +116,63 @@ def update_checkout(repo):
                 write_text(preset, activate_preset(updated))
 
 
+def unified_python_root(dsh_home):
+    return Path(dsh_home) / UNIFIED_ROOT_NAME
+
+
+def site_packages_dir(dsh_home):
+    """定位交易 venv 的 site-packages；venv 尚未创建时返回 None。"""
+    venv = Path(dsh_home) / "trading-venv"
+    for pattern in ("lib/python*/site-packages", "Lib/site-packages"):
+        for candidate in sorted(venv.glob(pattern)):
+            if candidate.is_dir():
+                return candidate
+    return None
+
+
+def extract_python(archive, plugin, dsh_home, expect):
+    """把包内 python/ 的内容解到 <DSH>/trading-python/<plugin>/。
+
+    这是**单一来源**：仓库里的 python 是唯一事实来源，此处是安装时生成的副本，
+    因此不存在人工同步导致的漂移（重装即刷新）。
+    """
+    import tarfile
+    destination = unified_python_root(dsh_home) / plugin
+    if destination.exists():
+        shutil.rmtree(destination)
+    destination.mkdir(parents=True)
+    with tarfile.open(archive, "r:gz") as tar:
+        members = [m for m in tar.getmembers() if m.name.startswith("package/python/")]
+        if not members:
+            raise ValueError(f"{plugin} 包内没有 python/ 目录")
+        for member in members:
+            member.name = "/".join(member.name.split("/")[2:])  # 去掉 package/python 前缀
+            if not member.name:
+                continue
+            tar.extract(member, destination, filter="data")
+    if not (destination / expect).exists():
+        raise ValueError(f"{plugin} 解包后缺少 {expect}")
+    return destination
+
+
+def write_data_layer_pth(dsh_home):
+    """向交易 venv 写入 .pth，让任何插件脚本都能直接 import trading_datasource。
+
+    返回 (site_packages, target) 或 None（venv 不存在时）。
+    """
+    target = unified_python_root(dsh_home) / "datasource"
+    if not (target / "trading_datasource").is_dir():
+        return None
+    site = site_packages_dir(dsh_home)
+    if site is None:
+        return None
+    path = site / DATA_LAYER_PTH_NAME
+    content = str(target) + "\n"
+    if not path.exists() or read_text(path) != content:
+        path.write_text(content, encoding="utf-8")
+    return site, target
+
+
 def install_plugins(repo, dsh_home):
     repo, dsh_home = Path(repo).resolve(), Path(dsh_home).expanduser().resolve()
     commands = {}
@@ -134,7 +199,8 @@ def install_plugins(repo, dsh_home):
     # pnpm records file: sources in package.json/lockfiles. Keep immutable,
     # content-addressed archives; deleting them breaks later plugin updates.
     with tempfile.TemporaryDirectory(dir=repo, prefix=".install-pack-") as staging:
-        for plugin in PLUGINS:
+        packed_archives = {}
+        for plugin in PLUGINS + LIBRARIES:
             result = subprocess.run(
                 [commands["npm"], "pack", "--json", "--pack-destination", staging],
                 cwd=repo / "plugins" / plugin, env=env, check=True,
@@ -156,19 +222,29 @@ def install_plugins(repo, dsh_home):
             else:
                 with archive.open("xb") as output:
                     output.write(content)
-            subprocess.run(commands["dsh"] + ["plugin", "--profile", "web", "add", str(archive)],
+            packed_archives[plugin] = archive
+        for plugin in PLUGINS:
+            subprocess.run(commands["dsh"] + ["plugin", "--profile", "web", "add",
+                                              str(packed_archives[plugin])],
                            cwd=repo, env=env, check=True)
+        # 统一数据层：解到 <DSH>/trading-python/，各插件在运行时按同一路径定位
+        for plugin in UNIFIED_PYTHON:
+            extract_python(packed_archives[plugin], plugin, dsh_home,
+                           "trading_datasource" if plugin == "datasource" else "fin_sentiment.py")
     if read_text(preset) != original:
         raise ValueError("Preset changed during installation; refusing to overwrite concurrent edits.")
     if enabled != original:
         write_text(preset, enabled)
+    if write_data_layer_pth(dsh_home) is None:
+        print("NOTE: trading venv not found yet; run `install_plugins.py link` after creating it "
+              "so plugins can import trading_datasource.")
     print("Installed web profile Host and plugins; fin-data/trading-engine enabled. "
           "Restart dsh web (npx @deepseek-ai/dsh web).")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "update"))
+    parser.add_argument("action", choices=("install", "update", "link"))
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--dsh-home", type=Path,
                         default=Path(os.environ.get("DSH_HOME", str(Path.home() / ".dsh"))))
@@ -176,6 +252,14 @@ def main():
     try:
         if args.action == "update":
             update_checkout(args.repo)
+        elif args.action == "link":
+            result = write_data_layer_pth(args.dsh_home)
+            if result is None:
+                print("Data layer not linked: run `install` first, and make sure the trading venv exists.",
+                      file=sys.stderr)
+                return 1
+            site, target = result
+            print(f"Linked data layer into {site} -> {target}")
         else:
             install_plugins(args.repo, args.dsh_home)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

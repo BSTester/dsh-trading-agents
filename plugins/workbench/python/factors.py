@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bars import load_bars  # noqa: E402
+from trading_datasource.market import load_bars  # noqa: E402
 
 FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
                "liq_ratio": 1, "mdd_60": 1,
@@ -94,8 +94,8 @@ def valuation_values(ticker):
 
     # ① 富途 MCP（优先通道）
     try:
-        from futu_client import call_tool  # 同目录共享客户端
-        from bars import to_futu_symbol
+        from trading_datasource.futu_mcp import call_tool  # 共享客户端
+        from trading_datasource.market import to_futu_symbol
         symbol = to_futu_symbol(ticker)
         for vt, key in ((1, "pe_ttm"), (2, "pb"), (3, "ps")):
             try:

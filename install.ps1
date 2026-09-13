@@ -66,6 +66,12 @@ if ($py) {
     Warn "未找到 python：AKShare（A股新闻舆情）与 X 渠道不可用，其余功能正常。"
 }
 
+# 数据层链接：venv 建好后写 .pth，让插件脚本能直接 import trading_datasource
+if (Test-Path $venvPython) {
+    & $python (Join-Path $presetDst "scripts\install_plugins.py") link --repo $presetDst --dsh-home $dshHome
+    if ($LASTEXITCODE -ne 0) { Warn "数据层链接失败：行情与回测工具可能不可用，可重跑 install.ps1" }
+}
+
 # 富途授权（token 已存在则跳过；过期时可用 --refresh 续期）
 $tokenFile = Join-Path $dshHome "futu-token"
 if (Test-Path $tokenFile) {

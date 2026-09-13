@@ -60,6 +60,12 @@ else
   warn "未找到 python3：AKShare（A股新闻舆情）与 X 渠道不可用，其余功能正常。"
 fi
 
+# 3.5 数据层链接：venv 建好后才写 .pth，让插件脚本能直接 import trading_datasource
+if [[ -x "$VENV/bin/python" ]]; then
+  "$PYTHON" "$PRESET_DST/scripts/install_plugins.py" link --repo "$PRESET_DST" --dsh-home "$DSH_HOME" \
+    || warn "数据层链接失败：行情与回测工具可能不可用，可重跑 install.sh"
+fi
+
 # 4. 富途授权（在安装阶段完成，确保第一次会话就能用全部工具）
 if [[ -s "$DSH_HOME/futu-token" ]]; then
   say "检测到已有富途 token，跳过授权（过期时可用 --refresh 续期）"

@@ -21,12 +21,8 @@ import sys
 from pathlib import Path
 from uuid import uuid4
 
-if __package__:
-    from .backtest import (load_data, validate_data, ma_cross_signal, rsi_signal,
-                           COMMISSION, SLIPPAGE, STAMP_TAX)
-else:
-    from backtest import (load_data, validate_data, ma_cross_signal, rsi_signal,
-                          COMMISSION, SLIPPAGE, STAMP_TAX)
+from trading_datasource.backtest import (  # noqa: E402  （唯一回测实现，见 plugins/datasource）
+    COMMISSION, SLIPPAGE, STAMP_TAX, load_data, ma_cross_signal, rsi_signal, validate_data)
 
 import risk_config  # noqa: E402  （风控参数单一事实来源）
 
@@ -132,7 +128,33 @@ def _save_ledger(mode, ledger):
             staging.unlink(missing_ok=True)
 
 
-def compute_signal(ticker, strategy, fast=5, slow=20, rsi_buy=25, rsi_sell=75):
+def read_sentiment(ticker, count=6):
+    """读取情绪/舆情（与研报共用同一套 fin-data 渠道）。
+
+    **只作为并列的参考输入返回，不参与信号计算** —— 信号必须可由历史数据复现，
+    否则回测结论无法验证。渠道不可用时返回 available=False，绝不用占位数据填充。
+    """
+    from trading_datasource.locate import find_script, run_script
+    if find_script("fin-data", "fin_sentiment.py") is None:
+        return {"available": False, "reason": "未安装 fin-data 渠道（重跑 install.sh 可修复）"}
+    query = "$" + str(ticker).split(".")[0].lstrip("$").upper()
+    payload = run_script("fin-data", "fin_sentiment.py",
+                         ["--ticker", str(ticker), "--x-query", query, "--count", str(count)])
+    if not isinstance(payload, dict):
+        return {"available": False, "reason": "情绪渠道未返回结果"}
+    def count_of(key):
+        section = payload.get(key) or {}
+        return len(section.get("items") or [])
+    return {"available": True,
+            "source": "fin-data/fin_sentiment.py",
+            "sources_status": payload.get("sources_status") or {},
+            "x_count": count_of("x"), "reddit_count": count_of("reddit"),
+            "a_share_comment": payload.get("a_share_comment"),
+            "note": "仅为参考输入，不参与信号计算，也不改变风控参数"}
+
+
+def compute_signal(ticker, strategy, fast=5, slow=20, rsi_buy=25, rsi_sell=75,
+                   include_sentiment=False):
     df = validate_data(load_data(ticker, "2023-01-01", "auto"))
     if strategy == "ma_cross":
         sig = ma_cross_signal(df, fast, slow)
@@ -152,8 +174,11 @@ def compute_signal(ticker, strategy, fast=5, slow=20, rsi_buy=25, rsi_sell=75):
     ], axis=1).max(axis=1)
     atr = float(true_range.tail(14).mean())
     label = "BUY" if last == 1 else ("SELL" if last == -1 else "HOLD")
-    return {"ticker": ticker, "strategy": strategy, "date": date, "price": price,
-            "signal": label, "atr": atr, "execution_source": EXECUTION_SOURCE}
+    result = {"ticker": ticker, "strategy": strategy, "date": date, "price": price,
+              "signal": label, "atr": atr, "execution_source": EXECUTION_SOURCE}
+    if include_sentiment:
+        result["sentiment"] = read_sentiment(ticker)
+    return result
 
 
 def decide(ticker, strategy, apply_fill=False, **kw):
@@ -317,6 +342,8 @@ def main():
         p.add_argument("--slow", type=int, default=20)
         p.add_argument("--rsi-buy", type=int, default=25)
         p.add_argument("--rsi-sell", type=int, default=75)
+        p.add_argument("--sentiment", action="store_true",
+                       help="附带情绪/舆情参考输入（走 fin-data，不参与信号计算）")
         if name == "decide":
             p.add_argument("--apply", action="store_true", help="把意图落到本地台账（闭环验证）")
     sub.add_parser("report")
@@ -324,7 +351,9 @@ def main():
 
     if args.cmd == "signal":
         print(json.dumps(compute_signal(args.ticker, args.strategy, args.fast, args.slow,
-                                        args.rsi_buy, args.rsi_sell), ensure_ascii=False, indent=1))
+                                        args.rsi_buy, args.rsi_sell,
+                                        include_sentiment=getattr(args, "sentiment", False)),
+                         ensure_ascii=False, indent=1))
     elif args.cmd == "decide":
         out = decide(args.ticker, args.strategy, args.apply, fast=args.fast, slow=args.slow,
                      rsi_buy=args.rsi_buy, rsi_sell=args.rsi_sell)

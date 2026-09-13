@@ -15,7 +15,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from backtest import load_data, ma_cross_signal, metrics, rsi_signal, run  # noqa: E402
+from trading_datasource.backtest import (  # noqa: E402
+    load_data, ma_cross_signal, metrics, rsi_signal, run)
 
 METRICS = ("total_return", "annualized", "sharpe", "max_drawdown", "win_rate")
 

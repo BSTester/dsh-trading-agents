@@ -4,6 +4,7 @@ import os
 from pathlib import Path
 import subprocess
 import tempfile
+import re
 import unittest
 from unittest.mock import patch
 
@@ -23,6 +24,27 @@ PRESET = """# keep comments and unrelated disabled rows
   name: '@bstester/dsh-trading-engine'
   disabled: true
 """
+
+
+PACKAGE_PYTHON = {
+    "datasource": ["python/trading_datasource/__init__.py", "python/trading_datasource/market.py"],
+    "fin-data": ["python/fin_sentiment.py"],
+    "engine": ["python/engine.py"],
+    "workbench": ["python/bars.py"],
+}
+
+
+def write_tarball(path, plugin):
+    """写一个真实的 tar.gz，结构等同于 npm pack 的 package/ 布局。"""
+    import io
+    import tarfile
+
+    with tarfile.open(path, "w:gz") as tar:
+        for member in PACKAGE_PYTHON[plugin]:
+            payload = ("VALUE = %r\n" % member).encode()
+            info = tarfile.TarInfo("package/" + member)
+            info.size = len(payload)
+            tar.addfile(info, io.BytesIO(payload))
 
 
 class InstallerTests(unittest.TestCase):
@@ -78,7 +100,7 @@ class InstallerTests(unittest.TestCase):
                 if fail == "pack":
                     raise subprocess.CalledProcessError(5, args)
                 filename = name + "-0.2.0.tgz"
-                (destination / filename).write_bytes(name.encode())
+                write_tarball(destination / filename, name)
                 return subprocess.CompletedProcess(args, 0, json.dumps([{"filename": filename}]))
             self.assertEqual(args[:5], ["dsh", "plugin", "--profile", "web", "add"])
             archive = Path(args[5])
@@ -97,12 +119,66 @@ class InstallerTests(unittest.TestCase):
                 patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
             self.installer.install_plugins(self.repo, self.home)
             self.installer.install_plugins(self.repo, self.home)
-        self.assertEqual([path.read_bytes().decode() for path in self.added],
-                         ["workbench", "fin-data", "engine"] * 2)
+        # 归档是内容寻址的 <plugin>-<sha256>.tgz；按文件名还原插件顺序
+        names = [re.fullmatch(r"([a-z-]+)-[0-9a-f]{64}\.tgz", path.name).group(1)
+                 for path in self.added]
+        self.assertEqual(names, ["workbench", "fin-data", "engine"] * 2)
         self.assertTrue(all(not path.exists() for path in self.packed))
-        self.assertEqual(len(list((self.home / "trading-plugin-packages").glob("*.tgz"))), 3)
+        self.assertEqual(len(list((self.home / "trading-plugin-packages").glob("*.tgz"))), 4)
         self.assertEqual((self.repo / "agent.cordis.yml").read_text(),
                          self.installer.activate_preset(PRESET))
+
+    def test_data_layer_is_extracted_to_unified_tree(self):
+        """统一数据层必须解到 <DSH>/trading-python/，供各插件按同一路径定位。"""
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        root = self.home / "trading-python"
+        self.assertTrue((root / "datasource" / "trading_datasource" / "market.py").is_file())
+        self.assertTrue((root / "fin-data" / "fin_sentiment.py").is_file())
+        # 未被跨包引用的插件不必进统一目录
+        self.assertFalse((root / "engine").exists())
+
+    def test_data_layer_is_not_installed_as_a_plugin(self):
+        """datasource 是库不是 Harness 插件，不能被 dsh plugin add。"""
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        self.assertEqual(len(self.added), 3)
+
+    def test_reinstall_refreshes_unified_tree(self):
+        """重装即刷新，因此统一目录不可能与仓库版本漂移。"""
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        stale = self.home / "trading-python" / "datasource" / "stale.py"
+        stale.write_text("old")
+        self.installer.write_data_layer_pth  # 触碰以确保模块属性存在
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        self.assertFalse(stale.exists(), "重装必须清掉统一目录里的陈旧文件")
+
+    def test_link_writes_pth_into_trading_venv(self):
+        """venv 建好后才写 .pth；路径指向统一目录里的 datasource。"""
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        site = self.home / "trading-venv" / "lib" / "python3.13" / "site-packages"
+        site.mkdir(parents=True)
+        result = self.installer.write_data_layer_pth(self.home)
+        self.assertIsNotNone(result)
+        pth = site / "dsh-trading-python.pth"
+        self.assertTrue(pth.is_file())
+        self.assertEqual(pth.read_text().strip(),
+                         str(self.home / "trading-python" / "datasource"))
+
+    def test_link_returns_none_without_venv(self):
+        """venv 不存在时返回 None，由安装脚本提示重试，而不是写入错误路径。"""
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        self.assertIsNone(self.installer.write_data_layer_pth(self.home))
 
     def test_required_command_failures_keep_preset_disabled_and_clean_staging(self):
         for failure in ("pack", "add"):

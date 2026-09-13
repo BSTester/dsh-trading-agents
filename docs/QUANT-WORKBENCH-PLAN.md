@@ -170,20 +170,37 @@
 
 **端到端验证（真实数据，本轮实测）**：series/equity/positions/correlation/sensitivity/risk/trades/events/factors/ic 全部返回有效结果。
 
-## 八、统一数据层（重要）
+## 八、统一数据层（已实施）
 
-三条路径**共用同一行情规则**：富途 MCP 优先（全市场、分钟/日线 + 盘口/财务/资讯），
-A股长历史（>370 根）回退新浪源；资讯/情绪由 fin-data 插件负责（富途公开快讯 / AKShare / Yahoo RSS / X）。
+三条路径**共用同一份实现**：`plugins/datasource`（`@bstester/dsh-datasource`）持有唯一的
+富途 MCP 客户端、行情路由与回测核心。富途 MCP 优先（全市场、分钟/日线 + 盘口/财务/资讯），
+A股长历史（>370 根）回退新浪源；资讯/情绪仍由 fin-data 独家负责。
 
 | 路径 | 代码入口 | 数据来源 | 覆盖市场 |
 |---|---|---|---|
 | 研报（Harness 会话） | `mcp__futu__*` 工具 + `fin_news`/`fin_sentiment` | 富途 MCP + fin-data | 全市场 |
-| 量化（引擎工具） | `engine.py` / `backtest.py` → `market_data.load_bars` | 富途优先 → 新浪 | **全市场（本轮统一）** |
-| 工作台图表 | `bars.py` → `load_bars` | 富途优先 → 新浪 | 全市场 |
+| 量化（引擎工具） | `engine.py` / `backtest.py` → `trading_datasource.market.load_bars` | 富途优先 → 新浪 | 全市场 |
+| 工作台图表 | `bars.py` → `trading_datasource.market.load_bars` | 富途优先 → 新浪 | 全市场 |
+| 量化侧情绪（可选） | `engine.py --sentiment` → `locate.run_script("fin-data", ...)` | fin-data（X/Reddit/AKShare） | 全市场 |
 
-> 两个插件包各自独立，`plugins/engine/python/market_data.py` 与
-> `plugins/workbench/python/bars.py` 的路由规则保持一致，修改任一处需同步另一处
-> （已有测试断言两侧都支持 `auto` 源）。
+**为什么合并**：同一件事此前有多份实现——行情路由 2 份（`workbench/bars.py` 与
+`engine/market_data.py`，91 行逐字相同）、富途 MCP 客户端 4 份、回测核心 2 份
+（278 行仅差一行 import）。危害不是重复代码，而是**修一处漏一处**：富途 K 线
+`internal error` 排查时根因是参数名写错，只有一份实现所以改一次就好；
+同样的问题若发生在 `fetch_futu` 上要改三处，漏掉的那处会安静地继续坏着。
+
+`market_data.py`、`futu_client.py`、`workbench/backtest.py` 已删除，
+`backtest.py` 与 `bars.py` 降为薄入口，净删约 700 行。
+
+**安装后如何被找到**：安装器把该包的 `python/` 解到 `$DSH_HOME/trading-python/datasource/`，
+并向交易 venv 写 `dsh-trading-python.pth`，因此插件脚本直接 `import trading_datasource` 即可，
+无需 `PYTHONPATH`。该目录是安装时生成的副本，仓库版本是唯一事实来源，重装即刷新。
+包刻意**不 eager 导入**子模块——`import trading_datasource` 不拉起 `urllib`/`ssl`，
+纯本地路径不为网络栈付代价，也不会在禁网沙箱里失败。
+
+**量化侧的情绪是可选并列输入**：`quant_signal(include_sentiment=true)` 返回 `sentiment`
+字段，但**不参与信号计算、不改风控参数**。信号必须能由历史数据复现，否则回测结论无法验证；
+测试中有性质断言锁住「带不带情绪，`signal`/`price`/`atr` 必须完全一致」。
 
 ## 九、数据渠道优先级（用户约定）
 

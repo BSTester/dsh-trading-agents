@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """量化回测引擎 —— 历史K线 + 策略 + 绩效指标（含成本建模）。
 
+本模块是**唯一**的回测实现，由 engine 与 workbench 共同使用（此前两个插件各有一份 278 行副本，
+仅差一行 import，长期有漂移风险）。
+
 策略：
   ma_cross   双均线金叉/死叉（快线上穿慢线买入，下穿卖出）
   rsi        RSI 均值回归（超卖买入、超买卖出）
@@ -61,7 +64,7 @@ def load_data(ticker, start, source):
         # 统一行情入口：富途优先（全市场），A股长历史回退新浪。
         import pandas as pd
         from datetime import date as _date
-        from bars import load_bars
+        from .market import load_bars
         needed = max(120, int((_date.today() - _date.fromisoformat(start)).days * 0.72) + 40)
         bars, _source, _stale = load_bars(ticker, "1d", min(needed, 900))
         frame = pd.DataFrame([{"date": b["t"], "open": b["o"], "high": b["h"],

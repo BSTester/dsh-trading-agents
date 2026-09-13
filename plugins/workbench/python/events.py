@@ -30,8 +30,8 @@ def parse_date(value):
 
 def futu_dividends(ticker):
     """富途分红/除权除息（全市场，主通道）。"""
-    from bars import to_futu_symbol
-    from futu_client import FutuUnavailable, call_tool
+    from trading_datasource.market import to_futu_symbol
+    from trading_datasource.futu_mcp import FutuUnavailable, call_tool
     data = call_tool("quote_corporate_actions_dividends", {"symbol": to_futu_symbol(ticker)})
     rows = []
     for item in data.get("dividend_list") or []:
@@ -50,7 +50,7 @@ def futu_dividends(ticker):
 
 def futu_economic_calendar():
     """富途经济日历（best-effort；无数据时返回空列表，不报错）。"""
-    from futu_client import FutuUnavailable, call_tool
+    from trading_datasource.futu_mcp import FutuUnavailable, call_tool
     try:
         data = call_tool("quote_economic_calendar_hot", {"date": date.today().strftime("%Y%m%d")})
     except FutuUnavailable:

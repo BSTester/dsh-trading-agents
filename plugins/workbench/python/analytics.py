@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bars import load_bars  # noqa: E402
+from trading_datasource.market import load_bars  # noqa: E402
 
 DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
 LEDGER = DSH / "quant-ledger.json"

@@ -120,6 +120,14 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/x_search.py --login
 X 的前端 queryId 与混淆算法会随发版变化，`x_api` 任一环节失败即自动降级到 DOM 抓取，
 渠道不会整体不可用。详见 [docs/QUANT-WORKBENCH-PLAN.md](docs/QUANT-WORKBENCH-PLAN.md)。
 
+**研报与量化共用同一套取数实现。** 行情路由、富途 MCP 客户端与回测核心都只有一份，
+放在 `plugins/datasource`（`@bstester/dsh-datasource`）；安装器会把它解到
+`$DSH_HOME/trading-python/` 并向交易 venv 写入 `.pth`，所以任何插件脚本都能直接
+`from trading_datasource.market import load_bars`，无需设置 `PYTHONPATH`。
+量化侧可选地复用 fin-data 的情绪渠道（`quant_signal(include_sentiment=true)`），
+但情绪**只是并列参考输入，不参与信号计算**——否则回测结论无法复现。
+详见 [plugins/datasource/README.md](plugins/datasource/README.md)。
+
 ## 获取富途 token（可选，推荐）——一条命令，弹出授权页
 
 没有 token 也能用——行情/新闻自动降级到 web 搜索；配了 token 才有富途的 K 线、财务、研报与交易工具。
@@ -163,6 +171,7 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # �
 ├── agent.cordis.yml       # 对话模式组合：persona + 工具 + 富途 MCP 桥
 ├── preset.yml             # 模式元数据（名称/介绍）
 ├── skills/trading-agents/ # Harness 十二角色、六阶段工作流
+├── plugins/datasource/   # 统一数据层（库，非插件）：唯一 MCP 客户端/行情路由/回测核心
 ├── plugins/engine/       # 研究记录/发布、量化工具、账户策略；含 Python 量化实现
 ├── plugins/fin-data/     # 统一新闻与舆情工具
 ├── plugins/workbench/    # Host 状态服务 + Harness Client 面板与卡片
