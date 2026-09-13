@@ -14,6 +14,23 @@ import sys
 from pathlib import Path
 
 
+def release_browser():
+    """释放子脚本留存的浏览器（避免窗口/进程堆积）。"""
+    here = Path(__file__).resolve().parent
+    cleanup = (
+        "import sys; sys.path.insert(0, r'%s');"
+        "from x_search import close_browser_if_we_launched_it, close_by_port_best_effort;"
+        "close_browser_if_we_launched_it(); close_by_port_best_effort()" % here
+    )
+    venv_py = Path(os.environ.get("DSH_HOME", Path.home() / ".dsh")) / "trading-venv"
+    py = venv_py / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
+    exe = [str(py)] if py.exists() else [sys.executable]
+    try:
+        subprocess.run(exe + ["-c", cleanup], capture_output=True, text=True, timeout=30)
+    except Exception:
+        pass
+
+
 def is_a_share(ticker):
     return bool(re.fullmatch(r"\d{6}", ticker.split(".")[0]))
 
@@ -27,8 +44,9 @@ def x_sentiment(query, count):
     venv_py = Path(os.environ.get("DSH_HOME", Path.home() / ".dsh")) / "trading-venv"
     py = venv_py / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     exe = [str(py)] if py.exists() else [sys.executable]
+    env = {**os.environ, "SOCIAL_BROWSER_PERSIST": "1"}  # 复用浏览器，最后由本进程统一关闭
     out = subprocess.run(exe + [str(script), query, "--live", "--count", str(count)],
-                         capture_output=True, text=True, timeout=180)
+                         capture_output=True, text=True, timeout=180, env=env)
     stdout = out.stdout
     data = json.loads(stdout[stdout.index("{"):]) if "{" in stdout else {}
     if data.get("skip"):
@@ -47,8 +65,9 @@ def reddit_sentiment(query, count):
     venv_py = Path(os.environ.get("DSH_HOME", Path.home() / ".dsh")) / "trading-venv"
     py = venv_py / ("Scripts/python.exe" if sys.platform == "win32" else "bin/python")
     exe = [str(py)] if py.exists() else [sys.executable]
+    env = {**os.environ, "SOCIAL_BROWSER_PERSIST": "1"}  # 与 X 复用同一浏览器
     out = subprocess.run(exe + [str(script), query, "--count", str(count)],
-                         capture_output=True, text=True, timeout=180)
+                         capture_output=True, text=True, timeout=180, env=env)
     stdout = out.stdout
     data = json.loads(stdout[stdout.index("{"):]) if "{" in stdout else {}
     if data.get("skip"):
@@ -101,6 +120,7 @@ def main():
         except Exception as e:
             result["sources_status"]["akshare"] = f"fail: {str(e)[:80]}"
 
+    release_browser()
     print(json.dumps(result, ensure_ascii=False, indent=1))
     return 0
 

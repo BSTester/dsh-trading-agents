@@ -116,6 +116,70 @@ def terminate_pid(pid):
         pass
 
 
+# ── 标签页复用（只操作带我方标记的标签，绝不触碰用户自己的标签）────────────────
+SCRATCH_MARK = "dsh_scratch=1"
+SCRATCH_BASE = "https://x.com/?dsh_scratch=1"
+
+
+def browser_persist_requested():
+    """父进程（fin_sentiment）要求保留浏览器以复用；任务结束后由父进程统一关闭。"""
+    return os.environ.get("SOCIAL_BROWSER_PERSIST") == "1"
+
+
+def terminate_browser_for_retry():
+    """关闭**自有**浏览器实例并清理锁（不触碰用户自己的浏览器）。"""
+    close_browser_if_we_launched_it()
+    close_by_port_best_effort()
+    clear_stale_profile_locks()
+    time.sleep(1)
+
+
+def connect_browser(pw, timeout_ms=20000, retries=3):
+    """连接 CDP：短超时 + 有界重试。
+
+    关键：连接失败但端口仍活着时**只等待重试，绝不杀浏览器**——早期实现在这里误杀
+    正在初始化的浏览器，导致第二次连接必然 ECONNREFUSED。只有端口确认已死才重建。
+    """
+    last = None
+    for _ in range(retries + 1):
+        try:
+            return pw.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}", timeout=timeout_ms)
+        except Exception as error:  # noqa: BLE001
+            last = error
+            if debug_port_alive():
+                time.sleep(2)
+                continue
+            terminate_browser_for_retry()
+            if not ensure_browser():
+                break
+    raise RuntimeError(f"CDP 连接失败：{str(last)[:120]}")
+
+
+def acquire_scratch_page(context, base_url):
+    """复用已有标记标签，没有才新建。"""
+    for page in list(context.pages):
+        try:
+            if SCRATCH_MARK in (page.url or ""):
+                page.goto(base_url, timeout=45000, wait_until="domcontentloaded")
+                return page
+        except Exception:
+            continue
+    page = context.new_page()
+    page.goto(base_url, timeout=45000, wait_until="domcontentloaded")
+    return page
+
+
+def close_scratch_pages(context):
+    """关闭我方标记标签，及时释放资源（不动用户标签）。"""
+    for page in list(context.pages):
+        try:
+            if SCRATCH_MARK in (page.url or ""):
+                page.close()
+        except Exception:
+            pass
+
+
+
 def ensure_browser():
     if debug_port_alive():
         return True
@@ -129,6 +193,8 @@ def ensure_browser():
     proc = subprocess.Popen(
         [exe, f"--remote-debugging-port={DEBUG_PORT}",
          f"--user-data-dir={PROFILE_DIR}", "--restore-last-session=false",
+         # 容器/受限环境必需：否则 Chromium 会启动但 CDP 无响应（表现为连接超时）
+         "--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu",
          "about:blank"],
         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
     )
@@ -160,26 +226,44 @@ def close_browser_if_we_launched_it():
         pass
 
 
-def close_by_port_best_effort():
-    """兜底：关闭仍占用调试端口的浏览器进程（处理历史遗留实例）。"""
+def close_by_port_best_effort(force=False):
+    """关闭调试端口上的浏览器。
+
+    默认**只关闭由本脚本启动的实例**（依据 pid 文件），不误杀用户自己的浏览器——
+    早期实现按端口无条件清理，导致每次查询都冷启动、反复开窗。
+    force=True（CLI --force-clean）时按端口强制清理。
+    """
     import signal
-    try:
-        if sys.platform == "win32":
-            out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True).stdout
-            pids = {line.split()[-1] for line in out.splitlines()
-                    if f":{DEBUG_PORT}" in line and "LISTENING" in line.upper()}
-            for pid in pids:
-                subprocess.run(["taskkill", "/PID", pid, "/T", "/F"], capture_output=True)
-        else:
-            out = subprocess.run(["fuser", f"{DEBUG_PORT}/tcp"], capture_output=True, text=True).stdout
-            for pid in out.split():
-                try:
-                    terminate_pid(int(pid))
-                except ValueError:
-                    pass
-            clear_stale_profile_locks()
-    except Exception:
-        pass
+    pid_file = DSH_HOME / "x-chrome.pid"
+    pids = set()
+    if pid_file.exists():
+        try:
+            pids.add(int(pid_file.read_text().strip()))
+        except (ValueError, OSError):
+            pass
+    if force:
+        try:
+            if sys.platform == "win32":
+                out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True).stdout
+                pids |= {line.split()[-1] for line in out.splitlines()
+                         if f":{DEBUG_PORT}" in line and "LISTENING" in line.upper()}
+            else:
+                out = subprocess.run(["fuser", f"{DEBUG_PORT}/tcp"], capture_output=True, text=True).stdout
+                pids |= {p for p in out.split() if p.isdigit()}
+        except Exception:
+            pass
+    for value in pids:
+        try:
+            if sys.platform == "win32":
+                subprocess.run(["taskkill", "/PID", str(value), "/T", "/F"], capture_output=True)
+            else:
+                os.kill(int(value), signal.SIGTERM)
+        except (ValueError, ProcessLookupError, PermissionError, OSError):
+            pass
+    if pids:
+        time.sleep(1.5)
+        clear_stale_profile_locks()
+    pid_file.unlink(missing_ok=True)
 
 
 def x_reachable(timeout=3):
@@ -199,6 +283,7 @@ def main():
     ap.add_argument("--live", action="store_true", help="按最新排序（默认热门）")
     ap.add_argument("--login", action="store_true", help="首次登录：打开 x.com 让用户登录，登录态持久保存")
     ap.add_argument("--keep-browser", action="store_true", help="完成后保持浏览器打开（默认自动关闭）")
+    ap.add_argument("--force-clean", action="store_true", help="强制清理占用调试端口的浏览器")
     args = ap.parse_args()
 
     try:
@@ -206,6 +291,11 @@ def main():
     except ImportError:
         print(json.dumps({"error": "缺少 playwright 库", "fix": "pip install playwright"}))
         return 1
+
+    if getattr(args, "force_clean", False):
+        close_by_port_best_effort(force=True)
+        print(json.dumps({"status": "已强制清理调试端口上的浏览器"}, ensure_ascii=False))
+        return 0
 
     if not x_reachable():
         print(json.dumps({"skip": True, "reason": "x.com 不可达，跳过 X 渠道"}))
@@ -220,9 +310,9 @@ def main():
             + ("&f=live" if args.live else ""))
 
         with sync_playwright() as pw:
-            browser = pw.chromium.connect_over_cdp(f"http://127.0.0.1:{DEBUG_PORT}")
+            browser = connect_browser(pw)
             context = browser.contexts[0]
-            page = context.new_page()
+            page = acquire_scratch_page(context, SCRATCH_BASE)
             page.goto(url, timeout=45000, wait_until="domcontentloaded")
 
             if args.login:
@@ -231,7 +321,7 @@ def main():
                 page.wait_for_url("**/home**", timeout=300000)
                 print(json.dumps({"status": "登录成功，登录态已保存到专属配置，下次直接搜索即可"},
                                  ensure_ascii=False))
-                page.close()
+                close_scratch_pages(context)
                 return 0
 
             page.wait_for_selector("article", timeout=30000, state="attached")
@@ -245,7 +335,7 @@ def main():
                    })""",
                 args.count,
             )
-            page.close()
+            close_scratch_pages(context)
             print(json.dumps({"query": args.query, "count": len(items), "items": items},
                              ensure_ascii=False, indent=1))
             return 0
