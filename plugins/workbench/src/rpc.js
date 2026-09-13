@@ -118,7 +118,8 @@ export function createRpcHandler(store, deps = {}) {
         }
         try {
           return await cached(endpoint, payload, forceRefresh,
-            () => provider[endpoint](payload), "trading/analytics-unavailable");
+            () => provider[endpoint](payload, { refresh: forceRefresh === true }),
+            "trading/analytics-unavailable");
         } catch (error) {
           return { ok: false, error: { code: "trading/analytics-unavailable",
             message: String(error?.message ?? error).slice(0, 300), details: {} } };
@@ -156,7 +157,8 @@ export function createRpcHandler(store, deps = {}) {
         }
         try {
           return await cached(endpoint, payload, forceRefresh,
-            () => provider[endpoint](payload), "trading/analytics-unavailable");
+            () => provider[endpoint](payload, { refresh: forceRefresh === true }),
+            "trading/analytics-unavailable");
         } catch (error) {
           return { ok: false, error: { code: "trading/analytics-unavailable",
             message: String(error?.message ?? error).slice(0, 300), details: {} } };

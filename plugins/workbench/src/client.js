@@ -486,42 +486,63 @@ window.__ModuleLoader__.load({
         h("p", { className: "tw-hint" }, "工作台只展示结果；信号计算、回测与下单请在 Harness 会话中发起。"));
     }
 
+    /** 一行券商持仓。 */
+    function BrokerPositionRow({ row }) {
+      const pnl = row.pl_val ?? 0;
+      return h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" }, `${row.symbol || "—"} ${row.name}`),
+        h("div", { className: "tw-kv-v", style: { color: pnl >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
+          `${row.qty ?? "—"} 股 · 成本 ${row.cost_price ?? "—"} → 现价 ${row.price ?? "—"}`
+          + ` · 市值 ${row.market_value ?? "—"}（${pnl >= 0 ? "+" : ""}${row.pl_val ?? "—"} / ${row.pl_ratio ?? "—"}%）`));
+    }
+
+    /** 券商真实持仓：按账户分组，从不跨账户/币种合并。 */
     function PortfolioView({ rpc, snapshot }) {
       const ledgerPreview = snapshot.previews.find((p) => p.kind === "ledger");
-      const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
+      const broker = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
       const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
-      const rows = positions.data?.positions ?? [];
+      const groups = broker.data?.groups ?? [];
+      const counts = broker.data?.counts ?? {};
       const points = equity.data?.points ?? [];
+
+      const accountCard = (group) => h(Card, {
+        key: group.acc_id,
+        title: group.kind === "real" ? group.account : `${group.account}（模拟）`,
+        count: group.positions.length,
+      },
+        h(Paged, { items: group.positions, pageSize: 8,
+          render: (row) => h(BrokerPositionRow, { key: `${group.acc_id}-${row.symbol}`, row }) }),
+        h("p", { className: "tw-meta" },
+          group.subtotals
+            ? `小计（按币种分开）：${group.subtotals.map((s) => `${s.currency} 市值 ${s.market_value} / 盈亏 ${s.pl_val}`).join(" · ")}`
+            : `小计：市值 ${group.market_value ?? "—"} · 盈亏 ${group.pl_val ?? "—"}`));
+
       return h(React.Fragment, null,
-        h(Card, { title: "账户与权益" },
-          h("div", { className: "tw-kv" },
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "账户模式"),
-              h("div", { className: "tw-kv-v" }, snapshot.mode === "live" ? "实盘 LIVE" : "模拟盘 SIM")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "现金"),
-              h("div", { className: "tw-kv-v" }, positions.data?.cash?.toLocaleString?.() ?? "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "持仓市值"),
-              h("div", { className: "tw-kv-v" }, positions.data?.market_value?.toLocaleString?.() ?? "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "总权益"),
-              h("div", { className: "tw-kv-v" }, positions.data?.equity?.toLocaleString?.() ?? "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "累计收益"),
-              h("div", { className: "tw-kv-v" }, equity.data?.total_return !== undefined ? `${(equity.data.total_return * 100).toFixed(2)}%` : "—")),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交笔数"),
-              h("div", { className: "tw-kv-v" }, String(equity.data?.trades ?? positions.data?.trades ?? "—")))),
-          positions.error && h("p", { className: "tw-alert" }, `持仓读取失败：${positions.error}`),
-          h("p", { className: "tw-meta" }, "来源：本地模拟台账（非券商资产）；实盘持仓请用富途账户查询工具。")),
-        h(Card, { title: "权益曲线（按成交回放 + 日线盯市）",
-          empty: points.length > 1 ? undefined : (equity.loading ? "加载中…" : "暂无成交记录，无法回放权益曲线") },
+        h(Card, { title: "券商持仓（富途真实数据）", count: counts.positions ?? 0,
+          empty: broker.loading ? "读取中…" : (broker.error || "当前账户无持仓") },
+          h("p", { className: "tw-meta" },
+            `${snapshot.mode === "live" ? "实盘" : "模拟盘"} · 数据源 ${broker.data?.source ?? "—"}`
+            + ` · 取数于 ${broker.data?.as_of ?? "—"}`
+            + (broker.data?.cached ? "（本地缓存）" : "")
+            + (broker.data?.stale ? " ⚠ 实时读取失败，展示上次缓存" : "")
+            + ` · 检查 ${counts.accounts_checked ?? "—"} 个账户，`
+            + `${counts.accounts_with_positions ?? 0} 个有持仓`),
+          broker.data?.error && h("p", { className: "tw-alert" }, broker.data.error),
+          (broker.data?.errors ?? []).length > 0 && h("p", { className: "tw-alert" },
+            `部分账户读取失败：${broker.data.errors.map((e) => `${e.account}(${e.reason})`).join("；")}`),
+          h("p", { className: "tw-meta" }, broker.data?.note ?? ""),
+        ),
+        ...groups.map(accountCard),
+
+        h(Card, { title: "本地策略台账（不是券商资产）", count: points.length,
+          empty: points.length > 1 ? undefined : (equity.loading ? "加载中…" : "暂无本地策略成交记录") },
+          h("p", { className: "tw-meta" },
+            "来源：本地模拟台账 ~/.dsh/quant-ledger.json，用于回放 quant_signal/quant_backtest 的策略表现；"
+            + "与上面的券商持仓是两套账，不要相加。"
+            + (ledgerPreview ? ` · 最近台账预览 ${ledgerPreview.at}` : "")),
           h(LineChart, { points: points.map((p) => ({ v: p.equity })), label: equity.data?.note || "" }),
           equity.data && h("p", { className: "tw-meta" },
-            `区间 ${points[0]?.t} → ${points[points.length - 1]?.t} · 最大回撤 ${(equity.data.max_drawdown * 100).toFixed(2)}% · 夏普 ${equity.data.sharpe}`)),
-        h(Card, { title: "持仓明细", count: rows.length,
-          empty: rows.length ? undefined : "当前无持仓" },
-          rows.length > 0 && h("div", { className: "tw-kv" }, rows.map((row) =>
-            h("div", { key: row.ticker, className: "tw-kv-item" },
-              h("div", { className: "tw-kv-k" }, `${row.ticker} · ${row.shares} 股 · 止损 ${row.stop ?? "—"}`),
-              h("div", { className: "tw-kv-v", style: { color: (row.pnl ?? 0) >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
-                `${row.price ?? "—"}（${row.pnl >= 0 ? "+" : ""}${row.pnl} / ${row.pnl_pct ?? "—"}%）`)))),
-          ledgerPreview && h("p", { className: "tw-meta" }, `最近台账预览：${ledgerPreview.at}`)));
+            `区间 ${points[0]?.t} → ${points[points.length - 1]?.t} · 最大回撤 ${(equity.data.max_drawdown * 100).toFixed(2)}% · 夏普 ${equity.data.sharpe}`)));
     }
 
     function RiskConfigCard({ rpc, mode }) {

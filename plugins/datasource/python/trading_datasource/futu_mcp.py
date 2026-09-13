@@ -15,6 +15,7 @@ workbench/bars.py、engine/market_data.py、workbench/sources.py 探测），
 """
 import json
 import os
+import threading
 import time
 from pathlib import Path
 
@@ -70,18 +71,24 @@ def _post(payload, session, headers, tries=4, timeout=30):
 
 
 _cache = {"session": None, "at": 0.0}
+# 会话建立必须串行：并发首次调用否则会各自 initialize，浪费往返甚至互相覆盖会话。
+# 加锁后 call_tool 可安全地被线程池并发调用（批量读持仓时用得上）。
+_session_lock = threading.Lock()
 
 
 def _session(headers, client_name):
-    """复用会话（5 分钟内），减少握手开销。"""
+    """复用会话（5 分钟内），减少握手开销。线程安全。"""
     if _cache["session"] and time.time() - _cache["at"] < SESSION_TTL_SECONDS:
         return _cache["session"]
-    session, _ = _post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
-                        "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
-                                   "clientInfo": {"name": client_name, "version": "1"}}},
-                       None, headers)
-    _cache["session"], _cache["at"] = session, time.time()
-    return session
+    with _session_lock:
+        if _cache["session"] and time.time() - _cache["at"] < SESSION_TTL_SECONDS:
+            return _cache["session"]  # 等锁期间别人已建立
+        session, _ = _post({"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                            "params": {"protocolVersion": PROTOCOL_VERSION, "capabilities": {},
+                                       "clientInfo": {"name": client_name, "version": "1"}}},
+                           None, headers)
+        _cache["session"], _cache["at"] = session, time.time()
+        return session
 
 
 def reset_session():

@@ -41,10 +41,11 @@ function intInRange(value, fallback, min, max, label) {
 export function createAnalyticsProvider({ exec = run, python = pythonPath, now = Date.now } = {}) {
   const cache = new Map();
 
-  async function call(args, key) {
+  async function call(args, key, options = {}) {
     const hit = cache.get(key);
-    if (hit && now() - hit.at < CACHE_TTL_MS) return hit.value;
-    const { stdout } = await exec(python(), [path.join(pythonDir, "analytics.py"), ...args],
+    if (hit && !options.skipCache && now() - hit.at < CACHE_TTL_MS) return hit.value;
+    const script = options.script ?? "analytics.py";
+    const { stdout } = await exec(python(), [path.join(pythonDir, script), ...args],
       { timeout: 180_000, maxBuffer: 16 * 1024 * 1024 });
     const start = stdout.indexOf("{");
     if (start < 0) throw new Error("analytics.py returned no JSON");
@@ -60,9 +61,13 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       const window = intInRange(payload.window, 250, 20, 1000, "window");
       return call(["equity", "--mode", mode, "--window", String(window)], `equity|${mode}|${window}`);
     },
-    async positions(payload = {}) {
+    // 券商真实持仓（模拟盘读模拟账户，实盘读真实账户）；python 侧另有磁盘缓存，
+    // 因此用户点「刷新」时需要把 refresh 透传下去，否则只会拿到同一份缓存。
+    async positions(payload = {}, options = {}) {
       const mode = modeOf(payload.mode);
-      return call(["positions", "--mode", mode], `positions|${mode}`);
+      const args = ["--mode", mode];
+      if (options.refresh) args.push("--refresh");
+      return call(args, `positions|${mode}`, { skipCache: options.refresh, script: "positions.py" });
     },
     async sensitivity(payload = {}) {
       const tickerList = payload.ticker;
