@@ -288,3 +288,59 @@ test("skill 与限制文档必须写明：券商能力限制以实测为准，�
   // 记忆条目格式必须带账户字段
   assert.match(skill, /\[<日期> \| <sim\|live>账户/, "记忆条目格式未包含账户字段");
 });
+
+test("K 线悬停：鼠标 x 坐标 → 正确的 K 线下标", async () => {
+  const plugin = await client();
+  const { barIndexAt } = plugin.internals;
+  // 绘图区 x∈[54, 254)，10 根 K 线 → 每根 20px
+  const shape = { padL: 54, plotW: 200, count: 10 };
+  assert.equal(barIndexAt(54, shape), 0, "绘图区左边界是第 0 根");
+  assert.equal(barIndexAt(73.9, shape), 0);
+  assert.equal(barIndexAt(74, shape), 1, "跨过一根宽就应换下标");
+  assert.equal(barIndexAt(253.9, shape), 9, "最后一根");
+  // 绘图区之外一律 null，不能误命中首尾
+  assert.equal(barIndexAt(53.9, shape), null, "左侧留白区不应命中");
+  assert.equal(barIndexAt(254, shape), null, "右侧留白区不应命中");
+  assert.equal(barIndexAt(-100, shape), null);
+  assert.equal(barIndexAt(9999, shape), null);
+  // 边界输入不应抛
+  assert.equal(barIndexAt(10, { padL: 54, plotW: 0, count: 10 }), null);
+  assert.equal(barIndexAt(10, { padL: 54, plotW: 200, count: 0 }), null);
+});
+
+test("K 线悬停：信息框在靠近右边缘时翻到左侧，不会超出画布", async () => {
+  const plugin = await client();
+  const { tooltipLeft } = plugin.internals;
+  const width = 600, boxW = 160;
+  // 光标在左侧：信息框正常放右侧
+  assert.equal(tooltipLeft(100, boxW, width), 114);
+  // 光标靠近右边缘：右侧放不下，翻到左侧
+  assert.equal(tooltipLeft(560, boxW, width), 560 - 14 - boxW);
+  // 连左侧也放不下（画布很窄）：贴右边缘，但不越界
+  const narrow = 200;
+  const left = tooltipLeft(150, boxW, narrow);
+  assert.ok(left >= 4, "不能越出左边界");
+  assert.ok(left + boxW <= narrow - 4 + 0.001, "不能越出右边界");
+});
+
+test("K 线悬停：成交量用紧凑写法", async () => {
+  const plugin = await client();
+  const { compactNumber } = plugin.internals;
+  assert.equal(compactNumber(12345), "1.23万");
+  assert.equal(compactNumber(123456789), "1.23亿");
+  assert.equal(compactNumber(999), "999");
+  assert.equal(compactNumber(null), "—");
+  assert.equal(compactNumber("abc"), "—");
+});
+
+test("K 线图接上了鼠标事件，且只在跨根时才重绘", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function KLineChart("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /onMouseMove: handleMove/, "缺少鼠标移动处理");
+  assert.match(text, /onMouseLeave: \(\) => setHover\(null\)/, "缺少移出清理");
+  assert.match(text, /if \(next !== hover\) setHover\(next\)/, "应在跨到另一根 K 线时才 setState，避免每次移动都重绘");
+  assert.match(text, /geometry\.current = \{/, "绘制时须记录几何量，命中判定才能与绘制对齐");
+  assert.match(source, /function drawKLineHover\(/, "缺少悬停绘制");
+});
