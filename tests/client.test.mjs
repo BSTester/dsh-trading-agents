@@ -705,3 +705,22 @@ test("台账成交方向的中文标签由产出侧提供，客户端只做回�
     "analytics 应为旧台账补中文标签");
   assert.match(source, /from trading_datasource\.labels import action_label/, "应复用共享标签表");
 });
+
+test("每条预览先给中文结论，原始 JSON 只作可核对证据", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /function PreviewSummary\(/, "缺少中文结论块");
+  // 结论块必须排在原始 JSON 之前，否则用户还是得自己去 JSON 里找
+  const details = source.slice(source.indexOf("h(PreviewSummary, { preview: p })"));
+  assert.match(details.slice(0, 260), /以下为原始返回（可核对，未做翻译）/, "应说明 JSON 是原始证据");
+  // 三类预览都要有中文列项
+  for (const kind of ["signal", "backtest", "ledger"]) {
+    assert.match(source, new RegExp(`preview\\.kind === "${kind}"`), `${kind} 缺少中文结论块`);
+  }
+  // 结论块里不得直接渲染机器码
+  const body = source.slice(source.indexOf("function PreviewSummary("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.doesNotMatch(text, /\$\{v\.signal\}/, "信号应用 labeled");
+  assert.match(text, /labeled\(v\.signal, v\.signal_label, "SIGNAL"\)/, "信号未走中文标签");
+  assert.match(text, /v\.execution_source_label \?\? zh\("EXECUTION_SOURCE"/, "口径未走中文标签");
+});

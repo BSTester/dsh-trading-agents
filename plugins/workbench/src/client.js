@@ -1082,6 +1082,55 @@ ol.sources code{font-size:11.5px}
         submitted && h(KLineCard, { rpc, ticker: submitted }));;
     }
 
+    /**
+     * 一条预览的中文结论块。
+     *
+     * 此前这里只有一段原始 JSON：结论（信号、收益率、回撤）都得自己去 JSON 里找，
+     * 而且看到的是 `HOLD`、`local_simulation` 这类机器码。结论用中文列在上方，
+     * JSON 仍然保留在下方作为可核对的原始证据。
+     */
+    function PreviewSummary({ preview }) {
+      const v = preview.value ?? {};
+      const kv = (pairs) => h("div", { className: "tw-kv" }, pairs
+        .filter(([, value]) => value !== undefined && value !== null && value !== "")
+        .map(([label, value]) => h(RiskMetricItem, { key: label, label, value: String(value) })));
+      const pct = (x, digits = 2) => (Number.isFinite(x) ? `${(x * 100).toFixed(digits)}%` : "—");
+      if (preview.kind === "signal") {
+        return kv([
+          ["结论", labeled(v.signal, v.signal_label, "SIGNAL")],
+          ["标的", v.ticker], ["策略", v.strategy_label ?? v.strategy],
+          ["信号日期", v.date], ["价格", v.price], ["ATR（14 日）", Number.isFinite(v.atr) ? v.atr.toFixed(3) : "—"],
+          ["口径", v.execution_source_label ?? zh("EXECUTION_SOURCE", v.execution_source)],
+        ]);
+      }
+      if (preview.kind === "backtest") {
+        const m = v.summary ?? {};
+        return kv([
+          ["标的", v.ticker], ["策略", v.strategy],
+          ["行情区间", v.data_start && v.data_end ? `${v.data_start} → ${v.data_end}` : "—"],
+          ["数据源", v.source],
+          ["累计收益", pct(m.total_return)], ["年化", pct(m.annualized)],
+          ["夏普", Number.isFinite(m.sharpe) ? m.sharpe : "—"],
+          ["最大回撤", pct(m.max_drawdown)],
+          ["交易笔数", m.trades], ["胜率", pct(m.win_rate, 1)],
+          ["成交口径", v.execution_timing_label ?? zh("EXECUTION_TIMING", v.execution_timing)],
+          ["末仓处理", v.end_position_policy_label ?? zh("END_POSITION_POLICY", v.end_position_policy)],
+          ["持仓中", (v.open_positions ?? []).length ? `${(v.open_positions ?? []).length} 笔` : "无"],
+        ]);
+      }
+      if (preview.kind === "ledger") {
+        return kv([
+          ["账户模式", v.mode === "live" ? "实盘" : "模拟盘"],
+          ["状态", v.status_label ?? (v.status === "available" ? "可用" : v.status)],
+          ["可用现金", v.cash], ["账户权益", v.equity], ["累计收益", pct(v.total_return)],
+          ["持仓数", v.positions ? Object.keys(v.positions).length : "—"],
+          ["已平仓笔数", v.trades], ["胜率", pct(v.win_rate, 1)],
+          ["口径", v.execution_source_label ?? zh("EXECUTION_SOURCE", v.execution_source)],
+        ]);
+      }
+      return null;
+    }
+
     function SignalView({ snapshot }) {
       const previews = snapshot.previews.filter((p) => p.kind === "signal" || p.kind === "backtest");
       return h(React.Fragment, null,
@@ -1098,7 +1147,10 @@ ol.sources code{font-size:11.5px}
                 [p.value?.ticker, p.value?.strategy_label ?? p.value?.strategy]
                   .filter(Boolean).join(" · "),
                 h("span", { className: "tw-meta" }, p.at)),
-              h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(p.value, null, 2)))) })),
+              h("div", { className: "tw-item-body" },
+                h(PreviewSummary, { preview: p }),
+                h("p", { className: "tw-meta" }, "以下为原始返回（可核对，未做翻译）："),
+                h("pre", { className: "tw-pre" }, JSON.stringify(p.value, null, 2)))) })),
         h("p", { className: "tw-hint" }, "工作台只展示结果；信号计算、回测与下单请在 Harness 会话中发起。"));
     }
 
@@ -1128,6 +1180,7 @@ ol.sources code{font-size:11.5px}
 
     function PortfolioView({ rpc, snapshot }) {
       const ledgerPreview = snapshot.previews.find((p) => p.kind === "ledger");
+      // 台账预览此前只显示原始 JSON，结论先给中文
       const broker = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
       const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
       const groups = broker.data?.groups ?? [];
@@ -1177,6 +1230,8 @@ ol.sources code{font-size:11.5px}
             "来源：本地模拟台账 ~/.dsh/quant-ledger.json，用于回放 quant_signal/quant_backtest 的策略表现；"
             + "与上面的券商持仓是两套账，不要相加。"
             + (ledgerPreview ? ` · 最近台账预览 ${ledgerPreview.at}` : "")),
+          // 台账预览的结论先用中文列出，原始 JSON 仍可在「信号」页展开核对
+          ledgerPreview && h(PreviewSummary, { preview: ledgerPreview }),
           h(LineChart, { points: points.map((p) => ({ v: p.equity })), label: equity.data?.note || "" }),
           equity.data && h("p", { className: "tw-meta" },
             `区间 ${points[0]?.t} → ${points[points.length - 1]?.t}`
