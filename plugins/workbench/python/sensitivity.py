@@ -66,7 +66,7 @@ def main():
     ap.add_argument("--sell-grid", default="65,70,75,80")
     ap.add_argument("--metric", default="total_return", choices=METRICS)
     ap.add_argument("--start", default="2023-01-01")
-    ap.add_argument("--source", default="sina")
+    ap.add_argument("--source", default="auto")
     args = ap.parse_args()
 
     try:

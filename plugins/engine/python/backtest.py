@@ -17,6 +17,7 @@ import argparse
 import json
 import math
 import sys
+from datetime import date
 
 COMMISSION = 0.0003   # 双边佣金
 STAMP_TAX = 0.001     # 卖出印花税（A股）
@@ -54,8 +55,18 @@ def validate_data(df):
 
 def load_data(ticker, start, source):
     """加载并校验日线 OHLCV；数据源错误向调用方传播。"""
-    if source not in ("stooq", "synth", "yahoo", "sina", "akshare"):
+    if source not in ("auto", "stooq", "synth", "yahoo", "sina", "akshare"):
         raise ValueError(f"Unsupported data source: {source}")
+    if source == "auto":
+        # 统一行情入口：富途优先（全市场），A股长历史回退新浪。
+        import pandas as pd
+        from datetime import date as _date
+        from market_data import load_bars
+        needed = max(120, int((_date.today() - _date.fromisoformat(start)).days * 0.72) + 40)
+        bars, _source, _stale = load_bars(ticker, "1d", min(needed, 900))
+        frame = pd.DataFrame([{"date": b["t"], "open": b["o"], "high": b["h"],
+                               "low": b["l"], "close": b["c"], "volume": b["v"]} for b in bars])
+        return frame[frame["date"] >= start].reset_index(drop=True)
     if source == "stooq":
         import pandas as pd
         symbol = ticker.lower().replace("-", ".")
@@ -217,7 +228,7 @@ def main():
     ap.add_argument("--ticker", required=True)
     ap.add_argument("--start", default="2023-01-01")
     ap.add_argument("--strategy", default="ma_cross", choices=["ma_cross", "rsi"])
-    ap.add_argument("--source", default="sina", choices=["sina", "akshare", "stooq", "yahoo", "synth"])
+    ap.add_argument("--source", default="auto", choices=["auto", "sina", "akshare", "stooq", "yahoo", "synth"])
     ap.add_argument("--fast", type=int, default=5)
     ap.add_argument("--slow", type=int, default=20)
     ap.add_argument("--rsi-buy", type=int, default=30)

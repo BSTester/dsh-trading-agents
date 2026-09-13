@@ -445,3 +445,45 @@ class BarsSymbolTests(unittest.TestCase):
             self.assertIn(period, bars.PERIOD_TO_FUTU_KTYPE, period)
         self.assertLessEqual(bars.FUTU_MAX_BARS, 370, "富途单次上限为 370 根")
 
+class UnifiedDataLayerTests(unittest.TestCase):
+    """量化路径与工作台共用同一数据规则（富途优先，全市场）。"""
+
+    def _engine_module(self, name):
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).resolve().parent.parent / "plugins" / "engine" / "python" / f"{name}.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_engine_market_data_symbol_normalization(self):
+        md = self._engine_module("market_data")
+        cases = {"600519": "SH.600519", "000001": "SZ.000001", "00700.HK": "HK.00700",
+                 "700": "HK.00700", "AAPL": "US.AAPL", "US.AAPL": "US.AAPL"}
+        for raw, expected in cases.items():
+            self.assertEqual(md.to_futu_symbol(raw), expected, raw)
+
+    def test_engine_supports_all_declared_periods(self):
+        md = self._engine_module("market_data")
+        for period in ("1m", "5m", "15m", "30m", "60m", "1d"):
+            self.assertIn(period, md.PERIOD_TO_FUTU_KTYPE, period)
+
+    def test_load_bars_rejects_unknown_period(self):
+        md = self._engine_module("market_data")
+        with self.assertRaises(ValueError):
+            md.load_bars("600519", "3s", 100)
+
+    def test_backtest_auto_source_is_declared(self):
+        """两个包里的 backtest 都必须支持 auto（统一数据入口），避免路径不一致。"""
+        for package in ("engine", "workbench"):
+            path = Path(__file__).resolve().parent.parent / "plugins" / package / "python" / "backtest.py"
+            text = path.read_text(encoding="utf-8")
+            self.assertIn('source == "auto"', text, f"{package} backtest 缺少 auto 分支")
+            self.assertIn('default="auto"', text, f"{package} backtest 默认源不是 auto")
+
+    def test_engine_signal_uses_auto_source(self):
+        path = Path(__file__).resolve().parent.parent / "plugins" / "engine" / "python" / "engine.py"
+        text = path.read_text(encoding="utf-8")
+        self.assertNotIn('load_data(ticker, "2023-01-01", "sina")', text,
+                         "信号计算不应再硬编码 sina（港美股会失败）")
+        self.assertIn('load_data(ticker, "2023-01-01", "auto")', text)
+

@@ -169,3 +169,18 @@
 **测试覆盖**：42 Node + 54 Python 全绿（含端点参数白名单、子进程隔离、降级路径、恶意输入、估值因子方向与缺失容忍）。
 
 **端到端验证（真实数据，本轮实测）**：series/equity/positions/correlation/sensitivity/risk/trades/events/factors/ic 全部返回有效结果。
+
+## 八、统一数据层（重要）
+
+三条路径**共用同一行情规则**：富途 MCP 优先（全市场、分钟/日线 + 盘口/财务/资讯），
+A股长历史（>370 根）回退新浪源；资讯/情绪由 fin-data 插件负责（富途公开快讯 / AKShare / Yahoo RSS / X）。
+
+| 路径 | 代码入口 | 数据来源 | 覆盖市场 |
+|---|---|---|---|
+| 研报（Harness 会话） | `mcp__futu__*` 工具 + `fin_news`/`fin_sentiment` | 富途 MCP + fin-data | 全市场 |
+| 量化（引擎工具） | `engine.py` / `backtest.py` → `market_data.load_bars` | 富途优先 → 新浪 | **全市场（本轮统一）** |
+| 工作台图表 | `bars.py` → `load_bars` | 富途优先 → 新浪 | 全市场 |
+
+> 两个插件包各自独立，`plugins/engine/python/market_data.py` 与
+> `plugins/workbench/python/bars.py` 的路由规则保持一致，修改任一处需同步另一处
+> （已有测试断言两侧都支持 `auto` 源）。

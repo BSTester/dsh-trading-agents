@@ -133,7 +133,7 @@ def _save_ledger(mode, ledger):
 
 
 def compute_signal(ticker, strategy, fast=5, slow=20, rsi_buy=25, rsi_sell=75):
-    df = validate_data(load_data(ticker, "2023-01-01", "sina"))
+    df = validate_data(load_data(ticker, "2023-01-01", "auto"))
     if strategy == "ma_cross":
         sig = ma_cross_signal(df, fast, slow)
     elif strategy == "rsi":
@@ -275,7 +275,7 @@ def equity(ledger, positions, quotes=None):
 
 
 def latest_price(ticker):
-    df = validate_data(load_data(ticker, "2025-01-01", "sina"))
+    df = validate_data(load_data(ticker, "2025-01-01", "auto"))
     return float(df["close"].iloc[-1])
 
 
