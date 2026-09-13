@@ -92,6 +92,15 @@ def reset_session():
 # 服务端的合法空结果：不是错误，也不是结构异常（实测 account_funds 无数据时返回 "no data"）。
 EMPTY_RESULT_TEXTS = frozenset({"", "no data", "nodata", "null", "{}"})
 
+# 服务端同时存在两种返回信封（实测）：
+#   行情类 quote_*    {"ret_code": 0, "data": {...}}
+#   账户类 account_*  {"s": "ok",    "d": {...}}
+# 只认其中一种会把另一种的**成功响应**判成失败——实测 account_authorized_trd_accs
+# 因此报 "ret=None None"，拿不到 acc_id，持仓必然读不出来。
+RET_CODE_KEY = "ret_code"
+STATUS_KEY = "s"
+STATUS_OK_VALUES = frozenset({"ok", "success"})
+
 
 def _unwrap(name, data):
     """从 JSON-RPC 响应中取出工具的业务数据。
@@ -110,13 +119,25 @@ def _unwrap(name, data):
         if str(text).strip().lower() in EMPTY_RESULT_TEXTS:
             return {}
         raise FutuUnavailable(f"{name}: 非结构化返回：{str(text)[:100]}")
-    if inner.get("ret_code") != 0:
-        raise FutuUnavailable(f"{name}: ret={inner.get('ret_code')} {inner.get('ret_msg')}")
-    return inner.get("data") or {}
+    if not isinstance(inner, dict):
+        raise FutuUnavailable(f"{name}: 返回不是对象：{str(inner)[:80]}")
+
+    if STATUS_KEY in inner:  # 账户类信封 {"s": "ok", "d": {...}}
+        status = inner[STATUS_KEY]
+        if status is not None and str(status).lower() not in STATUS_OK_VALUES:
+            detail = inner.get("m") or inner.get("msg") or inner.get("message") or ""
+            raise FutuUnavailable(f"{name}: s={status} {str(detail)[:100]}")
+        return inner.get("d") or {}
+
+    if RET_CODE_KEY in inner:  # 行情类信封 {"ret_code": 0, "data": {...}}
+        if inner[RET_CODE_KEY] != 0:
+            raise FutuUnavailable(f"{name}: ret={inner[RET_CODE_KEY]} {inner.get('ret_msg')}")
+        return inner.get("data") or {}
+
+    raise FutuUnavailable(f"{name}: 未识别的返回信封（键：{sorted(inner)[:6]}）")
 
 
-def call_tool(name, arguments, timeout=30, client_name=DEFAULT_CLIENT_NAME):
-    """调用一个富途 MCP 工具，返回 inner['data']；失败抛 FutuUnavailable。"""
+def _call_once(name, arguments, timeout, client_name):
     headers = _headers()
     session = _session(headers, client_name)
     try:
@@ -129,10 +150,110 @@ def call_tool(name, arguments, timeout=30, client_name=DEFAULT_CLIENT_NAME):
     return _unwrap(name, json.loads(body))
 
 
+def call_tool(name, arguments, timeout=30, client_name=DEFAULT_CLIENT_NAME, auto_refresh=True):
+    """调用一个富途 MCP 工具，返回 inner['data']；失败抛 FutuUnavailable。
+
+    access_token 只有 2 小时有效期，过期后服务端对所有工具返回 internal error。
+    因此遇到该特征时先自动续期再重试一次——用户不需要每两小时重走一次授权页。
+    """
+    try:
+        return _call_once(name, arguments, timeout, client_name)
+    except FutuUnavailable as error:
+        if not (auto_refresh and _looks_like_auth_failure(error)):
+            raise
+        if not refresh_access_token():
+            raise
+    return _call_once(name, arguments, timeout, client_name)
+
+
 # 探测用工具：无账户依赖、参数最少、返回稳定。
 # 不能只做 initialize —— 实测 token 过期时 initialize 仍然成功，
 # 而所有 tools/call 返回 "internal error"，旧探测因此长期误报「token 有效」。
 PROBE_TOOL = "quote_trading_days"
+
+
+# ---- access token 有效期 ----
+# 实测 OAuth 响应：access_token 的 expires_in = 7200（2 小时），且续期不会换发
+# 新的 refresh_token。2 小时很短，因此必须能被自动续期，否则每隔两小时就会
+# 出现「所有工具突然报 internal error」——服务端不返回 401，只给 internal error。
+EXPIRY_FILE = DSH / "futu-token-expiry"
+TOKEN_URL = "https://webapi.futunn.com/oauth2/token"
+CLIENT_FILE = DSH / "futu-client-id"
+REFRESH_FILE = DSH / "futu-refresh"
+
+
+def record_expiry(expires_in):
+    """记录 access_token 到期时刻（ISO 本地时间，仅供展示与预警）。"""
+    if not expires_in:
+        return None
+    from datetime import datetime, timedelta
+    moment = datetime.now() + timedelta(seconds=float(expires_in))
+    try:
+        DSH.mkdir(parents=True, exist_ok=True)
+        EXPIRY_FILE.write_text(moment.isoformat(timespec="seconds"))
+    except OSError:
+        return moment
+    return moment
+
+
+def token_expiry():
+    """返回 access_token 的到期时间；未知返回 None。"""
+    from datetime import datetime
+    try:
+        return datetime.fromisoformat(EXPIRY_FILE.read_text().strip())
+    except (OSError, ValueError):
+        return None
+
+
+def seconds_until_expiry():
+    """距到期还剩多少秒；未知返回 None（未知不等于有效）。"""
+    from datetime import datetime
+    moment = token_expiry()
+    return None if moment is None else (moment - datetime.now()).total_seconds()
+
+
+def refresh_access_token(timeout=30):
+    """用 refresh_token 换新 access_token 并落盘。成功返回 True。
+
+    这是 2 小时过期问题的正解：持久化授权（refresh_token）仍然有效时，
+    不需要用户重新点授权页。
+    """
+    import urllib.parse
+    import urllib.request
+    client_file, refresh_file = CLIENT_FILE, REFRESH_FILE
+    if not (client_file.exists() and refresh_file.exists()):
+        return False
+    try:
+        body = urllib.parse.urlencode({
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_file.read_text().strip(),
+            "client_id": client_file.read_text().strip(),
+        }).encode()
+        request = urllib.request.Request(TOKEN_URL, data=body, headers={
+            "Content-Type": "application/x-www-form-urlencoded"})
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read().decode())
+    except Exception:  # noqa: BLE001 - 续期失败交由调用方降级
+        return False
+    access = payload.get("access_token")
+    if not access:
+        return False
+    try:
+        token_path().write_text(access)
+        token_path().chmod(0o600)
+        if payload.get("refresh_token"):
+            refresh_file.write_text(payload["refresh_token"])
+    except OSError:
+        return False
+    record_expiry(payload.get("expires_in"))
+    reset_session()
+    return True
+
+
+def _looks_like_auth_failure(message):
+    """服务端在凭证失效时返回 internal error（不是 401），因此按特征识别。"""
+    lowered = str(message).lower()
+    return "internal error" in lowered or "invalid_token" in lowered or "unauthorized" in lowered
 
 
 def probe(timeout=20, client_name=DEFAULT_CLIENT_NAME):
@@ -159,7 +280,14 @@ def probe(timeout=20, client_name=DEFAULT_CLIENT_NAME):
             return False, "未授权（无 token 文件）"
         if "MCP 请求失败" in message:
             return None, f"网络不可达：{message[:100]}"
-        # 服务端返回 internal error 时无法区分 token 过期与服务端故障，
-        # 两者都指向同一个动作：先续期，仍失败则稍后重试。
-        return False, f"{message[:100]}（先尝试续期：scripts/futu_auth.py --refresh）"
-    return True, "token 有效"
+        # internal error 无法区分凭证过期与服务端故障；两者都指向同一动作：
+        # 先续期，仍失败则稍后重试。
+        return False, f"{message[:100]}（可尝试续期：scripts/futu_auth.py --refresh）"
+    remaining = seconds_until_expiry()
+    if remaining is None:
+        return True, "token 有效（到期时间未知）"
+    if remaining <= 0:
+        return False, "token 已过期（下次调用会自动续期）"
+    hours = remaining / 3600
+    return True, (f"token 有效 · 剩余约 {hours:.1f} 小时"
+                  if hours >= 1 else f"token 有效 · 剩余约 {int(remaining / 60)} 分钟")

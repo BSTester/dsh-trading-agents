@@ -145,6 +145,18 @@ python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py"
 > 动态客户端注册），token 走 refresh_token 刷新、`/oauth2/revoke` 吊销。token 文件
 > 只存本机，预设组合在加载时自动读取，不进任何代码或仓库。
 
+### token 有效期（重要）
+
+富途 OAuth 返回的 `expires_in` 是 **7200 秒（2 小时）**，续期不会换发新的 refresh_token。
+这很短，所以要特别注意：**过期后服务端不对所有工具返回 401，而是统一返回 `internal error`**，
+表现上像"富途服务挂了"。
+
+现在的处理方式：
+
+- 任何富途调用遇到该特征时会**自动用 refresh_token 续期并重试一次**，通常无需人工干预；
+- 渠道状态页显示**剩余有效期**，剩余不足 10 分钟时给出预警；
+- 自动续期也失败才需要 `--refresh`；refresh_token 失效才需重新完整授权。
+
 **安全说明**：未设置模式时默认模拟盘；完整插件模式下有账户工具守卫与 Harness 原生实盘审批，
 会话仍需逐笔复述并确认订单。仅安装 skill 不具备插件级守卫。日常建议只授权只读 scope。
 

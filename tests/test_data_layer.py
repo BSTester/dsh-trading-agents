@@ -201,6 +201,127 @@ class FutuClientTests(unittest.TestCase):
         self.assertTrue(ok)
 
 
+class TokenLifecycleTests(unittest.TestCase):
+    """access_token 只有 2 小时（官方 expires_in=7200），过期必须能自动续期。
+
+    服务端在凭证失效时返回的是 internal error 而不是 401，所以"过期"和"服务端故障"
+    在报文上无法区分 —— 这一点此前导致渠道状态页长期误报「token 有效」。
+    """
+
+    def setUp(self):
+        self.calls = []
+
+    def test_both_response_envelopes_are_understood(self):
+        """实测服务端有两种信封：行情类 ret_code/data，账户类 s/d。
+
+        只认一种会把另一种的成功响应判成失败——account_authorized_trd_accs 曾因此
+        报 "ret=None None"，拿不到 acc_id，进而持仓必然读不出来。
+        """
+        quote = {"jsonrpc": "2.0", "id": 2, "result": {"content": [
+            {"type": "text", "text": '{"ret_code": 0, "data": {"kline_list": [1]}}'}]}}
+        account = {"jsonrpc": "2.0", "id": 2, "result": {"content": [
+            {"type": "text", "text": '{"s": "ok", "d": {"accounts": [{"account_id": 1}]}}'}]}}
+        self.assertEqual(futu_mcp._unwrap("quote", quote), {"kline_list": [1]})
+        self.assertEqual(futu_mcp._unwrap("account", account), {"accounts": [{"account_id": 1}]})
+
+    def test_account_envelope_error_status_is_reported(self):
+        payload = {"jsonrpc": "2.0", "id": 2, "result": {"content": [
+            {"type": "text", "text": '{"s": "error", "m": "account not found"}'}]}}
+        with self.assertRaises(futu_mcp.FutuUnavailable) as caught:
+            futu_mcp._unwrap("account_positions", payload)
+        self.assertIn("account not found", str(caught.exception))
+
+    def test_unknown_envelope_is_reported_not_silently_accepted(self):
+        payload = {"jsonrpc": "2.0", "id": 2, "result": {"content": [
+            {"type": "text", "text": '{"something": "else"}'}]}}
+        with self.assertRaises(futu_mcp.FutuUnavailable) as caught:
+            futu_mcp._unwrap("mystery", payload)
+        self.assertIn("未识别的返回信封", str(caught.exception))
+
+    def test_auth_failure_signature_is_recognized(self):
+        self.assertTrue(futu_mcp._looks_like_auth_failure("quote_x: internal error"))
+        self.assertTrue(futu_mcp._looks_like_auth_failure("invalid_token"))
+        self.assertFalse(futu_mcp._looks_like_auth_failure("quote_x: ret=-3 invalid parameter"))
+
+    def test_call_tool_refreshes_once_then_retries(self):
+        """internal error → 续期一次 → 重试成功，用户不必手工处理。"""
+        attempts = []
+
+        def fake_call_once(name, arguments, timeout, client_name):
+            attempts.append(name)
+            if len(attempts) == 1:
+                raise futu_mcp.FutuUnavailable(f"{name}: internal error")
+            return {"ok": True}
+
+        with patch.object(futu_mcp, "_call_once", side_effect=fake_call_once), \
+             patch.object(futu_mcp, "refresh_access_token", return_value=True) as refresh:
+            self.assertEqual(futu_mcp.call_tool("quote_trading_days", {}), {"ok": True})
+        self.assertEqual(len(attempts), 2, "必须重试恰好一次")
+        refresh.assert_called_once()
+
+    def test_call_tool_does_not_retry_business_errors(self):
+        """业务错误（参数错/无权限）不该触发续期，否则会掩盖真实原因。"""
+        with patch.object(futu_mcp, "_call_once",
+                          side_effect=futu_mcp.FutuUnavailable("x: ret=-3 invalid parameter")), \
+             patch.object(futu_mcp, "refresh_access_token") as refresh:
+            with self.assertRaises(futu_mcp.FutuUnavailable):
+                futu_mcp.call_tool("x", {})
+        refresh.assert_not_called()
+
+    def test_call_tool_gives_up_when_refresh_fails(self):
+        with patch.object(futu_mcp, "_call_once",
+                          side_effect=futu_mcp.FutuUnavailable("x: internal error")), \
+             patch.object(futu_mcp, "refresh_access_token", return_value=False):
+            with self.assertRaises(futu_mcp.FutuUnavailable):
+                futu_mcp.call_tool("x", {})
+
+    def test_auto_refresh_can_be_disabled(self):
+        with patch.object(futu_mcp, "_call_once",
+                          side_effect=futu_mcp.FutuUnavailable("x: internal error")), \
+             patch.object(futu_mcp, "refresh_access_token") as refresh:
+            with self.assertRaises(futu_mcp.FutuUnavailable):
+                futu_mcp.call_tool("x", {}, auto_refresh=False)
+        refresh.assert_not_called()
+
+    def test_expiry_round_trip(self):
+        import tempfile
+        from datetime import datetime, timedelta
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "futu-token-expiry"
+            with patch.object(futu_mcp, "EXPIRY_FILE", path):
+                moment = futu_mcp.record_expiry(7200)
+                self.assertIsNotNone(moment)
+                self.assertAlmostEqual(futu_mcp.seconds_until_expiry(), 7200, delta=5)
+                path.write_text((datetime.now() - timedelta(minutes=1)).isoformat())
+                self.assertLess(futu_mcp.seconds_until_expiry(), 0)
+
+    def test_expiry_unknown_is_not_treated_as_valid(self):
+        with patch.object(futu_mcp, "EXPIRY_FILE", Path("/nonexistent/expiry")):
+            self.assertIsNone(futu_mcp.seconds_until_expiry())
+            self.assertIsNone(futu_mcp.token_expiry())
+
+    def test_refresh_records_expiry_from_the_response(self):
+        """续期成功后必须按响应里的 expires_in 记账，状态页才能显示剩余时间。"""
+        import json as jsonlib
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp = Path(tmp)
+            (tmp / "futu-client-id").write_text("cid")
+            (tmp / "futu-refresh").write_text("rtok")
+            (tmp / "futu-token").write_text("old")
+            payload = jsonlib.dumps({"access_token": "brand-new", "expires_in": 7200}).encode()
+            with patch.object(futu_mcp, "CLIENT_FILE", tmp / "futu-client-id"), \
+                 patch.object(futu_mcp, "REFRESH_FILE", tmp / "futu-refresh"), \
+                 patch.object(futu_mcp, "token_path", return_value=tmp / "futu-token"), \
+                 patch.object(futu_mcp, "EXPIRY_FILE", tmp / "futu-token-expiry"), \
+                 patch.object(futu_mcp, "reset_session"), \
+                 patch("urllib.request.urlopen", return_value=_FakeResponse(payload)):
+                self.assertTrue(futu_mcp.refresh_access_token())
+                # 断言必须在 patch 生效期间：否则会读到真实 ~/.dsh 的到期文件
+                self.assertAlmostEqual(futu_mcp.seconds_until_expiry(), 7200, delta=15)
+            self.assertEqual((tmp / "futu-token").read_text(), "brand-new")
+
+
 class LocateTests(unittest.TestCase):
     """跨插件定位：找不到就返回 None，让调用方明确降级。"""
 
@@ -285,6 +406,20 @@ class QuantSentimentTests(unittest.TestCase):
         source = (ROOT / "plugins" / "engine" / "python" / "engine.py").read_text(encoding="utf-8")
         self.assertIn('"--sentiment"', source)
         self.assertIn("include_sentiment=getattr(args, \"sentiment\", False)", source)
+
+
+class _FakeResponse:
+    def __init__(self, body):
+        self._body = body
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
 
 
 def _synthetic_frame():

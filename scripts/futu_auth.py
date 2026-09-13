@@ -29,6 +29,7 @@ DSH_HOME = Path(os.environ.get("DSH_HOME", Path.home() / ".dsh"))
 TOKEN_FILE = DSH_HOME / "futu-token"
 REFRESH_FILE = DSH_HOME / "futu-refresh"
 CLIENT_FILE = DSH_HOME / "futu-client-id"
+EXPIRY_FILE = DSH_HOME / "futu-token-expiry"
 CALLBACK_PORT = 18923
 REDIRECT_URI = f"http://127.0.0.1:{CALLBACK_PORT}/callback"
 REGISTER_URL = "https://webapi.futunn.com/oauth2/register"
@@ -111,6 +112,24 @@ def touch_preset():
         warn("重启 harness 会话后，富途工具（mcp__futu__*）即可用。")
 
 
+def record_expiry(resp):
+    """记录 access_token 到期时刻。
+
+    实测 OAuth 响应 expires_in = 7200（2 小时）——很短，且过期时服务端对所有工具
+    返回 internal error 而不是 401。把它写下来，渠道状态页才能提前预警。
+    """
+    seconds = resp.get("expires_in")
+    if not seconds:
+        return None
+    from datetime import datetime, timedelta
+    moment = datetime.now() + timedelta(seconds=float(seconds))
+    try:
+        EXPIRY_FILE.write_text(moment.isoformat(timespec="seconds"))
+    except OSError:
+        pass
+    return moment
+
+
 def refresh_tokens():
     """用 refresh_token 换新 access_token（token 过期时免重新授权）。"""
     if not REFRESH_FILE.exists():
@@ -131,9 +150,11 @@ def refresh_tokens():
         os.chmod(TOKEN_FILE, 0o600)
     except OSError:
         pass
+    moment = record_expiry(resp)
     if resp.get("refresh_token"):
         REFRESH_FILE.write_text(resp["refresh_token"])
-    say("续期成功，token 已更新。")
+    moment = record_expiry(resp)
+    say("续期成功，token 已更新。" + (f"（有效期至 {moment:%H:%M}）" if moment else ""))
     touch_preset()
     return 0
 
@@ -223,6 +244,7 @@ def main():
         os.chmod(TOKEN_FILE, 0o600)
     except OSError:
         pass
+    moment = record_expiry(resp)
     if refresh:
         REFRESH_FILE.write_text(refresh)
         try:

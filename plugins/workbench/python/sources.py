@@ -74,8 +74,20 @@ def check(probe=True):
         valid, detail = probe_futu_token()
     else:
         valid, detail = (token_path.exists(), "未探测")
-    if valid is True:
+    if valid is True and not probe:
         status = "ok"
+    elif valid is True:
+        remaining = None
+        try:
+            from trading_datasource import futu_mcp
+            remaining = futu_mcp.seconds_until_expiry()
+        except Exception:  # noqa: BLE001
+            remaining = None
+        # access_token 实测只有 2 小时，快到期的"有效"需要提前预警
+        if remaining is not None and remaining <= 600:
+            status, detail = "warn", f"{detail} · 即将过期，下次调用会自动续期"
+        else:
+            status = "ok"
     elif valid is False:
         status = "fail"
     else:
@@ -84,8 +96,9 @@ def check(probe=True):
         "key": "futu", "label": "富途远程 MCP（行情/账户/交易）", "status": status,
         "detail": f"{detail} · token 更新于 {age_text(token_path) or '未知'}"
                   + (f" · refresh_token {'有' if refresh_path.exists() else '无'}" if token_path.exists() else ""),
-        "fix": "已过期时执行：python scripts/futu_auth.py --refresh（免交互续期）；"
-               "refresh 也失效才需重新完整授权：python scripts/futu_auth.py",
+        "fix": "access_token 有效期仅 2 小时，过期后调用会自动续期，通常无需手工处理；"
+               "自动续期也失败时执行：python scripts/futu_auth.py --refresh；"
+               "refresh_token 也失效才需重新完整授权：python scripts/futu_auth.py",
     })
 
     # 2) 社交渠道登录态（X 必取；Reddit 同配置）

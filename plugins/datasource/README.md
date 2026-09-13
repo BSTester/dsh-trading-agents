@@ -42,6 +42,23 @@ PYTHONPATH=plugins/datasource/python python plugins/workbench/python/bars.py --t
 > 该目录由安装器生成，仓库里的 `plugins/datasource/python` 是**唯一事实来源**；
 > 重装即刷新，因此不存在人工同步导致的漂移。
 
+## 富途返回信封与凭证续期
+
+服务端同时存在**两种返回信封**，必须都认：
+
+| 工具类别 | 信封 |
+|---|---|
+| 行情类 `quote_*` | `{"ret_code": 0, "data": {...}}` |
+| 账户类 `account_*` | `{"s": "ok", "d": {...}}` |
+
+只认一种会把另一种的成功响应判成失败——实测 `account_authorized_trd_accs` 因此报
+`ret=None None`，拿不到 `acc_id`，**持仓必然读不出来**。
+
+access_token 的官方有效期是 `expires_in = 7200`（2 小时）。过期时服务端对所有工具返回
+`internal error` 而**不是 401**，所以 `call_tool` 遇到该特征会先用 refresh_token 自动续期
+并重试一次（`auto_refresh=False` 可关闭）；续期成功会记下新的到期时刻供状态页显示。
+业务错误（如 `ret=-3 invalid parameter`）不会触发续期，避免掩盖真实原因。
+
 ## 刻意不做的两件事
 
 - **不 eager 导入子模块**。`import trading_datasource` 不会拉起 `urllib`/`ssl`；
@@ -51,8 +68,9 @@ PYTHONPATH=plugins/datasource/python python plugins/workbench/python/bars.py --t
 
 ## 测试
 
-`tests/test_data_layer.py`（离线，31 例）覆盖：单一实现断言（旧副本文件不得复活、
+`tests/test_data_layer.py`（离线，42 例）覆盖：单一实现断言（旧副本文件不得复活、
 MCP 端点不得再出现在别处、两插件必须解析到同一个函数对象）、路由优先级、
 全部数据源失败时必须报错而非返回空、富途错误语义（`"no data"` 是合法空结果而非异常）、
 凭证探测（`internal error` 不得被当作 token 有效）、跨插件定位缺失时返回 `None`、
-以及「带不带情绪，信号与 ATR 必须完全一致」这条可复现性性质。
+「带不带情绪，信号与 ATR 必须完全一致」这条可复现性性质，
+以及两种返回信封的解析与凭证自动续期（含"业务错误不得触发续期"）。
