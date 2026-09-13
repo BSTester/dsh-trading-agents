@@ -7,7 +7,14 @@ async function client() {
   let definition;
   const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
   vm.runInNewContext(source, { window: { __ModuleLoader__: { load: value => { definition = value; } } } });
-  const React = { createElement: (tag, props, ...children) => ({ tag, props, children }) };
+  // 假 React：组件在 node:test 里直接调用，hooks 只需可执行且返回合理值
+  const React = { Fragment: Symbol("Fragment"),
+    // children 只挂在节点上（不再复制进 props）：复制会让 JSON.stringify 把
+    // 子树输出两遍，"某字段出现几次"这类断言就会数错。
+    createElement: (tag, props, ...children) => ({ tag, props: props ?? {}, children }),
+    useState: (init) => [typeof init === "function" ? init() : init, () => {}],
+    useEffect: () => {}, useMemo: (fn) => fn(), useCallback: (fn) => fn,
+    useRef: (value) => ({ current: value }), useLayoutEffect: () => {} };
   return definition.factory(name => {
     assert.equal(name, "react");
     return React;
@@ -507,4 +514,140 @@ test("不再引用载荷里不存在的 broker.data.error 单数字段", async (
   // positions 载荷只有 errors 数组；单数 error 是死分支，会让人以为已处理整段失败
   assert.doesNotMatch(source, /broker\.data\?\.error\b/, "死分支应删除");
   assert.match(source, /broker\.data\?\.errors/, "部分账户失败仍应展示");
+});
+
+// ================= 研报 Markdown 渲染 =================
+
+const REPORT_MD = [
+  "# 腾讯控股（00700.HK）研究报告",
+  "",
+  "**评级：Hold** · 目标价区间 380–430 港元",
+  "",
+  "## 一、结论",
+  "",
+  "- 游戏：国内流水同比 +6%",
+  "- 广告：视频号加载率提升，但单价承压",
+  "  - 关键变量是 eCPM 而非库存",
+  "",
+  "1. 估值不具备安全边际",
+  "2. 回购提供下限支撑",
+  "",
+  "> 风险提示：宏观复苏不及预期。",
+  "",
+  "| 指标 | 2026E |",
+  "| --- | ---: |",
+  "| 营收 | 7120 |",
+  "",
+  "```python",
+  "pe = price / eps",
+  "```",
+  "",
+  "---",
+  "",
+  "详见 [富途行情](https://www.futunn.com/quote/HK.00700) 与 `pe` 口径。",
+].join("\n");
+
+test("研报 Markdown：块级结构解析正确", async () => {
+  const plugin = await client();
+  const blocks = plugin.internals.parseMarkdown(REPORT_MD);
+  const kinds = blocks.map((b) => b.type);
+  // 展开成本 realm 的数组：client 在 vm 里跑，deepEqual 会比较原型
+  assert.deepEqual([...kinds], ["heading", "paragraph", "heading", "list", "list", "quote",
+    "table", "code", "hr", "paragraph"]);
+  assert.equal(blocks[0].level, 1);
+  assert.equal(blocks[2].level, 2);
+  assert.equal(blocks[3].ordered, false);
+  assert.equal(blocks[4].ordered, true, "1. 2. 应识别为有序列表");
+  assert.equal(blocks[6].header.length, 2);
+  assert.equal(blocks[6].rows.length, 1);
+  assert.equal(blocks[7].lang, "python");
+});
+
+test("研报 Markdown：嵌套列表不得被拍平成同级", async () => {
+  const plugin = await client();
+  const blocks = plugin.internals.parseMarkdown(REPORT_MD);
+  const list = blocks.find((b) => b.type === "list" && !b.ordered);
+  assert.equal(list.items.length, 2, "子项不应变成第三个同级项");
+  assert.ok(list.items[1].sub, "第二项应带子列表");
+  assert.equal(list.items[1].sub.items.length, 1);
+  assert.equal(list.items[0].sub, undefined);
+});
+
+test("研报 Markdown：行内标记解析为节点而不是字面量", async () => {
+  const plugin = await client();
+  const blocks = plugin.internals.parseMarkdown("**加粗** *斜体* `code` [链接](https://a.com)");
+  const types = blocks[0].children.map((c) => c.type);
+  assert.deepEqual([...types], ["strong", "text", "em", "text", "code", "text", "link"]);
+  const link = blocks[0].children.find((c) => c.type === "link");
+  assert.equal(link.href, "https://a.com");
+  // 源码里不应残留标记符号
+  const rendered = JSON.stringify(plugin.internals.renderBlocks(blocks));
+  assert.doesNotMatch(rendered, /\*\*/, "不应残留 ** 标记");
+});
+
+test("研报 Markdown：危险链接与原始 HTML 一律当字面量，不构成注入", async () => {
+  const plugin = await client();
+  const { parseMarkdown, blocksToHtml, renderBlocks } = plugin.internals;
+  const blocks = parseMarkdown("[点我](javascript:alert(1))\n\n<script>alert(1)</script>\n\n[ok](https://x.com)");
+  const html = blocksToHtml(blocks);
+  assert.doesNotMatch(html, /href="javascript:/i, "javascript: 不能出现在 href 里");
+  assert.doesNotMatch(html, /<script>/, "原始 HTML 必须转义");
+  assert.match(html, /&lt;script&gt;/, "应转义成实体");
+  assert.match(html, /href="https:\/\/x\.com"/, "合法链接应保留");
+  const hrefs = JSON.stringify(renderBlocks(blocks)).match(/"href":"[^"]*"/g) ?? [];
+  assert.ok(hrefs.length >= 1, "合法链接应生成 href");
+  assert.ok(hrefs.every((row) => /^"href":"https?:/.test(row)), "href 只允许 http(s)");
+});
+
+test("研报 Markdown：表格与代码块按结构渲染", async () => {
+  const plugin = await client();
+  const { parseMarkdown, blocksToHtml } = plugin.internals;
+  const html = blocksToHtml(parseMarkdown(REPORT_MD));
+  assert.match(html, /<table><thead><tr><th>指标<\/th><th>2026E<\/th>/, "表头应成 th");
+  assert.match(html, /<tbody><tr><td>营收<\/td><td>7120<\/td>/, "表体应成 td");
+  assert.match(html, /<pre><code>pe = price \/ eps<\/code><\/pre>/, "代码块应保留原文");
+  assert.match(html, /<blockquote>/, "引用应成 blockquote");
+  assert.match(html, /<hr>/, "分隔线应成 hr");
+});
+
+test("研报 Markdown：正文为空时给出空态，不渲染空壳", async () => {
+  const plugin = await client();
+  const empty = plugin.internals.Markdown({ text: "   " });
+  assert.match(JSON.stringify(empty), /没有正文/);
+  assert.equal(plugin.internals.parseMarkdown("").length, 0);
+});
+
+test("研报详情用 Markdown 渲染，且新标签页复用同一份解析", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function ReportDetail("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /h\(Markdown, \{ text: report\.report \}\)/, "正文应走 Markdown 组件");
+  assert.doesNotMatch(text, /h\("pre", \{ className: "tw-pre" \}, report\.report\)/, "不应再是 <pre> 原样输出");
+  assert.match(text, /blocksToHtml\(parseMarkdown\(report\.report\)\)/, "新标签页应复用同一份解析");
+  // 排版样式必须存在，否则渲染出来仍是一堆裸标签
+  assert.match(source, /\.tw-md-table/, "缺少表格样式");
+  assert.match(source, /\.tw-md-quote/, "缺少引用样式");
+  assert.match(source, /\.tw-md-h1/, "缺少标题层级样式");
+  assert.match(source, /prefers-color-scheme:dark/, "独立页缺少深色适配");
+});
+
+test("研报 Markdown：渲染出的元素序列与样式类名正确", async () => {
+  const plugin = await client();
+  const blocks = plugin.internals.parseMarkdown([
+    "# 标题", "", "正文 **粗** 与 `代码`", "", "- 甲", "  - 甲一", "- 乙", "",
+    "| a | b |", "| --- | --- |", "| 1 | 2 |", "", "> 引用", "", "```js", "x", "```",
+  ].join("\n"));
+  const tree = plugin.internals.renderBlocks(blocks);
+  // 收集顶层标签与 class
+  const tags = tree.map((node) => `${node.tag}${node.props.className ? "." + String(node.props.className).split(" ")[0] : ""}`);
+  assert.deepEqual([...tags], ["h1.tw-md-h", "p.tw-md-p", "ul.tw-md-list",
+    "div.tw-md-table-wrap", "blockquote.tw-md-quote", "pre.tw-md-pre"]);
+  // 嵌套列表必须有子 ul，而不是拍平
+  const ul = tree.find((n) => n.tag === "ul");
+  const sub = JSON.stringify(ul).match(/"tag":"ul"/g) ?? [];
+  assert.equal(sub.length, 2, "子列表应渲染成嵌套的 ul");
+  // 独页导出同样保留结构
+  const html = plugin.internals.blocksToHtml(blocks);
+  assert.match(html, /<ul><li>甲<ul><li>甲一<\/li><\/ul><\/li><li>乙<\/li><\/ul>/, "嵌套结构应保留");
 });

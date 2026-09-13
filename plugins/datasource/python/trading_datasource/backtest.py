@@ -22,6 +22,8 @@ import math
 import sys
 from datetime import date
 
+from .market import MAX_BARS, is_a_share, to_futu_symbol  # noqa: E402  （A 股判定/符号归一的唯一实现）
+
 COMMISSION = 0.0003   # 双边佣金
 STAMP_TAX = 0.001     # 卖出印花税（A股）
 SLIPPAGE = 0.001      # 双边滑点
@@ -56,20 +58,46 @@ def validate_data(df):
     return df
 
 
+def _shortfall_note(data_start, requested_start):
+    """行情起点晚于请求起点时的说明；小差异只是节假日，不算异常。"""
+    from datetime import date as _date
+    try:
+        gap = (_date.fromisoformat(data_start) - _date.fromisoformat(requested_start)).days
+    except ValueError:
+        return ""
+    if gap <= 20:
+        return ""
+    return f"；请求起点 {requested_start} 早于可取到的最早行情，前 {gap} 天未参与回测"
+
+
+def bars_to_frame(bars, start=None):
+    """行情字典 → 校验过的日线 DataFrame（唯一的字典→表转换实现）。"""
+    import pandas as pd
+    frame = pd.DataFrame([{"date": b["t"], "open": b["o"], "high": b["h"],
+                           "low": b["l"], "close": b["c"], "volume": b["v"]} for b in bars])
+    if start is not None and not frame.empty:
+        frame = frame[frame["date"] >= start].reset_index(drop=True)
+    return frame
+
+
 def load_data(ticker, start, source):
-    """加载并校验日线 OHLCV；数据源错误向调用方传播。"""
+    """加载并校验日线 OHLCV。返回 (DataFrame, 实际使用的数据源标签)。
+
+    返回实际来源而不是请求值：面板上写 "auto" 等于没写 —— 用户无从知道这次
+    回测的行情到底来自富途、新浪还是 Yahoo，也就无法判断口径（复权方式不同）。
+    数据源错误向调用方传播。
+    """
     if source not in ("auto", "stooq", "synth", "yahoo", "sina", "akshare"):
         raise ValueError(f"Unsupported data source: {source}")
     if source == "auto":
-        # 统一行情入口：富途优先（全市场），A股长历史回退新浪。
-        import pandas as pd
+        # 统一行情入口：富途优先（全市场）；A 股长历史走新浪，港美股长历史走 Yahoo。
         from datetime import date as _date
         from .market import load_bars
         needed = max(120, int((_date.today() - _date.fromisoformat(start)).days * 0.72) + 40)
-        bars, _source, _stale = load_bars(ticker, "1d", min(needed, 900))
-        frame = pd.DataFrame([{"date": b["t"], "open": b["o"], "high": b["h"],
-                               "low": b["l"], "close": b["c"], "volume": b["v"]} for b in bars])
-        return frame[frame["date"] >= start].reset_index(drop=True)
+        # 上限取共享的 MAX_BARS（2000，约 8 年），而不是拍脑袋的 900：
+        # 否则请求 2010 年起的回测会被悄悄截到最近三年。
+        bars, used, _stale = load_bars(ticker, "1d", min(needed, MAX_BARS))
+        return bars_to_frame(bars, start), used
     if source == "stooq":
         import pandas as pd
         symbol = ticker.lower().replace("-", ".")
@@ -78,7 +106,7 @@ def load_data(ticker, start, source):
         df = df.rename(columns={"Date": "date", "Open": "open", "High": "high",
                                 "Low": "low", "Close": "close", "Volume": "volume"})
         df["date"] = df["date"].astype(str)
-        return validate_data(df)
+        return validate_data(df), "stooq"
     if source == "synth":
         import pandas as pd, numpy as np
         n = 300
@@ -92,18 +120,16 @@ def load_data(ticker, start, source):
             "high": np.maximum(open_, close) * 1.01,
             "low": np.minimum(open_, close) * 0.99,
             "close": close, "volume": 1e6,
-        }).round(4))
+        }).round(4)), "synth（合成数据，仅供自检）"
     if source == "yahoo":
-        import yfinance as yf
-        df = yf.download(ticker, start=start, progress=False, auto_adjust=True)
-        if df.columns.nlevels > 1:
-            df.columns = df.columns.get_level_values(0)
-        df = df.reset_index()
-        df = df.rename(columns={"Date": "date", "Open": "open", "High": "high",
-                                "Low": "low", "Close": "close", "Volume": "volume"})
-        return validate_data(df)
+        # 复用共享层的 Yahoo 实现与符号归一（港股的 Yahoo 代码是 4 位）
+        from .market import fetch_yahoo
+        bars, used = fetch_yahoo(ticker, "1d", 2000)
+        return bars_to_frame(bars, start), used
+    if not is_a_share(ticker):
+        raise ValueError(f"{source} 仅支持 A 股；{ticker} 请用 --source auto / yahoo")
     import akshare as ak
-    code = ticker.split(".")[0]
+    code = to_futu_symbol(ticker).split(".")[1]
     if source == "sina":
         prefix = {"6": "sh", "9": "sh", "4": "bj", "8": "bj"}.get(code[0], "sz")
         df = ak.stock_zh_a_daily(symbol=f"{prefix}{code}",
@@ -111,13 +137,13 @@ def load_data(ticker, start, source):
         df = df.rename(columns={"date": "date", "open": "open", "high": "high",
                                 "low": "low", "close": "close", "volume": "volume"})
         df["date"] = df["date"].astype(str)
-        return validate_data(df)
+        return validate_data(df), "akshare/sina"
     df = ak.stock_zh_a_hist(symbol=code, period="daily",
                             start_date=start.replace("-", ""), adjust="qfq")
     df = df.rename(columns={"日期": "date", "开盘": "open", "最高": "high",
                             "最低": "low", "收盘": "close", "成交量": "volume"})
     df["date"] = df["date"].astype(str)
-    return validate_data(df)
+    return validate_data(df), "akshare/东方财富"
 
 
 def ma(series, n):
@@ -238,9 +264,9 @@ def main():
     ap.add_argument("--rsi-sell", type=int, default=70)
     args = ap.parse_args()
 
-    df = load_data(args.ticker, args.start, args.source)
+    df, used_source = load_data(args.ticker, args.start, args.source)
     if len(df) < 60:
-        print(json.dumps({"error": f"数据不足（{len(df)} 条）"}))
+        print(json.dumps({"error": f"数据不足（{len(df)} 条）"}, ensure_ascii=False))
         return 1
 
     if args.strategy == "ma_cross":
@@ -256,7 +282,15 @@ def main():
     wins = [t for t in sells if t.get("return", 0) > 0]
 
     out = {
-        "ticker": args.ticker, "strategy": label, "source": args.source,
+        "ticker": args.ticker, "strategy": label,
+        # 实际来源，不是请求值：面板写 "auto" 等于没写，用户无从判断口径
+        "source": used_source, "requested_source": args.source,
+        "data_start": str(df["date"].iloc[0]), "data_end": str(df["date"].iloc[-1]),
+        "requested_start": args.start,
+        # 富途单次上限 370 根、各源历史长度不同，可能拿不到请求的全部区间；
+        # 静默缩短回测区间会让人以为覆盖了整段时间，必须显式说明。
+        "coverage_note": (f"实际行情区间 {df['date'].iloc[0]} → {df['date'].iloc[-1]}"
+                          + _shortfall_note(str(df["date"].iloc[0]), args.start)),
         "execution_source": EXECUTION_SOURCE,
         "execution_timing": "previous_bar_next_open",
         "end_position_policy": "mark_to_market_no_liquidation",

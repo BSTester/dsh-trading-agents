@@ -155,7 +155,8 @@ def read_sentiment(ticker, count=6):
 
 def compute_signal(ticker, strategy, fast=5, slow=20, rsi_buy=25, rsi_sell=75,
                    include_sentiment=False):
-    df = validate_data(load_data(ticker, "2023-01-01", "auto"))
+    df, _used = load_data(ticker, "2023-01-01", "auto")
+    df = validate_data(df)
     if strategy == "ma_cross":
         sig = ma_cross_signal(df, fast, slow)
     elif strategy == "rsi":
@@ -304,7 +305,8 @@ def equity(ledger, positions, quotes=None):
 
 
 def latest_price(ticker):
-    df = validate_data(load_data(ticker, "2025-01-01", "auto"))
+    df, _used = load_data(ticker, "2025-01-01", "auto")
+    df = validate_data(df)
     return float(df["close"].iloc[-1])
 
 

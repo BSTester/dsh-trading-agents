@@ -13,6 +13,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+# A 股判定只有一份实现：显式市场标注优先（000001.HK 是港股，不是平安银行）
+from trading_datasource.market import is_a_share  # noqa: E402
+
 
 def release_browser():
     """释放子脚本留存的浏览器（避免窗口/进程堆积）。"""
@@ -29,10 +32,6 @@ def release_browser():
         subprocess.run(exe + ["-c", cleanup], capture_output=True, text=True, timeout=30)
     except Exception:
         pass
-
-
-def is_a_share(ticker):
-    return bool(re.fullmatch(r"\d{6}", ticker.split(".")[0]))
 
 
 def x_sentiment(query, count):

@@ -84,6 +84,36 @@ window.__ModuleLoader__.load({
 .tw-empty{margin:0;color:var(--dsw-alias-label-tertiary,GrayText);font-size:12px}
 .tw-link{background:none;border:none;padding:0;cursor:pointer;font:inherit;font-weight:600;color:var(--dsw-alias-label-primary-bluish,LinkText);text-align:left}
 .tw-link:hover{text-decoration:underline}
+
+/* ---- 研报正文（Markdown）----
+   排版目标是"能读"：研报是长文，标题层级、列表缩进、表格边框、
+   代码块与引用的区分都要一眼可辨，而不是一堵等宽字体的墙。 */
+.tw-md{font-size:13px;line-height:1.75;color:var(--dsw-alias-label-primary,CanvasText);overflow-wrap:anywhere}
+.tw-md>*:first-child{margin-top:0}
+.tw-md>*:last-child{margin-bottom:0}
+.tw-md-h{margin:18px 0 8px;font-weight:650;line-height:1.35;letter-spacing:-0.01em}
+.tw-md-h1{font-size:19px;padding-bottom:6px;border-bottom:1px solid var(--dsw-alias-border-l1,GrayText)}
+.tw-md-h2{font-size:16px;padding-bottom:5px;border-bottom:1px solid var(--dsw-alias-border-l1,GrayText)}
+.tw-md-h3{font-size:14.5px}
+.tw-md-h4,.tw-md-h5,.tw-md-h6{font-size:13.5px;color:var(--dsw-alias-label-secondary,GrayText)}
+.tw-md-p{margin:9px 0}
+.tw-md-list{margin:9px 0;padding-left:22px}
+.tw-md-list li{margin:4px 0}
+.tw-md-list li::marker{color:var(--dsw-alias-label-tertiary,GrayText)}
+.tw-md-code{padding:1px 5px;border-radius:5px;font-size:12px;font-family:var(--ds-font-family-code,ui-monospace,Menlo,monospace);background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.14));border:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.22))}
+.tw-md-pre{position:relative;margin:11px 0;padding:12px 13px;border-radius:9px;overflow:auto;max-height:420px;font-size:12px;line-height:1.6;font-family:var(--ds-font-family-code,ui-monospace,Menlo,monospace);background:var(--dsw-alias-bg-base,Canvas);border:1px solid var(--dsw-alias-border-l1,GrayText)}
+.tw-md-pre code{white-space:pre;background:none;border:none;padding:0;font-size:inherit}
+.tw-md-lang{position:absolute;top:6px;right:10px;font-size:10px;letter-spacing:.06em;text-transform:uppercase;color:var(--dsw-alias-label-tertiary,GrayText)}
+.tw-md-quote{margin:11px 0;padding:2px 0 2px 13px;border-left:3px solid var(--dsw-alias-label-primary-bluish,LinkText);color:var(--dsw-alias-label-secondary,GrayText)}
+.tw-md-quote .tw-md-p{margin:6px 0}
+.tw-md-hr{margin:16px 0;border:none;border-top:1px solid var(--dsw-alias-border-l1,GrayText)}
+.tw-md-table-wrap{margin:11px 0;overflow-x:auto;border:1px solid var(--dsw-alias-border-l1,GrayText);border-radius:9px}
+.tw-md-table{width:100%;border-collapse:collapse;font-size:12.5px}
+.tw-md-table th{text-align:left;font-weight:650;padding:7px 10px;white-space:nowrap;background:var(--dsw-alias-bg-layer-2,rgba(127,127,127,.1))}
+.tw-md-table td{padding:7px 10px;border-top:1px solid var(--dsw-alias-border-l1,rgba(127,127,127,.22));vertical-align:top}
+.tw-md-table tbody tr:nth-child(even){background:var(--dsw-alias-bg-layer-1,rgba(127,127,127,.04))}
+.tw-md-link{color:var(--dsw-alias-label-primary-bluish,LinkText);text-decoration:none;border-bottom:1px solid color-mix(in srgb,currentColor 35%,transparent)}
+.tw-md-link:hover{border-bottom-color:currentColor}
 .tw-pager{display:flex;align-items:center;gap:10px;justify-content:center;padding-top:6px;border-top:1px solid var(--dsw-alias-border-l1,GrayText);margin-top:4px}
 .tw-toolcard{border:1px solid var(--dsw-alias-border-l1,GrayText);border-left:3px solid var(--dsw-alias-button-info-fill,Highlight);border-radius:8px;background:var(--dsw-alias-bg-layer-1,Canvas)}
 .tw-toolcard>summary{cursor:pointer;padding:8px 10px;font-size:12px;font-weight:600}
@@ -553,13 +583,15 @@ window.__ModuleLoader__.load({
     function ReportDetail({ report, onBack }) {
       const openInTab = () => {
         try {
-          const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${report.ticker} 研报</title>`
-            + `<style>body{font-family:system-ui,-apple-system,sans-serif;max-width:900px;margin:32px auto;padding:0 20px;line-height:1.6}`
-            + `pre{white-space:pre-wrap;background:#f6f8fa;padding:16px;border-radius:8px}`
-            + `h1{font-size:20px}ul{color:#555}</style></head><body>`
-            + `<h1>${report.ticker} · ${report.rating} · ${report.published_at}</h1>`
-            + `<pre>${String(report.report).replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]))}</pre>`
-            + `<h3>来源</h3><ul>${(report.sources || []).map((s) => `<li>${s.name} · ${s.as_of} · ${s.reference}</li>`).join("")}</ul>`
+          const esc = (value) => String(value).replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
+          const html = `<!DOCTYPE html><html><head><meta charset="utf-8"><title>${esc(report.ticker)} 研报</title>`
+            + `<style>${STANDALONE_CSS}</style></head><body>`
+            + `<header><h1>${esc(report.ticker)} · ${esc(report.rating)}</h1>`
+            + `<p class="meta">发布 ${esc(report.published_at)}${report.session_id ? ` · 会话 ${esc(report.session_id)}` : ""}</p></header>`
+            + `<article class="md">${blocksToHtml(parseMarkdown(report.report))}</article>`
+            + `<h2>数据来源</h2><ol class="sources">${(report.sources || []).map((src) =>
+              `<li><strong>${esc(src.name)}</strong><span>${esc(src.as_of)}</span><code>${esc(src.reference)}</code></li>`).join("")}</ol>`
+            + `<p class="foot">由 DeepSeek Harness 交易工作台导出 · 不构成投资建议</p>`
             + `</body></html>`;
           const url = URL.createObjectURL(new Blob([html], { type: "text/html" }));
           if (typeof window !== "undefined") window.open(url, "_blank", "noopener");
@@ -571,11 +603,309 @@ window.__ModuleLoader__.load({
           h("button", { type: "button", className: "tw-btn primary", onClick: openInTab }, "在新标签打开"),
           h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
           h("span", { className: "tw-meta" }, `${report.ticker} · ${report.published_at}`)),
-        h(Card, { title: "研报正文" }, h("pre", { className: "tw-pre" }, report.report)),
+        h(Card, { title: "研报正文" }, h(Markdown, { text: report.report })),
         h(Card, { title: "数据来源", count: (report.sources || []).length,
           empty: (report.sources || []).length ? undefined : "未记录来源" },
           h(Paged, { items: report.sources || [], pageSize: 8, empty: "未记录来源",
             render: (source, index) => h(Source, { key: index, source }) })));
+    }
+
+
+    /**
+     * 「在新标签打开」是脱离 Harness 的独立页面，拿不到主题令牌，
+     * 因此自带一套克制的配色，并跟随系统深色模式。
+     */
+    const STANDALONE_CSS = `
+:root{--fg:#1f2328;--muted:#656d76;--bg:#fff;--line:#d8dee4;--soft:#f6f8fa;--accent:#0969da}
+@media (prefers-color-scheme:dark){:root{--fg:#e6edf3;--muted:#9198a1;--bg:#0d1117;--line:#30363d;--soft:#161b22;--accent:#4493f8}}
+*{box-sizing:border-box}
+body{margin:0;padding:48px 24px 72px;background:var(--bg);color:var(--fg);
+  font:15px/1.75 system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif}
+header,article,h2,ol.sources,.foot{max-width:820px;margin-left:auto;margin-right:auto}
+header h1{margin:0 0 4px;font-size:26px;letter-spacing:-.02em}
+header .meta{margin:0 0 28px;color:var(--muted);font-size:13px}
+h2{font-size:15px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);
+  margin:44px auto 12px;padding-bottom:8px;border-bottom:1px solid var(--line)}
+h1,h2,h3,h4{line-height:1.35;font-weight:650}
+h1{font-size:22px;margin:30px 0 10px;padding-bottom:6px;border-bottom:1px solid var(--line)}
+h2{border-bottom:none}
+h3{font-size:17px;margin:26px 0 8px}
+p{margin:11px 0}
+ul,ol{padding-left:24px;margin:11px 0}
+li{margin:5px 0}
+code{font:12.5px/1.6 ui-monospace,SFMono-Regular,Menlo,monospace;background:var(--soft);
+  border:1px solid var(--line);border-radius:5px;padding:1px 5px}
+pre{background:var(--soft);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto}
+pre code{background:none;border:none;padding:0}
+blockquote{margin:14px 0;padding:2px 0 2px 16px;border-left:3px solid var(--accent);color:var(--muted)}
+hr{border:none;border-top:1px solid var(--line);margin:26px 0}
+table{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+th,td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+th{background:var(--soft);font-weight:650}
+tbody tr:nth-child(even){background:color-mix(in srgb,var(--soft) 55%,transparent)}
+a{color:var(--accent);text-decoration:none;border-bottom:1px solid color-mix(in srgb,currentColor 35%,transparent)}
+a:hover{border-bottom-color:currentColor}
+ol.sources{padding-left:20px;color:var(--muted);font-size:13.5px}
+ol.sources li{margin:8px 0}
+ol.sources strong{color:var(--fg);font-weight:600}
+ol.sources span{margin:0 8px}
+ol.sources code{font-size:11.5px}
+.foot{max-width:820px;margin:48px auto 0;padding-top:16px;border-top:1px solid var(--line);
+  color:var(--muted);font-size:12px}
+@media print{body{padding:0;color:#000;background:#fff}.foot{display:none}}
+`;
+
+    // ================= Markdown 渲染 =================
+    //
+    // 研报正文是 Markdown。此前直接塞进 <pre>：标题、列表、表格全成了源码，
+    // 一份结构化研报读起来是一堵墙。
+    //
+    // 不引第三方库（客户端没有打包器、也没有依赖），因此自己解析；
+    // 但**渲染成 React 元素而不是拼 HTML 字符串**：研报正文含用户/模型产出，
+    // 拼字符串再 innerHTML 等于开一个注入口子。
+    //
+    // 支持：标题、段落、有序/无序列表（含嵌套）、围栏代码块、引用、分隔线、
+    //       表格、`粗体` *斜体* `行内代码` [链接](url)。
+    // 不支持：原始 HTML（按字面转义）、图片（研报不放图）。
+
+    /** 行内解析：文本 → 行内节点数组。 */
+    function parseInline(text) {
+      const nodes = [];
+      const push = (node) => nodes.push(node);
+      let buffer = "";
+      const flush = () => { if (buffer) { push({ type: "text", value: buffer }); buffer = ""; } };
+      // 依次匹配：代码、链接、粗体、斜体。代码优先，避免 `**a**` 被当成粗体。
+      const pattern = /(`[^`]+`)|(\[[^\]]*\]\([^)\s]+\))|(\*\*[^*]+\*\*)|(__[^_]+__)|(\*[^*\n]+\*)|(_[^_\n]+_)/;
+      let rest = String(text ?? "");
+      while (rest.length > 0) {
+        const match = pattern.exec(rest);
+        if (!match) { buffer += rest; break; }
+        buffer += rest.slice(0, match.index);
+        flush();
+        const token = match[0];
+        if (token.startsWith("`")) {
+          push({ type: "code", value: token.slice(1, -1) });
+        } else if (token.startsWith("[")) {
+          const split = token.indexOf("](");
+          const href = token.slice(split + 2, -1);
+          // 只允许安全协议，挡掉 javascript: 之类
+          const safe = /^(https?:|mailto:|\/|#)/i.test(href) ? href : null;
+          if (safe) push({ type: "link", href: safe, children: parseInline(token.slice(1, split)) });
+          else push({ type: "text", value: token });
+        } else if (token.startsWith("**") || token.startsWith("__")) {
+          push({ type: "strong", children: parseInline(token.slice(2, -2)) });
+        } else {
+          push({ type: "em", children: parseInline(token.slice(1, -1)) });
+        }
+        rest = rest.slice(match.index + token.length);
+      }
+      flush();
+      return nodes;
+    }
+
+    /** 表格分隔行：| --- | :--: | */
+    const TABLE_DIVIDER = /^\s*\|?\s*:?-{2,}:?\s*(\|\s*:?-{2,}:?\s*)*\|?\s*$/;
+    const splitRow = (line) => line.replace(/^\s*\|/, "").replace(/\|\s*$/, "").split("|").map((cell) => cell.trim());
+
+    const LIST_ITEM = /^(\s*)([-*+]|\d+[.)])\s+(.*)$/;
+
+    /**
+     * 解析一个列表（含嵌套）。缩进更深的项作为上一项的子列表，
+     * 而不是拍平成同级——拍平会让"关键变量是 eCPM 而非库存"这种
+     * 补充说明看起来和主结论平级，改变语义。
+     */
+    function parseList(lines, start, baseIndent) {
+      const items = [];
+      let index = start;
+      const ordered = /\d/.test(LIST_ITEM.exec(lines[start])[2]);
+      while (index < lines.length) {
+        const item = LIST_ITEM.exec(lines[index]);
+        if (!item || item[1].length !== baseIndent) break;
+        const parts = [item[3]];
+        index += 1;
+        // 续行：比本项缩进更深、且不是新的列表项
+        while (index < lines.length && lines[index].trim()
+               && !LIST_ITEM.test(lines[index])
+               && lines[index].length - lines[index].trimStart().length > baseIndent) {
+          parts.push(lines[index].trim()); index += 1;
+        }
+        const node = { children: parseInline(parts.join(" ")) };
+        const nested = index < lines.length ? LIST_ITEM.exec(lines[index]) : null;
+        if (nested && nested[1].length > baseIndent) {
+          const sub = parseList(lines, index, nested[1].length);
+          node.sub = sub.list;
+          index = sub.next;
+        }
+        items.push(node);
+      }
+      return { list: { type: "list", ordered, items }, next: index };
+    }
+
+    /**
+     * 块级解析：Markdown → 块节点数组。
+     * 纯函数、不碰 React，便于离线断言结构。
+     */
+    function parseMarkdown(text) {
+      const lines = String(text ?? "").replace(/\r\n?/g, "\n").split("\n");
+      const blocks = [];
+      let index = 0;
+      while (index < lines.length) {
+        const line = lines[index];
+        if (!line.trim()) { index += 1; continue; }
+        // 围栏代码块
+        const fence = /^\s*(```|~~~)\s*(\S*)\s*$/.exec(line);
+        if (fence) {
+          const marker = fence[1][0].repeat(3);
+          const body = [];
+          index += 1;
+          while (index < lines.length && !new RegExp(`^\\s*${marker}`).test(lines[index])) {
+            body.push(lines[index]); index += 1;
+          }
+          index += 1;   // 跳过收尾围栏
+          blocks.push({ type: "code", lang: fence[2] || "", text: body.join("\n") });
+          continue;
+        }
+        // 标题
+        const heading = /^(#{1,6})\s+(.*)$/.exec(line);
+        if (heading) {
+          blocks.push({ type: "heading", level: heading[1].length, children: parseInline(heading[2].trim()) });
+          index += 1; continue;
+        }
+        // 分隔线
+        if (/^\s*([-*_])(\s*\1){2,}\s*$/.test(line)) { blocks.push({ type: "hr" }); index += 1; continue; }
+        // 表格：表头 + 分隔行
+        if (line.includes("|") && index + 1 < lines.length && TABLE_DIVIDER.test(lines[index + 1])) {
+          const header = splitRow(line).map(parseInline);
+          const rows = [];
+          index += 2;
+          while (index < lines.length && lines[index].includes("|") && lines[index].trim()) {
+            rows.push(splitRow(lines[index]).map(parseInline)); index += 1;
+          }
+          blocks.push({ type: "table", header, rows });
+          continue;
+        }
+        // 引用（可多行）
+        if (/^\s*>\s?/.test(line)) {
+          const body = [];
+          while (index < lines.length && /^\s*>\s?/.test(lines[index])) {
+            body.push(lines[index].replace(/^\s*>\s?/, "")); index += 1;
+          }
+          blocks.push({ type: "quote", children: parseMarkdown(body.join("\n")) });
+          continue;
+        }
+        // 列表：按缩进分层（子项挂到上一项的 sub 上，拍平会丢层次）
+        const bullet = LIST_ITEM.exec(line);
+        if (bullet) {
+          const parsed = parseList(lines, index, bullet[1].length);
+          blocks.push(parsed.list);
+          index = parsed.next;
+          continue;
+        }
+        // 段落：连续非空行合并（Markdown 的软换行按空格处理）
+        const paragraph = [line.trim()];
+        index += 1;
+        while (index < lines.length && lines[index].trim()
+               && !/^(#{1,6})\s|^\s*(```|~~~)|^\s*>|^\s*([-*+]|\d+[.)])\s/.test(lines[index])
+               && !(lines[index].includes("|") && index + 1 < lines.length && TABLE_DIVIDER.test(lines[index + 1]))) {
+          paragraph.push(lines[index].trim()); index += 1;
+        }
+        blocks.push({ type: "paragraph", children: parseInline(paragraph.join(" ")) });
+      }
+      return blocks;
+    }
+
+    /** 行内节点 → React 元素。 */
+    function renderInline(nodes, keyPrefix) {
+      return (nodes ?? []).map((node, i) => {
+        const key = `${keyPrefix}-${i}`;
+        switch (node.type) {
+          case "strong": return h("strong", { key }, renderInline(node.children, key));
+          case "em": return h("em", { key }, renderInline(node.children, key));
+          case "code": return h("code", { key, className: "tw-md-code" }, node.value);
+          case "link": return h("a", { key, className: "tw-md-link", href: node.href,
+            target: "_blank", rel: "noopener noreferrer" }, renderInline(node.children, key));
+          default: return h(React.Fragment, { key }, node.value);
+        }
+      });
+    }
+
+    /** 块节点 → React 元素。 */
+    function renderBlocks(blocks, keyPrefix = "md") {
+      return (blocks ?? []).map((block, i) => {
+        const key = `${keyPrefix}-${i}`;
+        switch (block.type) {
+          case "heading": {
+            const level = Math.min(Math.max(block.level, 1), 6);
+            return h(`h${level}`, { key, className: `tw-md-h tw-md-h${level}` },
+              renderInline(block.children, key));
+          }
+          case "code":
+            return h("pre", { key, className: "tw-md-pre" },
+              block.lang ? h("span", { className: "tw-md-lang" }, block.lang) : null,
+              h("code", null, block.text));
+          case "quote":
+            return h("blockquote", { key, className: "tw-md-quote" },
+              renderBlocks(block.children, key));
+          case "hr":
+            return h("hr", { key, className: "tw-md-hr" });
+          case "list": {
+            const tag = block.ordered ? "ol" : "ul";
+            return h(tag, { key, className: "tw-md-list" },
+              block.items.map((item, j) => h("li", { key: `${key}-${j}` },
+                renderInline(item.children, `${key}-${j}`),
+                item.sub ? renderBlocks([item.sub], `${key}-${j}s`) : null)));
+          }
+          case "table": {
+            return h("div", { key, className: "tw-md-table-wrap" },
+              h("table", { className: "tw-md-table" },
+                h("thead", null, h("tr", null, block.header.map((cell, j) =>
+                  h("th", { key: `${key}-h${j}` }, renderInline(cell, `${key}-h${j}`))))),
+                h("tbody", null, block.rows.map((row, r) =>
+                  h("tr", { key: `${key}-r${r}` }, row.map((cell, c) =>
+                    h("td", { key: `${key}-r${r}c${c}` }, renderInline(cell, `${key}-r${r}c${c}`))))))));
+          }
+          default:
+            return h("p", { key, className: "tw-md-p" }, renderInline(block.children, key));
+        }
+      });
+    }
+
+    /** 块节点 → HTML 字符串（仅用于「在新标签打开」的独立文档）。 */
+    function blocksToHtml(blocks) {
+      const esc = (value) => String(value).replace(/[<>&]/g, (c) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;" }[c]));
+      const inline = (nodes) => (nodes ?? []).map((node) => {
+        switch (node.type) {
+          case "strong": return `<strong>${inline(node.children)}</strong>`;
+          case "em": return `<em>${inline(node.children)}</em>`;
+          case "code": return `<code>${esc(node.value)}</code>`;
+          case "link": return `<a href="${esc(node.href)}" target="_blank" rel="noopener noreferrer">${inline(node.children)}</a>`;
+          default: return esc(node.value);
+        }
+      }).join("");
+      return (blocks ?? []).map((block) => {
+        switch (block.type) {
+          case "heading": return `<h${block.level}>${inline(block.children)}</h${block.level}>`;
+          case "code": return `<pre><code>${esc(block.text)}</code></pre>`;
+          case "quote": return `<blockquote>${blocksToHtml(block.children)}</blockquote>`;
+          case "hr": return "<hr>";
+          case "list": {
+            const tag = block.ordered ? "ol" : "ul";
+            return `<${tag}>${block.items.map((item) => `<li>${inline(item.children)}`
+              + (item.sub ? blocksToHtml([item.sub]) : "") + "</li>").join("")}</${tag}>`;
+          }
+          case "table":
+            return `<table><thead><tr>${block.header.map((c) => `<th>${inline(c)}</th>`).join("")}</tr></thead>`
+              + `<tbody>${block.rows.map((row) => `<tr>${row.map((c) => `<td>${inline(c)}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+          default: return `<p>${inline(block.children)}</p>`;
+        }
+      }).join("\n");
+    }
+
+    /** 研报正文：解析一次，抽屉里渲染 React，新标签页渲染 HTML。 */
+    function Markdown({ text }) {
+      const blocks = React.useMemo(() => parseMarkdown(text), [text]);
+      if (!String(text ?? "").trim()) return h("p", { className: "tw-empty" }, "本篇研报没有正文");
+      return h("div", { className: "tw-md" }, renderBlocks(blocks));
     }
 
     /**
@@ -891,7 +1221,9 @@ window.__ModuleLoader__.load({
       const label = (base, subject) => (subject ? `${base}（${subject}）` : base);
       const btDetail = joinParts([btSubject,
         Number.isFinite(bt?.bars) ? `${bt.bars} 根日线` : "",
+        // 实际来源而不是请求值：auto 等于没写，用户无从判断复权口径
         bt?.source ? `数据源 ${bt.source}` : "",
+        bt?.data_start && bt?.data_end ? `区间 ${bt.data_start} → ${bt.data_end}` : "",
         latest?.at ? String(latest.at).slice(0, 16).replace("T", " ") : ""]);
 
       return h(React.Fragment, null,
@@ -909,6 +1241,8 @@ window.__ModuleLoader__.load({
             `台账回放：${replaySubject || "无标的"}`
             + `　｜　最近回测：${btDetail || "尚无回测预览"}`
             + (backtests.length > 1 ? `（共 ${backtests.length} 次回测记录，此处为最新一次）` : "")),
+          bt?.coverage_note && bt.requested_start && bt.data_start > bt.requested_start
+            && h("p", { className: "tw-alert" }, bt.coverage_note),
           h("div", { className: "tw-kv" },
             h(RiskMetricItem, { label: label("最大回撤 · 台账回放", replaySubject),
               value: percent(equity.data?.max_drawdown) }),
@@ -1463,6 +1797,7 @@ window.__ModuleLoader__.load({
     return { inject: ["slots", "connection"], apply, request,
       internals: { readCache, writeCache, invalidateCaches, KNOWN_ENDPOINTS, CLIENT_TTL_MS,
         Card, cardEmpty, numeric, percent, percentValue,
+        parseMarkdown, renderBlocks, blocksToHtml, Markdown, ReportDetail, Paged,
         barIndexAt, tooltipLeft, compactNumber,
         servedEndpoints: () => servedEndpoints, cacheSize: () => endpointCache.size,
         missingEndpoints: () => [...missingEndpoints] } };

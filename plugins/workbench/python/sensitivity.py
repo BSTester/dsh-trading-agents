@@ -73,7 +73,7 @@ def main():
     try:
         rows = grid(args.fast_grid if args.strategy == "ma_cross" else args.buy_grid)
         cols = grid(args.slow_grid if args.strategy == "ma_cross" else args.sell_grid)
-        df = load_data(args.ticker, args.start, args.source)
+        df, used_source = load_data(args.ticker, args.start, args.source)
         if len(df) < 60:
             raise ValueError(f"数据不足（{len(df)} 条）")
 

@@ -182,7 +182,7 @@ class IsolatedLedger(unittest.TestCase):
 
     def test_atr_accounts_for_previous_close_gap(self):
         df = bars((10, 20), (10, 20))
-        with patch.object(engine, "load_data", return_value=df), \
+        with patch.object(engine, "load_data", return_value=(df, "stub")), \
                 patch.object(engine, "rsi_signal", return_value=pd.Series([0, 0])):
             self.assertEqual(engine.compute_signal("600519", "rsi")["atr"], 6.5)
 
@@ -369,7 +369,8 @@ class BacktestRegression(unittest.TestCase):
                 backtest.run(bars(), lambda frame: pd.Series(values))
 
     def test_synthetic_ohlc_is_valid(self):
-        df = backtest.load_data("TEST", "2024-01-01", "synth")
+        df, used = backtest.load_data("TEST", "2024-01-01", "synth")
+        self.assertIn("synth", used, "必须回传实际来源，而不是请求值")
         self.assertTrue((df["high"] >= df[["open", "close"]].max(axis=1)).all())
         self.assertTrue((df["low"] <= df[["open", "close"]].min(axis=1)).all())
 

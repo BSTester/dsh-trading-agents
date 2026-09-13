@@ -38,6 +38,33 @@ for the requested market`。
 工作台的 A 股标的卡已按此降级：`quote_stock_quote` 失败后回退到 `quote_stock_basicinfo`
 与日线收盘，并在 `note` 里写明"实时快照不可用"。
 
+### 日线长历史：回测的市场覆盖
+
+富途 `quote_history_kline` **单次上限 370 根**，覆盖不了 2023 年起的日线（约 900 根）。
+行情路由按"谁能满足这次请求"排序，而不是无条件富途优先：
+
+| 市场 | 请求 ≤ 370 根 | 请求 > 370 根（长历史） |
+|---|---|---|
+| 沪深 A 股 | 富途 → 新浪 | **新浪**（AKShare）→ 富途 |
+| 港股 / 美股 | 富途 → Yahoo | **Yahoo**（复权）→ 富途 |
+
+- 港股在 Yahoo 是 **4 位**代码：`00700.HK` → `0700.HK`（写 5 位会返回空）。转换见
+  `market.to_yahoo_symbol`，只有一份实现。
+- 回测输出里的 `source` 是**实际使用的源**（`akshare/sina`、`yahoo/auto_adjusted`、
+  `futu/quote_history_kline`），另有 `requested_source`、`data_start`/`data_end` 与
+  `coverage_note`。请求区间拿不满时会明说，不要拿 `requested_source` 当口径。
+- 复权口径不同源不同（新浪 `qfq`、Yahoo `auto_adjust`、富途原始价），跨源比较收益率前先对齐口径。
+
+### A 股判定必须看显式市场标注
+
+`000001.HK` 是港股**长和**（约 70 港元），不是 A 股平安银行（约 10 元）。
+仅凭"点号前 6 位数字"判断 A 股会把 6 位港股代码当成 A 股：回测被路由到新浪、
+取到 `sz000001` 的行情，**静默回测了另一个标的**（价格差一个数量级，且不报错）。
+
+判定只有一份实现（`market.is_a_share`），其余模块（`events.py`/`fin_news.py`/
+`fin_sentiment.py`/`fundamentals.py`）一律 import 它，不再各写一份。
+裸 6 位数字仍按 A 股处理——它与港股无法区分，属已知约定。
+
 ## 三、上下文炸弹（无分页、单次返回极大）
 
 | 工具 | 规模 |

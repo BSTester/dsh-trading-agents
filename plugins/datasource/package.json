@@ -1,6 +1,6 @@
 {
   "name": "@bstester/dsh-datasource",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "private": true,
   "description": "统一数据层：唯一的富途 MCP 客户端、行情路由与回测核心（供 trading-engine / trading-workbench 共用）",
   "files": [

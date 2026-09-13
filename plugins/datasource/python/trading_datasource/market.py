@@ -32,7 +32,14 @@ MIN_BARS = 20
 
 
 def is_a_share(ticker):
-    return bool(re.fullmatch(r"\d{6}", str(ticker).split(".")[0]))
+    """A 股判定。
+
+    必须尊重**显式**市场标注：`000001.HK` 是港股长和，不是平安银行。
+    此前只看点号前的数字，于是 6 位港股代码被当成 A 股：回测被路由到新浪，
+    拿 `sz000001` 的行情算了一遍，静默回测了另一个标的（价格差了一个数量级）。
+    裸 6 位数字仍按 A 股处理（历史约定，无法与港股区分）。
+    """
+    return bool(re.fullmatch(r"(?:SH|SZ|BJ)\.[A-Z0-9.]+", to_futu_symbol(ticker)))
 
 
 def to_futu_symbol(ticker):
@@ -48,6 +55,25 @@ def to_futu_symbol(ticker):
     if re.fullmatch(r"\d{1,5}", text):  # 纯数字 1~5 位按港股代码处理（如 700 / 0700 / 00700）
         return f"HK.{text.zfill(5)}"
     return f"US.{text}"
+
+
+def to_yahoo_symbol(ticker):
+    """富途符号 → Yahoo 符号；无法映射返回 None。
+
+    Yahoo 的港股是 **4 位**代码（0700.HK）：拿 5 位的 00700.HK 去查会返回空。
+    这是唯一实现，fundamentals 也复用它，不再各存一份。
+    """
+    if not str(ticker or "").strip():
+        return None
+    symbol = to_futu_symbol(ticker)
+    market, _, code = symbol.partition(".")
+    if market == "HK":
+        return f"{code.lstrip('0').zfill(4)}.HK"
+    if market == "SH":
+        return f"{code}.SS"
+    if market in ("SZ", "BJ"):
+        return f"{code}.SZ"
+    return code
 
 
 def sina_symbol(code):
@@ -137,14 +163,51 @@ def fetch_a_share(ticker, period, limit):
     return bars, "akshare/sina"
 
 
+def fetch_yahoo(ticker, period, limit):
+    """港美股长历史通道（Yahoo，复权价）。
+
+    富途 quote_history_kline 单次上限 370 根，覆盖不了 2023 年起的日线；
+    Yahoo 可给 900+ 根。A 股不用它（新浪已够），因此只在港美股长历史时启用。
+    """
+    if period != "1d":
+        raise ValueError("Yahoo 通道仅用于日线长历史")
+    import yfinance as yf
+    symbol = to_yahoo_symbol(ticker)
+    if symbol is None:
+        raise ValueError("空标的无法映射到 Yahoo 代码")
+    frame = yf.download(symbol, period="max", progress=False, auto_adjust=True)
+    if frame is None or frame.empty:
+        raise RuntimeError(f"Yahoo 无 {symbol} 的日线数据")
+    if getattr(frame.columns, "nlevels", 1) > 1:
+        frame.columns = frame.columns.get_level_values(0)
+    bars = []
+    for stamp, row in frame.tail(limit).iterrows():
+        bars.append({"t": str(stamp)[:10],
+                     "o": round(float(row["Open"]), 4), "h": round(float(row["High"]), 4),
+                     "l": round(float(row["Low"]), 4), "c": round(float(row["Close"]), 4),
+                     "v": float(row.get("Volume") or 0)})
+    if not bars:
+        raise RuntimeError("Yahoo 返回空 K 线")
+    return bars, "yahoo/auto_adjusted"
+
+
 def route(ticker, period, limit):
     """返回 [(标签, 取数函数), ...] —— 渠道优先级只在这里定义一次。"""
-    if period == "1d" and is_a_share(ticker) and limit > FUTU_MAX_BARS:
-        return [("sina", lambda: fetch_a_share(ticker, period, limit)),
+    # 富途单次上限 370 根：请求更长历史时，富途根本无法满足，
+    # 因此长历史源排在前面（A 股新浪 / 港美股 Yahoo），富途作后备。
+    if period == "1d" and limit > FUTU_MAX_BARS:
+        if is_a_share(ticker):
+            return [("sina", lambda: fetch_a_share(ticker, period, limit)),
+                    ("futu", lambda: fetch_futu(ticker, period, limit))]
+        return [("yahoo", lambda: fetch_yahoo(ticker, period, limit)),
                 ("futu", lambda: fetch_futu(ticker, period, limit))]
     if is_a_share(ticker):
         return [("futu", lambda: fetch_futu(ticker, period, limit)),
                 ("sina", lambda: fetch_a_share(ticker, period, limit))]
+    # 港美股：Yahoo 只有日线，分钟级不得挂一个必然失败的通道
+    if period == "1d":
+        return [("futu", lambda: fetch_futu(ticker, period, limit)),
+                ("yahoo", lambda: fetch_yahoo(ticker, period, limit))]
     return [("futu", lambda: fetch_futu(ticker, period, limit))]
 
 

@@ -21,36 +21,9 @@ import re
 SOURCE_YAHOO = "yahoo/yfinance"
 SOURCE_AKSHARE = "akshare/东方财富"
 
-# Yahoo 的 A 股后缀
-_A_SUFFIX = {"SH": "SS", "SZ": "SZ", "BJ": "BJ"}
-
-
-def to_yahoo_symbol(ticker):
-    """把内部写法归一为 Yahoo 代码；无法映射返回 None。"""
-    text = str(ticker).strip().upper()
-    if not text:
-        return None
-    # 已是 MARKET.CODE
-    match = re.fullmatch(r"(SH|SZ|BJ|HK|US)\.([A-Z0-9.]+)", text)
-    if match:
-        market, code = match.group(1), match.group(2)
-    else:
-        # CODE.MARKET
-        match = re.fullmatch(r"([A-Z0-9.]+)\.(SH|SZ|BJ|HK|US)", text)
-        if match:
-            code, market = match.group(1), match.group(2)
-        elif re.fullmatch(r"\d{6}", text):
-            market, code = ("SH" if text[0] in "69" else "BJ" if text[0] in "48" else "SZ"), text
-        elif re.fullmatch(r"\d{1,5}", text):
-            market, code = "HK", text
-        else:
-            market, code = "US", text
-    if market == "HK":
-        # Yahoo 港股用 4 位代码：700 / 0700 / 00700 / 09988 → 0700.HK / 9988.HK
-        return f"{code.lstrip('0').zfill(4)}.HK"
-    if market in _A_SUFFIX:
-        return f"{code}.{_A_SUFFIX[market]}"
-    return code
+# 符号归一与 A 股判定都只有一份实现（见 market）：此前这里各存一份，
+# 两份对 000001.HK 的判断不一致，导致拿港股代码去取平安银行的报表。
+from .market import is_a_share, to_futu_symbol, to_yahoo_symbol  # noqa: E402,F401
 
 
 def _first_present(frame, names):
@@ -109,10 +82,10 @@ def from_yahoo(ticker):
 
 def from_akshare(ticker):
     """A 股的第二道备用（东方财富）。非 A 股返回 None。"""
-    text = str(ticker).strip().upper()
-    code = text.split(".")[0] if "." in text else text
-    if not re.fullmatch(r"\d{6}", code):
+    # 显式市场标注优先：000001.HK 是港股，不能拿它去取平安银行的资产负债表
+    if not is_a_share(ticker):
         return None
+    code = to_futu_symbol(ticker).split(".")[1]
     prefix = "SH" if code[0] in "69" else "BJ" if code[0] in "48" else "SZ"
     try:
         import akshare as ak

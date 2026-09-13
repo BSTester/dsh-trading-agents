@@ -12,15 +12,14 @@ import sys
 import urllib.parse
 import urllib.request
 
+# A 股判定只有一份实现：显式市场标注优先（000001.HK 是港股，不是平安银行）
+from trading_datasource.market import is_a_share  # noqa: E402
+
 
 def http_get(url, headers=None, timeout=15):
     req = urllib.request.Request(url, headers=headers or {"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", "replace")
-
-
-def is_a_share(ticker):
-    return bool(re.fullmatch(r"\d{6}", ticker.split(".")[0]))
 
 
 def futu_news(keyword, count, lang):

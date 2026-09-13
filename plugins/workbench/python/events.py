@@ -13,9 +13,8 @@ from datetime import date, datetime, timedelta
 
 sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent))
 
-
-def is_a_share(ticker):
-    return bool(re.fullmatch(r"\d{6}", str(ticker).split(".")[0]))
+# A 股判定只有一份实现：显式市场标注优先（000001.HK 是港股，不是平安银行）
+from trading_datasource.market import is_a_share  # noqa: E402
 
 
 def parse_date(value):

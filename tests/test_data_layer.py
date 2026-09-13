@@ -56,6 +56,33 @@ class SingleImplementationTests(unittest.TestCase):
         self.assertLess(len(engine_shim.splitlines()), 30,
                         "engine 的 backtest.py 应是薄入口，不应再含实现")
 
+    def test_a_share_detection_exists_only_in_shared_layer(self):
+        """A 股判定只能有一份实现。
+
+        此前 events.py / fin_news.py / fin_sentiment.py / fundamentals.py 各写一份
+        `re.fullmatch(r"\d{6}", ticker.split(".")[0])`：全都忽略显式市场标注，
+        于是 000001.HK（港股长和）被当成 A 股平安银行。
+        """
+        offenders = []
+        for path in (ROOT / "plugins").rglob("*.py"):
+            if "datasource" in path.parts or "__pycache__" in path.parts:
+                continue
+            if "is_a_share" in path.read_text(encoding="utf-8") and "def is_a_share" in path.read_text(encoding="utf-8"):
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual(offenders, [], "这些文件自带了 is_a_share，应 import 共享实现")
+
+    def test_yahoo_symbol_conversion_exists_only_in_shared_layer(self):
+        """富途↔Yahoo 符号归一也只能有一份（港股 4 位 vs 5 位最容易写错）。"""
+        offenders = []
+        for path in (ROOT / "plugins").rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            if path.name == "market.py" and "datasource" in path.parts:
+                continue
+            if "def to_yahoo_symbol" in path.read_text(encoding="utf-8"):
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual(offenders, [], "这些文件自带了 to_yahoo_symbol，应 import 共享实现")
+
     def test_futu_mcp_client_exists_only_in_shared_layer(self):
         """富途 JSON-RPC 握手此前有 4 份实现，现在只允许共享层持有。"""
         self.assertFalse((ROOT / "plugins" / "workbench" / "python" / "futu_client.py").exists())
@@ -103,8 +130,42 @@ class RoutingTests(unittest.TestCase):
 
     def test_non_a_share_has_no_sina_fallback(self):
         """港美股没有 A 股专属的新浪通道，不应假装有备用源。"""
-        self.assertEqual(self.labels("00700.HK", "1d", 900), ["futu"])
-        self.assertEqual(self.labels("AAPL", "1d", 900), ["futu"])
+        for ticker in ("00700.HK", "AAPL"):
+            self.assertNotIn("sina", self.labels(ticker, "1d", 900), ticker)
+            self.assertNotIn("sina", self.labels(ticker, "1d", 250), ticker)
+
+    def test_non_a_share_long_history_goes_yahoo_first(self):
+        """港美股超过富途单次上限时走 Yahoo 长历史（富途最多 370 根，给不了）。"""
+        for ticker in ("00700.HK", "AAPL"):
+            self.assertEqual(self.labels(ticker, "1d", market.FUTU_MAX_BARS + 1),
+                             ["yahoo", "futu"], ticker)
+            self.assertEqual(self.labels(ticker, "1d", market.FUTU_MAX_BARS),
+                             ["futu", "yahoo"], ticker)
+
+    def test_yahoo_channel_is_daily_only(self):
+        """Yahoo 没有分钟数据，不得把必然失败的通道挂在分钟级上。"""
+        for ticker in ("00700.HK", "AAPL"):
+            self.assertEqual(self.labels(ticker, "5m", 300), ["futu"], ticker)
+
+    def test_a_share_is_detected_by_explicit_market_not_digit_count(self):
+        """000001.HK 是港股长和，不是平安银行。
+
+        此前 is_a_share 只看点号前的数字，6 位港股代码被判定成 A 股：
+        回测被路由到新浪、取到 sz000001 的行情，静默跑了一遍另一个标的。
+        """
+        for ticker in ("00700.HK", "000001.HK", "00001.HK", "09988.HK", "AAPL", "TSLA"):
+            self.assertFalse(market.is_a_share(ticker), ticker)
+        for ticker in ("600519", "000001", "000001.SZ", "688981", "SH.600519", "300750"):
+            self.assertTrue(market.is_a_share(ticker), ticker)
+
+    def test_yahoo_symbol_conversion(self):
+        """Yahoo 的港股是 4 位代码，直接拿 5 位去查会返回空。"""
+        self.assertEqual(market.to_yahoo_symbol("00700.HK"), "0700.HK")
+        self.assertEqual(market.to_yahoo_symbol("00001.HK"), "0001.HK")
+        self.assertEqual(market.to_yahoo_symbol("09988.HK"), "9988.HK")
+        self.assertEqual(market.to_yahoo_symbol("AAPL"), "AAPL")
+        self.assertEqual(market.to_yahoo_symbol("600519"), "600519.SS")
+        self.assertEqual(market.to_yahoo_symbol("000001"), "000001.SZ")
 
     def test_load_bars_rejects_unknown_period(self):
         with self.assertRaises(ValueError):
@@ -113,7 +174,9 @@ class RoutingTests(unittest.TestCase):
     def test_load_bars_falls_back_to_cache_and_marks_stale(self):
         cached = {"bars": [{"t": "2026-01-01", "o": 1, "h": 2, "l": 0.5, "c": 1.5, "v": 10}],
                   "source": "futu/quote_history_kline"}
-        with patch.object(market, "fetch_futu", side_effect=RuntimeError("boom")):
+        # 路由里港美股日线有 futu 与 yahoo 两条通道，必须都失败才谈得上"全部失败"
+        with patch.object(market, "fetch_futu", side_effect=RuntimeError("boom")), \
+                patch.object(market, "fetch_yahoo", side_effect=RuntimeError("boom")):
             bars, source, stale = market.load_bars("AAPL", "1d", 30, cached=cached)
         self.assertEqual(bars, cached["bars"])
         self.assertTrue(stale, "全部数据源失败时必须标记 stale")
@@ -121,7 +184,8 @@ class RoutingTests(unittest.TestCase):
 
     def test_load_bars_raises_when_every_source_fails(self):
         """没有缓存又全部失败时，必须报错 —— 不能返回空列表冒充「无行情」。"""
-        with patch.object(market, "fetch_futu", side_effect=RuntimeError("boom")):
+        with patch.object(market, "fetch_futu", side_effect=RuntimeError("boom")), \
+                patch.object(market, "fetch_yahoo", side_effect=RuntimeError("boom")):
             with self.assertRaises(RuntimeError):
                 market.load_bars("AAPL", "1d", 30)
 
@@ -451,7 +515,7 @@ class QuantSentimentTests(unittest.TestCase):
         engine = self._engine()
         frame = _synthetic_frame()
         payload = {"sources_status": {"x": "ok:api/graphql"}, "x": {"items": []}, "reddit": {"items": []}}
-        with patch.object(engine, "load_data", return_value=frame):
+        with patch.object(engine, "load_data", return_value=(frame, "stub")):
             plain = engine.compute_signal("AAPL", "ma_cross")
             with patch.object(locate, "find_script", return_value=Path("fin_sentiment.py")), \
                  patch.object(locate, "run_script", return_value=payload):
