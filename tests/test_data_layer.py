@@ -532,5 +532,59 @@ class SkillGuidanceTests(unittest.TestCase):
         self.assertIn("没有任何 watcher", script)
 
 
+class InstallDocTests(unittest.TestCase):
+    """安装说明必须能被 AI 按字面执行到"完整安装"。
+
+    背景：方式 C 原先写着"如需完整工作台，运行 install.sh……三个插件"——
+    措辞把完整安装写成可选项，且插件数量已过时（实际 4 个）。
+    AI 照做就可能只装出 skill 基础模式，用户以为装全了。
+    """
+
+    def _readme(self):
+        return (ROOT / "README.md").read_text(encoding="utf-8")
+
+    def test_ai_instruction_demands_a_full_install(self):
+        text = self._readme()
+        section = text[text.index("方式 C · 让 AI 帮你装"):text.index("## 一键启动")]
+        self.assertIn("不要只装 skill 基础模式", section)
+        self.assertNotIn("如需完整工作台", section, "不得把完整安装写成可选项")
+
+    def test_ai_instruction_names_every_plugin(self):
+        text = self._readme()
+        section = text[text.index("方式 C · 让 AI 帮你装"):text.index("## 一键启动")]
+        for plugin in ("workbench", "fin-data", "trading-engine", "futu-keepalive"):
+            self.assertIn(plugin, section, f"安装说明漏了插件 {plugin}")
+        self.assertNotIn("三个插件", section, "插件数量已过时（实际 4 个）")
+
+    def test_ai_instruction_includes_the_self_check(self):
+        text = self._readme()
+        section = text[text.index("方式 C · 让 AI 帮你装"):text.index("## 一键启动")]
+        self.assertIn("install_plugins.py", section)
+        self.assertIn("check", section)
+        self.assertIn("✅ 安装完整", section, "缺少可验收的通过标准")
+
+    def test_ai_instruction_tells_the_user_to_restart(self):
+        text = self._readme()
+        section = text[text.index("方式 C · 让 AI 帮你装"):text.index("## 一键启动")]
+        self.assertIn("重启 dsh web", section, "Host 插件需重启才加载，必须写进说明")
+
+    def test_documented_plugin_list_matches_the_installer(self):
+        """文档里列的插件必须与安装器的 PLUGINS 完全一致，避免再次过时。"""
+        import importlib.util
+        spec = importlib.util.spec_from_file_location(
+            "install_plugins_doc", ROOT / "scripts" / "install_plugins.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        # 文档用的是展示名，与安装器的目录名不完全一致（engine → trading-engine）
+        display = {"workbench": "workbench", "fin-data": "fin-data",
+                   "engine": "trading-engine", "futu-keepalive": "futu-keepalive"}
+        self.assertEqual(set(display), set(module.PLUGINS),
+                         "新增插件后要同步这里的展示名映射")
+        text = self._readme()
+        section = text[text.index("方式 C · 让 AI 帮你装"):text.index("## 一键启动")]
+        for plugin in module.PLUGINS:
+            self.assertIn(display[plugin], section, f"文档漏了安装器实际会装的插件：{plugin}")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

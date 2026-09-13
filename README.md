@@ -58,16 +58,44 @@ git clone https://github.com/BSTester/dsh-trading-agents && cd dsh-trading-agent
 git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents; .\install.ps1
 ```
 
-**方式 C · 让 AI 帮你装**——把下面这段话直接发给你正在使用的 DeepSeek Harness 会话即可：
+**方式 C · 让 AI 帮你装**——把下面这段话直接发给你正在使用的 DeepSeek Harness 会话。
+
+> 实测：按下面的步骤走完，会装出 **2 个 skill + 4 个插件 + 统一数据层 + Python 依赖**，
+> 并以自检「✅ 安装完整」为准。`install.sh` 会自行把 preset 克隆到用户 preset 目录，
+> 因此**不需要你手动克隆**。
 
 ```text
-请帮我安装 dsh-trading-agents 对话模式：
-1. 把 https://github.com/BSTester/dsh-trading-agents 克隆到本机的 Harness 用户 preset 目录
-   （$HOME/.dsh/.agent-presets/dsh-trading-agents，Windows 为 %USERPROFILE%\.dsh\.agent-presets\...；已存在则 git pull 更新）
-2. 检查该目录下是否有 agent.cordis.yml、preset.yml 和 skills/trading-agents/SKILL.md，逐一确认存在
-3. 如需完整工作台，运行 install.sh（Windows：install.ps1），安装依赖及三个插件；
-   富途 OAuth 由安装向导处理，也可暂时不授权，以公开数据降级使用
-4. 完成后告诉我如何启动（dsh web → 新建会话 → 选「交易智囊模式」）
+请帮我完整安装 dsh-trading-agents。这是"对话模式 + 全部插件"的完整安装，不要只装 skill 基础模式。
+按下面四步做，每一步都要看到预期结果再继续：
+
+1) 克隆仓库并运行完整安装器：
+     git clone https://github.com/BSTester/dsh-trading-agents /tmp/dsh-trading-agents
+     bash /tmp/dsh-trading-agents/install.sh
+   Windows 用 powershell -File /tmp/dsh-trading-agents/install.ps1
+   它会：把 preset 装到 $HOME/.dsh/.agent-presets/dsh-trading-agents（Windows 为
+   %USERPROFILE%\.dsh\...）、安装 workbench / fin-data / trading-engine / futu-keepalive
+   四个插件、解出统一数据层并注入交易 venv、创建 venv 并安装 akshare 与 playwright。
+   预期最后一行为「重启 dsh web → 新建会话 → 选择「交易智囊模式」…」。
+   ⚠️ 过程中会弹出富途授权页（OAuth）等你确认。此刻不想授权就让它跳过，
+     之后随时可以补：python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py
+
+2) 运行安装自检，必须看到「✅ 安装完整」：
+     python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/install_plugins.py" check \
+       --repo "$HOME/.dsh/.agent-presets/dsh-trading-agents" --dsh-home "$HOME/.dsh"
+   自检会逐项核对 preset 各行的启用状态、四个插件、统一数据层与 .pth。
+   若报出问题，按它给出的修复命令处理后重跑，直到通过为止。
+
+3) 确认 preset 目录下有 agent.cordis.yml、preset.yml、skills/trading-agents/SKILL.md。
+
+4) 把这三件事告诉我：安装结果、第 2 步的自检输出原文、以及怎么启动
+   （重启 dsh web → 新建会话 → 选「交易智囊模式」）。
+```
+
+**更短的说法**（把细节交给 AI 按仓库文档执行）：
+
+```text
+请按 https://github.com/BSTester/dsh-trading-agents 的 README「方式 C」完整安装
+（要装全部插件，不要只装 skill 基础模式），完成后运行安装器自检并把输出发我。
 ```
 
 ## 一键启动
