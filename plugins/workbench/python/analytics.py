@@ -18,7 +18,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bars import fetch_a_share, is_a_share  # noqa: E402
+from bars import load_bars  # noqa: E402
 
 DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
 LEDGER = DSH / "quant-ledger.json"
@@ -42,10 +42,11 @@ def load_ledger(mode):
 
 
 def daily_closes(ticker, window):
-    """取日线收盘序列 {date: close}（A股走新浪源）。"""
-    if not is_a_share(ticker):
-        raise RuntimeError(f"{ticker} 非 A 股，暂不支持日线序列")
-    bars, _source = fetch_a_share(ticker, "1d", window)
+    """取日线收盘序列 {date: close}（全市场：富途优先，A股长历史走新浪）。"""
+    limit = min(max(window, 80), 900)
+    bars, _source, _stale = load_bars(ticker, "1d", limit)
+    if not bars:
+        raise RuntimeError(f"{ticker} 无日线数据")
     return {b["t"]: b["c"] for b in bars}
 
 

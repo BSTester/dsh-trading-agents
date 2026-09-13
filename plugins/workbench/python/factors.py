@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from bars import fetch_a_share  # noqa: E402
+from bars import load_bars  # noqa: E402
 
 FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
                "liq_ratio": 1, "mdd_60": 1,
@@ -32,10 +32,12 @@ TRADING_DAYS = 252
 
 
 def closes_volumes(ticker, window, period="1d"):
-    bars, source = fetch_a_share(ticker, period, window)
+    """日线序列（全市场：富途优先；A股长历史走新浪）。"""
+    limit = min(max(window, 80), 900)
+    bars, source, stale = load_bars(ticker, period, limit)
     if len(bars) < 65:
         raise RuntimeError(f"{ticker} 日线不足（{len(bars)} 根）")
-    return bars, source
+    return bars, source + ("(缓存)" if stale else "")
 
 
 def rsi(values, n=14):

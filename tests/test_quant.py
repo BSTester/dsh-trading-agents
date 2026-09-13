@@ -419,3 +419,29 @@ class FactorValuationTests(unittest.TestCase):
             self.assertIsNotNone(row["score"], "估值缺失时价量因子仍应给出打分")
         self.assertEqual(ranked[0]["ticker"], "A", "动量/趋势更优的 A 应排前")
 
+class BarsSymbolTests(unittest.TestCase):
+    """富途符号归一化（离线）。"""
+
+    def _load(self):
+        spec = importlib.util.spec_from_file_location(
+            "wb_bars", Path(__file__).resolve().parent.parent / "plugins" / "workbench" / "python" / "bars.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_symbol_normalization(self):
+        bars = self._load()
+        cases = {
+            "600519": "SH.600519", "000001": "SZ.000001", "300750": "SZ.300750",
+            "430047": "BJ.430047", "00700.HK": "HK.00700", "700": "HK.00700",
+            "0700": "HK.00700", "AAPL": "US.AAPL", "US.AAPL": "US.AAPL", "SZ.000001": "SZ.000001",
+        }
+        for raw, expected in cases.items():
+            self.assertEqual(bars.to_futu_symbol(raw), expected, raw)
+
+    def test_ktype_mapping_covers_all_periods(self):
+        bars = self._load()
+        for period in ("1m", "5m", "15m", "30m", "60m", "1d"):
+            self.assertIn(period, bars.PERIOD_TO_FUTU_KTYPE, period)
+        self.assertLessEqual(bars.FUTU_MAX_BARS, 370, "富途单次上限为 370 根")
+

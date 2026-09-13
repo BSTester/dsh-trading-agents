@@ -162,7 +162,9 @@
 | 估值因子 | ✅ 已交付 | 改用同花顺源 `ak.stock_value_em`（PE(TTM)/PB/PEG/PS）；实测茅台 PE 19.57/PB 6.34；低估值银行股在合成打分中升至前列 |
 | 质量因子（ROE/毛利率等） | ⬜ 未做 | 需财务指标源（`quote_financials_statements` 在 Harness 内可用） |
 | 权益日序列落盘 | ⬜ 未做 | 当前以台账成交回放重建（等价可用）；落盘可支持更长历史 |
-| 富途 K线工具排障 | ⚠️ 阻塞 | `quote_cur_kline`/`quote_history_kline` 所有符号格式+完整握手均 internal error（服务端；快照类正常） |
+| 富途 K线工具 | ✅ 已解决 | 此前判定为"服务端 internal error"，实为**参数格式错误**：`quote_history_kline` 需 `symbol`（`MARKET.CODE`，如 `SH.600519`/`HK.00700`/`US.AAPL`）+ `ktype` + `end`。修正后 **A股/港股/美股 × 1m/5m/15m/30m/60m/日线全部可用**（单次上限 370 根） |
+| 港美股分钟 K 线 | ✅ 已解决 | 随富途 K 线打通而具备：`bars.py` 优先走富途，A股长历史（>370 根）走新浪源 |
+| A股实时快照 | ⚠️ 权限受限 | `quote_stock_quote` 对 A股返回 `ret=-9 realtime quote permission required`；港股/美股正常。K线不受影响 |
 
 **测试覆盖**：42 Node + 54 Python 全绿（含端点参数白名单、子进程隔离、降级路径、恶意输入、估值因子方向与缺失容忍）。
 
