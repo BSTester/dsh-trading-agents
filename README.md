@@ -162,6 +162,21 @@ python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py"
 - 渠道状态页显示**剩余有效期**，剩余不足 10 分钟时给出预警；
 - 自动续期也失败才需要 `--refresh`；refresh_token 失效才需重新完整授权。
 
+### 授权范围的实测行为（重要）
+
+**请求的 `scope` 不构成权限上限。** 实测：脚本请求 `quote:read accid:* trade:read`（不含
+`trade:write`），而富途授权服务端最终下发的 scope 是：
+
+```
+quote:read quote:write trade:read trade:write accid:...
+```
+
+即**多授了 `trade:write`**。所以不要指望通过收窄 `scope` 参数来限制权限——真正的执行边界是
+本仓库自己的两层：**账户模式互斥（默认 sim）** + **Harness 原生实盘审批**。
+这带来一个必须知道的推论：模式守卫是**插件级**的，凭据本身允许写操作；
+若绕过插件直接以 HTTP 调券商接口（本仓库明令禁止），模式守卫不会拦你。请在授权页面上
+按需选择权限，并始终经由 Harness 的工具体系下单。
+
 **安全说明**：未设置模式时默认模拟盘；完整插件模式下有账户工具守卫与 Harness 原生实盘审批，
 会话仍需逐笔复述并确认订单。仅安装 skill 不具备插件级守卫。日常建议只授权只读 scope。
 

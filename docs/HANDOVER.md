@@ -95,6 +95,21 @@ PowerShell 安装器，也未启动完整 Harness Web。后续券商模拟订单
 显式传 `market=1` 后成功；市场编号必须取实际账户响应，不能照抄静态示例。
 部分业务失败的 MCP 外层仍是 `isError=false`，必须检查文本 JSON 的 `ret_code`。
 
+### 授权范围的实测行为（2026-09-13 重授权时发现）
+
+脚本请求的 scope 是 `quote:read accid:* trade:read`，但富途授权服务端下发的实际 scope 为
+`quote:read quote:write trade:read **trade:write** accid:...` —— **多授了交易写权限**。
+
+结论：**请求的 `scope` 不是权限上限**，不能靠收窄参数来限制能力。真正的执行边界只有两层，
+都在本仓库内：
+
+1. 账户模式互斥（`~/.dsh/trading-account-mode`，默认 sim，由 `policy.js` 强制）；
+2. Harness 原生实盘审批 + 会话内逐笔确认。
+
+必须交代的推论：模式守卫是**插件级**的。凭据本身允许下单，若有人绕过插件直接以
+HTTP/shell 调券商接口，模式守卫不会拦截——仓库文档明令禁止这种行为，但它是**约定**，
+不是技术强制。
+
 ## 五、尚未完成的能力
 
 | 缺口 | 必须如何描述 |
