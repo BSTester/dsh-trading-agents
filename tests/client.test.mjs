@@ -651,3 +651,57 @@ test("研报 Markdown：渲染出的元素序列与样式类名正确", async ()
   const html = plugin.internals.blocksToHtml(blocks);
   assert.match(html, /<ul><li>甲<ul><li>甲一<\/li><\/ul><\/li><li>乙<\/li><\/ul>/, "嵌套结构应保留");
 });
+
+// ================= 结论中文化 =================
+
+test("结论性字段一律以中文呈现，旧记录也要翻过来", async () => {
+  const plugin = await client();
+  const { zh, labeled } = plugin.internals;
+  // 新记录：产出侧已给中文标签，直接用
+  assert.equal(labeled("BUY", "买入", "SIGNAL"), "买入");
+  // 旧记录：只有英文码，必须按码翻译（此前界面上就是这些英文）
+  assert.equal(labeled("BUY", undefined, "SIGNAL"), "买入");
+  assert.equal(labeled("SELL", undefined, "ACTION"), "卖出");
+  assert.equal(labeled("HOLD", undefined, "SIGNAL"), "观望");
+  assert.equal(labeled("buy", undefined, "TRADE_TYPE"), "买入");
+  assert.equal(labeled("open", undefined, "TRADE_STATUS"), "持仓中");
+  assert.equal(labeled("closed", undefined, "TRADE_STATUS"), "已平仓");
+  // 评级：大小写都要认（历史上 Buy / buy 都出现过）
+  assert.equal(labeled("Buy", undefined, "RATING"), "买入");
+  assert.equal(labeled("Hold", undefined, "RATING"), "持有");
+  assert.equal(labeled("Underweight", undefined, "RATING"), "减持");
+  assert.equal(labeled("overweight", undefined, "RATING"), "增持");
+  // 数据源状态
+  assert.equal(labeled("ok", undefined, "SOURCE_STATUS"), "正常");
+  assert.equal(labeled("warn", undefined, "SOURCE_STATUS"), "待配置");
+  // 未知枚举原样返回，不静默吞掉
+  assert.equal(labeled("WHAT", undefined, "ACTION"), "WHAT");
+  assert.equal(zh("ACTION", null), undefined);
+});
+
+test("展示点不得直接渲染英文结论码", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  // 这些是把英文码直接塞进文案的写法，全部已改为 labeled(...) / zh(...)
+  assert.doesNotMatch(source, /`\$\{row\.action\} \$\{row\.shares\}/, "台账成交方向应走 labeled");
+  assert.doesNotMatch(source, /p\.value\?\.signal \?\? p\.kind/, "信号标签应走 labeled");
+  assert.doesNotMatch(source, /`📄 \$\{report\.ticker\} · \$\{report\.rating\}/, "研报评级应走 labeled");
+  assert.doesNotMatch(source, /· 来源 \$\{entry\.source\}/, "审计来源应走 source_label");
+  // 中文标签表必须存在且被使用
+  assert.match(source, /function labeled\(/, "缺少 labeled 助手");
+  assert.match(source, /labeled\(row\.action, row\.action_label, "ACTION"\)/, "台账成交未接线");
+  assert.match(source, /labeled\(p\.value\?\.signal, p\.value\?\.signal_label, "SIGNAL"/, "信号未接线");
+  assert.match(source, /labeled\(report\.rating, report\.rating_label, "RATING"\)/, "评级未接线");
+});
+
+test("风控参数显示中文名，并保留原键名便于对照配置文件", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /zh\("RISK_CONFIG", key\)/, "风控参数应显示中文名");
+  assert.match(source, /（\$\{key\}）/, "应保留原键名");
+});
+
+test("台账成交方向的中文标签由产出侧提供，客户端只做回退", async () => {
+  const source = await readFile(new URL("../plugins/workbench/python/analytics.py", import.meta.url), "utf8");
+  assert.match(source, /"action_label": trade\.get\("action_label"\) or action_label\(trade\["action"\]\)/,
+    "analytics 应为旧台账补中文标签");
+  assert.match(source, /from trading_datasource\.labels import action_label/, "应复用共享标签表");
+});

@@ -64,7 +64,8 @@ export function registerEngineTools(ctx, defineTool, quant = runQuant) {
     parameters: {
       run_id: { type: "string", required: true },
       ticker: { type: "string", required: true },
-      rating: { type: "string", required: true, enum: ["Buy", "Overweight", "Hold", "Underweight", "Sell"] },
+      rating: { type: "string", required: true, enum: ["Buy", "Overweight", "Hold", "Underweight", "Sell"],
+        description: "评级（接口枚举）。工作台按中文呈现：Buy=买入 Overweight=增持 Hold=持有 Underweight=减持 Sell=卖出；报告正文一律写中文结论。" },
       report: { type: "string", required: true, description: "完整 Markdown 研报，含现有持仓、频率、风险、数据不足及免责声明" },
       sources: { type: "array", required: true, items: {
         type: "object", additionalProperties: false, properties: {

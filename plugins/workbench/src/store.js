@@ -1,4 +1,5 @@
 import { summarizeBrokerActivity } from "./broker_trades.js";
+import { zh } from "./labels.js";
 import { randomUUID } from "node:crypto";
 import { closeSync, existsSync, mkdirSync, openSync, readFileSync, readdirSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import os from "node:os";
@@ -288,7 +289,10 @@ export class WorkbenchStore {
       if (run.mode !== this.readMode()) throw new WorkbenchError("Account mode changed; start a new research run");
       if (run.status !== "running") throw new WorkbenchError("Research run is already settled");
       if (run.ticker !== ticker) throw new WorkbenchError("Research ticker mismatch");
-      const result = { id: run.id, ticker, mode: run.mode, session_id: sessionId, rating: args.rating,
+      const result = { id: run.id, ticker, mode: run.mode, session_id: sessionId,
+        rating: args.rating,
+        // 评级码保留（枚举校验与历史记录都靠它），另存中文标签供界面与记忆使用
+        rating_label: zh("RATING", args.rating),
         report, sources, published_at: new Date().toISOString() };
       state.reports.push(result);
       run.status = "completed";

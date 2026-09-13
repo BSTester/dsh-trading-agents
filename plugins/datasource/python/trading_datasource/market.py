@@ -142,9 +142,16 @@ def fetch_futu(ticker, period, limit):
 
 
 def fetch_a_share(ticker, period, limit):
-    """A 股备用源（AKShare 的新浪通道）：日线可给长历史，分钟受接口限制。"""
+    """A 股备用源（AKShare 的新浪通道）：日线可给长历史，分钟受接口限制。
+
+    自身再判一次市场：调用方（route）已经判过，但这里的代码把
+    `ticker.split(".")[0]` 直接当 A 股代码拼 `sh/sz` 前缀——
+    一旦被误调（000001.HK → sz000001 = 平安银行），就会静默取到别的标的。
+    """
+    if not is_a_share(ticker):
+        raise ValueError(f"新浪通道仅支持 A 股：{ticker}")
     import akshare as ak
-    code = str(ticker).split(".")[0]
+    code = to_futu_symbol(ticker).split(".")[1]
     if period in PERIOD_TO_AKSHARE:
         frame = ak.stock_zh_a_minute(symbol=sina_symbol(code),
                                      period=PERIOD_TO_AKSHARE[period], adjust="qfq")

@@ -601,7 +601,8 @@ window.__ModuleLoader__.load({
         h("div", { className: "tw-toolbar" },
           h("button", { type: "button", className: "tw-btn", onClick: onBack }, "‹ 返回列表"),
           h("button", { type: "button", className: "tw-btn primary", onClick: openInTab }, "在新标签打开"),
-          h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
+          h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` },
+            labeled(report.rating, report.rating_label, "RATING")),
           h("span", { className: "tw-meta" }, `${report.ticker} · ${report.published_at}`)),
         h(Card, { title: "研报正文" }, h(Markdown, { text: report.report })),
         h(Card, { title: "数据来源", count: (report.sources || []).length,
@@ -654,6 +655,51 @@ ol.sources code{font-size:11.5px}
   color:var(--muted);font-size:12px}
 @media print{body{padding:0;color:#000;background:#fff}.foot{display:none}}
 `;
+
+    // ================= 中文标签 =================
+    //
+    // 结论性字段（信号/买卖/评级/状态）在产出侧已附 `*_label`，这里只做两件事：
+    //   1) 渲染时优先用产出侧的中文标签；
+    //   2) 旧记录（旧台账、旧预览、旧研报）没有标签字段，按码翻译，别让界面翻出英文。
+    //
+    // 表与 `plugins/datasource/python/trading_datasource/labels.py` 一致，由
+    // tests/test_labels.py 比对，防止两边漂移。client 是单文件、无法 import，只能内置。
+    const ZH = {
+      SIGNAL: { BUY: "买入", SELL: "卖出", HOLD: "观望" },
+      ACTION: { BUY: "买入", SELL: "卖出" },
+      SIDE: { 1: "买入", 2: "卖出" },
+      TRADE_TYPE: { buy: "买入", sell: "卖出" },
+      TRADE_STATUS: { open: "持仓中", closed: "已平仓" },
+      RATING: { Buy: "买入", Overweight: "增持", Hold: "持有", Underweight: "减持", Sell: "卖出" },
+      SOURCE_STATUS: { ok: "正常", warn: "待配置", fail: "异常", empty: "无数据" },
+      EXECUTION_TIMING: { previous_bar_next_open: "信号次一交易日开盘成交" },
+      END_POSITION_POLICY: { mark_to_market_no_liquidation: "按最后收盘价盯市，不强制平仓" },
+      EXECUTION_SOURCE: { local_simulation: "本地模拟（非券商成交）" },
+      RISK_CONFIG: { risk_per_trade: "单笔风险占权益比", stop_atr_mult: "ATR 止损倍数",
+        max_positions: "最大持仓数", max_position_pct: "单标的上限占权益比" },
+      METRIC: { total_return: "累计收益", annualized: "年化收益", sharpe: "夏普比率",
+        max_drawdown: "最大回撤", win_rate: "胜率" },
+      GRID_AXIS: { fast: "快线", slow: "慢线", rsi_buy: "买入阈值", rsi_sell: "卖出阈值" },
+      STRATEGY: { ma_cross: "双均线", rsi: "RSI" },
+    };
+
+    /** 按码翻译；大小写不敏感（历史记录里 BUY / buy / Buy 都出现过）。 */
+    function zh(table, value, fallback) {
+      const dict = ZH[table] ?? {};
+      if (value === null || value === undefined) return fallback;
+      if (Object.prototype.hasOwnProperty.call(dict, value)) return dict[value];
+      if (typeof value === "string") {
+        const hit = Object.keys(dict).find((key) => String(key).toLowerCase() === value.toLowerCase());
+        if (hit !== undefined) return dict[hit];
+      }
+      return fallback === undefined ? value : fallback;
+    }
+
+    /** 优先用产出侧给的中文标签，没有才按码翻译。 */
+    function labeled(value, label, table, fallback) {
+      if (typeof label === "string" && label.trim()) return label;
+      return zh(table, value, fallback);
+    }
 
     // ================= Markdown 渲染 =================
     //
@@ -1046,8 +1092,8 @@ ol.sources code{font-size:11.5px}
           h(Paged, { items: previews, pageSize: 8, empty: "暂无信号预览",
             render: (p) => h("details", { key: p.id, className: "tw-item" },
               h("summary", null,
-                h("span", { className: `tw-tag ${p.value?.signal === "BUY" ? "buy" : p.value?.signal === "SELL" ? "sell" : "hold"}` },
-                  p.value?.signal ?? p.kind),
+                h("span", { className: `tw-tag ${String(p.value?.signal ?? "").toUpperCase() === "BUY" ? "buy" : String(p.value?.signal ?? "").toUpperCase() === "SELL" ? "sell" : "hold"}` },
+                  labeled(p.value?.signal, p.value?.signal_label, "SIGNAL", p.kind)),
                 // 策略层就必须看得见「哪个标的、哪套策略」，否则条目无法归因
                 [p.value?.ticker, p.value?.strategy_label ?? p.value?.strategy]
                   .filter(Boolean).join(" · "),
@@ -1146,7 +1192,8 @@ ol.sources code{font-size:11.5px}
           count: 0, fallback: "不可用" }) },
         config && h("div", { className: "tw-kv" }, Object.entries(config).map(([key, value]) =>
           h("div", { key, className: "tw-kv-item" },
-            h("div", { className: "tw-kv-k" }, key),
+            // 中文名在前，原键名附在后面，便于对照 ~/.dsh/trading-risk.json
+            h("div", { className: "tw-kv-k" }, `${zh("RISK_CONFIG", key)}（${key}）`),
             h("div", { className: "tw-kv-v" }, String(value))))),
         h("p", { className: "tw-meta" }, `来源：${risk.data?.source ?? "—"}`),
         h("p", { className: "tw-hint" }, "参数由 scripts/risk_config 管理；引擎每次决策前读取，非法配置直接拒绝交易。"));
@@ -1408,7 +1455,8 @@ ol.sources code{font-size:11.5px}
           `${row.qty ?? "—"} 股 @ 委托 ${tradeMoney(row.price)} · `
           + `成交 ${row.filled_qty ?? "—"} 股 @ 均价 ${tradeMoney(row.avg_fill_price)}`),
         h("div", { className: "tw-meta" },
-          `成交金额 ${tradeMoney(row.amount)} · 订单号 ${row.order_id} · status=${row.status_code ?? "—"}`));
+          `成交金额 ${tradeMoney(row.amount)} · 订单号 ${row.order_id}`
+          + ` · 券商原始状态码 ${row.status_code ?? "—"}（未公开枚举含义，故原样保留）`));
     }
 
     /** 一行下单/改单/撤单动作。 */
@@ -1495,8 +1543,8 @@ ol.sources code{font-size:11.5px}
               count: rows.length, fallback: "暂无成交记录" }),
             render: (row, i) => h("div", { key: i, className: "tw-kv-item" },
               h("div", { className: "tw-kv-k" }, `${row.date} · ${row.ticker}`),
-              h("div", { className: "tw-kv-v", style: { color: row.action === "BUY" ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
-                `${row.action} ${row.shares} @ ${row.price}`),
+              h("div", { className: "tw-kv-v", style: { color: String(row.action).toUpperCase() === "BUY" ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
+                `${labeled(row.action, row.action_label, "ACTION")} ${row.shares} @ ${row.price}`),
               h("div", { className: "tw-meta" },
                 `费用 ${row.fee ?? "—"}${row.return !== undefined && row.return !== null ? ` · 收益 ${(row.return * 100).toFixed(2)}%` : ""}${row.reason ? ` · ${row.reason}` : ""}`)) }),
           trades.data && h("p", { className: "tw-meta" },
@@ -1530,18 +1578,18 @@ ol.sources code{font-size:11.5px}
             render: (report) => h("div", { key: report.id, className: "tw-item" },
               h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
                 h("button", { type: "button", className: "tw-link", onClick: () => onOpenReport(report) },
-                  `📄 ${report.ticker} · ${report.rating} · ${report.published_at}`),
+                  `📄 ${report.ticker} · ${labeled(report.rating, report.rating_label, "RATING")} · ${report.published_at}`),
                 h("div", { className: "tw-meta" }, (report.report || "").replace(/\s+/g, " ").slice(0, 120) + "…"))) })),
         h(Card, { title: "参数敏感性（样本内网格）" },
           h("div", { className: "tw-toolbar" },
             h("span", { className: "tw-meta" }, `标的 ${ticker}`),
             h("button", { type: "button", className: `tw-btn seg${strategy === "ma_cross" ? " active" : ""}`,
-              onClick: () => setStrategy("ma_cross") }, "双均线"),
+              onClick: () => setStrategy("ma_cross") }, zh("STRATEGY", "ma_cross")),
             h("button", { type: "button", className: `tw-btn seg${strategy === "rsi" ? " active" : ""}`,
-              onClick: () => setStrategy("rsi") }, "RSI"),
+              onClick: () => setStrategy("rsi") }, zh("STRATEGY", "rsi")),
             ["total_return", "sharpe", "max_drawdown", "win_rate"].map((m) =>
               h("button", { key: m, type: "button", className: `tw-btn seg${metric === m ? " active" : ""}`,
-                onClick: () => setMetric(m) }, m)),
+                onClick: () => setMetric(m) }, zh("METRIC", m))),
             h("button", { type: "button", className: "tw-btn primary", disabled: busy, onClick: runSensitivity },
               busy ? "计算中…" : "计算网格")),
           failure && h("p", { className: "tw-alert" }, `计算失败：${failure}`),
@@ -1549,8 +1597,10 @@ ol.sources code{font-size:11.5px}
           result && h(React.Fragment, null,
             h(HeatmapChart, { rowLabels: result.rows, colLabels: result.cols, matrix: result.matrix }),
             h("p", { className: "tw-meta" },
-              `行=${result.row_label} 列=${result.col_label} · 指标=${result.metric} · 样本 ${result.bars} 根（截至 ${result.as_of}）`),
-            h("p", { className: "tw-meta" }, `最优：${result.row_label}=${result.best.row}, ${result.col_label}=${result.best.col} → ${result.metric} ${result.best.value}（${result.best.trades} 笔 / 胜率 ${result.best.win_rate}）`),
+              `行=${zh("GRID_AXIS", result.row_label)} 列=${zh("GRID_AXIS", result.col_label)}`
+              + ` · 指标=${zh("METRIC", result.metric)} · 样本 ${result.bars} 根（截至 ${result.as_of}）`),
+            h("p", { className: "tw-meta" }, `最优：${zh("GRID_AXIS", result.row_label)}=${result.best.row}, ${zh("GRID_AXIS", result.col_label)}=${result.best.col}`
+              + ` → ${zh("METRIC", result.metric)} ${result.best.value}（${result.best.trades} 笔 / 胜率 ${result.best.win_rate}）`),
             h("p", { className: "tw-hint" }, result.note))));
     }
 
@@ -1582,7 +1632,8 @@ ol.sources code{font-size:11.5px}
               count: upcoming.length, fallback: "窗口内无即将发生的事件" }),
             render: (event, index) => line(event, index) }),
           events.data && h("p", { className: "tw-meta" },
-            `来源状态：${Object.entries(events.data.sources_status || {}).map(([k, v]) => `${k}=${v}`).join(" · ")}`)),
+            `来源状态：${Object.entries(events.data.sources_status || {})
+              .map(([k, v]) => `${k}=${labeled(v, undefined, "SOURCE_STATUS")}`).join(" · ")}`)),
         h(Card, { title: "近期已发生", count: past.length },
           h(Paged, { items: past, pageSize: 8, empty: "窗口内无历史事件",
             render: (event, index) => line(event, index) })),
@@ -1601,7 +1652,7 @@ ol.sources code{font-size:11.5px}
           render: (row) => h("div", { key: row.key, className: "tw-item" },
             h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
               h("span", { className: `tw-tag ${row.status === "ok" ? "buy" : row.status === "fail" ? "sell" : "hold"}` },
-                `${icon[row.status] ?? ""} ${row.label}`),
+                `${icon[row.status] ?? ""} ${row.label}（${labeled(row.status, row.status_label, "SOURCE_STATUS")}）`),
               h("div", { className: "tw-meta" }, row.detail),
               row.status !== "ok" && row.fix && h("div", { className: "tw-meta" }, `修复：${row.fix}`))) }),
         sources.data && h("p", { className: "tw-meta" },
@@ -1657,7 +1708,8 @@ ol.sources code{font-size:11.5px}
                       entry.linked
                         ? ` · 依据信号 ${entry.signal_id}（滞后 ${entry.lag_hours}h）`
                         : " · ⚠ 未找到对应信号"),
-                h("div", { className: "tw-meta" }, `${entry.detail} · 来源 ${entry.source}`)));
+                h("div", { className: "tw-meta" },
+                  `${entry.detail} · 来源 ${entry.source_label ?? entry.source}`)));
             } })),
         h(SourcesCard, { rpc, revision: snapshot.generated_at }),
         h("p", { className: "tw-hint" }, "审计仅记录 Harness 观察到的响应与本地台账；实盘成交请以券商成交查询为准。"));
@@ -1731,7 +1783,8 @@ ol.sources code{font-size:11.5px}
         h("aside", { className: `tw-drawer${open ? " open" : ""}`, role: "dialog", "aria-label": "交易工作台", "aria-hidden": !open },
           h("header", { className: "tw-top" },
             h("h2", { className: "tw-title" }, "交易工作台"),
-            snapshot && h("span", { className: `tw-badge${live ? " live" : ""}` }, live ? "实盘 LIVE" : "模拟盘 SIM"),
+            // 徽标也用中文：结论性字样一律中文，缩写留给代码
+            snapshot && h("span", { className: `tw-badge${live ? " live" : ""}` }, live ? "实盘" : "模拟盘"),
             snapshot && h("span", { className: "tw-meta" }, `更新 ${String(snapshot.generated_at).slice(11, 19)}`),
             h("span", { className: "tw-meta", title: "面板数据按 TTL 本地缓存，命中时不重新取数" },
               `本地缓存 ${cacheSize()} 项`),
@@ -1798,6 +1851,7 @@ ol.sources code{font-size:11.5px}
       internals: { readCache, writeCache, invalidateCaches, KNOWN_ENDPOINTS, CLIENT_TTL_MS,
         Card, cardEmpty, numeric, percent, percentValue,
         parseMarkdown, renderBlocks, blocksToHtml, Markdown, ReportDetail, Paged,
+        zh, labeled, ZH,
         barIndexAt, tooltipLeft, compactNumber,
         servedEndpoints: () => servedEndpoints, cacheSize: () => endpointCache.size,
         missingEndpoints: () => [...missingEndpoints] } };

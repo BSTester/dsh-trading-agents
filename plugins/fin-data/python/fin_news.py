@@ -13,7 +13,8 @@ import urllib.parse
 import urllib.request
 
 # A 股判定只有一份实现：显式市场标注优先（000001.HK 是港股，不是平安银行）
-from trading_datasource.market import is_a_share  # noqa: E402
+from trading_datasource.market import (  # noqa: E402
+    is_a_share, to_futu_symbol, to_yahoo_symbol)
 
 
 def http_get(url, headers=None, timeout=15):
@@ -37,15 +38,23 @@ def futu_news(keyword, count, lang):
 
 
 def akshare_news(ticker, count):
+    """A 股财经快讯（东财）。自身判市场，避免被误调后拿错标的的新闻。"""
+    if not is_a_share(ticker):
+        raise RuntimeError(f"东财快讯仅支持 A 股：{ticker}")
     import akshare as ak
-    df = ak.stock_news_em(symbol=ticker.split(".")[0])
+    df = ak.stock_news_em(symbol=to_futu_symbol(ticker).split(".")[1])
     rows = df.head(count).to_dict("records")
     return [{"source": "akshare", "title": r.get("新闻标题"),
              "url": r.get("新闻链接"), "time": str(r.get("发布时间"))} for r in rows]
 
 
 def yahoo_news(ticker, count):
-    symbol = ticker.upper()
+    """Yahoo RSS（港美股）。
+
+    必须走共享的符号归一：Yahoo 的港股是 4 位代码，直接拿 `00700.HK` 去查
+    返回 0 条（实测 `0700.HK` 有 17 条），港股快讯就只剩富途那一条。
+    """
+    symbol = to_yahoo_symbol(ticker) or ticker.upper()
     qs = urllib.parse.urlencode({"s": symbol, "region": "US", "lang": "en-US"})
     xml = http_get(f"https://feeds.finance.yahoo.com/rss/2.0/headline?{qs}")
     items = []

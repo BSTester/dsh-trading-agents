@@ -14,7 +14,7 @@ import sys
 from pathlib import Path
 
 # A 股判定只有一份实现：显式市场标注优先（000001.HK 是港股，不是平安银行）
-from trading_datasource.market import is_a_share  # noqa: E402
+from trading_datasource.market import is_a_share, to_futu_symbol  # noqa: E402
 
 
 def release_browser():
@@ -77,10 +77,14 @@ def reddit_sentiment(query, count):
 
 
 def a_share_comment(ticker):
+    """A 股千股千评（东财）。自身判市场，避免被误调后拿错标的的舆情。"""
+    if not is_a_share(ticker):
+        raise RuntimeError(f"千股千评仅支持 A 股：{ticker}")
     import akshare as ak
+    code = to_futu_symbol(ticker).split(".")[1]
     df = ak.stock_comment_em()
-    row = df[df["代码"].astype(str) == ticker.split(".")[0]
-             if "代码" in df.columns else df.iloc[:, 0].astype(str) == ticker.split(".")[0]]
+    row = df[df["代码"].astype(str) == code
+             if "代码" in df.columns else df.iloc[:, 0].astype(str) == code]
     if row.empty:
         raise RuntimeError("no comment row")
     r = row.tail(1).to_dict("records")[0]

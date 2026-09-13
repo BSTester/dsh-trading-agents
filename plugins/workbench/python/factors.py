@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from trading_datasource.market import load_bars  # noqa: E402
+from trading_datasource.market import is_a_share, load_bars  # noqa: E402
 
 FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
                "liq_ratio": 1, "mdd_60": 1,
@@ -114,9 +114,16 @@ def valuation_values(ticker):
     except Exception:
         pass
 
-    # ② 同花顺备用（A股，含 PEG）
+    # ② 同花顺备用（**仅 A 股**，含 PEG）
+    #
+    # 必须显式判市场：`ak.stock_value_em` 吃的是 A 股代码，
+    # `000001.HK`（港股长和）用 split(".")[0] 得到 "000001"，
+    # 正好是平安银行 —— 富途估值一旦取不到，就会把平安银行的 PE/PB
+    # 悄悄填进长和的因子行。此前这里没有任何市场判断。
     try:
         import akshare as ak
+        if not is_a_share(ticker):
+            raise RuntimeError("同花顺估值仅支持 A 股")
         df = ak.stock_value_em(symbol=str(ticker).split(".")[0])
         if df is not None and not df.empty:
             row = df.tail(1).to_dict("records")[0]

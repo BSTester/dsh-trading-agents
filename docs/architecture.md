@@ -1,5 +1,18 @@
 # 架构与交互边界
 
+## 结论性字段的中文标签
+
+结论（信号、买卖方向、评级、持仓状态、数据源状态、回测口径）在产出侧一律附
+`*_label` 中文标签，**机器码保留不动**（台账已落盘、逻辑在比较、旧记录要能读）。
+
+唯一事实来源是 `plugins/datasource/python/trading_datasource/labels.py`；
+`plugins/workbench/src/labels.js` 是 Host 侧镜像，`src/client.js` 里的 `ZH`
+是浏览器侧回退表（client 是单文件、无法 import）。三份表由
+`tests/test_labels.py` 解析比对，漂移即失败。
+
+回退表存在的唯一理由是**渲染历史记录**：旧台账/旧预览/旧研报里只有 `BUY`、
+`buy`、`open`、`Buy` 这类英文码，界面必须能翻成中文。
+
 ## 产品定位
 
 本项目是 **DeepSeek Harness 的对话模式与插件组合**，不是独立交易终端。

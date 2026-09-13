@@ -19,6 +19,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from trading_datasource.market import load_bars  # noqa: E402
+from trading_datasource.labels import action_label  # noqa: E402  （中文标签唯一事实来源）
 
 DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
 LEDGER = DSH / "quant-ledger.json"
@@ -229,11 +230,16 @@ def trades_view(mode="sim", limit=50):
     rows = []
     for trade in history[:limit]:
         rows.append({
-            "date": trade["date"], "action": trade["action"], "ticker": trade["ticker"],
+            "date": trade["date"], "action": trade["action"],
+            # 界面直接渲染这一行，中文标签必须由产出侧给（旧台账没有该字段，
+            # 客户端另有按码翻译的回退）
+            "action_label": trade.get("action_label") or action_label(trade["action"]),
+            "ticker": trade["ticker"],
             "shares": trade["shares"], "price": trade["price"],
             "fee": trade.get("fee"), "return": trade.get("return"),
             "reason": trade.get("reason"), "stop": trade.get("stop"),
             "execution_source": trade.get("execution_source"),
+            "execution_source_label": "本地模拟（非券商成交）",
         })
     sells = [r for r in rows if r["action"] == "SELL" and r.get("return") is not None]
     wins = [r for r in sells if (r["return"] or 0) > 0]

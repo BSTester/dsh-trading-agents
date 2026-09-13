@@ -391,9 +391,6 @@ class BacktestRegression(unittest.TestCase):
         self.assertEqual(outputs[0], outputs[1])
 
 
-if __name__ == "__main__":
-    unittest.main()
-
 class FactorValuationTests(unittest.TestCase):
     """估值因子接入后的因子库行为（离线，不访问网络）。"""
 
@@ -491,4 +488,8 @@ class UnifiedDataLayerTests(unittest.TestCase):
         self.assertNotIn('load_data(ticker, "2023-01-01", "sina")', text,
                          "信号计算不应再硬编码 sina（港美股会失败）")
         self.assertIn('load_data(ticker, "2023-01-01", "auto")', text)
+
+
+if __name__ == "__main__":
+    unittest.main()
 

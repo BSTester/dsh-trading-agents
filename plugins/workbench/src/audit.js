@@ -8,6 +8,7 @@
 // 这是纯函数：不读文件、不发请求，便于单测。
 
 import { businessData, actionLabel, toolName, ORDER_SOURCE } from "./broker_trades.js";
+import { labeled, zh } from "./labels.js";
 
 const SIGNAL_WINDOW_MS = 7 * 24 * 3600 * 1000;
 
@@ -72,8 +73,10 @@ export function buildAuditChain({ snapshot = {}, trades = {}, maxEntries = 120 }
       at: p.at ?? null,
       atMs: toMs(p.at),
       ticker: upper(p.value.ticker),
-      detail: `${p.value.signal ?? "—"} @ ${p.value.price ?? "—"}${p.value.strategy ? ` · ${p.value.strategy}` : ""}`,
+      detail: `${labeled(p.value.signal, p.value.signal_label, "SIGNAL")} @ ${p.value.price ?? "—"}`
+        + (p.value.strategy_label || p.value.strategy ? ` · ${p.value.strategy_label ?? p.value.strategy}` : ""),
       source: "quant_signal",
+      source_label: "量化信号",
       origin: true,
     }))
     .filter((entry) => entry.ticker !== null);
@@ -84,7 +87,9 @@ export function buildAuditChain({ snapshot = {}, trades = {}, maxEntries = 120 }
     at: t.date ?? null,
     atMs: toMs(t.date),
     ticker: upper(t.ticker),
-    detail: `${t.action} ${t.shares} @ ${t.price}${t.fee !== undefined && t.fee !== null ? ` · 费用 ${t.fee}` : ""}${t.return !== undefined && t.return !== null ? ` · 收益 ${(t.return * 100).toFixed(2)}%` : ""}`,
+    detail: `${labeled(t.action, t.action_label, "ACTION")} ${t.shares} @ ${t.price}`
+      + (t.fee !== undefined && t.fee !== null ? ` · 费用 ${t.fee}` : "")
+      + (t.return !== undefined && t.return !== null ? ` · 收益 ${(t.return * 100).toFixed(2)}%` : ""),
     reason: t.reason ?? null,
     source: "local-ledger",
   }));
@@ -115,6 +120,7 @@ export function buildAuditChain({ snapshot = {}, trades = {}, maxEntries = 120 }
         ticker: fields.ticker,
         detail: `${name}${fields.orderId ? ` · #${fields.orderId}` : ""}${fields.status ? ` · status=${fields.status}` : ""}`,
         source: "broker-observed",
+        source_label: "券商响应（Harness 观察）",
       };
     })
     .filter(Boolean);

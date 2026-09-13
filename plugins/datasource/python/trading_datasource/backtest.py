@@ -23,11 +23,17 @@ import sys
 from datetime import date
 
 from .market import MAX_BARS, is_a_share, to_futu_symbol  # noqa: E402  （A 股判定/符号归一的唯一实现）
+# 注意：本模块自己有一个字符串常量 EXECUTION_SOURCE，标签表必须改名导入，
+# 否则会把它覆盖成字典（曾因此报 "string indices must be integers"）。
+from .labels import (  # noqa: E402  （中文标签唯一事实来源）
+    EXECUTION_SOURCE as EXECUTION_SOURCE_ZH, EXECUTION_TIMING, END_POSITION_POLICY,
+    trade_status_label, trade_type_label)
 
 COMMISSION = 0.0003   # 双边佣金
 STAMP_TAX = 0.001     # 卖出印花税（A股）
 SLIPPAGE = 0.001      # 双边滑点
 EXECUTION_SOURCE = "local_simulation"
+EXECUTION_SOURCE_LABEL = EXECUTION_SOURCE_ZH["local_simulation"]
 
 
 def validate_data(df):
@@ -211,9 +217,12 @@ def run(df, signal_fn):
                 pos = lots * 100
                 entry_cost = cost + fee
                 entry_date = date
-                trades.append({"type": "buy", "date": date, "price": price,
+                trades.append({"type": "buy", "type_label": trade_type_label("buy"),
+                               "date": date, "price": price,
                                "signal_date": signal_date, "status": "open",
+                               "status_label": trade_status_label("open"),
                                "execution_source": EXECUTION_SOURCE,
+                               "execution_source_label": EXECUTION_SOURCE_LABEL,
                                "shares": pos, "fee": round(fee, 2)})
         elif s == -1 and pos > 0 and date > entry_date:
             proceeds = price * pos
@@ -221,8 +230,11 @@ def run(df, signal_fn):
             cash += proceeds - fee
             ret = (proceeds - fee) / entry_cost - 1
             trades[-1]["status"] = "closed"
-            trades.append({"type": "sell", "date": date, "price": price,
+            trades[-1]["status_label"] = trade_status_label("closed")
+            trades.append({"type": "sell", "type_label": trade_type_label("sell"),
+                           "date": date, "price": price,
                            "signal_date": signal_date, "execution_source": EXECUTION_SOURCE,
+                           "execution_source_label": EXECUTION_SOURCE_LABEL,
                            "shares": pos, "fee": round(fee, 2), "return": round(ret, 4),
                            "hold_days": (pd.Timestamp(date) - pd.Timestamp(entry_date)).days})
             pos = 0
@@ -292,10 +304,16 @@ def main():
         "coverage_note": (f"实际行情区间 {df['date'].iloc[0]} → {df['date'].iloc[-1]}"
                           + _shortfall_note(str(df["date"].iloc[0]), args.start)),
         "execution_source": EXECUTION_SOURCE,
+        "execution_source_label": EXECUTION_SOURCE_LABEL,
+        # 口径说明此前以英文枚举直接展示，界面读不懂，这里一并给中文
         "execution_timing": "previous_bar_next_open",
+        "execution_timing_label": EXECUTION_TIMING["previous_bar_next_open"],
         "end_position_policy": "mark_to_market_no_liquidation",
+        "end_position_policy_label": END_POSITION_POLICY["mark_to_market_no_liquidation"],
         "open_positions": [
             {**trade, "ticker": args.ticker,
+             "type_label": trade_type_label(trade.get("type")),
+             "status_label": trade_status_label(trade.get("status")),
              "mark_price": float(df["close"].iloc[-1]),
              "mark_date": str(df["date"].iloc[-1]),
              "market_value": round(trade["shares"] * float(df["close"].iloc[-1]), 2)}

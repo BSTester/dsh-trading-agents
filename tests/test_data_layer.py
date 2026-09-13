@@ -650,5 +650,74 @@ class InstallDocTests(unittest.TestCase):
             self.assertIn(display[plugin], section, f"文档漏了安装器实际会装的插件：{plugin}")
 
 
+
+
+class MarketGuardTests(unittest.TestCase):
+    """A 股专用通道必须自己判市场，不能靠调用方记得判。
+
+    这一类的共同失败模式是**静默取到别的标的**：`ticker.split(".")[0]` 把
+    `000001.HK`（港股长和）变成 `000001`（A 股平安银行），既可能报错，
+    也可能悄悄返回另一个标的的行情/估值/舆情。
+    """
+
+    def test_fetch_a_share_refuses_non_a_share(self):
+        for ticker in ("00001.HK", "00700.HK", "AAPL", "TSLA"):
+            with self.subTest(ticker=ticker):
+                with self.assertRaises(ValueError):
+                    market.fetch_a_share(ticker, "1d", 250)
+
+    def test_fetch_yahoo_refuses_intraday(self):
+        with self.assertRaises(ValueError):
+            market.fetch_yahoo("AAPL", "5m", 200)
+
+    def test_fetch_yahoo_rejects_empty_ticker(self):
+        with self.assertRaises(ValueError):
+            market.fetch_yahoo("", "1d", 200)
+
+    def test_valuation_fallback_is_a_share_only(self):
+        """同花顺估值只服务 A 股；港股不能混入同代码的 A 股估值。"""
+        source = (ROOT / "plugins" / "workbench" / "python" / "factors.py").read_text(encoding="utf-8")
+        self.assertIn("if not is_a_share(ticker):", source,
+                      "同花顺估值兜底必须显式判市场")
+        self.assertIn("from trading_datasource.market import is_a_share", source)
+
+    def test_yahoo_channels_use_the_shared_symbol_conversion(self):
+        """凡是用 Yahoo 的通道都必须走符号归一。
+
+        Yahoo 的港股是 4 位代码：`00700.HK` 查新闻返回 0 条，`0700.HK` 返回 17 条。
+        价格通道已修，新闻通道又漏了一次 —— 所以这里按"用到 Yahoo"来扫，
+        而不是逐个记哪里修过。
+        """
+        offenders = []
+        for path in (ROOT / "plugins").rglob("*.py"):
+            if "__pycache__" in path.parts:
+                continue
+            text = path.read_text(encoding="utf-8")
+            if "yahoo" not in text.lower():
+                continue
+            if path.name == "market.py" and "datasource" in path.parts:
+                continue   # 归一实现的所在地
+            # 出现 yahoo.finance 域名或 yf.download，却没用共享转换
+            uses_yahoo = ("finance.yahoo.com" in text) or ("yf.download" in text)
+            # 必须是真的**调用**（带括号），只 import 不算 —— 否则护栏会被导入行骗过
+            if uses_yahoo and "to_yahoo_symbol(" not in text:
+                offenders.append(str(path.relative_to(ROOT)))
+        self.assertEqual(offenders, [], f"这些文件用了 Yahoo 但没走 to_yahoo_symbol：{offenders}")
+
+    def test_a_share_only_fetchers_guard_themselves(self):
+        """东财快讯 / 千股千评也要自己判市场，而不是只依赖调用方。"""
+        checks = [
+            (ROOT / "plugins" / "fin-data" / "python" / "fin_news.py", "def akshare_news"),
+            (ROOT / "plugins" / "fin-data" / "python" / "fin_sentiment.py", "def a_share_comment"),
+        ]
+        for path, marker in checks:
+            with self.subTest(path=path.name):
+                text = path.read_text(encoding="utf-8")
+                start = text.index(marker)
+                body = text[start:start + 600]
+                self.assertIn("if not is_a_share(", body,
+                              f"{path.name} 的 A 股专用函数未自行判市场")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

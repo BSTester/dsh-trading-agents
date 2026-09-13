@@ -25,6 +25,8 @@ from trading_datasource.backtest import (  # noqa: E402  （唯一回测实现�
     COMMISSION, SLIPPAGE, STAMP_TAX, load_data, ma_cross_signal, rsi_signal, validate_data)
 
 import risk_config  # noqa: E402  （风控参数单一事实来源）
+from trading_datasource.labels import (  # noqa: E402  （中文标签唯一事实来源）
+    action_label, rating_label, signal_label)
 
 DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
 LEDGER = DSH / "quant-ledger.json"
@@ -180,7 +182,10 @@ def compute_signal(ticker, strategy, fast=5, slow=20, rsi_buy=25, rsi_sell=75,
                       else f"rsi({rsi_buy},{rsi_sell})")
     result = {"ticker": ticker, "strategy": strategy, "strategy_label": strategy_label,
               "date": date, "price": price,
-              "signal": label, "atr": atr, "execution_source": EXECUTION_SOURCE}
+              # signal 保留机器码（旧预览仍在读），另给中文标签供界面与研报使用
+              "signal": label, "signal_label": signal_label(label),
+              "atr": atr, "execution_source": EXECUTION_SOURCE,
+              "execution_source_label": "本地模拟（非券商成交）"}
     if include_sentiment:
         result["sentiment"] = read_sentiment(ticker)
     return result
@@ -213,8 +218,10 @@ def _decide(ticker, strategy, apply_fill, **kw):
         if not sellable(pos, fill_date):
             blocked_reason = "T+1: acquisition date missing or not before the fill date"
         else:
-            order = {"action": "SELL", "ticker": ticker, "shares": pos["shares"],
+            order = {"action": "SELL", "action_label": action_label("SELL"),
+                     "ticker": ticker, "shares": pos["shares"],
                      "price": price, "stop": None, "strategy": s["strategy"],
+                     "strategy_label": s.get("strategy_label"),
                      "reason": "ATR stop triggered" if price <= pos.get("stop", 0)
                                else f"{s['strategy']} sell signal"}
     elif sig == "BUY" and pos is None and len(ledger["positions"]) < risk["max_positions"]:
@@ -225,8 +232,10 @@ def _decide(ticker, strategy, apply_fill, **kw):
         cash_lots = math.floor(ledger["cash"] / (price * (1 + COMMISSION + SLIPPAGE) * 100))
         shares = min(risk_lots, cash_lots) * 100
         if shares >= 100 and 0 < stop < price:
-            order = {"action": "BUY", "ticker": ticker, "shares": shares,
+            order = {"action": "BUY", "action_label": action_label("BUY"),
+                     "ticker": ticker, "shares": shares,
                      "price": price, "stop": stop, "strategy": s["strategy"],
+                     "strategy_label": s.get("strategy_label"),
                      "reason": f"{s['strategy']} 信号，ATR止损 2x"}
 
     if order:
@@ -272,7 +281,8 @@ def fill_order(mode, ledger, order):
         ledger["cash"] -= cost + fee
         ledger["positions"][t] = {"shares": shares, "entry": price,
                                   "stop": stop, "date": fill_date, "entry_fee": fee}
-        ledger["history"].append({**fill, "fee": round(fee, 2)})
+        ledger["history"].append({**fill, "fee": round(fee, 2),
+                                  "action_label": action_label(fill.get("action"))})
     elif order["action"] == "SELL":
         pos = ledger["positions"].get(t)
         if pos is None or shares != pos["shares"]:
@@ -286,7 +296,8 @@ def fill_order(mode, ledger, order):
         ret = (proceeds - fee) / basis - 1
         ledger["positions"].pop(t)
         ledger["cash"] += proceeds - fee
-        ledger["history"].append({**fill, "fee": round(fee, 2), "return": round(ret, 4)})
+        ledger["history"].append({**fill, "fee": round(fee, 2), "return": round(ret, 4),
+                                  "action_label": action_label(fill.get("action"))})
     else:
         raise ValueError("Unsupported simulation action")
 
@@ -326,7 +337,9 @@ def report():
     sells = [h for h in ledger["history"] if h["action"] == "SELL"]
     wins = [h for h in sells if h.get("return", 0) > 0]
     print(json.dumps({
-        "mode": mode, "execution_source": EXECUTION_SOURCE, "status": "available",
+        "mode": mode, "execution_source": EXECUTION_SOURCE,
+        "execution_source_label": "本地模拟（非券商成交）", "status": "available",
+        "status_label": "可用",
         "cash": round(ledger["cash"], 2), "equity": round(eq, 2),
         "total_return": round(eq / INITIAL_CASH - 1, 4),
         "positions": {t: {k: (round(v, 2) if isinstance(v, float) else v) for k, v in p.items()}
