@@ -1,4 +1,5 @@
 import { WorkbenchError } from "./store.js";
+import { buildAuditChain } from "./audit.js";
 
 // Exact Connection Fetch routes share Harness authentication and its RPC envelope.
 export function createRpcFetchHandler(store, endpoint, deps = {}) {
@@ -54,6 +55,20 @@ export function createRpcHandler(store, deps = {}) {
           return { ok: false, error: { code: "trading/analytics-unavailable",
             message: String(error?.message ?? error).slice(0, 300), details: {} } };
         }
+      }
+      if (endpoint === "audit") {
+        if (Object.keys(payload).length !== 0) throw new WorkbenchError("audit takes no payload");
+        const mode = store.snapshot().mode;
+        let trades = { trades: [] };
+        const provider = deps.analytics;
+        if (provider && typeof provider.trades === "function") {
+          try {
+            trades = await provider.trades({ mode, limit: 100 });
+          } catch {
+            trades = { trades: [] };  // 台账不可读时仍给出信号/响应链路
+          }
+        }
+        return { ok: true, value: buildAuditChain({ snapshot: store.snapshot(), trades }) };
       }
       if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades" || endpoint === "events" || endpoint === "factors" || endpoint === "ic") {
         const allowed = endpoint === "sensitivity"

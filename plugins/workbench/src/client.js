@@ -95,7 +95,7 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic"].includes(endpoint))
+      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit"].includes(endpoint))
         throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
@@ -633,10 +633,47 @@ window.__ModuleLoader__.load({
           || "事件来自公开披露源；港股/美股事件请用富途工具查询（quote_financials_* / quote_corporate_actions_* / quote_economic_calendar_search）。"));
     }
 
-    function AuditView({ snapshot }) {
-      return h(Card, { title: "审计：响应与预览记录", count: snapshot.activity.length + snapshot.previews.length },
-        h("p", { className: "tw-meta" }, `账户模式 ${snapshot.mode}；进行中的账户调用 ${snapshot.in_flight}；暂存响应 ${snapshot.pending_observations}。`),
-        h("p", { className: "tw-hint" }, "信号→订单→成交的完整链路审计（含审批记录）在 QW-6 交付；当前记录观察到的工具响应与量化预览。"));
+    const CHAIN_KIND = {
+      signal: { label: "信号", cls: "" },
+      order: { label: "下单", cls: "buy" },
+      "order-error": { label: "下单失败", cls: "sell" },
+      fill: { label: "成交", cls: "hold" },
+    };
+
+    function AuditView({ rpc, snapshot }) {
+      const audit = useEndpoint(rpc, "audit", {}, [rpc, snapshot.mode, snapshot.generated_at]);
+      const entries = audit.data?.entries ?? [];
+      const stats = audit.data?.stats;
+      return h(React.Fragment, null,
+        h(Card, { title: "链路统计",
+          empty: stats ? undefined : (audit.loading ? "加载中…" : (audit.error || "暂无链路数据")) },
+          stats && h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "信号"), h("div", { className: "tw-kv-v" }, String(stats.signals))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "下单响应"), h("div", { className: "tw-kv-v" }, String(stats.orders))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交（台账）"), h("div", { className: "tw-kv-v" }, String(stats.fills))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "已关联信号"),
+              h("div", { className: "tw-kv-v", style: { color: "var(--dsw-alias-state-success-primary,#2ea043)" } }, String(stats.linked))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "未关联"),
+              h("div", { className: "tw-kv-v", style: { color: stats.unlinked > 0 ? "var(--dsw-alias-state-warn-label,#9a6700)" : "inherit" } }, String(stats.unlinked)))),
+          stats && h("p", { className: "tw-meta" }, `关联规则：${stats.link_rule}`),
+          h("p", { className: "tw-meta" }, `账户模式 ${snapshot.mode} · 进行中调用 ${snapshot.in_flight} · 暂存响应 ${snapshot.pending_observations}`)),
+        h(Card, { title: "审计时间线（信号 → 下单 → 成交）", count: entries.length,
+          empty: entries.length ? undefined : "暂无记录：先在 Harness 中产生信号，再下单/成交后这里会出现链路。" },
+          entries.slice(0, 40).map((entry) => {
+            const meta = CHAIN_KIND[entry.kind] ?? { label: entry.kind, cls: "" };
+            return h("div", { key: entry.id, className: "tw-item" },
+              h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
+                h("span", { className: `tw-tag ${meta.cls}` }, meta.label),
+                ` ${entry.at ?? "—"} · ${entry.ticker ?? "未知标的"}`,
+                entry.origin
+                  ? h("span", { className: "tw-meta" }, " · 链路起点")
+                  : h("span", { className: "tw-meta" },
+                      entry.linked
+                        ? ` · 依据信号 ${entry.signal_id}（滞后 ${entry.lag_hours}h）`
+                        : " · ⚠ 未找到对应信号"),
+                h("div", { className: "tw-meta" }, `${entry.detail} · 来源 ${entry.source}`)));
+          })),
+        h("p", { className: "tw-hint" }, "审计仅记录 Harness 观察到的响应与本地台账；实盘成交请以券商成交查询为准。"));
     }
 
     function Dashboard({ rpc }) {
