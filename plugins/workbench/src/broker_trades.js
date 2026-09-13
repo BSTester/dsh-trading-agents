@@ -14,19 +14,23 @@
 // 纯函数，无 IO，便于离线测试。
 
 /** 下单/改单/撤单：这些才会改变券商侧状态。 */
-const ORDER_ACTIONS = [
+export const ORDER_ACTIONS = [
   { match: /input_order$/, label: "下单" },
   { match: /modify_order$/, label: "改单" },
   { match: /cancel_order$/, label: "撤单" },
 ];
 
 /** 唯一能提供订单事实的工具：其 data.orders 是券商侧的订单列表。 */
-const ORDER_SOURCE = /history_order_list$/;
+export const ORDER_SOURCE = /history_order_list$/;
 
 const SIDE_LABELS = { 1: "买入", 2: "卖出" };
 
-/** 从 MCP 工具响应条目里取出业务数据（兼容 ret_code/data 与 s/d 两种信封）。 */
-function businessData(entry) {
+/**
+ * 从 MCP 工具响应条目里取出业务数据（兼容 ret_code/data 与 s/d 两种信封）。
+ * 富途返回的业务 JSON 是**字符串**，藏在 value.content[].text 里；不解析它
+ * 就取不到 symbol/order_id，只能显示「未知标的」。
+ */
+export function businessData(entry) {
   const content = entry?.value?.content;
   if (!Array.isArray(content)) return { ok: false, reason: "无内容" };
   const text = content.find((part) => part?.type === "text")?.text;
@@ -49,11 +53,11 @@ function businessData(entry) {
   return { ok: true, data };
 }
 
-function toolName(entry) {
+export function toolName(entry) {
   return String(entry?.tool ?? "").replace(/^mcp__futu__/, "");
 }
 
-function actionLabel(name) {
+export function actionLabel(name) {
   const found = ORDER_ACTIONS.find((row) => row.match.test(name));
   return found ? found.label : null;
 }

@@ -1,6 +1,6 @@
 import { WorkbenchError } from "./store.js";
 import { buildAuditChain } from "./audit.js";
-import { ENDPOINTS } from "./endpoints.js";
+import { ENDPOINTS, matchesShape } from "./endpoints.js";
 import { createTtlCache } from "./cache.js";
 
 // 结果缓存：面板是查看用途，不需要实时。这些接口背后是 python 子进程与富途调用，
@@ -63,12 +63,17 @@ export function createRpcHandler(store, deps = {}) {
     const key = `${endpoint}|${stableKey(payload)}`;
     if (!force && ttl > 0) {
       const hit = cache.read(key, ttl);
-      if (hit) {
+      // 命中也要校验形状：坏条目（空对象、截断结果）当作未命中并重新取数，
+      // 否则界面会把「取数失败」展示成「账户没有持仓」。
+      if (hit && matchesShape(endpoint, hit.value)) {
         return { ok: true, value: hit.value, cached: true, cached_at: new Date(hit.at).toISOString() };
       }
     }
     try {
       const value = await produce();
+      if (!matchesShape(endpoint, value)) {
+        throw new Error(`${endpoint} 返回的载荷不完整，已按失败处理`);
+      }
       const entry = ttl > 0 ? cache.write(key, value) : { at: Date.now() };
       return { ok: true, value, cached: false, cached_at: new Date(entry.at).toISOString() };
     } catch (error) {

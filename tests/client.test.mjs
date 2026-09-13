@@ -431,3 +431,80 @@ test("信号预览必须显示策略名，且优先用带参数的标签", async
   assert.match(text, /strategy_label \?\? p\.value\?\.strategy/, "信号条目未显示策略");
   assert.match(text, /p\.value\?\.ticker/, "信号条目未显示标的");
 });
+
+test("Card 的 empty 传常量字符串会吞掉正文——全局护栏", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  // `Card` 渲染的是 `empty ? <空态> : children`。传常量字符串 → 恒为真 → children 永不渲染。
+  // 这个错误已经在 SignalView 上真实发生过：标题写着 2 条，正文永远「暂无信号」。
+  // 允许的唯一例外是「故意没有 children 的守卫卡」（props 后直接收尾 `})`）。
+  const offenders = [];
+  for (const match of source.matchAll(/h\(Card, \{/g)) {
+    const start = match.index + match[0].length - 1;
+    let depth = 0, end = -1;
+    for (let i = start; i < source.length; i += 1) {
+      const ch = source[i];
+      if (ch === "{") depth += 1;
+      else if (ch === "}") { depth -= 1; if (depth === 0) { end = i; break; } }
+    }
+    if (end === -1) continue;
+    const props = source.slice(start, end + 1);
+    const emptyMatch = props.match(/\bempty:\s*/);
+    if (!emptyMatch) continue;
+    const rest = props.slice(emptyMatch.index + emptyMatch[0].length);
+    const isConstant = /^["`]/.test(rest);
+    // props 闭合后紧跟 `)` 说明这张卡没有 children，此时常量 empty 是它的唯一内容，合法
+    const tail = source.slice(end + 1, end + 3);
+    const hasChildren = !tail.startsWith(")");
+    if (isConstant && hasChildren) {
+      const line = source.slice(0, match.index).split("\n").length;
+      offenders.push(`L${line}: ${rest.slice(0, 50)}`);
+    }
+  }
+  assert.deepEqual(offenders, [],
+    `Card 的 empty 传了常量字符串，正文会被吞掉；应写成 items.length ? undefined : "文案" 或 cardEmpty({...})`);
+});
+
+test("信号页在有条目时必须渲染列表，而不是永远显示空态", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function SignalView("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /empty: previews\.length \? undefined/, "SignalView 的 Card empty 必须是条件式");
+  assert.match(text, /h\(Paged, \{ items: previews/, "信号列表仍未接线");
+});
+
+test("相关性矩阵的标的必须从 groups 展平取，根级没有 positions", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  // positions.py 的载荷只有 groups；曾误读 positions.data.positions，
+  // 导致 held 恒为空、相关性矩阵永远显示「只有 0 个可识别标的」。
+  const body = source.slice(source.indexOf("function RiskView("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /positions\.data\?\.groups/, "未从 groups 取持仓");
+  assert.match(text, /flatMap\(\(group\) => group\.positions/, "未展平各账户的持仓明细");
+  assert.doesNotMatch(text, /positions\.data\?\.positions/, "不应再读根本不存在的根级 positions");
+  assert.match(text, /new Set\(/, "同一标的在多个账户出现时应去重");
+});
+
+test("指标不可得时显示「—」而不是「—%」", async () => {
+  const plugin = await client();
+  const { numeric, percent, percentValue } = plugin.internals;
+  assert.equal(numeric(undefined), "—");
+  assert.equal(numeric(1.234, 2), "1.23");
+  // 比例 → 百分比
+  assert.equal(percent(undefined), "—");
+  assert.equal(percent(null), "—");
+  assert.equal(percent(-0.1813, 2), "-18.13%");
+  // 已经是百分数：不能先除 100，否则 null 会变成 0 并显示成 0.00%
+  assert.equal(percentValue(null), "—");
+  assert.equal(percentValue(undefined), "—");
+  assert.equal(percentValue(25), "25.00%");
+  assert.equal(percentValue(25, 1), "25.0%");
+});
+
+test("不再引用载荷里不存在的 broker.data.error 单数字段", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  // positions 载荷只有 errors 数组；单数 error 是死分支，会让人以为已处理整段失败
+  assert.doesNotMatch(source, /broker\.data\?\.error\b/, "死分支应删除");
+  assert.match(source, /broker\.data\?\.errors/, "部分账户失败仍应展示");
+});

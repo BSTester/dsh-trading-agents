@@ -8,7 +8,7 @@ import path from "node:path";
 
 const equity = { mode: "sim", count: 3, current: 1010000, total_return: 0.01, max_drawdown: -0.02,
   points: [{ t: "2026-09-09", equity: 1000000, dd: 0 }, { t: "2026-09-10", equity: 1010000, dd: 0 }] };
-const positions = { mode: "sim", cash: 100, market_value: 200, equity: 300, positions: [] };
+const positions = { mode: "sim", cash: 100, market_value: 200, equity: 300, groups: [] };
 const correlation = { tickers: ["600519", "000001"], matrix: [[1, 0.4], [0.4, 1]], window: 120 };
 
 /**
@@ -96,7 +96,7 @@ test("analytics provider surfaces python-reported errors", async () => {
 test("sensitivity / risk / trades endpoints accept validated payloads only", async () => {
   const calls = [];
   const handle = handlerWith({
-    sensitivity: async (payload) => { calls.push(["sensitivity", payload]); return { rows: [3, 5], cols: [10, 20], matrix: [[1, 2], [3, null]] }; },
+    sensitivity: async (payload) => { calls.push(["sensitivity", payload]); return { ticker: "600519", rows: [3, 5], cols: [10, 20], matrix: [[1, 2], [3, null]] }; },
     risk: async () => ({ config: { risk_per_trade: 0.01 }, source: "(默认值)" }),
     trades: async (payload) => { calls.push(["trades", payload]); return { count: 0, trades: [] }; },
   });
@@ -117,7 +117,9 @@ test("sensitivity / risk / trades endpoints accept validated payloads only", asy
 test("sensitivity provider validates grids, metric, and start date", async () => {
   let executions = 0;
   const analytics = createAnalyticsProvider({
-    exec: async () => { executions += 1; return { stdout: JSON.stringify({ rows: [], cols: [], matrix: [] }) }; },
+    // 桩必须返回形状合法的载荷：校验只针对入参，不该被载荷校验抢先拦下
+    exec: async () => { executions += 1;
+      return { stdout: JSON.stringify({ ticker: "600519", rows: [], cols: [], matrix: [] }) }; },
     python: () => "/tmp/python", now: () => 0,
   });
   await assert.rejects(() => analytics.sensitivity({ ticker: "600519", metric: "profit" }), /Invalid metric/);
@@ -161,7 +163,7 @@ test("events provider validates ticker pattern and window bounds", async () => {
 test("factors / ic endpoints validate payloads and delegate", async () => {
   const seen = [];
   const handle = handlerWith({
-    factors: async (payload) => { seen.push(payload); return { rows: [{ ticker: "600519", rank: 1, score: 0.5 }] }; },
+    factors: async (payload) => { seen.push(payload); return { tickers: ["600519", "000001"], rows: [{ ticker: "600519", rank: 1, score: 0.5 }] }; },
     ic: async (payload) => { seen.push(payload); return { mean_ic: 0.09, icir: 0.16, points: [] }; },
   });
   const snap = await handle("factors", { tickers: ["600519", "000001"], window: 250 });
@@ -176,7 +178,9 @@ test("factors / ic endpoints validate payloads and delegate", async () => {
 test("factors / ic providers enforce universe size, factor enum, and bounds", async () => {
   let executions = 0;
   const analytics = createAnalyticsProvider({
-    exec: async () => { executions += 1; return { stdout: JSON.stringify({ rows: [] }) }; },
+    exec: async (_python, args) => { executions += 1;
+      // ic 与 snapshot 的载荷形状不同，各给一份合法的
+      return { stdout: JSON.stringify(args[1] === "ic" ? { points: [] } : { tickers: ["600519"] }) }; },
     python: () => "/tmp/python", now: () => 0,
   });
   await assert.rejects(() => analytics.factors({ tickers: ["600519"] }), /2\.\.8/);
@@ -221,4 +225,31 @@ test("sources provider passes --no-probe through and degrades on failure", async
     python: () => "/tmp/python", now: () => 0,
   });
   await assert.rejects(() => failing.sources({}), /探测失败/);
+});
+
+test("子进程返回空对象/缺字段时按失败处理，不得缓存成「账户没有持仓」", async () => {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "analytics-shape-"));
+  const handle = createRpcHandler({}, { dir,
+    analytics: createAnalyticsProvider({
+      // 模拟偶发的畸形返回：空对象、缺 groups、截断后的 JSON
+      exec: async (_python, args) => {
+        const script = String(args[0]);
+        if (script.endsWith("positions.py")) return { stdout: "{}" };
+        if (script.endsWith("analytics.py") && args[1] === "correlation") return { stdout: '{"tickers":[]}' };
+        return { stdout: '{"mode":"sim","count":1,"points":[]}' };
+      },
+      python: () => "python3",
+    }) });
+
+  const positions = await handle("positions", { mode: "sim" });
+  assert.equal(positions.ok, false, "空载荷必须报错，不能当作空持仓");
+  assert.match(positions.error.message, /载荷不完整/);
+
+  const correlation = await handle("correlation", { tickers: ["600519", "000001"], window: 120 });
+  assert.equal(correlation.ok, false, "缺 matrix 的相关性结果不能进缓存");
+
+  // 关键：坏结果不能落进缓存——否则 TTL 内每次都会展示「没有持仓」
+  const again = await handle("positions", { mode: "sim" });
+  assert.equal(again.ok, false);
+  assert.equal(again.cached, undefined, "失败结果不应被标记为缓存命中");
 });

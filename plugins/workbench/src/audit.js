@@ -7,8 +7,12 @@
 //
 // 这是纯函数：不读文件、不发请求，便于单测。
 
-const ORDER_TOOL = /(order|trade|fill)/i;
+import { businessData, actionLabel, toolName, ORDER_SOURCE } from "./broker_trades.js";
+
 const SIGNAL_WINDOW_MS = 7 * 24 * 3600 * 1000;
+
+/** 影响券商状态的动作 → 时间线上的标签。 */
+const ACTION_KIND = { "下单": "order", "改单": "order-modify", "撤单": "order-cancel" };
 
 function toMs(value) {
   if (!value) return null;
@@ -21,10 +25,17 @@ function upper(value) {
   return typeof value === "string" ? value.trim().toUpperCase() : null;
 }
 
-/** 从券商响应里尽力取标的与状态（只做浅层扫描，不做深递归）。 */
+/**
+ * 从券商响应里尽力取标的与状态（只做浅层扫描，不做深递归）。
+ *
+ * 关键点：业务 JSON 是字符串，包在 value.content[].text 里。此前直接扫 value，
+ * 于是永远扫不到 symbol，时间线上全是「未知标的」，信号关联也恒为 0。
+ */
 export function extractBrokerFields(value) {
   const found = { ticker: null, status: null, orderId: null };
-  const queue = [value];
+  // 先尝试按 MCP 信封解开；解不开就退回按原样扫描（例如已是普通对象）
+  const unwrapped = businessData({ value });
+  const queue = [unwrapped.ok ? unwrapped.data : value];
   let visited = 0;
   while (queue.length > 0 && visited < 200) {
     const node = queue.shift();
@@ -78,20 +89,48 @@ export function buildAuditChain({ snapshot = {}, trades = {}, maxEntries = 120 }
     source: "local-ledger",
   }));
 
+  // 只收录与订单**有关**的响应：改单/撤单/下单、订单列表查询，以及命名未知但显然
+  // 与订单有关的工具。此前用 /(order|trade|fill)/ 一把抓，把 sim_trade_cash_info
+  // 这类只读查询也标成「下单」——做了几笔交易完全看不出来。
+  // 这里只排除**明确**的只读查询后缀；命名未知的订单工具宁可保留，也不静默丢弃。
+  const READ_ONLY_QUERY = /(_info|_query|_summary|_accounts?|_accts?)$/;
   const orders = (snapshot.activity ?? [])
-    .filter((a) => a && ORDER_TOOL.test(String(a.tool ?? "")))
     .map((a) => {
+      const name = toolName(a);
+      const action = actionLabel(name);
+      const isFacts = ORDER_SOURCE.test(name);
+      const orderNamed = /order/i.test(name);
+      if (action === null && !isFacts && !(orderNamed && !READ_ONLY_QUERY.test(name))) return null;
       const fields = extractBrokerFields(a.value ?? a);
+      const kind = a.is_error ? "order-error"
+        : isFacts && action === null ? "order-facts"
+          : (ACTION_KIND[action] ?? (action === null ? "order-other" : "order"));
       return {
         id: a.id,
-        kind: a.is_error ? "order-error" : "order",
+        kind,
+        action: action ?? (isFacts ? "订单查询" : "订单工具"),
         at: a.at ?? null,
         atMs: toMs(a.at),
+        order_id: fields.orderId,
         ticker: fields.ticker,
-        detail: `${a.tool}${fields.orderId ? ` · #${fields.orderId}` : ""}${fields.status ? ` · ${fields.status}` : ""}`,
+        detail: `${name}${fields.orderId ? ` · #${fields.orderId}` : ""}${fields.status ? ` · status=${fields.status}` : ""}`,
         source: "broker-observed",
       };
-    });
+    })
+    .filter(Boolean);
+
+  // 下单/改单/撤单的响应只回 order_id，不带 symbol；同一 order_id 的订单记录里
+  // 有 symbol。按订单号补全 —— 这是同一条订单的事实连接，不是对标的的猜测。
+  const tickerByOrder = new Map();
+  for (const entry of orders) {
+    if (entry.order_id && entry.ticker) tickerByOrder.set(entry.order_id, entry.ticker);
+  }
+  for (const entry of orders) {
+    if (!entry.ticker && entry.order_id && tickerByOrder.has(entry.order_id)) {
+      entry.ticker = tickerByOrder.get(entry.order_id);
+      entry.ticker_from = "order_id";
+    }
+  }
 
   // 为每个下单/成交找最近的、时间不晚于它的同标信号（7 天窗口内）
   const linkTo = (entry) => {
@@ -122,11 +161,18 @@ export function buildAuditChain({ snapshot = {}, trades = {}, maxEntries = 120 }
     .slice(0, maxEntries);
 
   const linked = decorated.filter((e) => e.linked).length;
+  // 动作明细：不拆开的话，「订单响应 34」到底是下了 34 单还是查了 34 次，读不出来
+  const order_kinds = {};
+  for (const entry of orders) {
+    const label = entry.action ?? "其他";
+    order_kinds[label] = (order_kinds[label] ?? 0) + 1;
+  }
   return {
     entries,
     stats: {
       signals: signals.length,
       orders: orders.length,
+      order_kinds,
       fills: fills.length,
       linked,
       unlinked: decorated.length - linked,

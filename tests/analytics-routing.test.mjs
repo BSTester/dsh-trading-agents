@@ -17,13 +17,37 @@ import { createAnalyticsProvider } from "../plugins/workbench/src/analytics.js";
 
 const PYTHON_DIR = fileURLToPath(new URL("../plugins/workbench/python/", import.meta.url));
 
-/** 记录每次 exec 的 (脚本名, 参数)，并返回空 JSON，使 provider 走完自己的解析。 */
+/**
+ * 各脚本的最小合法载荷。provider 会校验形状（空载荷一律按失败处理，
+ * 免得把「取数失败」缓存成「账户没有持仓」），所以桩不能只回 {}。
+ */
+function stubPayload(script, args) {
+  switch (script) {
+    case "positions.py": return { mode: "sim", groups: [] };
+    case "quality.py": return { ticker: "US.AAPL" };
+    case "instruments.py": return { ticker: "00700.HK" };
+    case "sensitivity.py": return { ticker: "600519", matrix: [] };
+    case "events.py": return { ticker: "00700.HK", events: [] };
+    case "sources.py": return { sources: [] };
+    case "factors.py": return args[0] === "ic" ? { points: [] } : { tickers: [] };
+    default: return {
+      equity: { mode: "sim", count: 0, points: [] },
+      correlation: { matrix: [] },
+      risk: { config: {} },
+      trades: { trades: [] },
+    }[args[0]] ?? {};
+  }
+}
+
+/** 记录每次 exec 的 (脚本名, 参数)，并返回形状合法的载荷，使 provider 走完自己的解析。 */
 function recorder() {
   const calls = [];
   const exec = async (_python, argv) => {
-    calls.push({ script: path.basename(argv[0]), args: argv.slice(1) });
+    const script = path.basename(argv[0]);
+    const args = argv.slice(1);
+    calls.push({ script, args });
     // 让返回体带上脚本名，便于断言"错误信息里的脚本名也是对的"
-    return { stdout: JSON.stringify({ ok: true }) };
+    return { stdout: JSON.stringify({ ok: true, ...stubPayload(script, args) }) };
   };
   return { calls, exec };
 }

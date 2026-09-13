@@ -27,3 +27,34 @@ export const ENDPOINTS = [
   "instrument",
   "quality",
 ];
+
+/**
+ * 每个接口结果的最小字段。用途：缓存读写两侧都校验形状。
+ *
+ * 为什么必须校验：缓存目录由 Host 进程、CLI 与测试共用。一旦有空对象/截断结果
+ * 混进缓存，TTL 内界面会把「取数失败」显示成「账户没有持仓」——用户会以为
+ * 仓位真的清空了。宁可当作未命中重新取数，也不要展示一个假事实。
+ */
+export const ENDPOINT_SHAPE = {
+  series: ["ticker", "bars"],
+  equity: ["mode", "points"],
+  positions: ["mode", "groups"],
+  correlation: ["matrix"],
+  sensitivity: ["ticker", "matrix"],
+  risk: ["config"],
+  trades: ["trades"],
+  events: ["ticker", "events"],
+  factors: ["tickers"],
+  ic: ["points"],
+  sources: ["sources"],
+  instrument: ["ticker"],
+  quality: ["ticker"],
+};
+
+/** 载荷是否具备该接口的最小字段；未知接口一律放行。 */
+export function matchesShape(endpoint, value) {
+  const required = ENDPOINT_SHAPE[endpoint];
+  if (!required) return true;
+  if (!value || typeof value !== "object" || Array.isArray(value)) return false;
+  return required.every((field) => field in value);
+}

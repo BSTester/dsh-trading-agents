@@ -10,7 +10,7 @@
 //   * 解析失败、超限、写盘失败一律当作未命中，绝不让缓存问题影响正常取数。
 //   * 大结果（超过 maxBytes）只进内存，不落盘——面板数据不值得为此占用磁盘。
 import { mkdirSync, readFileSync, readdirSync, renameSync, statSync, unlinkSync, writeFileSync } from "node:fs";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import os from "node:os";
 import path from "node:path";
 
@@ -66,7 +66,11 @@ export function createTtlCache(options = {}) {
         })
         .filter(Boolean)
         .sort((a, b) => b.at - a.at);
-      for (const file of files.slice(maxFiles)) {
+      // 崩溃残留的临时文件也一并清掉
+      for (const file of files.filter((row) => row.name.endsWith(".tmp"))) {
+        try { unlinkSync(path.join(dir, file.name)); } catch { /* 忽略 */ }
+      }
+      for (const file of files.filter((row) => !row.name.endsWith(".tmp")).slice(maxFiles)) {
         try { unlinkSync(path.join(dir, file.name)); } catch { /* 忽略 */ }
       }
     } catch { /* 目录不可读时跳过淘汰 */ }
@@ -99,7 +103,9 @@ export function createTtlCache(options = {}) {
       if (Buffer.byteLength(payload) > maxBytes) return entry;
       const target = path.join(dir, safeName(key));
       try {
-        const temp = `${target}.tmp`;
+        // 临时名必须唯一：Host 进程与 CLI/测试会共用同一个缓存目录，
+        // 共用 "${target}.tmp" 时两个进程会互相截断对方的写入。
+        const temp = `${target}.${process.pid}.${randomBytes(4).toString("hex")}.tmp`;
         writeFileSync(temp, payload);
         renameSync(temp, target);
         prune();

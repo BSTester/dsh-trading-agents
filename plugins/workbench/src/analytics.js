@@ -35,6 +35,24 @@ function intInRange(value, fallback, min, max, label) {
 }
 
 /**
+ * 载荷形状校验：子进程偶发返回空对象或截断 JSON 时，绝不能把它当有效数据
+ * 缓存下来——缓存住之后，界面会把「取数失败」展示成「账户没有持仓」，
+ * 用户会以为仓位真的清空了。缺字段一律按失败处理。
+ */
+function shapeOf(script, args, value) {
+  if (script === "positions.py") return ["mode", "groups"];
+  if (script === "quality.py" || script === "instruments.py") return ["ticker"];
+  if (script === "sensitivity.py") return ["ticker", "matrix"];
+  if (script === "events.py") return ["ticker", "events"];
+  if (script === "sources.py") return ["sources"];
+  if (script === "factors.py") return args[0] === "ic" ? ["points"] : ["tickers"];
+  return {
+    equity: ["count", "points"], correlation: ["matrix"],
+    risk: ["config"], trades: ["trades"],
+  }[args[0]];
+}
+
+/**
  * 分析层数据提供方：权益曲线回放、持仓盯市、相关性矩阵。
  * 全部只读；参数在 Host 侧校验后才进入子进程。
  */
@@ -51,6 +69,11 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
     if (start < 0) throw new Error(`${script} returned no JSON`);
     const value = JSON.parse(stdout.slice(start));
     if (value.error) throw new Error(value.error);
+    const required = shapeOf(script, args, value);
+    const missing = (required ?? []).filter((field) => !(field in (value ?? {})));
+    if (!value || typeof value !== "object" || missing.length > 0) {
+      throw new Error(`${script} 返回的载荷不完整（缺 ${missing.join("/") || "全部字段"}），已按失败处理`);
+    }
     cache.set(key, { at: now(), value });
     return value;
   }

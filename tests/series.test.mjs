@@ -1,43 +1,57 @@
 import test from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import { createRpcHandler } from "../plugins/workbench/src/rpc.js";
 import { createSeriesProvider } from "../plugins/workbench/src/series.js";
+
+/**
+ * 每个 handler 用一次性缓存目录。
+ * 默认目录是用户真实的 ~/.dsh/trading-workbench-cache：测试往里写一条
+ * 假载荷，面板在 TTL 内就会把「取数失败」显示成真实数据。
+ */
+function isolated(t) {
+  const dir = mkdtempSync(path.join(os.tmpdir(), "series-cache-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  return { dir };
+}
 
 const bars = { ticker: "600519", period: "5m", source: "akshare/sina", as_of: "2026-09-11 15:00:00",
   count: 2, bars: [{ t: "2026-09-11 14:55:00", o: 1, h: 2, l: 0.5, c: 1.5, v: 10 },
                    { t: "2026-09-11 15:00:00", o: 1.5, h: 2.5, l: 1, c: 2, v: 20 }] };
 
-function handlerWith(fetchSeries) {
-  return createRpcHandler({}, { fetchSeries });
+function handlerWith(t, fetchSeries) {
+  return createRpcHandler({}, { ...isolated(t), fetchSeries });
 }
 
-test("series endpoint returns bars from the injected provider", async () => {
-  const handle = handlerWith(async () => bars);
+test("series endpoint returns bars from the injected provider", async (t) => {
+  const handle = handlerWith(t, async () => bars);
   const result = await handle("series", { ticker: "600519", period: "5m", limit: 100 });
   assert.equal(result.ok, true);
   assert.equal(result.value.count, 2);
   assert.equal(result.value.bars[1].c, 2);
 });
 
-test("series endpoint rejects unexpected fields and never reaches the provider", async () => {
+test("series endpoint rejects unexpected fields and never reaches the provider", async (t) => {
   let called = false;
-  const handle = handlerWith(async () => { called = true; return bars; });
+  const handle = handlerWith(t, async () => { called = true; return bars; });
   const result = await handle("series", { ticker: "600519", order: "buy" });
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "trading/invalid-operation");
   assert.equal(called, false);
 });
 
-test("series provider failure degrades to a readable error instead of throwing", async () => {
-  const handle = handlerWith(async () => { throw new Error("分钟数据源不可用"); });
+test("series provider failure degrades to a readable error instead of throwing", async (t) => {
+  const handle = handlerWith(t, async () => { throw new Error("分钟数据源不可用"); });
   const result = await handle("series", { ticker: "600519", period: "1m", limit: 50 });
   assert.equal(result.ok, false);
   assert.equal(result.error.code, "trading/series-unavailable");
   assert.match(result.error.message, /分钟数据源不可用/);
 });
 
-test("unknown endpoint still rejects, and provider absence is explicit", async () => {
-  const handle = createRpcHandler({}, {});
+test("unknown endpoint still rejects, and provider absence is explicit", async (t) => {
+  const handle = createRpcHandler({}, isolated(t));
   const unknown = await handle("orders", {});
   assert.equal(unknown.ok, false);
   assert.equal(unknown.error.code, "trading/invalid-operation");

@@ -88,7 +88,7 @@ test("observed responses are not fills and snapshots never mix sim/live", async 
 
 test("RPC exposes only snapshot and explicit mode switch, never tools or orders", async (t) => {
   const { store } = await fixture(t);
-  const rpc = createRpcHandler(store);
+  const rpc = createRpcHandler(store, isolatedCache(t));
   assert.equal((await rpc("snapshot", {})).ok, true);
   assert.equal((await rpc("execute", { tool: "trading_order_place" })).ok, false);
   assert.equal((await rpc("switch-mode", { mode: "live", expected_mode: "sim" })).ok, false);
@@ -124,7 +124,7 @@ test("native RPC envelope rejects endpoint mismatch before any mutation", async 
 
 test("snapshot 声明 Host 实际提供的接口清单", async (t) => {
   const { store } = await fixture(t);
-  const handle = createRpcHandler(store);
+  const handle = createRpcHandler(store, isolatedCache(t));
   const result = await handle("snapshot", {});
   assert.equal(result.ok, true);
   assert.deepEqual(result.value.endpoints, ENDPOINTS);
@@ -137,7 +137,7 @@ test("重复请求命中 Host 缓存，不再重跑取数", async (t) => {
   let calls = 0;
   const handle = createRpcHandler(store, {
     ...isolatedCache(t),
-    analytics: { async positions() { calls += 1; return { positions: [] }; } },
+    analytics: { async positions() { calls += 1; return { mode: "sim", groups: [] }; } },
   });
   const first = await handle("positions", { mode: "sim" });
   const second = await handle("positions", { mode: "sim" });
@@ -153,7 +153,7 @@ test("_refresh 绕过缓存但仍是合法请求", async (t) => {
   let calls = 0;
   const handle = createRpcHandler(store, {
     ...isolatedCache(t),
-    analytics: { async positions() { calls += 1; return { positions: [], n: calls }; } },
+    analytics: { async positions() { calls += 1; return { mode: "sim", groups: [], n: calls }; } },
   });
   await handle("positions", { mode: "sim" });
   const forced = await handle("positions", { mode: "sim", _refresh: true });
@@ -182,7 +182,7 @@ test("缓存过期后重新取数", async (t) => {
   const handle = createRpcHandler(store, {
     ...isolatedCache(t),
     now: () => clock,
-    analytics: { async positions() { calls += 1; return { n: calls }; } },
+    analytics: { async positions() { calls += 1; return { mode: "sim", groups: [], n: calls }; } },
   });
   await handle("positions", { mode: "sim" });
   clock += CACHE_TTL_MS.positions - 1;
@@ -195,7 +195,8 @@ test("缓存过期后重新取数", async (t) => {
 
 test("_refresh 不参与各接口的字段校验", async (t) => {
   const { store } = await fixture(t);
-  const handle = createRpcHandler(store, { analytics: { async positions() { return {}; } } });
+  const handle = createRpcHandler(store, { ...isolatedCache(t),
+    analytics: { async positions() { return { mode: "sim", groups: [] }; } } });
   const ok = await handle("positions", { mode: "sim", _refresh: true });
   assert.equal(ok.ok, true);
   const bad = await handle("positions", { mode: "sim", unexpected: 1 });

@@ -203,6 +203,16 @@ window.__ModuleLoader__.load({
       return Number.isFinite(value) ? `${value.toFixed(digits)}${suffix}` : "—";
     }
 
+    /** 比例转百分比（0.18 → 18.00%）：不可得时只显示「—」，不能拼成「—%」那种半截单位。 */
+    function percent(ratio, digits = 2) {
+      return Number.isFinite(ratio) ? `${(ratio * 100).toFixed(digits)}%` : "—";
+    }
+
+    /** 已经是百分数的数值（45.67 → 45.67%）。注意别先做除法：null/100 会变成 0。 */
+    function percentValue(value, digits = 2) {
+      return Number.isFinite(value) ? `${value.toFixed(digits)}%` : "—";
+    }
+
     /** 当前客户端缓存条目数（仅用于界面显示，让"是否在缓存"可见）。 */
     const cacheSize = () => endpointCache.size;
 
@@ -700,7 +710,9 @@ window.__ModuleLoader__.load({
       const previews = snapshot.previews.filter((p) => p.kind === "signal" || p.kind === "backtest");
       return h(React.Fragment, null,
         h(Card, { title: "量化信号与回测（由 Harness 计算）", count: previews.length,
-          empty: "暂无信号。请在 Harness 会话中请求（如“看下 600519 的信号”），结果显示在这里。" },
+          // 必须是条件式：常量字符串恒为真，会让下面的 Paged 列表永远不渲染
+          empty: previews.length ? undefined
+            : "暂无信号。请在 Harness 会话中请求（如“看下 600519 的信号”），结果显示在这里。" },
           h(Paged, { items: previews, pageSize: 8, empty: "暂无信号预览",
             render: (p) => h("details", { key: p.id, className: "tw-item" },
               h("summary", null,
@@ -769,7 +781,6 @@ window.__ModuleLoader__.load({
             + (broker.data?.stale ? " ⚠ 实时读取失败，展示上次缓存" : "")
             + ` · 检查 ${counts.accounts_checked ?? "—"} 个账户，`
             + `${counts.accounts_with_positions ?? 0} 个有持仓`),
-          broker.data?.error && h("p", { className: "tw-alert" }, broker.data.error),
           (broker.data?.errors ?? []).length > 0 && h("p", { className: "tw-alert" },
             `部分账户读取失败：${broker.data.errors.map((e) => `${e.account}(${e.reason})`).join("；")}`),
           h("p", { className: "tw-meta" }, broker.data?.note ?? ""),
@@ -793,7 +804,7 @@ window.__ModuleLoader__.load({
           h(LineChart, { points: points.map((p) => ({ v: p.equity })), label: equity.data?.note || "" }),
           equity.data && h("p", { className: "tw-meta" },
             `区间 ${points[0]?.t} → ${points[points.length - 1]?.t}`
-            + ` · 最大回撤 ${numeric(equity.data.max_drawdown * 100)}%`
+            + ` · 最大回撤 ${percent(equity.data.max_drawdown)}`
             + ` · 夏普 ${numeric(equity.data.sharpe)}`)));
     }
 
@@ -825,12 +836,12 @@ window.__ModuleLoader__.load({
         h("div", { className: "tw-kv-k" },
           `${group.account} · ${risk.positions ?? 0} 笔 · 持仓市值 ${tradeMoney(risk.market_value)}`),
         h("div", { className: "tw-kv-v" },
-          `最大集中度 ${risk.max_share_symbol ?? "—"} ${numeric(risk.max_share_of_positions, 2)}%`),
+          `最大集中度 ${risk.max_share_symbol ?? "—"} ${percentValue(risk.max_share_of_positions)}`),
         h("div", { className: "tw-meta" },
           `浮盈 ${risk.winners?.count ?? 0} 笔 ${tradeMoney(risk.winners?.pl_val)}`
           + ` · 浮亏 ${risk.losers?.count ?? 0} 笔 ${tradeMoney(risk.losers?.pl_val)}`),
         h("div", { className: "tw-meta" },
-          top.map((row) => `${row.symbol} ${numeric(row.share_of_positions, 1)}%`
+          top.map((row) => `${row.symbol} ${percentValue(row.share_of_positions, 1)}`
             + `（占总资产 ${numeric(row.share_of_assets, 1)}%）`).join(" · ")
           || "无可用市值数据"));
     }
@@ -861,9 +872,12 @@ window.__ModuleLoader__.load({
       const s = bt?.summary;
       const equity = useEndpoint(rpc, "equity", { mode: snapshot.mode, window: 250 }, [rpc, snapshot.mode]);
       const positions = useEndpoint(rpc, "positions", { mode: snapshot.mode }, [rpc, snapshot.mode]);
-      // 券商持仓用的字段是 symbol（早期本地台账是 ticker），两种都认，避免又对不上
-      const held = (positions.data?.positions ?? [])
-        .map((p) => p.symbol ?? p.ticker).filter(Boolean).slice(0, 6);
+      // positions.py 的根字段是 groups（按账户分组），**没有**根级 positions；
+      // 曾误读 positions.data.positions，导致 held 恒为空、相关性矩阵永远算不出来。
+      // 明细里的字段是 symbol（早期本地台账是 ticker），两种都认。
+      const held = [...new Set((positions.data?.groups ?? [])
+        .flatMap((group) => group.positions ?? [])
+        .map((p) => p.symbol ?? p.ticker).filter(Boolean))].slice(0, 6);
       const canCorrelate = held.length >= 2;
       const correlation = useEndpoint(rpc, "correlation", { tickers: held, window: 120 }, [rpc, held.join(",")]);
       const ddPoints = (equity.data?.points ?? []).map((p) => ({ v: (p.dd ?? 0) * 100 }));
@@ -897,13 +911,13 @@ window.__ModuleLoader__.load({
             + (backtests.length > 1 ? `（共 ${backtests.length} 次回测记录，此处为最新一次）` : "")),
           h("div", { className: "tw-kv" },
             h(RiskMetricItem, { label: label("最大回撤 · 台账回放", replaySubject),
-              value: `${numeric(equity.data?.max_drawdown * 100)}%` }),
+              value: percent(equity.data?.max_drawdown) }),
             h(RiskMetricItem, { label: label("夏普 · 台账回放", replaySubject),
               value: numeric(equity.data?.sharpe) }),
             h(RiskMetricItem, { label: label("最大回撤 · 回测", btSubject),
-              value: `${numeric(s?.max_drawdown * 100)}%` }),
+              value: percent(s?.max_drawdown) }),
             h(RiskMetricItem, { label: label("夏普 / 年化 · 回测", btSubject),
-              value: `${numeric(s?.sharpe)} / ${numeric(s?.annualized * 100, 1)}%` }))),
+              value: `${numeric(s?.sharpe)} / ${percent(s?.annualized, 1)}` }))),
         h(Card, { title: "回撤曲线（水下图，%）",
           empty: ddPoints.length > 1 ? undefined : "需要成交记录才能回放回撤" },
           h(LineChart, { points: ddPoints, label: "drawdown %" })),
@@ -1263,6 +1277,10 @@ window.__ModuleLoader__.load({
     const CHAIN_KIND = {
       signal: { label: "信号", cls: "" },
       order: { label: "下单", cls: "buy" },
+      "order-modify": { label: "改单", cls: "buy" },
+      "order-cancel": { label: "撤单", cls: "sell" },
+      "order-facts": { label: "订单查询", cls: "hold" },
+      "order-other": { label: "订单工具", cls: "buy" },
       "order-error": { label: "下单失败", cls: "sell" },
       fill: { label: "成交", cls: "hold" },
     };
@@ -1277,12 +1295,17 @@ window.__ModuleLoader__.load({
             count: 0, fallback: "暂无链路数据" }) },
           stats && h("div", { className: "tw-kv" },
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "信号"), h("div", { className: "tw-kv-v" }, String(stats.signals))),
-            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "下单响应"), h("div", { className: "tw-kv-v" }, String(stats.orders))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "订单相关响应"),
+              h("div", { className: "tw-kv-v" }, String(stats.orders))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "成交（台账）"), h("div", { className: "tw-kv-v" }, String(stats.fills))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "已关联信号"),
               h("div", { className: "tw-kv-v", style: { color: "var(--dsw-alias-state-success-primary,#2ea043)" } }, String(stats.linked))),
             h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "未关联"),
               h("div", { className: "tw-kv-v", style: { color: stats.unlinked > 0 ? "var(--dsw-alias-state-warn-label,#9a6700)" : "inherit" } }, String(stats.unlinked)))),
+          // 拆出动作明细：否则「订单相关响应 34」会被读成「下了 34 单」
+          stats && stats.order_kinds && Object.keys(stats.order_kinds).length > 0
+            && h("p", { className: "tw-meta" }, "构成："
+              + Object.entries(stats.order_kinds).map(([label, n]) => `${label} ${n} 次`).join(" · ")),
           stats && h("p", { className: "tw-meta" }, `关联规则：${stats.link_rule}`),
           h("p", { className: "tw-meta" }, `账户模式 ${snapshot.mode} · 进行中调用 ${snapshot.in_flight} · 暂存响应 ${snapshot.pending_observations}`)),
         h(Card, { title: "审计时间线（信号 → 下单 → 成交）", count: entries.length },
@@ -1439,7 +1462,7 @@ window.__ModuleLoader__.load({
     // `internals` 仅供测试断言缓存与接口自检行为，不参与运行时逻辑
     return { inject: ["slots", "connection"], apply, request,
       internals: { readCache, writeCache, invalidateCaches, KNOWN_ENDPOINTS, CLIENT_TTL_MS,
-        Card, cardEmpty, numeric,
+        Card, cardEmpty, numeric, percent, percentValue,
         barIndexAt, tooltipLeft, compactNumber,
         servedEndpoints: () => servedEndpoints, cacheSize: () => endpointCache.size,
         missingEndpoints: () => [...missingEndpoints] } };

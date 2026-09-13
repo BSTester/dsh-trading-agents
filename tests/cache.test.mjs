@@ -123,3 +123,69 @@ test("默认目录落在 DSH_HOME 下的 trading-workbench-cache", (t) => {
   });
   assert.equal(createTtlCache().directory, path.join(home, "trading-workbench-cache"));
 });
+
+test("坏缓存条目（空对象/截断结果）必须当未命中，不能展示成「账户没有持仓」", async () => {
+  const { createRpcHandler } = await import("../plugins/workbench/src/rpc.js");
+  const { mkdtempSync } = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "cache-shape-"));
+
+  let calls = 0;
+  const handle = createRpcHandler({}, { dir, analytics: {
+    positions: async () => { calls += 1; return { mode: "sim", groups: [{ acc_id: "1", positions: [] }] }; },
+  } });
+  const good = await handle("positions", { mode: "sim" });
+  assert.equal(good.ok, true);
+  assert.equal(good.cached, false);
+
+  // 直接往磁盘缓存里塞一个空对象，模拟并发写入/崩溃留下的坏条目。
+  // 必须换一个 handler：原 handler 的内存缓存里还是刚才那份好数据。
+  const { createTtlCache } = await import("../plugins/workbench/src/cache.js");
+  createTtlCache({ dir }).write('positions|[["mode","sim"]]', {});
+  const after = await createRpcHandler({}, { dir, analytics: {
+    positions: async () => { calls += 1; return { mode: "sim", groups: [{ acc_id: "1", positions: [] }] }; },
+  } })("positions", { mode: "sim" });
+  assert.equal(after.ok, true, "坏条目应被忽略并重新取数，而不是报错");
+  assert.equal(after.cached, false, "坏条目不得被当作缓存命中");
+  assert.equal(after.value.groups.length, 1);
+  assert.equal(calls, 2, "应当重新取数一次");
+});
+
+test("并发写缓存不得共用同一个临时文件", async () => {
+  const source = await (await import("node:fs/promises")).readFile(
+    new URL("../plugins/workbench/src/cache.js", import.meta.url), "utf8");
+  // 共用 "${target}.tmp" 时，Host 进程与 CLI 会互相截断写入，留下半截 JSON
+  assert.doesNotMatch(source, /const temp = `\$\{target\}\.tmp`/,
+    "临时文件名必须唯一（含 pid 与随机串）");
+  assert.match(source, /process\.pid/, "临时名应包含 pid");
+});
+
+test("测试绝不允许写进用户真实的缓存目录——全局护栏", async () => {
+  const { readdir, readFile } = await import("node:fs/promises");
+  const url = new URL(".", import.meta.url);
+  const files = (await readdir(url)).filter((name) => name.endsWith(".test.mjs"));
+  const offenders = [];
+  for (const name of files) {
+    const source = await readFile(new URL(name, url), "utf8");
+    for (const match of source.matchAll(/createRpcHandler\(/g)) {
+      // 括号配对取出整个调用的实参
+      let depth = 0, end = -1;
+      const start = match.index + match[0].length - 1;
+      for (let i = start; i < source.length; i += 1) {
+        if (source[i] === "(") depth += 1;
+        else if (source[i] === ")") { depth -= 1; if (depth === 0) { end = i; break; } }
+      }
+      if (end === -1) continue;
+      const args = source.slice(start, end + 1);
+      // 允许：显式 dir、isolatedCache(t)/isolated(t) 这类一次性目录
+      if (/\bdir\b|isolatedCache\(|isolated\(/.test(args)) continue;
+      const line = source.slice(0, match.index).split("\n").length;
+      offenders.push(`${name}:L${line} → ${args.slice(0, 60).replace(/\s+/g, " ")}`);
+    }
+  }
+  // 真实事故：测试用桩返回空载荷并写进了 ~/.dsh/trading-workbench-cache，
+  // 于是面板在 TTL 内把「没有持仓」当成事实展示出来。
+  assert.deepEqual(offenders, [],
+    "测试必须给 createRpcHandler 传一次性 dir，否则会污染用户真实缓存");
+});
