@@ -442,6 +442,35 @@ empty: sources.loading ? "自检中…" : (sources.error || "不可用")
 文件里不得出现 `error ||`（注释除外），因为正确的做法是把 `error` 交给
 `cardEmpty` 决定优先级。
 
+## 六之六、卡片被"挡住"的根因：flex 收缩 + overflow 裁切
+
+用户反馈"有些内容卡片被挡住了"。根因在这两条 CSS：
+
+```css
+.tw-content{... overflow:auto; display:flex; flex-direction:column; gap:14px}
+.tw-card{... overflow:hidden}
+```
+
+`.tw-content` 是**可滚动的 flex 纵向容器**，而 flex 子项默认 `flex-shrink: 1`。
+卡片总高超过抽屉高度时，浏览器会**压缩卡片**而不是让容器滚动；卡片内的
+`overflow: hidden` 再把超出部分**裁掉**——于是"内容看不全/像被挡住"。
+
+修法：`.tw-content>*{flex:0 0 auto}` 禁止收缩，让容器滚动；
+`.tw-card-body>*{flex:0 0 auto}` 同样禁止内层被压。
+
+同时补齐三处**没有分页的列表**（此前只有 8 处做了分页）：
+
+| 位置 | 条数上限 | pageSize |
+|---|---|---|
+| 渠道自检 | 6（可增长） | 6 |
+| 研报详情 · 数据来源 | **30**（store 校验 1..30） | 8 |
+| 因子表格 | 8 行 | 4 |
+
+分页覆盖率现在由测试兜住：断言 10 个会渲染记录列表的组件都使用了 `Paged`
+（`ResearchView`/`SignalView`/`ExecutionView`/`AuditView`/`EventsBody`/
+`SourcesCard`/`ReportDetail`/`FactorsView`/`PortfolioView`/`TradeSummaryCard`），
+新增列表组件若忘了分页会直接失败。
+
 ## 七、回滚方式
 
 ```bash

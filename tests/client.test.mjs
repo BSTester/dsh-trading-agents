@@ -50,8 +50,10 @@ test("workbench client ships pagination, report detail, and drawer UI", async ()
   assert.match(source, /tw-drawer/, "抽屉容器缺失");
   assert.match(source, /在新标签打开/, "缺少新标签打开入口");
   // 所有列表类视图必须走 Paged，避免出现无分页的超长列表
-  // 注意 EventsView 只是"未选标的时给提示"的外壳，真正渲染列表的是 EventsBody
-  for (const view of ["ResearchView", "SignalView", "ExecutionView", "AuditView", "EventsBody"]) {
+  // 注意 EventsView 只是"未选标的时给提示"的外壳，真正渲染列表的是 EventsBody。
+  // 这里要覆盖**所有会渲染记录列表**的组件：漏掉一个就会出现无分页的长列表。
+  for (const view of ["ResearchView", "SignalView", "ExecutionView", "AuditView", "EventsBody",
+    "SourcesCard", "ReportDetail", "FactorsView", "PortfolioView", "TradeSummaryCard"]) {
     const body = source.slice(source.indexOf(`function ${view}(`));
     const end = body.indexOf("\n    function ", 10);
     const text = end === -1 ? body : body.slice(0, end);

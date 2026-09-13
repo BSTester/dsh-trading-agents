@@ -51,10 +51,15 @@ window.__ModuleLoader__.load({
 .tw-btn.danger{background:var(--dsw-alias-state-error-primary,#d1242f);color:#fff;border-color:transparent}
 .tw-btn.seg{padding:5px 10px;font-size:11px}
 .tw-btn.seg.active{background:var(--dsw-alias-interactive-bg-active,var(--dsw-alias-button-info-fill,Highlight));color:var(--dsw-alias-label-primary-foreground,HighlightText)}
+/* 关键：.tw-content 是「可滚动 + flex 纵向」，flex 子项默认 flex-shrink:1。
+   卡片总高超过抽屉高度时会被压缩，再配合下面的 overflow:hidden 就把内容裁掉了
+   ——表现为"卡片被挡住/看不全"。用 flex:0 0 auto 禁止收缩，让容器去滚动而不是压缩卡片。 */
+.tw-content>*{flex:0 0 auto}
 .tw-card{border:1px solid var(--dsw-alias-border-l1,GrayText);border-radius:10px;background:var(--dsw-alias-bg-layer-2,Canvas);overflow:hidden}
 .tw-card-head{display:flex;align-items:center;gap:8px;padding:10px 12px;font-weight:600;font-size:13px;border-bottom:1px solid var(--dsw-alias-border-l1,GrayText)}
 .tw-count{margin-left:auto;font-size:11px;font-weight:600;padding:1px 8px;border-radius:999px;color:var(--dsw-alias-label-secondary,GrayText);background:var(--dsw-alias-interactive-bg-hover,rgba(128,128,128,.14))}
 .tw-card-body{padding:12px;display:flex;flex-direction:column;gap:10px}
+.tw-card-body>*{flex:0 0 auto}
 .tw-chart{width:100%;height:360px;display:block;border-radius:8px;background:var(--dsw-alias-bg-base,Canvas)}
 .tw-chart.small{height:150px}
 .tw-kv{display:grid;grid-template-columns:repeat(auto-fit,minmax(150px,1fr));gap:8px}
@@ -448,7 +453,8 @@ window.__ModuleLoader__.load({
         h(Card, { title: "研报正文" }, h("pre", { className: "tw-pre" }, report.report)),
         h(Card, { title: "数据来源", count: (report.sources || []).length,
           empty: (report.sources || []).length ? undefined : "未记录来源" },
-          h("ul", { className: "tw-sources" }, (report.sources || []).map((s, i) => h(Source, { key: i, source: s })))));
+          h(Paged, { items: report.sources || [], pageSize: 8, empty: "未记录来源",
+            render: (source, index) => h(Source, { key: index, source }) })));
     }
 
     /**
@@ -779,6 +785,22 @@ window.__ModuleLoader__.load({
         h("p", { className: "tw-hint" }, quality.data?.note ?? ""));
     }
 
+    /** 因子表格的一行：一个标的的排名、综合分与各因子取值。 */
+    function FactorRow({ row }) {
+      const tone = (row.score ?? 0) >= 0
+        ? "var(--dsw-alias-state-success-primary,#2ea043)"
+        : "var(--dsw-alias-state-error-primary,#d1242f)";
+      const detail = Object.entries(FACTOR_LABELS).map(([key, label]) => {
+        const value = row.factors?.[key];
+        return `${label} ${value === undefined || value === null ? "—" : Number(value).toFixed(3)}`;
+      }).join(" · ");
+      return h("div", { className: "tw-kv-item" },
+        h("div", { className: "tw-kv-k" }, `#${row.rank} ${row.ticker}`),
+        h("div", { className: "tw-kv-v", style: { color: tone } },
+          `${row.score >= 0 ? "+" : ""}${row.score}`),
+        h("div", { className: "tw-meta" }, detail));
+    }
+
     function FactorsView({ rpc, ticker, watchlist, setWatchlist }) {
       const [factor, setFactor] = React.useState("mom_20");
       const tickers = watchlist;
@@ -800,14 +822,8 @@ window.__ModuleLoader__.load({
           empty: !enough ? "有效标的不足：请在下方输入至少 2 个标的（如 00700.HK,AAPL）"
             : cardEmpty({ loading: snap.loading, error: snap.error,
               count: rows.length, fallback: "暂无数据" }) },
-          rows.length > 0 && h("div", { className: "tw-kv" }, rows.map((row) =>
-            h("div", { key: row.ticker, className: "tw-kv-item" },
-              h("div", { className: "tw-kv-k" }, `#${row.rank} ${row.ticker}`),
-              h("div", { className: "tw-kv-v", style: { color: (row.score ?? 0) >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
-                `${row.score >= 0 ? "+" : ""}${row.score}`),
-              h("div", { className: "tw-meta" }, Object.entries(FACTOR_LABELS).map(([k, label]) =>
-                `${label} ${row.factors[k] !== undefined && row.factors[k] !== null ? Number(row.factors[k]).toFixed(3) : "—"}`).join(" · "))))),
-          snap.data?.failures && Object.keys(snap.data.failures).length > 0
+          h(Paged, { items: rows, pageSize: 4, empty: "暂无因子数据",
+            render: (row) => h(FactorRow, { key: row.ticker, row }) }),          snap.data?.failures && Object.keys(snap.data.failures).length > 0
             && h("p", { className: "tw-meta" }, `跳过：${Object.entries(snap.data.failures).map(([k, v]) => `${k}(${v})`).join("；")}`)),
         h(Card, { title: "因子 IC / ICIR（横截面，forward 5 日）",
           empty: tickers.length < 3 ? "IC 需要 3..8 个标的（横截面相关）"
@@ -1044,12 +1060,13 @@ window.__ModuleLoader__.load({
       return h(Card, { title: "数据源与授权状态", count: rows.length,
         empty: cardEmpty({ loading: sources.loading, error: sources.error,
           count: rows.length, fallback: "未返回渠道状态" }) },
-        rows.map((row) => h("div", { key: row.key, className: "tw-item" },
-          h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
-            h("span", { className: `tw-tag ${row.status === "ok" ? "buy" : row.status === "fail" ? "sell" : "hold"}` },
-              `${icon[row.status] ?? ""} ${row.label}`),
-            h("div", { className: "tw-meta" }, row.detail),
-            row.status !== "ok" && row.fix && h("div", { className: "tw-meta" }, `修复：${row.fix}`)))),
+        h(Paged, { items: rows, pageSize: 6, empty: "未返回渠道状态",
+          render: (row) => h("div", { key: row.key, className: "tw-item" },
+            h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
+              h("span", { className: `tw-tag ${row.status === "ok" ? "buy" : row.status === "fail" ? "sell" : "hold"}` },
+                `${icon[row.status] ?? ""} ${row.label}`),
+              h("div", { className: "tw-meta" }, row.detail),
+              row.status !== "ok" && row.fix && h("div", { className: "tw-meta" }, `修复：${row.fix}`))) }),
         sources.data && h("p", { className: "tw-meta" },
           `自检时间 ${sources.data.checked_at} · 正常 ${sources.data.summary.ok} / 待配置 ${sources.data.summary.warn} / 异常 ${sources.data.summary.fail}`));
     }
