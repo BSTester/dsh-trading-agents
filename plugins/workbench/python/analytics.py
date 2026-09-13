@@ -193,18 +193,69 @@ def correlation(tickers, window=120):
             "as_of": common[-1], "note": "基于共同交易日的日收益率皮尔逊相关系数"}
 
 
+def risk_view():
+    """读取生效风控参数（与引擎同一事实来源）。"""
+    import subprocess
+    script = Path(__file__).resolve().parent.parent.parent / "engine" / "python" / "risk_config.py"
+    if not script.exists():
+        # 安装后两个插件各自成包，改为读同一配置文件
+        config_path = DSH / "trading-risk.json"
+        defaults = {"risk_per_trade": 0.01, "stop_atr_mult": 2.0, "max_positions": 5,
+                    "daily_loss_limit_pct": 0.03, "max_position_pct": 0.25}
+        if config_path.exists():
+            try:
+                cfg = {**defaults, **json.loads(config_path.read_text())}
+                return {"config": cfg, "source": str(config_path)}
+            except (OSError, ValueError) as error:
+                return {"config": None, "error": f"风控配置无法解析：{error}", "source": str(config_path)}
+        return {"config": defaults, "source": "(默认值，未落盘)"}
+    out = subprocess.run([sys.executable, str(script), "show"], capture_output=True, text=True, timeout=30)
+    data = json.loads(out.stdout[out.stdout.index("{"):])
+    return {"config": data.get("config"), "source": data.get("source"),
+            "defaults": data.get("defaults")}
+
+
+def trades_view(mode="sim", limit=50):
+    """台账成交记录（执行页展示；不是券商成交推送）。"""
+    ledger = load_ledger(mode)
+    history = [t for t in ledger["history"] if t.get("date")]
+    history.sort(key=lambda t: t["date"], reverse=True)
+    rows = []
+    for trade in history[:limit]:
+        rows.append({
+            "date": trade["date"], "action": trade["action"], "ticker": trade["ticker"],
+            "shares": trade["shares"], "price": trade["price"],
+            "fee": trade.get("fee"), "return": trade.get("return"),
+            "reason": trade.get("reason"), "stop": trade.get("stop"),
+            "execution_source": trade.get("execution_source"),
+        })
+    sells = [r for r in rows if r["action"] == "SELL" and r.get("return") is not None]
+    wins = [r for r in sells if (r["return"] or 0) > 0]
+    fees = sum(float(r.get("fee") or 0) for r in rows)
+    return {"mode": mode, "count": len(rows), "total": len(history), "trades": rows,
+            "win_rate": round(len(wins) / len(sells), 4) if sells else None,
+            "total_fees": round(fees, 2),
+            "note": "本地模拟台账成交；实盘成交请用富途 account_fills_* 查询。"}
+
+
 def main():
     ap = argparse.ArgumentParser()
     sub = ap.add_subparsers(dest="cmd", required=True)
     p1 = sub.add_parser("equity"); p1.add_argument("--mode", default="sim"); p1.add_argument("--window", type=int, default=250)
     p2 = sub.add_parser("positions"); p2.add_argument("--mode", default="sim")
     p3 = sub.add_parser("correlation"); p3.add_argument("--tickers", required=True); p3.add_argument("--window", type=int, default=120)
+    p4 = sub.add_parser("risk")
+    p5 = sub.add_parser("trades"); p5.add_argument("--mode", default="sim"); p5.add_argument("--limit", type=int, default=50)
     args = ap.parse_args()
     try:
         if args.cmd == "equity":
             print(json.dumps(equity_curve(args.mode, args.window), ensure_ascii=False))
         elif args.cmd == "positions":
             print(json.dumps(positions_view(args.mode), ensure_ascii=False))
+        elif args.cmd == "risk":
+            print(json.dumps(risk_view(), ensure_ascii=False))
+        elif args.cmd == "trades":
+            print(json.dumps(trades_view(args.mode, args.limit), ensure_ascii=False))
         else:
             tickers = [t.strip() for t in args.tickers.split(",") if t.strip()][:8]
             if not tickers:

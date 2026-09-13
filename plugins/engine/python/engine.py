@@ -28,14 +28,16 @@ else:
     from backtest import (load_data, validate_data, ma_cross_signal, rsi_signal,
                           COMMISSION, SLIPPAGE, STAMP_TAX)
 
+import risk_config  # noqa: E402  （风控参数单一事实来源）
+
 DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
 LEDGER = DSH / "quant-ledger.json"
 MODE_FILE = DSH / "trading-account-mode"
 EXECUTION_SOURCE = "local_simulation"
 INITIAL_CASH = 1_000_000.0
-RISK_PER_TRADE = 0.01      # 单笔风险 = 权益的 1%
-STOP_ATR_MULT = 2.0        # 止损 = 入场价 - 2*ATR
-MAX_POSITIONS = 5
+# 风控参数已迁移到 risk_config.py（~/.dsh/trading-risk.json，可配置）；
+# 下方仅为默认值参考，运行时一律以 risk_config.load() 为准。
+DEFAULT_RISK = {"risk_per_trade": 0.01, "stop_atr_mult": 2.0, "max_positions": 5}
 
 
 def read_mode():
@@ -173,6 +175,7 @@ def _decide(ticker, strategy, apply_fill, **kw):
     pos = ledger["positions"].get(ticker)
     order = None
     blocked_reason = None
+    risk = risk_config.load()  # 非法配置即拒绝交易，不静默降级
     quotes = {ticker: price}
     eq = equity(ledger, ledger["positions"], quotes)
 
@@ -184,9 +187,9 @@ def _decide(ticker, strategy, apply_fill, **kw):
                      "price": price, "stop": None,
                      "reason": "ATR stop triggered" if price <= pos.get("stop", 0)
                                else f"{s['strategy']} sell signal"}
-    elif sig == "BUY" and pos is None and len(ledger["positions"]) < MAX_POSITIONS:
-        stop = price - STOP_ATR_MULT * atr
-        risk_budget = eq * RISK_PER_TRADE
+    elif sig == "BUY" and pos is None and len(ledger["positions"]) < risk["max_positions"]:
+        stop = price - risk["stop_atr_mult"] * atr
+        risk_budget = min(eq * risk["risk_per_trade"], eq * risk["max_position_pct"])
         per_share = max(price - stop, 0.01)
         risk_lots = math.floor(risk_budget / per_share / 100)
         cash_lots = math.floor(ledger["cash"] / (price * (1 + COMMISSION + SLIPPAGE) * 100))

@@ -95,7 +95,7 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation"].includes(endpoint))
+      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades"].includes(endpoint))
         throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
@@ -279,36 +279,40 @@ window.__ModuleLoader__.load({
       return state;
     }
 
-    function HeatmapChart({ tickers, matrix }) {
+    function HeatmapChart({ rowLabels, colLabels, tickers, matrix, unit = "" }) {
+      const rows = rowLabels ?? tickers ?? [];
+      const cols = colLabels ?? tickers ?? [];
       const ref = useCanvasChart((ctx, width, height, color) => {
-        if (!tickers || !matrix || matrix.length < 2) {
+        if (!rows.length || !matrix || !matrix.length) {
           ctx.fillStyle = color.text; ctx.font = "12px sans-serif";
-          ctx.fillText("暂无相关性数据", 12, 22); return;
+          ctx.fillText("暂无矩阵数据", 12, 22); return;
         }
-        const padL = 62, padT = 24, padR = 10, padB = 10;
-        const cols = tickers.length;
-        const cell = Math.min((width - padL - padR) / cols, (height - padT - padB) / cols, 64);
+        const padL = 54, padT = 24, padR = 10, padB = 10;
+        const cell = Math.min((width - padL - padR) / cols.length, (height - padT - padB) / rows.length, 64);
         ctx.font = "10px sans-serif";
-        tickers.forEach((t, i) => {
-          ctx.fillStyle = color.text;
-          ctx.fillText(String(t).slice(0, 8), 4, padT + cell * i + cell / 2 + 3);
-          ctx.fillText(String(t).slice(0, 8), padL + cell * i + 2, padT - 8);
-        });
-        matrix.forEach((row, i) => row.forEach((value, j) => {
+        let min = Infinity, max = -Infinity;
+        matrix.forEach((line) => line.forEach((v) => { if (v !== null && v !== undefined) { min = Math.min(min, v); max = Math.max(max, v); } }));
+        if (!Number.isFinite(min)) { min = 0; max = 1; }
+        const span = max - min || 1;
+        rows.forEach((label, i) => { ctx.fillStyle = color.text; ctx.fillText(String(label), 4, padT + cell * i + cell / 2 + 3); });
+        cols.forEach((label, j) => { ctx.fillStyle = color.text; ctx.fillText(String(label), padL + cell * j + 2, padT - 8); });
+        matrix.forEach((line, i) => line.forEach((value, j) => {
           const x = padL + cell * j, y = padT + cell * i;
           if (value === null || value === undefined) {
-            ctx.fillStyle = color.grid; ctx.fillRect(x, y, cell - 2, cell - 2); return;
+            ctx.fillStyle = color.grid; ctx.fillRect(x, y, cell - 2, cell - 2);
+            ctx.fillStyle = color.text; ctx.fillText("--", x + 4, y + cell / 2 + 3);
+            return;
           }
-          const strength = Math.min(Math.abs(value), 1);
+          const strength = (value - min) / span;
           ctx.fillStyle = value >= 0 ? color.up : color.down;
-          ctx.globalAlpha = 0.15 + strength * 0.75;
+          ctx.globalAlpha = 0.12 + strength * 0.78;
           ctx.fillRect(x, y, cell - 2, cell - 2);
           ctx.globalAlpha = 1;
-          ctx.fillStyle = strength > 0.55 ? "#fff" : color.text;
-          ctx.fillText(value.toFixed(2), x + 4, y + cell / 2 + 3);
+          ctx.fillStyle = strength > 0.6 ? "#fff" : color.text;
+          ctx.fillText(value.toFixed(2) + unit, x + 3, y + cell / 2 + 3);
         }));
-      }, [tickers, matrix]);
-      return h("canvas", { ref, className: "tw-chart small" });
+      }, [rows.join(","), cols.join(","), JSON.stringify(matrix)]);
+      return h("canvas", { ref, className: "tw-chart" });
     }
 
     function Card({ title, count, empty, children }) {
@@ -438,6 +442,19 @@ window.__ModuleLoader__.load({
           h(LineChart, { points: series.map((b) => ({ v: b.c })), label: "收盘价" })));
     }
 
+    function RiskConfigCard({ rpc, mode }) {
+      const risk = useEndpoint(rpc, "risk", {}, [rpc]);
+      const config = risk.data?.config;
+      return h(Card, { title: "风控参数（引擎实际生效值）",
+        empty: config ? undefined : (risk.loading ? "加载中…" : (risk.error || "不可用")) },
+        config && h("div", { className: "tw-kv" }, Object.entries(config).map(([key, value]) =>
+          h("div", { key, className: "tw-kv-item" },
+            h("div", { className: "tw-kv-k" }, key),
+            h("div", { className: "tw-kv-v" }, String(value))))),
+        h("p", { className: "tw-meta" }, `来源：${risk.data?.source ?? "—"}`),
+        h("p", { className: "tw-hint" }, "参数由 scripts/risk_config 管理；引擎每次决策前读取，非法配置直接拒绝交易。"));
+    }
+
     function RiskView({ rpc, snapshot }) {
       const latest = snapshot.previews.find((p) => p.kind === "backtest");
       const s = latest?.value?.summary;
@@ -468,29 +485,80 @@ window.__ModuleLoader__.load({
             : (correlation.loading ? "加载中…" : (correlation.error || "标的不足")) },
           correlation.data && h(HeatmapChart, { tickers: correlation.data.tickers, matrix: correlation.data.matrix }),
           correlation.data && h("p", { className: "tw-meta" }, `窗口 ${correlation.data.window} 个共同交易日 · 截至 ${correlation.data.as_of}`)),
+        h(RiskConfigCard, { rpc, mode: snapshot.mode }),
         h("p", { className: "tw-hint" }, "持仓敞口与相关性均基于本地台账与公开日线；实盘口径请结合富途账户查询。"));
     }
 
-    function ExecutionView({ snapshot }) {
-      return h(Card, { title: "交易动态（Harness 观察到的券商响应）", count: snapshot.activity.length },
-        h("p", { className: "tw-meta" }, "响应不等于成交；状态以券商查询为准。下单请在 Harness 会话中完成并确认。"),
-        snapshot.activity.slice(0, 30).map((row) => h("details", { key: row.id, className: "tw-item" },
-          h("summary", null, `${row.at} · ${row.tool ?? row.kind}`,
-            row.is_error ? h("span", { className: "tw-tag sell" }, "失败") : null),
-          h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2))))));
+    function ExecutionView({ rpc, snapshot }) {
+      const trades = useEndpoint(rpc, "trades", { mode: snapshot.mode, limit: 50 }, [rpc, snapshot.mode]);
+      const rows = trades.data?.trades ?? [];
+      return h(React.Fragment, null,
+        h(Card, { title: "成交记录（本地台账）", count: rows.length,
+          empty: trades.loading ? "加载中…" : (trades.error || "暂无成交记录") },
+          rows.length > 0 && h("div", { className: "tw-kv" }, rows.slice(0, 20).map((row, i) =>
+            h("div", { key: i, className: "tw-kv-item" },
+              h("div", { className: "tw-kv-k" }, `${row.date} · ${row.ticker}`),
+              h("div", { className: "tw-kv-v", style: { color: row.action === "BUY" ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
+                `${row.action} ${row.shares} @ ${row.price}`),
+              h("div", { className: "tw-meta" },
+                `费用 ${row.fee ?? "—"}${row.return !== undefined && row.return !== null ? ` · 收益 ${(row.return * 100).toFixed(2)}%` : ""}${row.reason ? ` · ${row.reason}` : ""}`)))),
+          trades.data && h("p", { className: "tw-meta" },
+            `共 ${trades.data.total} 笔 · 胜率 ${trades.data.win_rate === null ? "—" : `${(trades.data.win_rate * 100).toFixed(0)}%`} · 累计费用 ${trades.data.total_fees}`)),
+        h(Card, { title: "交易动态（Harness 观察到的券商响应）", count: snapshot.activity.length },
+          h("p", { className: "tw-meta" }, "响应不等于成交；下单请在 Harness 会话中完成并确认。"),
+          snapshot.activity.slice(0, 30).map((row) => h("details", { key: row.id, className: "tw-item" },
+            h("summary", null, `${row.at} · ${row.tool ?? row.kind}`,
+              row.is_error ? h("span", { className: "tw-tag sell" }, "失败") : null),
+            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, JSON.stringify(row.value ?? row, null, 2)))))));
     }
 
-    function ResearchView({ snapshot }) {
+    function ResearchView({ rpc, snapshot, ticker }) {
       const running = snapshot.runs.filter((run) => run.status === "running");
-      return h(Card, { title: "研报结果", count: snapshot.reports.length,
-        empty: snapshot.reports.length || running.length ? undefined : "暂无研报。在 Harness 中要求完整投研后，发布结果会显示在这里。" },
-        running.map((run) => h("div", { key: run.id, className: "tw-item" },
-          h("div", { className: "tw-item-body" }, h("span", { className: "tw-tag" }, "进行中"), ` ${run.ticker} · ${run.started_at}`))),
-        snapshot.reports.map((report) => h("details", { key: report.id, className: "tw-item" },
-          h("summary", null, h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
-            report.ticker, h("span", { className: "tw-meta" }, report.published_at)),
-          h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, report.report),
-            h("ul", { className: "tw-sources" }, report.sources.map((s, i) => h(Source, { key: i, source: s })))))));
+      const [strategy, setStrategy] = React.useState("ma_cross");
+      const [metric, setMetric] = React.useState("total_return");
+      const [result, setResult] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const [failure, setFailure] = React.useState("");
+
+      const runSensitivity = async () => {
+        setBusy(true); setFailure("");
+        try {
+          const value = await request(rpc, "sensitivity", { ticker, strategy, metric, start: "2023-01-01" });
+          setResult(value);
+        } catch (error) { setFailure(error.message); }
+        finally { setBusy(false); }
+      };
+
+      return h(React.Fragment, null,
+        h(Card, { title: "研报结果", count: snapshot.reports.length,
+          empty: snapshot.reports.length || running.length ? undefined : "暂无研报。在 Harness 中要求完整投研后，发布结果会显示在这里。" },
+          running.map((run) => h("div", { key: run.id, className: "tw-item" },
+            h("div", { className: "tw-item-body" }, h("span", { className: "tw-tag" }, "进行中"), ` ${run.ticker} · ${run.started_at}`))),
+          snapshot.reports.map((report) => h("details", { key: report.id, className: "tw-item" },
+            h("summary", null, h("span", { className: `tw-tag ${RATING_CLASS[report.rating] ?? ""}` }, report.rating),
+              report.ticker, h("span", { className: "tw-meta" }, report.published_at)),
+            h("div", { className: "tw-item-body" }, h("pre", { className: "tw-pre" }, report.report),
+              h("ul", { className: "tw-sources" }, report.sources.map((s, i) => h(Source, { key: i, source: s }))))))),
+        h(Card, { title: "参数敏感性（样本内网格）" },
+          h("div", { className: "tw-toolbar" },
+            h("span", { className: "tw-meta" }, `标的 ${ticker}`),
+            h("button", { type: "button", className: `tw-btn seg${strategy === "ma_cross" ? " active" : ""}`,
+              onClick: () => setStrategy("ma_cross") }, "双均线"),
+            h("button", { type: "button", className: `tw-btn seg${strategy === "rsi" ? " active" : ""}`,
+              onClick: () => setStrategy("rsi") }, "RSI"),
+            ["total_return", "sharpe", "max_drawdown", "win_rate"].map((m) =>
+              h("button", { key: m, type: "button", className: `tw-btn seg${metric === m ? " active" : ""}`,
+                onClick: () => setMetric(m) }, m)),
+            h("button", { type: "button", className: "tw-btn primary", disabled: busy, onClick: runSensitivity },
+              busy ? "计算中…" : "计算网格")),
+          failure && h("p", { className: "tw-alert" }, `计算失败：${failure}`),
+          !result && !busy && h("p", { className: "tw-empty" }, "点击「计算网格」运行参数扫描（只读回测，不下单）。"),
+          result && h(React.Fragment, null,
+            h(HeatmapChart, { rowLabels: result.rows, colLabels: result.cols, matrix: result.matrix }),
+            h("p", { className: "tw-meta" },
+              `行=${result.row_label} 列=${result.col_label} · 指标=${result.metric} · 样本 ${result.bars} 根（截至 ${result.as_of}）`),
+            h("p", { className: "tw-meta" }, `最优：${result.row_label}=${result.best.row}, ${result.col_label}=${result.best.col} → ${result.metric} ${result.best.value}（${result.best.trades} 笔 / 胜率 ${result.best.win_rate}）`),
+            h("p", { className: "tw-hint" }, result.note))));
     }
 
     function EventsView() {
@@ -570,8 +638,8 @@ window.__ModuleLoader__.load({
               snapshot && tab === "signal" && h(SignalView, { snapshot, series: market.bars }),
               snapshot && tab === "portfolio" && h(PortfolioView, { rpc, snapshot, series: market.bars }),
               snapshot && tab === "risk" && h(RiskView, { rpc, snapshot }),
-              snapshot && tab === "execution" && h(ExecutionView, { snapshot }),
-              snapshot && tab === "research" && h(ResearchView, { snapshot }),
+              snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
+              snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker: market.ticker }),
               tab === "events" && h(EventsView, null),
               snapshot && tab === "audit" && h(AuditView, { snapshot }),
               snapshot && h("div", { className: "tw-row" },

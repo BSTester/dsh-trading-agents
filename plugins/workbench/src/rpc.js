@@ -55,6 +55,24 @@ export function createRpcHandler(store, deps = {}) {
             message: String(error?.message ?? error).slice(0, 300), details: {} } };
         }
       }
+      if (endpoint === "sensitivity" || endpoint === "risk" || endpoint === "trades") {
+        const allowed = endpoint === "sensitivity"
+          ? ["ticker", "strategy", "metric", "fast_grid", "slow_grid", "buy_grid", "sell_grid", "start"]
+          : endpoint === "trades" ? ["mode", "limit"] : [];
+        if (Object.keys(payload).some(key => !allowed.includes(key))) {
+          throw new WorkbenchError(`Unexpected ${endpoint} field`);
+        }
+        const provider = deps.analytics;
+        if (!provider || typeof provider[endpoint] !== "function") {
+          throw new WorkbenchError("Analytics provider unavailable");
+        }
+        try {
+          return { ok: true, value: await provider[endpoint](payload) };
+        } catch (error) {
+          return { ok: false, error: { code: "trading/analytics-unavailable",
+            message: String(error?.message ?? error).slice(0, 300), details: {} } };
+        }
+      }
       if (endpoint === "series") {
         if (Object.keys(payload).some(key => !["ticker", "period", "limit"].includes(key))) {
           throw new WorkbenchError("Unexpected series field");

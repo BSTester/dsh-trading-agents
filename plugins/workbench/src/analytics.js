@@ -8,6 +8,9 @@ const run = promisify(execFile);
 const pythonDir = fileURLToPath(new URL("../python/", import.meta.url));
 
 const MODES = new Set(["sim", "live"]);
+const STRATEGIES = new Set(["ma_cross", "rsi"]);
+const METRICS = new Set(["total_return", "annualized", "sharpe", "max_drawdown", "win_rate"]);
+const GRID = /^\d{1,3}(,\d{1,3}){1,7}$/;
 const TICKER = /^[A-Za-z0-9.^-]{1,40}$/;
 const CACHE_TTL_MS = 30_000;
 
@@ -59,6 +62,39 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
     async positions(payload = {}) {
       const mode = modeOf(payload.mode);
       return call(["positions", "--mode", mode], `positions|${mode}`);
+    },
+    async sensitivity(payload = {}) {
+      const tickerList = payload.ticker;
+      if (typeof tickerList !== "string" || !TICKER.test(tickerList)) throw new Error("Invalid ticker");
+      const strategy = payload.strategy ?? "ma_cross";
+      if (!STRATEGIES.has(strategy)) throw new Error("Invalid strategy");
+      const metric = payload.metric ?? "total_return";
+      if (!METRICS.has(metric)) throw new Error("Invalid metric");
+      for (const field of ["fast_grid", "slow_grid", "buy_grid", "sell_grid"]) {
+        const value = payload[field];
+        if (value === undefined) continue;
+        if (typeof value !== "string" || !GRID.test(value)) throw new Error(`Invalid ${field}`);
+        for (const part of value.split(",")) {
+          const number = Number(part);
+          if (!Number.isInteger(number) || number < 1 || number > 500) throw new Error(`Invalid ${field} value`);
+        }
+      }
+      const start = payload.start ?? "2023-01-01";
+      if (!/^\d{4}-\d{2}-\d{2}$/.test(start)) throw new Error("Invalid start date");
+      const args = ["sensitivity", "--ticker", tickerList, "--strategy", strategy, "--metric", metric, "--start", start];
+      if (payload.fast_grid) args.push("--fast-grid", payload.fast_grid);
+      if (payload.slow_grid) args.push("--slow-grid", payload.slow_grid);
+      if (payload.buy_grid) args.push("--buy-grid", payload.buy_grid);
+      if (payload.sell_grid) args.push("--sell-grid", payload.sell_grid);
+      return call(args, `sensitivity|${args.join(" ")}`);
+    },
+    async risk() {
+      return call(["risk"], "risk");
+    },
+    async trades(payload = {}) {
+      const mode = modeOf(payload.mode);
+      const limit = intInRange(payload.limit, 50, 1, 200, "limit");
+      return call(["trades", "--mode", mode, "--limit", String(limit)], `trades|${mode}|${limit}`);
     },
     async correlation(payload = {}) {
       const tickers = payload.tickers;

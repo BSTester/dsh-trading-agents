@@ -83,3 +83,41 @@ test("analytics provider surfaces python-reported errors", async () => {
   });
   await assert.rejects(() => analytics.correlation({ tickers: ["600519", "000001"] }), /共同交易日不足/);
 });
+
+test("sensitivity / risk / trades endpoints accept validated payloads only", async () => {
+  const calls = [];
+  const handle = handlerWith({
+    sensitivity: async (payload) => { calls.push(["sensitivity", payload]); return { rows: [3, 5], cols: [10, 20], matrix: [[1, 2], [3, null]] }; },
+    risk: async () => ({ config: { risk_per_trade: 0.01 }, source: "(默认值)" }),
+    trades: async (payload) => { calls.push(["trades", payload]); return { count: 0, trades: [] }; },
+  });
+  const sens = await handle("sensitivity", { ticker: "600519", strategy: "ma_cross", metric: "sharpe", fast_grid: "3,5", slow_grid: "10,20" });
+  assert.equal(sens.ok, true);
+  assert.equal(sens.value.matrix[1][1], null);
+  const risk = await handle("risk", {});
+  assert.equal(risk.value.config.risk_per_trade, 0.01);
+  const trades = await handle("trades", { mode: "sim", limit: 20 });
+  assert.equal(trades.ok, true);
+  // 越界字段被拒
+  const bad = await handle("sensitivity", { ticker: "600519", order: "buy" });
+  assert.equal(bad.ok, false);
+  const badRisk = await handle("risk", { mode: "sim" });
+  assert.equal(badRisk.ok, false);
+});
+
+test("sensitivity provider validates grids, metric, and start date", async () => {
+  let executions = 0;
+  const analytics = createAnalyticsProvider({
+    exec: async () => { executions += 1; return { stdout: JSON.stringify({ rows: [], cols: [], matrix: [] }) }; },
+    python: () => "/tmp/python", now: () => 0,
+  });
+  await assert.rejects(() => analytics.sensitivity({ ticker: "600519", metric: "profit" }), /Invalid metric/);
+  await assert.rejects(() => analytics.sensitivity({ ticker: "600519", fast_grid: "3" }), /Invalid fast_grid/);
+  await assert.rejects(() => analytics.sensitivity({ ticker: "600519", fast_grid: "3,999" }), /Invalid fast_grid value/);
+  await assert.rejects(() => analytics.sensitivity({ ticker: "600519", start: "2023/01/01" }), /Invalid start date/);
+  assert.equal(executions, 0);
+  await analytics.sensitivity({ ticker: "600519" });
+  assert.equal(executions, 1);
+  await assert.rejects(() => analytics.trades({ mode: "paper" }), /Invalid mode/);
+  await assert.rejects(() => analytics.trades({ limit: 9999 }), /Invalid limit/);
+});
