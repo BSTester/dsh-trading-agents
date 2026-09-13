@@ -1,6 +1,6 @@
 ---
 name: trading-agents
-description: TradingAgents 多角色投研流水线——按分析师、多空辩论、裁决、交易提案、风控辩论、终审六阶段分析标的。当用户要求分析某只股票/标的、判断买卖时机或给出投资建议时使用。
+description: TradingAgents 多角色投研流水线（12角色/6阶段）——仅在用户明确要求深度投研、完整研报、多角度评估或多空辩论时使用。日常"能不能买卖/看信号/跑回测/短线量化"一律走 quant-trading 快路径，不要启动本流程。
 ---
 
 # TradingAgents 投研流水线
