@@ -715,7 +715,10 @@ window.__ModuleLoader__.load({
       const latest = quality.data?.latest;
       const periods = quality.data?.periods ?? [];
       const pct = (value) => (value === null || value === undefined ? "—" : `${value}%`);
+      const returns = quality.data?.returns ?? {};
       const metrics = latest ? [
+        ["净资产收益率 ROE", pct(returns.roe)],
+        ["总资产收益率 ROA", pct(returns.roa)],
         ["毛利率", pct(latest.gross_margin)],
         ["营业利润率", pct(latest.operating_margin)],
         ["净利率", pct(latest.net_margin)],
@@ -738,6 +741,10 @@ window.__ModuleLoader__.load({
           h("div", { key: label, className: "tw-kv-item" },
             h("div", { className: "tw-kv-k" }, label),
             h("div", { className: "tw-kv-v" }, String(value))))),
+        returns.available && h("p", { className: "tw-meta" },
+          `ROE/ROA 来源 ${returns.source} · 权益期 ${returns.balance_period ?? "—"}`
+          + ` · 利润期 ${returns.income_period ?? "—"}（富途无资产负债表接口，按渠道优先级落到备用源）`),
+        returns.available && h("p", { className: "tw-hint" }, returns.note ?? ""),
         (quality.data?.unavailable ?? []).length > 0 && h("p", { className: "tw-hint" },
           "无法提供：" + quality.data.unavailable.map((row) => `${row.label}（${row.reason}）`).join("；")),
         h("p", { className: "tw-hint" }, quality.data?.note ?? ""));

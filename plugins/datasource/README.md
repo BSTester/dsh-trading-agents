@@ -22,6 +22,7 @@
 | `market` | 行情路由（富途优先，A 股长历史走新浪）、符号归一化、本地缓存回退 |
 | `backtest` | 回测核心：策略、成本建模、绩效指标 |
 | `locate` | 跨插件定位兄弟插件的 python 脚本（量化侧据此复用 fin-data 的情绪渠道） |
+| `fundamentals` | ROE/ROA 备用源（Yahoo Finance，A 股再退 AKShare）——富途无资产负债表接口 |
 
 ## 安装后如何被找到
 
