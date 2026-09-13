@@ -148,3 +148,35 @@ test("events provider validates ticker pattern and window bounds", async () => {
   await analytics.events({ ticker: "600519" });
   assert.equal(executions, 1);
 });
+
+test("factors / ic endpoints validate payloads and delegate", async () => {
+  const seen = [];
+  const handle = handlerWith({
+    factors: async (payload) => { seen.push(payload); return { rows: [{ ticker: "600519", rank: 1, score: 0.5 }] }; },
+    ic: async (payload) => { seen.push(payload); return { mean_ic: 0.09, icir: 0.16, points: [] }; },
+  });
+  const snap = await handle("factors", { tickers: ["600519", "000001"], window: 250 });
+  assert.equal(snap.ok, true);
+  assert.equal(snap.value.rows[0].rank, 1);
+  const ic = await handle("ic", { tickers: ["600519", "000001", "601318"], factor: "mom_20", forward: 5, window: 250 });
+  assert.equal(ic.value.mean_ic, 0.09);
+  const bad = await handle("factors", { tickers: ["600519", "000001"], metric: "x" });
+  assert.equal(bad.ok, false);
+});
+
+test("factors / ic providers enforce universe size, factor enum, and bounds", async () => {
+  let executions = 0;
+  const analytics = createAnalyticsProvider({
+    exec: async () => { executions += 1; return { stdout: JSON.stringify({ rows: [] }) }; },
+    python: () => "/tmp/python", now: () => 0,
+  });
+  await assert.rejects(() => analytics.factors({ tickers: ["600519"] }), /2\.\.8/);
+  await assert.rejects(() => analytics.factors({ tickers: ["600519", "bad; rm"], window: 250 }), /Invalid ticker/);
+  await assert.rejects(() => analytics.ic({ tickers: ["600519", "000001"] }), /3\.\.8/);
+  await assert.rejects(() => analytics.ic({ tickers: ["600519", "000001", "601318"], factor: "hack" }), /Invalid factor/);
+  await assert.rejects(() => analytics.ic({ tickers: ["600519", "000001", "601318"], forward: 900 }), /Invalid forward/);
+  assert.equal(executions, 0, "非法参数不得进入子进程");
+  await analytics.factors({ tickers: ["600519", "000001"] });
+  await analytics.ic({ tickers: ["600519", "000001", "601318"] });
+  assert.equal(executions, 2);
+});

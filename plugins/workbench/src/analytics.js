@@ -11,6 +11,7 @@ const MODES = new Set(["sim", "live"]);
 const STRATEGIES = new Set(["ma_cross", "rsi"]);
 const METRICS = new Set(["total_return", "annualized", "sharpe", "max_drawdown", "win_rate"]);
 const GRID = /^\d{1,3}(,\d{1,3}){1,7}$/;
+const FACTORS = new Set(["mom_20", "mom_60", "vol_20", "trend", "rsi_14", "liq_ratio", "mdd_60"]);
 const TICKER = /^[A-Za-z0-9.^-]{1,40}$/;
 const CACHE_TTL_MS = 30_000;
 
@@ -93,6 +94,30 @@ export function createAnalyticsProvider({ exec = run, python = pythonPath, now =
       if (typeof ticker !== "string" || !TICKER.test(ticker)) throw new Error("Invalid ticker");
       const days = intInRange(payload.days, 180, 30, 2000, "days");
       return call(["events", "--ticker", ticker, "--days", String(days)], `events|${ticker}|${days}`);
+    },
+    async factors(payload = {}) {
+      const tickers = payload.tickers;
+      if (!Array.isArray(tickers) || tickers.length < 2 || tickers.length > 8) {
+        throw new Error("tickers must list 2..8 symbols");
+      }
+      if (tickers.some((t) => typeof t !== "string" || !TICKER.test(t))) throw new Error("Invalid ticker in list");
+      const window = intInRange(payload.window, 250, 80, 1000, "window");
+      return call(["snapshot", "--tickers", tickers.join(","), "--window", String(window)],
+        `factors|${tickers.join(",")}|${window}`);
+    },
+    async ic(payload = {}) {
+      const tickers = payload.tickers;
+      if (!Array.isArray(tickers) || tickers.length < 3 || tickers.length > 8) {
+        throw new Error("IC 需要 3..8 个标的（横截面相关）");
+      }
+      if (tickers.some((t) => typeof t !== "string" || !TICKER.test(t))) throw new Error("Invalid ticker in list");
+      const factor = payload.factor ?? "mom_20";
+      if (!FACTORS.has(factor)) throw new Error("Invalid factor");
+      const forward = intInRange(payload.forward, 5, 1, 60, "forward");
+      const window = intInRange(payload.window, 250, 80, 1000, "window");
+      return call(["ic", "--tickers", tickers.join(","), "--factor", factor,
+                   "--forward", String(forward), "--window", String(window)],
+        `ic|${tickers.join(",")}|${factor}|${forward}|${window}`);
     },
     async risk() {
       return call(["risk"], "risk");

@@ -95,7 +95,7 @@ window.__ModuleLoader__.load({
     }
 
     async function request(rpc, endpoint, payload, signal) {
-      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events"].includes(endpoint))
+      if (!["snapshot", "switch-mode", "series", "equity", "positions", "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic"].includes(endpoint))
         throw new Error("Unsupported workbench operation");
       const result = await rpc.call("/api", `trading-workbench/${endpoint}`, payload, signal);
       if (!result.ok) throw new Error(result.error.message);
@@ -343,6 +343,7 @@ window.__ModuleLoader__.load({
     const NAV = [
       { id: "market", label: "行情" }, { id: "signal", label: "信号" },
       { id: "portfolio", label: "组合" }, { id: "risk", label: "风险" },
+      { id: "factors", label: "因子" },
       { id: "execution", label: "执行" }, { id: "research", label: "研究" },
       { id: "events", label: "事件" }, { id: "audit", label: "审计" },
     ];
@@ -489,6 +490,52 @@ window.__ModuleLoader__.load({
         h("p", { className: "tw-hint" }, "持仓敞口与相关性均基于本地台账与公开日线；实盘口径请结合富途账户查询。"));
     }
 
+    const FACTOR_LABELS = {
+      mom_20: "动量20", mom_60: "动量60", vol_20: "波动率", trend: "趋势偏离",
+      rsi_14: "RSI14", liq_ratio: "量能比", mdd_60: "最大回撤",
+    };
+
+    function FactorsView({ rpc, ticker, watchlist, setWatchlist }) {
+      const [factor, setFactor] = React.useState("mom_20");
+      const tickers = watchlist;
+      const snap = useEndpoint(rpc, "factors", { tickers, window: 250 }, [rpc, tickers.join(",")]);
+      const ic = useEndpoint(rpc, "ic", { tickers, factor, forward: 5, window: 250 }, [rpc, tickers.join(","), factor]);
+      const rows = snap.data?.rows ?? [];
+      const icPoints = (ic.data?.points ?? []).map((p) => ({ v: p.ic }));
+      return h(React.Fragment, null,
+        h(Card, { title: "标的池", count: tickers.length },
+          h("div", { className: "tw-toolbar" },
+            h("input", { className: "tw-input", value: tickers.join(","), "aria-label": "标的池（逗号分隔，2..8个）",
+              onChange: (e) => setWatchlist(e.target.value.toUpperCase().split(",").map((t) => t.trim()).filter(Boolean).slice(0, 8)) }),
+            h("button", { type: "button", className: "tw-btn", onClick: () => setWatchlist([ticker, ...tickers.filter((t) => t !== ticker)].slice(0, 8)) },
+              `加入当前标的 ${ticker}`)),
+          h("p", { className: "tw-hint" }, "价量因子横截面打分；估值/质量因子待基本面源接入。")),
+        h(Card, { title: "因子打分与排序", count: rows.length,
+          empty: snap.loading ? "加载中…" : (snap.error || "有效标的不足") },
+          rows.length > 0 && h("div", { className: "tw-kv" }, rows.map((row) =>
+            h("div", { key: row.ticker, className: "tw-kv-item" },
+              h("div", { className: "tw-kv-k" }, `#${row.rank} ${row.ticker}`),
+              h("div", { className: "tw-kv-v", style: { color: (row.score ?? 0) >= 0 ? "var(--dsw-alias-state-success-primary,#2ea043)" : "var(--dsw-alias-state-error-primary,#d1242f)" } },
+                `${row.score >= 0 ? "+" : ""}${row.score}`),
+              h("div", { className: "tw-meta" }, Object.entries(FACTOR_LABELS).map(([k, label]) =>
+                `${label} ${row.factors[k] !== undefined && row.factors[k] !== null ? Number(row.factors[k]).toFixed(3) : "—"}`).join(" · "))))),
+          snap.data?.failures && Object.keys(snap.data.failures).length > 0
+            && h("p", { className: "tw-meta" }, `跳过：${Object.entries(snap.data.failures).map(([k, v]) => `${k}(${v})`).join("；")}`)),
+        h(Card, { title: "因子 IC / ICIR（横截面，forward 5 日）",
+          empty: ic.loading ? "加载中…" : (ic.error || "样本不足") },
+          h("div", { className: "tw-toolbar" }, Object.entries(FACTOR_LABELS).map(([k, label]) =>
+            h("button", { key: k, type: "button", className: `tw-btn seg${factor === k ? " active" : ""}`,
+              onClick: () => setFactor(k) }, label))),
+          ic.data && h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "均值 IC"), h("div", { className: "tw-kv-v" }, String(ic.data.mean_ic))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "IC 标准差"), h("div", { className: "tw-kv-v" }, String(ic.data.ic_std))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "ICIR"), h("div", { className: "tw-kv-v" }, String(ic.data.icir))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "正 IC 占比"), h("div", { className: "tw-kv-v" }, String(ic.data.positive_ratio))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "样本期数"), h("div", { className: "tw-kv-v" }, String(ic.data.count)))),
+          icPoints.length > 1 && h(LineChart, { points: icPoints, label: "IC 序列" }),
+          ic.data && h("p", { className: "tw-hint" }, ic.data.note)));
+    }
+
     function ExecutionView({ rpc, snapshot }) {
       const trades = useEndpoint(rpc, "trades", { mode: snapshot.mode, limit: 50 }, [rpc, snapshot.mode]);
       const rows = trades.data?.trades ?? [];
@@ -602,6 +649,7 @@ window.__ModuleLoader__.load({
       const [switching, setSwitching] = React.useState(false);
       const [revision, setRevision] = React.useState(0);
       const [market, setMarket] = React.useState({ ticker: "600519", period: "5m", bars: null, loading: false, error: "", meta: {} });
+      const [watchlist, setWatchlist] = React.useState(["600519", "000001", "601318", "600036", "300750"]);
       const generation = React.useRef(0);
 
       React.useEffect(() => {
@@ -657,6 +705,7 @@ window.__ModuleLoader__.load({
               snapshot && tab === "signal" && h(SignalView, { snapshot, series: market.bars }),
               snapshot && tab === "portfolio" && h(PortfolioView, { rpc, snapshot, series: market.bars }),
               snapshot && tab === "risk" && h(RiskView, { rpc, snapshot }),
+              tab === "factors" && h(FactorsView, { rpc, ticker: market.ticker, watchlist, setWatchlist }),
               snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
               snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker: market.ticker }),
               tab === "events" && h(EventsView, { rpc, ticker: market.ticker }),
