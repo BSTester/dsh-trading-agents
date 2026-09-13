@@ -22,6 +22,15 @@ description: TradingAgents 多角色投研流水线（12角色/6阶段）——�
 - 完整安装后，先调用 `run_trading_analysis(ticker)` 取得研究记录 `id`。该工具仅启动记录，不调用私有 LLM、不替你取数或完成分析。保留 `id`，继续执行下面的完整流程。
 - 完成终审后调用 `research_publish(run_id, ticker, rating, report, sources)`。`sources` 至少一项，每项含 `name`、`as_of`（数据时间）和 `reference`（URL 或 Harness 工具记录）。没有可靠数据时不得编造报告或用默认 Hold 掩盖失败。
 - `trading_status` 返回工作台快照；`quant_signal`、`quant_backtest`、`quant_report` 的结果自动保存为量化预览，均不下单。本地模拟台账不是富途模拟账户。
+- `research_cancel` 处理**被中断的会话留下的孤儿记录**：这种 run 会永远停在 `running`，
+  面板「研究」页一直显示"进行中"。用户问起时按下面处理，**不要让他去点什么按钮**
+  （工作台是只读展示，指令入口只有对话）：
+  - 先 `research_cancel(action="list")` 把当前进行中的记录列出来给他看；
+  - 确认要取消哪一条后 `research_cancel(action="cancel", run_id=...)`——
+    只把状态改成 `cancelled` 并**保留记录**，不删数据、不影响已发布的研报；
+  - 积压较多时用 `research_cancel(action="cancel_stale", older_than_minutes=120)` 批量处理；
+  - 超过 2 小时仍 `running` 的，面板本就按派生状态显示为已中断（不改写磁盘数据），
+    所以只有**不到 2 小时**的那些才需要人工确认。
 - 工作台仅展示研报、最近的账户工具响应、量化预览和账户模式切换。动态来自 Harness 工具调用，不代表已经订阅券商成交推送。
 - 文中的默认数据根目录为 `~/.dsh`；配置了 `DSH_HOME` 时以它为准。无插件时仍可执行基础 skill 流程，但不宣称有工作台或代码级账户守卫。
 

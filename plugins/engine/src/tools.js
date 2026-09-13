@@ -5,6 +5,8 @@ import os from "node:os";
 import path from "node:path";
 
 const run = promisify(execFile);
+// 批量取消的默认阈值：与面板派生 abandoned 的阈值保持一致
+const DEFAULT_STALE_MINUTES = 120;
 const pythonRoot = fileURLToPath(new URL("../python/", import.meta.url));
 const jsonOutput = {
   schema: { type: "object", additionalProperties: true },
@@ -74,6 +76,45 @@ export function registerEngineTools(ctx, defineTool, quant = runQuant) {
     },
     output: { ...jsonOutput, render: (_args, value) => [{ type: "text", text: value.report }] },
     async execute(args, exec) { return store.publishResearch(args, sessionId(exec)); },
+  });
+  register({
+    name: "research_cancel",
+    // 用户通过对话操作：工具而不是面板按钮——工作台保持只读展示，指令入口只有对话。
+    description: "查看或取消仍停留在「进行中」的投研记录（被中断的会话会留下这种孤儿，"
+      + "面板上会一直显示进行中）。先用 action=list 查看；取消只改状态并保留记录，"
+      + "不删除数据，也不影响已发布的研报。与下单无关。",
+    parameters: {
+      action: { type: "string", required: true, enum: ["list", "cancel", "cancel_stale"],
+        description: "list=列出进行中的记录；cancel=按 run_id 取消一条；cancel_stale=批量取消超时未结算的" },
+      run_id: { type: "string", description: "action=cancel 时必填" },
+      older_than_minutes: { type: "integer",
+        description: `action=cancel_stale 的阈值（分钟），默认 ${DEFAULT_STALE_MINUTES}` },
+    },
+    async execute(args) {
+      const action = args.action;
+      const running = store.snapshot().runs.filter(row => row.status === "running");
+      if (action === "list") {
+        return { action, running_count: running.length, running };
+      }
+      if (action === "cancel") {
+        const id = String(args.run_id ?? "").trim();
+        if (!id) throw new Error("action=cancel 需要 run_id（可先用 action=list 查看）");
+        const settled = store.cancelRun(id);
+        return { action, cancelled: [settled.id], ticker: settled.ticker,
+          status: settled.status, settled_at: settled.settled_at,
+          note: "已标记为 cancelled 并保留记录；面板下一次快照即不再显示进行中。" };
+      }
+      if (action === "cancel_stale") {
+        const minutes = args.older_than_minutes ?? DEFAULT_STALE_MINUTES;
+        if (!Number.isInteger(minutes) || minutes < 1 || minutes > 10080) {
+          throw new Error("older_than_minutes 必须是 1..10080 的整数");
+        }
+        const cancelled = store.cancelStaleRuns({ olderThanMs: minutes * 60_000 });
+        return { action, older_than_minutes: minutes, cancelled_count: cancelled.length,
+          cancelled, note: cancelled.length ? "已批量取消。" : "没有超过该阈值仍在进行的记录。" };
+      }
+      throw new Error(`未知 action：${action}`);
+    },
   });
   register({
     name: "trading_status",

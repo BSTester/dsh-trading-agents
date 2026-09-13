@@ -101,7 +101,20 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 ## 维护：清掉"进行中"的研究记录
 
 被中断的会话会留下停在 `running` 的研究 run，面板「研究」页会一直显示"进行中"。
-两种处理方式：
+
+**首选方式：直接在对话里说**（工作台是只读展示，指令入口只有对话）：
+
+> 看一下有哪些研报还卡在"进行中"，把那条不要的取消掉。
+
+对应工具 `research_cancel`：
+
+| 调用 | 作用 |
+|---|---|
+| `research_cancel(action="list")` | 列出进行中的记录 |
+| `research_cancel(action="cancel", run_id=…)` | 取消指定一条（改状态、**保留记录**） |
+| `research_cancel(action="cancel_stale", older_than_minutes=120)` | 批量取消超时的 |
+
+**命令行方式**（AI 不在场时用）：
 
 ```bash
 ADMIN="$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/workbench_admin.mjs"

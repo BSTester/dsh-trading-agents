@@ -74,10 +74,78 @@ test("real pinned defineTool accepts every schema and renders a published report
   const { ctx, tools, exec } = await setup(t);
   const { apply } = await import("../plugins/engine/src/index.js");
   apply(ctx);
-  assert.equal(tools.size, 7);
+  // 工具清单：run_trading_analysis / research_publish / research_cancel /
+  // trading_status / quant_signal / quant_backtest / quant_report / quant_switch
+  assert.deepEqual([...tools.keys()].sort(), [
+    "quant_backtest", "quant_report", "quant_signal", "quant_switch",
+    "research_cancel", "research_publish", "run_trading_analysis", "trading_status",
+  ], "工具清单变了：请确认是有意新增，并同步这里的断言");
   const run = await tools.get("run_trading_analysis").execute({ ticker: "AAPL" }, exec);
   const args = { run_id: run.id, ticker: "AAPL", rating: "Hold", report: "Report",
     sources: [{ name: "quote", as_of: "2026-09-12", reference: "Harness tool" }] };
   const report = await tools.get("research_publish").execute(args, exec);
   assert.equal(report.report, "Report");
+});
+
+test("通过对话取消进行中的投研记录：list / cancel / cancel_stale", async (t) => {
+  const { ctx, tools, store, exec } = await setup(t);
+  registerEngineTools(ctx, value => value);
+  const cancel = tools.get("research_cancel");
+  assert.ok(cancel, "缺少 research_cancel 工具（面板只读，必须由对话操作）");
+
+  const started = await tools.get("run_trading_analysis").execute({ ticker: "AAPL" }, exec);
+
+  // ① list
+  const listed = await cancel.execute({ action: "list" }, exec);
+  assert.equal(listed.running_count, 1);
+  assert.equal(listed.running[0].id, started.id);
+
+  // ② cancel 需要 run_id
+  await assert.rejects(cancel.execute({ action: "cancel" }, exec), /run_id/);
+
+  // ③ cancel 指定的一条：改状态但保留记录
+  const done = await cancel.execute({ action: "cancel", run_id: started.id }, exec);
+  assert.deepEqual(done.cancelled, [started.id]);
+  assert.equal(done.status, "cancelled");
+  assert.equal(store.read().runs.length, 1, "取消不是删除");
+  assert.equal((await cancel.execute({ action: "list" }, exec)).running_count, 0);
+  // 重复取消应明确报错，而不是静默成功
+  await assert.rejects(cancel.execute({ action: "cancel", run_id: started.id }, exec), /already settled/);
+});
+
+test("cancel_stale 只动超时的，且阈值有校验", async (t) => {
+  const { ctx, tools, store, exec } = await setup(t);
+  registerEngineTools(ctx, value => value);
+  const cancel = tools.get("research_cancel");
+  const stale = await tools.get("run_trading_analysis").execute({ ticker: "AAPL" }, exec);
+  const fresh = await tools.get("run_trading_analysis").execute({ ticker: "TSLA" }, exec);
+  store.update((state) => {
+    state.runs.find((row) => row.id === stale.id).started_at =
+      new Date(Date.now() - 5 * 3600_000).toISOString();
+  });
+
+  const result = await cancel.execute({ action: "cancel_stale", older_than_minutes: 120 }, exec);
+  assert.equal(result.cancelled_count, 1);
+  assert.deepEqual(result.cancelled, [stale.id]);
+  const byId = Object.fromEntries(store.read().runs.map((r) => [r.id, r.status]));
+  assert.equal(byId[fresh.id], "running", "新鲜的不应被动");
+
+  for (const bad of [0, -5, 999999, 1.5, "120"]) {
+    await assert.rejects(cancel.execute({ action: "cancel_stale", older_than_minutes: bad }, exec),
+      /1\.\.10080/, `阈值 ${bad} 应被拒绝`);
+  }
+});
+
+test("research_cancel 不影响已发布的研报", async (t) => {
+  const { ctx, tools, store, exec } = await setup(t);
+  registerEngineTools(ctx, value => value);
+  const started = await tools.get("run_trading_analysis").execute({ ticker: "AAPL" }, exec);
+  await tools.get("research_publish").execute({
+    run_id: started.id, ticker: "AAPL", rating: "Hold", report: "已发布。",
+    sources: [{ name: "s", as_of: "2026-09-13", reference: "r" }],
+  }, exec);
+  // 已结算的 run 不能被取消
+  await assert.rejects(tools.get("research_cancel").execute({ action: "cancel", run_id: started.id }, ctx),
+    /already settled/);
+  assert.equal(store.read().reports.length, 1);
 });
