@@ -139,7 +139,11 @@ def _unwrap(name, data):
     if RET_CODE_KEY in inner:  # 行情类信封 {"ret_code": 0, "data": {...}}
         if inner[RET_CODE_KEY] != 0:
             raise FutuUnavailable(f"{name}: ret={inner[RET_CODE_KEY]} {inner.get('ret_msg')}")
-        return inner.get("data") or {}
+        data = inner.get("data") or {}
+        pagination = inner.get("pagination")  # 分页游标信封（实测成分股工具带此键）
+        if pagination:  # 剥层时必须透出，否则调用方永远只见第一页；无此键返回形状不变
+            data = {**data, "pagination": pagination}
+        return data
 
     raise FutuUnavailable(f"{name}: 未识别的返回信封（键：{sorted(inner)[:6]}）")
 

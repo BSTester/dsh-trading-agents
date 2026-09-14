@@ -126,3 +126,55 @@ def sync_fundamentals(conn, ticker, fetcher=None):
                 continue  # 非数值科目 → 缺指标（宁缺毋假，quality.py 同口径）
             rows.append({"field": field, "period_end": period_end, "value": float(raw)})
     return store.upsert_fundamentals(conn, futu_symbol, rows, "futu/statements")
+
+
+UNIVERSE_BIAS_NOTE = "当前成分快照，未含历史成分，含幸存者偏差（规格 §13.4 缺口②降级）"
+
+
+def merge_announcements_akshare(conn, period, akshare_module=None):
+    """缺口①（规格 §13.4）：A股公告日双源合并。
+
+    period 形如 "20260630"（报告期）。一次调用覆盖全市场当期业绩表，
+    逐行把「股票代码+报告期」匹配到的 fundamentals 行补上公告日。
+    只补 announced_at IS NULL 的行，不覆盖已合并的来源。
+    """
+    ak = akshare_module
+    if ak is None:
+        import akshare as ak
+    df = ak.stock_yjbb_em(date=period)
+    if df is None or len(df) == 0:
+        return {"matched": 0, "rows": 0}
+    period_end = f"{period[:4]}-{period[4:6]}-{period[6:8]}"
+    code_col = next(c for c in df.columns if "股票代码" in c)
+    date_col = next(c for c in df.columns if "公告" in c)
+    matched = 0
+    for _, row in df.iterrows():
+        code = str(row[code_col]).strip().zfill(6)
+        symbol = to_futu_symbol(code)
+        raw = str(row[date_col]).strip()
+        announced = raw[:10] if len(raw) >= 10 else raw
+        matched += store.set_announced_at(conn, symbol, period_end, announced, "akshare/yjbb")
+    return {"matched": matched, "rows": int(len(df))}
+
+
+def sync_universe(conn, index_symbol, as_of, fetcher=None, bias_note=UNIVERSE_BIAS_NOTE,
+                  limit=50):
+    """指数成分快照：quote_valuation_index_component_stock_list 键集分页（limit≤50；
+    实测协议 2026-09-14：游标在响应的 pagination.next_key，stop 于 pagination.has_more=false，
+    tools/list schema 同口径）。bias_note 承载缺口②的幸存者偏差标注。"""
+    fetcher = fetcher or call_tool
+    symbols, next_key, has_more = [], None, True
+    while has_more:
+        args = {"symbol": index_symbol, "limit": limit}
+        if next_key:
+            args["next_key"] = next_key
+        data = fetcher("quote_valuation_index_component_stock_list", args) or {}
+        page = data.get("stock_list") or []
+        symbols.extend(r["symbol"] for r in page if r.get("symbol"))
+        pagination = data.get("pagination") or {}
+        next_key = pagination.get("next_key")
+        has_more = bool(pagination.get("has_more")) and bool(next_key) and bool(page)
+    # 成分返回的是 futu 格式（SH.600519）；universe 统一存 6 位裸码（is_a_share 约定）
+    bare = sorted({s.split(".")[-1] if "." in s else s for s in symbols})
+    store.store_universe(conn, as_of, index_symbol, bare, "futu/component_stock_list", bias_note)
+    return len(bare)

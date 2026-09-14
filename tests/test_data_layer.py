@@ -9,6 +9,7 @@
 全部离线：不访问网络、不启动浏览器、不读写真实台账。
 """
 import importlib.util
+import json
 import os
 import sys
 import unittest
@@ -287,6 +288,27 @@ class TokenLifecycleTests(unittest.TestCase):
             {"type": "text", "text": '{"s": "ok", "d": {"accounts": [{"account_id": 1}]}}'}]}}
         self.assertEqual(futu_mcp._unwrap("quote", quote), {"kline_list": [1]})
         self.assertEqual(futu_mcp._unwrap("account", account), {"accounts": [{"account_id": 1}]})
+
+    def test_pagination_envelope_is_passed_through(self):
+        """行情类信封可能带 pagination（翻页游标，实测成分股工具）：必须透出。
+
+        剥层时丢弃 pagination 会让调用方永远只见第一页——键集分页形同虚设。
+        无 pagination 的响应不受影响（向后兼容）。
+        """
+        paged = {"jsonrpc": "2.0", "id": 2, "result": {"content": [
+            {"type": "text", "text": json.dumps({
+                "ret_code": 0, "ret_msg": "success",
+                "data": {"stock_list": [{"symbol": "SZ.300896"}]},
+                "pagination": {"has_more": True, "next_key": "50", "total": 300}})}]}}
+        unwrapped = futu_mcp._unwrap("quote_valuation_index_component_stock_list", paged)
+        self.assertEqual(unwrapped["pagination"],
+                         {"has_more": True, "next_key": "50", "total": 300})
+        self.assertEqual(unwrapped["stock_list"], [{"symbol": "SZ.300896"}])
+
+        bare = {"jsonrpc": "2.0", "id": 2, "result": {"content": [
+            {"type": "text", "text": '{"ret_code": 0, "data": {"kline_list": [1]}}'}]}}
+        self.assertEqual(futu_mcp._unwrap("quote", bare),
+                         {"kline_list": [1]})  # 无 pagination：返回值形状不变
 
     def test_account_envelope_error_status_is_reported(self):
         payload = {"jsonrpc": "2.0", "id": 2, "result": {"content": [

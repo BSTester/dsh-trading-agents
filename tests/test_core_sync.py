@@ -161,5 +161,54 @@ class AdjustmentsFundamentalsTest(unittest.TestCase):
         self.assertEqual([r["field"] for r in rows], ["revenue"])
 
 
+class AnnouncementsUniverseTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = store.connect(str(Path(self.tmp.name) / "t.sqlite"))
+        # 先落一期的富途基本面（announced_at 为空）
+        sync.sync_fundamentals(self.conn, "600519", fetcher=lambda n, a: STATEMENTS_SAMPLE)
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_merge_announcements(self):
+        import pandas as pd
+
+        class FakeAk:
+            @staticmethod
+            def stock_yjbb_em(date):
+                assert date == "20260630"
+                return pd.DataFrame([
+                    {"股票代码": "600519", "公告日期": "2026-08-28 00:00:00", "净利润": 1.0},
+                    {"股票代码": "000001", "公告日期": "2026-08-29", "净利润": 2.0}])
+
+        result = sync.merge_announcements_akshare(self.conn, "20260630", akshare_module=FakeAk)
+        self.assertEqual(result["matched"], 4)  # 600519 一期 × 4 字段；000001 无台账行，rowcount=0
+        # 台账按 futu 格式符号存（store 约定），裸码读不到行
+        rows = store.read_fundamentals(self.conn, "SH.600519", as_of="2026-09-14")
+        self.assertEqual([r["field"] for r in rows],
+                         ["diluted_eps", "gross_profit", "net_profit", "revenue"])
+        self.assertTrue(all(r["announced_at"] == "2026-08-28" for r in rows))
+
+    def test_universe_pagination(self):
+        # 翻页形状为实测协议（2026-09-14 tools/call）：游标在 pagination 子对象，
+        # 停止条件 pagination.has_more=false；顶层无 next_key（计划文本的猜测形状）
+        pages = {"": {"stock_list": [{"symbol": f"SZ.3008{i:02d}"} for i in range(50)],
+                      "pagination": {"has_more": True, "next_key": "50", "total": 51}},
+                 "50": {"stock_list": [{"symbol": "SH.600519"}],
+                        "pagination": {"has_more": False, "next_key": "-1", "total": 51}}}
+
+        def fetcher(name, args):
+            self.assertEqual(name, "quote_valuation_index_component_stock_list")
+            return pages[args.get("next_key", "")]
+
+        n = sync.sync_universe(self.conn, "SH.000300", "2026-09-14", fetcher=fetcher)
+        self.assertEqual(n, 51)
+        snap = store.read_universe(self.conn, as_of="2026-09-14", index_name="SH.000300")
+        self.assertEqual(len(snap["symbols"]), 51)
+        self.assertIn("幸存者偏差", snap["bias_note"])  # 缺口②的降级标注（规格 §13.4）
+
+
 if __name__ == "__main__":
     unittest.main()
