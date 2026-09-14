@@ -5,6 +5,7 @@
 此处只控制调用频率）。
 """
 import datetime as _dt
+import re
 import time
 
 from trading_datasource.futu_mcp import call_tool
@@ -145,16 +146,20 @@ def merge_announcements_akshare(conn, period, akshare_module=None):
     if df is None or len(df) == 0:
         return {"matched": 0, "rows": 0}
     period_end = f"{period[:4]}-{period[4:6]}-{period[6:8]}"
-    code_col = next(c for c in df.columns if "股票代码" in c)
-    date_col = next(c for c in df.columns if "公告" in c)
-    matched = 0
+    code_col = next((c for c in df.columns if "股票代码" in c), None)
+    date_col = next((c for c in df.columns if "公告" in c), None)
+    if code_col is None or date_col is None:
+        raise ValueError(f"yjbb 列缺失（实际列：{sorted(df.columns)}）")
+    matched = skipped = 0
     for _, row in df.iterrows():
         code = str(row[code_col]).strip().zfill(6)
         symbol = to_futu_symbol(code)
-        raw = str(row[date_col]).strip()
-        announced = raw[:10] if len(raw) >= 10 else raw
+        announced = str(row[date_col]).strip()[:10]
+        if not re.match(r"^\d{4}-\d{2}-\d{2}$", announced):
+            skipped += 1  # 脏日期（如 "nan"）入库即 PIT 永久不可见，宁缺毋假
+            continue
         matched += store.set_announced_at(conn, symbol, period_end, announced, "akshare/yjbb")
-    return {"matched": matched, "rows": int(len(df))}
+    return {"matched": matched, "rows": int(len(df)), "skipped": skipped}
 
 
 def sync_universe(conn, index_symbol, as_of, fetcher=None, bias_note=UNIVERSE_BIAS_NOTE,
@@ -163,17 +168,19 @@ def sync_universe(conn, index_symbol, as_of, fetcher=None, bias_note=UNIVERSE_BI
     实测协议 2026-09-14：游标在响应的 pagination.next_key，stop 于 pagination.has_more=false，
     tools/list schema 同口径）。bias_note 承载缺口②的幸存者偏差标注。"""
     fetcher = fetcher or call_tool
-    symbols, next_key, has_more = [], None, True
-    while has_more:
+    symbols, next_key, pages = [], None, 0
+    while pages < 40:  # 页数上限：2000 成分 / 50 每页，兼防服务端游标异常循环
         args = {"symbol": index_symbol, "limit": limit}
-        if next_key:
+        if next_key is not None:
             args["next_key"] = next_key
         data = fetcher("quote_valuation_index_component_stock_list", args) or {}
         page = data.get("stock_list") or []
-        symbols.extend(r["symbol"] for r in page if r.get("symbol"))
+        symbols.extend(r.get("symbol") for r in page if r.get("symbol"))
         pagination = data.get("pagination") or {}
         next_key = pagination.get("next_key")
-        has_more = bool(pagination.get("has_more")) and bool(next_key) and bool(page)
+        pages += 1
+        if not pagination.get("has_more") or not page or next_key is None:
+            break
     # 成分返回的是 futu 格式（SH.600519）；universe 统一存 6 位裸码（is_a_share 约定）
     bare = sorted({s.split(".")[-1] if "." in s else s for s in symbols})
     store.store_universe(conn, as_of, index_symbol, bare, "futu/component_stock_list", bias_note)

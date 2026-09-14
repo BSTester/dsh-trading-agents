@@ -209,6 +209,18 @@ class AnnouncementsUniverseTest(unittest.TestCase):
         self.assertEqual(len(snap["symbols"]), 51)
         self.assertIn("幸存者偏差", snap["bias_note"])  # 缺口②的降级标注（规格 §13.4）
 
+    def test_merge_skips_malformed_dates(self):
+        import pandas as pd
+
+        class FakeAk:
+            @staticmethod
+            def stock_yjbb_em(date):
+                return pd.DataFrame([{"股票代码": "600519", "公告日期": "nan"}])
+
+        result = sync.merge_announcements_akshare(self.conn, "20260630", akshare_module=FakeAk)
+        self.assertEqual(result["matched"], 0)
+        self.assertEqual(result["skipped"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
