@@ -151,6 +151,7 @@ class InstallerTests(unittest.TestCase):
         root = self.home / "trading-python"
         self.assertTrue((root / "datasource" / "trading_datasource" / "market.py").is_file())
         self.assertTrue((root / "fin-data" / "fin_sentiment.py").is_file())
+        self.assertTrue((root / "core" / "trading_core" / "__init__.py").is_file())
         # 未被跨包引用的插件不必进统一目录
         self.assertFalse((root / "engine").exists())
 

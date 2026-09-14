@@ -19,6 +19,7 @@ LIBRARIES = ("datasource", "core")
 # 需要出现在"统一 python 目录"里、可被其他插件 import 或调用的包：
 #   datasource —— 被 engine/workbench 直接 import
 #   fin-data   —— 被量化侧以子进程调用（共用同一套新闻/情绪渠道）
+#   core       —— 量化平台核心库（PIT 存储/日历/同步/质量），WP1 起被各插件共用
 UNIFIED_PYTHON = ("datasource", "fin-data", "core")
 UNIFIED_ROOT_NAME = "trading-python"
 # 目录名 → npm 包名（自检用；工作台没有 preset 行，故不放进 PRESET_PACKAGES）
