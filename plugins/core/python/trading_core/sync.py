@@ -7,9 +7,12 @@
 import datetime as _dt
 import time
 
-from trading_datasource.market import load_bars
+from trading_datasource.futu_mcp import call_tool
+from trading_datasource.market import load_bars, to_futu_symbol
 
 from . import store
+
+_TZ8 = _dt.timezone(_dt.timedelta(hours=8))  # 富途毫秒时间戳按 UTC+8 零点对齐
 
 SLEEP_SECONDS = 0.5            # 富途通道调用间隔；测试注入 0
 PROGRESS_KEY_BACKFILL = "backfill:bars:1d"
@@ -68,3 +71,50 @@ def backfill_bars(conn, tickers, period="1d", limit=BACKFILL_LIMIT,
         _sleep(sleep_seconds)
     return {"ok": ok, "failed": failed,
             "done_total": len(done), "pending": [t for t in tickers if t not in done]}
+
+
+# 富途科目名按市场不同（实测口径沿用 workbench/python/quality.py 的 alias 表，只取 4 键）。
+FIELD_ALIASES = {
+    "revenue": ["Total Revenue as Reported", "Total Revenue", "Total Operating Revenue",
+                "Operating Revenue"],
+    "net_profit": ["Net Profit", "Net Income to Parent Company",
+                   "Net Profit of Parent Company Owners"],
+    "gross_profit": ["Gross Profit"],
+    "diluted_eps": ["Diluted EPS"],
+}
+
+
+def ms_to_date(ms):
+    """富途报告期毫秒时间戳 → YYYY-MM-DD（按 UTC+8 零点对齐，实测口径）。"""
+    return _dt.datetime.fromtimestamp(ms / 1000, _TZ8).strftime("%Y-%m-%d")
+
+
+def sync_adjustments(conn, ticker, divi_mode="include_divi", fetcher=None):
+    """复权因子：quote_corporate_actions_rehab（炸弹工具，单标的调用；divi_mode
+    默认 include_divi = A股/富途口径，schema 实测确认）。"""
+    fetcher = fetcher or call_tool
+    data = fetcher("quote_corporate_actions_rehab",
+                   {"symbol": to_futu_symbol(ticker), "divi_mode": divi_mode}) or {}
+    rows = [{"ex_date": r["ex_div_date"],
+             "cum_forward": r.get("cum_forward_adj_factorA"),
+             "cum_backward": r.get("cum_backward_adj_factorA"),
+             "actions": r.get("action_types") or []}
+            for r in (data.get("rehabs") or []) if r.get("ex_div_date")]
+    return store.upsert_adjustments(conn, to_futu_symbol(ticker), rows, "futu/rehab")
+
+
+def sync_fundamentals(conn, ticker, fetcher=None):
+    """财务报表：quote_financials_statements → 4 个核心字段。
+    富途不含公告日，announced_at 落 NULL，由 merge_announcements_akshare 补齐。"""
+    fetcher = fetcher or call_tool
+    futu_symbol = to_futu_symbol(ticker)
+    data = fetcher("quote_financials_statements", {"symbol": futu_symbol}) or {}
+    rows = []
+    for report in data.get("report_list") or []:
+        period_end = ms_to_date(report["date_time"])
+        items = {i.get("display_name"): i.get("data") for i in report.get("item_list") or []}
+        for field, aliases in FIELD_ALIASES.items():
+            value = next((items[a] for a in aliases if items.get(a) is not None), None)
+            if value is not None:
+                rows.append({"field": field, "period_end": period_end, "value": float(value)})
+    return store.upsert_fundamentals(conn, futu_symbol, rows, "futu/statements")

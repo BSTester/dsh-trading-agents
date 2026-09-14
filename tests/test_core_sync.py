@@ -95,5 +95,56 @@ class BarsSyncTest(unittest.TestCase):
             sync.sync_bars_incremental(self.conn, "600519", "5m", loader=lambda t, p, l: ([], "x", False))
 
 
+REHAB_SAMPLE = {"rehabs": [
+    {"ex_div_date": "2026-06-20", "cum_forward_adj_factorA": 12.34,
+     "cum_backward_adj_factorA": 0.98, "action_types": ["DIVIDEND"], "per_cash_div": 2.0},
+    {"ex_div_date": "2025-06-20", "cum_forward_adj_factorA": 12.10,
+     "cum_backward_adj_factorA": 0.97, "action_types": ["DIVIDEND"], "per_cash_div": 1.8}]}
+
+STATEMENTS_SAMPLE = {"report_list": [
+    {"date_time": 1782748800000, "financial_type": 2, "fiscal_year": 2026,
+     "item_list": [{"display_name": "Total Operating Revenue", "data": 37575159697.98},
+                   {"display_name": "Net Profit", "data": 1890123456.78},
+                   {"display_name": "Gross Profit", "data": 3012345678.9},
+                   {"display_name": "Diluted EPS", "data": 15.06}]}]}
+
+
+class AdjustmentsFundamentalsTest(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = store.connect(str(Path(self.tmp.name) / "t.sqlite"))
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_adjustments_mapping(self):
+        seen = {}
+
+        def fetcher(name, args):
+            seen["args"] = args
+            return REHAB_SAMPLE
+
+        n = sync.sync_adjustments(self.conn, "600519", fetcher=fetcher)
+        self.assertEqual(n, 2)
+        self.assertEqual(seen["args"]["symbol"], "SH.600519")   # futu 格式
+        rows = store.read_adjustments(self.conn, "SH.600519", as_of="2026-09-14")
+        self.assertEqual(rows[-1]["cum_forward"], 12.34)
+        self.assertEqual(rows[-1]["actions"], ["DIVIDEND"])
+
+    def test_fundamentals_aliases_and_pit_invisible(self):
+        seen = {}
+
+        def fetcher(name, args):
+            seen["args"] = args
+            return STATEMENTS_SAMPLE
+
+        n = sync.sync_fundamentals(self.conn, "600519", fetcher=fetcher)
+        self.assertEqual(n, 4)  # revenue/net_profit/gross_profit/diluted_eps 各一期
+        self.assertEqual(seen["args"]["symbol"], "SH.600519")
+        # 富途无公告日：PIT 读取必须不可见，直到任务 6 的合并作业补上
+        self.assertEqual(store.read_fundamentals(self.conn, "600519", as_of="2026-09-14"), [])
+
+
 if __name__ == "__main__":
     unittest.main()
