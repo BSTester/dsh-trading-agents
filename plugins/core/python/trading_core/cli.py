@@ -25,7 +25,7 @@ def build_parser():
     s.add_argument("--end", required=True)
     _add_db(s)
 
-    s = sub.add_parser("sync-bars", help="增量同步日线")
+    s = sub.add_parser("sync-bars", help="增量同步日线（--tickers 逗号分隔）")
     s.add_argument("--tickers", required=True, help="逗号分隔")
     _add_db(s)
 
@@ -35,18 +35,18 @@ def build_parser():
     _add_db(s)
 
     s = sub.add_parser("adjustments", help="同步复权因子")
-    s.add_argument("--tickers", required=True)
+    s.add_argument("--tickers", required=True, help="逗号分隔")
     _add_db(s)
 
     s = sub.add_parser("fundamentals", help="同步财务报表（公告日留空）")
-    s.add_argument("--tickers", required=True)
+    s.add_argument("--tickers", required=True, help="逗号分隔")
     _add_db(s)
 
     s = sub.add_parser("merge-announcements", help="合并 A 股公告日（akshare/yjbb）")
     s.add_argument("--period", required=True, help="报告期，如 20260630")
     _add_db(s)
 
-    s = sub.add_parser("universe", help="指数成分快照")
+    s = sub.add_parser("universe", help="同步指数成分快照")
     s.add_argument("--index", default="SH.000300")
     s.add_argument("--as-of", default=_dt.date.today().isoformat())
     _add_db(s)
@@ -62,7 +62,7 @@ def build_parser():
 
 def main(argv=None):
     args = build_parser().parse_args(argv)
-    conn = store.connect(args.db) if getattr(args, "db", None) else store.connect()
+    conn = store.connect(args.db)
     try:
         if args.cmd == "calendar":
             result = {"days": cal.sync_calendar(conn, args.market, args.start, args.end)}
