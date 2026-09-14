@@ -1728,3 +1728,40 @@ git commit -m "docs(plans): WP1 验收记录（回填/覆盖率/缺口报告原�
 - 分钟级同步、关注池（WP2 按策略需要再开）；
 - 港美公告日（Yahoo earnings dates）——`announced_coverage` 会如实显示 HK/US 为 0%，属规格 §13.4① 的既定边界；
 - daemon/调度（WP4）、组合回测（WP2）、OMS（WP3）。
+
+---
+
+## 验收记录（2026-09-15 执行）
+
+**任务 1-9**：10 个实现子代理 + 每任务两阶段审查（规格合规 → 代码质量），全部通过。
+审查驱动的修复共 7 轮（T1 package.json private/files、T2 补覆盖与不可覆写锁、
+T3 卫生门禁 main 块、T4 仅 1d 守卫与 needed 锁定、T5 两步式匹配+类型守卫、
+T6 公告日格式校验与分页上限、T7 去跨测试 import 与跨源口径说明、T9 PIT 断言
+改 futu 符号）。执行期发现并勘误计划文本笔误 4 处（read_fundamentals 漏列、
+CLOSE 日口径、覆盖率分桶、PIT 裸码断言）。
+
+**步骤 1 全量回归**：`Ran 265 tests in ~14s — OK`（0 失败；含既有 52+ 与新增 core 套件）。
+
+**步骤 2 真实冒烟**（2026-09-15，真实富途 MCP + akshare，库 `~/.dsh/trading-data/trading.sqlite`）：
+- calendar SH 2026-01-01..09-14 → 170 交易日
+- backfill 600519,00700,AAPL → ok×3、failed {}，12.1s（新浪长历史/富途/Yahoo 路由各自动生效）
+- fundamentals ×3 → 35/40/40 行（多报告期 × 4 字段，PK 去重后 SH 29/HK 32/US 32）
+- merge-announcements 20260630 → matched 3、rows 11449、skipped 0（全市场表一次拉取）
+- quality（600519）：gaps []、freshness last=09-14、coverage：SH 3/29、**HK 0/32、US 0/32**
+  ——HK/US 公告日 0% 为规格 §13.4① 既定边界，如实呈现（诚实性验收点）
+
+**步骤 3 安装验收（安全变体）**：手动解出 core 至 `~/.dsh/trading-python/core/` +
+`link`（.pth 两行：datasource、core）+ 纯 venv 导入 `trading_core 0.1.0` 成功。
+`check` 除一项**存量状态**外全部通过：仓库 preset 的 futu-keepalive 行本就
+`disabled: true`（部署流程「方式 B」才会启用，与 WP1 无关）。完整 `install` 的
+preset 翻动留待用户部署时执行，本验收不做。
+
+**步骤 4 WP1 验收标准对照（规格 §十）**：
+- 三市场日线回填完成 ✅（冒烟三市场各 1 标的端到端；全市场回填属运维作业，由
+  daemon/调度（WP4）按关注池与节奏执行）
+- 缺口报告可查 ✅（`python -m trading_core quality`）
+- `announced_at` 覆盖率可统计 ✅（同上，SH/HK/US 分桶如实）
+
+**遗留**：HK/US 公告日（规格 §13.4① 后半，随 WP2 港美基本面接入）；全市场回填
+调度（WP4 daemon 作业链）；`test_data_layer` 的真实富途探测测试依赖 MCP 在线
+（环境性，已在本轮全量中自然通过）。
