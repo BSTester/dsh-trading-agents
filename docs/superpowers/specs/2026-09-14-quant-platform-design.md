@@ -119,7 +119,8 @@ plugins/core/python/trading_core/
 
 - 全市场三市场日线（约 1.5 万标的 × 10 年 ≈ 3700 万行，SQLite 可承受）；
 - **分钟级仅关注池**（≤ 200 只，配置于 `trading-platform.json`）；
-- 首次运行全量回填：分块 ≤ 370 根（富途单次上限）、限速、游标记进度、可断点续传；
+- 首次运行全量回填：分块 ≤ 370 根（富途单次上限）、限速（复用 `futu_mcp` 现有
+  串行节流与退避重试）、游标记进度、可断点续传；
 - 增量同步：每市场收盘后 +30min 触发（按 calendar 判定交易日）；
 - 数据质量作业：缺口检测（按日历）、跨源抽样交叉校验（日线 close 差异超阈值告警）、
   新鲜度标注。
@@ -182,6 +183,11 @@ status: draft → frozen → approved → executing → done | cancelled | expir
 冻结后内容不可变。执行请求必须携带 `plan_hash + expected_mode`
 （复用 switch-mode 防呆模式，防止拿旧页面批新计划）。
 
+状态语义补充：`approved` 是持久化状态——记录确认时间、确认来源（指令文件 id）与
+口令校验结果，随后才进入 `executing`；审计链据此可回答"谁在何时批准了哪个hash的计划"。
+`expired` 的判定：下一交易日新计划生成时，前一交易日仍未执行的计划自动置为 expired
+（跨日计划不可执行，防止拿昨天的目标持仓今天下单）。
+
 ### 6.2 订单状态机
 
 ```
@@ -200,8 +206,10 @@ draft → frozen → submitting → submitted → partial → filled
 ### 6.3 对账与 TCA
 
 - **对账**：每次执行后 + 每日固定作业。拉券商 positions + 当日 orders/fills，
-  与 OMS 台账比对数量/成本/状态；差异超阈值 → critical 告警 + **自动暂停后续计划执行**
-  （只暂停，不自动平仓）。差异与处理记录落表。
+  与 OMS 台账比对数量/成本/状态。差异判定：**持仓数量不一致即差异**；成本/市值口径
+  差异 > `reconcile_value_diff_pct`（默认 0.5%，trading-platform.json 可配）为差异。
+  差异 → critical 告警 + **自动暂停后续计划执行**（只暂停，不自动平仓）。
+  差异与处理记录落表。
 - **TCA**：记录到达价（计划冻结时 close 与提交时 quote 双口径）vs 实际成交价 →
   滑点 bps，按标的/日/策略聚合，工作台展示。
 
@@ -239,6 +247,9 @@ draft → frozen → submitting → submitted → partial → filled
 | 每市场收盘后 +30min | sync_bars → sync_fundamentals → data_quality |
 | 数据就绪后 | run_signals → build_plan（仅启用的策略） |
 | 每次执行后 + 每日固定 | reconcile → tca → daily_digest（摘要落盘供对话读取） |
+
+「数据就绪」的判定：该市场 sync 作业成功完成 **且** data_quality 无 critical 缺口，
+由 daemon 按作业链顺序推进；sync 失败或质量检查亮红灯则跳过当日信号与计划并告警。
 
 ### 8.2 指令目录（工作台 → daemon 唯一通道）
 
