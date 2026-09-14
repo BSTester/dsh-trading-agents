@@ -1,8 +1,12 @@
 """交易日历：抓取 quote_trading_days 并落库（规格 §4.1 calendar 表）。
 
 口径（2026-09-14 实测）：market 必须大写（SH/HK/US/...），start/end 必传。
+返回值：sync_calendar 返回落库天数；上游信封异常导致 0 行时静默返回 0，
+由调用方（daemon 质量检查）按「日历就绪」语义处理。
+实测返回样例：{"trading_days": [{"time": "2026-09-11", "trade_date_type": "WHOLE", "trade_second": 14400}]}
 """
 from trading_datasource.futu_mcp import call_tool
+from . import store
 
 
 def _default_fetcher(market, start, end):
@@ -19,5 +23,4 @@ def sync_calendar(conn, market, start, end, fetcher=None):
     days = [{"day": d["time"], "trade_date_type": d.get("trade_date_type"),
              "trade_second": d.get("trade_second")}
             for d in (payload.get("trading_days") or [])]
-    from . import store
     return store.upsert_calendar(conn, market, days)

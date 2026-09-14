@@ -57,3 +57,7 @@ class MarketConstantsTest(unittest.TestCase):
         self.assertEqual(INDEX_SYMBOLS["ixic"], "US..IXIC")
         self.assertEqual(INDEX_SYMBOLS["dji"], "US..DJI")
         self.assertEqual(INDEX_SYMBOLS["sp500_proxy"], "US.SPY")  # 标普指数代码无效，SPY 替代
+
+
+if __name__ == "__main__":
+    unittest.main()
