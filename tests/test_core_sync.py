@@ -5,6 +5,7 @@ import unittest
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "datasource" / "python"))
 from trading_core import store, sync  # noqa: E402
 
 
@@ -63,6 +64,35 @@ class BarsSyncTest(unittest.TestCase):
                                       progress_key=sync.PROGRESS_KEY_BACKFILL)
         self.assertEqual(summary2["ok"], ["00700"])
         self.assertEqual(store.last_bar_date(self.conn, "00700", "1d"), "2026-09-11")
+        self.assertEqual(summary2["failed"], {})  # 成功后 failed 必须清空
+
+    def test_incremental_needed_estimation(self):
+        cases = []
+        loader = lambda t, p, limit: (cases.append(limit) or (_bars("2026-09-14"), "x", False))
+
+        sync.sync_bars_incremental(self.conn, "600519", "1d", loader=loader)  # 首次
+        self.assertEqual(cases[-1], 370)
+
+        sync.sync_bars_incremental(self.conn, "600519", "1d",
+                                   loader=lambda t, p, l: (_bars("2099-01-01"), "x", False))
+        # 上一次把 last 推到 2099（未来）：since 为负 → max(…,5) 兜底
+        cases.clear()
+        sync.sync_bars_incremental(self.conn, "600519", "1d",
+                                   loader=lambda t, p, l: (cases.append(l) or ([], "x", False)))
+        self.assertEqual(cases[-1], 5)
+
+        # 手工把 last 拨回很旧：last_bar_date=MAX(ts)，须先清掉 2099 行，upsert 旧 K 线才生效
+        self.conn.execute("DELETE FROM bars WHERE symbol='600519' AND period='1d'")
+        self.conn.commit()
+        store.upsert_bars(self.conn, "600519", "1d", _bars("2020-01-01"), "x")
+        cases.clear()
+        sync.sync_bars_incremental(self.conn, "600519", "1d",
+                                   loader=lambda t, p, l: (cases.append(l) or ([], "x", False)))
+        self.assertEqual(cases[-1], 370)  # 很旧的 last → 上限封顶
+
+    def test_incremental_rejects_intraday(self):
+        with self.assertRaises(ValueError):
+            sync.sync_bars_incremental(self.conn, "600519", "5m", loader=lambda t, p, l: ([], "x", False))
 
 
 if __name__ == "__main__":

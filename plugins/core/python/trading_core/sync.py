@@ -22,11 +22,17 @@ def _sleep(seconds):
 
 
 def sync_bars_incremental(conn, ticker, period="1d", loader=None):
+    """仅支持 1d：增量按自然日折算根数，分钟级请用 backfill_bars（period 透传）。"""
+    if period != "1d":
+        raise ValueError("增量同步仅支持 1d（分钟级根数无法按自然日折算）")
     loader = loader or load_bars
     last = store.last_bar_date(conn, ticker, period)
     if last is None:
         needed = 370                      # 首次增量 = 富途单次上限；更长历史交给 backfill
     else:
+        # 自然日 +7 缓冲折算根数；last 异常落在未来时 since 为负，max(…,5) 兜底
+        # （注：market.MIN_BARS=20 会把 <20 的请求抬到 20，此处 5 只是下限防御）；
+        # 落后超过 370 根的存量缺口由 backfill 补，增量永不静默追平
         since = (_dt.date.today() - _dt.date.fromisoformat(last)).days + 7
         needed = min(370, max(since, 5))
     bars, source, stale = loader(ticker, period, needed)
@@ -39,7 +45,8 @@ def sync_bars_incremental(conn, ticker, period="1d", loader=None):
 def backfill_bars(conn, tickers, period="1d", limit=BACKFILL_LIMIT,
                   loader=None, sleep_seconds=None, progress_key=PROGRESS_KEY_BACKFILL):
     """全量回填：每标的一次 load_bars（路由层自动满足长历史）；失败记录不中断；
-    kv 游标（done/failed）支持断点续传——重复调用只处理未完成标的。"""
+    kv 游标（done/failed）支持断点续传——重复调用只处理未完成标的。
+    前置：存量长历史缺口先 backfill 一次；增量入口（sync_bars_incremental）只覆盖近期窗口。"""
     loader = loader or load_bars
     sleep_seconds = SLEEP_SECONDS if sleep_seconds is None else sleep_seconds
     progress = store.kv_get(conn, progress_key, default={"done": [], "failed": {}})
