@@ -15,11 +15,11 @@ import tempfile
 
 PLUGINS = ("workbench", "fin-data", "engine", "futu-keepalive")
 # 统一数据层：不是 Harness 插件（没有 cordis 行），只作为 python 库被各插件共用。
-LIBRARIES = ("datasource",)
+LIBRARIES = ("datasource", "core")
 # 需要出现在"统一 python 目录"里、可被其他插件 import 或调用的包：
 #   datasource —— 被 engine/workbench 直接 import
 #   fin-data   —— 被量化侧以子进程调用（共用同一套新闻/情绪渠道）
-UNIFIED_PYTHON = ("datasource", "fin-data")
+UNIFIED_PYTHON = ("datasource", "fin-data", "core")
 UNIFIED_ROOT_NAME = "trading-python"
 # 目录名 → npm 包名（自检用；工作台没有 preset 行，故不放进 PRESET_PACKAGES）
 PACKAGE_NAMES = {
@@ -28,8 +28,31 @@ PACKAGE_NAMES = {
     "engine": "@bstester/dsh-trading-engine",
     "futu-keepalive": "@bstester/dsh-futu-keepalive",
     "datasource": "@bstester/dsh-datasource",
+    "core": "@bstester/dsh-trading-core",
 }
 DATA_LAYER_PTH_NAME = "dsh-trading-python.pth"
+# 库目录 → 解包后必须存在的标记（extract 与自检共用）。
+LIBRARY_MARKERS = {"datasource": "trading_datasource", "fin-data": "fin_sentiment.py",
+                   "core": "trading_core"}
+
+
+def data_layer_pth_lines(dsh_home):
+    """返回应写入 .pth 的目录行与缺失的库。
+
+    返回 (lines, missing)：lines 是已就绪库的绝对路径列表；missing 是未解出的库名。
+    datasource 缺失时调用方维持旧行为（返回 None 提示先 install）。
+    """
+    root = unified_python_root(dsh_home)
+    lines, missing = [], []
+    for lib in LIBRARIES:  # 只遍历 LIBRARIES：fin-data 是子进程调用，不进 .pth
+        marker = LIBRARY_MARKERS[lib]
+        if (root / lib / marker).is_dir():
+            lines.append(str(root / lib))
+        else:
+            missing.append(lib)
+    return lines, missing
+
+
 PRESET_PACKAGES = {
     "fin-data": "@bstester/dsh-fin-data",
     "trading-engine": "@bstester/dsh-trading-engine",
@@ -165,21 +188,21 @@ def extract_python(archive, plugin, dsh_home, expect):
 
 
 def write_data_layer_pth(dsh_home):
-    """向交易 venv 写入 .pth，让任何插件脚本都能直接 import trading_datasource。
+    """向交易 venv 写入 .pth（每个已解出的库一行），让插件脚本直接 import。
 
-    返回 (site_packages, target) 或 None（venv 不存在时）。
+    返回 (site_packages, lines) 或 None（datasource 未解出或 venv 不存在时）。
     """
-    target = unified_python_root(dsh_home) / "datasource"
-    if not (target / "trading_datasource").is_dir():
+    lines, missing = data_layer_pth_lines(dsh_home)
+    if "datasource" in missing:
         return None
     site = site_packages_dir(dsh_home)
     if site is None:
         return None
     path = site / DATA_LAYER_PTH_NAME
-    content = str(target) + "\n"
+    content = "".join(line + "\n" for line in lines)
     if not path.exists() or read_text(path) != content:
         path.write_text(content, encoding="utf-8")
-    return site, target
+    return site, lines
 
 
 def check_install(repo, dsh_home):
@@ -210,7 +233,7 @@ def check_install(repo, dsh_home):
         problems.append(f"找不到 preset 组合文件：{preset}")
 
     for plugin, package in PACKAGE_NAMES.items():
-        if plugin == "datasource":
+        if plugin in ("datasource", "core"):  # 库不装进 profiles，走统一 python 目录
             continue
         manifest = dsh_home / "profiles" / "web" / "node_modules" / package / "package.json"
         if manifest.is_file():
@@ -223,7 +246,8 @@ def check_install(repo, dsh_home):
             problems.append(f"插件 {plugin} 未安装（缺 {manifest}）")
 
     root = unified_python_root(dsh_home)
-    for plugin, expect in (("datasource", "trading_datasource"), ("fin-data", "fin_sentiment.py")):
+    for plugin in ("datasource", "fin-data", "core"):
+        expect = LIBRARY_MARKERS[plugin]
         if (root / plugin / expect).exists():
             notes.append(f"统一数据层 {plugin}: {root / plugin}")
         else:
@@ -234,11 +258,14 @@ def check_install(repo, dsh_home):
         problems.append(f"找不到交易 venv 的 site-packages（{dsh_home / 'trading-venv'}）")
     else:
         pth = site / DATA_LAYER_PTH_NAME
-        expected = str(Path(unified_python_root(dsh_home)) / "datasource") + "\n"
+        lines, missing = data_layer_pth_lines(dsh_home)
+        expected = "".join(line + "\n" for line in lines)
         if not pth.is_file():
             problems.append(f"未写入 .pth：{pth}（跑 `link` 动作）")
         elif read_text(pth) != expected:
             problems.append(f".pth 内容不对：期望 {expected.strip()}，实际 {read_text(pth).strip()}")
+        elif missing:
+            problems.append(f".pth 缺少库行：{', '.join(missing)}（重跑 `install` 解出）")
 
     print("安装自检：")
     for line in notes:
@@ -312,7 +339,7 @@ def install_plugins(repo, dsh_home):
         # 统一数据层：解到 <DSH>/trading-python/，各插件在运行时按同一路径定位
         for plugin in UNIFIED_PYTHON:
             extract_python(packed_archives[plugin], plugin, dsh_home,
-                           "trading_datasource" if plugin == "datasource" else "fin_sentiment.py")
+                           LIBRARY_MARKERS[plugin])
     if read_text(preset) != original:
         raise ValueError("Preset changed during installation; refusing to overwrite concurrent edits.")
     if enabled != original:
@@ -342,8 +369,8 @@ def main():
                 print("Data layer not linked: run `install` first, and make sure the trading venv exists.",
                       file=sys.stderr)
                 return 1
-            site, target = result
-            print(f"Linked data layer into {site} -> {target}")
+            site, lines = result
+            print(f"Linked data layer into {site} -> {', '.join(lines)}")
         else:
             install_plugins(args.repo, args.dsh_home)
     except (OSError, ValueError, subprocess.CalledProcessError) as error:

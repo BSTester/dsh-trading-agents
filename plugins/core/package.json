@@ -1,0 +1,6 @@
+{
+  "name": "@bstester/dsh-trading-core",
+  "version": "0.1.0",
+  "description": "量化平台核心库：PIT 存储、交易日历、同步、数据质量（库，非 Harness 插件）",
+  "license": "SEE LICENSE IN LICENSE"
+}

@@ -33,6 +33,7 @@ PRESET = """# keep comments and unrelated disabled rows
 PACKAGE_PYTHON = {
     "datasource": ["python/trading_datasource/__init__.py", "python/trading_datasource/market.py"],
     "fin-data": ["python/fin_sentiment.py"],
+    "core": ["python/trading_core/__init__.py"],
     "engine": ["python/engine.py"],
     "workbench": ["python/bars.py"],
     "futu-keepalive": ["src/index.js"],
@@ -184,8 +185,12 @@ class InstallerTests(unittest.TestCase):
         self.assertIsNotNone(result)
         pth = site / "dsh-trading-python.pth"
         self.assertTrue(pth.is_file())
-        self.assertEqual(pth.read_text().strip(),
-                         str(self.home / "trading-python" / "datasource"))
+        # .pth 每个已解出的库一行：datasource 行 + core 行（与 helper 同一口径）
+        lines, missing = self.installer.data_layer_pth_lines(self.home)
+        self.assertEqual([Path(line) for line in lines],
+                         [self.home / "trading-python" / "datasource",
+                          self.home / "trading-python" / "core"])
+        self.assertEqual(pth.read_text(), "".join(line + "\n" for line in lines))
 
     def test_link_returns_none_without_venv(self):
         """venv 不存在时返回 None，由安装脚本提示重试，而不是写入错误路径。"""
