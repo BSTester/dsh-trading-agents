@@ -1,5 +1,4 @@
 """store 层单测：六张表、PIT 纪律强制、幂等 upsert、kv 游标。全部离线。"""
-import sqlite3
 import sys
 import tempfile
 import unittest
@@ -80,6 +79,47 @@ class StoreTest(unittest.TestCase):
         store.kv_set(self.conn, "backfill:daily", {"done": ["600519"], "failed": {}})
         self.assertEqual(store.kv_get(self.conn, "backfill:daily")["done"], ["600519"])
         self.assertIsNone(store.kv_get(self.conn, "nope", default=None))
+
+    def test_adjustments_roundtrip(self):
+        rows = [{"ex_date": "2026-06-20", "cum_forward": 12.34, "cum_backward": 0.98,
+                 "actions": ["DIVIDEND", "SPLIT"]}]
+        self.assertEqual(store.upsert_adjustments(self.conn, "SH.600519", rows, "futu/rehab"), 1)
+        got = store.read_adjustments(self.conn, "SH.600519", as_of="2026-09-14")
+        self.assertEqual(got[0]["actions"], ["DIVIDEND", "SPLIT"])
+        self.assertAlmostEqual(got[0]["cum_forward"], 12.34)
+        self.assertEqual(store.read_adjustments(self.conn, "SH.600519", as_of="2026-06-19"), [])
+        with self.assertRaises(ValueError):
+            store.read_adjustments(self.conn, "SH.600519", as_of=None)
+
+    def test_announced_coverage_groups_by_market_prefix(self):
+        store.upsert_fundamentals(self.conn, "SH.600519",
+                                  [{"field": "revenue", "period_end": "2026-06-30", "value": 1.0}],
+                                  "s")
+        store.upsert_fundamentals(self.conn, "HK.00700",
+                                  [{"field": "revenue", "period_end": "2026-06-30", "value": 2.0}],
+                                  "s")
+        store.upsert_fundamentals(self.conn, "bare600519",
+                                  [{"field": "revenue", "period_end": "2026-06-30", "value": 3.0}],
+                                  "s")
+        store.set_announced_at(self.conn, "SH.600519", "2026-06-30", "2026-08-28", "ak")
+        cov = store.announced_coverage(self.conn)
+        self.assertEqual(cov["SH"], {"total": 1, "with_date": 1})
+        self.assertEqual(cov["HK"], {"total": 1, "with_date": 0})
+        self.assertEqual(cov["?"], {"total": 1, "with_date": 0})  # 无市场前缀 → ? 桶
+
+    def test_last_bar_date_and_set_announced_at_no_overwrite(self):
+        store.upsert_bars(self.conn, "600519", "1d", BARS, "s")
+        self.assertEqual(store.last_bar_date(self.conn, "600519", "1d"), "2026-09-11")
+        self.assertIsNone(store.last_bar_date(self.conn, "nope", "1d"))
+        store.upsert_fundamentals(self.conn, "600519",
+                                  [{"field": "revenue", "period_end": "2026-06-30", "value": 1.0}],
+                                  "s")
+        store.set_announced_at(self.conn, "600519", "2026-06-30", "2026-08-28", "ak1")
+        n = store.set_announced_at(self.conn, "600519", "2026-06-30", "2026-09-30", "ak2")
+        self.assertEqual(n, 0)  # 已有公告日：重跑合并不得覆写（PIT 关键保证）
+        rows = store.read_fundamentals(self.conn, "600519", as_of="2026-09-30")
+        self.assertEqual(rows[0]["announced_at"], "2026-08-28")
+        self.assertEqual(rows[0]["announced_source"], "ak1")
 
 
 if __name__ == "__main__":

@@ -4,6 +4,9 @@
      as_of，缺省直接拒绝（ValueError），不存在"全量读"口子；
   2. 复权统一 —— bars 一律存原始价，复权因子在 adjustments 表，口径查询时派生；
   3. 宁缺毋假 —— 本层不生成占位行；announced_at 未合并的基本面行对 PIT 读取不可见。
+
+连接约定：连接由调用方负责关闭；默认不可跨线程共享（sqlite3 默认 check_same_thread）；
+写函数即写即提交，外部无法编排多语句事务（单进程 CLI 场景，规格 §四既定）。
 """
 import json
 import sqlite3
@@ -15,7 +18,7 @@ _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars(
   symbol TEXT NOT NULL, period TEXT NOT NULL, ts TEXT NOT NULL,
   open REAL NOT NULL, high REAL NOT NULL, low REAL NOT NULL, close REAL NOT NULL,
-  volume REAL NOT NULL, source TEXT NOT NULL, adj_factor REAL NOT NULL DEFAULT 1.0,
+  volume REAL NOT NULL, source TEXT NOT NULL, adj_factor REAL NOT NULL DEFAULT 1.0, -- 预留列，勿写入：复权唯一事实来源是 adjustments 表
   PRIMARY KEY(symbol, period, ts)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS adjustments(
   symbol TEXT NOT NULL, ex_date TEXT NOT NULL,
@@ -82,7 +85,7 @@ def read_bars(conn, symbol, period, as_of, limit=None):
     sql = "SELECT ts,open,high,low,close,volume,source FROM bars" \
           " WHERE symbol=? AND period=? AND ts<=? ORDER BY ts DESC"
     params = [symbol, period, as_of]
-    if limit:
+    if limit is not None:
         sql += " LIMIT ?"
         params.append(int(limit))
     rows = conn.execute(sql, params).fetchall()
