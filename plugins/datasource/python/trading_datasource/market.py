@@ -235,3 +235,8 @@ def load_bars(ticker, period="1d", limit=300, cached=None):
     if cached is not None and cached.get("bars"):
         return cached["bars"], str(cached.get("source")) + "(缓存)", True
     raise RuntimeError(f"取数失败：{str(failure)[:160]}")
+
+
+# 指数/基准代码映射（2026-09-14 实测，规格 §13.2）：标普指数代码无效，用 SPY ETF 代理。
+INDEX_SYMBOLS = {"csi300": "SH.000300", "hsi": "HK.800000", "ixic": "US..IXIC",
+                 "dji": "US..DJI", "sp500_proxy": "US.SPY"}
