@@ -144,6 +144,21 @@ class AdjustmentsFundamentalsTest(unittest.TestCase):
         self.assertEqual(seen["args"]["symbol"], "SH.600519")
         # 富途无公告日：PIT 读取必须不可见，直到任务 6 的合并作业补上
         self.assertEqual(store.read_fundamentals(self.conn, "600519", as_of="2026-09-14"), [])
+        store.set_announced_at(self.conn, "SH.600519", "2026-06-30", "2026-08-28", "ak")
+        rows = store.read_fundamentals(self.conn, "SH.600519", as_of="2026-08-28")
+        self.assertEqual({r["period_end"] for r in rows}, {"2026-06-30"})  # UTC+8 换算锁定
+
+    def test_alias_fallback_and_type_guard(self):
+        sample = {"report_list": [
+            {"date_time": 1782748800000, "item_list": [
+                {"display_name": "Operating Revenue", "data": 100.0},   # 首别名缺失，次选命中
+                {"display_name": "Net Profit", "data": "N/A"}]}]}       # 非数值 → 缺指标
+
+        n = sync.sync_fundamentals(self.conn, "600519", fetcher=lambda n_, a_: sample)
+        self.assertEqual(n, 1)
+        store.set_announced_at(self.conn, "SH.600519", "2026-06-30", "2026-08-28", "ak")
+        rows = store.read_fundamentals(self.conn, "SH.600519", as_of="2026-09-14")
+        self.assertEqual([r["field"] for r in rows], ["revenue"])
 
 
 if __name__ == "__main__":

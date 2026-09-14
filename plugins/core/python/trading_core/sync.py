@@ -93,14 +93,15 @@ def sync_adjustments(conn, ticker, divi_mode="include_divi", fetcher=None):
     """复权因子：quote_corporate_actions_rehab（炸弹工具，单标的调用；divi_mode
     默认 include_divi = A股/富途口径，schema 实测确认）。"""
     fetcher = fetcher or call_tool
+    futu_symbol = to_futu_symbol(ticker)
     data = fetcher("quote_corporate_actions_rehab",
-                   {"symbol": to_futu_symbol(ticker), "divi_mode": divi_mode}) or {}
+                   {"symbol": futu_symbol, "divi_mode": divi_mode}) or {}
     rows = [{"ex_date": r["ex_div_date"],
              "cum_forward": r.get("cum_forward_adj_factorA"),
              "cum_backward": r.get("cum_backward_adj_factorA"),
              "actions": r.get("action_types") or []}
             for r in (data.get("rehabs") or []) if r.get("ex_div_date")]
-    return store.upsert_adjustments(conn, to_futu_symbol(ticker), rows, "futu/rehab")
+    return store.upsert_adjustments(conn, futu_symbol, rows, "futu/rehab")
 
 
 def sync_fundamentals(conn, ticker, fetcher=None):
@@ -111,10 +112,17 @@ def sync_fundamentals(conn, ticker, fetcher=None):
     data = fetcher("quote_financials_statements", {"symbol": futu_symbol}) or {}
     rows = []
     for report in data.get("report_list") or []:
-        period_end = ms_to_date(report["date_time"])
+        stamp = report.get("date_time")
+        if not stamp:
+            continue  # 无报告期：无法定位 PIT，宁缺毋假
+        period_end = ms_to_date(stamp)
         items = {i.get("display_name"): i.get("data") for i in report.get("item_list") or []}
         for field, aliases in FIELD_ALIASES.items():
-            value = next((items[a] for a in aliases if items.get(a) is not None), None)
-            if value is not None:
-                rows.append({"field": field, "period_end": period_end, "value": float(value)})
+            present = next((a for a in aliases if a in items), None)
+            if present is None:
+                continue
+            raw = items[present]
+            if not isinstance(raw, (int, float)) or isinstance(raw, bool):
+                continue  # 非数值科目 → 缺指标（宁缺毋假，quality.py 同口径）
+            rows.append({"field": field, "period_end": period_end, "value": float(raw)})
     return store.upsert_fundamentals(conn, futu_symbol, rows, "futu/statements")
