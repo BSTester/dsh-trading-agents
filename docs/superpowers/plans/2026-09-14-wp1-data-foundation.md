@@ -1645,11 +1645,12 @@ class PipelineTest(unittest.TestCase):
         # 4) 质量报告：零缺口 + 覆盖率 100%
         report = quality.full_report(conn, "SH", TICKERS, DAYS[0], DAYS[-1])
         self.assertEqual(report["gaps"], {t: [] for t in TICKERS})
-        self.assertEqual(report["announced_coverage"]["SH"],
-                         {"total": 8, "with_date": 8})
+        self.assertEqual(report["announced_coverage"],
+                         {"SH": {"total": 4, "with_date": 4},
+                          "SZ": {"total": 4, "with_date": 4}})
 
         # 5) PIT 纪律抽查：公告日之前读不到财务
-        self.assertEqual(store.read_fundamentals(conn, "600519", as_of="2026-08-27"), [])
+        self.assertEqual(store.read_fundamentals(conn, "SH.600519", as_of="2026-08-27"), [])
 
 
 if __name__ == "__main__":
@@ -1667,6 +1668,8 @@ if __name__ == "__main__":
 git add tests/test_core_integration.py
 git commit -m "test(core): 离线端到端（日历→回填→财务→公告日→质量零缺口）"
 ```
+
+> 勘误（2026-09-15 执行期发现）：覆盖率断言按市场分桶、PIT 断言须用 futu 格式符号——原计划文本两处笔误已随实现修正。
 
 ---
 

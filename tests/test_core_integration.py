@@ -38,10 +38,12 @@ class PipelineTest(unittest.TestCase):
                 raise RuntimeError("模拟瞬时失败")
             return _bars(DAYS), "fake/src", False
 
-        sync.backfill_bars(conn, TICKERS, loader=loader, sleep_seconds=0)
+        first = sync.backfill_bars(conn, TICKERS, loader=loader, sleep_seconds=0)
+        self.assertEqual(set(first["failed"]), {"000858"})
         summary = sync.backfill_bars(conn, TICKERS, loader=loader, sleep_seconds=0,
                                      progress_key=sync.PROGRESS_KEY_BACKFILL)
         self.assertEqual(set(summary["failed"]), set())
+        self.assertEqual(state["calls"], 3)  # 600519×1 + 000858 失败×1 + 重试×1：游标跳过已完成
 
         # 3) 财务 + 公告日合并
         statements = {"report_list": [
@@ -71,7 +73,8 @@ class PipelineTest(unittest.TestCase):
                           "SZ": {"total": 4, "with_date": 4}})
 
         # 5) PIT 纪律抽查：公告日之前读不到财务
-        self.assertEqual(store.read_fundamentals(conn, "600519", as_of="2026-08-27"), [])
+        self.assertEqual(store.read_fundamentals(conn, "SH.600519", as_of="2026-08-27"), [])
+        self.assertEqual(len(store.read_fundamentals(conn, "SH.600519", as_of="2026-08-28")), 4)
 
 
 if __name__ == "__main__":
