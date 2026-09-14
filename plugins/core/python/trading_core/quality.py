@@ -8,7 +8,7 @@ from trading_datasource.market import load_bars
 
 from . import store
 
-CROSS_SOURCE_TOLERANCE = 0.005  # 收盘价交叉校验容差 0.5%（规格 §4.3）
+CROSS_SOURCE_TOLERANCE = 0.005  # 0.5%：量级借用规格 §6.3 对账阈值；§4.3 仅要求超阈值告警
 
 
 def gap_report(conn, market, symbol, start, end):
@@ -31,10 +31,15 @@ def announced_coverage(conn):
 
 
 def cross_source_check(conn, ticker, period="1d", sample=5,
-                       tolerance=CROSS_SOURCE_TOLERANCE, loader=None):
-    """抽样比对：库内最后 N 根收盘 vs 现取同源收盘，超容差记为不一致。"""
+                       tolerance=CROSS_SOURCE_TOLERANCE, loader=None, today=None):
+    """抽样比对：库内最后 N 根收盘 vs 现取收盘，超容差记为不一致。
+
+    口径前提：现取走 load_bars 路由（富途优先），库内存原始价——跨源（如新浪 qfq）
+    在除权事件附近差异会远超容差，接线跨源比对前必须先对齐复权口径
+    （见 docs/TOOL-LIMITS.md「日线长历史」）。当前仅用于同源复核。
+    """
     loader = loader or load_bars
-    today = _dt.date.today().isoformat()
+    today = today or _dt.date.today().isoformat()
     stored = store.read_bars(conn, ticker, period, as_of=today, limit=sample)
     if not stored:
         return []

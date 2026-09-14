@@ -6,7 +6,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "datasource" / "python"))
-from trading_core import quality, store  # noqa: E402
+from trading_core import quality, store, sync  # noqa: E402
 
 
 class QualityTest(unittest.TestCase):
@@ -42,9 +42,25 @@ class QualityTest(unittest.TestCase):
         self.assertEqual(len(bad), 1)
         self.assertEqual(bad[0]["date"], "2026-09-14")
 
+    def test_cross_source_within_tolerance_ignored(self):
+        fresh = _bars("2026-09-14", base=10.03)  # c=10.53，与库内 10.5 差 0.03 < 0.5% 容差
+
+        def loader(ticker, period, limit):
+            return fresh, "sina/test", False
+
+        self.assertEqual(
+            quality.cross_source_check(self.conn, "600519", "1d", sample=1, loader=loader), [])
+
+    def test_cross_source_skips_dates_missing_in_fresh(self):
+        fresh = _bars("2026-09-13", base=99.0)  # fresh 无 09-14：跳过而非误报
+
+        def loader(ticker, period, limit):
+            return fresh, "sina/test", False
+
+        self.assertEqual(
+            quality.cross_source_check(self.conn, "600519", "1d", sample=1, loader=loader), [])
+
     def test_announced_coverage(self):
-        from tests.test_core_sync import STATEMENTS_SAMPLE  # 复用同口径样例
-        from trading_core import sync
         sync.sync_fundamentals(self.conn, "600519", fetcher=lambda n, a: STATEMENTS_SAMPLE)
         store.set_announced_at(self.conn, "SH.600519", "2026-06-30", "2026-08-28", "akshare/yjbb")
         cov = quality.announced_coverage(self.conn)
