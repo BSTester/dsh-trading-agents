@@ -67,8 +67,10 @@ class PipelineTest(unittest.TestCase):
         self.assertEqual(merge["matched"], 8)
 
         # 4) 质量报告：零缺口 + 覆盖率 100%
-        report = quality.full_report(conn, "SH", TICKERS, DAYS[0], DAYS[-1])
-        self.assertEqual(report["gaps"], {t: [] for t in TICKERS})
+        # （backfill 落库为 futu 符号：600519→SH.600519、000858→SZ.000858，读回按 futu 键）
+        futu_tickers = ["SH.600519", "SZ.000858"]
+        report = quality.full_report(conn, "SH", futu_tickers, DAYS[0], DAYS[-1])
+        self.assertEqual(report["gaps"], {t: [] for t in futu_tickers})
         self.assertEqual(report["announced_coverage"],
                          {"SH": {"total": 4, "with_date": 4},
                           "SZ": {"total": 4, "with_date": 4}})

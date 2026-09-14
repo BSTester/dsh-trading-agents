@@ -36,7 +36,7 @@ class BarsSyncTest(unittest.TestCase):
             self.conn, "600519", "1d",
             loader=lambda t, p, l: (_bars("2026-09-11", "2026-09-14"), "futu/x", False))
         self.assertEqual(second["rows"], 1)  # 只补 09-14
-        self.assertEqual(store.last_bar_date(self.conn, "600519", "1d"), "2026-09-14")
+        self.assertEqual(store.last_bar_date(self.conn, "SH.600519", "1d"), "2026-09-14")
         self.assertEqual(len(calls), 1)  # 第二次用内联 lambda，不再记 calls
 
     def test_backfill_resume_after_failure(self):
@@ -63,7 +63,7 @@ class BarsSyncTest(unittest.TestCase):
                                       loader=good_loader, sleep_seconds=0,
                                       progress_key=sync.PROGRESS_KEY_BACKFILL)
         self.assertEqual(summary2["ok"], ["00700"])
-        self.assertEqual(store.last_bar_date(self.conn, "00700", "1d"), "2026-09-11")
+        self.assertEqual(store.last_bar_date(self.conn, "HK.00700", "1d"), "2026-09-11")
         self.assertEqual(summary2["failed"], {})  # 成功后 failed 必须清空
 
     def test_incremental_needed_estimation(self):
@@ -82,9 +82,10 @@ class BarsSyncTest(unittest.TestCase):
         self.assertEqual(cases[-1], 5)
 
         # 手工把 last 拨回很旧：last_bar_date=MAX(ts)，须先清掉 2099 行，upsert 旧 K 线才生效
-        self.conn.execute("DELETE FROM bars WHERE symbol='600519' AND period='1d'")
+        # （sync 落库为 futu 格式，清理与旧 K 线都按 SH.600519 操作）
+        self.conn.execute("DELETE FROM bars WHERE symbol='SH.600519' AND period='1d'")
         self.conn.commit()
-        store.upsert_bars(self.conn, "600519", "1d", _bars("2020-01-01"), "x")
+        store.upsert_bars(self.conn, "SH.600519", "1d", _bars("2020-01-01"), "x")
         cases.clear()
         sync.sync_bars_incremental(self.conn, "600519", "1d",
                                    loader=lambda t, p, l: (cases.append(l) or ([], "x", False)))

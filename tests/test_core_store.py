@@ -121,6 +121,19 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(rows[0]["announced_at"], "2026-08-28")
         self.assertEqual(rows[0]["announced_source"], "ak1")
 
+    def test_resync_fundamentals_keeps_announced_at(self):
+        store.upsert_fundamentals(self.conn, "SH.600519",
+                                  [{"field": "revenue", "period_end": "2026-06-30", "value": 1.0}],
+                                  "futu/statements")
+        store.set_announced_at(self.conn, "SH.600519", "2026-06-30", "2026-08-28", "akshare/yjbb")
+        store.upsert_fundamentals(self.conn, "SH.600519",
+                                  [{"field": "revenue", "period_end": "2026-06-30", "value": 9.9}],
+                                  "futu/statements")
+        rows = store.read_fundamentals(self.conn, "SH.600519", as_of="2026-09-14")
+        self.assertEqual(rows[0]["value"], 9.9)          # 数值刷新
+        self.assertEqual(rows[0]["announced_at"], "2026-08-28")  # 公告日保留
+        self.assertEqual(rows[0]["announced_source"], "akshare/yjbb")
+
 
 if __name__ == "__main__":
     unittest.main()

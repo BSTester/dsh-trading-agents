@@ -30,7 +30,8 @@ def sync_bars_incremental(conn, ticker, period="1d", loader=None):
     if period != "1d":
         raise ValueError("增量同步仅支持 1d（分钟级根数无法按自然日折算）")
     loader = loader or load_bars
-    last = store.last_bar_date(conn, ticker, period)
+    symbol = to_futu_symbol(ticker)   # 落库统一 futu 格式；loader 仍收原 ticker
+    last = store.last_bar_date(conn, symbol, period)
     if last is None:
         needed = 370                      # 首次增量 = 富途单次上限；更长历史交给 backfill
     else:
@@ -41,9 +42,9 @@ def sync_bars_incremental(conn, ticker, period="1d", loader=None):
         needed = min(370, max(since, 5))
     bars, source, stale = loader(ticker, period, needed)
     fresh = [b for b in bars if last is None or b["t"] > last]
-    rows = store.upsert_bars(conn, ticker, period, fresh, source)
-    return {"ticker": ticker, "rows": rows, "source": source, "stale": stale,
-            "last": store.last_bar_date(conn, ticker, period)}
+    rows = store.upsert_bars(conn, symbol, period, fresh, source)
+    return {"ticker": symbol, "rows": rows, "source": source, "stale": stale,
+            "last": store.last_bar_date(conn, symbol, period)}
 
 
 def backfill_bars(conn, tickers, period="1d", limit=BACKFILL_LIMIT,
@@ -62,7 +63,8 @@ def backfill_bars(conn, tickers, period="1d", limit=BACKFILL_LIMIT,
             continue
         try:
             bars, source, stale = loader(ticker, period, limit)
-            store.upsert_bars(conn, ticker, period, bars, source)
+            symbol = to_futu_symbol(ticker)   # 落库统一 futu 格式；loader/游标仍用原 ticker
+            store.upsert_bars(conn, symbol, period, bars, source)
             failed.pop(ticker, None)
             done.append(ticker)
             ok.append(ticker)

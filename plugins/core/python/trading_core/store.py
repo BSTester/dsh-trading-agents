@@ -123,9 +123,13 @@ def read_adjustments(conn, symbol, as_of):
 def upsert_fundamentals(conn, symbol, rows, source):
     params = [(symbol, r["field"], r["period_end"], r.get("announced_at"),
                r.get("announced_source"), r["value"], source) for r in rows]
-    conn.executemany("INSERT OR REPLACE INTO fundamentals"
-                     "(symbol,field,period_end,announced_at,announced_source,value,source)"
-                     " VALUES(?,?,?,?,?,?,?)", params)
+    # 冲突只刷新 value/source：announced_at/announced_source 一经合并，
+    # 重跑 sync_fundamentals 不得打回 NULL（新行仍为 NULL，宁缺毋假不受影响）
+    conn.executemany(
+        "INSERT INTO fundamentals(symbol,field,period_end,announced_at,announced_source,value,source)"
+        " VALUES(?,?,?,?,?,?,?)"
+        " ON CONFLICT(symbol,field,period_end) DO UPDATE SET value=excluded.value,"
+        " source=excluded.source", params)
     conn.commit()
     return len(params)
 
