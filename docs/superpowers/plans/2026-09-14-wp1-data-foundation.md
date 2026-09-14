@@ -1,6 +1,7 @@
 # WP1 数据基座 实现计划
 
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法来跟踪进度。
+> **全局约定**（UI 文案规范/数据可行性协议/工程约定）见 `2026-09-14-platform-plan-index.md`，本计划同等受其约束。
 
 **目标：** 建成 trading-core 的数据基座——PIT SQLite 存储、交易日历、三市场行情/复权/财务同步（含全量回填与断点续传）、财报公告日双源合并、数据质量报告；随安装器分发（LIBRARIES 机制）。
 
