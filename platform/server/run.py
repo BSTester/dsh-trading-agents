@@ -1,11 +1,11 @@
 """服务入口（WP6 补遗 C）：``python -m server.run``（cwd = ``platform/``）。
 
-对齐 ``platform/server/start.mjs`` 的启动/就绪/优雅退出：
-  * ``start.mjs:26-34`` —— 监听成功后打印**单行 JSON**：ok/service/url/mcp/tools/auth
+对齐 Node 服务层原实现（已退役，见 git 历史 ``aaa5f42^``）的启动/就绪/优雅退出：
+  * 监听成功后打印**单行 JSON**：ok/service/url/mcp/tools/auth
     （端口从真实 socket address 取，``port=0`` 时即内核分配的端口）；
-  * ``start.mjs:22-24`` —— 监听失败不悬挂，打印 ``{"ok": false, ...}`` 后以 1 退出；
-  * ``start.mjs:36-43`` —— SIGINT/SIGTERM 优雅退出：uvicorn 自带信号处理（等价于 Node 的
-    ``server.close()``），``timeout_graceful_shutdown=5`` 对应其 5s 强制回收。
+  * 监听失败不悬挂，打印 ``{"ok": false, ...}`` 后以 1 退出；
+  * SIGINT/SIGTERM 优雅退出：uvicorn 自带信号处理（等价于原实现的 ``server.close()``），
+    ``timeout_graceful_shutdown=5`` 对应其 5s 强制回收。
 
 **解释器要求（Q-8）**：服务应在 ``$DSH_HOME/trading-venv`` 内启动
 （``~/.dsh/trading-venv/bin/python -m server.run``）。``compute.PYTHON`` 取
@@ -44,7 +44,7 @@ SERVICE = "quant-platform"
 
 
 def tool_count():
-    """工具面清单长度（``start.mjs:32`` 的 ``manifest.length``）。
+    """工具面清单长度（Node 原实现（已退役）的 ``manifest.length``）。
 
     任务 D 会把 ``server.mcp_tools`` 填成 25 项真实清单；在那之前按规格取常量 25。
     """
@@ -62,7 +62,7 @@ def tool_count():
 
 
 def ready_line(address, config):
-    """就绪行（``start.mjs:26-34``）：address 优先（``port=0`` 由内核分配端口）。"""
+    """就绪行（Node 原实现（已退役））：address 优先（``port=0`` 由内核分配端口）。"""
     host, port = config.get("host"), config.get("port")
     if address:
         host, port = address[0], address[1]
@@ -128,7 +128,7 @@ def interpreter_warning(home=None):
 
 
 def main(argv=None):
-    del argv  # 入口无参数：配置全部来自 env / trading-platform.json（config.mjs 同）
+    del argv  # 入口无参数：配置全部来自 env / trading-platform.json（Node 原实现同）
     home = os.environ.get("DSH_HOME")
     warning = interpreter_warning(home)
     if warning is not None:
@@ -140,7 +140,7 @@ def main(argv=None):
         server.run()
     except SystemExit as error:
         # uvicorn 0.53 的 bind 失败不是 OSError 而是 ``sys.exit(3)``（STARTUP_FAILURE）：
-        # 捕 SystemExit 才能覆盖 EADDRINUSE 这条真实路径（start.mjs:22-24 的等价物）。
+        # 捕 SystemExit 才能覆盖 EADDRINUSE 这条真实路径（Node 原实现已退役的等价物）。
         if error.code in (None, 0):  # 正常退出码不当失败
             return 0
         print(json.dumps({"ok": False, "service": SERVICE,

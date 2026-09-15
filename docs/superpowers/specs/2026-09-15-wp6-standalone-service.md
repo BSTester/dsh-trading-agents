@@ -86,7 +86,7 @@
 
 ⚠ = 动作类工具（§5.1 审批链 A3/A4 的载体）。**通道分级（防模型自填口令）**：
 
-- `mcp__quantwb__switch_mode` **仅限 sim→sim**：`mode:"live"` 一律拒绝（`trading/live-switch-web-only`）——模型可见的通道不得持有 live 切换能力，与 `quant_switch`「模型不能代替用户确认实盘」同一条不变量；**live 切换只能由用户在独立 Web 操作**（Web 的 `/api/wb/switch-mode` 保留口令流程）。
+- `mcp__quantwb__switch_mode` **只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝**：`mode:"live"` 一律拒绝（`trading/live-switch-web-only`）——模型可见的通道不得持有 live 切换能力，与 `quant_switch`「模型不能代替用户确认实盘」同一条不变量；**live 切换只能由用户在独立 Web 操作**（Web 的 `/api/wb/switch-mode` 保留口令流程）。
 - `mcp__quantwb__plan_execute` 保留口令入口：这是规格 §8.3 承诺的对话侧等价入口——用户在对话中逐笔确认后由模型携带口令调用，与面板同 handler 同风控；live 切换不可经 MCP 完成，因此 MCP 侧 plan-execute 前的 live 状态必然源自用户的 Web 操作。
 
 两者的口令与 `expected_mode` 复核均在**服务端 handler 内**执行（`store.switchMode` / `plan-execute` 分支）——「模式切换不授权交易」「live 双口令」不变量跨入口成立的机制保证。
@@ -232,7 +232,7 @@ platform/web/
 |---|---|---|
 | A1 | 账户模式互斥：sim 模式拒 `account_*`/`trading_*`；live 模式拒 `sim_trade_*` | `policy.js` guard |
 | A2 | live 写操作原生审批：`trading_*` 在 pre-execute 强制 `{kind:"ask"}`；`sim_trade_*` 永不 ask | `policy.js` pre-execute |
-| A3 | 模式切换双保险：live 需口令「确认实盘」+ `expected_mode` 一致 + 无在途租约；切换不授权下单；**MCP 通道 switch_mode 仅限 sim→sim**（模型自填口令被通道规则封死） | `store.switchMode` + manifest 通道规则 |
+| A3 | 模式切换双保险：live 需口令「确认实盘」+ `expected_mode` 一致 + 无在途租约；切换不授权下单；**MCP 通道 switch_mode 只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝**（模型自填口令被通道规则封死） | `store.switchMode` + manifest 通道规则 |
 | A4 | 计划执行窄门：live 需口令「确认执行」+ `plan_hash` + `expected_mode` 复核；成功仅 `queued`；daemon 侧 kill 文件 + 风控 8 规则兜底 | rpc plan-execute 分支 + commands + risk |
 | A5 | `quant_switch` 只能切 sim；模型不能代替用户确认实盘 | engine tools |
 | A6 | 在途租约：`enterBrokerCall` 期间拒绝模式切换 | store 租约 |
@@ -320,7 +320,7 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 ## 八、风险与诚实清单
 
 1. **双进程并发写 store**：服务进程与 Harness 进程共享 `trading-workbench.json`；既有原子写 + 独占锁跨进程成立，但「两处同时切换模式」的竞态窗口由 `expected_mode` 复核兜底（后到者拒绝）。
-2. **MCP 工具是模型可直接调用的**：`plan_execute` 对模型可见，口令是门槛（用户在对话中逐笔确认后由模型携带，规格 §8.3 设计如此）；`switch_mode` 经 MCP 被封在 sim→sim（§3.2 通道分级），live 切换只有用户的 Web 通道。这是半自动模式的固有边界，与 daemon 通道同级，不宣称达到实盘安全保证。
+2. **MCP 工具是模型可直接调用的**：`plan_execute` 对模型可见，口令是门槛（用户在对话中逐笔确认后由模型携带，规格 §8.3 设计如此）；`switch_mode` 经 MCP **只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝**（§3.2 通道分级），live 切换只有用户的 Web 通道。这是半自动模式的固有边界，与 daemon 通道同级，不宣称达到实盘安全保证。
 3. **npm 离线环境**：bootstrap 需联网一次；lockfile 提交后可复现安装。
 4. **ProComponents 版本漂移**：antd 锁 5.x + lockfile；升级属显式变更。
 5. **K 线/热力图移植失真**：几何纯函数带测试移植，视觉回归靠人工清单比对。

@@ -243,7 +243,7 @@ class R3SwitchModeTests(Base):
         self.assertFalse((self.home / "trading-account-mode").exists())
 
     def test_mcp_channel_forwards_sim_and_shares_the_app_handle(self):
-        """sim→sim 才转 handle，且用的就是 app.state.handle 同一个实例。"""
+        """只接受切到 sim：sim 才转 handle，且用的就是 app.state.handle 同一个实例。"""
         tool = self.tool(self.app, "switch_mode")
         self.assertIs(tool.handle, self.app.state.handle)
         body = self.mcp_call(self.app, "switch_mode", {"mode": "sim", "expected_mode": "sim"})

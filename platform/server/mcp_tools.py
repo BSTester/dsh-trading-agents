@@ -11,11 +11,11 @@
 # 零调用）。live 切换只能由用户在独立 Web 输入口令完成。``plan_execute`` 保留口令入口
 # （规格 §8.3 的对话侧等价入口，口令仍在服务端 handler 内复核）。
 #
-# 错误语义（规格 §3.2 末段，与 Node 侧 mcp.mjs 同形）：
+# 错误语义（规格 §3.2 末段，与 Node 服务层原实现（已退役，见 git 历史 ``aaa5f42^``）同形）：
 #   * 业务失败（``ok:false`` + ``trading/*``）是**正常工具结果**（isError=false，文本为 JSON）；
 #   * handler 之外的程序异常才 isError=true + ``trading/tool-failed`` 信封；
 #   * 维护工具的 store 同步抛错（数据文件损坏/不可写/未知 run）按业务失败处理（isError=false
-#     + ``trading/invalid-operation``），与 manifest.mjs 的 ``envelope(fn)`` 同义。
+#     + ``trading/invalid-operation``），与 Node 原实现（已退役）的 ``envelope(fn)`` 同义。
 #
 # SDK 适配结论（mcp 2.2.0 实测，非推测）：
 #   * ``from mcp.server.mcpserver import MCPServer``（2.x 由 FastMCP 更名）；
@@ -68,10 +68,10 @@ SERVER_VERSION = "0.1.0"
 # 工具面总数：20 端点工具（§3.2）+ 5 维护工具（§3.4）。锁定测试断言 25 恒成立。
 TOOL_COUNT = 25
 
-# 规格 §3.6 禁用名黑名单（与 manifest.mjs 同表）。匹配语义是**整名或分段精确**：工具名按
+# 规格 §3.6 禁用名黑名单（与 Node 原实现（已退役）同表）。匹配语义是**整名或分段精确**：工具名按
 # 非字母数字切段，任一段命中才算，所以 ``plan_execute`` 不因子串 "exec" 被误伤，而
-# ``run_shell`` / ``exec_cmd`` / ``read_file`` 一律拦下（与 platform/tests/wp6-locks.test.mjs
-# 的判定逐字一致）。
+# ``run_shell`` / ``exec_cmd`` / ``read_file`` 一律拦下（与 Node 原实现（已退役）的锁定测试
+# 判定逐字一致）。
 TOOL_NAME_BLACKLIST = ("exec", "shell", "file_read", "file_write", "read_file",
                        "write_file", "token")
 
@@ -201,8 +201,8 @@ class ToolDefinition:
 # ---------------------------------------------------------------------------
 # 25 工具清单（规格 §3.2 表 1-20 / §3.4 表 21-25，逐项对应）
 # ---------------------------------------------------------------------------
-# 名称、描述、输入字段集与 manifest.mjs 的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，字段顺序
-# 也保持 Node 侧顺序（inputSchema 的 properties 顺序因此稳定可比）。
+# 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
+# 字段顺序也保持原实现顺序（inputSchema 的 properties 顺序因此稳定可比）。
 TOOLS = (
     ToolDefinition(
         "snapshot",
@@ -213,14 +213,14 @@ TOOLS = (
     ),
     ToolDefinition(
         "switch_mode",
-        "切换账户模式，仅限 live→sim（回模拟盘）。sim→live 被本工具拒绝：实盘切换只能由用户在"
-        "独立 Web（默认 http://127.0.0.1:8397，端口随服务配置）输入口令「确认实盘」完成。"
-        "切换模式不授权任何订单。",
+        "切换账户模式，只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝：实盘切换只能"
+        "由用户在独立 Web（默认 http://127.0.0.1:8397，端口随服务配置）输入口令「确认实盘」"
+        "完成。切换模式不授权任何订单。",
         "switch-mode",
         (
-            req("mode", "mode", "目标模式（本工具只接受 sim）"),
+            req("mode", "mode", "目标模式（本工具只接受切到 sim；sim→live 一律拒绝）"),
             req("expected_mode", "mode", "调用方所见当前模式，防过期数据误切换"),
-            opt("confirmation", "str", "回 sim 无需口令；本工具不接受 live 切换"),
+            opt("confirmation", "str", "切到 sim 无需口令；本工具不接受 sim→live 切换"),
             REFRESH,
         ),
     ),
@@ -432,7 +432,7 @@ def _message(error):
 
 
 def failure(code, message):
-    """``{ok:false, error:{code, message, details:{}}}``（util.mjs 的信封同形）。"""
+    """``{ok:false, error:{code, message, details:{}}}``（Node 原实现（已退役）的信封同形）。"""
     return {"ok": False, "error": {"code": code, "message": message, "details": {}}}
 
 
@@ -458,7 +458,7 @@ def payload_of(arguments):
 def _store_call(name, store_api, arguments):
     """维护工具 → store_access 调用（hours 原样透传，阈值语义只有 _hours_to_ms 一份实现）。
 
-    有意差异：manifest.mjs 的 ``hoursToMs`` 用 ``Math.max(1, hours ?? 2)``，``hours<=0`` 时给
+    有意差异：Node 原实现（已退役）的 ``hoursToMs`` 用 ``Math.max(1, hours ?? 2)``，``hours<=0`` 时给
     1 小时；store_access 移植的是 ``workbench_admin.mjs`` 的 ``hoursArg``（``<=0``/非法 →
     默认 2 小时）。规格 §3.4 把维护工具锚在 workbench_admin.mjs 的能力上，故以 store_access 为准。
     """
@@ -480,7 +480,7 @@ def dispatch(definition, handle, store_api, arguments):
     if definition.kind == "admin":
         try:
             return {"ok": True, "value": _store_call(definition.name, store_api, arguments)}
-        except Exception as error:  # noqa: BLE001 —— 与 manifest.mjs envelope() 的 catch 同宽
+        except Exception as error:  # noqa: BLE001 —— 与 Node 原实现 envelope() 的 catch 同宽
             return failure(INVALID_OPERATION_CODE, _message(error))
     if definition.name == "switch_mode" and arguments.get("mode") == "live":
         # 通道分级（规格 §3.2 ⚠）：模型可见的通道不得持有 live 切换能力。这里直接返回，绝不

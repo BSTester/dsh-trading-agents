@@ -76,5 +76,6 @@ WP1（§13.2 六项）、WP2（估值字段路径复用 `workbench/python/factor
 3. Harness 定位不变：入口 = 决策与操作确认；固定信息收集由服务定时跑。
 落地：6a mcp_server（工具面=工作台全功能清单）；6b Ant Design Pro 前端 + 服务 HTTP；
 6c preset 行替换与审批回归。
-规格：`docs/superpowers/specs/2026-09-15-wp6-standalone-service.md`（2026-09-15 产出，前端形态经用户确认为 Vite + antd5 + ProComponents）。
-实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（验收记录见其末节）。
+规格：`docs/superpowers/specs/2026-09-15-wp6-standalone-service.md`（2026-09-15 产出，前端形态经用户确认为 Vite + antd5 + ProComponents；同日第二次决策把服务后端改为 **FastAPI（Python）单进程**，规格与计划已同步修订）。
+实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（含补遗 A–E：FastAPI 架构变更与 Node 服务层退役）。
+验收记录：**`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md` 末节「WP6 验收记录」**（分支与提交清单、全量测试证据、规格 §六 关键验收对照、真实进程冒烟、人工会话回归留位、执行偏差与 live 准入）。

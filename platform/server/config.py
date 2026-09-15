@@ -2,7 +2,8 @@
 
 优先级：环境变量 TRADING_SERVICE_PORT > 配置文件 > 默认（env 覆盖在缺文件时同样生效——
 集成测试正是用「临时 DSH_HOME + TRADING_SERVICE_PORT=0」起服务的）。
-这是 platform/server/config.mjs 的 Python 移植版，语义逐条对齐。
+这是 Node 服务层 config.mjs 原实现（已退役，见 git 历史 ``aaa5f42^``）的 Python 移植版，
+语义逐条对齐。
 """
 import json
 import os

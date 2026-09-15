@@ -21,7 +21,7 @@
 #   store.js:226-240 switchMode             -> switch_mode()
 #   store.js:242-259 enterBrokerCall        -> 只取租约命名/在途判定（_active_leases）
 #   store.js:329-336 pendingObservations    -> pending_observations()
-#   scripts/workbench_admin.mjs:14-25       hoursArg/ageMinutes -> _hours_to_ms/admin_runs
+#   scripts/workbench_admin.mjs            hoursArg/ageMinutes -> _hours_to_ms/admin_runs
 #   plugins/workbench/src/endpoints.js:12-33 ENDPOINTS          -> endpoints()
 # 本模块只用标准库；不写回任何 Node 侧尚未写入的键，错误语义（消息、类型）对齐 Node。
 # JS 语义助手（真值、字段访问）统一来自 server/_js.py：store_access/summary/audit_chain 不再
@@ -125,7 +125,7 @@ def _parse_ms(value):
 
 
 def _hours_to_ms(hours):
-    """workbench_admin.mjs:14-19 hoursArg：非有限或 <=0 一律退回默认 2h。"""
+    """workbench_admin.mjs 的 hoursArg：非有限或 <=0 一律退回默认 2h。"""
     if hours is None:
         return ABANDONED_AFTER_MS
     try:
@@ -325,7 +325,7 @@ def switch_mode(home, mode=None, expected_mode=None, confirmation=None):
 
 
 def admin_status(home):
-    """服务侧新 API（Node 侧没有对应的 store 方法）：形状照 workbench_admin.mjs:28-31 的
+    """服务侧新 API（Node 侧没有对应的 store 方法）：形状照 workbench_admin.mjs 的
     status 打印——数据文件路径与四张表的计数，让面板不必解析 CLI 文本。"""
     state = read_store(home)
     return {
@@ -338,8 +338,8 @@ def admin_status(home):
 
 
 def admin_runs(home, now=None):
-    """服务侧新 API（Node 侧没有对应的 store 方法）：形状照 workbench_admin.mjs:21-25/33-39
-    的 runs 打印——每条 run 的状态与年龄（started_at 解析失败 -> None，对应 "年龄未知"）。"""
+    """服务侧新 API（Node 侧没有对应的 store 方法）：形状照 workbench_admin.mjs 的
+    runs 打印——每条 run 的状态与年龄（started_at 解析失败 -> None，对应 "年龄未知"）。"""
     state = read_store(home)
     current = _now_ms() if now is None else now
     rows = []

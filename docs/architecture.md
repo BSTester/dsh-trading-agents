@@ -1,6 +1,10 @@
 # 架构与交互边界
 
-> **WP4 状态标注（WP5 修订）：** 本文涉及 daemon、`plan`/`plan-execute`/`schedule`/`reconcile` 四个 RPC 的描述按 WP4 计划规格撰写，**以 WP4 合并后实测为准**。
+> **状态标注（WP6 修订，2026-09-15）：** 本文涉及 daemon、`plan`/`plan-execute`/`schedule`/`reconcile`
+> 四个 RPC 的描述按 WP4 计划规格撰写，**WP4/WP5 合并后已实测**（回归见 `tests/workbench-wp4.test.mjs`、
+> `tests/test_core_wp4_e2e.py`、`tests/test_core_wp4_snapshots.py`）。WP6 起工作台前端由
+> `platform/` **独立服务进程（FastAPI 单进程）**托管，Harness 内 legacy 面板过渡期并存；
+> 验收记录见 `docs/superpowers/plans/2026-09-15-wp6-standalone-service.md` 末节。
 
 ## 结论性字段的中文标签
 
@@ -18,8 +22,11 @@
 ## 产品定位
 
 本项目是 **DeepSeek Harness 的对话模式与插件组合**，不是独立交易终端。
-Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台嵌在 Harness 内，
-用于研报结果、交易动态、量化信息预览，以及模拟盘/实盘模式切换。
+Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台自 WP6 起是
+**独立 Web（FastAPI 单进程托管）+ Harness 内 legacy 面板过渡期并存**：
+独立 Web 只用于研报结果、交易动态、量化信息预览与模拟盘/实盘模式切换；
+Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户策略依赖它），
+面板移除另行提交。
 
 ```text
 用户 ↔ Harness 对话 / 原生审批
@@ -33,18 +40,37 @@ Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台嵌�
           └─ 原生富途账户/交易工具 → 观察最终响应
                     │
                     ▼
-          workbench Host：持久结果与模式
-                    │ Harness Connection RPC
+          workbench Host：持久结果与模式（Harness 进程内）
+                    │ Harness Connection RPC（legacy 面板，过渡期）
                     ▼
           workbench Client：结果卡片 + 展示面板 + 模式切换
+
+          独立服务进程（platform/，FastAPI + uvicorn 单进程）
+            ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
+            ├─ /mcp（mcp SDK streamable-http，25 工具）→ Harness 的 mcp__quantwb__*
+            └─ 静态托管 platform/web/dist；同一份 store/模式/指令文件
+               （双进程无网络互通，靠原子写 + 文件锁互斥）
 ```
 
 **明确不做**：第二个聊天窗口、浏览器直接持有富途 token、
 插件私建 LLM 对话循环、工作台 RPC 任意执行工具或 shell。
+独立 Web **无聊天、无逐单下单/撤单表单、无 shell/LLM/token 接口**。
 工作台的下单边界已从「无任何下单入口」变更为「**恰好一个受约束执行入口——
 执行已冻结计划**」：唯一写路径是指令文件（白名单 5 种指令），live 需口令复核，
 对话侧保留等价 `plan_execute`，两条入口汇聚同一核心函数、同一套风控；
 逐单下单/撤单表单仍然不做。
+
+**双进程数据约定（WP6）**：服务进程与 Harness 进程共享同一份
+`<DSH_HOME>/trading-workbench.json`、模式文件 `trading-account-mode` 与指令目录
+`trading-commands/`；互斥依赖既有的**原子写 + 独占锁**，两处同时切换模式的竞态由
+`expected_mode` 复核兜底（后到者拒绝）。Python 侧快照读**不合并** pending observations
+（合并留给 Harness Host），见 `docs/HANDOVER.md`。
+
+**MCP 通道分级（WP6）**：`mcp__quantwb__switch_mode` **只接受切到 sim
+（live→sim 回模拟盘）；sim→live 一律拒绝**（`trading/live-switch-web-only`）——
+实盘切换只能由用户在独立 Web 输入口令「确认实盘」完成（Web 的
+`/api/wb/switch-mode` 保留口令流程），与 `quant_switch`「模型不能代替用户确认实盘」
+同一条不变量。
 
 ## 组件职责
 
@@ -61,6 +87,7 @@ Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台嵌�
 | `plugins/datasource/python` | **统一数据层**：唯一的富途 MCP 客户端、行情路由与回测核心，被 engine/workbench 共同依赖（不是 Harness 插件） |
 | `plugins/core/python/trading_core` | **量化平台核心库**（非 Harness 插件）：PIT 存储/日历/同步/质量（WP1）、因子/策略/组合回测/walk-forward（WP2）、风控八规则/计划冻结/OMS 状态机/券商适配/对账/TCA（WP3）、daemon 调度/指令目录/告警（WP4） |
 | `trading_core` daemon | 无 LLM 单进程守护进程（`python -m trading_core daemon`）：按交易日历触发作业链（sync→质量→信号→计划、对账→TCA→摘要）、心跳落 `~/.dsh/trading-daemon.json`（> 5 分钟未刷新工作台标红）、轮询指令目录 `~/.dsh/trading-commands/`、告警分级落 `alerts` 表（WP4） |
+| `platform/` 独立服务进程（WP6） | FastAPI/uvicorn **单进程**：`POST /api/wb/<endpoint>`（envelope 契约，20 端点）+ `/mcp`（mcp SDK streamable-http，**25 工具**）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/5 个 `admin_*` 维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
 
 `plugins/trading-agents` 是旧的未启用脚手架，不是当前执行引擎。
 workbench 包通过 `dsh.bundle.patch` 插入根级 Host 行；fin-data/engine 是普通插件包，
@@ -245,10 +272,15 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
 工作台通过原生 `ctx.connection.fetch.register` 注册精确 POST 路由，
 Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 采用 Harness 的请求/响应 envelope，继承 Connection 的信任、认证和生命周期。
-不占用 Gateway 的共享 interceptor，也不创建额外 Web 服务。
+不占用 Gateway 的共享 interceptor。
+
+**WP6 起同一批端点在 `platform/` 独立服务进程内以 `POST /api/wb/<endpoint>` 暴露**
+（envelope 契约不变：`{ok, value?, cached?, cached_at?, error?{code,message,details}}`）；
+`/mcp` 的 25 个 MCP 工具与 HTTP 路由在该进程内调用**同一批 Python 处理函数**
+（同一 `(endpoint, payload) -> envelope`），行为对等由代码结构 + 审批回归矩阵共同保障。
 `snapshot` / `switch-mode` 之外，WP4 新增 4 个受约束端点
-（读侧一律经 `pycore` 调 `trading_core` 只读子命令取数，Node 不直接读 SQLite；
-写侧只落指令目录，不直接操作业务状态）：
+（读侧一律经只读子命令取数，Node 侧经 `pycore`、Python 侧经 `trading_core snapshot-*`
+读 SQLite，不直接改库；写侧只落指令目录，不直接操作业务状态）：
 
 | Endpoint | 输入 | 输出 |
 |---|---|---|
@@ -261,6 +293,16 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 
 除 `plan-execute`（执行已冻结计划，白名单指令落盘）外，不开放下单、shell、LLM 或
 token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
+
+**独立 Web 的安全边界（诚实清单，规格 §4.7）**：脱离 Harness Connection 后，
+认证边界变为 **loopback 绑定（默认 127.0.0.1:8397）+ 可选静态 Bearer token**
+（`~/.dsh/trading-platform.json` 的 `service.token` 非空时 `/api/*` 与 `/mcp` 均要求
+`Authorization`，`/healthz` 与静态前端豁免）。相对 Connection 这是明示的能力降级；
+loopback 不防同机其他进程，token 是可选加固而非强认证。浏览器不持有任何券商凭据，
+服务进程只能读写既有数据文件（store JSON、模式文件、指令目录、SQLite 只读快照），
+`switch-mode`/`plan-execute` 的口令校验在服务端执行，浏览器绕不过。
+敏感字段沿用 `store.sanitize` 脱敏（token/secret/password/authorization/cookie →
+`[redacted]`，64KB 截断），HTTP 与 MCP 输出同源。
 
 默认数据根目录 `~/.dsh`，可用 `DSH_HOME` 覆盖。`trading-workbench.json` 保存版本化快照，
 各列表最多保留最近 100 项；这不是完整审计档案，完整过程仍在 Harness 会话记录中。
@@ -281,5 +323,5 @@ Connection RPC、工具守卫/结果事件、客户端 `./client` 导出和 modu
 优先级：安装/宿主集成验收 → 数据源与量化正确性 → 富途模拟盘成交/对账 →
 告警、审计、熔断及恢复 → 样本外策略评估 → 人工决定是否小额实盘。
 券商实时推送、港美历史数据与多市场交易规则仍需后续实现；本地对账/调度/熔断告警
-由 WP3–WP4 交付（以 WP4 合并后实测为准，恢复演练见 [RUNBOOK.md](RUNBOOK.md)）；
+由 WP3–WP4 交付（已实测，恢复演练见 [RUNBOOK.md](RUNBOOK.md)）；
 面板可用不代表已达到实盘准入条件。

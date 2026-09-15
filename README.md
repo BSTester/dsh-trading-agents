@@ -4,8 +4,10 @@
 
 DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 多角色投研流水线装进 Harness，数据与交易能力来自[富途远程 MCP](https://github.com/FutunnOpen/futu-agent-plugin)（免 OpenD、OAuth 授权）。
 
-**Harness 是唯一对话与指令入口。** 工作台嵌在 Harness 内，只用于查看研报、交易概要、
-量化信息预览及切换模拟盘/实盘；没有独立聊天、下单或撤单入口。
+**Harness 是唯一对话与指令入口。** 工作台自 WP6 起是**独立 Web**（FastAPI 单进程托管，
+默认 `http://127.0.0.1:8397`；同一批能力另有 `mcp__quantwb__*` MCP 工具面），Harness 内
+legacy 面板过渡期并存。两种形态都只用于查看研报、交易概要、量化信息预览及切换
+模拟盘/实盘；没有独立聊天、下单或撤单入口。
 
 ```
 市场分析师 ┐
@@ -146,9 +148,34 @@ Harness 会使用原生工具与子代理完成四位分析师报告、多空辩
 （Buy/Overweight/Hold/Underweight/Sell 五档评级 + 参考入场价 + 止损 + 仓位建议）。
 缺少可靠数据时必须注明，不能编造价格或承诺完成时间。
 
+## 可选：启动独立工作台服务（WP6）
+
+不启动也不影响 Harness 的对话、投研与量化能力——`agent.cordis.yml` 的
+`quant-platform-mcp` 行默认 `disabled: true`，服务未起时安静降级。要用独立 Web 工作台：
+
+```bash
+# 1. 依赖：Python 侧复用交易 venv；前端构建需要 Node（只需联网一次）
+~/.dsh/trading-venv/bin/pip install -r platform/requirements.txt
+npm --prefix platform/web install && npm --prefix platform/web run build
+
+# 2. 启动：HTTP API + MCP + 静态前端同一个进程（默认 127.0.0.1:8397）
+cd platform && ~/.dsh/trading-venv/bin/python -m server.run
+```
+
+浏览器打开 `http://127.0.0.1:8397` 即是工作台（`/healthz` 为存活探针）。
+**不能在仓库根用 `python -m platform.server.run`**——标准库 `platform` 遮蔽同名包。
+
+要让 Harness 会话直接调用工作台能力，把 `agent.cordis.yml` 里 `quant-platform-mcp` 行的
+`disabled: true` 改成 `false`，然后**新建会话**（已挂载的会话不会重新读取组合）：会话内
+出现 `mcp__quantwb__*` 共 25 个工具，与 Web 同源（HTTP 与 MCP 调用同一批处理函数）。
+实盘切换只能在 Web 输入口令「确认实盘」完成；`switch_mode` 工具只接受切到 sim
+（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
+[docs/RUNBOOK.md](docs/RUNBOOK.md) 的「平台服务」一节。
+
 ## 工作台与指令示例
 
-完整安装并重启 Harness、刷新页面后，点击右下角 **「交易工作台」**：
+完整安装并重启 Harness、刷新页面后，点击右下角 **「交易工作台」**（legacy 面板，
+过渡期保留）；或按上节启动独立 Web 后在浏览器打开 `http://127.0.0.1:8397`：
 
 | 页面内容 | 数据从哪里来 |
 |---|---|
@@ -288,8 +315,11 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # �
 ├── plugins/core/         # 量化平台核心库 trading_core（库，非插件）：PIT 存储/研究/执行/调度与运维
 ├── plugins/engine/       # 研究记录/发布、量化工具、账户策略；含 Python 量化实现
 ├── plugins/fin-data/     # 统一新闻与舆情工具
-├── plugins/workbench/    # Host 状态服务 + Harness Client 面板与卡片
+├── plugins/workbench/    # Host 状态服务 + Harness Client 面板与卡片（legacy 面板，过渡期保留）
 ├── plugins/quant/        # 旧量化脚本兼容入口
+├── platform/             # 独立工作台服务：server/（FastAPI 单进程：HTTP API + MCP + 静态托管）
+│                         #   + web/（Vite + antd5 + ProComponents 前端，构建产物 dist/）
+│                         #   + requirements.txt（fastapi/uvicorn/mcp/httpx 锁定）
 ├── install.sh / install.ps1 # 跨平台完整安装
 └── docs/architecture.md   # 架构与路线图
 ```

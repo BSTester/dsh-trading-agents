@@ -207,11 +207,11 @@ export const ENDPOINT_TOOLS = [
   endpointTool("snapshot", "snapshot", "工作台全量快照：账户模式、研报、研究 run、量化预览、交易响应、去重订单事实（trade_summary）、在途调用与缺失端点清单。无券商数据时明确为空。", {}),
   {
     kind: "endpoint", name: "switch_mode", endpoint: "switch-mode",
-    description: "切换账户模式，仅限 live→sim（回模拟盘）。sim→live 被本工具拒绝：实盘切换只能由用户在独立 Web（http://127.0.0.1:8397）输入口令「确认实盘」完成。切换模式不授权任何订单。",
+    description: "切换账户模式，只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝：实盘切换只能由用户在独立 Web（http://127.0.0.1:8397）输入口令「确认实盘」完成。切换模式不授权任何订单。",
     input: {
-      mode: z.enum(["sim", "live"]).describe("目标模式（本工具只接受 sim）"),
+      mode: z.enum(["sim", "live"]).describe("目标模式（本工具只接受切到 sim；sim→live 一律拒绝）"),
       expected_mode: z.enum(["sim", "live"]).describe("调用方所见当前模式，防过期数据误切换"),
-      confirmation: z.string().optional().describe("回 sim 无需口令；本工具不接受 live 切换"),
+      confirmation: z.string().optional().describe("切到 sim 无需口令；本工具不接受 sim→live 切换"),
       refresh: z.boolean().optional(),
     },
     async run({ handle, args }) {
@@ -1044,7 +1044,7 @@ git commit -m "test(core): WP6 审批回归 Python 矩阵（P1-P3）"
 # ── 量化平台独立服务（WP6：MCP 工具面 = 工作台全功能，规格见
 #    docs/superpowers/specs/2026-09-15-wp6-standalone-service.md） ─────────────
 # 需先启动服务：node platform/server/start.mjs（未启动时本行安静降级）。
-# 通道分级：quantwb 的 switch_mode 仅限 live→sim；实盘切换只能在独立 Web 由用户输入口令。
+# 通道分级：quantwb 的 switch_mode 只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝；实盘切换只能在独立 Web 由用户输入口令。
 
 - id: quant-platform-mcp
   name: '@deepseek-ai/dsh-mcp-client'
@@ -1789,7 +1789,7 @@ git commit -m "feat(web): 页面批 3（计划窄门/调度 kill/审计三级链
 
 **文件：** 修改 `docs/architecture.md`、`docs/RUNBOOK.md`、`README.md`、`docs/HANDOVER.md`、`docs/P4-live-trading.md`、`docs/superpowers/plans/2026-09-14-platform-plan-index.md`；本文件末尾「WP6 验收记录」
 
-- [ ] **步骤 1：`architecture.md`**：组件职责表加一行「`platform/` 独立服务进程（WP6）」；「产品定位」图补独立 Web/MCP 两条通道；「明确不做」补「独立 Web 无聊天/逐单表单；MCP switch_mode 仅限 live→sim（通道分级，规格 §3.2）」；文首「以 WP6 合并后实测为准」标注
+- [ ] **步骤 1：`architecture.md`**：组件职责表加一行「`platform/` 独立服务进程（WP6）」；「产品定位」图补独立 Web/MCP 两条通道；「明确不做」补「独立 Web 无聊天/逐单表单；MCP switch_mode 只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝（通道分级，规格 §3.2）」；文首「以 WP6 合并后实测为准」标注
 - [ ] **步骤 2：`RUNBOOK.md`**：新增「平台服务」一节——启动 `node platform/server/start.mjs`、`~/.dsh/trading-platform.json` 配置样例（port/host/token）、前端构建 `npm --prefix platform/web run build`、mcp-smoke 排障（`node --test platform/tests/smoke.test.mjs`）、systemd unit 样例：
 
 ```ini
@@ -1832,9 +1832,309 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 - [ ] **步骤 2**：执行规格 §5.3 人工清单 5 步（工具面出现 / MCP live 拒绝 / Web 口令切 live / trading_* 原生审批卡 / plan_execute 窄门 + kill 演练），证据粘贴进「WP6 验收记录」
 - [ ] **步骤 3**：全部通过后在「WP6 验收记录」标记 WP6 验收完成；任何一步失败 → 按 §5.5 回滚 preset 行（`disabled: true`）并修复重跑
 
-## WP6 验收记录（执行时填写）
+## WP6 验收记录（2026-09-16 回填）
 
-> 按任务顺序回填：每个任务的 commit、全量测试输出、mcp-smoke 输出、文案自查结果、人工清单 5 步证据。live 准入仍按 P4 清单，人工评估项保持未勾选。
+> 环境：worktree `/home/penn/workspace/dsh-wp6`，分支 `feat/wp6`，HEAD `044d0ce`（本记录所在提交的父提交）；
+> Python `~/.dsh/trading-venv`（3.13.5），Node v22.23.2 / npm 10.9.8。
+> **本记录的证据全部来自上述 worktree 的真实运行，先跑后抄**；凡未执行者一律标注「待办」，不预填。
+> live 准入仍按 `docs/P4-live-trading.md` 清单人工评估，人工项保持未勾选。
+
+### 1. 分支与提交清单
+
+基线 `ecec7d1`（WP6 规格落库前的上一提交）；Node 服务层退役前状态 = `aaa5f42^`。
+全程未切分支、未 rebase。
+
+| 任务 | commit | 主题 |
+|---|---|---|
+| 规格/计划立项 | `c10ebbe` | docs(specs): WP6 独立服务化规格与实现计划（MCP 工具面/AntD Pro 迁移/审批回归） |
+| 任务 0 | `c6ccf1e` | feat(platform): WP6 服务脚手架与锁定测试（config/常量/工具面契约） |
+| 任务 1 | `de367b6` | feat(platform): WP6 工具面清单（20 端点对等 + 5 维护 + live 通道分级） |
+| 任务 0/1 审查修复 | `d6c8953` | fix(platform): admin 错误包装改 thunk、黑名单补 write_file/read_file、series.limit 收紧 |
+| 任务 0/1 审查修复 | `802dee2` | fix(platform): config env 覆盖修复（缺文件同样生效）、读错误分流、黑名单守卫 |
+| 任务 2 | `d21b365` | feat(platform): HTTP API + 静态托管 + healthz（零框架，token 可选） |
+| 任务 2 审查修复 | `5da8058` | fix(platform): 静态防护补分隔符边界；未构建 dist 404 分支覆盖 |
+| 任务 2 审查修复 | `e71254b` | fix(platform): 静态流错误兜底、超限 413 envelope、畸形编码 400 |
+| 任务 3 | `dde1d3d` | feat(platform): MCP streamable-http 端点（会话模式，与 HTTP 同 handler） |
+| 任务 4 | `1b11fa9` | feat(platform): 服务组装入口与进程级 MCP 冒烟 |
+| 任务 3/4 审查修复 | `6705fa1` | fix(platform): MCP 会话生命周期（陈旧会话拒建/惰性清扫/上限）、信号兜底、smoke 进程与定时器清理 |
+| 任务 5+6 | `3eea2ab` | test: WP6 审批回归矩阵（Node R1-R5 + Python P1-P3） |
+| 任务 7 | `c6be420` | feat(preset): WP6 preset 行替换（quant-platform-mcp 行 + persona/描述修订） |
+| 任务 8 | `cc63b52` | feat(web): WP6 前端脚手架（ProLayout 壳/数据层/11 页签骨架） |
+| 任务 9 | `8b3f098` | feat(web): 图表移植（几何纯函数带测试 + K线/折线/热力图）+ 数据层三处审查修复 |
+| 任务 9 审查修复 | `7e94743` | fix(web): 图表错导入修复与 bundle 校验固化；hooks 代际守卫；解析错误保留原因 |
+| 任务 10 | `a659a22` | feat(web): 页面批 1（行情/信号/组合/风险） |
+| 任务 11 | `4319184` | feat(web): 页面批 2（因子/执行/研究/事件）+ Markdown 渲染移植 + hook/format 收拢 |
+| 架构修订（第二次决策） | `68fbfab` | docs(specs): WP6 架构修订——FastAPI 单进程服务（用户第二次决策），计划补遗任务 A-E |
+| 补遗 A | `42af887` | feat(platform): FastAPI 服务依赖与 config 移植（锁定测试） |
+| 补遗 B | `187f750` | feat(platform): store 访问层 Python 移植（只读快照/模式切换/管理动作） |
+| 补遗 B | `796f14e` | feat(platform): trade_summary/audit 链 Python 移植（差分测试）与快照接线 |
+| **修复批次 1** | `708c329` | fix(platform): 移植分叉修复（失败信封判定/Number 语义/键序）+ JS 助手统一 _js.py |
+| 补遗 C | `e4362c7` | feat(platform): FastAPI app（envelope/白名单/静态/认证）与计算桥 |
+| **修复批次 2** | `92a74f5` | fix(platform): 信封兜底路由/413 分层/参数校验对齐 + 缓存两级与 audit 内层缓存 |
+| 补遗 D | `0ed37c2` | feat(platform): MCPServer 25 工具面（通道分级）与 /mcp 挂载 + 服务面审批回归 |
+| 补遗 E | `aaa5f42` | refactor(platform): 退役 Node 服务层，审批回归重排为 Node 策略链 + Python 服务面 |
+| 任务 12 | `ae2aa82` | feat(web): 页面批 3（计划窄门/调度 kill/审计三级链路） |
+| 任务 12 审查修复 | `9ffde7f` | fix: 计划端点最新在前（修陈旧计划执行口径）+ 调度首屏加载态 + 计划页刷新 + 审计展示一致性 |
+| **修复批次 3** | `044d0ce` | chore(platform): 收窄私有 API 改动面 + 记录 anyOf/PTC 退化 + /mcp 鉴权加固 + admin/schema 用例补齐 |
+| 任务 13 | （本记录所在提交） | docs: WP6 文档修订与全量验收记录（FastAPI 单进程服务） |
+
+### 2. 全量测试证据
+
+**(1) Python 全量离线套件**（提交前最终验证运行）
+
+```console
+$ ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'
+Ran 642 tests in 108.492s
+
+OK (skipped=1)
+```
+
+唯一的 skip 是 `tests/test_wp6_service.py::DefaultWiringSmokeTests::test_series_with_default_wiring_optional`
+（`@unittest.skipUnless(os.environ.get("DSH_WP6_SLOW") == "1", "慢用例（bars.py 真实取数可能 ~10s）")`，
+默认关闭以免全量套件依赖真实取数）。
+
+**(2) Node 策略链 + legacy 套件**
+
+```console
+$ node --test tests/*.test.mjs
+# tests 181
+# pass 181
+# fail 0
+# duration_ms 14397.608474
+```
+
+（184 → 181 是补遗 E 的预期变化：R3/R4/R5 三条服务面用例迁移到 Python 侧。）
+
+**(3) 前端单测**
+
+```console
+$ npm --prefix platform/web test
+# tests 184
+# pass 184
+# fail 0
+```
+
+**(4) 前端构建（含产物大小；提交前最终验证运行）**
+
+```console
+$ npm --prefix platform/web run build
+vite v6.4.3 building for production...
+✓ 3873 modules transformed.
+dist/index.html                    0.33 kB │ gzip:   0.26 kB
+dist/assets/index-BAtbIGwN.js  1,348.77 kB │ gzip: 426.74 kB
+✓ built in 1m 17s
+```
+
+**(5) 图表打包校验（lint:charts）**
+
+```console
+$ npm --prefix platform/web run lint:charts
+  node_modules/.cache/chart-check/kline.js    127.4kb
+  node_modules/.cache/chart-check/heatmap.js  123.3kb
+  node_modules/.cache/chart-check/line.js     123.2kb
+⚡ Done in 242ms
+```
+
+### 3. 关键验收对照（规格 §六）
+
+| 规格 §六 验收项 | 状态 | 证据 |
+|---|---|---|
+| 1 全量离线套件全绿 | ✅ | 上节三套：Python 642 / OK，Node 181/0，前端 184/0 |
+| 2 R1–R6 / P1–P3 / S1–S4 逐条对应提交留档 | ✅ | 本节各小节 + §4 对照表 |
+| 3 独立 Web 11 页签可用 + 文案规范 grep 0 | ✅ 自动部分 | 11 页签组件与数据层用例 184/0、构建通过；文案 grep 见下；**真实数据下的目视核对属人工步骤** |
+| 4 MCP tools/list = 25 且无黑名单工具 | ✅ | R5（16 用例）+ S1（2 用例，真实 uvicorn + mcp 客户端） |
+| 5 人工会话回归 5 步留痕 | ⏳ **待用户** | §5 留空位 |
+| 6 文档修订与实现一致 | ✅ | 本次提交（architecture/RUNBOOK/README/HANDOVER/P4/索引 + 计划末节）；路径与端点抽查见下 |
+| 7 live 准入人工项保持未勾选 | ✅ | P4 清单新增第 10 项，未勾选（§7） |
+
+**25 工具封闭（R5）**：`tests/test_wp6_service_approval.py` 的 `R5ToolSurfaceTests`（9 用例）
+断言注册面恰 25 且名单/顺序等于 `mcp_tools.TOOLS`；端点工具集（20）= 从 `endpoints.js`
+文本提取的 `store_access.endpoints()`；每个 inputSchema 的 `properties` 等于声明的字段集、
+`additionalProperties: false`、`required` 与必填项一致；`plan_execute.action` 是
+`["execute","cancel","kill","unkill"]` 枚举；黑名单（exec/shell/file_read/file_write/read_file/write_file/token）
+零命中且分段精确（`plan_execute` 不误伤）；未知工具不经 handle；handler 外异常 → `trading/tool-failed`
+（isError=true），业务失败 → isError=false。`R5AdminToolTests`（7 用例）另在真实 run store 上
+钉死 5 个维护工具的行为与 `hours` 阈值（专有断言见 `tests/test_wp6_service_approval.py:533-554`）。
+`S1` 用真实 `uvicorn` + `mcp` 客户端 over the wire 复核 tools/list = 25。
+
+**通道分级（R3 / S2，零触达证据摘要）**：
+
+- R3 `test_mcp_channel_refuses_live_regardless_of_passphrase`：对
+  `confirmation ∈ {None, "确认实盘", "错误口令"}` 三次调用 `switch_mode(mode="live")`，
+  三次均 `ok:false` + `trading/live-switch-web-only`；随后两条零触达断言
+  `handle_calls == []`（**未触达 handle**）、`store_api.calls == []`（**未触达 store 访问层**），
+  且 `~/.dsh/trading-account-mode` 未被创建（**模式文件零写入**）。
+- R3 `test_mcp_channel_live_refusal_never_touches_the_app_handle`：在真实 app 上再证一次，
+  `store_access.read_mode(home) == "sim"`、指令目录 `pending/` 为空。
+- S2 `test_s2_live_switch_is_refused_on_mcp_channel`：真实服务进程 + mcp 客户端，同样三档口令，
+  均 `isError=false`（业务失败不是协议错误）+ `trading/live-switch-web-only`，模式仍 sim、
+  模式文件不存在。
+- 规格 §3.2 ⚠ 的措辞已全仓统一为「只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝」，
+  `grep -rnE "仅限 (sim|live)→sim" .` 零命中（见 §6 偏差 8）。
+
+**同源（R6）**：`R6SameSourceTests`（5 用例）——25 个工具对象都 `is app.state.handle`；
+`snapshot` 的稳定字段（mode/version/endpoints/in_flight）HTTP 与 MCP 同值；同一 payload
+先 HTTP 再 MCP 命中**同一条 TTL 缓存**（`cached_at` 同值、`cached:false → true`）；
+`refresh: true` 经 MCP 绕过缓存；live 下 switch-mode 的业务失败信封两通道逐字段相等。
+
+**窄门（R4）**：`R4PlanExecuteTests`（6 用例）——live 无口令拒绝且**不写任何指令文件**；
+带口令 → `{queued:true, nonce}` 且口令字段**不落盘**；`execute/cancel/kill/unkill` 四映射到
+白名单指令；白名单外 action 在 schema 层与 handler 层双重拒绝；MCP 侧同样转发全部白名单动作。
+`P2`（`tests/test_core_wp6_approval.py`）另断言指令白名单恒 5 种、processed nonce 幂等，
+`P3` 断言口令字段不落指令目录。
+
+**kill 联动（P1）**：`tests/test_core_wp6_approval.py::test_p1_kill_file_blocks_execution_chain`
+—— `~/.dsh/trading-kill` 存在时 `execute_plan` 被风控规则 1 拒绝；`unkill`（删除文件）后恢复。
+
+**文案 grep 零命中**：
+
+```console
+$ grep -rn "设计稿\|示例数据\|宁可\|窄门\|规格\|token 说明" platform/web/src
+（无输出，exit 1）
+```
+
+口径说明见 §6 偏差 9（规格 §4.4 的裸 `token` 写法另有 2 处用户可见字符串，属白名单第 3 类）。
+
+**文档与实现一致性抽查**（规格 §六-6）：`platform/server/{app,run,config,store_access,mcp_tools}.py`
+存在；`platform/requirements.txt`、`platform/web/dist/index.html` 存在；
+`/healthz`、`/api/wb/<endpoint>`、`/mcp`、`platform/web/dist` 静态托管均按文档实测通过（§4）；
+`grep -rn "platform/server/.*\.mjs\|platform/tests/" platform tests` 仅剩计划任务 0–4 的历史命令文本。
+
+#### 审批回归矩阵：文件 ↔ 用例数 ↔ 本次结果
+
+| 用例 | 文件 | 用例数 | 本次结果 |
+|---|---|---|---|
+| R1–R2（Node 策略链 A1/A2） | `tests/wp6-approval-regression.test.mjs` | 2 | 2 pass / 0 fail |
+| R3（switch_mode 矩阵 + 通道分级） | `tests/test_wp6_service_approval.py::R3SwitchModeTests` | 8 | 见下合计 |
+| R4（plan_execute 窄门） | `tests/test_wp6_service_approval.py::R4PlanExecuteTests` | 6 | 见下合计 |
+| R5（工具面封闭 + 维护工具真实 store） | `tests/test_wp6_service_approval.py::R5ToolSurfaceTests` 9 + `R5AdminToolTests` 7 | 16 | 见下合计 |
+| R6（HTTP/MCP 同源） | `tests/test_wp6_service_approval.py::R6SameSourceTests` | 5 | 见下合计 |
+| **R3–R6 合计** | `tests/test_wp6_service_approval.py` | **35** | `Ran 35 tests … OK` |
+| P1–P3 | `tests/test_core_wp6_approval.py` | 3 | `Ran 3 tests … OK` |
+| S1–S4（协议层，真实进程） | `tests/test_wp6_mcp.py`（S1×2 / S2 / S3 / S4 / 失败语义 / token 守卫×2） | 8 | `Ran 8 tests … OK` |
+| 服务锁定（config/端口/工具面契约） | `tests/test_wp6_service_locks.py` | 4 | `Ran 4 tests … OK` |
+| 核心锁定（口令常量/白名单仍 5 种） | `tests/test_core_wp6_locks.py` | 3 | `Ran 3 tests … OK` |
+| 表锁定（TTL/端点/shape/脚本映射） | `tests/test_wp6_tables_lock.py` | 10 | `Ran 10 tests … OK` |
+
+（另有服务面端到端 `tests/test_wp6_service.py` 97 用例、store 访问层
+`tests/test_wp6_store_access.py` 40 用例、移植差分 `tests/test_wp6_summary_audit.py` 69 用例，
+全部 OK，计入 §2 的 642。）
+
+### 4. 真实进程冒烟（FastAPI 单进程，2026-09-16 重跑）
+
+```console
+$ cd platform && DSH_HOME=<临时目录> TRADING_SERVICE_PORT=0 ~/.dsh/trading-venv/bin/python -m server.run
+{"ok": true, "service": "quant-platform", "url": "http://127.0.0.1:35891", "mcp": "http://127.0.0.1:35891/mcp", "tools": 25, "auth": "loopback-only"}
+
+$ curl -s -w ' [%{http_code}]' http://127.0.0.1:35891/healthz
+{"ok":true,"mode":"sim"} [200]
+
+$ curl -s -X POST http://127.0.0.1:35891/api/wb/snapshot -H 'content-type: application/json' -d '{}'
+{"ok":true,"value":{"version":1,"mode":"sim","generated_at":"2026-09-15T17:07:56.512Z","runs":[],"reports":[],
+"previews":[],"activity":[],"trade_summary":{"orders":[],"actions":[],"queries":{"count":0,"tools":[]},
+"counts":{"responses":0,"order_responses":0,"orders":0,"actions":0,"errors":0},"notice":"交易概要由 Harness 观察到的
+富途工具响应归纳而来……"},"broker":null,"in_flight":0,"pending_observations":0,"recording_error":null,
+"notice":"交易动态来自 Harness 最近的富途工具响应……","endpoints":["snapshot","switch-mode","series","equity",
+"positions","correlation","sensitivity","risk","trades","events","factors","ic","audit","sources","instrument",
+"quality","plan","plan-execute","schedule","reconcile"]}}
+
+$ curl -s -D - -o /dev/null http://127.0.0.1:35891/
+HTTP/1.1 200 OK
+content-type: text/html; charset=utf-8
+content-length: 329
+
+$ curl -s http://127.0.0.1:35891/ | grep -o '<title>[^<]*</title>'
+<title>量化工作台</title>
+
+$ curl -s -X POST http://127.0.0.1:35891/api/wb/not-an-endpoint -H 'content-type: application/json' -d '{}' \
+    -w ' [%{http_code}]'
+{"ok":false,"error":{"code":"trading/unknown-endpoint","message":"未知端点 not-an-endpoint","details":{}}} [404]
+```
+
+另核：`snapshot.value.endpoints` 恰 20 项；就绪行 `tools: 25`；
+`curl -I /`（HEAD）返回 405「仅 GET」信封——静态路径只认 GET，属有意行为（已写入 RUNBOOK）。
+
+### 5. 人工会话回归（规格 §5.3，5 步）——**待用户在真实 Harness 会话执行**
+
+> 本 worktree 无法起真实 Harness 会话（preset 行与 MCP 客户端需在用户环境的 dsh web 内生效），
+> 故以下 5 步**未执行**，证据位留空。任何一步失败 → 按规格 §5.5 回滚 `agent.cordis.yml`
+> 的 `quant-platform-mcp` 行为 `disabled: true` 并修复重跑。
+
+| # | 步骤（规格 §5.3） | 结果 | 证据 |
+|---|---|---|---|
+| 1 | 新建 Harness 会话，`mcp__quantwb__*` 25 工具出现在 tools 列表 | 待执行 | |
+| 2 | sim 下调 `switch_mode(live, expected=sim)`（带/不带口令各一次）→ 一律拒绝 `trading/live-switch-web-only`，模式不变 | 待执行 | |
+| 3 | 独立 Web 切 live：输入口令「确认实盘」→ 页头 LIVE 徽章；`quant_switch` 仍拒 live | 待执行 | |
+| 4 | live 下对话请求一个 `mcp__futu__trading_*` 工具 → 出现 Harness 原生审批卡（确认/拒绝各一次） | 待执行 | |
+| 5 | 独立 Web 计划页 live 执行：无口令拒；带口令 → queued；`scripts/drills.sh` kill 演练联动拒单 | 待执行 | |
+
+（步骤 1/2 的**自动等价物**已由 S1/S2 在真实 uvicorn + mcp 客户端上通过：tools/list=25、
+live 一律拒且模式文件不落地；步骤 4 的审批链由 R1/R2 在假 ctx 上驱动 `policy.js` 通过。
+但「真实 Harness 会话 + preset 行 + 原生审批卡 UI」只能由用户在场确认，不能由自动用例代替。）
+
+### 6. 执行偏差与已知限制
+
+1. **入口命令偏差（计划 → 实现）**：计划字面入口 `python -m platform.server.run` **在本环境不可能工作**——
+   标准库 `platform` 是模块（非包），`-m` 解析到标准库即失败。落地为
+   `cd platform && python -m server.run` 或 `python platform/server/run.py`（两者加载同一份 `server` 包）。
+   `run.py` 在解释器不是 `$DSH_HOME/trading-venv/bin/python` 时向 stderr 打一行告警 JSON（不硬失败，
+   否则集成测试的替身注入会被挡住）；用系统 Python 起服务会让所有子进程改用系统解释器。
+2. **admin `hours` 语义锚点**：规格 §3.4 锚在 `scripts/workbench_admin.mjs` 的 `hoursArg()`
+   （`<=0`/非法 → 默认 2h；`0.5` → 0.5h），而非 Node manifest 的 `hoursToMs`
+   （`Math.max(1, hours ?? 2)`，`<=0` 给 1h）；以 `store_access._hours_to_ms` 为准，
+   `R5AdminToolTests` 7 用例逐条钉死（`0.5h` 接受、非法退回 2h）。
+3. **`anyOf` / PTC 退化（补遗 D 审查实测，已在 `platform/server/mcp_tools.py` 文件头登记）**：
+   可选字段注解为 `base | None`，inputSchema 因此带 `anyOf`；dsh-tools 的 schema 子集不含 `anyOf`，
+   25 个工具里 **22 个**（含可选字段者）在 **PTC / run_code 模式**下入参类型静默退化为 `Any`。
+   **native 模式不受影响**（注册通过、schema 原样透传、调用正常；S1/R5 的 schema 断言即证据）。
+   根治需去掉 `| None`（只动 `Param.annotation()` 一处），会改变显式 null 的处理位置，
+   需重核 25 个工具的载荷语义；本次只披露不改。
+4. **Python 快照不合并 pending observations（诚实边界，规格 §八-7）**：服务侧 `snapshot()` 只读
+   `trading-workbench.json`，**不**调用 `flushObservations()`；`trading-observations/` 的暂存观察
+   不被合并，`pending_observations` 如实照抄文件数，合并仍由 Harness 进程内的 Node Host 完成。
+   因此合并前的账户响应不会出现在独立 Web 快照里。
+5. **`in_flight` 恒 0**：服务进程不派发券商调用（规格补遗 B「in_flight(空)」）；
+   但安全护栏不受影响——`switch_mode()` 仍按 `trading-call-*.active` 租约文件命名做在途检查并据此拒切。
+6. **双实现并存（长期风险）**：Harness 进程内的 Node Host（观察合并/面板写路径）与服务进程内的
+   Python 访问层（快照读/模式切换/管理动作）操作同一份 store，靠原子写 + 独占锁互斥；
+   legacy 面板移除后 Node 侧写路径只剩观察记录，届时收敛为单一实现。`trade_summary`/`audit` 链
+   是 Node 原实现的 Python 移植版，等价性由 `tests/test_wp6_summary_audit.py`（69 用例，含与 Node
+   实现的差分比对）钉死。
+7. **`npm audit` 3 high 的处置结论**：`platform/web` 报 3 个 high，全部来自
+   `path-to-regexp@8.0.0-8.3.0`（经 `@ant-design/pro-layout` ← `@ant-design/pro-components` 传递依赖，
+   DoS/ReDoS 类 GHSA-j3q9-mxjg-w52f、GHSA-27v5-c462-wpq7）；`npm audit fix --force` 会把
+   `@ant-design/pro-components` 降到 2.7.17（**breaking change**），与规格 §3.7 的 ^2.8.10 锁定冲突。
+   处置：**不强制降级**，维持锁定版本并在本文留档；影响面是本地单操作者 loopback 服务、
+   前端路由不来自不可信输入，风险可接受；待上游 pro-components 升级 path-to-regexp 后随常规依赖更新处理。
+8. **措辞统一**：`switch_mode` 全仓统一为「**只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝**」
+   （规格 §3.2 ⚠ 注 + §5.1 A3 行 + §八-2、`platform/server/mcp_tools.py` 工具描述与参数描述、
+   计划任务 1/7 与任务 13 行、`agent.cordis.yml` 注释）；
+   `grep -rnE "仅限 (sim|live)→sim" .` 与 `grep -rnE "(sim|live)→sim" .` 均零命中。
+   同时清理了 Python 源码里指向**已删 Node 服务源**的行号溯源注释（`platform/server/{app,run,mcp_tools,store_access,config}.py`
+   + `tests/test_wp6_service.py`，共 56 处替换），统一改为「Node 原实现（已退役，见 git 历史 `aaa5f42^`）」
+   并保留语义说明；仍存在的 `scripts/workbench_admin.mjs` 去掉行号保留文件名/符号；
+   `tests/test_wp6_summary_audit.py` 中指向现存 Node 夹具的 `.mjs:` 引用（`audit.test.mjs`/`broker-trades.test.mjs`）保留不动。
+9. **文案 grep 口径差异（记偏差）**：验收用计划任务 12 的口径
+   `grep -rn "设计稿\|示例数据\|宁可\|窄门\|规格\|token 说明" platform/web/src` → **0 命中**；
+   但规格 §4.4 写作裸 `token`，按该口径另有 2 处用户可见字符串
+   （`app.jsx` 令牌输入占位符、`services/api.js` 401 提示「填入服务配置的 token」）与若干内部标识符
+   （`markdown-core.js` 分词变量、`localStorage` 键 `trading_token`）。2 处字符串属白名单第 3 类
+   「安全与合规必需（token 输入）」；若要严格满足裸 `token` 口径，需把这 2 处改成「访问令牌」并重建前端，
+   留待后续提交决定。
+10. **前端两处审查修复已并入**：`7e94743`（图表错导入/bundle 校验/hooks 代际守卫）、
+    `9ffde7f`（计划端点最新在前、调度首屏加载态、计划页刷新、审计展示一致性）——均为审查后修复，
+    不是新增范围；页签数与规格 §3.3 的 11 个一致。
+11. **计划任务 13 步骤 7 的历史命令**：其中 `node --test platform/tests/*.test.mjs` 与
+    `grep … platform/server/*.mjs` 已随补遗 E（`aaa5f42`）失效（Node 服务层删除），
+    现行命令见补遗任务 E 与本节 §2。
+12. **本记录未覆盖的部分**：人工会话回归（§5）与 live 准入（§7）未完成前，WP6 验收**未**判定通过；
+    真实数据（富途 token/账户）下的 11 页签目视核对同样待用户在场执行。
+
+### 7. live 准入
+
+`docs/P4-live-trading.md`「实盘前必须满足」的 9 项人工评估条件与本次新增第 10 项
+（「独立 Web + MCP 入口审批回归（§5.3 人工清单 5 步）通过」）
+**全部保持未勾选**；WP6 交付的是服务形态与审批回归的自动证据，不升级任何实盘能力。
 
 ## 执行说明（面向调度者）
 
@@ -1929,3 +2229,10 @@ A → B → C → D → E 严格串行（同 worktree）；任务 12（页面批
 > Python 服务源中仍有指向已删 Node 源的溯源注释（`app.py`/`run.py`/`mcp_tools.py`/
 > `store_access.py`/`config.py` 的 ``xxx.mjs`` 行号引用），属遗留溯源引用，建议在任务 13
 > 文档修订时一并改写为「Node 原实现（已退役）」的语义描述。
+
+> **任务 13 已处理（2026-09-16）**：上述 ``xxx.mjs`` 行号引用已全部改写为
+> 「Node 原实现（已退役，见 git 历史 `aaa5f42^`）」的语义描述（保留原有语义说明，共 56 处替换，
+> 覆盖 `platform/server/{app,run,mcp_tools,store_access,config}.py` + `tests/test_wp6_service.py`）；
+> 仍存在的活文件引用（`scripts/workbench_admin.mjs`）保留文件名与符号、去掉易腐的行号；
+> `tests/test_wp6_summary_audit.py` 中指向现存 Node 夹具（`audit.test.mjs`/`broker-trades.test.mjs`）
+> 的引用保持不动。`switch_mode` 措辞亦已全仓统一（见本文件末节验收记录 §6-8）。

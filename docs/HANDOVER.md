@@ -9,7 +9,9 @@
 本项目是 **DeepSeek Harness 的新对话模式 + 原生插件**：
 
 - Harness 负责全部 AI 对话、投研/量化指令、交易指令和逐笔人工确认。
-- 工作台嵌在 Harness 中，展示研报、最近交易响应、量化预览，并提供 sim/live 切换。
+- 工作台自 WP6 起是**独立 Web**（`platform/` FastAPI 单进程托管，默认
+  `http://127.0.0.1:8397`），Harness 内 legacy 面板过渡期并存；两种形态都只展示研报、
+  最近交易响应、量化预览，并提供 sim/live 切换。
 - 不另建聊天入口，不在工作台提供下单、撤单或任意工具执行接口。
 - 模式切换不授权交易；本地模拟台账不代表富途模拟账户或真实账户。
 
@@ -24,6 +26,7 @@
 | 研究引擎 | 不再私建无取数能力的 LLM 循环；`run_trading_analysis` 启动记录，Harness 完成研究，`research_publish` 发布 |
 | 发布约束 | 校验 run、会话、标的、当前模式、五档评级、报告与带时间的来源；不猜测评级 |
 | 工作台 Host | 根级 `tradingWorkbench` 服务，持久报告/预览/响应；认证后的 Harness Connection RPC |
+| 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，20 端点）+ `/mcp`（streamable-http，25 工具）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
 | 工作台 Client | 正确的 Host/Client 双入口、宿主 React module factory；结果卡片与面板，不需重建 Harness Web |
 | 交易动态 | 观察原生账户工具最终响应；打开面板时每 3 秒刷新快照；不伪装券商成交推送 |
 | 模式切换 | 用户在面板明确确认 live，携带预期旧模式；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |
@@ -47,6 +50,12 @@ fin-data/engine 只在 preset 中启用。安装器保留内容寻址的 tarball
   Connection RPC、客户端 `./client` 和 `window.__ModuleLoader__.load`。
 - 数据根目录：`DSH_HOME`，默认 `~/.dsh`；前后端不传输 OAuth token。
 - 模式文件持久化，**重启不会自动回到模拟盘**。
+- 独立工作台服务（WP6）依赖装在 `~/.dsh/trading-venv`：`fastapi` / `uvicorn` / `mcp` /
+  `httpx`（`platform/requirements.txt` 锁定，`pip install -r platform/requirements.txt`）；
+  前端为构建产物 `platform/web/dist`（`npm --prefix platform/web install && npm --prefix platform/web run build`）。
+- 服务启动：`cd platform && ~/.dsh/trading-venv/bin/python -m server.run`
+  （或 `python platform/server/run.py`）。**不能**在仓库根执行
+  `python -m platform.server.run`——标准库 `platform` 遮蔽同名包。
 - `plugins/trading-agents` 为未启用旧脚手架；当前工具实现位于 `plugins/engine`。
 
 ## 四、验证分层
@@ -181,3 +190,18 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   失联（工作台标红）；`critical: true` 是告警常驻红点标志位，处置后随恢复流程清除。
 - **不自动清除未知在途租约/订单**：执行中断留下的 `unknown` 订单与调用租约，
   一律先查券商核对真实状态，再按 RUNBOOK 场景 2/3 迁移状态机或清 halt；禁止重放。
+- **双进程数据约定（WP6）**：独立服务进程与 Harness 进程共享同一份
+  `<DSH_HOME>/trading-workbench.json`、模式文件 `trading-account-mode` 与指令目录
+  `trading-commands/`；写路径靠既有**原子写 + 独占锁**互斥，两处同时切换模式的竞态由
+  `expected_mode` 复核兜底（后到者拒绝）。排查数据不一致时先确认没有两个进程同时在写。
+- **Python 侧快照的诚实边界（WP6）**：服务进程的 store 访问层只读
+  `trading-workbench.json`，**不合并** pending observations（合并仍由 Harness Host 完成），
+  因此合并前的账户响应不会出现在独立 Web 快照里；`trade_summary`/`audit` 链是 Node
+  原实现的 Python 移植版，等价性由差分测试钉死（见 `tests/test_wp6_summary_audit.py`）。
+- **legacy 面板过渡期并存（WP6）**：`plugins/workbench` 的 Host 行与面板**必须保留**
+  （`tradingWorkbench` 服务是 engine 账户策略的进程内锚）；面板本身在独立 Web 验收后
+  **另行提交**移除，不在 WP6 范围内。
+- **服务依赖与启动（WP6）**：依赖 `platform/requirements.txt`（FastAPI/uvicorn/mcp/httpx，
+  装在 `~/.dsh/trading-venv`）；启动 `cd platform && ~/.dsh/trading-venv/bin/python -m server.run`；
+  未构建 `platform/web/dist` 时 `GET /` 404，取数类工具全报 `trading/*-unavailable`
+  多为服务未用 venv 解释器启动。

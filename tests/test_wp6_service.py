@@ -183,7 +183,7 @@ class ContractTests(Base):
     def test_non_post_and_multi_segment_paths_use_envelope(self):
         """P1-1 实测矩阵：绝不能再落到 Starlette 的 ``{"detail": "Method Not Allowed"}``。
 
-        service.mjs:54-83 的判定顺序是「先方法、后格式」：``/api/wb/*`` 下非 POST 一律 405；
+        Node 原实现（已退役）的判定顺序是「先方法、后格式」：``/api/wb/*`` 下非 POST 一律 405；
         POST 但路径不是单个 ``[a-z-]+`` 段（含 ``/``、尾斜杠、空段）→ 404 unknown-endpoint；
         其余路径非 GET → 405「仅 GET」。
         """
@@ -203,7 +203,7 @@ class ContractTests(Base):
         self.assertEqual(response.status_code, 405)
         self.assertEqual(response.json()["error"]["message"], "仅 GET")
         self.assertEqual(response.json()["error"]["code"], "trading/method-not-allowed")
-        # 非 POST 的多段路径在 service.mjs 里同样是 405（方法先于路径格式判定）
+        # 非 POST 的多段路径在原实现里同样是 405（方法先于路径格式判定）
         self.assertEqual(client.put("/api/wb/a/b").status_code, 405)
 
     def test_body_limit_only_applies_inside_wb_whitelist(self):
@@ -293,7 +293,7 @@ class ContractTests(Base):
                 self.assertEqual(response.json()["jsonrpc"], "2.0")
 
     def test_unexpected_error_is_500_envelope(self):
-        """500 兜底（service.mjs:84-87）：未预期异常也必须回 trading/internal 信封。
+        """500 兜底（Node 原实现已退役）：未预期异常也必须回 trading/internal 信封。
 
         触发方式：数据文件损坏时 ``read_store`` 抛 JSONDecodeError（不是 WorkbenchError，
         与 Node 侧 ``JSON.parse`` 抛 SyntaxError 同位置），因此它穿透 handle 到框架兜底，
@@ -741,7 +741,7 @@ class StaticTests(Base):
         self.assertEqual(status, 403, raw[:200])
         self.assertNotIn("top-secret", raw)
         self.assertNotIn("secret.txt", raw)
-        # 顺带验证就绪行（start.mjs:26-34 的单行 JSON）与真实端口
+        # 顺带验证就绪行（Node 原实现已退役的单行 JSON）与真实端口
         self.assertTrue(ready)
         line = json.loads(ready[-1])
         self.assertEqual(line, {"ok": True, "service": "quant-platform",

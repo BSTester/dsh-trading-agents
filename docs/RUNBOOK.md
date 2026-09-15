@@ -20,6 +20,88 @@
 | 数据依赖核验 | `scripts/verify-data-deps.py` | 约定：富途侧发版异常（internal error 面扩大）时**先跑本脚本**定位漂移面 |
 | kill 演练 | `scripts/drills.sh` | 建 kill → 断言风控拒单 → 清除，输出 JSON，无残留 |
 
+## 平台服务（FastAPI 单进程，WP6）
+
+工作台独立服务：**一个进程**承载 HTTP API（`POST /api/wb/<endpoint>`）、MCP
+（`/mcp`，streamable-http，25 工具，Harness 侧工具名 `mcp__quantwb__*`）与前端静态托管
+（`platform/web/dist`）。默认 `127.0.0.1:8397`，loopback 绑定，可选静态 token。
+
+### 依赖安装（一次性，需联网）
+
+```bash
+~/.dsh/trading-venv/bin/pip install -r platform/requirements.txt   # fastapi/uvicorn/mcp/httpx
+```
+
+前端构建产物由服务托管，改动前端后必须重新构建：
+
+```bash
+npm --prefix platform/web install
+npm --prefix platform/web run build     # 输出 platform/web/dist
+```
+
+### 启动
+
+```bash
+cd platform && ~/.dsh/trading-venv/bin/python -m server.run
+# 或：~/.dsh/trading-venv/bin/python platform/server/run.py
+```
+
+- **不能用 `python -m platform.server.run`**：标准库 `platform` 模块遮蔽同名包，
+  `-m` 会解析到标准库而失败（`ModuleNotFoundError: 'platform' is not a package`）。
+- 服务应在 `~/.dsh/trading-venv` 内启动：`compute.PYTHON` 取 `sys.executable`，
+  用系统 Python 启动会让分析/核心子进程改用系统解释器；`run.py` 在解释器与 venv
+  不一致时向 stderr 打一行告警 JSON（不硬失败）。
+- 启动成功打印**单行 JSON**：`{"ok": true, "service": "quant-platform", "url": ...,
+  "mcp": ".../mcp", "tools": 25, "auth": "loopback-only"}`。
+
+### 配置
+
+`~/.dsh/trading-platform.json`（文件缺失或字段缺省即取默认；`DSH_HOME` 可换根目录）：
+
+```json
+{ "service": { "port": 8397, "host": "127.0.0.1", "token": null } }
+```
+
+`TRADING_SERVICE_PORT` 环境变量最后覆盖端口（`0` = 由内核分配临时端口，供测试用）；
+`token` 非空时 `/api/*` 与 `/mcp` 均要求 `Authorization: Bearer <token>`，
+`/healthz` 与静态前端豁免。
+
+### 健康检查与冒烟
+
+```bash
+curl -s http://127.0.0.1:8397/healthz            # {"ok":true,"mode":"sim"}
+curl -s -X POST http://127.0.0.1:8397/api/wb/snapshot \
+  -H 'content-type: application/json' -d '{}'    # envelope：{"ok":true,"value":{...}}
+curl -s -D - -o /dev/null http://127.0.0.1:8397/  # 200 + text/html; charset=utf-8（dist/index.html）
+~/.dsh/trading-venv/bin/python -B -m unittest tests.test_wp6_mcp -v   # MCP 协议冒烟 S1–S4
+```
+
+（静态路径只认 GET：`curl -I` 发的是 HEAD，会得到 405「仅 GET」信封——这是有意行为，不是故障。）
+
+排障要点：`/healthz` 不通 → 看进程是否在、端口是否被占（`ss -ltnp | grep 8397`）；
+`GET /` 404 → `platform/web/dist` 未构建；Harness 里看不到 `mcp__quantwb__*` →
+确认 preset 的 `quant-platform-mcp` 行已启用、服务已起、新会话已新建
+（`failOnStartupError: false`，服务未起时安静降级）；取数类工具全报
+`trading/*-unavailable` → 多因服务不是用 venv 解释器启动。
+
+### systemd unit 样例
+
+```ini
+# ~/.config/systemd/user/quant-platform.service
+# 路径按实际安装位置替换（preset 安装在 ~/.dsh/.agent-presets/dsh-trading-agents/platform）。
+[Unit]
+Description=quant platform service (workbench HTTP API + MCP + web)
+[Service]
+WorkingDirectory=%h/dsh-trading-agents/platform
+ExecStart=%h/.dsh/trading-venv/bin/python -m server.run
+Restart=on-failure
+[Install]
+WantedBy=default.target
+```
+
+`WorkingDirectory` 必须指向 `platform/`（对应 `python -m server.run`）；
+`ExecStart` 用 venv 内的 python 绝对路径。
+
 ## 场景 1：daemon 崩溃（kill -9）→ systemd 重启 → 心跳恢复 → 指令去重
 
 **症状：** daemon 进程消失/无响应；心跳文件 `heartbeat` 停止刷新（> 5 分钟工作台标红）。

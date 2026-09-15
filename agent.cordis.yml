@@ -163,7 +163,7 @@
 # ── 量化平台独立服务（WP6：MCP 工具面 = 工作台全功能，规格见
 #    docs/superpowers/specs/2026-09-15-wp6-standalone-service.md） ─────────────
 # 需先启动服务：cd platform && python -m server.run（或 python platform/server/run.py；服务须在 ~/.dsh/trading-venv 内启动）（未启动时本行安静降级）。
-# 通道分级：quantwb 的 switch_mode 仅限 live→sim；实盘切换只能在独立 Web 由用户输入口令。
+# 通道分级：quantwb 的 switch_mode 只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝；实盘切换只能在独立 Web 由用户输入口令。
 
 - id: quant-platform-mcp
   name: '@deepseek-ai/dsh-mcp-client'

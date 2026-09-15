@@ -6,13 +6,13 @@
     audit 的 trades 兜底（rpc.js:132-145）、plan/schedule/reconcile（rpc.js:172-182）、
     plan-execute 的动作映射与校验顺序（rpc.js:183-210）、series（rpc.js:211-224）、
     未知端点与 WorkbenchError → ``trading/invalid-operation`` 信封（rpc.js:225-228）；
-  * ``platform/server/service.mjs:42-88`` —— 路由顺序、白名单 404 先于 handle、
+  * Node 原实现（已退役，见 git 历史 ``aaa5f42^``）—— 路由顺序、白名单 404 先于 handle、
     content-type 415、1MB 413、坏 JSON 400、静态托管与 SPA 兜底、500 兜底信封；
-  * ``platform/server/util.mjs`` —— sendJson / authorized / unauthorized 的等价物；
+  * Node 服务层原实现（已退役，见 git 历史 ``aaa5f42^``）—— sendJson / authorized / unauthorized 的等价物；
   * ``plugins/workbench/src/analytics.js`` —— 逐端点参数构造（在 ``server.compute``）。
 
 与 Node 侧的有意差异（均为「规格更严」而非语义变更）：
-  1. ``auth`` 在中间件里统一判定（service.mjs 在每个分支里散着判），但判定条件与豁免面
+  1. ``auth`` 在中间件里统一判定（Node 服务层原实现逐分支散判），但判定条件与豁免面
      完全一致：token 非空时 ``/api/*`` 与 ``/mcp``（含 ``/mcp/...`` 任何子路径）需
      ``Authorization: Bearer <token>``。``/mcp`` 用「等值或前缀」判定而不是等值：SDK 将来若在
      ``/mcp`` 下加子路径，前缀判定保证新路径仍在鉴权分支内，不出现未鉴权旁路。
@@ -23,17 +23,17 @@
      不变式由框架保证而不是约定；handle 内部对未知端点仍抛同样的 WorkbenchError。
   4. 阻塞取数（子进程/文件）经 ``asyncio.to_thread`` 让出事件循环——响应内容不变，
      只是不再阻塞其他请求。
-  5. 405 的 ``detail`` 用 service.mjs 的错误码 ``trading/method-not-allowed``。
+  5. 405 的 ``detail`` 用 Node 原实现的错误码 ``trading/method-not-allowed``。
   6. 静态路径拼接用 ``lstrip('/')``（见 ``_serve_static_sync`` 的说明）。
-  7. 非 POST/非 GET 的兜底路由显式把**所有**方法收进信封（service.mjs:57/83）：
+  7. 非 POST/非 GET 的兜底路由显式把**所有**方法收进信封（Node 原实现已退役）：
      ``/api/wb/*`` 下非 POST → 405「仅 POST」，多段/含斜杠路径 → 404 unknown-endpoint，
      其余路径非 GET → 405「仅 GET」。否则会落到 Starlette 的 ``{"detail": "Method Not
      Allowed"}``，前端 ``response.json()`` 就拿不到统一信封。
   8. 体上限（413）只在 ``/api/wb/*`` 分支内判、且在白名单与 content-type 之后
-     （service.mjs:60-75 的顺序），不再对静态与白名单外请求生效；读取时按块计数
+     （沿用 Node 原实现已退役的顺序），不再对静态与白名单外请求生效；读取时按块计数
      （``request.stream()``），超限立刻 413，不先整读。
   9. 静态响应用显式 ``Content-Type`` 头而不是 ``media_type=``：Starlette 会给 ``text/*``
-     追加 ``; charset=utf-8``，而 service.mjs:10-14 的表里只有 ``.html`` 带 charset。
+     追加 ``; charset=utf-8``，而已退役 Node 原实现的表里只有 ``.html`` 带 charset。
 """
 import asyncio
 import contextlib
@@ -53,9 +53,9 @@ from server.store_access import WorkbenchError
 
 Body = dict  # 文档用途：handle 的载荷一律是普通 dict
 
-# service.mjs:10-14 的 MIME 表：**只认这张手写表**，未收录扩展名回落 octet-stream。
+# 已退役 Node 原实现的 MIME 表：**只认这张手写表**，未收录扩展名回落 octet-stream。
 # 刻意不用 ``mimetypes.guess_type``：它会读 /etc/mime.types 等主机文件，同一份代码在不同
-# 机器上给出不同 Content-Type（且会给 text/* 追加 charset），与 service.mjs 不可比。
+# 机器上给出不同 Content-Type（且会给 text/* 追加 charset），与已退役 Node 原实现不可比。
 MIME = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript",
@@ -68,10 +68,10 @@ MIME = {
     ".map": "application/json",
 }
 
-MAX_PAYLOAD = 1024 * 1024  # util.mjs:2 collectBody 默认上限
+MAX_PAYLOAD = 1024 * 1024  # 与 Node 原实现（已退役）collectBody 默认上限一致
 DEFAULT_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
 
-# 兜底路由的方法面：service.mjs 对每个路径段都只按「是不是 POST/GET」分派，
+# 兜底路由的方法面：Node 原实现（已退役）对每个路径段都只按「是不是 POST/GET」分派，
 # 其余方法一律落统一信封，因此这里收全 HTTP 方法，绝不再落到 Starlette 的默认 405。
 ALL_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD")
 NON_GET_METHODS = ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD")
@@ -261,7 +261,7 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
 
 
 def create_app(home=None, dist=None, config=None, analytics=None, series=None, core=None):
-    """组装 FastAPI 应用（``platform/server/start.mjs`` 的组装顺序：一份 handle 共享）。"""
+    """组装 FastAPI 应用（沿用 Node 原实现已退役的组装顺序：一份 handle 共享）。"""
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
     home = str(home)
@@ -301,7 +301,7 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
     @app.exception_handler(Exception)
     async def unhandled(_request, error):
-        """500 兜底（service.mjs:84-87）：任何未预期异常都回 ``trading/internal`` 信封。
+        """500 兜底（Node 原实现已退役）：任何未预期异常都回 ``trading/internal`` 信封。
 
         Starlette 默认的回退是 ``PlainTextResponse("Internal Server Error")``，那会让
         前端 ``response.json()`` 解析失败并显示解析器原始错误；这里显式接管成同形信封。
@@ -312,13 +312,13 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         token = config.get("token")
         if not token:
             return True
-        return authorization == f"Bearer {token}"  # util.mjs:31-33 authorized
+        return authorization == f"Bearer {token}"  # Node 原实现（已退役）的 authorized
 
     @app.middleware("http")
     async def guard(request, call_next):
-        """认证（service.mjs:47-56 的认证顺序：healthz 豁免 → /mcp 与 /api/* 需 token）。
+        """认证（Node 原实现的认证顺序：healthz 豁免 → /mcp 与 /api/* 需 token）。
 
-        体上限刻意不在这里判：service.mjs 的 413 只在 ``/api/wb/*`` 分支内、且在白名单与
+        体上限刻意不在这里判：Node 原实现的 413 只在 ``/api/wb/*`` 分支内、且在白名单与
         content-type 之后生效（否则白名单外请求会先撞 413，静态请求也会被请求头误伤）。
         """
         route = request.url.path
@@ -326,18 +326,18 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         # ``/mcp/<sub>`` 子路径，纯等值判定会让那些请求绕过鉴权直接落到路由层。
         protected = route.startswith("/api/") or route == "/mcp" or route.startswith("/mcp/")
         if protected and not check_auth(request.headers.get("authorization")):
-            # util.mjs:27-29：token 缺失/不匹配 → 401 trading/unauthorized
+            # Node 原实现（已退役）：token 缺失/不匹配 → 401 trading/unauthorized
             return error_envelope("trading/unauthorized", "需要 Bearer token", 401)
         return await call_next(request)
 
     @app.api_route("/healthz", methods=list(ALL_METHODS))
     async def healthz():
-        """service.mjs:47-49：豁免认证的存活探针（Node 侧不判方法，任何方法同响应）。"""
+        """Node 原实现（已退役）：豁免认证的存活探针（不判方法，任何方法同响应）。"""
         return {"ok": True, "mode": read_mode(home)}
 
     @app.post("/api/wb/{endpoint}")
     async def workbench(endpoint: str, request: Request):
-        """``service.mjs:54-81``：白名单 → content-type → 体上限 → JSON → handle。"""
+        """Node 原实现（已退役）：白名单 → content-type → 体上限 → JSON → handle。"""
         if endpoint not in endpoints:
             # 白名单 404 先于 handle（规格 §5.1 A7 封闭性）
             return error_envelope("trading/unknown-endpoint", f"未知端点 {endpoint}", 404)
@@ -346,7 +346,7 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
             return error_envelope("trading/invalid-operation", "Expected application/json", 415)
         declared = request.headers.get("content-length")
         if declared and declared.isdigit() and int(declared) > MAX_PAYLOAD:
-            # 快路径：声明就超限时不必读体（util.mjs collectBody 同样先看 content-length）
+            # 快路径：声明就超限时不必读体（Node 原实现 collectBody 同样先看 content-length）
             return error_envelope("trading/payload-too-large", "请求体超过 1MB 上限", 413)
         body = bytearray()
         # Q-3：按块计数，超限立即返回，不先把整个体读进内存
@@ -368,12 +368,12 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
     @app.api_route("/api/wb/{rest:path}", methods=list(ALL_METHODS))
     async def workbench_fallback(rest: str, request: Request):
-        """``service.mjs:54-63`` 的兜底：方法错误 → 405；多段/含斜杠路径 → 404。
+        """Node 原实现（已退役）的兜底：方法错误 → 405；多段/含斜杠路径 → 404。
 
         单段的合法 POST 由上一条路由吃掉，这里只接单段以外的形态：
-          * 非 POST → 405「仅 POST」（service.mjs:56-58 先判方法再判白名单）；
+          * 非 POST → 405「仅 POST」（Node 原实现先判方法再判白名单）；
           * POST 但 ``rest`` 含 ``/``（``a/b``、``snapshot/``、空串）→ 404 unknown-endpoint
-            （service.mjs:60 的 ``^[a-z-]+$`` 判定）。
+            （Node 原实现的 ``^[a-z-]+$`` 判定）。
         """
         if request.method != "POST":
             return error_envelope("trading/method-not-allowed", "仅 POST", 405)
@@ -390,12 +390,12 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
     @app.get("/{path:path}")
     async def static_files(path: str):
-        """``service.mjs:82``：GET 走静态托管 + SPA 兜底。"""
+        """Node 原实现（已退役）：GET 走静态托管 + SPA 兜底。"""
         return await _serve_static(root, path)
 
     @app.api_route("/{path:path}", methods=list(NON_GET_METHODS))
     async def non_get_fallback():
-        """``service.mjs:83``：静态路径的非 GET 一律 405「仅 GET」信封。"""
+        """Node 原实现（已退役）：静态路径的非 GET 一律 405「仅 GET」信封。"""
         return error_envelope("trading/method-not-allowed", "仅 GET", 405)
 
     return app
@@ -418,14 +418,14 @@ async def _serve_static(root, url_path):
 
 
 def _serve_static_sync(root, url_path):
-    """``service.mjs:16-40 serveStatic``：解码 → 边界防护 → 文件/SPA 兜底 → MIME。
+    """Node 原实现（已退役）的 serveStatic：解码 → 边界防护 → 文件/SPA 兜底 → MIME。
 
-    有意差异 6：``service.mjs:23`` 用 Node 的 ``path.join(dist, relative)``，它对以 ``/``
+    有意差异 6：Node 原实现用 ``path.join(dist, relative)``，它对以 ``/``
     开头的第二段**不重置**（``join('/a','/b') === '/a/b'``），而 Python 的 ``os.path.join``
     会重置（``'/b'``）——因此这里显式 ``lstrip('/')`` 后再拼接，保持与移植源同一落点。
 
     有意差异 9：``Content-Type`` 走 ``headers=`` 而不是 ``media_type=``。Starlette 会对
-    ``text/*`` 追加 ``; charset=utf-8``，而 ``service.mjs:10-14`` 的表里只有 ``.html``
+    ``text/*`` 追加 ``; charset=utf-8``，而已退役 Node 原实现的表里只有 ``.html``
     带 charset（``.js`` 是裸 ``text/javascript``、``.css`` 是裸 ``text/css``）；未收录扩展名
     一律 ``application/octet-stream``，不做任何猜测。
     """
@@ -435,7 +435,7 @@ def _serve_static_sync(root, url_path):
         return error_envelope("trading/invalid-operation", "路径编码非法", 400)
     target = os.path.normpath(os.path.join(str(root), relative.lstrip("/")))
     if target != str(root) and not target.startswith(str(root) + os.sep):
-        # service.mjs:24-26：归一化后越出 root 一律 403（不泄漏目标路径）
+        # Node 原实现（已退役）：归一化后越出 root 一律 403（不泄漏目标路径）
         return error_envelope("trading/forbidden", "路径非法", 403)
     if not os.path.isfile(target):
         # SPA 路由兜底；index.html 也不存在 → 前端未构建
@@ -448,7 +448,7 @@ def _serve_static_sync(root, url_path):
     try:
         content = Path(target).read_bytes()
     except OSError as error:
-        # service.mjs:36-38：读取失败 → 500 trading/internal
+        # Node 原实现（已退役）：读取失败 → 500 trading/internal
         return error_envelope("trading/internal", f"静态文件读取失败：{error}"[:300], 500)
     media_type = MIME.get(os.path.splitext(target)[1]) or "application/octet-stream"
     return Response(content=content, headers={"Content-Type": media_type})
@@ -461,8 +461,8 @@ def _decode(value):
     """``decodeURIComponent`` 等价：%XX 必须成对；解码失败/含 NUL 抛 ValueError。
 
     ``urllib.parse.unquote`` 默认会吞掉非法转义（``errors="replace"`` 语义），而
-    ``decodeURIComponent`` 抛 URIError——这里先自己判非法转义，再解码（service.mjs:19-22
-    的 try/catch 落到 400）。
+    ``decodeURIComponent`` 抛 URIError——这里先自己判非法转义，再解码（Node 原实现已退役的
+    try/catch 落到 400）。
     """
     if _BAD_ESCAPE.search(value):
         raise ValueError(f"invalid escape in {value!r}")
