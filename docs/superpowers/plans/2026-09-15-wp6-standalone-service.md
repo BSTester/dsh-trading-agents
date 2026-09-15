@@ -2263,7 +2263,7 @@ HTTP 404（前端 endpoints.js 预检会先拦；404 文案保留兜底）
     服务端 404 分支文案保留作兜底。
 ### 6bis. 收尾期观察（2026-09-16）
 
-- **Python 套件单次失败未复现**：收尾期一次全量 `unittest discover`（642 用例）报 1 例失败，但未捕获用例名；随后连续 7 次全量运行均 `OK (skipped=1)`（含 4 次专门盯守）。可疑面是既有的端口保留/子进程类用例竞态（非 WP6 新增用例）。记录为**待观察**：若再现请先留用例名。**（2026-09-16 已定位根因，见 §8-18：`tests/test_install.py` 的假 tarball 带 gzip mtime，与内容寻址去重相冲。）**
+- **Python 套件偶发失败：已定位并修复（`64a0c2b`）**。收尾期一次全量 `unittest discover` 报 1 例失败；根因定位为 `tests/test_install.py::write_tarball` 的假 npm pack 用 `tarfile.open(path, "w:gz")`，gzip 头带当前 mtime，而 `scripts/install_plugins.py` 按 tarball 字节做内容寻址 —— 跨秒的两次「同内容打包」哈希不同，去重/幂等断言随机失败。修法：tar 成员与 gzip 头 mtime 固定 0（同一内容打包字节级确定，已用 sha256 双打包验证），并连跑 3 次 install 用例 + 2 次全量（669 用例）全绿。**（2026-09-16 已定位根因，见 §8-18：`tests/test_install.py` 的假 tarball 带 gzip mtime，与内容寻址去重相冲。）**
 - **最终整体审查的阻断项已修复**：独立 Web 缺模式切换入口（初版计划未为规格 §4.5:1 配置任务）→ 已在 `83376ae` 补齐「页头徽章 → 账户模式对话框」窄门（口令「确认实盘」+ `expected_mode` + `order_authorized:false` 展示），并补 `snapshot.endpoints` 声明预检；对应偏差 13/14。
 - **规格 §4.6 命令补 venv 前缀**：`cd platform && ~/.dsh/trading-venv/bin/python -m server.run`（系统 Python 会静默降级取数）。
 
