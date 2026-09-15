@@ -3,7 +3,8 @@
 > 状态：按 `docs/superpowers/plans/2026-09-14-platform-plan-index.md` §WP6 立项（2026-09-15 用户决策）产出；
 > 前端形态经用户确认（2026-09-15）：**Vite + antd5 + @ant-design/pro-components**。
 > 全局约定（UI 文案规范 2.1 / 依赖锁定协议 2.2 / 工程约定 2.3）见 `2026-09-14-platform-plan-index.md`，本规格同等受其约束。
-> 实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（本规格 §八 验收标准为其验收门）。
+> 实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（本规格 §六 验收标准为其验收门；计划末尾「补遗」为架构变更后的任务重排）。
+> **修订（2026-09-15，用户第二次决策）**：服务后端改为 **FastAPI（Python）单进程**——HTTP API、MCP、静态前端同进程启动，不单独配前端服务。原 Node 服务方案（§二 图、§3.1 对等机制、§3.6 传输实现、§3.7 Node SDK 选型）退役，相关小节已同步修订。
 
 ## 一、目标与非目标
 
@@ -11,7 +12,7 @@
 
 | # | 立项原文 | 本规格落地口径 |
 |---|---|---|
-| 1 | 工作台一切能力经 MCP 暴露给 Harness（与面板完全对等，非子集） | 6a：独立 Node 服务进程，MCP 工具面 = **25 个工具**（§3：20 端点对等 + 5 维护动作），工具实现直接复用面板同一个 `createRpcHandler` 实例——对等性由代码结构保证，不靠人工对照 |
+| 1 | 工作台一切能力经 MCP 暴露给 Harness（与面板完全对等，非子集） | 6a：独立 **FastAPI（Python）服务进程**，MCP 工具面 = **25 个工具**（§3：20 端点对等 + 5 维护动作）；HTTP 与 MCP 两条通道在**同一进程内调用同一批处理函数**，数据路径复用既有 Python 计算脚本与指令协议——行为对等由代码结构 + §5.2 审批回归矩阵共同保障 |
 | 2 | 工作台 UI 用 Ant Design Pro 重实现（脱离 Harness 面板宿主，独立 Web） | 6b：同一服务进程托管 HTTP API + 静态前端（11 页签全量重实现），浏览器不再依赖 Harness Connection |
 | 3 | Harness 定位不变：入口 = 决策与操作确认；固定信息收集由服务定时跑 | 6c：preset 行替换 + 审批回归（§五）。固定信息收集 = 既有 daemon 作业链（WP4 已交付），服务自身不做新调度；Harness 会话内逐笔确认、原生审批、口令门槛一条不少 |
 
@@ -32,27 +33,28 @@
 │   └ Connection RPC 20 端点（legacy 面板过渡期保留）  │
 └──────────────┬────────────────────────────────────┘
                │ 同一份数据文件（无网络）
-┌─ 独立服务进程（WP6 新增，node platform/server/start.mjs）─┐
-│ createRpcHandler（与 Host 同一实现，同一 TTL 缓存）        │
-│   ├ MCP streamable-http  http://127.0.0.1:8397/mcp        │──► Harness 新增 mcp-client 行
-│   ├ HTTP API             POST /api/wb/<endpoint>           │──► Ant Design Pro 前端
-│   ├ 静态托管             GET /  → platform/web/dist        │   （独立浏览器页）
-│   └ 维护动作             WorkbenchStore（admin_* 工具）     │
+┌─ 独立服务进程（WP6 新增，FastAPI/uvicorn：python -m platform.server.run）─┐
+│ 服务层（Python 单实现，HTTP 与 MCP 共用同一批处理函数 + 同一 TTL 缓存）     │
+│   ├ MCP streamable-http  http://127.0.0.1:8397/mcp（mcp SDK 挂载）        │──► Harness 新增 mcp-client 行
+│   ├ HTTP API             POST /api/wb/<endpoint>（envelope 契约不变）      │──► Ant Design Pro 前端
+│   ├ 静态托管             GET /  → platform/web/dist（SPA fallback）       │   （独立浏览器页）
+│   └ 维护动作             store 访问层（admin_* 工具，同锁协议）            │
 └──────────────┬────────────────────────────────────────┘
-               │ pycore 子进程 / 指令目录 / SQLite 只读快照
-┌─ trading_core + daemon（不动）─────────────────────────┐
-│ 16 个 CLI 子命令、5 种白名单指令、心跳/kill/告警文件      │
+               │ 同进程子进程桥 / 指令目录 / SQLite 只读快照
+┌─ trading_core + daemon + workbench python 脚本（不动）─────┐
+│ 16 个 CLI 子命令、5 种白名单指令、心跳/kill/告警文件        │
+│ analytics/bars/positions/events/factors/quality 脚本原样复用 │
 └────────────────────────────────────────────────────────┘
 ```
 
-关键决策：**MCP 服务端用 Node 实现**（`@modelcontextprotocol/sdk`），因为面板的全部业务逻辑（store、analytics provider、series provider、corebridge、commandbus、TTL 缓存、字段白名单校验）都是 Node 模块——复用它们即天然对等；Python 侧经既有 `pycore` 子进程桥取数，无新增通道。trading-venv 不装 Python MCP SDK（2026-09-15 探测：venv 无 `mcp` 包，亦无需安装）。
+关键决策（2026-09-15 第二次用户决策）：**服务后端用 FastAPI（Python）**。数据路径不做二次实现——分析/行情/事件/质量等计算直接子进程调用 workbench 既有 Python 脚本（与 legacy 面板的 analytics.js 拉起**同一批脚本、同一参数、同一 JSON 解析**），plan/schedule/reconcile 走 trading_core snapshot-* CLI，plan-execute/kill/unkill 经 `trading_core.commands`（与 daemon 同一实现）；需移植的只有三层薄皮：store JSON 访问（snapshot/switch-mode/管理动作，同锁协议）、`trade_summary` 与 `audit` 链两个纯函数、TTL 缓存。MCP 经 `mcp` Python SDK（streamable-http）挂载于 `/mcp`。服务内不再有 JS 运行时（前端仅为构建产物）；trading-venv 新增 fastapi/uvicorn/mcp/httpx（`platform/requirements.txt` 锁定）。
 
 ## 三、Part A：MCP 工具面清单（= 工作台全功能盘点）
 
 ### 3.1 盘点方法与对等性定义
 
 - 盘点基准（2026-09-15，代码为证）：`plugins/workbench/src/endpoints.js` 20 端点、`client.js` 11 页签、`scripts/workbench_admin.mjs` 5 维护动作、`store.js` snapshot/switchMode。
-- **对等**定义为：面板能做的每一件事，在 MCP 面上存在一个工具，且二者走**同一个 handler 函数**（`createRpcHandler` 返回的 `(endpoint, payload) => {ok, value|error}`）。工具面新增能力 = 维护动作 5 项（原仅 shell 脚本可达）。
+- **对等**定义为：面板能做的每一件事，在 MCP 面上存在一个工具，且 HTTP 端点与 MCP 工具在服务进程内**调用同一批处理函数**（同一 `(endpoint, payload) -> {ok, value|error}` envelope）。与 legacy 面板的对等 = 同一数据文件协议、同一批 Python 计算脚本（同参数同解析）、同一指令目录协议；行为对等由 §5.2 审批回归矩阵逐条验证。工具面新增能力 = 维护动作 5 项（原仅 shell 脚本可达）。
 - 工具面**白名单之外无任何工具**：无任意执行、无 shell、无文件读写、无 LLM、无 token 读取。tools/list 快照测试锁定总数与名单（§5.2 T6）。
 
 ### 3.2 端点 → 工具映射总表（20 个）
@@ -134,7 +136,7 @@
 
 ### 3.6 协议与命名规范
 
-- 传输：MCP **streamable-http**（与 preset 既有 futu-mcp 行同构）；HTTP API 与 MCP 同进程不同路径（`/mcp` 与 `/api/wb/*`）。
+- 传输：MCP **streamable-http**（`mcp` Python SDK，挂载于 FastAPI 的 `/mcp`；与 preset 既有 futu-mcp 行同构，dsh-mcp-client 兼容性由 S1 冒烟实测验证）；HTTP API 与 MCP 同进程不同路径（`/mcp` 与 `/api/wb/*`）。
 - 服务与预设行：`serverName: quantwb`；`failOnStartupError: false`（服务未启动时其余能力不受影响，与 futu 行同策略）；`toolCallTimeoutMs: 120000`（冷启动 factors 实测 25s，留余量）。
 - 输入校验：每个工具的 inputSchema 按 §3.2 输入列生成（additionalProperties: false），超集字段在 schema 层拒绝；handler 内白名单校验保持不变（双保险）。
 - 工具命名：读工具沿用端点名；动作工具 snake_case 动词（`switch_mode`、`plan_execute`）；维护工具 `admin_` 前缀。禁用名黑名单（exec/shell/file/token）由锁定测试断言。
@@ -143,17 +145,18 @@
 
 | 依赖 | 锁定 | 探测证据 |
 |---|---|---|
-| Node | ≥ 22（本机 v22.23.2） | `node --version` |
-| `@modelcontextprotocol/sdk` | ^1.30.0（lockfile 提交） | `npm view` = 1.30.0，registry 可达 |
-| `antd` | ^5（配 ProComponents 兼容矩阵，不追 6.x） | `npm view antd` 6.6.4 存在；ProComponents 2.8.x 对 antd5 为成熟组合 |
-| `@ant-design/pro-components` | ^2.8.10 | `npm view` = 2.8.10 |
-| `react` | ^18.3（ProComponents peer 稳妥区） | 组件库 peer 约定 |
-| `vite` | 安装时锁最新稳定（lockfile 提交） | registry 可达 |
-| Python MCP SDK | 不采用 | trading-venv 无 `mcp` 包；Node 侧复用 handler 决策（§二） |
+| Python 运行时 | trading-venv（本机 3.13.5） | `python --version` |
+| `fastapi` / `uvicorn` / `httpx`（TestClient） | `platform/requirements.txt` 锁定（安装后回填精确版本） | registry 可达（2026-09-15 探测） |
+| `mcp`（Python 官方 SDK） | 同上（2026-09-15 探测可用 2.2.0） | `pip index versions mcp` |
+| `antd` | ^5（配 ProComponents 兼容矩阵，不追 6.x） | 实装 5.29.3（lockfile 提交） |
+| `@ant-design/pro-components` | ^2.8.10 | 实装 2.8.10 |
+| `react` | ^18.3（ProComponents peer 稳妥区） | 实装 18.3.1 |
+| `vite` | ^6（lockfile 提交；dev server 仅为开发期可选工具） | 实装 6.4.3 |
+| Node | 仅前端构建期需要（vite）；服务层无 JS 运行时 | `node --version` v22.23.2 |
 | MCP 传输 | streamable-http | 与 preset futu-mcp 行同构，dsh-mcp-client 支持 |
 | 端口/绑定 | 默认 8397 / 127.0.0.1，`~/.dsh/trading-platform.json` `{"service":{"port","token","host"}}` 可覆盖 | 新增约定（文件缺失取默认） |
 
-锁定测试：`tests/wp6-locks.test.mjs`（25 工具名单与黑名单、端点集 = ENDPOINTS、目录/端口常量）+ `tests/test_core_wp6_locks.py`（指令白名单仍 5 种、config 路径与端口默认、口令字符串常量）。上游 schema 变化时人工重跑核验并更新本表。
+锁定测试：`tests/test_wp6_service_locks.py`（25 工具名单与黑名单、端点集 = 从 `plugins/workbench/src/endpoints.js` 文本提取、config/端口/口令常量）+ `tests/test_core_wp6_locks.py`（指令白名单仍 5 种、口令字符串常量）。上游 schema 变化时人工重跑核验并更新本表。
 
 ## 四、Part B：Ant Design Pro 迁移方案（6b）
 
@@ -206,11 +209,12 @@ platform/web/
 3. kill 开关：激活/解除均走 `plan_execute` 的 kill/unkill 动作；解除文案注明「人工确认后解除」；
 4. 全站页头常驻 SIM/LIVE 徽章 + 一行免责声明。
 
-### 4.6 构建与托管
+### 4.6 构建与托管（单进程）
 
-- 开发：`npm run dev`（Vite，proxy `/api` → 127.0.0.1:8397）；生产：`npm run build` → `platform/web/dist`，由服务进程静态托管（`GET /`）。
-- 服务进程零框架（`node:http` + MCP SDK 的 StreamableHTTPServerTransport 挂 Node req/res），路由仅：`POST /api/wb/:endpoint`、`GET /healthz`、`GET /mcp`+`POST /mcp`（streamable-http）、静态 dist。
-- 启停：`node platform/server/start.mjs`；RUNBOOK 增加 systemd unit 样例与端口/token 配置说明。
+- 生产（唯一部署形态）：`npm --prefix platform/web run build` → `platform/web/dist`，由 FastAPI 静态托管（`GET /`，SPA fallback 到 index.html，路径分隔符边界防护）。**一个进程承载全部：HTTP API + MCP + 静态前端，不单独配前端服务**。
+- 开发（可选工具，非部署组件）：`npm run dev`（Vite dev server，proxy `/api` → 127.0.0.1:8397）仅用于前端热更调试。
+- 服务框架：FastAPI + uvicorn（`platform/requirements.txt` 锁定），路由仅：`POST /api/wb/{endpoint}`（envelope 契约不变）、`GET /healthz`、`/mcp`（streamable-http，mcp SDK 挂载）、静态 dist。
+- 启停：`python -m platform.server.run`（内部 uvicorn，读 `~/.dsh/trading-platform.json`）；RUNBOOK 增加 systemd unit 样例与端口/token 配置说明。
 
 ### 4.7 安全边界变化声明（诚实清单）
 
@@ -235,37 +239,40 @@ platform/web/
 | A7 | 工具面白名单封闭：MCP 25 工具无 shell/exec/token 类；HTTP 20 端点白名单外 404 语义（Unknown operation） | manifest 锁定测试 |
 | A8 | 前端无下单面：AntD Web 仅可调 `/api/wb/*` 20 端点，无券商直连代码 | 静态检查 + 代码评审 |
 
-WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）**必须复用同一 handler**，使 A3/A4 在新入口上零新增逻辑——这是回归方案的核心架构手段。
+WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 FastAPI 进程内**必须调用同一批处理函数**（HTTP 路由与 MCP 工具是同一函数的两个薄壳），使 A3/A4 在新入口上零新增逻辑——这是回归方案的核心架构手段。注意：A3/A4 的服务端处理函数是 **Python 移植版**（与 Node Host 的 `store.switchMode`/plan-execute 分支行为逐条等价），其等价性由 R3/R4 的 Python 回归逐断言钉死。
 
-### 5.2 自动回归矩阵（三层）
+### 5.2 自动回归矩阵（三层；2026-09-15 FastAPI 架构修订后重排）
 
-**Node 层**（`tests/wp6-approval-regression.test.mjs`，离线，临时 DSH_HOME）：
+**Node 层**（`tests/wp6-approval-regression.test.mjs`，离线，临时 DSH_HOME）——只保留策略链条（A1/A2，代码在 Harness 进程内，不受服务架构变更影响）：
 
 | 用例 | 断言 |
 |---|---|
 | R1 | sim 下 guard 拒 `mcp__futu__account_positions`（消息含「账户模式」）；live 下拒 `sim_trade_*`（经 `installTradingPolicy` 假 ctx 驱动） |
 | R2 | live 下 `trading_*` pre-execute 返回 `ask` 且 reason 含「真实账户操作」；`sim_trade_*` 放行不 ask |
-| R3 | `switch_mode`：无口令 live 拒绝；错口令拒绝；对口令成功且 `order_authorized:false`；`expected_mode` 过期拒绝；租约期间拒绝（WorkbenchBusyError）；**MCP manifest 的 switch_mode 对 mode:"live" 无论口令一律拒绝（trading/live-switch-web-only）** |
-| R4 | `plan_execute`：live 无口令拒绝；带口令 → `{queued:true,nonce}`；指令文件落盘含 `plan_hash/expected_mode` 且**不含口令字段**；action 四映射到白名单指令 |
-| R5 | manifest：恰 25 工具；端点工具集 ≡ ENDPOINTS；无黑名单名（exec/shell/file/token/write_file） |
-| R6 | HTTP 与 MCP 同源：两入口对同一 payload 结果一致（同一 handler 实例断言；实现位置：`platform/tests/mcp.test.mjs` S3 末断言） |
 
-**Python 层**（`tests/test_core_wp6_approval.py`，离线）：
+**Python 层**（全部离线，临时 DSH_HOME）——服务面回归（R3–R6 对 FastAPI 处理函数 / TestClient 重写）+ 既有 P 系列：
 
-| 用例 | 断言 |
+| 用例 | 断言（文件：`tests/test_wp6_service_approval.py`） |
 |---|---|
-| P1 | kill 文件存在时 execute_plan 被风控规则 1 拒（复用 WP4 e2e 驱动风格）；unkill 后恢复 |
+| R3 | 服务层 `switch_mode`：无口令 live 拒绝；错口令拒绝；对口令成功且 `order_authorized:false`；`expected_mode` 过期拒绝；租约期间拒绝；**MCP 工具 `switch_mode` 对 mode:"live" 无论口令一律拒绝（trading/live-switch-web-only）** |
+| R4 | 服务层 `plan_execute`：live 无口令拒绝；带口令 → `{queued:true,nonce}`；指令文件落盘含 `plan_hash/expected_mode` 且**不含口令字段**；action 四映射到白名单指令；白名单外 action 拒绝 |
+| R5 | 工具面封闭：FastMCP tools/list 恰 25；端点工具集 ≡ ENDPOINTS（从 endpoints.js 文本提取）；无黑名单名（exec/shell/file/token/write_file） |
+| R6 | HTTP 与 MCP 同源：同一 payload 经 `/api/wb/*` 与 MCP 工具调用结果一致（稳定字段断言） |
+
+| 用例 | 断言（文件：`tests/test_core_wp6_approval.py`，维持） |
+|---|---|
+| P1 | kill 文件存在时 execute_plan 被风控规则 1 拒；unkill 后恢复 |
 | P2 | 指令白名单恒 5 种；processed/ nonce 幂等不回归 |
-| P3 | 服务 config 锁定：端口默认 8397、路径常量、口令常量与 Node 侧锁定表一致（读 `tests/wp6-locks.test.mjs` 同源常量的 Python 镜像） |
+| P3 | 口令字段不落指令目录 |
 
-**协议层**（`platform/tests/mcp-smoke.test.mjs`，loopback 集成，临时 DSH_HOME）：
+**协议层**（`tests/test_wp6_mcp.py`，loopback 集成，临时 DSH_HOME；`mcp` Python 客户端对真实 uvicorn 进程）：
 
 | 用例 | 断言 |
 |---|---|
-| S1 | 起真实服务进程 → SDK Client initialize → tools/list 恰 25 且与 manifest 一致 |
+| S1 | 起真实服务 → 客户端 initialize → tools/list 恰 25 且与清单一致 |
 | S2 | call snapshot → ok；call switch_mode(live, confirmation=「确认实盘」) → ok:false（trading/live-switch-web-only）且模式仍 sim |
-| S3 | call plan_execute(未知 plan) → ok:false；HTTP /api/wb/snapshot 与 MCP snapshot 同值 |
-| S4 | 未声明端点 POST /api/wb/not-an-endpoint → 4xx 语义，无旁路 |
+| S3 | call plan_execute(未知 plan) → queued 排队成功（校验在 daemon）；HTTP /api/wb/snapshot 与 MCP snapshot 稳定字段同值 |
+| S4 | 未声明端点 POST /api/wb/not-an-endpoint → 404 语义，无旁路 |
 
 ### 5.3 人工会话回归清单（preset 更新后，新会话执行，记录进 WP6 验收记录）
 
@@ -318,3 +325,4 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）**必�
 4. **ProComponents 版本漂移**：antd 锁 5.x + lockfile；升级属显式变更。
 5. **K 线/热力图移植失真**：几何纯函数带测试移植，视觉回归靠人工清单比对。
 6. **本规格不改台账/审计保留口径**：各列表仍最近 100 项，完整审计仍在 Harness 会话。
+7. **store 双实现并存（FastAPI 架构的固有代价）**：Harness 进程内的 Node Host（观察记录合并、面板写路径）与服务进程内的 Python 访问层（快照读、switch-mode、管理动作）操作同一份 `trading-workbench.json`，依赖既有原子写 + 独占锁协议互斥。诚实边界：Python 侧快照读**不合并** pending observations（留给 Host 完成），合并前的观察不计入快照；`trade_summary`/`audit` 链为 Python 移植版，其与 Node 原实现的等价性由移植测试（差分用例）钉死。双实现漂移是长期风险，legacy 面板移除后 Node 侧写路径只剩观察记录，届时收敛为单一实现。

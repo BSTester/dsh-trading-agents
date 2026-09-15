@@ -1841,3 +1841,78 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 - 任务依赖：0 → 1 → 2 → 3 → 4 → 5 → 6（Python 侧可与 5 并行）；7 独立可并行；8 → 9 → 10 → 11 → 12 串行（前端）；13 收尾；14 用户在场。
 - 每任务一个子代理，产出后按 subagent-driven-development 两阶段审查（spec 合规 + 代码正确性）。
 - 子代理通用上下文：仓库 `/home/penn/workspace/dsh-trading-agents`；Python 用 `~/.dsh/trading-venv/bin/python`；Node 测试零框架 `node --test`；**规格 §3.2 ⚠ 通道分级规则不得放松**。
+
+---
+
+## 补遗：FastAPI 架构变更（2026-09-15 第二次用户决策，本节覆盖上文任务 0–4 与任务 5/6 的服务面部分）
+
+> **决策**：服务后端改为 **FastAPI（Python）单进程**——HTTP API、MCP（`mcp` Python SDK streamable-http 挂载 `/mcp`）、静态前端（`platform/web/dist`）同进程；**不单独配前端服务**（Vite dev server 仅为开发期可选工具）。原 Node 服务（`platform/server/*.mjs`、`platform/tests/*.test.mjs`、`platform/package.json`）在任务 E 退役删除。
+> **对等机制修订**：HTTP 与 MCP 两条通道在服务进程内调用**同一批 Python 处理函数**；与 legacy 面板的对等 = 同一数据文件协议 + 同一批 workbench Python 脚本（同参数同解析）+ 同一指令目录协议。A3/A4 的服务端处理函数为 Python 移植版，等价性由 R3/R4 Python 回归逐断言钉死。
+> **前端契约不变**：`POST /api/wb/<endpoint>` 的 envelope（`{ok, value?, cached?, cached_at?, error?{code,message,details}}`）、405/415/400/413/404 语义、`_refresh` 旁路、token 认证、`GET /healthz`、SPA fallback——全部保持，前端代码零改动。
+> 任务 7（preset 行）不变：仍是 `http://127.0.0.1:8397/mcp`。任务 8–12（前端）不变。任务 13 需按本补遗修订文档。
+
+### 补遗任务 A：venv 依赖 + config 移植 + 锁定测试更新
+
+**文件**：创建 `platform/requirements.txt`、`platform/server/__init__.py`、`platform/server/config.py`；更新 `tests/test_core_wp6_locks.py` 的 `test_service_defaults`（改为断言 `platform/server/config.py` 含 8397 与 trading-platform.json、`platform/server/mcp_tools.py`（占位文件）含 `trading/live-switch-web-only`）；Node 侧（`platform/server/*.mjs`、`platform/tests/*.test.mjs`）**本任务不删**（任务 E 才删），全量套件保持双向绿。
+
+- `platform/requirements.txt`：`fastapi`、`uvicorn`、`mcp`、`httpx`（TestClient 依赖），安装后回填 `==` 精确版本；`~/.dsh/trading-venv/bin/pip install -r platform/requirements.txt`。
+- `platform/server/config.py`：逐条移植 `platform/server/config.mjs` 语义（DEFAULTS 冻结 8397/127.0.0.1/token:None；`config_path(home)`；`load_config(home)`——ENOENT 回退默认、其他读错误原样抛、坏 JSON 抛「解析失败」、service 节三字段校验（文件端口须 >0 且 <65536）、`TRADING_SERVICE_PORT` 环境变量最后覆盖（允许 0=临时端口，其余须合法整数）、空串忽略）。
+- 新增测试并入 `tests/test_wp6_service_locks.py`：DEFAULTS 锁定、env 覆盖在缺文件时生效、env=0 合法、非法 env 忽略、坏 JSON 抛错（tmp_path 驱动）。
+- 验证：`~/.dsh/trading-venv/bin/python -B -m unittest tests.test_wp6_service_locks tests.test_core_wp6_locks -v` 全 PASS；`node --test tests/*.test.mjs` 184/0 不回归。
+- Commit：`feat(platform): FastAPI 服务依赖与 config 移植（锁定测试）`
+
+### 补遗任务 B：store 访问层 + trade_summary / audit 链移植
+
+**文件**：创建 `platform/server/store_access.py`、`platform/server/summary.py`、`platform/server/audit_chain.py`；测试 `tests/test_wp6_store_access.py`、`tests/test_wp6_summary_audit.py`。
+
+- **store_access.py**（读 `plugins/workbench/src/store.js` 逐行为准移植，禁止猜协议）：
+  - `read_mode(home)`：`trading-account-mode` 缺失=sim、非法内容抛错；
+  - `snapshot(home)`：读 `trading-workbench.json`（**共享读、绝不写**——不合并 pending observations，诚实标注字段 `pending_observations` 照抄文件值），输出与 `store.js snapshot()` 同构：`{version, mode, generated_at, runs(带 abandoned 派生状态，2h 阈值), reports, previews, activity(按模式过滤倒序), trade_summary, broker[mode], in_flight(空), pending_observations, recording_error, notice, endpoints(20 端点名单)}`；
+  - `switch_mode(home, {mode, expected_mode, confirmation})`：校验顺序与 store.js `switchMode` 一致——mode/expected_mode 合法 → 当前模式≠expected_mode 抛「Account mode changed」→ 在途租约文件（`trading-call-*.active`，语义按 store.js `enterBrokerCall` 的文件命名与持有者检查）存在抛「有账户调用正在进行」→ live 且 confirmation≠「确认实盘」抛「请输入「确认实盘」；切换模式不等于授权下单」→ 原子写模式文件；返回 `{mode, previous_mode, order_authorized: false}`；
+  - `admin_status/admin_runs/admin_cancel_run/admin_cancel_stale/admin_prune_runs`：与 store.js `cancelRun/cancelStaleRuns/pruneAbandonedRuns` 语义一致（2h 阈值、孤儿判定「无研报者」、锁内原子写）。
+- **summary.py**：移植 `broker_trades.js summarizeBrokerActivity`（只归纳不推测：order_side 1=买 2=卖、cum_qty 推导成交情况、状态原码不猜、order_id 去重保留最后观测、无 order_id 丢弃）。测试用例从 `tests/broker-trades.test.mjs` 移植等价 fixture（差分：同输入断言同输出结构）。
+- **audit_chain.py**：移植 `audit.js buildAuditChain`。测试从 `tests/audit.test.mjs` 移植等价用例。
+- 验证：两个新测试文件全 PASS；Node 侧全量不回归（184/0）+ Python 全量 discover 全绿。
+- Commit：`feat(platform): store 访问层与 trade_summary/audit 链移植（差分测试）`
+
+### 补遗任务 C：计算桥 + TTL 缓存 + FastAPI app + run 入口
+
+**文件**：创建 `platform/server/compute.py`、`platform/server/caches.py`、`platform/server/app.py`、`platform/server/run.py`；测试 `tests/test_wp6_service.py`（fastapi TestClient，离线，临时 DSH_HOME）。
+
+- **compute.py**（数据路径零二次实现）：`run_script(name, args)` 用 `sys.executable` 子进程调 `plugins/workbench/python/<name>.py`（与 `analytics.js`/`series.js` 同参数同 JSON 解析：取 stdout 首个 `{` 起 parse；`error` 键→抛错），覆盖 equity/positions/correlation/sensitivity/risk/trades/events/factors/ic/sources/instrument/quality 对应脚本与 `bars.py`（series）；`snapshot_cli(name)` 调 `python -m trading_core snapshot-plan/snapshot-schedule/snapshot-reconcile`（等价 corebridge.js，超时 60s）。`plan-execute/kill/unkill/cancel` 指令经 `trading_core.commands.write_command` **进程内导入**（同一白名单/nonce/原子写实现）。
+- **caches.py**：`CACHE_TTL_MS` 表逐项移植（rpc.js 同值）+ `cached(endpoint, payload, force, produce)`：命中校验 `ENDPOINT_SHAPE`（移植表）→ `{ok, value, cached: true, cached_at}`；未命中取数 → 写缓存；异常 → `{ok:false, error:{code: 对应错误码, message≤300, details:{}}}`（错误码映射与 rpc.js 一致：series→trading/series-unavailable、pycore 类→trading/core-unavailable、analytics 类→trading/analytics-unavailable）。
+- **app.py**：`create_app(home=None, dist=None)` 组装——
+  - 路由：`POST /api/wb/{endpoint}`（content-type 415 → 白名单 404（在 handler 之前）→ 载荷解析 400/413（payload-too-large→413 trading/payload-too-large，体上限 1MB）→ `handle(endpoint, payload)` 200）；`GET /healthz`（豁免认证）；静态 dist（SPA fallback、分隔符边界防护、未构建 404 envelope）；
+  - `handle(endpoint, payload)` 是 HTTP 与 MCP 共用的唯一分发函数：`_refresh` 剥离 → snapshot/switch-mode/19 读端点/plan-execute 分派（校验顺序与 rpc.js 逐条等价，含 live 口令「确认执行」、expected_mode 复核、action→白名单指令映射、口令绝不落盘）；
+  - token 中间件（config.token 非空时校验 Bearer，覆盖 /api 与 /mcp，healthz/静态豁免）；
+  - `/mcp` 挂载留给任务 D（本任务先留 405 占位路由）。
+- **run.py**：`python -m platform.server.run` → uvicorn（host/port 来自 load_config，TRADING_SERVICE_PORT=0 支持）→ 就绪打印单行 JSON（ok/service/url/mcp/tools=25/auth）；SIGTERM 优雅关闭。
+- 测试（TestClient）：envelope/404 白名单先于 handler/405/415/400/413/healthz/token 三态/SPA fallback/未构建 404；snapshot 端到端（临时 home 无数据也应 ok）；switch-mode 全矩阵（R3 的 HTTP 部分）。
+- Commit：`feat(platform): FastAPI app（envelope/白名单/静态/认证）与计算桥`
+
+### 补遗任务 D：FastMCP 工具面 + /mcp 挂载 + 协议冒烟
+
+**文件**：创建 `platform/server/mcp_tools.py`；更新 `platform/server/app.py`（挂载）；测试 `tests/test_wp6_mcp.py`、`tests/test_wp6_service_approval.py`（R3/R5/R6 的 MCP 断言）。
+
+- `mcp_tools.py`：基于 `mcp` Python SDK（以 site-packages 实际 API 为准，FastMCP 或低层 server 皆可）注册 **25 个工具**（名单与描述与规格 §3.2/§3.4 一一对应；inputSchema 用 pydantic/type hints 表达同字段集；`refresh` 参数映射 `_refresh`）。**通道分级**：`switch_mode` 工具函数对 `mode=="live"` 无论 confirmation 一律返回 `{ok:false, error:{code:"trading/live-switch-web-only", ...}}`（不触达 store 访问层）。工具 handler 全部调用 app.py 的同一 `handle`/store 访问函数（R6 同源的结构保证）；程序异常→isError:true + trading/tool-failed，业务失败→isError:false + ok:false envelope。
+- 挂载：streamable-http app 挂到 `/mcp`（注意 SDK 的 session manager lifespan 需并入主 app lifespan——以 SDK 版本文档/源码为准）。
+- 测试：
+  - `tests/test_wp6_mcp.py`（S1–S4）：uvicorn 线程起真实 app（TRADING_SERVICE_PORT=0）→ `mcp` Python 客户端 streamablehttp 连接 → initialize/tools=25/snapshot ok/switch_mode live 拒（模式仍 sim）/plan_execute queued/HTTP-MCP 稳定字段同值/未知端点 404；
+  - `tests/test_wp6_service_approval.py`：R3 全矩阵（含 MCP 通道分级）、R4 全矩阵、R5（tools 名单 ≡ 清单 + 黑名单）、R6。
+- 验证：新测试全 PASS；Python 全量 discover 全绿；Node 184/0 不回归。
+- Commit：`feat(platform): FastMCP 工具面（25 工具/通道分级）挂载与协议冒烟`
+
+### 补遗任务 E：审批回归重排 + Node 服务退役
+
+**文件**：改 `tests/wp6-approval-regression.test.mjs`（只留 R1/R2，头部注释改「策略链审批回归（A1/A2）；服务面回归已迁移 tests/test_wp6_service_approval.py + tests/test_wp6_mcp.py」）；改 `tests/test_core_wp6_locks.py`（对 Python 文件的断言核对路径）；**删除** `platform/server/*.mjs`、`platform/tests/`（整个目录）、`platform/package.json`、`platform/package-lock.json`；`platform/.gitignore` 保留 web 条目。
+
+- 验证（切换完成的判据）：
+  - `node --test tests/*.test.mjs`：181 pass 0 fail（184−R3/R4/R5 三条）；
+  - `~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'`：全绿（基线 375 + 新增 service/approval/mcp/locks 用例）；
+  - `grep -rn "platform/server/.*\.mjs" tests/ platform/ docs/` 零命中（文档引用在任务 13 修订）；
+  - 手动冒烟：`python -m platform.server.run` 起服（临时 DSH_HOME + TRADING_SERVICE_PORT=0）→ `curl localhost:<port>/healthz` 200 → `curl -XPOST .../api/wb/snapshot` envelope → `curl localhost:<port>/` 返回 dist index.html。
+- Commit：`refactor(platform): 退役 Node 服务层，审批回归重排为 Node 策略链 + Python 服务面`
+
+### 执行顺序与依赖
+
+A → B → C → D → E 严格串行（同 worktree）；任务 12（页面批 3）与本补遗无文件交集，可在 E 之后执行。任务 13 文档修订范围新增：architecture.md/RUNBOOK/README 的启动命令改为 `python -m platform.server.run`、依赖改为 platform/requirements.txt、补「单进程、无独立前端服务」表述、任务 7 审查的两条措辞建议（通道分级措辞对齐、mcp 行启用指引）。
