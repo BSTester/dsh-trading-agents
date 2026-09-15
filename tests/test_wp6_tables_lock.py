@@ -4,8 +4,9 @@
 本测试把 ``plugins/workbench/src`` 里的 JS 字面量提取出来，与 Python 常量逐项比对——
 JS 源被改动而 Python 没跟上时立刻红。Python 侧一律直接 import 后比对常量（不重复解析）。
 
-**迁移说明（任务 E）**：任务 E 会删除 ``plugins/workbench/src/*.js`` 与
-``platform/server/*.mjs``。届时本文件应当**二选一**：
+**迁移说明（任务 E）**：JS 服务层已退役（platform/server 下的 Node 服务源已删除）；本测试
+锁定的是 workbench legacy 面板源（``plugins/workbench/src/*.js``，仍保留），其删除另行决策。
+届时本文件应当**二选一**：
   1. 改成纯 Python 断言——把下面 ``js_*`` 提取出来的值内联成期望常量（等于把 JS 的
      当前事实冻结在测试里），或
   2. 整体删除——若那时已有更权威的单一事实来源（例如 Python 表本身就是唯一来源）。

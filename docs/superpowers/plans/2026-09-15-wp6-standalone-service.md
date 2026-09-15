@@ -1904,15 +1904,22 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 
 ### 补遗任务 E：审批回归重排 + Node 服务退役
 
-**文件**：改 `tests/wp6-approval-regression.test.mjs`（只留 R1/R2，头部注释改「策略链审批回归（A1/A2）；服务面回归已迁移 tests/test_wp6_service_approval.py + tests/test_wp6_mcp.py」）；改 `tests/test_core_wp6_locks.py`（对 Python 文件的断言核对路径）；**删除** `platform/server/*.mjs`、`platform/tests/`（整个目录）、`platform/package.json`、`platform/package-lock.json`；`platform/.gitignore` 保留 web 条目。
+**文件**：改 `tests/wp6-approval-regression.test.mjs`（只留 R1/R2，头部注释改「策略链审批回归（A1/A2）；服务面回归已迁移 tests/test_wp6_service_approval.py + tests/test_wp6_mcp.py」）；改 `tests/test_core_wp6_locks.py`（对 Python 文件的断言核对路径）、`tests/test_wp6_tables_lock.py`（迁移说明改注「JS 服务层已退役，本测试锁定 legacy 面板源」）、`agent.cordis.yml`（服务启动命令）、`preset.yml`（核对无命令，无需改）；**删除** `platform/server/*.mjs`、`platform/tests/`（整个目录）、`platform/package.json`、`platform/package-lock.json`；`platform/.gitignore` 删除首行 `node_modules/`（根 `.gitignore` 已覆盖），只留 web 两条，`git check-ignore platform/web/dist platform/web/node_modules` 仍命中。
 
 - 验证（切换完成的判据）：
-  - `node --test tests/*.test.mjs`：181 pass 0 fail（184−R3/R4/R5 三条）；
-  - `~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'`：全绿（基线 375 + 新增 service/approval/mcp/locks 用例）；
-  - `grep -rn "platform/server/.*\.mjs" tests/ platform/ docs/` 零命中（文档引用在任务 13 修订）；
-  - 手动冒烟：`python -m platform.server.run` 起服（临时 DSH_HOME + TRADING_SERVICE_PORT=0）→ `curl localhost:<port>/healthz` 200 → `curl -XPOST .../api/wb/snapshot` envelope → `curl localhost:<port>/` 返回 dist index.html。
+  - `node --test tests/*.test.mjs`：181 pass 0 fail（184−R3/R4/R5 三条；R1/R2 断言不得弱化）；
+  - `~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'`：全绿（基线 628 含新增 service/approval/mcp/locks 用例）；`npm --prefix platform/web test`：184 pass 0 fail（前端不受影响）；
+  - `grep -rn "platform/server/.*\.mjs\|platform/tests/" --include="*.py" --include="*.mjs" --include="*.yml" --include="*.md" .` 仅命中本计划任务 0–4 的历史命令文本（已退役，保留历史性），其余零命中；
+  - 手动冒烟：**`cd platform && python -m server.run`（或 `python platform/server/run.py`；不能用 `python -m platform.server.run`——标准库 `platform` 遮蔽同名包）** 起服（临时 DSH_HOME + TRADING_SERVICE_PORT=0）→ `curl localhost:<port>/healthz` 200 → `curl -XPOST .../api/wb/snapshot` envelope → `curl localhost:<port>/` 返回 dist index.html。
 - Commit：`refactor(platform): 退役 Node 服务层，审批回归重排为 Node 策略链 + Python 服务面`
 
 ### 执行顺序与依赖
 
-A → B → C → D → E 严格串行（同 worktree）；任务 12（页面批 3）与本补遗无文件交集，可在 E 之后执行。任务 13 文档修订范围新增：architecture.md/RUNBOOK/README 的启动命令改为 `python -m platform.server.run`、依赖改为 platform/requirements.txt、补「单进程、无独立前端服务」表述、任务 7 审查的两条措辞建议（通道分级措辞对齐、mcp 行启用指引）。
+A → B → C → D → E 严格串行（同 worktree）；任务 12（页面批 3）与本补遗无文件交集，可在 E 之后执行。任务 13 文档修订范围新增：architecture.md/RUNBOOK/README 的启动命令改为 `cd platform && python -m server.run`（或 `python platform/server/run.py`；标准库 `platform` 遮蔽，`python -m platform.server.run` 不可用）、依赖改为 platform/requirements.txt、补「单进程、无独立前端服务」表述、任务 7 审查的两条措辞建议（通道分级措辞对齐、mcp 行启用指引）。
+
+> **任务 E 已执行（Node 服务层已退役）**：本计划任务 0–4 段落里的 `platform/server/*.mjs`、
+> `platform/tests/*.test.mjs`、`platform/package.json` 与其 `node --test platform/tests/...`
+> 命令均为**历史记录**，对应文件已删除、命令已失效；现行命令见补遗任务 E 段落。
+> Python 服务源中仍有指向已删 Node 源的溯源注释（`app.py`/`run.py`/`mcp_tools.py`/
+> `store_access.py`/`config.py` 的 ``xxx.mjs`` 行号引用），属遗留溯源引用，建议在任务 13
+> 文档修订时一并改写为「Node 原实现（已退役）」的语义描述。
