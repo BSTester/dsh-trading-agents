@@ -1,14 +1,20 @@
-"""WP6 补遗 B1 差分测试：store 访问层 Python 移植（平台侧只读快照/模式切换/管理动作）。
+"""WP6 补遗 B1 差分测试：store 访问层 Python 移植（平台侧只读快照/模式切换/管理动作/业务确认）。
 
 对照基准是 plugins/workbench/src/store.js 与 scripts/workbench_admin.mjs 的实际行为；
 用例逐条钉死字段名、过滤/倒序、2h 派生阈值、锁协议、错误消息。全部离线，临时 home 目录
 显式传给每个 API——store_access 自己**不读** DSH_HOME（那是 config.py 的职责，见
 tests/test_wp6_service_locks.py），所以这里不再改环境变量。
+
+业务确认（2026-09-15 main 修订）另有一节：``request_confirmation``/``confirmation_view``/
+``decide_confirmation`` 的 TTL 超时、signal 取消、重复决定、跨 home 隔离。确认是**进程内
+内存态**（store.js:136 的语义），因此这些用例不需要落盘校验之外的夹具。
 """
 import json
 import stat
 import sys
 import tempfile
+import threading
+import time
 import unittest
 import uuid
 from datetime import datetime, timedelta, timezone
@@ -211,9 +217,12 @@ class SnapshotTest(StoreAccessBase):
         # 字段齐备：与 store.js:210-223 同构（+ endpoints）
         self.assertEqual(set(snap), {"version", "mode", "generated_at", "runs", "reports", "previews",
                                      "activity", "trade_summary", "broker", "in_flight",
-                                     "pending_observations", "recording_error", "notice", "endpoints"})
+                                     "confirmation", "pending_observations", "recording_error",
+                                     "notice", "endpoints"})
         self.assertEqual(snap["broker"], {"at": "2026-09-15T02:00:00.000Z", "tool": "live"})
         self.assertEqual(snap["in_flight"], 0)
+        # 服务进程无待确认（内存态为空）→ 快照如实为 null，不伪造
+        self.assertIsNone(snap["confirmation"])
         self.assertEqual(snap["pending_observations"], 0)
         self.assertIsNone(snap["recording_error"])
         self.assertEqual(snap["notice"], sa.NOTICE)
@@ -253,16 +262,18 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(sa.store_file(self.home).read_bytes(), before)
         self.assert_no_lock_left()
 
-    def test_endpoints_manifest_is_20_and_cached(self):
+    def test_endpoints_manifest_is_22_and_cached(self):
         endpoints = sa.endpoints()
-        self.assertEqual(len(endpoints), 20)
+        self.assertEqual(len(endpoints), 22)
         self.assertEqual(endpoints[0], "snapshot")
-        self.assertEqual(endpoints[-1], "reconcile")
-        self.assertEqual(len(set(endpoints)), 20)
+        self.assertEqual(endpoints[-1], "confirm-decide")
+        # 业务确认两端点必须在白名单里（HTTP 面据此注册路由）
+        self.assertEqual(endpoints[-2:], ["confirmation", "confirm-decide"])
+        self.assertEqual(len(set(endpoints)), 22)
         self.assertEqual(endpoints, sa.endpoints())
         # 缓存返回副本：调用方改动不会污染下一次
         endpoints.append("bogus")
-        self.assertEqual(len(sa.endpoints()), 20)
+        self.assertEqual(len(sa.endpoints()), 22)
 
     def test_snapshot_reports_pending_observations_without_merging(self):
         """有意差异 1：Python 只读快照不 flushObservations，pending 计数照抄文件系统。"""
@@ -304,7 +315,8 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(snap["mode"], "sim")
         self.assertEqual(snap["runs"], [])
         self.assertEqual(snap["activity"], [])
-        self.assertEqual(len(snap["endpoints"]), 20)
+        self.assertEqual(len(snap["endpoints"]), 22)
+        self.assertIsNone(snap["confirmation"])
         self.assertFalse(sa.store_file(self.home).exists())  # 只读：连空 store 都不落盘
 
     def test_missing_home_snapshot_is_valid(self):
@@ -546,6 +558,236 @@ class AdminPruneRunsTest(StoreAccessBase):
                 self.write_state(self.state(runs=[_run("r_90m", hours_ago=1.5)]))
                 self.assertEqual(sa.admin_prune_runs(self.home, hours=hours), [])
                 self.assertEqual(len(self.read_state()["runs"]), 1)
+
+
+class ConfirmationTest(StoreAccessBase):
+    """store.js:299-410 业务确认三方法的移植（TTL 超时 / signal 取消 / 重复决定 / 隔离）。
+
+    ``request_confirmation`` 是**阻塞**调用（Node 的 Promise 等价物），因此「等人作答」的
+    用例在后台线程里发起，主线程用 ``confirmation_view`` 看到待确认项后再决定。超时与取消
+    无需并发，直接在主线程调用（短 TTL / 预先 set 的 Event）。
+    """
+
+    TOOL = "mcp__futu__trading_input_order"
+    ARGS = {"acc_id": "281756480774050900", "market": 100, "symbol": "TSLL",
+            "order_type": 1, "order_side": 1, "qty": 4, "price": 9.30}
+
+    # —— 夹具 ——
+    def start(self, home=None, **overrides):
+        """后台线程发起一笔确认，返回 ``(pending_view, outcome_box, thread)``。"""
+        home = self.home if home is None else home
+        kwargs = {"tool": self.TOOL, "mode": "live", "args": self.ARGS, "session_id": "s1"}
+        kwargs.update(overrides)
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.update(sa.request_confirmation(home, **kwargs)), daemon=True)
+        thread.start()
+        pending = self.wait_for_pending(home)
+        return pending, outcome, thread
+
+    def wait_for_pending(self, home=None, timeout=3.0):
+        home = self.home if home is None else home
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            view = sa.confirmation_view(home)
+            if view is not None:
+                return view
+            time.sleep(0.005)
+        self.fail("3 秒内未出现待确认项")
+
+    def decide(self, home=None, decision="approved", confirmation_id=None):
+        home = self.home if home is None else home
+        if confirmation_id is None:
+            view = sa.confirmation_view(home)
+            # 没有待确认时给一个占位编号：错误语义由 decide_confirmation 自己判（先判有无）
+            confirmation_id = view["id"] if view else "no-pending"
+        return sa.decide_confirmation(home, confirmation_id=confirmation_id, decision=decision)
+
+    def activity(self, home=None):
+        home = self.home if home is None else home
+        return json.loads(sa.store_file(home).read_text(encoding="utf-8"))["activity"]
+
+    # —— 常量与纯函数 ——
+    def test_confirm_ttl_and_operations_match_store_js(self):
+        self.assertEqual(sa.CONFIRM_TTL_MS, 120_000)
+        self.assertEqual(sa.CONFIRM_OPERATIONS, {"input": "下单", "modify": "改单",
+                                                 "cancel": "撤单"})
+        self.assertEqual(sa.order_operation("mcp__futu__trading_input_order"), "input")
+        self.assertEqual(sa.order_operation("mcp__futu__trading_modify_order"), "modify")
+        self.assertEqual(sa.order_operation("mcp__futu__trading_cancel_order"), "cancel")
+        self.assertIsNone(sa.order_operation("mcp__futu__trading_something_else"))
+        self.assertIsNone(sa.order_operation(None))
+
+    def test_view_has_no_pending_when_table_is_empty(self):
+        self.assertIsNone(sa.confirmation_view(self.home))
+
+    def test_summary_renders_chinese_order_fields(self):
+        """摘要与 store.js 同形：中文可核对字段 + 未知枚举原样显示 + raw 原样保留。"""
+        summary = sa.describe_order_args(self.TOOL, self.ARGS)
+        self.assertEqual(summary["tool"], self.TOOL)
+        self.assertEqual(summary["raw"], self.ARGS)
+        fields = {field["label"]: field["value"] for field in summary["fields"]}
+        for label in ("账户", "市场", "标的", "方向", "数量", "价格"):
+            self.assertIn(label, fields)
+        self.assertEqual(fields["市场"], "100（美股）")
+        self.assertEqual(fields["方向"], "买入（order_side=1）")
+        self.assertEqual(fields["数量"], "4")
+        self.assertEqual(fields["账户"], "281756480774050900")
+
+        unknown = sa.describe_order_args(self.TOOL, {"market": 77, "order_side": 9, "qty": 0})
+        unknown_fields = {field["label"]: field["value"] for field in unknown["fields"]}
+        self.assertRegex(unknown_fields["市场"], r"未识别.*请核对")
+        self.assertRegex(unknown_fields["方向"], r"未识别.*请核对")
+        # 数量 0 必须显示（JS 的 push 只跳过 undefined/null/""）
+        self.assertEqual(unknown_fields["数量"], "0")
+        # 空值字段不出现（买卖方向缺失时连标签都没有）
+        empty = sa.describe_order_args(self.TOOL, {"symbol": "", "price": None})
+        self.assertEqual([field["label"] for field in empty["fields"]], [])
+
+    # —— 批准 / 拒绝（唯一的作答通道）——
+    def test_approve_resolves_the_waiter_and_clears_the_view(self):
+        pending, outcome, thread = self.start()
+        self.assertEqual(pending["operation"], "下单")
+        self.assertEqual(pending["tool"], self.TOOL)
+        self.assertEqual(pending["mode"], "live")
+        self.assertEqual(pending["session_id"], "s1")
+        self.assertEqual(pending["status"], "pending")
+        self.assertEqual(set(pending), {"id", "at", "expires_at", "mode", "tool", "operation",
+                                        "session_id", "status", "summary"})
+        self.assertEqual([field["label"] for field in pending["summary"]["fields"]][:2],
+                         ["账户", "市场"])
+        self.assertTrue(pending["expires_at"] > pending["at"])
+
+        decided = self.decide(decision="approved")
+        self.assertEqual(decided, {"id": pending["id"], "decision": "approved",
+                                   "tool": self.TOOL, "operation": "下单"})
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "批准后等待方必须立即解除阻塞")
+        self.assertEqual(outcome["decision"], "approved")
+        self.assertEqual(outcome["reason"], "用户在工作台确认")
+        self.assertEqual(outcome["id"], pending["id"])
+        self.assertIsNone(sa.confirmation_view(self.home))
+
+        kinds = [row["kind"] for row in self.activity()]
+        self.assertEqual(kinds, ["confirmation_requested", "confirmation_approved"])
+        approved = self.activity()[1]
+        self.assertEqual(approved["confirmation_id"], pending["id"])
+        self.assertEqual(approved["session_id"], "s1")
+        self.assertEqual(approved["summary"][0]["label"], "账户")
+
+    def test_reject_resolves_as_rejected_and_keeps_the_record(self):
+        pending, outcome, thread = self.start()
+        self.decide(decision="rejected")
+        thread.join(5)
+        self.assertEqual(outcome["decision"], "rejected")
+        self.assertEqual(outcome["reason"], "用户在工作台拒绝")
+        self.assertIsNone(sa.confirmation_view(self.home))
+        self.assertEqual([row["kind"] for row in self.activity()],
+                         ["confirmation_requested", "confirmation_rejected"])
+
+    # —— 失败路径 ——
+    def test_timeout_is_rejected_fail_closed(self):
+        outcome = sa.request_confirmation(self.home, tool=self.TOOL, mode="live",
+                                          args=self.ARGS, session_id="s1", ttl_ms=40)
+        self.assertEqual(outcome["decision"], "rejected")
+        self.assertIn("未确认", outcome["reason"])
+        self.assertIsNone(sa.confirmation_view(self.home))
+        stored = self.activity()
+        self.assertIn("confirmation_expired", [row["kind"] for row in stored])
+        expired = next(row for row in stored if row["kind"] == "confirmation_expired")
+        self.assertIn("超过", expired["note"])
+
+    def test_signal_already_set_cancels_immediately(self):
+        signal = threading.Event()
+        signal.set()
+        outcome = sa.request_confirmation(self.home, tool=self.TOOL, mode="live",
+                                          args=self.ARGS, session_id="s1", signal=signal)
+        self.assertEqual(outcome["decision"], "rejected")
+        self.assertEqual(outcome["reason"], "会话已中断")
+        self.assertIsNone(sa.confirmation_view(self.home))
+        self.assertIn("confirmation_cancelled", [row["kind"] for row in self.activity()])
+
+    def test_signal_cancel_while_waiting(self):
+        """等待中被取消：后台线程发起，主线程 set() 之后线程立即返回拒绝。"""
+        signal = threading.Event()
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.update(sa.request_confirmation(
+                self.home, tool=self.TOOL, mode="live", args=self.ARGS, session_id="s1",
+                signal=signal)), daemon=True)
+        thread.start()
+        self.wait_for_pending()
+        signal.set()
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "取消后等待方必须解除阻塞")
+        self.assertEqual(outcome["decision"], "rejected")
+        self.assertEqual(outcome["reason"], "会话已中断")
+        self.assertIsNone(sa.confirmation_view(self.home))
+        self.assertEqual([row["kind"] for row in self.activity()],
+                         ["confirmation_requested", "confirmation_cancelled"])
+
+    def test_unknown_id_and_invalid_decision_are_errors(self):
+        self.start()
+        with self.assertRaises(sa.WorkbenchError) as caught:
+            self.decide(decision="maybe")
+        self.assertEqual(str(caught.exception), "Invalid decision; expected approved/rejected")
+        with self.assertRaises(sa.WorkbenchError) as caught:
+            self.decide(confirmation_id="wrong")
+        self.assertEqual(str(caught.exception), "确认编号不匹配；可能已被处理或已超时")
+        # 编号不匹配不得顺手清掉待确认项：正确编号仍能批准
+        self.assertIsNotNone(sa.confirmation_view(self.home))
+        self.decide(decision="approved")
+        self.assertIsNone(sa.confirmation_view(self.home))
+
+    def test_decide_without_pending_and_repeat_decide(self):
+        with self.assertRaises(sa.WorkbenchError) as caught:
+            self.decide(decision="approved")
+        self.assertEqual(str(caught.exception), "没有待确认的实盘操作（可能已超时或被处理）")
+
+        pending, outcome, thread = self.start()
+        self.decide(decision="approved")
+        thread.join(5)
+        with self.assertRaises(sa.WorkbenchError) as caught:
+            self.decide(confirmation_id=pending["id"], decision="approved")
+        self.assertEqual(str(caught.exception), "没有待确认的实盘操作（可能已超时或被处理）")
+        self.assertEqual(outcome["decision"], "approved")
+
+    def test_only_one_pending_at_a_time(self):
+        _, first, thread = self.start()
+        second = sa.request_confirmation(self.home, tool="mcp__futu__trading_cancel_order",
+                                         mode="live", args={"order_id": "1"}, session_id="s1")
+        self.assertEqual(second["decision"], "rejected")
+        self.assertIsNone(second["id"])
+        self.assertIn("已有一笔待确认", second["reason"])
+        # 第一笔仍然有效
+        self.decide(decision="approved")
+        thread.join(5)
+        self.assertEqual(first["decision"], "approved")
+
+    def test_invalid_arguments_are_rejected_before_touching_the_table(self):
+        cases = [
+            ({"tool": self.TOOL, "mode": "sim"}, "只有实盘写操作需要业务确认"),
+            ({"tool": self.TOOL, "mode": "paper"}, "Invalid account mode; expected sim/live"),
+            ({"tool": "  ", "mode": "live"}, "Invalid tool name"),
+            ({"tool": None, "mode": "live"}, "Invalid tool name"),
+        ]
+        for kwargs, message in cases:
+            with self.subTest(kwargs=kwargs):
+                with self.assertRaises(sa.WorkbenchError) as caught:
+                    sa.request_confirmation(self.home, ttl_ms=1, **kwargs)
+                self.assertEqual(str(caught.exception), message)
+        self.assertIsNone(sa.confirmation_view(self.home))
+
+    def test_pending_table_is_per_home(self):
+        """内存态按 home 分槽：同一进程里两个 home 的待确认互不可见（跨进程边界的最小类比）。"""
+        other = self.home / "other"
+        other.mkdir()
+        self.start()
+        self.assertIsNotNone(sa.confirmation_view(self.home))
+        self.assertIsNone(sa.confirmation_view(other))
+        with self.assertRaises(sa.WorkbenchError):
+            sa.decide_confirmation(other, confirmation_id="x", decision="approved")
+        self.decide(decision="approved")
 
 
 class WriteLockTest(StoreAccessBase):

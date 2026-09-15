@@ -38,6 +38,8 @@ ENDPOINTS = [
     "snapshot", "switch-mode", "series", "equity", "positions", "correlation",
     "sensitivity", "risk", "trades", "events", "factors", "ic", "audit", "sources",
     "instrument", "quality", "plan", "plan-execute", "schedule", "reconcile",
+    # 2026-09-15 业务确认：读待确认（不进缓存）+ 唯一的人工批准通道
+    "confirmation", "confirm-decide",
 ]
 
 
@@ -130,7 +132,7 @@ class ContractTests(Base):
         body = response.json()
         self.assertTrue(body["ok"])
         self.assertEqual(body["value"]["endpoints"], ENDPOINTS)
-        self.assertEqual(len(body["value"]["endpoints"]), 20)
+        self.assertEqual(len(body["value"]["endpoints"]), 22)
         self.assertEqual(body["value"]["mode"], "sim")
         self.assertIn("generated_at", body["value"])
 
@@ -642,6 +644,89 @@ class PlanExecuteTests(Base):
         self.assertEqual(self.pending(), [])
 
 
+class ConfirmationRoutesTests(Base):
+    """业务确认路由契约（2026-09-15 修订）：22 端点白名单、confirmation 不缓存、批准走 HTTP。
+
+    业务确认的语义细节（TTL/取消/重复决定/工具面排除）在
+    ``tests/test_wp6_service_approval.py`` 的 R2′ 与 ``tests/test_wp6_store_access.py`` 的
+    ``ConfirmationTest``；这里只钉服务面契约：路由可达、信封同形、**不进缓存**、批准通道
+    经 HTTP 路由真的能让阻塞中的 ``request_confirmation`` 放行。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.app = self.make_app()
+        self.client = self.client(self.app)
+
+    def pending(self):
+        return self.post(self.client, "confirmation").json()["value"]["pending"]
+
+    def start(self, **overrides):
+        kwargs = {"tool": "mcp__futu__trading_input_order", "mode": "live",
+                  "args": {"symbol": "TSLL", "qty": 4}, "session_id": "s1"}
+        kwargs.update(overrides)
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.update(
+                store_access.request_confirmation(str(self.home), **kwargs)), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            view = self.pending()
+            if view is not None:
+                return view, outcome, thread
+            time.sleep(0.005)
+        self.fail("3 秒内未出现待确认项")
+
+    def test_both_endpoints_are_whitelisted_and_snapshot_declares_them(self):
+        self.assertEqual(len(store_access.endpoints()), 22)
+        self.assertIn("confirmation", store_access.endpoints())
+        self.assertIn("confirm-decide", store_access.endpoints())
+        declared = self.post(self.client, "snapshot").json()["value"]["endpoints"]
+        self.assertEqual(declared, ENDPOINTS)
+
+    def test_confirmation_takes_no_payload_and_is_never_cached(self):
+        first = self.post(self.client, "confirmation", {})
+        self.assertEqual(first.status_code, 200)
+        body = first.json()
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(body["value"], {"pending": None, "ttl_ms": store_access.CONFIRM_TTL_MS})
+        self.assertNotIn("cached", body)
+        second = self.post(self.client, "confirmation", {}).json()
+        self.assertNotIn("cached", second, "confirmation 直读内存态，绝不能进 TTL 缓存")
+        self.assertNotIn("cached_at", second)
+        # handle 层与 HTTP 同源：同一载荷同结果
+        self.assertEqual(self.app.state.handle("confirmation", {}), body)
+
+        bad = self.post(self.client, "confirmation", {"mode": "sim"}).json()
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["error"]["message"], "confirmation takes no payload")
+
+    def test_confirm_decide_envelope(self):
+        cases = [
+            ({}, "Invalid decision; expected approved/rejected"),
+            ({"id": "x", "decision": "no"}, "Invalid decision; expected approved/rejected"),
+            ({"id": "x", "decision": "approved"}, "没有待确认的实盘操作（可能已超时或被处理）"),
+            ({"id": "x", "decision": "approved", "price": 9.3}, "Unexpected confirm-decide field"),
+        ]
+        for payload, message in cases:
+            with self.subTest(payload=payload):
+                body = self.post(self.client, "confirm-decide", payload).json()
+                self.assertFalse(body["ok"], body)
+                self.assertEqual(body["error"]["code"], "trading/invalid-operation")
+                self.assertEqual(body["error"]["message"], message)
+
+    def test_http_approval_releases_the_blocked_call(self):
+        view, outcome, thread = self.start()
+        decided = self.post(self.client, "confirm-decide",
+                            {"id": view["id"], "decision": "approved"}).json()
+        self.assertTrue(decided["ok"], decided)
+        thread.join(5)
+        self.assertEqual(outcome["decision"], "approved")
+        self.assertEqual(outcome["reason"], "用户在工作台确认")
+        self.assertIsNone(self.pending())
+
+
 class StaticTests(Base):
     """静态托管：200 / SPA 兜底 / 未构建 404 / 路径穿越 403。"""
 
@@ -747,7 +832,7 @@ class StaticTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": f"http://127.0.0.1:{port}",
                                 "mcp": f"http://127.0.0.1:{port}/mcp",
-                                "tools": 25, "auth": "loopback-only"})
+                                "tools": 26, "auth": "loopback-only"})
 
     def test_bad_encoding_is_400(self):
         dist = self.make_dist()
@@ -1283,7 +1368,7 @@ class RunEntryTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": "http://127.0.0.1:41234",
                                 "mcp": "http://127.0.0.1:41234/mcp",
-                                "tools": 25, "auth": "loopback-only"})
+                                "tools": 26, "auth": "loopback-only"})
         line = run_module.ready_line(("127.0.0.1", 8397),
                                      {"port": 8397, "host": "127.0.0.1", "token": "t"})
         self.assertEqual(line["auth"], "token")

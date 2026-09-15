@@ -280,7 +280,7 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 
 **WP6 起同一批端点在 `platform/` 独立服务进程内以 `POST /api/wb/<endpoint>` 暴露**
 （envelope 契约不变：`{ok, value?, cached?, cached_at?, error?{code,message,details}}`）；
-`/mcp` 的 25 个 MCP 工具与 HTTP 路由在该进程内调用**同一批 Python 处理函数**
+`/mcp` 的 26 个 MCP 工具与 HTTP 路由在该进程内调用**同一批 Python 处理函数**
 （同一 `(endpoint, payload) -> envelope`），行为对等由代码结构 + 审批回归矩阵共同保障。
 `snapshot` / `switch-mode` 之外，WP4 新增 4 个受约束端点
 （读侧一律经只读子命令取数，Node 侧经 `pycore`、Python 侧经 `trading_core snapshot-*`
@@ -294,12 +294,30 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 | `plan-execute` | `{plan_hash, expected_mode, confirmation?}` | live 需口令「确认执行」；服务端复核冻结状态/hash/mode；成功只返回 `{queued, nonce}`，状态经 `plan` 轮询 |
 | `schedule` | `{}` | daemon 心跳、作业历史、下次运行 |
 | `reconcile` | `{}` | 最近对账差异、TCA 摘要、告警列表 |
+| `confirmation` | `{}`（空载荷，**不进缓存**） | `{pending, ttl_ms}`；`pending` 为待用户确认的实盘写操作（编号、工具、中文订单摘要、创建/到期时间）或 `null` |
+| `confirm-decide` | `{id, decision: "approved"\|"rejected"}` | 提交用户的决定；**唯一能批准实盘操作的通道**，只由独立 Web 的用户点击触发（不进 MCP 工具面） |
 
-除 `plan-execute`（执行已冻结计划，白名单指令落盘）外，不开放下单、shell、LLM 或
-token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
+除 `plan-execute`（执行已冻结计划，白名单指令落盘）与 `confirm-decide`（人工批准）外，
+不开放下单、shell、LLM 或 token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
+
+**业务确认的跨进程边界（诚实清单，2026-09-15 业务确认修订）**：实盘写操作的确认是
+“此刻等人回答”的**内存态**，刻意不落盘（进程重启后无人回答，落盘会让陈旧请求复活；
+持久化的只有 `activity` 里的事件留痕）。因此 **Harness 进程与独立服务进程各自持有自己的
+待确认表，互不可见**：
+
+- Harness 会话里实盘写操作触发的确认，**独立 Web 的 `confirmation` 端点读不到**（它会
+  诚实地显示为空，而不是“没有待确认＝不需要确认”）；该笔确认只能在 **Harness 内的
+  工作台面板**作答（同进程，Connection RPC 的 `confirmation`/`confirm-decide`）。
+- 服务进程的 `confirmation`/`confirm-decide` 只反映**服务自身处理函数发起**的确认。
+- 两进程共享的是数据文件（store JSON、指令目录）与只读快照，**确认表不在共享之列**；
+  若将来需要跨进程作答，正确做法是把请求/裁决落到共享文件（复用现有原子写与租约协议），
+  那是一项需要同时改 Node 侧的变更。
+
+`confirmation` 与 `confirm-decide` 因此是**同一进程内**的读/答两端，不是跨进程确认总线；
+页面若展示待确认列表，必须同时标注这条限制（服务侧看不到 Harness 的待确认）。
 
 **端点声明自检（前端）**：`snapshot` 响应带 `endpoints` 数组（服务端 `store_access.endpoints()`，
-恰 20 项），前端 `services/endpoints.js` 用纯函数比对本次要调的端点；未声明即
+恰 22 项），前端 `services/endpoints.js` 用纯函数比对本次要调的端点；未声明即
 「服务未提供 X（服务版本陈旧，请重启服务后刷新）」并**不发起请求**
 （`services/api.js` 接线；服务端 404 分支保留作兜底；声明集合取不到时一律放行，
 不把旧服务拦死）。

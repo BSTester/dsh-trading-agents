@@ -14,11 +14,12 @@ JS 源被改动而 Python 没跟上时立刻红。Python 侧一律直接 import 
 本文件因 ``FileNotFoundError`` 变成整套测试的红。
 
 覆盖：
-  * rpc.js ``CACHE_TTL_MS`` ↔ ``caches.CACHE_TTL_MS``；
-  * endpoints.js ``ENDPOINT_SHAPE`` ↔ ``caches.ENDPOINT_SHAPE``；
-  * endpoints.js ``ENDPOINTS`` ↔ ``store_access.endpoints()``；
+  * rpc.js ``CACHE_TTL_MS`` ↔ ``caches.CACHE_TTL_MS``（业务确认两端点**都不在**表里 = TTL 0）；
+  * endpoints.js ``ENDPOINT_SHAPE`` ↔ ``caches.ENDPOINT_SHAPE``（含 ``confirmation: ["pending"]``）；
+  * endpoints.js ``ENDPOINTS`` ↔ ``store_access.endpoints()``（22 端点，含 confirmation/confirm-decide）；
   * rpc.js 各端点 allowed 字段表 ↔ ``app.ANALYTICS_ENDPOINTS`` / ``SWITCH_MODE_FIELDS``
-    / ``PLAN_EXECUTE_FIELDS`` / ``SERIES_FIELDS`` / ``EMPTY_PAYLOAD_ENDPOINTS``；
+    / ``CONFIRM_DECIDE_FIELDS`` / ``PLAN_EXECUTE_FIELDS`` / ``SERIES_FIELDS``
+    / ``EMPTY_PAYLOAD_ENDPOINTS``；
   * analytics.js + series.js 的内层缓存 TTL ↔ ``compute.INNER_CACHE_TTL_MS``；
   * analytics.js 的逐端点 timeout ↔ ``compute.ENDPOINT_TIMEOUT_MS`` / ``compute.TIMEOUT``。
 """
@@ -83,10 +84,14 @@ def js_shape_table(text):
 
 
 def js_endpoint_list(text):
-    """endpoints.js:12-33 的 ``ENDPOINTS`` 数组。"""
+    """endpoints.js:12-37 的 ``ENDPOINTS`` 数组（先剥 ``//`` 行注释）。
+
+    必须剥注释：数组内的业务确认注释里带 ASCII 双引号（``"待确认"``），不剥会被字符串正则
+    误当成第 23 个端点（``store_access.endpoints()`` 侧同样剥注释，两边口径一致）。
+    """
     block = re.search(r"export const ENDPOINTS = \[(.*?)\];", text, re.S)
     assert block, "endpoints.js 里找不到 ENDPOINTS"
-    return js_strings(block.group(1))
+    return js_strings(re.sub(r"//[^\n]*", "", block.group(1)))
 
 
 def js_allowed_fields(text):
@@ -118,13 +123,28 @@ class CacheTtlLockTests(unittest.TestCase):
         self.assertEqual(js_cache_ttls(RPC_JS), dict(caches.CACHE_TTL_MS))
         self.assertEqual(js_cache_ttls(RPC_JS)["instrument"], 10 * 60_000)
 
+    def test_business_confirmation_endpoints_are_not_cached(self):
+        """业务确认两端点 TTL 恒为 0：rpc.js 的 CACHE_TTL_MS 本就不含它们，Python 侧同样不加。
+
+        缓存住「待确认」会让界面拿到已经处理掉的请求（rpc.js:116 的注释），因此这里既比对 JS
+        源（``test_cache_ttl_table_matches_rpc_js`` 已逐项相等），也显式钉死「不在表里」。
+        """
+        for endpoint in ("confirmation", "confirm-decide"):
+            self.assertNotIn(endpoint, js_cache_ttls(RPC_JS), endpoint)
+            self.assertNotIn(endpoint, caches.CACHE_TTL_MS, endpoint)
+            self.assertEqual(caches.CACHE_TTL_MS.get(endpoint, 0), 0, endpoint)
+
 
 class EndpointTableLockTests(unittest.TestCase):
     def test_shape_table_matches_endpoints_js(self):
         self.assertEqual(js_shape_table(ENDPOINTS_JS), dict(caches.ENDPOINT_SHAPE))
+        self.assertEqual(caches.ENDPOINT_SHAPE["confirmation"], ["pending"])
 
     def test_endpoint_list_matches_endpoints_js(self):
-        self.assertEqual(js_endpoint_list(ENDPOINTS_JS), store_access.endpoints())
+        endpoints = js_endpoint_list(ENDPOINTS_JS)
+        self.assertEqual(endpoints, store_access.endpoints())
+        self.assertEqual(len(endpoints), 22)
+        self.assertEqual(endpoints[-2:], ["confirmation", "confirm-decide"])
 
     def test_analytics_endpoints_are_declared_by_endpoints_js(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))
@@ -141,8 +161,11 @@ class WhitelistLockTests(unittest.TestCase):
         # guards[0] 是 platform/server/rpc fetch 的 RPC 信封白名单（与端点无关）
         self.assertEqual(guards[0], ["type", "rpcId", "method", "payload"])
         self.assertIn(list(app_module.SWITCH_MODE_FIELDS), guards)
+        self.assertIn(list(app_module.CONFIRM_DECIDE_FIELDS), guards)
         self.assertIn(list(app_module.PLAN_EXECUTE_FIELDS), guards)
         self.assertIn(list(app_module.SERIES_FIELDS), guards)
+        # 确认通道的载荷只有 id/decision：白名单外字段在 handle 层就被拒（不能变成下单通道）
+        self.assertEqual(list(app_module.CONFIRM_DECIDE_FIELDS), ["id", "decision"])
 
     def test_empty_payload_endpoints_match_rpc_js(self):
         named = set(re.findall(r'WorkbenchError\("([a-z-]+) takes no payload"\)', RPC_JS))
@@ -154,6 +177,7 @@ class WhitelistLockTests(unittest.TestCase):
         templated = set(re.findall(r'endpoint === "([a-z-]+)"', window))
         self.assertEqual(named | templated | {"snapshot"},
                          set(app_module.EMPTY_PAYLOAD_ENDPOINTS))
+        self.assertIn("confirmation", app_module.EMPTY_PAYLOAD_ENDPOINTS)
         self.assertIn('endpoint === "snapshot" && Object.keys(payload).length === 0', RPC_JS)
 
 

@@ -12,9 +12,9 @@
 
 | # | 立项原文 | 本规格落地口径 |
 |---|---|---|
-| 1 | 工作台一切能力经 MCP 暴露给 Harness（与面板完全对等，非子集） | 6a：独立 **FastAPI（Python）服务进程**，MCP 工具面 = **25 个工具**（§3：20 端点对等 + 5 维护动作）；HTTP 与 MCP 两条通道在**同一进程内调用同一批处理函数**，数据路径复用既有 Python 计算脚本与指令协议——行为对等由代码结构 + §5.2 审批回归矩阵共同保障 |
+| 1 | 工作台一切能力经 MCP 暴露给 Harness（与面板完全对等，非子集） | 6a：独立 **FastAPI（Python）服务进程**，MCP 工具面 = **26 个工具**（§3：21 端点工具 + 5 维护动作；22 端点中 `confirm-decide` **有意排除**，见 §3.1）；HTTP 与 MCP 两条通道在**同一进程内调用同一批处理函数**，数据路径复用既有 Python 计算脚本与指令协议——行为对等由代码结构 + §5.2 审批回归矩阵共同保障 |
 | 2 | 工作台 UI 用 Ant Design Pro 重实现（脱离 Harness 面板宿主，独立 Web） | 6b：同一服务进程托管 HTTP API + 静态前端（11 页签全量重实现），浏览器不再依赖 Harness Connection |
-| 3 | Harness 定位不变：入口 = 决策与操作确认；固定信息收集由服务定时跑 | 6c：preset 行替换 + 审批回归（§五）。固定信息收集 = 既有 daemon 作业链（WP4 已交付），服务自身不做新调度；Harness 会话内逐笔确认、原生审批、口令门槛一条不少 |
+| 3 | Harness 定位不变：入口 = 决策与操作确认；固定信息收集由服务定时跑 | 6c：preset 行替换 + 审批回归（§五）。固定信息收集 = 既有 daemon 作业链（WP4 已交付），服务自身不做新调度；Harness 会话内逐笔确认（2026-09-15 修订：改为工作台**业务确认**作答，不走原生 approval）、口令门槛一条不少 |
 
 ### 1.2 非目标（明确不做）
 
@@ -30,7 +30,7 @@
 ┌─ Harness 进程（不动） ─────────────────────────────┐
 │ engine 工具（8 个对话工具） + policy.js 三层审批     │
 │ workbench Host 插件（tradingWorkbench 服务锚）       │
-│   └ Connection RPC 20 端点（legacy 面板过渡期保留）  │
+│   └ Connection RPC 22 端点（legacy 面板过渡期保留）  │
 └──────────────┬────────────────────────────────────┘
                │ 同一份数据文件（无网络）
 ┌─ 独立服务进程（WP6 新增，FastAPI/uvicorn：cd platform && ~/.dsh/trading-venv/bin/python -m server.run）─┐
@@ -53,7 +53,7 @@
 
 ### 3.1 盘点方法与对等性定义
 
-- 盘点基准（2026-09-15，代码为证）：`plugins/workbench/src/endpoints.js` 20 端点、`client.js` 11 页签、`scripts/workbench_admin.mjs` 5 维护动作、`store.js` snapshot/switchMode。
+- 盘点基准（2026-09-15，代码为证）：`plugins/workbench/src/endpoints.js` 22 端点（2026-09-15 业务确认修订新增 `confirmation`/`confirm-decide`）、`client.js` 11 页签、`scripts/workbench_admin.mjs` 5 维护动作、`store.js` snapshot/switchMode/业务确认三方法。
 - **对等**定义为：面板能做的每一件事，在 MCP 面上存在一个工具，且 HTTP 端点与 MCP 工具在服务进程内**调用同一批处理函数**（同一 `(endpoint, payload) -> {ok, value|error}` envelope）。与 legacy 面板的对等 = 同一数据文件协议、同一批 Python 计算脚本（同参数同解析）、同一指令目录协议；行为对等由 §5.2 审批回归矩阵逐条验证。工具面新增能力 = 维护动作 5 项（原仅 shell 脚本可达）+ `confirmation` 读工具（2026-09-15 业务确认修订）；**唯一有意排除的端点是 `confirm-decide`**（人工决定通道）。
 - 工具面**白名单之外无任何工具**：无任意执行、无 shell、无文件读写、无 LLM、无 token 读取。tools/list 快照测试锁定总数与名单（§5.2 T6）。
 
@@ -122,7 +122,7 @@
 | 24 | `admin_cancel_stale` | hours?（默认 2） | 取消超时仍 running 的 run |
 | 25 | `admin_prune_runs` | hours?（默认 2） | 删除超时孤儿 run（无研报者） |
 
-实现走 `WorkbenchStore` 直接方法（`cancelRun/cancelStaleRuns/pruneAbandonedRuns`），不经 RPC handler（它们是 Node 侧数据维护，与 20 端点同库同锁）。原 shell 脚本保留（薄封装同一方法）。
+实现走 `WorkbenchStore` 直接方法（`cancelRun/cancelStaleRuns/pruneAbandonedRuns`），不经 RPC handler（它们是 Node 侧数据维护，与 22 端点同库同锁）。原 shell 脚本保留（薄封装同一方法）。
 
 ### 3.5 不入工具面的能力（防止面面俱到变成面面俱漏）
 
@@ -157,7 +157,7 @@
 | MCP 传输 | streamable-http | 与 preset futu-mcp 行同构，dsh-mcp-client 支持 |
 | 端口/绑定 | 默认 8397 / 127.0.0.1，`~/.dsh/trading-platform.json` `{"service":{"port","token","host"}}` 可覆盖 | 新增约定（文件缺失取默认） |
 
-锁定测试：`tests/test_wp6_service_locks.py`（25 工具名单与黑名单、端点集 = 从 `plugins/workbench/src/endpoints.js` 文本提取、config/端口/口令常量）+ `tests/test_core_wp6_locks.py`（指令白名单仍 5 种、口令字符串常量）。上游 schema 变化时人工重跑核验并更新本表。
+锁定测试：`tests/test_wp6_service_locks.py`（26 工具名单与黑名单、`confirm-decide` 排除常量、端点集 = 从 `plugins/workbench/src/endpoints.js` 文本提取、config/端口/口令常量）+ `tests/test_core_wp6_locks.py`（指令白名单仍 5 种、口令字符串常量）。上游 schema 变化时人工重跑核验并更新本表。
 
 ## 四、Part B：Ant Design Pro 迁移方案（6b）
 
@@ -242,6 +242,10 @@ platform/web/
 
 WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 FastAPI 进程内**必须调用同一批处理函数**（HTTP 路由与 MCP 工具是同一函数的两个薄壳），使 A3/A4 在新入口上零新增逻辑——这是回归方案的核心架构手段。注意：A3/A4 的服务端处理函数是 **Python 移植版**（与 Node Host 的 `store.switchMode`/plan-execute 分支行为逐条等价），其等价性由 R3/R4 的 Python 回归逐断言钉死。
 
+**业务确认的跨进程边界（A2 的服务侧移植，必须如实标注）**：确认是「此刻等人回答」的**内存态**（`store.js:136` 刻意不落盘），因此 **Harness 进程与服务进程各持一份待确认表，互不可见**。服务侧 `confirmation`/`confirm-decide`（Python `store_access.request_confirmation/confirmation_view/decide_confirmation`）只反映**服务自身处理函数发起**的确认；Harness 会话里 `trading_*` 写操作触发的确认在独立 Web 上读不到（`pending` 诚实地为 `null`，不是「不需要确认」），**该笔只能回 Harness 内的工作台面板作答**。两进程共享的是数据文件与只读快照，确认表不在共享之列。
+- 页面/文档责任：任何展示待确认列表的界面必须同时标注这条限制（服务侧看不到 Harness 的待确认）。
+- 最小缓解（本次不做，规格以 main 的 Node 实现为准）：主会话继续在 Harness 面板作答；将来若要跨进程，把请求/裁决落到共享文件（复用现有原子写 + 租约协议），届时须同时改 Node 侧。
+
 ### 5.2 自动回归矩阵（三层；2026-09-15 FastAPI 架构修订后重排）
 
 **Node 层**（`tests/wp6-approval-regression.test.mjs`，离线，临时 DSH_HOME）——只保留策略链条（A1/A2，代码在 Harness 进程内，不受服务架构变更影响）：
@@ -258,7 +262,7 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 | R2′ | 服务侧业务确认：HTTP `confirmation` 读待确认项（含 ttl）；`confirm-decide` 批准/拒绝改变 `confirmationView()`；**MCP 工具面不含 `confirm_decide`**（模型无法自批实盘单，R5 断言） |
 | R3 | 服务层 `switch_mode`：无口令 live 拒绝；错口令拒绝；对口令成功且 `order_authorized:false`；`expected_mode` 过期拒绝；租约期间拒绝；**MCP 工具 `switch_mode` 对 mode:"live" 无论口令一律拒绝（trading/live-switch-web-only）** |
 | R4 | 服务层 `plan_execute`：live 无口令拒绝；带口令 → `{queued:true,nonce}`；指令文件落盘含 `plan_hash/expected_mode` 且**不含口令字段**；action 四映射到白名单指令；白名单外 action 拒绝 |
-| R5 | 工具面封闭：FastMCP tools/list 恰 25；端点工具集 ≡ ENDPOINTS（从 endpoints.js 文本提取）；无黑名单名（exec/shell/file/token/write_file） |
+| R5 | 工具面封闭：FastMCP tools/list 恰 **26**；端点工具集 ≡ ENDPOINTS − `confirm-decide`（22 − 1 = 21，从 endpoints.js 文本提取）；**`confirm_decide` 不在名单**（不变式：模型不能自批实盘单）；无黑名单名（exec/shell/file/token/write_file） |
 | R6 | HTTP 与 MCP 同源：同一 payload 经 `/api/wb/*` 与 MCP 工具调用结果一致（稳定字段断言） |
 
 | 用例 | 断言（文件：`tests/test_core_wp6_approval.py`，维持） |
@@ -271,17 +275,17 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 
 | 用例 | 断言 |
 |---|---|
-| S1 | 起真实服务 → 客户端 initialize → tools/list 恰 25 且与清单一致 |
+| S1 | 起真实服务 → 客户端 initialize → tools/list 恰 **26** 且与清单一致（含 `confirmation` 读工具；**不含 `confirm_decide`**） |
 | S2 | call snapshot → ok；call switch_mode(live, confirmation=「确认实盘」) → ok:false（trading/live-switch-web-only）且模式仍 sim |
 | S3 | call plan_execute(未知 plan) → queued 排队成功（校验在 daemon）；HTTP /api/wb/snapshot 与 MCP snapshot 稳定字段同值 |
 | S4 | 未声明端点 POST /api/wb/not-an-endpoint → 404 语义，无旁路 |
 
 ### 5.3 人工会话回归清单（preset 更新后，新会话执行，记录进 WP6 验收记录）
 
-1. 新建 Harness 会话：`mcp__quantwb__*` 25 工具出现（tools 列表核对）；
+1. 新建 Harness 会话：`mcp__quantwb__*` 26 工具出现（tools 列表核对；**无 `confirm_decide`**）；
 2. sim 下调 `mcp__quantwb__switch_mode(live, expected=sim)`（带不带口令各试一次）→ 一律拒绝（trading/live-switch-web-only），模式不变；
 3. 独立 Web 切 live：口令「确认实盘」→ 页头 LIVE 徽章；`quant_switch` 仍拒 live；
-4. live 下对话请求一个 `mcp__futu__trading_*` 查询/写工具 → Harness 原生审批卡出现（ask）——确认与拒绝各演练一次；
+4. live 下对话请求一个 `mcp__futu__trading_*` 写工具 → **不再出现 Harness 原生审批卡**，而是由插件发起业务确认：Harness 内工作台面板出现待确认（中文订单摘要），批准/拒绝各演练一次（批准 → 放行，拒绝/超时 → deny）；同一笔在独立 Web 的 `confirmation` 端点上**看不到**（跨进程内存态，见 §5.1 末段）；
 5. 独立 Web 计划页 live 执行：无口令拒；带口令 → queued；`scripts/drills.sh` kill 演练联动拒单。
 
 ### 5.4 preset 行替换明细（6c）

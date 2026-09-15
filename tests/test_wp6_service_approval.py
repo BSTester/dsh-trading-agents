@@ -1,16 +1,20 @@
-"""WP6 补遗任务 D 服务面审批回归（规格 §5.2 Python 层 R3–R6，FastAPI 架构修订版）。
+"""WP6 补遗任务 D 服务面审批回归（规格 §5.2 Python 层 R2′/R3–R6，FastAPI 架构修订版）。
 
 覆盖（全部离线；TestClient + 临时 DSH_HOME + MCP 工具函数直调）：
 
+  * R2′ —— 服务侧业务确认（2026-09-15 main 修订）：HTTP ``confirmation`` 空载荷读待确认项
+    （含 ttl_ms、不进缓存）、``confirm-decide`` 批准/拒绝改变 ``confirmation_view``、未知编号/
+    非法 decision/多余字段的信封；**MCP 工具面不含 ``confirm_decide``**（模型不能自批实盘单）；
   * R3 —— 服务层 ``switch_mode`` 全矩阵（无口令/错口令/对口令 + order_authorized:false/
     expected_mode 过期/在途租约），以及**MCP 通道分级**：``mode:"live"`` 无论口令一律拒
     （trading/live-switch-web-only），且该分支不触达 handle、不触达 store（记录型替身零调用）；
   * R4 —— 服务层 ``plan_execute``：live 无口令拒、带口令 → queued+nonce、指令文件含
     plan_hash/expected_mode 且无口令字段、action 四映射、白名单外 action 拒；
-  * R5 —— 工具面封闭：tools/list 恰 25、名单 ≡ mcp_tools 清单、端点工具集 ≡ store_access.endpoints()、
-    输入字段与规格 §3.2/§3.4 逐项一致、无黑名单名、未知名不触达 handle；增补 5 个维护工具在真
-    run 的临时 store 上的全量行为（status/runs/cancel_run/cancel_stale/prune_runs）与 ``hours``
-    阈值语义（锚 ``scripts/workbench_admin.mjs`` 的 ``hoursArg``）；
+  * R5 —— 工具面封闭：tools/list 恰 26、名单 ≡ mcp_tools 清单、端点工具集 ≡
+    store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS（22 − 1 = 21，唯一排除 confirm-decide）、
+    输入字段与规格 §3.2（含 20b confirmation）/§3.4 逐项一致、无黑名单名、未知名不触达 handle；
+    增补 5 个维护工具在真 run 的临时 store 上的全量行为（status/runs/cancel_run/cancel_stale/
+    prune_runs）与 ``hours`` 阈值语义（锚 ``scripts/workbench_admin.mjs`` 的 ``hoursArg``）；
   * R6 —— HTTP 与 MCP 同源：``app.state.handle`` 同一实例、同一 TTL 缓存、同一 payload 同结果。
 
 MCP 会话客户端（``mcp.client.streamable_http``）只在真进程 loopback 场景才有意义，本文件走
@@ -21,6 +25,8 @@ import asyncio
 import json
 import sys
 import tempfile
+import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -38,7 +44,7 @@ from server import caches, mcp_tools, store_access  # noqa: E402
 ACTION_COMMANDS = {"execute": "execute_plan", "cancel": "cancel_plan",
                    "kill": "kill", "unkill": "unkill"}
 
-# R5 的独立转录：规格 §3.2（表 1-20）/§3.4（表 21-25）「输入」列，``*`` 进必填。
+# R5 的独立转录：规格 §3.2（表 1-20 + 20b confirmation）/§3.4（表 21-25）「输入」列，``*`` 进必填。
 # 与 mcp_tools.TOOLS 是两份分别书写的版本，因此能抓到清单本身的漂移。
 SPEC_FIELDS = {
     "snapshot": ((), ("refresh",)),
@@ -59,6 +65,8 @@ SPEC_FIELDS = {
     "instrument": (("ticker",), ("refresh",)),
     "quality": (("ticker",), ("refresh",)),
     "plan": ((), ("refresh",)),
+    # §3.2 表 20b：只读待确认列表，无业务字段（refresh 与其余无业务字段端点同形）
+    "confirmation": ((), ("refresh",)),
     "plan_execute": ((), ("plan_hash", "expected_mode", "confirmation", "action", "refresh")),
     "schedule": ((), ("refresh",)),
     "reconcile": ((), ("refresh",)),
@@ -172,6 +180,158 @@ class Base(unittest.TestCase):
 
     def run_ids(self):
         return [row["id"] for row in self.store_state()["runs"]]
+
+
+class R2ConfirmationTests(Base):
+    """R2′：服务侧业务确认（规格 §5.2 R2′ + §5.1 A2/A7）。
+
+    ``store_access.request_confirmation`` 是阻塞调用（Node 的 Promise 等价物），因此「等人作答」
+    的用例在后台线程发起、主线程经 HTTP 端点读取与决定。**跨进程边界**：待确认表是**服务进程
+    的内存态**，本类只覆盖服务侧自己发起的确认；Harness（Node 进程）发起的确认在独立 Web 上
+    看不到——那条链路必须回 Harness 面板作答（见 ``store_access`` 文件头与
+    ``docs/architecture.md`` 的端点表说明）。
+    """
+
+    TOOL = "mcp__futu__trading_input_order"
+    ARGS = {"acc_id": "A1", "market": 100, "symbol": "TSLL", "order_type": 1,
+            "order_side": 1, "qty": 4, "price": 9.30}
+
+    def setUp(self):
+        super().setUp()
+        self.app = self.make_app()
+        self.client = self.client(self.app)
+
+    def pending(self):
+        return self.post(self.client, "confirmation").json()["value"]["pending"]
+
+    def activity_kinds(self):
+        state = json.loads(store_access.store_file(self.home).read_text(encoding="utf-8"))
+        return [row["kind"] for row in state["activity"]]
+
+    def start(self, **overrides):
+        """后台线程发起一笔服务侧确认，返回 ``(pending_view, outcome_box, thread)``。"""
+        kwargs = {"tool": self.TOOL, "mode": "live", "args": self.ARGS, "session_id": "s1"}
+        kwargs.update(overrides)
+        outcome = {}
+        thread = threading.Thread(
+            target=lambda: outcome.update(
+                store_access.request_confirmation(str(self.home), **kwargs)), daemon=True)
+        thread.start()
+        deadline = time.monotonic() + 3
+        while time.monotonic() < deadline:
+            view = self.pending()
+            if view is not None:
+                return view, outcome, thread
+            time.sleep(0.005)
+        self.fail("3 秒内未出现待确认项")
+
+    def test_confirmation_endpoint_is_empty_payload_and_not_cached(self):
+        body = self.post(self.client, "confirmation", {}).json()
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(body["value"], {"pending": None, "ttl_ms": store_access.CONFIRM_TTL_MS})
+        self.assertNotIn("cached", body, "confirmation 不进缓存")
+        again = self.post(self.client, "confirmation", {}).json()
+        self.assertNotIn("cached", again, "再读一次同样没有 cached（未走 caches.cached）")
+        bad = self.post(self.client, "confirmation", {"mode": "sim"}).json()
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["error"]["code"], "trading/invalid-operation")
+        self.assertEqual(bad["error"]["message"], "confirmation takes no payload")
+        # 两端点都已在白名单里（否则路由层直接 404）
+        for endpoint in ("confirmation", "confirm-decide"):
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint,
+                              self.post(self.client, "snapshot").json()["value"]["endpoints"])
+                self.assertEqual(self.post(self.client, endpoint, {}).status_code, 200)
+
+    def test_confirm_decide_envelope_for_invalid_inputs(self):
+        cases = [
+            ({}, "Invalid decision; expected approved/rejected"),
+            ({"id": "x", "decision": "maybe"}, "Invalid decision; expected approved/rejected"),
+            ({"id": "x", "decision": "approved"}, "没有待确认的实盘操作（可能已超时或被处理）"),
+            ({"id": "x", "decision": "approved", "price": 1}, "Unexpected confirm-decide field"),
+        ]
+        for payload, message in cases:
+            with self.subTest(payload=payload):
+                body = self.post(self.client, "confirm-decide", payload).json()
+                self.assertFalse(body["ok"], body)
+                self.assertEqual(body["error"]["code"], "trading/invalid-operation")
+                self.assertEqual(body["error"]["message"], message)
+
+    def test_http_approval_is_the_only_channel_and_lets_the_waiting_call_through(self):
+        view, outcome, thread = self.start()
+        self.assertEqual(view["operation"], "下单")
+        self.assertEqual(view["tool"], self.TOOL)
+        self.assertEqual(view["session_id"], "s1")
+        # 只读通道不能批准：HTTP 读 + MCP 读各一次后仍是同一笔待确认、等待方仍未兑现
+        self.assertEqual(self.pending()["id"], view["id"])
+        tool_value = self.mcp_call(self.app, "confirmation", {})["value"]
+        self.assertEqual(tool_value["pending"]["id"], view["id"])
+        self.assertEqual(tool_value["ttl_ms"], store_access.CONFIRM_TTL_MS)
+        self.assertEqual(outcome, {}, "只读通道不得兑现请求")
+        self.assertIsNotNone(self.pending())
+
+        decided = self.post(self.client, "confirm-decide",
+                            {"id": view["id"], "decision": "approved"}).json()
+        self.assertTrue(decided["ok"], decided)
+        self.assertEqual(decided["value"], {"id": view["id"], "decision": "approved",
+                                            "tool": self.TOOL, "operation": "下单"})
+        thread.join(5)
+        self.assertFalse(thread.is_alive(), "批准后等待方必须解除阻塞")
+        self.assertEqual(outcome["decision"], "approved")
+        self.assertEqual(outcome["reason"], "用户在工作台确认")
+        self.assertIsNone(self.pending())
+        self.assertEqual(self.activity_kinds(),
+                         ["confirmation_requested", "confirmation_approved"])
+
+    def test_reject_unknown_id_and_repeat_decide(self):
+        view, outcome, thread = self.start()
+        wrong = self.post(self.client, "confirm-decide",
+                          {"id": "nope", "decision": "approved"}).json()
+        self.assertFalse(wrong["ok"])
+        self.assertEqual(wrong["error"]["message"], "确认编号不匹配；可能已被处理或已超时")
+        self.assertIsNotNone(self.pending(), "编号不匹配不得顺手清掉待确认项")
+
+        rejected = self.post(self.client, "confirm-decide",
+                             {"id": view["id"], "decision": "rejected"}).json()
+        self.assertTrue(rejected["ok"], rejected)
+        self.assertEqual(rejected["value"]["decision"], "rejected")
+        thread.join(5)
+        self.assertEqual(outcome["decision"], "rejected")
+        self.assertEqual(outcome["reason"], "用户在工作台拒绝")
+        self.assertEqual(self.activity_kinds(),
+                         ["confirmation_requested", "confirmation_rejected"])
+        again = self.post(self.client, "confirm-decide",
+                          {"id": view["id"], "decision": "approved"}).json()
+        self.assertFalse(again["ok"])
+        self.assertEqual(again["error"]["message"], "没有待确认的实盘操作（可能已超时或被处理）")
+
+    def test_timeout_is_rejected_and_the_view_empties(self):
+        outcome = store_access.request_confirmation(
+            str(self.home), tool=self.TOOL, mode="live", args=self.ARGS,
+            session_id="s1", ttl_ms=40)
+        self.assertEqual(outcome["decision"], "rejected")
+        self.assertIn("未确认", outcome["reason"])
+        self.assertIsNone(self.pending())
+        self.assertIn("confirmation_expired", self.activity_kinds())
+
+    def test_confirmation_read_tool_is_present_and_confirm_decide_is_absent(self):
+        names = [tool.name for tool in self.app.state.mcp_tools]
+        self.assertEqual(len(names), 26)
+        self.assertIn("confirmation", names)
+        self.assertNotIn("confirm_decide", names)
+        self.assertNotIn("confirm-decide", names)
+
+    def test_confirmation_view_only_reflects_this_process_table(self):
+        """诚实边界：HTTP ``confirmation`` 是服务进程内存表的直读，不做任何跨进程合并。
+
+        服务进程没有 Harness（Node）进程的待确认表，所以页面看到的就是本进程的事实；
+        断言「返回内容 ≡ ``store_access.confirmation_view``」把这条限制钉成契约而非口头承诺。
+        """
+        self.assertIsNone(self.pending())
+        view, _outcome, thread = self.start()
+        self.assertEqual(self.pending(), store_access.confirmation_view(str(self.home)))
+        self.post(self.client, "confirm-decide", {"id": view["id"], "decision": "approved"})
+        thread.join(5)
 
 
 class R3SwitchModeTests(Base):
@@ -348,7 +508,7 @@ class R4PlanExecuteTests(Base):
 
 
 class R5ToolSurfaceTests(Base):
-    """R5：工具面封闭（恰 25 / 端点对等 / 输入字段 / 黑名单 / 未知名不触达 handle）。"""
+    """R5：工具面封闭（恰 26 / 端点对等 − confirm-decide / 输入字段 / 黑名单 / 未知名不触达 handle）。"""
 
     def setUp(self):
         super().setUp()
@@ -357,22 +517,42 @@ class R5ToolSurfaceTests(Base):
     def registered(self):
         return asyncio.run(self.app.state.mcp.list_tools())
 
-    def test_exactly_25_tools_with_the_declared_names(self):
+    def test_exactly_26_tools_with_the_declared_names(self):
         tools = self.registered()
-        self.assertEqual(len(tools), 25)
+        self.assertEqual(len(tools), 26)
         self.assertEqual(len(tools), mcp_tools.TOOL_COUNT)
         self.assertEqual([tool.name for tool in tools],
                          [definition.name for definition in mcp_tools.TOOLS])
 
-    def test_endpoint_tool_set_equals_store_endpoints(self):
-        """端点工具集 ≡ 从 endpoints.js 文本提取的 20 端点（§3.2 的对等性断言）。"""
+    def test_confirm_decide_is_not_a_tool_and_never_reaches_any_channel(self):
+        """不变式 1（规格 §5.1 A7）：``confirm-decide`` 绝不进 MCP 工具面。
+
+        唯一能批准实盘操作的通道必须只由独立 Web 的用户点击触发；做成工具就等于让模型
+        自己发起、自己批准。这里同时断言工具名（连中划线/下划线两种写法都没有）与端点映射表。
+        """
+        names = [definition.name for definition in mcp_tools.TOOLS]
+        self.assertNotIn("confirm_decide", names)
+        self.assertNotIn("confirm-decide", names)
+        self.assertNotIn("confirm_decide", [tool.name for tool in self.registered()])
+        self.assertNotIn("confirm-decide", set(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()))
+        self.assertEqual(mcp_tools.MCP_EXCLUDED_ENDPOINTS, frozenset({"confirm-decide"}))
+        # 只读的 confirmation 工具**在**工具面里（读待确认不是批准）
+        self.assertIn("confirmation", names)
+        with self.assertRaises(Exception) as caught:
+            asyncio.run(self.app.state.mcp.call_tool("confirm_decide", {}))
+        self.assertIn("confirm_decide", str(caught.exception))
+
+    def test_endpoint_tool_set_equals_store_endpoints_minus_excluded(self):
+        """端点工具集 ≡ 从 endpoints.js 提取的 22 端点 − 有意排除集（§3.2 的对等性断言）。"""
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 20)
+        self.assertEqual(len(endpoints), 22)
         forwarded = [definition.endpoint for definition in mcp_tools.TOOLS
                      if definition.endpoint]
-        self.assertEqual(len(forwarded), 20)
-        self.assertEqual(sorted(forwarded), sorted(endpoints))
-        self.assertEqual(sorted(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()), sorted(endpoints))
+        self.assertEqual(len(forwarded), 21)
+        self.assertEqual(sorted(forwarded),
+                         sorted(set(endpoints) - mcp_tools.MCP_EXCLUDED_ENDPOINTS))
+        self.assertEqual(sorted(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()),
+                         sorted(set(endpoints) - mcp_tools.MCP_EXCLUDED_ENDPOINTS))
 
     def test_input_fields_match_the_spec_table(self):
         definitions = {definition.name: definition for definition in mcp_tools.TOOLS}
@@ -423,16 +603,16 @@ class R5ToolSurfaceTests(Base):
         self.assertIsNot(before.get("additionalProperties"), False)
         mcp_tools.register(server, recording_handle()[0], mcp_tools.StoreApi(self.home))
         schemas = {tool.name: tool.input_schema for tool in asyncio.run(server.list_tools())}
-        self.assertEqual(len(schemas), 26)
+        self.assertEqual(len(schemas), 27)
         self.assertEqual(schemas["foreign_tool"], before,
-                         "本模块只应封闭自己注册的 25 个工具")
+                         "本模块只应封闭自己注册的 26 个工具")
         self.assertIs(schemas["series"]["additionalProperties"], False)
 
     def test_unknown_tool_never_reaches_the_handle(self):
         handle, calls = recording_handle()
         server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
         mcp_tools.register(server, handle, mcp_tools.StoreApi(self.home))
-        self.assertEqual(len(asyncio.run(server.list_tools())), 25)
+        self.assertEqual(len(asyncio.run(server.list_tools())), 26)
         with self.assertRaises(Exception) as caught:
             asyncio.run(server.call_tool("not_a_tool", {}))
         self.assertIn("not_a_tool", str(caught.exception))
@@ -561,7 +741,7 @@ class R6SameSourceTests(Base):
         self.client = self.client(self.app)
 
     def test_every_tool_shares_the_app_handle(self):
-        self.assertEqual(len(self.app.state.mcp_tools), 25)
+        self.assertEqual(len(self.app.state.mcp_tools), 26)
         for tool in self.app.state.mcp_tools:
             self.assertIs(tool.handle, self.app.state.handle, tool.name)
 

@@ -46,19 +46,20 @@ SERVICE = "quant-platform"
 def tool_count():
     """工具面清单长度（Node 原实现（已退役）的 ``manifest.length``）。
 
-    任务 D 会把 ``server.mcp_tools`` 填成 25 项真实清单；在那之前按规格取常量 25。
+    正常路径是 ``len(mcp_tools.TOOLS)``（当前 26 项）；导入失败/清单缺失时回退到常量
+    ``mcp_tools.TOOL_COUNT``（仍取不到则用下面这个兜底数字，只为就绪行不至于崩溃）。
     """
     try:
         from server import mcp_tools  # noqa: PLC0415
     except ImportError:
-        return 25
+        return 26
     tools = getattr(mcp_tools, "TOOLS", None)
     if tools is None:
-        return 25
+        return getattr(mcp_tools, "TOOL_COUNT", 26)
     try:
         return len(tools)
     except TypeError:
-        return 25
+        return getattr(mcp_tools, "TOOL_COUNT", 26)
 
 
 def ready_line(address, config):

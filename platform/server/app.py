@@ -1,11 +1,13 @@
 """FastAPI 应用（WP6 补遗 C）：HTTP 面 + 唯一分发函数 handle。
 
 移植源（逐行为准）：
-  * ``plugins/workbench/src/rpc.js:97-230`` —— handle(endpoint, payload)：载荷对象性、
-    ``_refresh`` 剥离、逐端点字段白名单、snapshot 合并点（rpc.js:106）、switch-mode、
-    audit 的 trades 兜底（rpc.js:132-145）、plan/schedule/reconcile（rpc.js:172-182）、
-    plan-execute 的动作映射与校验顺序（rpc.js:183-210）、series（rpc.js:211-224）、
-    未知端点与 WorkbenchError → ``trading/invalid-operation`` 信封（rpc.js:225-228）；
+  * ``plugins/workbench/src/rpc.js:97-243`` —— handle(endpoint, payload)：载荷对象性、
+    ``_refresh`` 剥离、逐端点字段白名单、snapshot 合并点（rpc.js:104-107）、switch-mode、
+    ``confirmation``（空载荷直读，不进缓存；rpc.js:114-119）、``confirm-decide``（唯一人工
+    批准通道，字段仅 id/decision；rpc.js:120-126）、audit 的 trades 兜底（rpc.js:145-158）、
+    plan/schedule/reconcile（rpc.js:185-195）、plan-execute 的动作映射与校验顺序
+    （rpc.js:196-223）、series（rpc.js:224-237）、未知端点与 WorkbenchError →
+    ``trading/invalid-operation`` 信封（rpc.js:238-242）；
   * Node 原实现（已退役，见 git 历史 ``aaa5f42^``）—— 路由顺序、白名单 404 先于 handle、
     content-type 415、1MB 413、坏 JSON 400、静态托管与 SPA 兜底、500 兜底信封；
   * Node 服务层原实现（已退役，见 git 历史 ``aaa5f42^``）—— sendJson / authorized / unauthorized 的等价物；
@@ -93,8 +95,12 @@ ANALYTICS_ENDPOINTS = {
     "quality": ("ticker",),
 }
 
-# 空载荷端点（rpc.js:104/133/175）
-EMPTY_PAYLOAD_ENDPOINTS = ("snapshot", "audit", "plan", "schedule", "reconcile")
+# 空载荷端点（rpc.js:104/115/146/188）
+EMPTY_PAYLOAD_ENDPOINTS = ("snapshot", "audit", "confirmation", "plan", "schedule", "reconcile")
+
+# rpc.js:121-123 的 confirm-decide 字段白名单：载荷只有编号与结论，**没有下单参数**——
+# 确认通道不能变成下单通道。这也是唯一能批准实盘操作的入口（模型侧不进 MCP 工具面）。
+CONFIRM_DECIDE_FIELDS = ("id", "decision")
 
 # rpc.js:69-70 的动作 → 指令类型映射（规格 §8.2 的 5 种里服务面可达的 4 种）
 EXECUTE_ACTIONS = {
@@ -126,7 +132,10 @@ def _is_refresh(payload):
 
 
 def _takes_no_payload(endpoint, payload):
-    """rpc.js:104/133/175 的空载荷约束（snapshot 例外：payload 非空走未知端点分支）。"""
+    """rpc.js 各空载荷分支（snapshot/audit/confirmation/plan/schedule/reconcile）的等价约束。
+
+    snapshot 例外：payload 非空走未知端点分支（rpc.js:104 只在空载荷时命中快照合并点）。
+    """
     if endpoint == "snapshot":
         return
     if payload:
@@ -177,6 +186,18 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 return {"ok": True, "value": store_access.switch_mode(
                     home, mode=payload.get("mode"), expected_mode=payload.get("expected_mode"),
                     confirmation=payload.get("confirmation"))}
+            if endpoint == "confirmation":
+                # rpc.js:114-119：空载荷直读内存态，**不进缓存**——缓存住「待确认」会让
+                # 界面拿到一个已经处理掉的请求。跨进程边界见 store_access 文件头：
+                # 这里只反映服务进程自身发起的确认，看不到 Harness（Node）进程的待确认。
+                _takes_no_payload(endpoint, payload)
+                return {"ok": True, "value": {"pending": store_access.confirmation_view(home),
+                                              "ttl_ms": store_access.CONFIRM_TTL_MS}}
+            if endpoint == "confirm-decide":
+                # rpc.js:120-126：唯一能批准实盘操作的通道；载荷只有编号与结论。
+                _check_fields(endpoint, payload, CONFIRM_DECIDE_FIELDS)
+                return {"ok": True, "value": store_access.decide_confirmation(
+                    home, confirmation_id=payload.get("id"), decision=payload.get("decision"))}
             if endpoint in ANALYTICS_ENDPOINTS:
                 _check_fields(endpoint, payload, ANALYTICS_ENDPOINTS[endpoint])
                 provider = analytics.get(endpoint)
@@ -270,8 +291,9 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     handle = create_handler(home, analytics=analytics, series=series, core=core)
     endpoints = store_access.endpoints()
 
-    # MCP 工具面（补遗任务 D）：25 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
+    # MCP 工具面（补遗任务 D）：26 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
     # 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的 home 绑定门面。
+    # 22 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
     mcp_server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
     bound_tools = mcp_tools.register(mcp_server, handle, mcp_tools.StoreApi(home))
     # json_response=True 对齐 Node 版 enableJsonResponse：无 SSE 依赖，普通 JSON 响应。

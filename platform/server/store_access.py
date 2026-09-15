@@ -1,13 +1,18 @@
 # WP6 补遗任务 B1：store 访问层（Python 移植）。规格 §八-7 / 补遗任务 B。
 #
-# 唯一事实来源：plugins/workbench/src/store.js（363 行）。逐行对应关系：
+# 唯一事实来源：plugins/workbench/src/store.js（549 行）。逐行对应关系：
 #   store.js:9       LIMIT                  -> LIMIT
 #   store.js:13      ABANDONED_AFTER_MS     -> ABANDONED_AFTER_MS
 #   store.js:15-16   WorkbenchError/Busy    -> WorkbenchError/WorkbenchBusyError
+#   store.js:21      CONFIRM_TTL_MS         -> CONFIRM_TTL_MS
 #   store.js:25-28   modeValue              -> mode_value()
+#   store.js:29      CONFIRM_OPERATIONS     -> CONFIRM_OPERATIONS
 #   store.js:30-38   atomicWrite            -> _atomic_write()
+#   store.js:31-35   orderOperation         -> order_operation()
+#   store.js:37-45   ORDER_SIDE/MARKET_HINT -> ORDER_SIDE/MARKET_HINT
 #   store.js:48-50   emptyState             -> _empty_state()
 #   store.js:52-64   withRunStatus          -> with_run_status()
+#   store.js:53-77   describeOrderArgs      -> describe_order_args()
 #   store.js:66-73   构造器里的四组路径      -> store_file/mode_file/observations_dir/lock_file
 #   store.js:75-82   inFlight               -> _active_leases()
 #   store.js:84-91   readMode               -> read_mode()
@@ -20,12 +25,39 @@
 #   store.js:205-224 snapshot               -> snapshot()
 #   store.js:226-240 switchMode             -> switch_mode()
 #   store.js:242-259 enterBrokerCall        -> 只取租约命名/在途判定（_active_leases）
+#   store.js:299-368 requestConfirmation    -> request_confirmation()
+#   store.js:370-377 confirmationView       -> confirmation_view()
+#   store.js:379-399 decideConfirmation     -> decide_confirmation()
+#   store.js:401-410 recordConfirmationEvent-> _record_confirmation_event()
 #   store.js:329-336 pendingObservations    -> pending_observations()
 #   scripts/workbench_admin.mjs            hoursArg/ageMinutes -> _hours_to_ms/admin_runs
-#   plugins/workbench/src/endpoints.js:12-33 ENDPOINTS          -> endpoints()
+#   plugins/workbench/src/endpoints.js:12-37 ENDPOINTS         -> endpoints()
 # 本模块只用标准库；不写回任何 Node 侧尚未写入的键，错误语义（消息、类型）对齐 Node。
 # JS 语义助手（真值、字段访问）统一来自 server/_js.py：store_access/summary/audit_chain 不再
 # 各留一份，避免补遗 B 移植审查抓到的那种漂移（同一语义两处两种答案）。
+#
+# ---------------------------------------------------------------------------
+# 业务确认的**跨进程边界**（2026-09-15 main 修订；必须如实告知，不得隐瞒）
+# ---------------------------------------------------------------------------
+# Node 侧 `WorkbenchStore.pendingConfirmation` 是**实例内存态**（store.js:136 注释：确认是
+# 「此刻等人回答」的瞬时状态，刻意不落盘）。Python 侧照抄这一语义：待确认表是本模块的
+# **进程内模块级表**（`_PENDING`，按 home 归一化路径分槽），进程重启即消失，也不与任何其他
+# 进程共享。由此产生一个**用户可见的限制**：
+#
+#   * Harness 会话（Node 进程，policy.js 发起 `requestConfirmation`）产生的待确认，**服务
+#     进程（FastAPI/uvicorn）看不到**——两边各自持有自己的内存表，没有任何共享介质；
+#   * 服务进程的 `confirmation_view()` 只反映**经服务自身处理函数发起**的确认（本文件
+#     `request_confirmation`，即未来服务侧实盘写路径的调用点）；
+#   * 因此独立 Web 的「待确认」列表可能显示为空，而 Harness 会话其实正卡在等人确认上；
+#     反之亦然。`confirmation`/`confirm-decide` 两个端点**不是**跨进程的确认总线。
+#
+# 最小缓解（本次不改 Node 存储协议，规格以 main 实现为准）：
+#   1. 主会话仍在 Harness 内用 legacy 面板（Connection RPC 的 `confirmation`/`confirm-decide`）
+#      作答——那条链路与 Node Host 同进程，是本轮实盘操作**唯一可用**的作答通道；
+#   2. 服务侧 `confirmation` 端点把「本进程内存态」如实呈现为空（不伪造、不合并），页面与
+#      文档按此标注限制，避免用户以为「没有待确认 = 不需要确认」而误判；
+#   3. 未来若要让两进程共享，正确做法是把确认落到共享文件（例如 `$DSH_HOME/trading-confirmations/`
+#      下的请求/裁决文件 + 现有原子写与租约协议），那是另一项需要同时改 Node 侧的变更。
 #
 # 有意差异（诚实边界，须与 Node 行为区分；规格 §八-7 与补遗任务 B 明文允许）：
 #   1. 只读快照：snapshot() 不调用 flushObservations()（store.js:206）。trading-observations/
@@ -41,6 +73,7 @@
 import json
 import os
 import re
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -52,6 +85,23 @@ from server import _js, summary
 LIMIT = 100
 # 研究 run 超过这个时长仍是 running，就认为发起它的会话已中断（HOST 的派生状态阈值）。
 ABANDONED_AFTER_MS = 2 * 60 * 60 * 1000
+
+# store.js:17-21 实盘业务确认的存活时长；超时按**拒绝**处理（fail-closed）。
+CONFIRM_TTL_MS = 120_000
+
+# store.js:23-29 需要业务确认的实盘操作类型（按工具名后缀判定）。撤单也确认：
+# 确认回答的是「这笔业务参数对不对」，撤错单同样是业务错误。
+CONFIRM_OPERATIONS = {"input": "下单", "modify": "改单", "cancel": "撤单"}
+
+# store.js:31 从工具名取出操作类型：`mcp__futu__trading_input_order` → `input`。
+_ORDER_OPERATION = re.compile(r"(?:^|_)(input|modify|cancel)_order$")
+
+# store.js:37-38 方向：1=Buy 2=Sell（工具 schema 明文）。JS 对象键一律是字符串，
+# 因此查表统一走 _js.js_key_string（`1` 与 `"1"` 命中同一项，与 JS 的属性访问一致）。
+ORDER_SIDE = {"1": "买入", "2": "卖出"}
+# store.js:39-45 市场代码 → 中文提示。取值来自 `sim_trade_account_list` 的**实测返回**
+# （港股 market=1、A股 market=3、美股 market=100），不是从文档猜的；未列出的不猜。
+MARKET_HINT = {"1": "港股", "3": "A股", "100": "美股"}
 
 # store.js:222 原文（服务端不一致地改写这句话会让两个实现的快照出现假差异）。
 NOTICE = ("交易动态来自 Harness 最近的富途工具响应，不是券商成交推送；"
@@ -157,6 +207,69 @@ def with_run_status(run, now=None):
     return copied
 
 
+def order_operation(tool):
+    """store.js:31-35 orderOperation：从工具名取出 `input|modify|cancel`，否则 None。"""
+    match = _ORDER_OPERATION.search(_js.stringify(tool))  # String(tool ?? "")
+    return match.group(1) if match else None
+
+
+def describe_order_args(tool, args=None):
+    """store.js:47-77 describeOrderArgs：把券商写操作的工具入参渲染成中文订单摘要。
+
+    未知字段一律原样列出、未知枚举附上原始代码——摘要的作用是让人核对，不是替人解释。
+    值一律经 ``_js.template``（JS ``String(v)``）渲染，与 Node 写出的文字逐字一致。
+
+    有意差异：JS 的 ``Object.entries(args ?? {})`` 对非对象入参（数组/字符串）也能枚举，
+    这里把非 dict 的 ``args`` 收敛成 ``{}``——服务的调用方只会传 JSON 对象（工具入参），
+    该分支不可达；``raw`` 因此也只在对象入参时保留原值。
+    """
+    source = args if isinstance(args, dict) else {}
+    normalized = {}
+    for key, value in _js.ordered_items(source):  # Object.entries 的枚举序
+        normalized[str(key).lower()] = value
+    fields = []
+
+    def push(label, value):
+        # store.js:59：`value === undefined || value === null || value === ""` 一律不显示
+        # （0/False 不在其中：数量 0 必须显示出来让人核对）。
+        if value is _js.UNDEFINED or value is None or value == "":
+            return
+        fields.append({"label": label, "value": _js.template(value)})
+
+    def raw(key):
+        """store.js:56 ``raw(key)``：区分「字段缺失（undefined）」与「显式为 null」。"""
+        return _js.field_or_undefined(normalized, key)
+
+    def enumerated(value, table, known, unknown):
+        """三元的共用形态：命中枚举给中文，未命中原样显示并提示核对。"""
+        label = table.get(_js.js_key_string(value))
+        shown = _js.template(value)
+        return known.format(label=label, shown=shown) if _js.truthy(label) \
+            else unknown.format(shown=shown)
+
+    market = raw("market")
+    market_hint = _js.UNDEFINED if market is _js.UNDEFINED else enumerated(
+        market, MARKET_HINT, "{shown}（{label}）", "{shown}（未识别的市场代码，请核对）")
+    # `order_side ?? trd_side`：只有 undefined/null 回退；回退结果仍是 undefined 才不显示。
+    side = raw("order_side")
+    if side is _js.UNDEFINED or side is None:
+        side = raw("trd_side")
+    side_hint = _js.UNDEFINED if side is _js.UNDEFINED else enumerated(
+        side, ORDER_SIDE, "{label}（order_side={shown}）", "未识别（order_side={shown}，请核对）")
+
+    push("账户", raw("acc_id"))
+    push("市场", market_hint)
+    push("标的", raw("symbol"))
+    push("方向", side_hint)
+    push("数量", _js.js_nullish(raw("qty"), raw("quantity")))
+    push("价格", raw("price"))
+    push("订单类型", raw("order_type"))
+    push("订单号", raw("order_id"))
+    push("有效期", _js.js_nullish(raw("time_in_force"), raw("order_trade_time_type")))
+    push("备注", _js.js_nullish(raw("text"), raw("remark")))
+    return {"tool": tool, "fields": fields, "raw": source}
+
+
 def _atomic_write(target, content):
     """store.js:30-38 atomicWrite：独占建临时文件（0600）+ rename，失败也不留残骸。"""
     target = Path(target)
@@ -194,14 +307,19 @@ def pending_observations(home):
 
 
 def endpoints():
-    """endpoints.js:12-33 的 20 端点清单；从 JS 文本正则提取，首次调用缓存（单一事实来源）。"""
+    """endpoints.js:12-37 的 22 端点清单；从 JS 文本正则提取，首次调用缓存（单一事实来源）。
+
+    先剥 ``//`` 行注释：main 在数组内加的业务确认注释里带 ASCII 双引号（``"待确认"``），
+    不剥注释会被字符串正则误认成一个端点（实测 23 项，且会把 ``待确认`` 放进 HTTP 白名单）。
+    """
     global _ENDPOINTS_CACHE
     if _ENDPOINTS_CACHE is None:
         text = ENDPOINTS_JS.read_text(encoding="utf-8")
         block = re.search(r"export const ENDPOINTS\s*=\s*\[(.*?)\]", text, re.S)
         if block is None:
             raise WorkbenchError("Cannot read endpoints manifest: plugins/workbench/src/endpoints.js")
-        _ENDPOINTS_CACHE = re.findall(r'"([^"]+)"', block.group(1))
+        body = re.sub(r"//[^\n]*", "", block.group(1))
+        _ENDPOINTS_CACHE = re.findall(r'"([^"]+)"', body)
     return list(_ENDPOINTS_CACHE)
 
 
@@ -294,6 +412,10 @@ def snapshot(home):
         "broker": broker_state.get(mode) if isinstance(broker_state, dict) else None,
         # 有意差异 3：服务进程不派发券商调用，恒为 0（在途护栏在 switch_mode 内按租约文件判）。
         "in_flight": 0,
+        # store.js:291-292：待确认的业务动作也进快照（legacy 面板轮询 confirmation 端点，
+        # 快照 60 秒一次太慢，这里只是同源冗余）。**注意跨进程边界**：见文件头 —— 只反映本
+        # 进程内存表，看不到 Harness（Node）进程发起的确认。
+        "confirmation": confirmation_view(home),
         # 有意差异 1：只报暂存箱里待合并的文件数，不在读路径上合并（store.js:220 是同名计数）。
         "pending_observations": len(pending_observations(home)),
         # 服务进程没有记录观察的路径，与 Node 进程启动时的初值一致。
@@ -301,6 +423,216 @@ def snapshot(home):
         "notice": NOTICE,
         "endpoints": endpoints(),
     }
+
+
+# ---------------------------------------------------------------------------
+# 实盘业务确认（store.js:299-410）
+# ---------------------------------------------------------------------------
+# 待确认表：**进程内内存态**，按归一化后的 home 路径分槽（Node 侧一实例一个 home）。
+# 与 Node 的差异只有存储介质（模块级 dict + 互斥锁 vs 实例字段 + 事件循环单线程），
+# 语义逐条对齐：一次只允许一笔、TTL 超时按拒绝、signal 取消按拒绝、只有 decide 能批准。
+# 跨进程可见性限制见文件头，这里再强调一次：**本表不跨进程**。
+_PENDING = {}
+_PENDING_LOCK = threading.Lock()
+
+# 等待判决时的轮询间隔（秒）：用于在阻塞等待中观察 signal 取消，同时保持对 decide 的即时响应
+# （decide 通过 threading.Event.set() 唤醒，不依赖该间隔）。
+_SIGNAL_POLL_S = 0.02
+
+
+def _home_key(home):
+    """待确认表的分槽键：同一目录的不同写法（Path/str、相对/绝对）必须命中同一槽。"""
+    return os.path.realpath(str(home))
+
+
+def _signal_aborted(signal):
+    """``signal`` 的取消判定。Python 没有 AbortSignal，这里接受两种既有习惯的形态：
+
+    * ``threading.Event``（推荐，``is_set()``）；
+    * 任何带真值 ``aborted`` 属性的对象（JS AbortSignal 的直译）。
+    """
+    if signal is None:
+        return False
+    if hasattr(signal, "aborted"):
+        return bool(signal.aborted)
+    is_set = getattr(signal, "is_set", None)
+    return bool(is_set()) if callable(is_set) else False
+
+
+def _settle(request, decision, reason):
+    """兑现一次请求：记录结论并唤醒等待中的 ``request_confirmation``（幂等）。"""
+    if request["_settled"]:
+        return
+    request["_settled"] = True
+    request["_outcome"] = {"decision": decision, "reason": reason, "id": request["id"]}
+    request["_done"].set()
+
+
+def request_confirmation(home, tool=None, mode=None, args=None, session_id=None,
+                         ttl_ms=CONFIRM_TTL_MS, signal=None):
+    """store.js:299-368 requestConfirmation：发起一次**业务确认**并阻塞等人作答。
+
+    与 DSH 的 approval 系统完全无关：权限确认回答的是「这个动作准不准做」，由会话的
+    approval policy 裁决；full-access（policy="never"）下 ``approval.decide()`` 会直接返回
+    rejected，连问都不问。「这笔业务参数对不对」是交易动作的固有环节，不该因为系统被设成
+    免打扰就静默拒绝。因此写操作在这里无条件等人确认，调用方据结果返回 allow/deny，
+    **永不返回 {kind:"ask"}** —— 权限系统无从介入。
+
+    回答只能来自 ``decide_confirmation``（服务面由 ``confirm-decide`` 路由暴露）；工具参数
+    无法自证已确认，模型不能自己批自己。
+
+    ``ttl_ms`` 可注入（短 TTL 用于测试），``signal`` 见 ``_signal_aborted``。
+    返回 ``{decision: "approved"|"rejected", reason: str, id: str|None}``；超时/取消一律
+    rejected（fail-closed）。
+    """
+    mode_value(mode)
+    if mode != "live":
+        raise WorkbenchError("只有实盘写操作需要业务确认")
+    if not isinstance(tool, str) or not tool.strip():
+        raise WorkbenchError("Invalid tool name")
+    key = _home_key(home)
+    with _PENDING_LOCK:
+        # 一次只允许一笔：两笔并发时「我看到的是哪一笔」会变模糊，宁可让后来的重试。
+        if _PENDING.get(key) is not None:
+            return {"decision": "rejected", "id": None,
+                    "reason": "已有一笔待确认的实盘操作，请先在工作台处理它再重试"}
+        at_ms = _now_ms()
+        request = {
+            "id": str(uuid.uuid4()),
+            "at": _iso_now(at_ms),
+            "expires_at": _iso_now(at_ms + ttl_ms),
+            "mode": mode,
+            "tool": tool,
+            # `session_id ?? "unknown"`：只有 None 兜底，空串原样保留。
+            "session_id": "unknown" if session_id is None else session_id,
+            "operation": CONFIRM_OPERATIONS.get(order_operation(tool), "实盘写操作"),
+            "summary": describe_order_args(tool, args),
+            "status": "pending",
+            "decided_at": None,
+            "decided_by": None,
+            # 内部字段：confirmation_view 只挑显式列出的键，绝不把 settle 句柄送出去。
+            "_done": threading.Event(),
+            "_settled": False,
+            "_outcome": None,
+        }
+        _PENDING[key] = request
+        # 留痕放在锁内、发布之后立刻做（**有意与 JS 的行序对齐而非字面序**）：Node 是单线程，
+        # `this.pendingConfirmation = request` 与紧随其后的 recordConfirmationEvent 之间没有
+        # 别的执行流能插进来；Python 服务是多线程的，若把这条写盘放到锁外，decide 可能先抢到
+        # 数据文件的写锁，使「请求」事件落到「裁决」之后、甚至被 WorkbenchBusyError 静默丢掉
+        # （recordConfirmationEvent 是尽力而为的）。放在锁内可保证「请求」先落盘、
+        # 「裁决/取消/超时」必然在其后。写盘本身仍尽力而为，失败不影响确认结论。
+        _record_confirmation_event(home, "confirmation_requested", request)
+
+    deadline = time.monotonic() + ttl_ms / 1000
+
+    def abort():
+        """store.js:348-353：会话中断 → 清待确认、记 cancelled、按拒绝兑现。"""
+        if request["_settled"] or not _clear_pending(key, request):
+            return  # 已被 decide/expire 兑现：先到者定论（等价于 JS 里 settle 会解绑监听）
+        request["status"] = "cancelled"
+        _record_confirmation_event(home, "confirmation_cancelled", request, "会话已中断")
+        _settle(request, "rejected", "会话已中断")
+
+    def expire():
+        """store.js:354-362：TTL 到期 → 清待确认、记 expired、按拒绝兑现。"""
+        if request["_settled"] or not _clear_pending(key, request):
+            return
+        request["status"] = "expired"
+        # store.js:360/361 的 `Math.round(ttlMs / 1000)`：半数向 +∞（Python round 是银行家舍入）
+        seconds = _js.js_round(ttl_ms / 1000)
+        _record_confirmation_event(home, "confirmation_expired", request,
+                                  f"超过 {seconds} 秒未确认")
+        _settle(request, "rejected", f"超过 {seconds} 秒未确认，按拒绝处理")
+
+    # 已 aborted 的 signal 也要走同一条取消路径（store.js:365-366 先设 settle 再判 aborted）。
+    while True:
+        if _signal_aborted(signal):
+            abort()
+            break
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            expire()
+            break
+        # setTimeout 的等价物：等判决，最多等到 TTL 或下一次 signal 轮询。
+        if request["_done"].wait(min(_SIGNAL_POLL_S, remaining)):
+            break
+    return dict(request["_outcome"])
+
+
+def _clear_pending(key, request):
+    """仅当表里仍是这一笔时才清除（超时/取消与 decide 竞争时不让后者被前者覆盖）。"""
+    with _PENDING_LOCK:
+        if _PENDING.get(key) is request:
+            _PENDING.pop(key, None)
+            return True
+    return False
+
+
+def confirmation_view(home):
+    """store.js:370-377 confirmationView：当前待确认项的只读视图（不含内部 settle 句柄）。
+
+    字段与 store.js 逐字一致：``id/at/expires_at/mode/tool/operation/session_id/status/summary``。
+    """
+    request = _PENDING.get(_home_key(home))
+    if request is None:
+        return None
+    return {"id": request["id"], "at": request["at"], "expires_at": request["expires_at"],
+            "mode": request["mode"], "tool": request["tool"], "operation": request["operation"],
+            "session_id": request["session_id"], "status": request["status"],
+            "summary": request["summary"]}
+
+
+def decide_confirmation(home, confirmation_id=None, decision=None):
+    """store.js:379-399 decideConfirmation：用户作出决定。**唯一能批准实盘操作的入口**。
+
+    ``confirmation_id`` 对应 RPC 载荷的 ``id``（此处不叫 id 是为了不遮蔽内建函数；
+    app.handle 负责 ``id`` → ``confirmation_id`` 的映射）。
+    """
+    if decision != "approved" and decision != "rejected":
+        raise WorkbenchError("Invalid decision; expected approved/rejected")
+    key = _home_key(home)
+    with _PENDING_LOCK:
+        request = _PENDING.get(key)
+        if request is None:
+            raise WorkbenchError("没有待确认的实盘操作（可能已超时或被处理）")
+        if request["id"] != confirmation_id:
+            raise WorkbenchError("确认编号不匹配；可能已被处理或已超时")
+        _PENDING.pop(key, None)
+        request["status"] = decision
+        request["decided_at"] = _iso_now()
+        # 唯一能批准实盘操作的入口就是工作台作答通道，所以主体恒为工作台界面。
+        request["decided_by"] = "workbench-ui"
+        # 在锁内兑现：与超时/取消的竞争由此变成「先到者定论」，后到者只看得到已兑现的结论。
+        _settle(request, decision,
+                "用户在工作台确认" if decision == "approved" else "用户在工作台拒绝")
+    _record_confirmation_event(
+        home, "confirmation_approved" if decision == "approved" else "confirmation_rejected",
+        request)
+    return {"id": confirmation_id, "decision": decision,
+            "tool": request["tool"], "operation": request["operation"]}
+
+
+def _record_confirmation_event(home, kind, request, note=None):
+    """store.js:401-410 recordConfirmationEvent：确认链路的活动留痕。
+
+    写盘失败不影响确认本身（锁被占用时不能卡住等人回答）——与 Node 的空 catch 同义。
+    """
+    try:
+        payload = {"kind": kind, "mode": request["mode"], "tool": request["tool"],
+                   "operation": request["operation"], "confirmation_id": request["id"],
+                   "session_id": request["session_id"],
+                   # store.js:407 `request.summary?.fields ?? []`
+                   "summary": _js.field(request.get("summary") or {}, "fields") or []}
+        if note:
+            payload["note"] = note
+
+        def apply(state):
+            _event(state, payload)
+
+        _update(home, apply)
+    except Exception:  # noqa: BLE001 —— 留痕尽力而为，绝不因此改变确认结论
+        pass
 
 
 def switch_mode(home, mode=None, expected_mode=None, confirmation=None):
@@ -436,9 +768,11 @@ def admin_prune_runs(home, hours=2, now=None):
 
 
 __all__ = [
-    "ABANDONED_AFTER_MS", "LIMIT", "NOTICE", "WorkbenchBusyError", "WorkbenchError",
+    "ABANDONED_AFTER_MS", "CONFIRM_OPERATIONS", "CONFIRM_TTL_MS", "LIMIT", "MARKET_HINT",
+    "NOTICE", "ORDER_SIDE", "WorkbenchBusyError", "WorkbenchError",
     "admin_cancel_run", "admin_cancel_stale", "admin_prune_runs", "admin_runs", "admin_status",
-    "endpoints", "lock_file", "mode_file", "mode_value", "observations_dir",
-    "pending_observations", "read_mode", "read_store", "snapshot", "store_file",
-    "switch_mode", "with_run_status",
+    "confirmation_view", "decide_confirmation", "describe_order_args", "endpoints", "lock_file",
+    "mode_file", "mode_value", "observations_dir", "order_operation",
+    "pending_observations", "read_mode", "read_store", "request_confirmation", "snapshot",
+    "store_file", "switch_mode", "with_run_status",
 ]

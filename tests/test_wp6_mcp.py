@@ -3,10 +3,11 @@
 起**真实** uvicorn 线程（``TRADING_SERVICE_PORT=0`` + 临时 ``DSH_HOME``），用官方 ``mcp``
 Python 客户端的 streamable-http 传输连 ``/mcp``，逐条钉死：
 
-  * S1 —— initialize → tools/list 恰 25、名单与 ``mcp_tools.TOOLS`` 一致，且每个工具的
-    inputSchema 字段集/必填集与规格清单逐项一致（additionalProperties:false）；另有取值域
-    断言：``series.limit`` 的 ``20..2000`` 与 ``series.period`` 的六值枚举（可选字段落在
-    ``anyOf`` 的基类型分支上，见 ``non_null_branch``）；
+  * S1 —— initialize → tools/list 恰 26、名单与 ``mcp_tools.TOOLS`` 一致，且每个工具的
+    inputSchema 字段集/必填集与规格清单逐项一致（additionalProperties:false）；工具面
+    **不含** ``confirm_decide``（人工批准通道，规格 §5.1 A7），含只读的 ``confirmation``；
+    另有取值域断言：``series.limit`` 的 ``20..2000`` 与 ``series.period`` 的六值枚举
+    （可选字段落在 ``anyOf`` 的基类型分支上，见 ``non_null_branch``）；
   * S2 —— call snapshot → ok；call switch_mode(live, confirmation=「确认实盘」) →
     ``trading/live-switch-web-only``，随后 store 模式仍 sim、模式文件未被创建；
   * S3 —— call plan_execute(plan_hash="nope") → queued+nonce（校验在 daemon），指令文件落盘；
@@ -135,7 +136,7 @@ class McpProtocolSmoke(unittest.TestCase):
     # ---- S1 ----
 
     def test_s1_initialize_and_tool_surface(self):
-        """initialize → tools/list 恰 25；名单与输入字段集逐个对齐规格清单。"""
+        """initialize → tools/list 恰 26；名单与输入字段集逐个对齐规格清单。"""
         async def runner():
             async with streamable_http_client(self.url) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -146,9 +147,13 @@ class McpProtocolSmoke(unittest.TestCase):
         init, listing = asyncio.run(runner())
         self.assertEqual(init.server_info.name, mcp_tools.SERVER_NAME)
         names = [tool.name for tool in listing.tools]
-        self.assertEqual(len(names), 25)
+        self.assertEqual(len(names), 26)
         self.assertEqual(len(names), mcp_tools.TOOL_COUNT)
         self.assertEqual(names, [definition.name for definition in mcp_tools.TOOLS])
+        # 不变式 1：唯一能批准实盘操作的通道绝不进工具面（两种写法都不允许出现）
+        self.assertNotIn("confirm_decide", names)
+        self.assertNotIn("confirm-decide", names)
+        self.assertIn("confirmation", names)
         definitions = {definition.name: definition for definition in mcp_tools.TOOLS}
         for tool in listing.tools:
             definition = definitions[tool.name]
@@ -158,6 +163,14 @@ class McpProtocolSmoke(unittest.TestCase):
                              set(schema.get("required", [])), tool.name)
             self.assertIs(schema.get("additionalProperties"), False, tool.name)
             self.assertFalse(mcp_tools.is_blacklisted(tool.name), tool.name)
+
+    def test_s1_confirmation_tool_is_read_only(self):
+        """``confirmation`` 读工具：无待确认时 pending=null，且它是只读的（不触达批准）。"""
+        body = self.envelope(self.call("confirmation", {}))
+        self.assertTrue(body["ok"], body)
+        self.assertIsNone(body["value"]["pending"])
+        self.assertEqual(body["value"]["ttl_ms"], store_access.CONFIRM_TTL_MS)
+        self.assertEqual(store_access.confirmation_view(self.home), None)
 
     def test_s1_series_carries_its_value_domain(self):
         """S1 增补：取值域也随注解发布——``limit`` 区间与 ``period`` 枚举逐值可见。

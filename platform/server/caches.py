@@ -8,7 +8,7 @@
   * ``plugins/workbench/src/cache.js:26-118`` —— createTtlCache：**内存 + 磁盘两级**缓存
     （目录 ``$DSH_HOME/trading-workbench-cache``、条目 ``{value, at}``、TTL 过期删文件、
     ``maxFiles``/``maxBytes``、临时文件唯一名 + rename 原子落盘）；
-  * ``plugins/workbench/src/endpoints.js:35-68`` —— ENDPOINT_SHAPE 表与 matchesShape。
+  * ``plugins/workbench/src/endpoints.js:46-65`` —— ENDPOINT_SHAPE 表与 matchesShape。
 
 关于磁盘这一级（更正补遗 A/B 的说明）：Node 侧 rpc.js **不是**只内存缓存。``rpc.js:65``
 用 ``createTtlCache(deps)``，而 ``cache.js`` 明确实现了磁盘持久化——目的正是避免「每次重启
@@ -51,7 +51,7 @@ CACHE_TTL_MS = {
     "reconcile": 5 * 60_000,
 }
 
-# endpoints.js:42-60 的端点最小字段（plan-execute 是动作端点，不进缓存形状表）
+# endpoints.js:46-65 的端点最小字段（plan-execute 是动作端点，不进缓存形状表）
 ENDPOINT_SHAPE = {
     "series": ["ticker", "bars"],
     "equity": ["mode", "points"],
@@ -67,6 +67,9 @@ ENDPOINT_SHAPE = {
     "instrument": ["ticker"],
     "quality": ["ticker"],
     "plan": ["plans", "alerts"],
+    # 业务确认：``confirmation`` 有形状但 TTL=0（直读内存态，永不进缓存）；形状仍登记，
+    # 与 endpoints.js 的 ENDPOINT_SHAPE 逐项一致（test_wp6_tables_lock 比对两侧表）。
+    "confirmation": ["pending"],
     "schedule": ["heartbeat", "jobs"],
     "reconcile": ["diffs", "tca"],
 }

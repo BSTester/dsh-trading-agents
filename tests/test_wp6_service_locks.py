@@ -42,9 +42,12 @@ class Wp6ServiceLocks(unittest.TestCase):
                 load_config(home)
 
     def test_tool_surface_contract_markers(self):
-        """工具面清单文件含通道分级错误码（任务 D 填充后仍锁定）。"""
+        """工具面清单文件含通道分级错误码与业务确认排除常量（任务 D/2026-09-15 修订后仍锁定）。"""
         manifest = (ROOT / "platform" / "server" / "mcp_tools.py").read_text(encoding="utf-8")
         self.assertIn("trading/live-switch-web-only", manifest)
+        # 不变式 1（规格 §5.1 A7）：confirm-decide 绝不进 MCP 工具面——常量名与端点名都在源码里
+        self.assertIn("MCP_EXCLUDED_ENDPOINTS", manifest)
+        self.assertIn('frozenset({"confirm-decide"})', manifest)
 
 
 if __name__ == "__main__":

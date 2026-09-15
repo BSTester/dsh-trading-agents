@@ -107,6 +107,14 @@ export default function ExecutionPage() {
           <Typography.Text type="danger">快照读取失败：{snapshot.error}</Typography.Text>)}
         {snapshot.value?.notice && (
           <Typography.Text type="secondary">{snapshot.value.notice}</Typography.Text>)}
+        {/* 跨进程边界（必须如实标注，2026-09-15 业务确认修订）：实盘写操作的业务确认是
+            「此刻等人回答」的进程内存态，Harness 进程与服务进程各持一份、互不可见。
+            本页（独立 Web）看不到 Harness 会话里发起的待确认，那笔只能在 Harness 内的工作台
+            面板作答；确认列表界面将来上线时必须保留这句标注（规格 §5.1 A2 末段）。 */}
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          实盘写操作需在工作台逐笔确认；确认是进程内存态——
+          本页看不到 Harness 会话内发起的待确认，那笔请在 Harness 内的工作台面板作答。
+        </Typography.Text>
 
         <Card type="inner" title="券商订单（按订单号去重，保留最后一次观测）"
           extra={summary && (

@@ -2361,3 +2361,36 @@ A → B → C → D → E 严格串行（同 worktree）；任务 12（页面批
 > 仍存在的活文件引用（`scripts/workbench_admin.mjs`）保留文件名与符号、去掉易腐的行号；
 > `tests/test_wp6_summary_audit.py` 中指向现存 Node 夹具（`audit.test.mjs`/`broker-trades.test.mjs`）
 > 的引用保持不动。`switch_mode` 措辞亦已全仓统一（见本文件末节验收记录 §6-8）。
+
+> **业务确认移植（2026-09-15 main 修订并入 feat/wp6，合入提交 29912b4 之后执行）**：main 把实盘写操作
+> 从「Harness 原生审批 `{kind:"ask"}`」改为「插件自己发起的**业务确认**」（`policy.js` pre-execute →
+> `store.requestConfirmation` → 工作台 `confirmation`/`confirm-decide` 作答）。服务面同步移植，清单：
+>
+> - `platform/server/store_access.py`：`CONFIRM_TTL_MS`(120000)、`CONFIRM_OPERATIONS`、`order_operation`、
+>   `describe_order_args`（含 `ORDER_SIDE`/`MARKET_HINT` 与 JS `String(v)` 渲染）、
+>   `request_confirmation`（阻塞版的 `requestConfirmation`，含 TTL 超时 / signal 取消 / 一次一笔）、
+>   `confirmation_view`、`decide_confirmation`、`_record_confirmation_event`；待确认表是**进程内模块级
+>   内存态**（按 home 分槽），`snapshot()` 一并返回 `confirmation`（store.js:292 同构）。
+> - `platform/server/app.py`：`confirmation`（空载荷、**不进缓存**）与 `confirm-decide`（白名单
+>   `id`/`decision`）两个路由；`EMPTY_PAYLOAD_ENDPOINTS` 加 `confirmation`；端点集由
+>   `store_access.endpoints()` 自动跟随 endpoints.js 变为 **22**。
+> - `platform/server/mcp_tools.py`：新增 `confirmation` 读工具，`TOOL_COUNT` 25 → **26**；
+>   **`confirm-decide` 有意不进工具面**（`MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide"})`，
+>   规格 §5.1 A7：模型不得自批实盘单）。
+> - **提取口径修正**：main 在 `endpoints.js` 的 `ENDPOINTS` 数组里加了一条含 ASCII 双引号（`"待确认"`）
+>   的注释，原有的裸字符串正则会把 `待确认` 误当成第 23 个端点（并进入 HTTP 白名单）；
+>   `store_access.endpoints()` 与 `tests/test_wp6_tables_lock.py` 的 `js_endpoint_list()` 均改为先剥
+>   `//` 行注释再提取（两处口径必须一致）。
+> - **Node 回归修正**：`tests/wp6-approval-regression.test.mjs` 的 R2 按 main 写进本计划的片段改写
+>   （旧的 `ask` 断言在新 pre-execute 下会永久挂起）；R1 不受影响，R3/R4/R5 已在 Python 服务面。
+> - **跨进程可见性限制（必须如实标注，不改 Node 存储协议）**：确认表是内存态，Harness 进程与
+>   FastAPI 服务进程各持一份、**互不可见**；独立 Web 的 `confirmation` 只反映服务自身发起的确认，
+>   Harness 会话里实盘写操作触发的确认**读不到**（`pending` 诚实地为 `null`），只能回 Harness 面板作答。
+>   已标注于 `store_access.py` 文件头与 `confirmation_view` 注释、`docs/architecture.md`（端点表后的
+>   诚实清单段）、规格 §5.1 末段；最小缓解 = 主会话继续在 Harness 面板作答，将来若要跨进程需把
+>   请求/裁决落到共享文件（同时改 Node 侧）。**独立 Web 目前尚无待确认界面**，该界面上线时必须
+>   一并带上这条标注（规格 §5.1 已把「页面标注」写成页面责任）。
+> - 验证：`node --test tests/*.test.mjs` 202 pass / 0 fail（含 `business-confirmation.test.mjs` 与改写后的
+>   R1/R2）；`python -B -m unittest discover -s tests -p 'test_*.py'` 669 tests OK（skip 1）。
+>   注意：Node 与 Python 两套套件**不可并发跑**——`tests/test_install.py` 在仓库根下建临时目录，
+>   与 Node 侧扫描仓库根的用例会互相干扰（并发跑会出现与本次改动无关的 `test_install` 失败）。

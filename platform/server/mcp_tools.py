@@ -1,9 +1,17 @@
-# WP6 补遗任务 D：MCP 工具面（25 工具）与通道分级（规格 §3.2 / §3.4 / §3.6）。
+# WP6 补遗任务 D：MCP 工具面（26 工具）与通道分级（规格 §3.2 / §3.4 / §3.6）。
 #
-# 唯一事实来源：本文件的 ``TOOLS`` 清单（20 端点工具 + 5 维护工具）。MCP 工具不复制任何
+# 唯一事实来源：本文件的 ``TOOLS`` 清单（21 端点工具 + 5 维护工具）。MCP 工具不复制任何
 # 业务逻辑：端点工具一律 ``handle(endpoint, payload)``（app.create_handler 的产物，与 HTTP
 # 面同一个实例），维护工具一律 ``store_api.admin_*``——两条通道对同一 payload 因此必然同源
 # （规格 §5.1 A3/A4 的结构保证）。
+#
+# **``confirm-decide`` 有意不进工具面**（规格 §5.1 A7，2026-09-15 业务确认修订）：
+# HTTP 面 22 端点里有 21 个各有一个 MCP 工具，唯一被排除的就是 ``confirm-decide``。
+# 理由是通道分级：它是**唯一能批准实盘操作**的通道，必须只由独立 Web 上的用户点击触发。
+# 若把它做成工具，模型就能"自己发起、自己批准"，业务确认会退化成模型自批实盘单——
+# 与 A2 要守的"人回答这笔业务参数对不对"完全相反。``confirmation`` 是**只读**待确认列表，
+# 进工具面没有这个风险（描述里也写明模型不应也不能自行批准），故保留为读工具。
+# 常量 ``MCP_EXCLUDED_ENDPOINTS`` 是这条规则的唯一落点，R5/S1 都按它断言。
 #
 # 通道分级（规格 §3.2 ⚠，补遗 A 已锁定错误码）：``switch_mode`` 在本层封死 live——
 # 模型可见的通道不得持有实盘切换能力，``mode == "live"`` 无论 ``confirmation`` 为何直接返回
@@ -20,7 +28,7 @@
 # SDK 适配结论（mcp 2.2.0 实测，非推测）：
 #   * ``from mcp.server.mcpserver import MCPServer``（2.x 由 FastMCP 更名）；
 #   * 注册面是 ``MCPServer.add_tool(fn, name=..., description=..., structured_output=...)``，
-#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 25 个工具共用一个
+#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 26 个工具共用一个
 #     ``**kwargs`` 派发函数 + 每个工具自带的 ``__signature__`` 表达字段集，注解即契约；
 #   * ``MCPServer.list_tools/call_tool`` 是 async；``streamable_http_app()`` 返回的 Starlette
 #     app 自带 ``lifespan=session_manager.run()``，挂载时须并入主 app 的 lifespan；
@@ -40,15 +48,15 @@
 # 与 Node 侧的**有意差异**登记（上一条「哨兵默认值 / 显式 null」之外，此处登记 schema 形状）：
 #   * **``anyOf`` 与 PTC / run_code 退化（补遗 D 审查实测）**：``Param.annotation()`` 用
 #     ``base | None``，使每个可选字段的 inputSchema 变成 ``anyOf``（基类型分支 +
-#     ``{"type": "null"}`` 分支）。dsh-tools 支持的 schema 子集**不含 anyOf**，故 25 个工具里
-#     22 个（全部含可选字段者；只有 ``admin_status`` / ``admin_runs`` / ``admin_cancel_run``
+#     ``{"type": "null"}`` 分支）。dsh-tools 支持的 schema 子集**不含 anyOf**，故 26 个工具里
+#     23 个（全部含可选字段者；只有 ``admin_status`` / ``admin_runs`` / ``admin_cancel_run``
 #     三个无可选字段）在 **PTC / run_code 模式**下入参类型静默退化为 ``Any``。
 #     **native 模式不受影响**：注册通过、schema 原样透传、调用正常（S1 与 R5 的
 #     ``test_published_schemas_are_closed`` 都按原生 schema 断言，即其证据）。
 #     若要根治需去掉 ``| None``（只动 ``Param.annotation()`` 一处）：实测（mcp 2.2.0）schema
 #     随即变单分支，且 ``description``/``minimum``/``maximum`` 仍在分支上——代价不是「丢失
 #     可选字段描述/区间」，而是 null 分支消失、显式 null 改由 schema 层拒绝（与 Node/zod
-#     ``.optional()`` 趋同），因此要重新核对 25 个工具的载荷语义。本次补遗只披露，不改。
+#     ``.optional()`` 趋同），因此要重新核对 26 个工具的载荷语义。本次补遗只披露，不改。
 import inspect
 import json
 import warnings
@@ -65,8 +73,14 @@ from server import store_access
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
 
-# 工具面总数：20 端点工具（§3.2）+ 5 维护工具（§3.4）。锁定测试断言 25 恒成立。
-TOOL_COUNT = 25
+# 工具面总数：21 端点工具（§3.2，22 端点扣除有意排除的 confirm-decide）+ 5 维护工具（§3.4）。
+# 锁定测试断言 26 恒成立。
+TOOL_COUNT = 26
+
+# 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
+# ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
+# 让模型自己批自己的实盘单。R5/S1 按本常量断言「工具名集 ≡ 端点数 − 排除集」。
+MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide"})
 
 # 规格 §3.6 禁用名黑名单（与 Node 原实现（已退役）同表）。匹配语义是**整名或分段精确**：工具名按
 # 非字母数字切段，任一段命中才算，所以 ``plan_execute`` 不因子串 "exec" 被误伤，而
@@ -199,10 +213,12 @@ class ToolDefinition:
 
 
 # ---------------------------------------------------------------------------
-# 25 工具清单（规格 §3.2 表 1-20 / §3.4 表 21-25，逐项对应）
+# 26 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25，逐项对应）
 # ---------------------------------------------------------------------------
 # 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
 # 字段顺序也保持原实现顺序（inputSchema 的 properties 顺序因此稳定可比）。
+# 唯一新增/排除（2026-09-15 业务确认修订）：新增 ``confirmation`` 读工具（规格 §3.2 表 20b），
+# 排除 ``confirm-decide``（见文件头与 MCP_EXCLUDED_ENDPOINTS）。
 TOOLS = (
     ToolDefinition(
         "snapshot",
@@ -339,6 +355,15 @@ TOOLS = (
         (REFRESH,),
     ),
     ToolDefinition(
+        "confirmation",
+        "读取待用户确认的实盘写操作（下单/改单/撤单）：返回 pending（含编号、工具、中文订单摘要、"
+        "创建与到期时间）与 ttl_ms；无待确认时为 null。**只读**：这笔确认由用户在独立 Web 上作答，"
+        "模型不应也不能自行批准——工具参数无法自证已确认，批准只有 Web 的 confirm-decide 通道可达。"
+        "另注意跨进程边界：该列表只看得到本服务进程发起的确认，Harness 会话内的确认请在 Harness 面板作答。",
+        "confirmation",
+        (REFRESH,),
+    ),
+    ToolDefinition(
         "plan_execute",
         "唯一受约束执行入口：execute=执行已冻结计划（live 需口令「确认执行」，用户须在对话中"
         "逐笔确认后由你携带）；cancel=取消计划；kill/unkill=风控总开关。返回 queued+nonce，"
@@ -394,7 +419,7 @@ if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时
 # 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
 TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 
-# 20 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints()）。
+# 21 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 
@@ -536,7 +561,7 @@ class BoundTool:
 
 
 def build_tools(handle, store_api):
-    """25 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
+    """26 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
 
     ``handle`` 必须是 ``app.create_handler`` 的产物——与 HTTP 面同一个实例（规格 §5.2 R6）。
     """
@@ -562,7 +587,7 @@ def _bind(definition, handle, store_api):
 
 
 def register(server: MCPServer, handle, store_api=None):
-    """把 25 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
+    """把 26 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
 
     ``store_api`` 在生产路径上由 create_app 显式传入；缺省 None 只为单测里手搓 server 的便利
     （此时维护工具调用会抛 AttributeError，并按程序异常包成 tool-failed）。
@@ -609,8 +634,8 @@ def _forbid_extra_fields(server, own_names=TOOL_NAMES):
 
 __all__ = [
     "ENDPOINT_TOOL_ENDPOINTS", "INVALID_OPERATION_CODE", "LIVE_SWITCH_CODE", "LIVE_SWITCH_MESSAGE",
-    "SERVER_NAME", "SERVER_VERSION", "StoreApi", "TOOLS", "TOOL_COUNT", "TOOL_FAILED_CODE",
-    "TOOL_NAME_BLACKLIST", "TOOL_NAMES", "BoundTool", "Param", "ToolDefinition", "build_tools",
-    "dispatch", "failure", "is_blacklisted", "payload_of", "register", "result_payload",
-    "tool_result",
+    "MCP_EXCLUDED_ENDPOINTS", "SERVER_NAME", "SERVER_VERSION", "StoreApi", "TOOLS", "TOOL_COUNT",
+    "TOOL_FAILED_CODE", "TOOL_NAME_BLACKLIST", "TOOL_NAMES", "BoundTool", "Param",
+    "ToolDefinition", "build_tools", "dispatch", "failure", "is_blacklisted", "payload_of",
+    "register", "result_payload", "tool_result",
 ]
