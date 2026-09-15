@@ -4,14 +4,17 @@ store v3（plans/orders/fills/risk_checks）四表迁移与读写函数离线回
 注：任务 7 的 CLI 子命令测试也落在本文件——tests/test_core_cli.py 是 WP1 既有
 文件，不在 WP3 分支的文件所有权清单内（偏差已在 WP3 验收记录披露）。
 """
+import io
+import json
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "datasource" / "python"))
-from trading_core import broker, store  # noqa: E402
+from trading_core import broker, cli, store  # noqa: E402
 
 
 class Wp3Locks(unittest.TestCase):
@@ -93,6 +96,54 @@ class StoreV3Test(unittest.TestCase):
         self.assertEqual(store.kv_get(self.conn, "halt:active")["reason"], "daily_loss")
         store.clear_halt(self.conn)
         self.assertFalse(store.is_halted(self.conn))
+
+
+class Wp3CliCommands(unittest.TestCase):
+    """plan-build / reconcile-diff 子命令（离线 JSON 口径，规格 §2.3）。
+
+    计划原文把本组测试放在 tests/test_core_cli.py；该文件是 WP1 既有文件、
+    不在 WP3 分支所有权清单内，故落在本锁定文件（验收记录披露 D4）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.db = str(Path(self.tmp.name) / "t.sqlite")
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _run(self, argv):
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            code = cli.main(argv)
+        self.assertEqual(code, 0)
+        return json.loads(buf.getvalue())
+
+    def test_plan_build_freezes_plan_json(self):
+        out = self._run(["plan-build", "--mode", "SIM", "--strategy", "momentum_value_top5",
+                         "--target", '{"SH.600519": 0.5}',
+                         "--prices", '{"SH.600519": 1580.0}',
+                         "--as-of", "2026-09-13", "--db", self.db])
+        self.assertEqual(out["status"], "frozen")
+        self.assertEqual(len(out["orders"]), 1)
+        order = out["orders"][0]
+        self.assertEqual((order["symbol"], order["side"], order["qty"]), ("SH.600519", "BUY", 300))
+        conn = store.connect(self.db)
+        try:
+            self.assertEqual(store.get_plan(conn, out["plan_id"])["content_hash"],
+                             out["content_hash"])
+        finally:
+            conn.close()
+
+    def test_reconcile_diff_reports_qty_mismatch(self):
+        local = Path(self.tmp.name) / "local.json"
+        broker = Path(self.tmp.name) / "broker.json"
+        local.write_text('{"SH.600519": {"qty": 300}}', encoding="utf-8")
+        broker.write_text('{"SH.600519": {"qty": 320}}', encoding="utf-8")
+        out = self._run(["reconcile-diff", "--local", str(local), "--broker", str(broker),
+                         "--db", self.db])
+        self.assertEqual(out["diffs"][0]["qty_diff"], -20)
+        self.assertEqual(out["diffs"][0]["kind"], "qty")
 
 
 if __name__ == "__main__":

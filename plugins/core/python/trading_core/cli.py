@@ -6,6 +6,7 @@
 import argparse
 import datetime as _dt
 import json
+from pathlib import Path
 
 from . import calendar as cal
 from . import quality, store, sync
@@ -57,6 +58,19 @@ def build_parser():
     s.add_argument("--start", required=True)
     s.add_argument("--end", required=True)
     _add_db(s)
+
+    s = sub.add_parser("plan-build", help="生成并冻结计划（目标权重 JSON 内联提供）")
+    s.add_argument("--mode", default="SIM")
+    s.add_argument("--strategy", default="momentum_value_top5")
+    s.add_argument("--target", required=True, help='JSON，如 {"SH.600519": 0.5}')
+    s.add_argument("--prices", required=True, help="JSON，标的→限价")
+    s.add_argument("--as-of", required=True)
+    _add_db(s)
+
+    s = sub.add_parser("reconcile-diff", help="离线比对本地与券商持仓 JSON")
+    s.add_argument("--local", required=True)
+    s.add_argument("--broker", required=True)
+    _add_db(s)
     return p
 
 
@@ -88,6 +102,22 @@ def main(argv=None):
             result = quality.full_report(conn, args.market,
                                          [t.strip() for t in args.symbols.split(",") if t.strip()],
                                          args.start, args.end)
+        elif args.cmd == "plan-build":
+            from . import planner
+            target = json.loads(args.target)
+            prices = json.loads(args.prices)
+
+            def broker_positions(mode):
+                return {}, 1_000_000.0  # 无券商通道时的离线口径；真实通道走 daemon（WP4）
+
+            result = planner.build_and_freeze(conn, mode=args.mode, strategy_id=args.strategy,
+                                              target=target, broker_positions=broker_positions,
+                                              prices=prices, as_of=args.as_of)
+        elif args.cmd == "reconcile-diff":
+            from . import reconcile
+            result = {"diffs": reconcile.compare(
+                conn, json.loads(Path(args.local).read_text()),
+                json.loads(Path(args.broker).read_text()))}
         else:  # pragma: no cover - argparse 已约束
             raise ValueError(f"未知子命令 {args.cmd}")
     finally:
