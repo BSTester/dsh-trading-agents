@@ -79,3 +79,8 @@ WP1（§13.2 六项）、WP2（估值字段路径复用 `workbench/python/factor
 规格：`docs/superpowers/specs/2026-09-15-wp6-standalone-service.md`（2026-09-15 产出，前端形态经用户确认为 Vite + antd5 + ProComponents；同日第二次决策把服务后端改为 **FastAPI（Python）单进程**，规格与计划已同步修订）。
 实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（含补遗 A–E：FastAPI 架构变更与 Node 服务层退役）。
 验收记录：**`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md` 末节「WP6 验收记录」**（分支与提交清单、全量测试证据、规格 §六 关键验收对照、真实进程冒烟、人工会话回归留位、执行偏差与 live 准入）。
+
+## WP7 独立量化平台（已立项，2026-09-16 用户决策）
+
+合并 WP6 后重构为**完整独立版本**：工作台（FastAPI 单进程）自带调度与因子快照定时收集（吸收 daemon）、自带富途通道（账户/交易/行情的权威通道，写路径唯一：mode→风控→kill→业务确认）；Harness 只做大脑（研究/决策/分析），富途直连降级为只读研究通道（写类被 policy 拒绝并指引工作台）；提供一键安装提示词（`install/HARNESS_SETUP.md`）。
+规格：`docs/superpowers/specs/2026-09-16-wp7-standalone-platform.md`；计划：`docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md`（验收记录见其末节）。
