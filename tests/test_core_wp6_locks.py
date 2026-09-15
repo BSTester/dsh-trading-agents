@@ -13,10 +13,10 @@ class Wp6Locks(unittest.TestCase):
         self.assertIn("确认执行", rpc_js)
 
     def test_service_defaults(self):
-        config = (ROOT / "platform" / "server" / "config.mjs").read_text(encoding="utf-8")
+        config = (ROOT / "platform" / "server" / "config.py").read_text(encoding="utf-8")
         self.assertIn("8397", config)
         self.assertIn("trading-platform.json", config)
-        manifest = (ROOT / "platform" / "server" / "manifest.mjs").read_text(encoding="utf-8")
+        manifest = (ROOT / "platform" / "server" / "mcp_tools.py").read_text(encoding="utf-8")
         self.assertIn("trading/live-switch-web-only", manifest)
 
     def test_command_whitelist_still_five(self):

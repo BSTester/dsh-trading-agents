@@ -1,0 +1,5 @@
+# FastAPI 单进程服务依赖（WP6 补遗 A）。版本为安装后回填的精确锁定（pip freeze）。
+fastapi==0.141.1
+uvicorn==0.53.0
+mcp==2.2.0
+httpx==0.28.1
