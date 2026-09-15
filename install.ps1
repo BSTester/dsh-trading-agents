@@ -86,3 +86,10 @@ if (Test-Path $tokenFile) {
 # 缺少模式文件时运行时默认 sim；安装器不覆盖模式或修复非法状态。
 
 Say "重启 dsh web → 新建会话 → 选择「交易智囊模式」→ 说「分析一下 00700.HK」"
+
+# 可选：量化平台独立服务（工作台 Web + quantwb MCP 工具面）。
+# 有意不自动执行：涉及常驻进程与端口，交给用户决定时机；一键安装提示词
+# 与完整手册见 install\HARNESS_SETUP.md。
+Say "可选：安装量化平台独立服务（本脚本不自动执行）"
+Warn "手动运行：python scripts\install_platform.py --home $dshHome（幂等，--dry-run 可先看计划）"
+Warn "或把 install\HARNESS_SETUP.md ① 的提示词整段粘贴给新的 Harness 会话，由安装协调员自动完成"

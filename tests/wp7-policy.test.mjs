@@ -193,3 +193,31 @@ test("store.requestConfirmation/decideConfirmation 仍可用（legacy 面板过�
   store.decideConfirmation({ id: view.id, decision: "approved" });
   assert.equal((await settling).decision, "approved");
 });
+
+// ===================== 六、fail-closed：未知动词（WP7 任务 5 序言修复） =====================
+// 拒绝名单只列已知写动词的话，上游新增写动词（如 trading_order_place_v2）会被当
+// 读放行——live 下危险。两族策略有意不同，理由见 policy.js 头注：
+//   trading_*  未知动词一律按写拒绝（fail-closed，实盘不能赌）；
+//   sim_trade_* 未知动词按读处理（模式桶 sim 互斥照旧，sim 写伤害有界）。
+
+test("trading 族未知动词 fail-closed：trading_order_place_v2 按写拒绝，sim/live 皆然", async (t) => {
+  await inTempHome(t);
+  const store = new WorkbenchStore(); // sim
+  const { guard } = fakeHarness(store);
+  assert.match(String(guard(execOf("mcp__futu__trading_order_place_v2", {}))),
+    /请通过工作台交易/, "sim 下未知实盘动词也必须按写拒绝");
+  await store.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
+  assert.match(String(guard(execOf("mcp__futu__trading_order_place_v2", {}))),
+    /请通过工作台交易/, "live 下未知实盘动词必须按写拒绝（fail-closed 核心场景）");
+});
+
+test("sim_trade 族未知动词按读处理：sim_trade_unknown_query 走 sim 桶模式互斥", async (t) => {
+  await inTempHome(t);
+  const store = new WorkbenchStore(); // sim → 本模式读查询放行
+  const { guard } = fakeHarness(store);
+  assert.equal(guard(execOf("mcp__futu__sim_trade_unknown_query", {})),
+    undefined, "sim 族未知动词按读：本模式（sim）放行");
+  await store.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
+  assert.match(String(guard(execOf("mcp__futu__sim_trade_unknown_query", {}))),
+    /账户模式/, "sim 族未知动词按读：模式外（live）仍被互斥拒绝");
+});

@@ -17,6 +17,13 @@
  * guard 一律拒绝并指引工作台通道，不再区分 sim/live。
  * 查询类保留模式互斥（WP6 R1 口径）：sim 拒实盘查询、live 拒 sim 查询；
  * 模式外的账户查询请用工作台（quantwb account_positions 等）。
+ *
+ * WP7 任务 5 修订（未知动词 fail-closed）：上表只列已知动词，而写类判定若仅依赖
+ * 拒绝名单，上游新增写动词（如 `trading_order_place_v2`）会被当读放行——live 下
+ * 危险。因此两族策略**有意不同**：
+ *   - `trading_*` 族：未知动词一律按**写**拒绝（fail-closed，实盘不能赌）；
+ *   - `sim_trade_*` 族：未知动词按**读**处理（模式桶 sim 互斥照旧）——sim 写伤害
+ *     有界（模拟盘账本），fail-closed 误杀研究查询的代价更大；已知 4 个写动词仍按写拒绝。
  */
 
 /** 写动词（下单/改单/撤单）。按后缀匹配，覆盖两族的全部已知写工具与命名变体。 */
@@ -35,10 +42,17 @@ function writeOperation(operation) {
 function accountTool(name) {
   if (!name.startsWith("mcp__futu__")) return null;
   const operation = name.slice("mcp__futu__".length);
-  const write = writeOperation(operation);
-  if (operation.startsWith("sim_trade_")) return { mode: "sim", write };
+  if (operation.startsWith("sim_trade_")) {
+    // sim 族：未知动词按**读**处理（模式桶 sim，互斥照旧）。与 trading_ 族的差异是
+    // 有意为之：sim 写伤害有界，误杀查询代价更大；已知写动词仍按写拒绝（见头注）。
+    return { mode: "sim", write: writeOperation(operation) };
+  }
   if (operation.startsWith("account_")) return { mode: "live", write: false };
-  if (operation.startsWith("trading_")) return { mode: "live", write };
+  if (operation.startsWith("trading_")) {
+    // trading 族 fail-closed：未知动词一律按**写**拒绝。拒绝名单只覆盖已知动词，
+    // 上游新增写动词若被当读放行，live 下危险——实盘不能赌。
+    return { mode: "live", write: true };
+  }
   return null;
 }
 
