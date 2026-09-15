@@ -1,5 +1,9 @@
 // 数据层：POST /api/wb/<endpoint>；envelope 解包 + 客户端内存缓存（TTL 对齐旧 client.js）。
 // 业务失败（ok:false）抛 Error(message) 由页面展示——不弹全局错误掩盖降级数据。
+// 缺失端点自检：另维护 snapshot 声明的端点集合，未声明的端点直接拦下（不发请求）；
+// 纯逻辑在 services/endpoints.js，本文件只做接线（fetch/localStorage 不进 node 测试）。
+import { declaredEndpoints, endpointMissing } from "./endpoints.js";
+
 const TTL_MS = {
   snapshot: 0, series: 300_000, equity: 300_000, positions: 300_000,
   correlation: 1_800_000, sensitivity: 3_600_000, risk: 900_000, trades: 300_000,
@@ -8,6 +12,8 @@ const TTL_MS = {
   plan: 60_000, schedule: 30_000, reconcile: 300_000,
 };
 const memory = new Map();
+// snapshot 响应声明的端点集合；null = 尚未取到声明（不拦，交给 404 兜底）。
+let declared = null;
 
 export function getToken() {
   try { return localStorage.getItem("trading_token") ?? ""; } catch { return ""; }
@@ -23,6 +29,11 @@ export function clearCache() { memory.clear(); }
 export async function callApi(endpoint, payload = {}, { refresh = false } = {}) {
   const key = `${endpoint}|${JSON.stringify(payload)}`;
   const ttl = TTL_MS[endpoint] ?? 0;
+  // 声明预检（snapshot 自身除外）：未声明即服务版本陈旧，不发请求
+  if (endpoint !== "snapshot") {
+    const missing = endpointMissing(endpoint, declared);
+    if (missing) throw new Error(missing);
+  }
   const hit = memory.get(key);
   if (!refresh && ttl > 0 && hit && Date.now() - hit.at < ttl) return hit.value;
   const headers = { "Content-Type": "application/json" };
@@ -47,6 +58,8 @@ export async function callApi(endpoint, payload = {}, { refresh = false } = {}) 
     throw new Error(`服务响应异常（HTTP ${response.status}）：${error.message}`);
   }
   if (!body.ok) throw new Error(body.error?.message || body.error?.code || "请求失败");
+  // snapshot 是端点声明来源：写入模块级集合，后续调用据此预检
+  if (endpoint === "snapshot") declared = declaredEndpoints(body.value);
   // 审查修复：TTL=0 的端点（snapshot）不写缓存——缓存写入必须带有效期
   if (ttl > 0) memory.set(key, { at: Date.now(), value: body.value });
   return body.value;

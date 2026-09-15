@@ -43,7 +43,8 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
           workbench Host：持久结果与模式（Harness 进程内）
                     │ Harness Connection RPC（legacy 面板，过渡期）
                     ▼
-          workbench Client：结果卡片 + 展示面板 + 模式切换
+          workbench Client：结果卡片 + 展示面板 + 模式切换（legacy 通道，过渡期）
+                            模式切换的正式入口是独立 Web 页头徽章（见下）
 
           独立服务进程（platform/，FastAPI + uvicorn 单进程）
             ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
@@ -68,8 +69,9 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 
 **MCP 通道分级（WP6）**：`mcp__quantwb__switch_mode` **只接受切到 sim
 （live→sim 回模拟盘）；sim→live 一律拒绝**（`trading/live-switch-web-only`）——
-实盘切换只能由用户在独立 Web 输入口令「确认实盘」完成（Web 的
-`/api/wb/switch-mode` 保留口令流程），与 `quant_switch`「模型不能代替用户确认实盘」
+实盘切换只能由用户在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）
+输入口令「确认实盘」完成：`/api/wb/switch-mode` 保留口令流程，请求带 `expected_mode`，
+成功后显示 `order_authorized: false`；与 `quant_switch`「模型不能代替用户确认实盘」
 同一条不变量。
 
 ## 组件职责
@@ -255,8 +257,10 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
 
 - `DSH_HOME/trading-account-mode` 是模式真源，缺失时 sim，非法内容报错。
 - 模式持久化，**重启不会自动切回 sim**。
-- 用户在工作台输入「确认实盘」才能切 live；请求包含 `expected_mode`，
-  防止基于旧页面误切换。切换不授权任何订单。
+- 用户在工作台输入「确认实盘」才能切 live：独立 Web 的入口是页头 SIM/LIVE 徽章
+  （点击展开「账户模式」对话框，sim→live 显示口令输入框，`services/mode.js` 构造
+  `{mode, expected_mode, confirmation}`）；请求包含 `expected_mode`，
+  防止基于旧页面误切换。切换不授权任何订单（成功提示固定带 `order_authorized: false`）。
 - `quant_switch` 只能切 sim；`scripts/trade_mode.py` 可查询或离线恢复 sim，
   不再通过脚本启用 live。
 - 账户调用持有 `trading-call-*.active` 租约，期间拒绝切换；
@@ -293,6 +297,12 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 
 除 `plan-execute`（执行已冻结计划，白名单指令落盘）外，不开放下单、shell、LLM 或
 token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
+
+**端点声明自检（前端）**：`snapshot` 响应带 `endpoints` 数组（服务端 `store_access.endpoints()`，
+恰 20 项），前端 `services/endpoints.js` 用纯函数比对本次要调的端点；未声明即
+「服务未提供 X（服务版本陈旧，请重启服务后刷新）」并**不发起请求**
+（`services/api.js` 接线；服务端 404 分支保留作兜底；声明集合取不到时一律放行，
+不把旧服务拦死）。
 
 **独立 Web 的安全边界（诚实清单，规格 §4.7）**：脱离 Harness Connection 后，
 认证边界变为 **loopback 绑定（默认 127.0.0.1:8397）+ 可选静态 Bearer token**

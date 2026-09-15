@@ -1789,8 +1789,8 @@ git commit -m "feat(web): 页面批 3（计划窄门/调度 kill/审计三级链
 
 **文件：** 修改 `docs/architecture.md`、`docs/RUNBOOK.md`、`README.md`、`docs/HANDOVER.md`、`docs/P4-live-trading.md`、`docs/superpowers/plans/2026-09-14-platform-plan-index.md`；本文件末尾「WP6 验收记录」
 
-- [ ] **步骤 1：`architecture.md`**：组件职责表加一行「`platform/` 独立服务进程（WP6）」；「产品定位」图补独立 Web/MCP 两条通道；「明确不做」补「独立 Web 无聊天/逐单表单；MCP switch_mode 只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝（通道分级，规格 §3.2）」；文首「以 WP6 合并后实测为准」标注
-- [ ] **步骤 2：`RUNBOOK.md`**：新增「平台服务」一节——启动 `node platform/server/start.mjs`、`~/.dsh/trading-platform.json` 配置样例（port/host/token）、前端构建 `npm --prefix platform/web run build`、mcp-smoke 排障（`node --test platform/tests/smoke.test.mjs`）、systemd unit 样例：
+- [x] **步骤 1：`architecture.md`**：组件职责表加一行「`platform/` 独立服务进程（WP6）」；「产品定位」图补独立 Web/MCP 两条通道；「明确不做」补「独立 Web 无聊天/逐单表单；MCP switch_mode 只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝（通道分级，规格 §3.2）」；文首「以 WP6 合并后实测为准」标注
+- [x] **步骤 2：`RUNBOOK.md`**：新增「平台服务」一节——启动 `node platform/server/start.mjs`、`~/.dsh/trading-platform.json` 配置样例（port/host/token）、前端构建 `npm --prefix platform/web run build`、mcp-smoke 排障（`node --test platform/tests/smoke.test.mjs`）、systemd unit 样例：
 
 ```ini
 # ~/.config/systemd/user/quant-platform.service
@@ -1804,11 +1804,11 @@ Restart=on-failure
 WantedBy=default.target
 ```
 
-- [ ] **步骤 3：`README.md`**：目录结构加 `platform/`；「可选：启动独立工作台服务」小节（bootstrap 两条 npm install + 构建命令 + preset 行启用说明）
-- [ ] **步骤 4：`HANDOVER.md`**：交接注意加双进程数据约定（服务进程与 Harness 进程共享 `trading-workbench.json`，模式切换靠 `expected_mode` 复核兜底）与 legacy 面板过渡策略
-- [ ] **步骤 5：`P4-live-trading.md`**：实盘准入清单追加「独立 Web + MCP 入口审批回归（§5.3 人工清单 5 步）通过」
-- [ ] **步骤 6：`2026-09-14-platform-plan-index.md` WP6 节**：追加「规格：`docs/superpowers/specs/2026-09-15-wp6-standalone-service.md`；计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`；验收记录见计划末节」
-- [ ] **步骤 7：全量验收（命令与证据粘贴进「WP6 验收记录」）**
+- [x] **步骤 3：`README.md`**：目录结构加 `platform/`；「可选：启动独立工作台服务」小节（bootstrap 两条 npm install + 构建命令 + preset 行启用说明）
+- [x] **步骤 4：`HANDOVER.md`**：交接注意加双进程数据约定（服务进程与 Harness 进程共享 `trading-workbench.json`，模式切换靠 `expected_mode` 复核兜底）与 legacy 面板过渡策略
+- [x] **步骤 5：`P4-live-trading.md`**：实盘准入清单追加「独立 Web + MCP 入口审批回归（§5.3 人工清单 5 步）通过」
+- [x] **步骤 6：`2026-09-14-platform-plan-index.md` WP6 节**：追加「规格：`docs/superpowers/specs/2026-09-15-wp6-standalone-service.md`；计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`；验收记录见计划末节」
+- [x] **步骤 7：全量验收（命令与证据粘贴进「WP6 验收记录」）**
 
 ```bash
 ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py' -v
@@ -1819,14 +1819,26 @@ npm --prefix platform/web run build
 grep -rn "设计稿\|示例数据\|宁可\|窄门" platform/web/src   # 字符串字面量 0 命中
 ```
 
-- [ ] **步骤 8：Commit**
+- [x] **步骤 8：Commit**
 
 ```bash
 git add docs README.md
 git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引）"
 ```
 
+> **任务 13 完成注记（2026-09-16 回填）**：提交 `728582f`
+> （`docs: WP6 文档修订与全量验收记录（FastAPI 单进程服务）`），八步全部完成。
+> 步骤 2 的 `node platform/server/start.mjs` 与步骤 7 的 `node --test platform/tests/*.test.mjs`
+> 是补遗 E 之前的**历史命令**（Node 服务层已退役），实际执行的命令与证据见
+> 「WP6 验收记录」§2/§4；步骤 7 在本节的口径为 `platform/web/src` 字符串 grep 0 命中。
+> 最终整体审查发现的阻塞项 A（模式切换 UI）与须修 B/C/D 由本次修复提交补齐，
+> 见 §1 提交表末行与 §6 偏差 13/14。
+
 ### 任务 14：人工会话回归（需用户在场，自动执行部分之外的验收门）
+
+> **未勾选：待用户在场执行 §5.3 五步**。本 worktree 无法起真实 Harness 会话
+> （`quant-platform-mcp` 行与 MCP 客户端须在用户环境的 dsh 内生效），
+> 故步骤 1–3 一律保持 `- [ ]`，证据位留空于「WP6 验收记录」§5。
 
 - [ ] **步骤 1**：用户机器上启用 preset 的 `quant-platform-mcp` 行（`disabled: false`）并启动服务；新建 Harness 会话
 - [ ] **步骤 2**：执行规格 §5.3 人工清单 5 步（工具面出现 / MCP live 拒绝 / Web 口令切 live / trading_* 原生审批卡 / plan_execute 窄门 + kill 演练），证据粘贴进「WP6 验收记录」
@@ -1834,15 +1846,33 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 
 ## WP6 验收记录（2026-09-16 回填）
 
-> 环境：worktree `/home/penn/workspace/dsh-wp6`，分支 `feat/wp6`，HEAD `044d0ce`（本记录所在提交的父提交）；
+> 环境：worktree `/home/penn/workspace/dsh-wp6`，分支 `feat/wp6`，本记录原始提交 `728582f`
+> （其父 `044d0ce`）；最终整体审查修复提交见 §1 提交表末行（本次修复后 HEAD）。
 > Python `~/.dsh/trading-venv`（3.13.5），Node v22.23.2 / npm 10.9.8。
 > **本记录的证据全部来自上述 worktree 的真实运行，先跑后抄**；凡未执行者一律标注「待办」，不预填。
+> §2 的三套数字为最终审查修复后的复跑值（Python 642 / Node 181 / 前端 193）。
 > live 准入仍按 `docs/P4-live-trading.md` 清单人工评估，人工项保持未勾选。
 
 ### 1. 分支与提交清单
 
-基线 `ecec7d1`（WP6 规格落库前的上一提交）；Node 服务层退役前状态 = `aaa5f42^`。
-全程未切分支、未 rebase。
+**基线口径（两个提交的关系）**：
+
+- `ecec7d1`（docs(plans): 立项 WP6 独立服务化）= **WP6 立项提交**，同时是「规格/计划落库之前」
+  的最后一个提交；它已在主干上，本身不含任何 WP6 代码/测试。
+- `c10ebbe`（docs(specs): WP6 规格与实现计划落库）= `ecec7d1` 的**直接子提交**，也是
+  `git merge-base HEAD main` 的结果——即 **本分支相对主干的实际分叉点**。本分支全部
+  WP6 交付提交（首个为 `c6ccf1e`）都以它为父提交。
+- 因此「基线」在本文有两种读法，本记录的 **diff 范围口径**如下：
+  - **最终审查所审范围 = `c10ebbe..728582f`**（30 个提交，67 files changed，
+    +19024/−73）——只含规格/计划落库**之后**的 WP6 实现、测试与文档改动，
+    不含 `c10ebbe` 自身的规格/计划文本（该提交已在主干），也不含本轮修复提交。
+  - 若需要把规格/计划文本也纳入核对，用 `ecec7d1..728582f`（31 个提交，+21136/−20）：
+    差额恰好是 `c10ebbe` 新增的规格与计划两篇文档。
+  - 本轮修复提交自身另计（见下条），落在 `728582f..HEAD`。
+- `aaa5f42^` 仍是「Node 服务层退役前」的状态锚点。全程未切分支、未 rebase；
+  主干在此期间另前进了 `624ccd0`（不在本分支，合入前需对齐，本次按纪律不动分支）。
+- 本轮最终审查修复提交见下表末尾「最终审查修复」行；其改动范围 = 该提交自身
+  （`platform/web` + `agent.cordis.yml` + `README.md` + `docs/`）。
 
 | 任务 | commit | 主题 |
 |---|---|---|
@@ -1876,11 +1906,12 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 | 任务 12 | `ae2aa82` | feat(web): 页面批 3（计划窄门/调度 kill/审计三级链路） |
 | 任务 12 审查修复 | `9ffde7f` | fix: 计划端点最新在前（修陈旧计划执行口径）+ 调度首屏加载态 + 计划页刷新 + 审计展示一致性 |
 | **修复批次 3** | `044d0ce` | chore(platform): 收窄私有 API 改动面 + 记录 anyOf/PTC 退化 + /mcp 鉴权加固 + admin/schema 用例补齐 |
-| 任务 13 | （本记录所在提交） | docs: WP6 文档修订与全量验收记录（FastAPI 单进程服务） |
+| 任务 13 | `728582f` | docs: WP6 文档修订与全量验收记录（FastAPI 单进程服务） |
+| **最终审查修复（阻塞项 A + 须修 B/C/D）** | （本记录所在提交） | fix(web): 独立 Web 模式切换入口（口令 + `expected_mode`）+ endpoints 预检；文档/验收记录同步 |
 
 ### 2. 全量测试证据
 
-**(1) Python 全量离线套件**（提交前最终验证运行）
+**(1) Python 全量离线套件**（提交前最终验证运行；最终审查修复复跑同值）
 
 ```console
 $ ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'
@@ -1889,11 +1920,19 @@ Ran 642 tests in 108.492s
 OK (skipped=1)
 ```
 
+```console
+$ ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'   # 最终审查修复复跑
+Ran 642 tests in 84.458s
+
+OK (skipped=1)
+```
+
+数字未变（最终审查修复只动 `platform/web` 与文档，未改 Python 源码）。
 唯一的 skip 是 `tests/test_wp6_service.py::DefaultWiringSmokeTests::test_series_with_default_wiring_optional`
 （`@unittest.skipUnless(os.environ.get("DSH_WP6_SLOW") == "1", "慢用例（bars.py 真实取数可能 ~10s）")`，
 默认关闭以免全量套件依赖真实取数）。
 
-**(2) Node 策略链 + legacy 套件**
+**(2) Node 策略链 + legacy 套件**（最终审查修复复跑同值）
 
 ```console
 $ node --test tests/*.test.mjs
@@ -1903,27 +1942,43 @@ $ node --test tests/*.test.mjs
 # duration_ms 14397.608474
 ```
 
-（184 → 181 是补遗 E 的预期变化：R3/R4/R5 三条服务面用例迁移到 Python 侧。）
+（184 → 181 是补遗 E 的预期变化：R3/R4/R5 三条服务面用例迁移到 Python 侧。
+最终审查修复未改根 `tests/`，复跑 `# tests 181 / # pass 181 / # fail 0`，数字不变。）
 
-**(3) 前端单测**
+**(3) 前端单测**（最终审查修复后：184 → 193）
 
 ```console
 $ npm --prefix platform/web test
-# tests 184
-# pass 184
+# tests 193
+# pass 193
 # fail 0
+# suites 0
+# skipped 0
 ```
 
-**(4) 前端构建（含产物大小；提交前最终验证运行）**
+193 = 原 184（geometry 3 + markdown 181）+ 本次新增 9 条纯函数用例：
+`tests/mode.test.mjs` 5 条（免口令 sim 切换 / live 无口令与错口令拒绝 / 对口令成功且
+`expected_mode` 透传 / 非法目标拒绝 / 徽章两态）与 `tests/endpoints.test.mjs` 4 条
+（声明缺失拦截 / 声明集合为 null 不拦 / 已声明放行 / 空声明集合语义）。
+两条测试只 import `src/services/{mode,endpoints}.js` 纯模块——客户端 JSX 与
+`fetch`/`localStorage` 不进测试。
+
+**(4) 前端构建（含产物大小；最终审查修复后重建）**
 
 ```console
 $ npm --prefix platform/web run build
 vite v6.4.3 building for production...
-✓ 3873 modules transformed.
+✓ 3875 modules transformed.
 dist/index.html                    0.33 kB │ gzip:   0.26 kB
-dist/assets/index-BAtbIGwN.js  1,348.77 kB │ gzip: 426.74 kB
-✓ built in 1m 17s
+dist/assets/index-D-ms0OtJ.js  1,351.02 kB │ gzip: 427.54 kB
+✓ built in 1m 11s
 ```
+
+模块数 3873 → 3875（新增 `services/mode.js`、`services/endpoints.js`），
+产物 1,348.77 → 1,351.02 kB（gzip 426.74 → 427.54 kB）＝模式切换对话框、
+端点预检接线与徽章的键盘可达性属性。
+（`platform/web/dist` 由 `platform/.gitignore` 忽略，不入库——上表是部署前本地构建的实测值，
+构建命令见 README/RUNBOOK。）
 
 **(5) 图表打包校验（lint:charts）**
 
@@ -1939,12 +1994,12 @@ $ npm --prefix platform/web run lint:charts
 
 | 规格 §六 验收项 | 状态 | 证据 |
 |---|---|---|
-| 1 全量离线套件全绿 | ✅ | 上节三套：Python 642 / OK，Node 181/0，前端 184/0 |
+| 1 全量离线套件全绿 | ✅ | 上节三套（最终审查修复后复跑）：Python 642 / OK（skipped=1），Node 181/0，前端 **193/0** |
 | 2 R1–R6 / P1–P3 / S1–S4 逐条对应提交留档 | ✅ | 本节各小节 + §4 对照表 |
-| 3 独立 Web 11 页签可用 + 文案规范 grep 0 | ✅ 自动部分 | 11 页签组件与数据层用例 184/0、构建通过；文案 grep 见下；**真实数据下的目视核对属人工步骤** |
+| 3 独立 Web 11 页签可用 + 文案规范 grep 0 | ✅ 自动部分 | 11 页签组件与数据层用例 **193/0**（含本次新增模式切换/端点预检纯函数 9 条）、构建通过；页头 SIM/LIVE 徽章即模式切换入口（点击展开「账户模式」对话框，sim→live 需逐字口令「确认实盘」，请求带 `expected_mode`，成功提示带 `order_authorized: false`）——补上 §4.5:1 原先缺失的 UI；文案 grep 见下；**真实数据下的目视核对属人工步骤** |
 | 4 MCP tools/list = 25 且无黑名单工具 | ✅ | R5（16 用例）+ S1（2 用例，真实 uvicorn + mcp 客户端） |
 | 5 人工会话回归 5 步留痕 | ⏳ **待用户** | §5 留空位 |
-| 6 文档修订与实现一致 | ✅ | 本次提交（architecture/RUNBOOK/README/HANDOVER/P4/索引 + 计划末节）；路径与端点抽查见下 |
+| 6 文档修订与实现一致 | ✅ | `728582f`（architecture/RUNBOOK/README/HANDOVER/P4/索引 + 计划末节）+ 最终审查修复提交：`architecture.md` 与 `README.md` 的「模式切换」措辞改为「独立 Web 的模式切换入口（页头徽章 →「账户模式」对话框）」并与新增 UI 对齐；`agent.cordis.yml` 启动命令补 venv 前缀；路径与端点抽查见下 |
 | 7 live 准入人工项保持未勾选 | ✅ | P4 清单新增第 10 项，未勾选（§7） |
 
 **25 工具封闭（R5）**：`tests/test_wp6_service_approval.py` 的 `R5ToolSurfaceTests`（9 用例）
@@ -1993,6 +2048,8 @@ $ grep -rn "设计稿\|示例数据\|宁可\|窄门\|规格\|token 说明" platf
 （无输出，exit 1）
 ```
 
+最终审查修复复跑同上（新增 `services/mode.js`、`services/endpoints.js` 与 `app.jsx`
+的模式切换文案后仍 0 命中，exit 1）——新增文案全部属操作反馈/安全合规类。
 口径说明见 §6 偏差 9（规格 §4.4 的裸 `token` 写法另有 2 处用户可见字符串，属白名单第 3 类）。
 
 **文档与实现一致性抽查**（规格 §六-6）：`platform/server/{app,run,config,store_access,mcp_tools}.py`
@@ -2054,11 +2111,43 @@ $ curl -s -X POST http://127.0.0.1:35891/api/wb/not-an-endpoint -H 'content-type
 另核：`snapshot.value.endpoints` 恰 20 项；就绪行 `tools: 25`；
 `curl -I /`（HEAD）返回 405「仅 GET」信封——静态路径只认 GET，属有意行为（已写入 RUNBOOK）。
 
+#### 4.1 模式切换载荷逐字段复核（最终审查修复，2026-09-16 追加）
+
+最终审查修复按阻塞项 A 补上 UI 后，用**真实进程 + 临时 DSH_HOME** 复核前端将发出的
+载荷（`{mode, expected_mode, confirmation}`）与服务端逐条对上（临时目录已删除）：
+
+```console
+$ cd platform && DSH_HOME=<临时目录> TRADING_SERVICE_PORT=18397 ~/.dsh/trading-venv/bin/python -m server.run
+{"ok": true, "service": "quant-platform", "url": "http://127.0.0.1:18397", "mcp": "http://127.0.0.1:18397/mcp", "tools": 25, "auth": "loopback-only"}
+
+$ curl -s -X POST .../api/wb/snapshot -d '{}'   → mode=sim；endpoints 20 项，含 switch-mode
+
+$ # 1) live 无口令（前端 mode.js 先拦，服务端复核同文案）
+{"ok":false,"error":{"code":"trading/invalid-operation","message":"请输入「确认实盘」；切换模式不等于授权下单","details":{}}}
+$ # 2) live 错口令
+{"ok":false,"error":{"code":"trading/invalid-operation","message":"请输入「确认实盘」；切换模式不等于授权下单","details":{}}}
+$ # 3) live 对口令「确认实盘」
+{"ok":true,"value":{"mode":"live","previous_mode":"sim","order_authorized":false}}
+$ # 4) 模式已变后再用陈旧 expected_mode=sim
+{"ok":false,"error":{"code":"trading/invalid-operation","message":"Account mode changed; refresh before switching","details":{}}}
+$ # 5) 切回 sim（不需要口令）
+{"ok":true,"value":{"mode":"sim","previous_mode":"live","order_authorized":false}}
+$ # 6) 未声明端点
+HTTP 404（前端 endpoints.js 预检会先拦；404 文案保留兜底）
+```
+
+要点：错误文案与 `platform/web/src/services/mode.js` 的本地预检文案**逐字相同**；
+成功响应的 `order_authorized: false` 即页头提示里展示的字段；
+`expected_mode` 透传使陈旧页面被服务端拒绝（步骤 4）。
+
 ### 5. 人工会话回归（规格 §5.3，5 步）——**待用户在真实 Harness 会话执行**
 
 > 本 worktree 无法起真实 Harness 会话（preset 行与 MCP 客户端需在用户环境的 dsh web 内生效），
 > 故以下 5 步**未执行**，证据位留空。任何一步失败 → 按规格 §5.5 回滚 `agent.cordis.yml`
 > 的 `quant-platform-mcp` 行为 `disabled: true` 并修复重跑。
+> 步骤 3 依赖的模式切换 UI 已由最终审查修复补齐（页头徽章 →「账户模式」对话框；
+> 其发出的载荷已在 §4.1 对真实服务复核），但「用户在真实会话里点开徽章并输入口令」
+> 仍只能由用户在场完成，故该行保持「待执行」。
 
 | # | 步骤（规格 §5.3） | 结果 | 证据 |
 |---|---|---|---|
@@ -2129,6 +2218,25 @@ live 一律拒且模式文件不落地；步骤 4 的审批链由 R1/R2 在假 c
     现行命令见补遗任务 E 与本节 §2。
 12. **本记录未覆盖的部分**：人工会话回归（§5）与 live 准入（§7）未完成前，WP6 验收**未**判定通过；
     真实数据（富途 token/账户）下的 11 页签目视核对同样待用户在场执行。
+13. **模式切换 UI 漏配任务（最终审查发现的阻塞项 A，已修复）**：成因是**初版计划的任务 8–12
+    （前端脚手架 + 三批页面）只把模式切换落在页头只读徽章，没有为规格 §4.5:1 的
+    「sim→live 必须输入『确认实盘』+ `expected_mode` + 成功后显示 `order_authorized: false`」
+    配置任何实现任务**——计划任务 12 只给了计划页执行门槛（`确认执行`），模式切换被漏掉。
+    计划与实际代码的双重漏项使该不变量在独立 Web 侧**只有文档承诺、没有 UI 入口**
+    （MCP 通道按 §3.2 封死 live，legacy 面板之外无路可走）。最终整体审查据此判为阻断项，
+    本次补齐：新增 `platform/web/src/services/mode.js`（纯函数 `switchModeRequest` /
+    `modeBadge`）+ `tests/mode.test.mjs`（5 用例），`app.jsx` 页头徽章改为可点开的
+    「账户模式」对话框（Radio 选目标模式、live 且当前非 live 时显示口令输入、
+    `callApi("switch-mode", …)` 成功后提示带 `order_authorized: false` 并刷新 snapshot）。
+    服务端 `store_access.switch_mode` 的校验顺序与文案未改动——本次只补浏览器侧入口与预检。
+14. **前端 `snapshot.endpoints` 预检初版未实现（已补齐）**：规格 §4.3 要求「未声明端点直接
+    显示『服务版本陈旧，请重启服务』且**不发起请求**」，初版 `services/api.js` 只保留了
+    服务端 404 的兜底文案，没有任何声明比对。本次补齐：新增
+    `platform/web/src/services/endpoints.js`（`declaredEndpoints` 非数组→null；
+    `endpointMissing` 在声明集合为 null 时不拦，避免旧服务被前端拦死）+
+    `tests/endpoints.test.mjs`（4 用例）；`api.js` 维护模块级 `declared`（snapshot 响应写入
+    `body.value.endpoints`），非 snapshot 调用前先预检，命中即 `throw` 且**不发请求**，
+    服务端 404 分支文案保留作兜底。
 
 ### 7. live 准入
 

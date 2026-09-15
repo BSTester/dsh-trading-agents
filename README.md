@@ -168,8 +168,9 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 要让 Harness 会话直接调用工作台能力，把 `agent.cordis.yml` 里 `quant-platform-mcp` 行的
 `disabled: true` 改成 `false`，然后**新建会话**（已挂载的会话不会重新读取组合）：会话内
 出现 `mcp__quantwb__*` 共 25 个工具，与 Web 同源（HTTP 与 MCP 调用同一批处理函数）。
-实盘切换只能在 Web 输入口令「确认实盘」完成；`switch_mode` 工具只接受切到 sim
-（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
+实盘切换只能在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）
+输入口令「确认实盘」完成，成功后提示带 `order_authorized: false`；`switch_mode` 工具
+只接受切到 sim（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
 [docs/RUNBOOK.md](docs/RUNBOOK.md) 的「平台服务」一节。
 
 ## 工作台与指令示例
@@ -185,7 +186,7 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 | 持仓风险 | 按账户分组的集中度（占持仓市值 / 占总资产两个口径）与浮盈亏分布；**不跨账户合计** |
 | K 线图 | 富途 K 线（默认日线，可切 60m/15m/5m/1m）；按周期缓存，切页签不重复取数；**鼠标悬停显示该根 K 线的日期、开高低收、涨跌幅与成交量** |
 | 量化预览 | 在 Harness 请求 `quant_signal`、`quant_backtest`、`quant_report` 的结果 |
-| 模拟盘/实盘切换 | 面板内显式操作；实盘输入「确认实盘」，但不授权订单 |
+| 模拟盘/实盘切换 | 独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）显式操作；实盘输入「确认实盘」，但不授权订单（legacy 面板过渡期仍有同款口令流程） |
 
 仍然在 **Harness 对话中**下达指令，例如：
 

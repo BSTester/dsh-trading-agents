@@ -1,9 +1,10 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { App as AntApp, Button, ConfigProvider, Input, Modal, Space, Tag, Typography, theme } from "antd";
+import { App as AntApp, Button, ConfigProvider, Input, Modal, Radio, Space, Tag, Typography, theme } from "antd";
 import { ProLayout } from "@ant-design/pro-components";
 import zhCN from "antd/locale/zh_CN";
-import { clearCache, getToken, setToken } from "./services/api.js";
+import { callApi, clearCache, getToken, setToken } from "./services/api.js";
+import { LIVE_CONFIRMATION, modeBadge, switchModeRequest } from "./services/mode.js";
 import { useSnapshotPoll } from "./services/hooks.js";
 import MarketPage from "./pages/market.jsx";
 import SignalPage from "./pages/signal.jsx";
@@ -51,6 +52,74 @@ function TokenButton() {
   );
 }
 
+/** 页头模式切换入口：徽章可点开，sim→live 需逐字口令；服务端仍独立复核一遍。
+ *  MCP 通道的 switch_mode 只接受切到 sim，live 只能由用户在本入口（过渡期还有
+ *  legacy 面板）手工切换；请求带 expected_mode，成功后提示订单未获授权。 */
+function ModeButton({ mode, onSwitched }) {
+  const { message } = AntApp.useApp();
+  const [open, setOpen] = React.useState(false);
+  const [target, setTarget] = React.useState(mode);
+  const [confirmation, setConfirmation] = React.useState("");
+  const [busy, setBusy] = React.useState(false);
+  const badge = modeBadge(mode);
+  const needConfirmation = target === "live" && mode !== "live";
+
+  const openModal = () => { setTarget(mode); setConfirmation(""); setOpen(true); };
+  const closeModal = () => { if (!busy) setOpen(false); };
+
+  const submit = async () => {
+    let payload;
+    try {
+      payload = switchModeRequest({ target, current: mode, confirmation });
+    } catch (error) {
+      message.error(error.message || String(error));
+      return;
+    }
+    setBusy(true);
+    try {
+      const value = await callApi("switch-mode", payload);
+      const text = modeBadge(value?.mode ?? target).text;
+      message.success(`已切换为 ${text}；order_authorized: ${value?.order_authorized ?? false}`);
+      setOpen(false);
+      onSwitched();
+    } catch (error) {
+      message.error(`切换失败：${error.message || error}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <>
+      <Tag color={badge.color} style={{ cursor: "pointer" }} onClick={openModal}
+        role="button" tabIndex={0} aria-label={`账户模式：${badge.text}`}
+        onKeyDown={(event) => {
+          if (event.key === "Enter" || event.key === " ") { event.preventDefault(); openModal(); }
+        }}>{badge.text}</Tag>
+      <Modal title="账户模式" open={open} onCancel={closeModal} onOk={submit}
+        okText="确认切换" cancelText="取消" confirmLoading={busy}>
+        <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+          <Radio.Group value={target} disabled={busy}
+            aria-label="目标模式"
+            onChange={(event) => { setTarget(event.target.value); setConfirmation(""); }}
+            options={[
+              { label: "模拟 SIM", value: "sim" },
+              { label: "实盘 LIVE", value: "live" },
+            ]} />
+          {needConfirmation && (
+            <Input value={confirmation} autoComplete="off" disabled={busy}
+              aria-label={LIVE_CONFIRMATION}
+              placeholder={`输入：${LIVE_CONFIRMATION}`}
+              onChange={(event) => setConfirmation(event.target.value)} />)}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            切换模式不等于授权下单；确认后显示 order_authorized=false
+          </Typography.Text>
+        </Space>
+      </Modal>
+    </>
+  );
+}
+
 function Shell() {
   const [key, setKey] = React.useState(currentKey());
   React.useEffect(() => {
@@ -69,18 +138,18 @@ function Shell() {
         <a href={`#${item.path}`} onClick={() => setKey(item.path.slice(1))}>{dom}</a>)}
       avatarProps={{ render: () => (
         <Space size="small">
-          <Tag color={mode === "live" ? "red" : "green"}>{mode === "live" ? "实盘 LIVE" : "模拟 SIM"}</Tag>
+          <ModeButton mode={mode} onSwitched={() => snapshot.refresh()} />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             数据按 TTL 本地缓存；模式切换不授权下单
           </Typography.Text>
           <TokenButton />
         </Space>) }}>
-      <AntApp>{page.element}</AntApp>
+      {page.element}
     </ProLayout>
   );
 }
 
 createRoot(document.getElementById("root")).render(
   <ConfigProvider locale={zhCN} theme={{ algorithm: theme.defaultAlgorithm }}>
-    <Shell />
+    <AntApp><Shell /></AntApp>
   </ConfigProvider>);
