@@ -24,10 +24,10 @@ DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://githu
 > 要使用工作台、研报发布、量化工具与账户守卫，请运行方式 B 的完整安装器。
 
 > ⚠️ **方式 A 只装对话模式（skill 基础模式），不装插件。**
-> 工作台的 9 个脚本与量化引擎的 2 个脚本都 `import trading_datasource`（统一数据层），
-> 而**统一数据层只有安装器会解出**——只跑 `dsh plugin add` 装不出它，
-> 表现是一句 `ModuleNotFoundError: No module named 'trading_datasource'`。
-> 装完可用自检验证：
+> 工作台与量化引擎的脚本依赖统一 Python 层的**两个库**——`trading_datasource`（统一数据层）
+> 与 `trading_core`（量化核心：PIT 存储/研究/执行/调度），安装器以
+> `LIBRARIES=("datasource", "core")` 解出这两个库——只跑 `dsh plugin add` 装不出它们，
+> 表现是一句 `ModuleNotFoundError`。装完可用自检验证：
 
 ```bash
 python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/install_plugins.py" check \
@@ -60,7 +60,8 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 
 **方式 C · 让 AI 帮你装**——把下面这段话直接发给你正在使用的 DeepSeek Harness 会话。
 
-> 实测：按下面的步骤走完，会装出 **2 个 skill + 4 个插件 + 统一数据层 + Python 依赖**，
+> 实测：按下面的步骤走完，会装出 **2 个 skill + 4 个插件 + 统一 Python 层
+> （数据层 datasource + 量化核心 core）+ Python 依赖**，
 > 并以自检「✅ 安装完整」为准。`install.sh` 会自行把 preset 克隆到用户 preset 目录，
 > 因此**不需要你手动克隆**。
 
@@ -74,7 +75,8 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
    Windows 用 powershell -File /tmp/dsh-trading-agents/install.ps1
    它会：把 preset 装到 $HOME/.dsh/.agent-presets/dsh-trading-agents（Windows 为
    %USERPROFILE%\.dsh\...）、安装 workbench / fin-data / trading-engine / futu-keepalive
-   四个插件、解出统一数据层并注入交易 venv、创建 venv 并安装 akshare 与 playwright。
+   四个插件、解出统一 Python 层（datasource + core 两个库）并注入交易 venv、
+   创建 venv 并安装 akshare 与 playwright。
    预期最后一行为「重启 dsh web → 新建会话 → 选择「交易智囊模式」…」。
    ⚠️ 过程中会弹出富途授权页（OAuth）等你确认。此刻不想授权就让它跳过，
      之后随时可以补：python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py
@@ -82,7 +84,8 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 2) 运行安装自检，必须看到「✅ 安装完整」：
      python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/install_plugins.py" check \
        --repo "$HOME/.dsh/.agent-presets/dsh-trading-agents" --dsh-home "$HOME/.dsh"
-   自检会逐项核对 preset 各行的启用状态、四个插件、统一数据层与 .pth。
+   自检会逐项核对 preset 各行的启用状态、四个插件、统一 Python 层
+   （datasource/core 两库的标记文件）与 .pth 注入。
    若报出问题，按它给出的修复命令处理后重跑，直到通过为止。
 
 3) 确认 preset 目录下有 agent.cordis.yml、preset.yml、skills/trading-agents/SKILL.md。
@@ -198,9 +201,12 @@ X 的前端 queryId 与混淆算法会随发版变化，`x_api` 任一环节失�
 渠道不会整体不可用。详见 [docs/QUANT-WORKBENCH-PLAN.md](docs/QUANT-WORKBENCH-PLAN.md)。
 
 **研报与量化共用同一套取数实现。** 行情路由、富途 MCP 客户端与回测核心都只有一份，
-放在 `plugins/datasource`（`@bstester/dsh-datasource`）；安装器会把它解到
+放在 `plugins/datasource`（`@bstester/dsh-datasource`）；量化平台核心（PIT 存储、
+因子/策略/回测、风控/OMS/对账、调度运维）在 `plugins/core`（`trading_core`）。
+两者同属安装器 `LIBRARIES`，都会被解到
 `$DSH_HOME/trading-python/` 并向交易 venv 写入 `.pth`，所以任何插件脚本都能直接
-`from trading_datasource.market import load_bars`，无需设置 `PYTHONPATH`。
+`from trading_datasource.market import load_bars`、`from trading_core import store`，
+无需设置 `PYTHONPATH`。
 量化侧可选地复用 fin-data 的情绪渠道（`quant_signal(include_sentiment=true)`），
 但情绪**只是并列参考输入，不参与信号计算**——否则回测结论无法复现。
 详见 [plugins/datasource/README.md](plugins/datasource/README.md)。
@@ -279,6 +285,7 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # �
 ├── preset.yml             # 模式元数据（名称/介绍）
 ├── skills/trading-agents/ # Harness 十二角色、六阶段工作流
 ├── plugins/datasource/   # 统一数据层（库，非插件）：唯一 MCP 客户端/行情路由/回测核心
+├── plugins/core/         # 量化平台核心库 trading_core（库，非插件）：PIT 存储/研究/执行/调度与运维
 ├── plugins/engine/       # 研究记录/发布、量化工具、账户策略；含 Python 量化实现
 ├── plugins/fin-data/     # 统一新闻与舆情工具
 ├── plugins/workbench/    # Host 状态服务 + Harness Client 面板与卡片
