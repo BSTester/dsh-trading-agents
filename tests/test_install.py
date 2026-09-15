@@ -41,16 +41,27 @@ PACKAGE_PYTHON = {
 
 
 def write_tarball(path, plugin):
-    """写一个真实的 tar.gz，结构等同于 npm pack 的 package/ 布局。"""
+    """写一个真实的 tar.gz，结构等同于 npm pack 的 package/ 布局。
+
+    压缩头与成员时间戳固定为 0：安装器按 tarball 字节做内容寻址，
+    而 gzip 头默认带当前时间，跨秒的两次「同内容打包」会得到不同哈希，
+    使幂等/去重断言偶发失败（2026-09-16 定位并修掉该不确定性）。
+    """
+    import gzip
     import io
     import tarfile
 
-    with tarfile.open(path, "w:gz") as tar:
+    buffer = io.BytesIO()
+    with tarfile.open(fileobj=buffer, mode="w") as tar:
         for member in PACKAGE_PYTHON[plugin]:
             payload = ("VALUE = %r\n" % member).encode()
             info = tarfile.TarInfo("package/" + member)
             info.size = len(payload)
+            info.mtime = 0
             tar.addfile(info, io.BytesIO(payload))
+    with open(path, "wb") as handle:
+        with gzip.GzipFile(filename="", mode="wb", fileobj=handle, mtime=0) as gz:
+            gz.write(buffer.getvalue())
 
 
 class InstallerTests(unittest.TestCase):
