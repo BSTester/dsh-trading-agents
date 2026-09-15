@@ -39,8 +39,15 @@ export async function callApi(endpoint, payload = {}, { refresh = false } = {}) 
   }
   if (response.status === 401) throw new Error("需要访问令牌：右上角「令牌」处填入服务配置的 token");
   if (response.status === 404) throw new Error(`服务未提供 ${endpoint}（服务版本陈旧，请重启服务后刷新）`);
-  const body = await response.json();
+  // 审查修复：响应体解析失败（非 JSON）给出可读错误，而不是抛解析器原始错误
+  let body;
+  try {
+    body = await response.json();
+  } catch {
+    throw new Error(`服务响应异常（HTTP ${response.status}）`);
+  }
   if (!body.ok) throw new Error(body.error?.message || body.error?.code || "请求失败");
-  memory.set(key, { at: Date.now(), value: body.value });
+  // 审查修复：TTL=0 的端点（snapshot）不写缓存——缓存写入必须带有效期
+  if (ttl > 0) memory.set(key, { at: Date.now(), value: body.value });
   return body.value;
 }
