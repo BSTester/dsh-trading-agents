@@ -275,10 +275,22 @@ class ContractTests(Base):
         self.assertEqual(client.get("/").status_code, 200)
         self.assertEqual(client.get("/assets/app.js").status_code, 200)
 
-    def test_mcp_placeholder_is_405(self):
-        client = self.client(self.make_app())
-        self.assertEqual(client.get("/mcp").status_code, 405)
-        self.assertEqual(client.post("/mcp").status_code, 405)
+    def test_mcp_endpoint_is_mounted(self):
+        """任务 D 后 /mcp 是真实 MCP streamable-http 端点（不再是 405 占位）。
+
+        协议面（initialize / tools.list / 工具调用）由 tests/test_wp6_mcp.py 用真实 uvicorn
+        + 官方 mcp 客户端覆盖（S1–S4）；这里只锁服务面事实：路由已挂载，且响应是 JSON-RPC
+        线格式而不是 HTTP 框架的信封。Host 必须写成 ``127.0.0.1:<port>``——SDK 默认开启 DNS
+        rebinding 保护，allowed_hosts 是 ``127.0.0.1:*`` 这种带端口的模式，TestClient 默认的
+        ``testserver`` 或裸 ``127.0.0.1``（无端口）都会被 421 挡掉。
+        """
+        head = {"Accept": "application/json, text/event-stream"}
+        with TestClient(self.make_app(), base_url="http://127.0.0.1:8397") as client:
+            for response in (client.get("/mcp", headers=head),
+                             client.post("/mcp", json={}, headers=head)):
+                self.assertNotEqual(response.status_code, 405)
+                self.assertNotEqual(response.status_code, 404)
+                self.assertEqual(response.json()["jsonrpc"], "2.0")
 
     def test_unexpected_error_is_500_envelope(self):
         """500 兜底（service.mjs:84-87）：未预期异常也必须回 trading/internal 信封。

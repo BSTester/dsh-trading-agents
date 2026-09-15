@@ -14,7 +14,9 @@
 与 Node 侧的有意差异（均为「规格更严」而非语义变更）：
   1. ``auth`` 在中间件里统一判定（service.mjs 在每个分支里散着判），但判定条件与豁免面
      完全一致：token 非空时 ``/api/*`` 与 ``/mcp`` 需 ``Authorization: Bearer <token>``。
-  2. ``/mcp`` 本轮是 405 占位（任务 D 换成真实 MCP 挂载）。
+  2. ``/mcp`` 是真实 MCP streamable-http 端点（补遗任务 D）。SDK 的 ``streamable_http_app()``
+     自带 ``lifespan=lambda app: session_manager.run()``，因此并入主 app 的 lifespan；路由用
+     「插进主 router」而不是 ``app.mount()``（见 ``create_app`` 里的有意差异 10）。
   3. 端点白名单与静态路径在**路由层**判（先于 handle），使「白名单 404 不触达 handle」这一
      不变式由框架保证而不是约定；handle 内部对未知端点仍抛同样的 WorkbenchError。
   4. 阻塞取数（子进程/文件）经 ``asyncio.to_thread`` 让出事件循环——响应内容不变，
@@ -32,6 +34,7 @@
      追加 ``; charset=utf-8``，而 service.mjs:10-14 的表里只有 ``.html`` 带 charset。
 """
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -40,8 +43,9 @@ from urllib.parse import unquote
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
+from mcp.server.mcpserver import MCPServer
 
-from server import audit_chain, caches, compute, store_access
+from server import audit_chain, caches, compute, mcp_tools, store_access
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -264,11 +268,34 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     handle = create_handler(home, analytics=analytics, series=series, core=core)
     endpoints = store_access.endpoints()
 
-    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None)
+    # MCP 工具面（补遗任务 D）：25 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
+    # 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的 home 绑定门面。
+    mcp_server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
+    bound_tools = mcp_tools.register(mcp_server, handle, mcp_tools.StoreApi(home))
+    # json_response=True 对齐 Node 版 enableJsonResponse：无 SSE 依赖，普通 JSON 响应。
+    mcp_app = mcp_server.streamable_http_app(json_response=True)
+
+    @contextlib.asynccontextmanager
+    async def lifespan(_app):
+        """主 app lifespan 里并入 SDK 的 lifespan（session manager 的 task group）。
+
+        ``streamable_http_app()`` 返回的 Starlette app 自带
+        ``lifespan=lambda app: session_manager.run()``；不进入它，MCP 会话管理器从未启动，
+        ``/mcp`` 的每个请求都会因 ``self._task_group is None`` 失败。SDK 的
+        ``StreamableHTTPSessionManager.run()`` 每个实例只能进一次，因此进程内只建一个
+        MCPServer（``app.state.mcp``），由 uvicorn 的 lifespan 驱动。
+        """
+        async with mcp_app.router.lifespan_context(mcp_app):
+            yield
+
+    app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.home = home
     app.state.dist = str(root)
     app.state.config = config
     app.state.handle = handle
+    app.state.mcp = mcp_server
+    app.state.mcp_app = mcp_app
+    app.state.mcp_tools = bound_tools
 
     @app.exception_handler(Exception)
     async def unhandled(_request, error):
@@ -348,10 +375,13 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
             return error_envelope("trading/method-not-allowed", "仅 POST", 405)
         return error_envelope("trading/unknown-endpoint", f"未知端点 {rest}", 404)
 
-    @app.api_route("/mcp", methods=list(ALL_METHODS))
-    async def mcp_placeholder():
-        """任务 D 在此挂真实 MCP；本轮按任务约定给 405 占位。"""
-        return error_envelope("trading/method-not-allowed", "MCP 未启用（任务 D 接线）", 405)
+    # /mcp：MCP streamable-http 端点（规格 §3.6，SDK 挂载）。
+    # 有意差异 10：不用 ``app.mount("/mcp", mcp_app)``——Starlette 的 Mount 只匹配
+    # ``/mcp/...``，裸 ``/mcp`` 会由 redirect_slashes 变成 307 跳转；MCP 客户端（含
+    # dsh-mcp-client）对 307 的跟随策略不由我们掌握，且每次会话都多一跳。这里把 SDK 的
+    # 路由**原样插进主 app 的 router**（路径仍是 ``/mcp``），位置固定在静态兜底之前，
+    # 语义与挂载等价且没有跳转。token 中间件的判定路径 ``/mcp`` 因此仍然精确命中。
+    app.router.routes.extend(mcp_app.routes)
 
     @app.get("/{path:path}")
     async def static_files(path: str):
