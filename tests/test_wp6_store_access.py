@@ -37,6 +37,17 @@ def _iso_hours_ago(hours):
     return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
+def _broker_event(entry_id, at, tool, payload, mode="live", is_error=False):
+    """构造一条 broker_response 观察（形状与 store 记录一致：业务 JSON 在 content[].text）。"""
+    return {
+        "id": entry_id, "at": at, "kind": "broker_response", "tool": f"mcp__futu__{tool}",
+        "mode": mode, "session_id": "s-1", "is_error": is_error,
+        "value": {"content": [{"type": "text",
+                               "text": json.dumps(payload, ensure_ascii=False,
+                                                  separators=(",", ":"))}]},
+    }
+
+
 class StoreAccessBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -162,9 +173,24 @@ class SnapshotTest(StoreAccessBase):
                      {"id": "rep_a", "mode": "live", "ticker": "AAPL"},
                      {"id": "rep_b", "mode": "live", "ticker": "TSLA"}],
             previews=[{"id": "p_sim", "mode": "sim"}, {"id": "p_1", "mode": "live"}, {"id": "p_2", "mode": "live"}],
-            activity=[{"id": "a_sim", "mode": "sim", "at": "2026-09-15T00:00:00.000Z"},
-                      {"id": "a_1", "mode": "live", "at": "2026-09-15T01:00:00.000Z"},
-                      {"id": "a_2", "mode": "live", "at": "2026-09-15T02:00:00.000Z"}],
+            activity=[
+                # sim 模式的响应不得进入 live 快照的 trade_summary
+                _broker_event("a_sim", "2026-09-15T00:00:00.000Z", "sim_trade_history_order_list",
+                              {"ret_code": 0, "data": {"orders": [{"order_id": "sim-1",
+                                                                   "symbol": "MSFT"}]}},
+                              mode="sim"),
+                _broker_event("a_1", "2026-09-15T01:00:00.000Z", "sim_trade_history_order_list",
+                              {"ret_code": 0, "data": {"orders": [{
+                                  "order_id": "6526051", "symbol": "09961",
+                                  "stock_name": "携程集团-S", "side": 2, "qty": "200",
+                                  "price": "465.2", "avg_fill_price": "465.2", "cum_qty": "200",
+                                  "status": 4, "create_time": "1768550082000000",
+                                  "update_time": "1768550371000000"}]}}),
+                _broker_event("a_2", "2026-09-15T02:00:00.000Z", "sim_trade_input_order",
+                              {"ret_code": 0, "data": {"order_id": "7137730"}}),
+                _broker_event("a_3", "2026-09-15T03:00:00.000Z", "sim_trade_cash_info",
+                              {"ret_code": 0, "data": {"cash": 100}}),
+            ],
             broker={"sim": {"at": "2026-09-15T00:00:00.000Z", "tool": "sim"},
                     "live": {"at": "2026-09-15T02:00:00.000Z", "tool": "live"}})
         self.write_state(state)
@@ -185,7 +211,7 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual([row["status"] for row in snap["runs"]], ["completed", "running", "abandoned"])
         self.assertEqual([row["id"] for row in snap["reports"]], ["rep_b", "rep_a"])
         self.assertEqual([row["id"] for row in snap["previews"]], ["p_2", "p_1"])
-        self.assertEqual([row["id"] for row in snap["activity"]], ["a_2", "a_1"])
+        self.assertEqual([row["id"] for row in snap["activity"]], ["a_3", "a_2", "a_1"])
 
         # 字段齐备：与 store.js:210-223 同构（+ endpoints）
         self.assertEqual(set(snap), {"version", "mode", "generated_at", "runs", "reports", "previews",
@@ -202,14 +228,31 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(set(snap["runs"][1]),
                          {"id", "ticker", "session_id", "mode", "status", "started_at"})
 
-        # trade_summary 是 B2 之前的占位：形状正确、全零
-        self.assertEqual(set(snap["trade_summary"]),
-                         {"orders", "actions", "queries", "counts", "notice"})
-        self.assertEqual(snap["trade_summary"]["orders"], [])
-        self.assertEqual(snap["trade_summary"]["actions"], [])
-        self.assertEqual(snap["trade_summary"]["queries"], {"count": 0, "tools": []})
-        self.assertEqual(snap["trade_summary"]["counts"],
-                         {"responses": 0, "order_responses": 0, "orders": 0, "actions": 0, "errors": 0})
+        # B2 接线：trade_summary 由过滤后的 activity 派生（store.js:217 同入参同位置）
+        trade_summary = snap["trade_summary"]
+        self.assertEqual(set(trade_summary), {"orders", "actions", "queries", "counts", "notice"})
+        self.assertEqual(trade_summary["counts"],
+                         {"responses": 3, "order_responses": 1, "orders": 1, "actions": 1, "errors": 0})
+        self.assertEqual(trade_summary["queries"],
+                         {"count": 1, "tools": [{"tool": "sim_trade_cash_info", "count": 1}]})
+
+        order = trade_summary["orders"][0]
+        self.assertEqual(order["order_id"], "6526051")
+        self.assertEqual(order["symbol"], "09961")
+        self.assertEqual(order["name"], "携程集团-S")
+        self.assertEqual(order["side"], "卖出")
+        self.assertEqual(order["fill"], "全部成交")
+        self.assertEqual(order["amount"], 93040)              # 200 × 465.2
+        self.assertEqual(order["status_code"], 4)
+        self.assertEqual(order["ordered_at"], "2026-01-16T07:54:42.000Z")
+        self.assertEqual(order["seen_at"], "2026-09-15T01:00:00.000Z")
+        self.assertFalse(order["cancelled"])
+        self.assertEqual(order["modified_count"], 0)
+
+        action = trade_summary["actions"][0]
+        self.assertEqual((action["action"], action["ok"], action["order_id"]),
+                         ("下单", True, "7137730"))
+        self.assertIn("不是券商成交推送", trade_summary["notice"])
 
         # 只读守护：快照不写盘
         self.assertEqual(sa.store_file(self.home).read_bytes(), before)

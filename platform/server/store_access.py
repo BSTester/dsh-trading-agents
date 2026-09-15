@@ -29,8 +29,9 @@
 #   1. 只读快照：snapshot() 不调用 flushObservations()（store.js:206）。trading-observations/
 #      里的暂存观察不会被合并进 activity/broker，合并仍由 Harness 进程内的 Node Host 完成；
 #      pending_observations 如实照抄文件系统里的待合并文件数，合并前的观察不计入快照。
-#   2. trade_summary 是占位：形状与 broker_trades.js summarizeBrokerActivity 的五键输出
-#      一致但恒为空，任务 B2 接线 summary.summarize(activity) 后替换。
+#   2. trade_summary 由 summary.summarize(activity) 派生（B2 已接线），与 Node
+#      store.js:217 `summarizeBrokerActivity(activity)` 同入参（过滤后倒序的 activity）
+#      同输出；不写回磁盘，只读时计算。
 #   3. in_flight 恒为 0：服务进程不派发券商调用（规格 §B「in_flight(空)」）。安全护栏不受
 #      影响——switch_mode() 仍按 store.js:242-243 的租约文件命名做在途检查并据此拒绝切换。
 #   4. started_at 只按 ISO-8601 解析（Node Date.parse 还接受 RFC 2822 等宽松格式）。run 的
@@ -42,6 +43,8 @@ import time
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+
+from server import summary
 
 # store.js:9-13
 LIMIT = 100
@@ -298,15 +301,9 @@ def snapshot(home):
         "reports": _by_mode_desc(state["reports"], mode),
         "previews": _by_mode_desc(state["previews"], mode),
         "activity": activity,
-        # 有意差异 2：占位，任务 B2 接线 summary.summarize(activity)；键形状与
-        # broker_trades.js summarizeBrokerActivity 的输出一致，前端不会有形状断层。
-        "trade_summary": {
-            "orders": [],
-            "actions": [],
-            "queries": {"count": 0, "tools": []},
-            "counts": {"responses": 0, "order_responses": 0, "orders": 0, "actions": 0, "errors": 0},
-            "notice": "",
-        },
+        # 派生视图：把工具调用归纳成交易事实（与 store.js:216-217 同位置同入参）。
+        # 入参 activity 已按模式过滤并倒序（store.js:209），与 Node 一致；不写回磁盘。
+        "trade_summary": summary.summarize(activity),
         # `state.broker[mode] ?? null`
         "broker": broker_state.get(mode) if isinstance(broker_state, dict) else None,
         # 有意差异 3：服务进程不派发券商调用，恒为 0（在途护栏在 switch_mode 内按租约文件判）。
