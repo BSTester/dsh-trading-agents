@@ -33,7 +33,7 @@
 │   └ Connection RPC 20 端点（legacy 面板过渡期保留）  │
 └──────────────┬────────────────────────────────────┘
                │ 同一份数据文件（无网络）
-┌─ 独立服务进程（WP6 新增，FastAPI/uvicorn：cd platform && python -m server.run）─┐
+┌─ 独立服务进程（WP6 新增，FastAPI/uvicorn：cd platform && ~/.dsh/trading-venv/bin/python -m server.run）─┐
 │ 服务层（Python 单实现，HTTP 与 MCP 共用同一批处理函数 + 同一 TTL 缓存）     │
 │   ├ MCP streamable-http  http://127.0.0.1:8397/mcp（mcp SDK 挂载）        │──► Harness 新增 mcp-client 行
 │   ├ HTTP API             POST /api/wb/<endpoint>（envelope 契约不变）      │──► Ant Design Pro 前端
@@ -214,7 +214,7 @@ platform/web/
 - 生产（唯一部署形态）：`npm --prefix platform/web run build` → `platform/web/dist`，由 FastAPI 静态托管（`GET /`，SPA fallback 到 index.html，路径分隔符边界防护）。**一个进程承载全部：HTTP API + MCP + 静态前端，不单独配前端服务**。
 - 开发（可选工具，非部署组件）：`npm run dev`（Vite dev server，proxy `/api` → 127.0.0.1:8397）仅用于前端热更调试。
 - 服务框架：FastAPI + uvicorn（`platform/requirements.txt` 锁定），路由仅：`POST /api/wb/{endpoint}`（envelope 契约不变）、`GET /healthz`、`/mcp`（streamable-http，mcp SDK 挂载）、静态 dist。
-- 启停：`cd platform && python -m server.run`（或 `python platform/server/run.py`；内部 uvicorn，读 `~/.dsh/trading-platform.json`）。**不能用 `python -m platform.server.run`**：标准库 `platform` 模块遮蔽同名包，`-m` 会解析到标准库而失败。RUNBOOK 增加 systemd unit 样例与端口/token 配置说明。
+- 启停：`cd platform && ~/.dsh/trading-venv/bin/python -m server.run`（或 `~/.dsh/trading-venv/bin/python platform/server/run.py`；内部 uvicorn，读 `~/.dsh/trading-platform.json`）。服务必须在 trading-venv 内启动：取数子进程用 `sys.executable`，系统 Python 缺依赖时会静默降级为 `trading/*-unavailable`。**不能用 `python -m platform.server.run`**：标准库 `platform` 模块遮蔽同名包，`-m` 会解析到标准库而失败。RUNBOOK 增加 systemd unit 样例与端口/token 配置说明。
 
 ### 4.7 安全边界变化声明（诚实清单）
 

@@ -2237,6 +2237,12 @@ live 一律拒且模式文件不落地；步骤 4 的审批链由 R1/R2 在假 c
     `tests/endpoints.test.mjs`（4 用例）；`api.js` 维护模块级 `declared`（snapshot 响应写入
     `body.value.endpoints`），非 snapshot 调用前先预检，命中即 `throw` 且**不发请求**，
     服务端 404 分支文案保留作兜底。
+### 6bis. 收尾期观察（2026-09-16）
+
+- **Python 套件单次失败未复现**：收尾期一次全量 `unittest discover`（642 用例）报 1 例失败，但未捕获用例名；随后连续 7 次全量运行均 `OK (skipped=1)`（含 4 次专门盯守）。可疑面是既有的端口保留/子进程类用例竞态（非 WP6 新增用例）。记录为**待观察**：若再现请先留用例名。
+- **最终整体审查的阻断项已修复**：独立 Web 缺模式切换入口（初版计划未为规格 §4.5:1 配置任务）→ 已在 `83376ae` 补齐「页头徽章 → 账户模式对话框」窄门（口令「确认实盘」+ `expected_mode` + `order_authorized:false` 展示），并补 `snapshot.endpoints` 声明预检；对应偏差 13/14。
+- **规格 §4.6 命令补 venv 前缀**：`cd platform && ~/.dsh/trading-venv/bin/python -m server.run`（系统 Python 会静默降级取数）。
+
 
 ### 7. live 准入
 
