@@ -512,7 +512,7 @@ class TradeGate:
                         与 agent.cordis.yml 的 quant-platform-mcp 行 toolCallTimeoutMs
                         同值：MCP 调用在 preset 层 120s 先超时、闸门继续等到 TTL 到期
                         按拒绝收尾，模型侧看到超时但订单**不会**在无批准下提交；
-                        建议任务 5 把 preset 行调到 180000 留出作答余量）。
+                        preset 行已调为 180000（WP7 任务 5），作答余量充足）。
     """
 
     def __init__(self, home, broker=None, confirm=None, risk_fn=None, ctx_builder=None,

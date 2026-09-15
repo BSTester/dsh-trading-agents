@@ -30,7 +30,7 @@
 | 研究引擎 | 不再私建无取数能力的 LLM 循环；`run_trading_analysis` 启动记录，Harness 完成研究，`research_publish` 发布 |
 | 发布约束 | 校验 run、会话、标的、当前模式、五档评级、报告与带时间的来源；不猜测评级 |
 | 工作台 Host | 根级 `tradingWorkbench` 服务，持久报告/预览/响应；认证后的 Harness Connection RPC |
-| 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，22 端点）+ `/mcp`（streamable-http，26 工具；`confirm-decide` 有意不进工具面）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
+| 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，22 端点）+ `/mcp`（streamable-http，33 工具；`confirm-decide` 有意不进工具面）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
 | 工作台 Client | 正确的 Host/Client 双入口、宿主 React module factory；结果卡片与面板，不需重建 Harness Web |
 | 交易动态 | 观察原生账户工具最终响应；打开面板时每 3 秒刷新快照；不伪装券商成交推送 |
 | 模式切换 | 用户在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）明确确认 live，携带预期旧模式；legacy 面板过渡期保留同款口令流程；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |

@@ -18,7 +18,7 @@
 - 全部完成后输出汇总表（列：步骤 | 结果 | 证据——命令关键输出或 JSON 摘要行），
   并重申《安全边界》四条，最后执行第 9 步的用户验证提示。
 
-《安装手册》（环境要求：git；Node ≥22；Python ≥3.13；可访问外网。第 1 步先核验，
+《安装手册》（环境要求：git；Node ≥22 + pnpm（`corepack enable pnpm`，安装器依赖它打包）；Python ≥3.13；可访问外网。第 1 步先核验，
 任一缺失即报告用户并停止，不要代装系统级依赖。）
 
 0. 确认仓库根：
@@ -27,10 +27,12 @@
    [ -z "$REPO_ROOT" ] && REPO_ROOT="$HOME/.dsh/.agent-presets/dsh-trading-agents"
    生效的 Harness preset 是 "$HOME/.dsh/.agent-presets/dsh-trading-agents"；
    若它与 $REPO_ROOT 不同，后续编辑 agent.cordis.yml 一律以 preset 副本为准。
-1. 核验环境：node -v（≥22）、python3 -V（≥3.13）。
+1. 核验环境：node -v（≥22）、pnpm -v（缺失则 corepack enable pnpm 或 npm i -g pnpm）、python3 -V（≥3.13）。
 2. 获取/更新仓库：若 "$REPO_ROOT/.git" 已存在：
      git -C "$REPO_ROOT" pull --ff-only
-   （失败说明有本地修改：提示用户先提交或 stash，不得丢弃、不得 reset）；
+   （若因「本地 preset 行被安装器翻转 + 远端同改 agent.cordis.yml」而失败：改用
+    python3 scripts/install_plugins.py update --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"——
+    它专为已挂载副本的更新设计；其余本地修改场景提示用户先提交或 stash，不得丢弃、不得 reset）；
    否则：
      git clone --depth 1 https://github.com/BSTester/dsh-trading-agents.git "$REPO_ROOT"
 3. 安装插件并激活 preset 工具行：
@@ -66,6 +68,7 @@
 
 《失败排查》（细则见仓库 docs/RUNBOOK.md「平台服务」节与场景 1-4）
 - node -v 无输出或 <22：报告用户安装 Node ≥22 后重跑第 1 步（前端构建需要）。
+- install_plugins.py 报 FileNotFoundError: pnpm：`corepack enable pnpm` 或 `npm i -g pnpm` 后重跑该步（安装器用 pnpm 打包内容寻址 tarball）。
 - python3 -V <3.13：报告用户安装 Python ≥3.13 后重跑；安装器用当前解释器建 venv。
 - venv 步失败（exit 非 0）：磁盘空间/权限问题居多；删除 "$HOME/.dsh/trading-venv" 后重跑第 4 步。
 - deps 步失败：多为网络不通或 pip 源不可达；修复网络或配置镜像后重跑第 4 步
@@ -142,7 +145,7 @@ python3 scripts/install_platform.py --home ~/.dsh --skip-all             # 干�
 
 | 症状 | 首要处置 |
 |---|---|
-| `node -v` 缺失或 < 22 | 安装 Node ≥ 22 后重跑（前端构建必需） |
+| `node -v` 缺失或 < 22 | 安装 Node ≥ 22（并启用 pnpm：`corepack enable pnpm`，安装器依赖它） 后重跑（前端构建必需） |
 | `python3 -V` < 3.13 | 安装 Python ≥ 3.13 后重跑安装器（用当前解释器建 venv） |
 | `venv` 步失败 | 查磁盘/权限；必要时删除 `~/.dsh/trading-venv` 重建 |
 | `deps` 步失败 | 网络/pip 源问题；修复后重跑（pip 幂等） |

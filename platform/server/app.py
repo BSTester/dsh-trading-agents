@@ -357,9 +357,9 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         from server import scheduler as scheduler_module
         scheduler = scheduler_module.Scheduler(scheduler_module.build_tick(home), interval=60.0)
 
-    # MCP 工具面（补遗任务 D）：27 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
+    # MCP 工具面（WP6 补遗 D + WP7）：33 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
     # 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的 home 绑定门面。
-    # 23 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
+    # 29 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
     mcp_server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
     bound_tools = mcp_tools.register(mcp_server, handle, mcp_tools.StoreApi(home))
     # json_response=True 对齐 Node 版 enableJsonResponse：无 SSE 依赖，普通 JSON 响应。
