@@ -18,9 +18,11 @@ function endpointTool(name, endpoint, description, input) {
   };
 }
 
-async function envelope(promise) {
+// envelope 接收 thunk 而非 promise：store 方法同步抛错（数据文件损坏/不可写等）
+// 也必须被捕获并包装为 {ok:false, error:{code:"trading/invalid-operation"}} envelope。
+async function envelope(fn) {
   try {
-    return { ok: true, value: await promise };
+    return { ok: true, value: await fn() };
   } catch (error) {
     return { ok: false, error: { code: "trading/invalid-operation",
       message: String(error?.message ?? error).slice(0, 300), details: {} } };
@@ -50,7 +52,7 @@ export const ENDPOINT_TOOLS = [
   endpointTool("series", "series", "K 线序列（富途优先、降级如实标注）。", {
     ticker: z.string().describe("标的代码，如 SH.600519"),
     period: z.enum(["1m", "5m", "15m", "30m", "60m", "1d"]).optional().describe("默认 5m"),
-    limit: z.number().int().optional().describe("20..2000，默认 300"),
+    limit: z.number().int().min(20).max(2000).optional().describe("20..2000，默认 300"),
   }),
   endpointTool("equity", "equity", "本地模拟台账权益曲线（不代表券商资产）。", {
     mode: z.enum(["sim", "live"]).optional(), window: z.number().int().optional(),
@@ -107,29 +109,28 @@ function hoursToMs(hours) { return Math.max(1, hours ?? 2) * 3600_000; }
 export const ADMIN_TOOLS = [
   { kind: "admin", name: "admin_status", description: "工作台数据维护：数据文件路径与各类记录数量。",
     input: {},
-    run: ({ store }) => { const state = store.read();
-      return envelope(Promise.resolve({ file: store.file, runs: state.runs.length,
-        reports: state.reports.length, previews: state.previews.length, activity: state.activity.length })); } },
+    run: ({ store }) => envelope(() => { const state = store.read();
+      return { file: store.file, runs: state.runs.length,
+        reports: state.reports.length, previews: state.previews.length, activity: state.activity.length }; }) },
   { kind: "admin", name: "admin_runs", description: "工作台数据维护：列出全部研究 run（状态/标的/模式/年龄分钟）。",
     input: {},
-    run: ({ store }) => { const state = store.read();
-      return envelope(Promise.resolve(state.runs.map((row) => {
-        const started = Date.parse(row.started_at ?? "");
-        return { id: row.id, status: row.status, ticker: row.ticker, mode: row.mode,
-          age_minutes: Number.isFinite(started) ? Math.round((Date.now() - started) / 60000) : null };
-      }))); } },
+    run: ({ store }) => envelope(() => store.read().runs.map((row) => {
+      const started = Date.parse(row.started_at ?? "");
+      return { id: row.id, status: row.status, ticker: row.ticker, mode: row.mode,
+        age_minutes: Number.isFinite(started) ? Math.round((Date.now() - started) / 60000) : null };
+    })) },
   { kind: "admin", name: "admin_cancel_run", description: "工作台数据维护：取消指定研究 run（标记 cancelled，保留记录）。先用 admin_runs 查 id。",
     input: { run_id: z.string().describe("run id") },
-    run: ({ store, args }) => envelope(store.cancelRun(String(args.run_id))) },
+    run: ({ store, args }) => envelope(() => store.cancelRun(String(args.run_id))) },
   { kind: "admin", name: "admin_cancel_stale", description: "工作台数据维护：批量取消超时仍 running 的 run（默认 2 小时）。",
     input: { hours: z.number().optional().describe("阈值小时数，默认 2") },
-    run: ({ store, args }) => envelope(store.cancelStaleRuns({ olderThanMs: hoursToMs(args?.hours) })) },
+    run: ({ store, args }) => envelope(() => store.cancelStaleRuns({ olderThanMs: hoursToMs(args?.hours) })) },
   { kind: "admin", name: "admin_prune_runs", description: "工作台数据维护：删除超时孤儿 run（无研报者；有研报的保留）。",
     input: { hours: z.number().optional().describe("阈值小时数，默认 2") },
-    run: ({ store, args }) => envelope(store.pruneAbandonedRuns({ olderThanMs: hoursToMs(args?.hours) })) },
+    run: ({ store, args }) => envelope(() => store.pruneAbandonedRuns({ olderThanMs: hoursToMs(args?.hours) })) },
 ];
 
-export const TOOL_NAME_BLACKLIST = Object.freeze(["exec", "shell", "file_read", "file_write", "token"]);
+export const TOOL_NAME_BLACKLIST = Object.freeze(["exec", "shell", "file_read", "file_write", "read_file", "write_file", "token"]);
 export const TOOL_COUNT = ENDPOINT_TOOLS.length + ADMIN_TOOLS.length;
 
 /** 服务装配入口：handle=与面板同一的 createRpcHandler 产物；store=WorkbenchStore。 */

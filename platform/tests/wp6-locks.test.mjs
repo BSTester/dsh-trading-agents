@@ -32,3 +32,13 @@ test("wp6 服务常量锁定：8397/127.0.0.1/无默认 token", () => {
   assert.equal(DEFAULTS.host, "127.0.0.1");
   assert.equal(DEFAULTS.token, null);
 });
+
+test("wp6 admin 工具：store 同步抛错包装为 ok:false envelope", async () => {
+  const { buildManifest } = await import("../server/manifest.mjs");
+  const manifest = buildManifest({ handle: async () => ({ ok: true, value: {} }),
+    store: { read: () => { throw new Error("数据文件损坏"); } } });
+  const result = await manifest.find((tool) => tool.name === "admin_status").call({});
+  assert.equal(result.ok, false);
+  assert.equal(result.error.code, "trading/invalid-operation");
+  assert.match(result.error.message, /数据文件损坏/);
+});
