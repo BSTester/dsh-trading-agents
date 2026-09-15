@@ -7,7 +7,9 @@
 //       {plan_id, as_of, mode, strategy_id, target, content_hash, status, created_at,
 //        orders:[{client_order_id, symbol, side, qty, price, status, broker_order_id,
 //                 risk_verdict}]}
-//     计划行来自 store.list_plans（store.py:315-322，ORDER BY created_at, plan_id），
+//     计划行来自 store.list_plans（store.py:315-322，ORDER BY created_at, plan_id 升序），
+//     但端点经 snapshots.py:_plans_newest_first 翻转为「最新在前」——本页 plans[0] 即
+//     当前（最新）计划，绝不能按升序口径取首条（否则执行入口会提交最旧计划的 hash）。
 //     订单来自 store.get_orders_by_plan（store.py:344-346，ORDER BY rowid）与
 //     snapshots._orders_of（snapshots.py:23-34）。
 //   risk_verdict → snapshots._verdict_of（snapshots.py:10-20）：取该计划内该标的
@@ -70,6 +72,7 @@ export default function PlanPage() {
 
   const value = plan.value ?? {};
   const plans = value.plans ?? [];
+  // 端点口径最新在前（snapshots._plans_newest_first）：首条即当前计划
   const current = plans[0];
   const orders = current?.orders ?? [];
   const live = value.mode === "live";
@@ -88,7 +91,7 @@ export default function PlanPage() {
         ? { plan_hash: current.content_hash, expected_mode: value.mode,
             confirmation: live ? "确认执行" : undefined }
         : { plan_hash: current.content_hash, expected_mode: value.mode, action: "cancel" });
-      message.success("已提交，等待 daemon 回写状态…");
+      message.success("已提交；daemon 回写后点「刷新」查看状态…");
       plan.refresh();
     } catch (error) {
       message.error(`提交失败：${error.message || error}`);
@@ -100,6 +103,8 @@ export default function PlanPage() {
   return (
     <Card title="计划" extra={(
       <Space size="small">
+        {/* 刷新入口：daemon 按 60s 轮询回写状态，用户不必等页面自身的下次拉取 */}
+        <Button size="small" disabled={busy} onClick={() => plan.refresh()}>刷新</Button>
         <Typography.Text type="secondary">账户模式</Typography.Text>
         <Tag color={live ? "red" : "green"}>{live ? "实盘 LIVE" : "模拟 SIM"}</Tag>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -172,12 +177,13 @@ export default function PlanPage() {
             当前计划状态为 {PLAN_STATUS[current.status] ?? current.status ?? "—"}，非冻结态不显示执行区。
           </Typography.Text>)}
 
-        {/* 计划列表：端点按 created_at 升序返回全部计划（store.py:316），
-            上方「当前计划」取第一条——列出来便于核对是否存在更晚的计划。 */}
+        {/* 计划列表：端点按 created_at 倒序（最新在前）返回全部计划
+             （snapshots.py:_plans_newest_first 翻转 store.py:316 的升序），
+             上方「当前计划」取第一条——列出来便于核对是否有更晚的计划。 */}
         {plans.length > 1 && (
           <Card type="inner" title="计划列表" extra={(
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              端点按创建时间升序返回 {plans.length} 条，上方「当前计划」为第一条
+              端点按创建时间倒序（最新在前）返回 {plans.length} 条，上方「当前计划」为第一条
             </Typography.Text>)}>
             <Table size="small"
               rowKey={(row) => row.plan_id}

@@ -7,7 +7,8 @@
 //                       broker_order_id, risk_verdict, fills:[{price, qty, traded_at}]}]}]
 //     订单与成交来自 store.get_orders_by_plan（store.py:344-346）、
 //     store.fills_by_order（store.py:367-370）与 snapshots._orders_of(with_fills=True)
-//     （snapshots.py:23-34）；计划行来自 store.list_plans（store.py:315-322）。
+//     （snapshots.py:23-34）；计划行来自 store.list_plans（store.py:315-322 升序），
+//     端点经 snapshots.py:_plans_newest_first 翻转为最新在前（chain[0]=最新，与 plan 端点同口径）。
 //     ——计划号/订单号/成交这一层结构只在 chain 上，审计时间线（audit 端点）里没有。
 //   时间线 → audit 端点（app.py:186-198）→ platform/server/audit_chain.py:170-350
 //     build_audit_chain：{entries, stats}。
@@ -28,7 +29,7 @@
 import React from "react";
 import { Card, Space, Statistic, Table, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
-import { num } from "../services/format.jsx";
+import { num, stampOf } from "../services/format.jsx";
 
 const SIDE = { BUY: "买入", SELL: "卖出" };
 
@@ -59,6 +60,11 @@ const SOURCE_STATUS_COLOR = { ok: "green", warn: "gold", fail: "red", empty: "de
 
 // reconcile.py:12/17/23 的 kind 取值
 const DIFF_KIND = { missing_side: "单边缺失", qty: "数量不一致", value: "市值不一致" };
+
+// audit_chain.py 只给成交台账行写了 source（:244，无 source_label），故补一份中文兜底；
+// signal/order 行自带 source_label，优先用服务端文案；未知取值原样展示（「不猜」）。
+const SOURCE_LABEL = { "local-ledger": "本地台账", "broker-observed": "券商观察",
+                       quant_signal: "量化信号" };
 
 const DIFF_KIND_COLOR = { missing_side: "red", qty: "gold", value: "blue" };
 
@@ -123,7 +129,7 @@ const ENTRY_COLUMNS = [
     return <Typography.Text type="warning">未找到对应信号</Typography.Text>;
   } },
   { title: "来源", key: "source",
-    render: (_field, row) => row.source_label ?? row.source ?? "—" },
+    render: (_field, row) => row.source_label ?? SOURCE_LABEL[row.source] ?? row.source ?? "—" },
 ];
 
 const SOURCE_COLUMNS = [
@@ -259,7 +265,7 @@ export default function AuditPage() {
 
         <Card type="inner" title="对账差异" extra={(
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            差异时间 {reconcile.value?.diffs_at ?? "—"}
+            差异时间 {stampOf(reconcile.value?.diffs_at)}
           </Typography.Text>)}>
           <Table size="small"
             rowKey={(row) => row._key}

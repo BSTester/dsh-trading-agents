@@ -24,6 +24,7 @@ import React from "react";
 import { Alert, App, Button, Card, Space, Table, Tag, Typography } from "antd";
 import { callApi } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
+import { stampOf } from "../services/format.jsx";
 
 const HEARTBEAT_STALE_MS = 5 * 60_000;
 
@@ -41,17 +42,13 @@ function minutesSince(ms) {
   return Math.max(0, Math.floor((Date.now() - ms) / 60_000));
 }
 
-/** 告警时间是 alerts.emit 写的 ISO（T 分隔）：展示成与库内其他时间一致的秒级空格分隔。 */
-function stampOf(iso) {
-  return iso ? String(iso).replace("T", " ").slice(0, 19) : "—";
-}
-
 const JOB_COLUMNS = [
   { title: "最近运行", key: "ran", render: (_field, row) => row.ran ?? "—" },
   // 作业键形如 市场:作业名:日期（daemon.py:99），原样展示，不拆字段也不补状态
   { title: "作业", key: "job", render: (_field, row) => row.job ?? "—" },
 ];
 
+// 告警时间是 alerts.emit 写的 ISO（T 分隔）：展示走共享 stampOf（T→空格、秒级）。
 const ALERT_COLUMNS = [
   { title: "级别", key: "level",
     render: (_field, row) => (
@@ -69,6 +66,8 @@ export default function SchedulePage() {
 
   const value = schedule.value ?? {};
   const heartbeat = value.heartbeat ?? {};
+  // 首屏尚未拿到快照时不能断言失联：loading 且无 value 属「读取中」，非「心跳缺失」
+  const pending = schedule.loading && !schedule.value;
   const hbMs = parseHeartbeat(heartbeat.heartbeat);
   const stale = !Number.isFinite(hbMs) || (Date.now() - hbMs) > HEARTBEAT_STALE_MS;
   const minutes = minutesSince(hbMs);
@@ -131,11 +130,15 @@ export default function SchedulePage() {
           <Space direction="vertical" size={4} style={{ width: "100%" }}>
             <Space size="small" wrap>
               <Typography.Text type="secondary">心跳</Typography.Text>
-              <Tag color={stale ? "red" : "green"}>{stale ? "失联" : "正常"}</Tag>
+              <Tag color={pending ? "default" : stale ? "red" : "green"}>
+                {pending ? "读取中" : stale ? "失联" : "正常"}
+              </Tag>
               <Typography.Text>
-                {heartbeat.heartbeat
-                  ? `心跳 ${minutes ?? "—"} 分钟前`
-                  : "心跳缺失（daemon 未运行）"}
+                {pending
+                  ? "心跳读取中…"
+                  : heartbeat.heartbeat
+                    ? `心跳 ${minutes ?? "—"} 分钟前`
+                    : "心跳缺失（daemon 未运行）"}
               </Typography.Text>
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
                 {heartbeat.heartbeat ?? "—"}

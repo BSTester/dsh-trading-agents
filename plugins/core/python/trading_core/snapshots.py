@@ -34,10 +34,17 @@ def _orders_of(conn, plan_id, with_fills=False):
     return orders
 
 
+def _plans_newest_first(conn):
+    """端点取数口径 = 最新在前（store.list_plans 仍按 created_at, plan_id 升序——
+    通用访问器语义不变，两处口径差异只在快照端点边界归一）。plan 与 reconcile 的 chain、
+    以及 Web「当前计划」= plans[0] 都依赖这一口径：否则多计划并存时会取到最旧计划。"""
+    return list(reversed(store.list_plans(conn)))
+
+
 def plan_snapshot(conn, alert_limit=10):
     from . import alerts
     plans = []
-    for p in store.list_plans(conn):
+    for p in _plans_newest_first(conn):
         plans.append({"plan_id": p["plan_id"], "as_of": p["as_of"], "mode": p["mode"],
                       "strategy_id": p["strategy_id"], "target": p["target"],
                       "content_hash": p["content_hash"], "status": p["status"],
@@ -84,7 +91,7 @@ def reconcile_snapshot(conn, chain_limit=5, alert_limit=20):
         tca_rows = []
     avg_bps = (sum(r["bps"] for r in tca_rows) / len(tca_rows)) if tca_rows else None
     chain = []
-    for p in store.list_plans(conn)[::-1][:chain_limit]:
+    for p in _plans_newest_first(conn)[:chain_limit]:
         chain.append({"plan_id": p["plan_id"], "mode": p["mode"], "status": p["status"],
                       "created_at": p["created_at"],
                       "orders": _orders_of(conn, p["plan_id"], with_fills=True)})

@@ -25,3 +25,9 @@ export function maskedAccount(accId, title) {
   const masked = id ? `…${id.slice(-4)}` : "—";
   return <Tooltip title={title}><span>{masked}</span></Tooltip>;
 }
+
+/** 秒级时间戳统一展示：ISO 的 T 分隔 → 与库内时间一致的空格分隔；缺失显示 —。
+ *  用于卡片 extra 一类元数据（alerts.emit 的 created_at、reconcile 的 diffs_at 同源）。 */
+export function stampOf(value) {
+  return value ? String(value).replace("T", " ").slice(0, 19) : "—";
+}
