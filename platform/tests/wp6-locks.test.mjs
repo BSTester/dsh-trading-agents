@@ -17,8 +17,13 @@ test("wp6 端点对等：工具端点集 ≡ workbench ENDPOINTS", () => {
 
 test("wp6 能力黑名单：无 exec/shell/file/token 类工具", () => {
   const names = [...ENDPOINT_TOOLS, ...ADMIN_TOOLS].map((tool) => tool.name);
+  // 黑名单按整名或下划线/连字符分段精确匹配（规格 §3.6）：plan_execute 是规格点名的
+  // snake_case 动作工具，不得因子串 "exec" 误伤；exec/shell/file/token 类能力名仍被拦死。
   for (const banned of TOOL_NAME_BLACKLIST) {
-    assert.ok(!names.some((name) => name.toLowerCase().includes(banned)), banned);
+    assert.ok(!names.some((name) => {
+      const lower = name.toLowerCase();
+      return lower === banned || lower.split(/[^a-z0-9]+/).includes(banned);
+    }), banned);
   }
 });
 
