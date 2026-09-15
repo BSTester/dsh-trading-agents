@@ -152,3 +152,32 @@ def composite_score(per_symbol_factors, weights):
                 den += abs(w)
         out[symbol] = num / den if den else None
     return out
+
+
+def _rank(values):
+    order = sorted(values, key=values.get)
+    return {k: i for i, k in enumerate(order)}
+
+
+def rank_ic(factor_values, forward_returns):
+    """Spearman 秩相关；样本 < 3 或零方差返回 None。"""
+    common = [k for k in factor_values if k in forward_returns]
+    if len(common) < 3:
+        return None
+    rf, rr = _rank({k: factor_values[k] for k in common}), _rank({k: forward_returns[k] for k in common})
+    n = len(common)
+    d2 = sum((rf[k] - rr[k]) ** 2 for k in common)
+    return 1 - 6 * d2 / (n * (n * n - 1))
+
+
+def quintile_returns(factor_values, forward_returns, buckets=5):
+    """按因子升序分桶，返回 {Q1..Q5: 组内平均前向收益}；样本不足返回 {}。"""
+    common = sorted((k for k in factor_values if k in forward_returns), key=factor_values.get)
+    if len(common) < buckets:
+        return {}
+    size = len(common) // buckets
+    out = {}
+    for q in range(buckets):
+        part = common[q * size:(q + 1) * size] if q < buckets - 1 else common[(buckets - 1) * size:]
+        out[f"Q{q + 1}"] = sum(forward_returns[k] for k in part) / len(part)
+    return out

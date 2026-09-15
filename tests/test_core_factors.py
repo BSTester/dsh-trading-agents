@@ -48,6 +48,18 @@ class FactorsTest(unittest.TestCase):
         score = factors.composite_score({"A": {"f1": 1.0}, "B": {"f1": 2.0}}, weights={"f1": 1.0})
         self.assertGreater(score["B"], score["A"])
 
+    def test_rank_ic_perfect_monotonic(self):
+        vals = {f"S{i}": float(i) for i in range(6)}
+        fwd = {f"S{i}": float(i) * 0.01 for i in range(6)}
+        self.assertAlmostEqual(factors.rank_ic(vals, fwd), 1.0, places=6)
+
+    def test_quintile_spread_monotonic_universe(self):
+        # 12 标的、因子值与未来收益完全同序 → Q5（高因子）收益 > Q1
+        vals = {f"S{i}": float(i) for i in range(12)}
+        fwd = {f"S{i}": float(i) * 0.01 for i in range(12)}
+        q = factors.quintile_returns(vals, fwd)
+        self.assertGreater(q["Q5"], q["Q1"])
+
 
 if __name__ == "__main__":
     unittest.main()
