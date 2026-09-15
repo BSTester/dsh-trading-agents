@@ -190,3 +190,25 @@ def sync_universe(conn, index_symbol, as_of, fetcher=None, bias_note=UNIVERSE_BI
     bare = sorted({s.split(".")[-1] if "." in s else s for s in symbols})
     store.store_universe(conn, as_of, index_symbol, bare, "futu/component_stock_list", bias_note)
     return len(bare)
+
+
+def sync_valuations(conn, symbols, fetcher=None, today=None, akshare_module=None):
+    """估值因子按日落库（WP2 任务 3）：对每个 futu symbol 调用收敛后的唯一估值实现
+    （trading_core.factors.valuation_values，字段路径 2026-09-14 实测锁定），
+    把返回的 {field: value} 落 valuations 表（source=futu/valuation）。
+    fetcher/akshare_module/today 均可注入（离线测试与 PIT 确定性）；单项失败如实缺字段，
+    不中断其余标的（宁缺毋假）。"""
+    from . import factors
+    day = today or _dt.date.today().isoformat()
+    out = {}
+    for symbol in symbols:
+        try:
+            values, _source = factors.valuation_values(symbol, fetcher=fetcher,
+                                                       akshare_module=akshare_module)
+        except Exception as error:
+            out[symbol] = {"error": str(error)[:120]}
+            continue
+        if values:
+            store.upsert_valuations(conn, symbol, day, values, "futu/valuation")
+        out[symbol] = values
+    return out

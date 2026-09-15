@@ -1,4 +1,5 @@
 """同步层单测：增量过滤、回填断点续传、复权/财务/公告日/成分股映射。全部离线（注入假取数器）。"""
+import importlib.util
 import sys
 import tempfile
 import unittest
@@ -8,6 +9,8 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "datasource" / "python"))
 from trading_core import store, sync  # noqa: E402
+
+ROOT = Path(__file__).resolve().parents[1]
 
 
 def _bars(*dates, base=10.0):
@@ -235,6 +238,55 @@ class AnnouncementsUniverseTest(unittest.TestCase):
         result = sync.merge_announcements_akshare(self.conn, "20260630", akshare_module=FakeAk)
         self.assertEqual(result["matched"], 0)
         self.assertEqual(result["skipped"], 1)
+
+VALUATION_SAMPLE = {1: {"trend": {"current_value": 22.5, "valuation_percentile": 34.5}},
+                    2: {"trend": {"current_value": 8.1, "valuation_percentile": 40.1}},
+                    3: {"trend": {"current_value": 5.2, "valuation_percentile": 21.0}}}
+
+
+class ValuationsSyncTest(unittest.TestCase):
+    """sync_valuations：估值因子按日落库（假 fetcher 离线；同花顺兜底注入假模块）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.conn = store.connect(str(Path(self.tmp.name) / "t.sqlite"))
+
+    def tearDown(self):
+        self.conn.close()
+        self.tmp.cleanup()
+
+    def test_sync_valuations_stores_pit_fields(self):
+        seen = []
+
+        def fetcher(name, args):
+            seen.append((name, args["symbol"], args["valuation_type"]))
+            return VALUATION_SAMPLE[args["valuation_type"]]
+
+        class FakeAk:
+            @staticmethod
+            def stock_value_em(symbol):
+                return None  # 兜底通道离线空返回
+
+        out = sync.sync_valuations(self.conn, ["SH.600519"], fetcher=fetcher,
+                                   today="2026-09-13", akshare_module=FakeAk)
+        self.assertEqual(out["SH.600519"]["pe_ttm"], 22.5)
+        self.assertEqual(len(seen), 3)  # pe_ttm/pb/ps 三通道（字段路径锁定表）
+        rows = store.read_valuations(self.conn, "SH.600519", as_of="2026-09-13")
+        self.assertEqual(rows,
+                         {"pe_ttm": 22.5, "pe_ttm_pct": 34.5, "pb": 8.1, "pb_pct": 40.1,
+                          "ps": 5.2, "ps_pct": 21.0})
+
+    def test_workbench_valuation_delegates_to_core(self):
+        """收敛后唯一实现：workbench 侧薄委托，调用时转发 core 并透传 (values, source)。"""
+        from trading_core import factors as core_factors
+        spec = importlib.util.spec_from_file_location(
+            "wb_factors_wp2", ROOT / "plugins" / "workbench" / "python" / "factors.py")
+        wb = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(wb)
+        with patch.object(core_factors, "valuation_values",
+                          return_value=({"pe_ttm": 22.5}, "fake/source")):
+            values, source = wb.valuation_values("SH.600519")
+        self.assertEqual((values, source), ({"pe_ttm": 22.5}, "fake/source"))
 
 
 if __name__ == "__main__":

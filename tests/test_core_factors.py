@@ -30,6 +30,12 @@ class FactorsTest(unittest.TestCase):
         v = factors.REGISTRY["momentum_120"](self.conn, "SH.600519", "2026-02-05")
         self.assertIsNone(v)  # 历史不足 → None（宁缺毋假），上层记 missing
 
+    def test_valuation_factor_reads_store(self):
+        # 字段名用 pe_ttm：依赖锁定表规定估值字段路径以 valuation_values 实测实现为准
+        store.upsert_valuations(self.conn, "SH.600519", "2026-07-18", {"pe_ttm": 22.5}, "t")
+        self.assertEqual(factors.REGISTRY["ep"](self.conn, "SH.600519", "2026-07-18"), 1 / 22.5)
+        self.assertIsNone(factors.REGISTRY["ep"](self.conn, "SH.600519", "2026-07-01"))
+
 
 if __name__ == "__main__":
     unittest.main()

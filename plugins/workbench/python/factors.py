@@ -22,7 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from trading_datasource.market import is_a_share, load_bars  # noqa: E402
+from trading_datasource.market import load_bars  # noqa: E402
 
 FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
                "liq_ratio": 1, "mdd_60": 1,
@@ -86,65 +86,14 @@ def factor_values(bars, index=None):
 
 
 def valuation_values(ticker):
-    """估值因子：**优先富途**（PE/PB/PS + 历史分位，全市场），失败回退同花顺（A股）。
-
-    返回 (values, source)。
-    """
-    values, sources = {}, []
-
-    # ① 富途 MCP（优先通道）
-    try:
-        from trading_datasource.futu_mcp import call_tool  # 共享客户端
-        from trading_datasource.market import to_futu_symbol
-        symbol = to_futu_symbol(ticker)
-        for vt, key in ((1, "pe_ttm"), (2, "pb"), (3, "ps")):
-            try:
-                data = call_tool("quote_valuation_detail",
-                                 {"symbol": symbol, "valuation_type": vt})
-                trend = data.get("trend") or {}
-                value, percentile = trend.get("current_value"), trend.get("valuation_percentile")
-                if isinstance(value, (int, float)) and value > 0:
-                    values[key] = round(float(value), 4)
-                if isinstance(percentile, (int, float)):
-                    values[f"{key}_pct"] = round(float(percentile), 2)
-            except Exception:
-                continue  # 单项失败不影响其余估值指标
-        if values:
-            sources.append("futu/quote_valuation_detail")
-    except Exception:
-        pass
-
-    # ② 同花顺备用（**仅 A 股**，含 PEG）
-    #
-    # 必须显式判市场：`ak.stock_value_em` 吃的是 A 股代码，
-    # `000001.HK`（港股长和）用 split(".")[0] 得到 "000001"，
-    # 正好是平安银行 —— 富途估值一旦取不到，就会把平安银行的 PE/PB
-    # 悄悄填进长和的因子行。此前这里没有任何市场判断。
-    try:
-        import akshare as ak
-        if not is_a_share(ticker):
-            raise RuntimeError("同花顺估值仅支持 A 股")
-        df = ak.stock_value_em(symbol=str(ticker).split(".")[0])
-        if df is not None and not df.empty:
-            row = df.tail(1).to_dict("records")[0]
-
-            def pick(*names):
-                for name in names:
-                    value = row.get(name)
-                    if isinstance(value, (int, float)) and math.isfinite(value) and value > 0:
-                        return float(value)
-                return None
-
-            fallback = {"pe_ttm": pick("PE(TTM)"), "pb": pick("市净率"),
-                        "peg": pick("PEG值"), "ps": pick("市销率")}
-            added = {k: v for k, v in fallback.items() if v is not None and k not in values}
-            if added:
-                values.update(added)
-                sources.append("akshare/同花顺估值")
-    except Exception:
-        pass
-
-    return values, "+".join(sources) if sources else ""
+    """估值因子（薄委托，WP2 任务 3 收敛）：实现体已迁入 trading_core.factors，
+    字段路径以该唯一实现为准。返回 (values, source)，契约与收敛前逐字一致。"""
+    import sys
+    _core = str(Path(__file__).resolve().parents[2] / "core" / "python")
+    if _core not in sys.path:
+        sys.path.insert(0, _core)
+    from trading_core.factors import valuation_values as _core_valuation
+    return _core_valuation(ticker)
 
 
 def zscores(rows, keys):

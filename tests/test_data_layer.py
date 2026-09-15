@@ -822,11 +822,19 @@ class MarketGuardTests(unittest.TestCase):
             market.fetch_yahoo("", "1d", 200)
 
     def test_valuation_fallback_is_a_share_only(self):
-        """同花顺估值只服务 A 股；港股不能混入同代码的 A 股估值。"""
-        source = (ROOT / "plugins" / "workbench" / "python" / "factors.py").read_text(encoding="utf-8")
+        """同花顺估值只服务 A 股；港股不能混入同代码的 A 股估值。
+
+        WP2 任务 3 收敛：估值唯一实现迁入 trading_core.factors（workbench 侧薄委托），
+        本守护测试随之改指向新位置（计划既定：旧测试同步更新指向）。"""
+        source = (ROOT / "plugins" / "core" / "python" / "trading_core" / "factors.py"
+                  ).read_text(encoding="utf-8")
         self.assertIn("if not is_a_share(ticker):", source,
                       "同花顺估值兜底必须显式判市场")
         self.assertIn("from trading_datasource.market import is_a_share", source)
+        workbench = (ROOT / "plugins" / "workbench" / "python" / "factors.py"
+                     ).read_text(encoding="utf-8")
+        self.assertIn("from trading_core.factors import valuation_values", workbench,
+                      "workbench 必须保持薄委托，不得复活第二份实现")
 
     def test_yahoo_channels_use_the_shared_symbol_conversion(self):
         """凡是用 Yahoo 的通道都必须走符号归一。
