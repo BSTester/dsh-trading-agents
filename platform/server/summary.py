@@ -6,7 +6,7 @@
 #   broker_trades.js:33-54   businessData    -> business_data()
 #   broker_trades.js:56-58   toolName        -> tool_name()
 #   broker_trades.js:60-63   actionLabel     -> action_label()
-#   broker_trades.js:65-68   numeric         -> _numeric()
+#   broker_trades.js:65-68   numeric         -> _js.numeric()
 #   broker_trades.js:71-76   fillState       -> _fill_state()
 #   broker_trades.js:79-84   microTime       -> _micro_time()
 #   broker_trades.js:86-110  orderRow        -> _order_row()
@@ -16,6 +16,10 @@
 # 集守护）。入参是已按模式过滤且倒序的 activity 列表——与 store.js:217
 # `summarizeBrokerActivity(activity)` 的入参一致（store.js:209 的 `.filter(...).reverse()`）。
 #
+# JS 语义助手（真值、空值合并、模板字符串、Number()、Math.round、对象键枚举序）统一收在
+# server/_js.py，不再在本模块内重复实现——重复实现正是补遗 B 移植审查抓到的漂移来源
+# （summary 与 audit_chain 对空数组真值给了两种答案）。逐条语义与出处见 _js.py。
+#
 # 有意差异（诚实边界，均与 Node 行为区分并已核对）：
 #   1. 正则：JS `$` 同时匹配「串尾」与「尾随换行前」，Python `$` 同样如此，故 ORDER_ACTIONS /
 #      ORDER_SOURCE 用 re.search 逐条等价；JS 的 `.test()` 在不带 g 标志时无 lastIndex 状态。
@@ -24,21 +28,29 @@
 #      对负数向下取整，这里 micros<=0 已提前返回 None，故无差异）。
 #   3. 排序：JS `localeCompare` 对 ASCII/Unicode 默认按码点比较，与 Python 的字符串 `<`
 #      一致；`Array.prototype.sort` 自 ES2019 起稳定，本实现同样用稳定排序。
-#   4. JS 对象键序把「整数样式的键」提前并按数值升序枚举（§9.2.1 Array Index | 0 ≤ n < 2^32-1）；
-#      查询计数表因此按该规则还原枚举顺序（_query_tool_order），否则 queries.tools 的并列项次序会漂移。
-#   5. `Number()` 语义区分「字段缺失」与「显式 null」：缺失是 undefined -> NaN -> null（_present()），
-#      显式 null 是 0（_numeric()）。这两条在 orderRow 里结果不同（发现于差分用例 numeric_coercions）。
-#   6. `Math.round` 是半数向 +∞（_js_round），Python 内置 round() 是银行家舍入，0.1×0.05 这种
+#   4. JS 对象键序把「整数样式的键」提前并按数值升序枚举（Array index：0 ≤ n < 2^32-1）；
+#      查询计数表因此按该规则还原枚举顺序（_js.object_entry_order），否则 queries.tools 的
+#      并列项次序会漂移。
+#   5. `Number()` 语义区分「字段缺失」与「显式 null」：缺失是 undefined -> NaN -> null
+#      （_js.present()），显式 null 是 0（_js.numeric()）。这两条在 orderRow 里结果不同
+#      （发现于差分用例 numeric_coercions）。
+#   6. `Math.round` 是半数向 +∞（_js.js_round），Python 内置 round() 是银行家舍入，0.005 这类
 #      ×100 后恰为 .5 的值会分叉（JS 得 0.01，round() 得 0）。
 #   7. `parsed` 是数组时 JS 仍算 object（`typeof [] === "object"`），`.data` 取到 undefined -> {}，
-#      于是 envelope 解析**成功**；Python 里 list 没有 .get()，_field() 显式按「数组无业务字段」
-#      处理，保持与 Node 相同的 ok=True/data={}。
-#   8. JS 模板字符串 `${v}` 对 null 产出 "null"（_template），带 `?? ""` 的位置产出 ""（_stringify）；
-#      两者在 orderRow/actions 里都用到了，不能一律当空串。
+#      于是 envelope 解析**成功**；Python 里 list 没有 .get()，_js.field() 显式按「数组无业务
+#      字段」处理，保持与 Node 相同的 ok=True/data={}。
+#   8. JS 模板字符串 `${v}` 对 null 产出 "null"（_js.template）、带 `?? ""` 的位置产出 ""
+#      （_js.stringify）；数字走 JS 的 String(number)（`${1e-7}` 是 "1e-7"）。
+#   9. activity 里出现 null 元素：JS `entry.is_error`（broker_trades.js:163）抛 TypeError，
+#      本实现按「无名查询」计数而不抛错（服务进程不应因一条脏记录 500），见
+#      test_null_activity_entry_is_tolerated。orders 数组里的 null 元素同理：
+#      broker_trades.js:87 `raw.qty` 在 JS 里抛 TypeError，本实现取不到字段 -> 无 order_id -> 丢弃。
 import json
 import math
 import re
 from datetime import datetime, timezone
+
+from server import _js
 
 # broker_trades.js:17-21：下单/改单/撤单——这些才会改变券商侧状态。
 ORDER_ACTIONS = [
@@ -57,73 +69,6 @@ SIDE_LABELS = {1: "买入", 2: "卖出"}
 NOTICE = ("交易概要由 Harness 观察到的富途工具响应归纳而来，不是券商成交推送；"
           "只读查询仅计数不列出。下单与撤单请在 Harness 会话中完成并确认。")
 
-def _field(row, key):
-    """JS `row.key` 语义：非对象的行取不到字段（undefined -> None）。"""
-    if isinstance(row, dict):
-        return row.get(key)
-    return None
-
-
-def _present(row, key):
-    """JS `row.key !== undefined`：区分「字段缺失」与「字段显式为 null」。
-
-    Number(undefined) 是 NaN -> numeric() 返回 null；Number(null) 是 0。JSON 里两者都是
-    null，但键在不在是关键——numeric_coercions 差分用例正是钉这一点。
-    """
-    return isinstance(row, dict) and key in row
-
-
-def _truthy(value):
-    """JS 真值语义：None/False/0/""/空容器为假，其余为真。"""
-    if value is None or value is False:
-        return False
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value != ""
-    if isinstance(value, (list, dict, tuple)):
-        return len(value) > 0
-    return True
-
-
-def _js_nullish(*values):
-    """JS `a ?? b`：仅 None（undefined/null）触发回退，假值（0/""/False）不回退。"""
-    for value in values:
-        if value is not None:
-            return value
-    return None
-
-
-def _numeric(value):
-    """broker_trades.js:65-68 numeric：Number(value) 且有限，否则 None。
-
-    有意差异 5：输入来自 JSON，故 None -> 0（Number(null)），字符串按 JS 数字字面量解析
-    （含 '' -> 0、'0x1f' -> 31、'+1.5' -> 1.5）；解析失败/Infinity -> None（Number.isFinite）。
-    """
-    if value is None:
-        return 0.0
-    if isinstance(value, bool):
-        return 1.0 if value else 0.0
-    if isinstance(value, (int, float)):
-        return None if _non_finite(value) else float(value)
-    if isinstance(value, str):
-        text = value.strip()
-        if text == "":
-            return 0.0
-        try:
-            if text.lower().startswith(("0x", "+0x", "-0x")):
-                return float(int(text, 16))
-            if text in ("Infinity", "+Infinity", "-Infinity", "NaN"):
-                return None
-            parsed = float(text)
-        except ValueError:
-            return None
-        return None if _non_finite(parsed) else parsed
-    return None
-
-
-def _non_finite(value):
-    return math.isnan(value) or math.isinf(value)
 
 
 def _fill_state(qty, cum_qty):
@@ -139,7 +84,7 @@ def _fill_state(qty, cum_qty):
 
 def _micro_time(value):
     """broker_trades.js:79-84：券商时间戳是微秒；无法解析时返回 None，不编造时间。"""
-    micros = _numeric(value)
+    micros = _js.numeric(value)
     if micros is None or micros <= 0:
         return None
     millis = math.floor(micros / 1000)
@@ -157,14 +102,16 @@ def business_data(entry):
 
     业务 JSON 是**字符串**，藏在 value.content[].text 里（富途返回格式）。
     """
-    content = _field(_field(entry, "value"), "content")
+    content = _js.field(_js.field(entry, "value"), "content")
     if not isinstance(content, list):
         return {"ok": False, "reason": "无内容"}
+    # broker_trades.js:36-37：`content.find(part => part?.type === "text")?.text` 先命中的
+    # **第一个** text part 就定结果，再判 `typeof text !== "string"`。不能「跳过非字符串继续
+    # 往后找」——那会把本该失败的 text=null 信封判成成功（补遗 B F2）。
     text = None
     for part in content:
-        part_text = _field(part, "text")
-        if _field(part, "type") == "text" and isinstance(part_text, str):
-            text = part_text
+        if _js.field(part, "type") == "text":
+            text = _js.field(part, "text")
             break
     if not isinstance(text, str):
         return {"ok": False, "reason": "无文本内容"}
@@ -178,22 +125,26 @@ def business_data(entry):
         # 所以下面的 `.data` / `.d` 在数组上取到 undefined，最终落到 {}。Python 的 list
         # 没有 .get()，因此显式按「数组 = 没有业务字段」处理（有意差异：Node 会静默成功）。
         return {"ok": False, "reason": "返回不是对象"}
-    ret_code = _field(parsed, "ret_code")
+    ret_code = _js.field(parsed, "ret_code")
     if isinstance(ret_code, (int, float)) and not isinstance(ret_code, bool) and ret_code != 0:
-        reason = f"ret={ret_code} {_stringify(_field(parsed, 'ret_msg'))}"
+        # `${parsed.ret_code} ${parsed.ret_msg ?? ""}`：数字按 JS String(number)（1.0 -> "1"）
+        reason = f"ret={_js.template(ret_code)} {_js.stringify(_js.field(parsed, 'ret_msg'))}"
         return {"ok": False, "reason": reason.strip()}
-    marker = _field(parsed, "s")
-    if marker is not None and str(marker).lower() != "ok":
-        return {"ok": False, "reason": f"s={marker}"}
+    # broker_trades.js:49 `parsed.s !== undefined`：**显式 null 也算「存在」**，
+    # String(null)="null" !== "ok" -> 失败（补遗 B F1，差分用例 s_null_marker）。
+    if _js.present(parsed, "s"):
+        marker = _js.field(parsed, "s")
+        if _js.template(marker).lower() != "ok":
+            return {"ok": False, "reason": f"s={_js.template(marker)}"}
     # `parsed.data ?? parsed.d ?? {}`：data 显式为 null 时回退到 d；数组上取不到字段 -> {}
-    data = _js_nullish(_field(parsed, "data"), _field(parsed, "d"))
+    data = _js.js_nullish(_js.field(parsed, "data"), _js.field(parsed, "d"))
     return {"ok": True, "data": data if data is not None else {}}
 
 
 def tool_name(entry):
     """broker_trades.js:56-58：`String(entry?.tool ?? "").replace(/^mcp__futu__/, "")`。"""
-    tool = _field(entry, "tool")
-    return re.sub(r"^mcp__futu__", "", "" if tool is None else str(tool))
+    tool = _js.stringify(_js.field_or_undefined(entry, "tool"))
+    return re.sub(r"^mcp__futu__", "", tool)
 
 
 def action_label(name):
@@ -204,100 +155,49 @@ def action_label(name):
     return None
 
 
-def _template(value):
-    """JS 模板字符串 `${value}` 的等价形式：null -> "null"、undefined -> "undefined"。
-
-    只在真正来自 JS 模板/`String()` 的位置使用；带 `?? ""` 的位置走 _stringify()。
-    """
-    if value is None:
-        return "null"
-    if value is True:
-        return "true"
-    if value is False:
-        return "false"
-    if isinstance(value, (dict, list)):
-        return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-    if isinstance(value, float):
-        if math.isnan(value) or math.isinf(value):
-            return "NaN" if math.isnan(value) else ("Infinity" if value > 0 else "-Infinity")
-        if value.is_integer():
-            return str(int(value))
-    return str(value)
-
-
-def _stringify(value):
-    """`${parsed.ret_msg ?? ""}` 等带空值合并的插值：None -> ""，其余同 _template()。"""
-    if value is None:
-        return ""
-    return _template(value)
-
-
-def _js_round(value):
-    """JS `Math.round`：半数**向 +∞**取整（Python round 是银行家舍入，0.5 -> 0，会分叉）。
-
-    broker_trades.js:103 `Math.round(cumQty * avgFill * 100) / 100` 对 0.005 这类
-    二进制近似值（×100 后恰为 .5）与 Python round() 结果不同：JS 得 0.01、round() 得 0。
-    """
-    if math.isnan(value) or math.isinf(value):
-        return value
-    return math.floor(value + 0.5)
-
-
 def _order_row(raw, seen_at):
     """broker_trades.js:86-110 orderRow：订单字段直接取券商原文，不重算价格、不补默认值。"""
-    qty = _numeric(_field(raw, "qty")) if _present(raw, "qty") else None
-    cum_qty = _numeric(_field(raw, "cum_qty")) if _present(raw, "cum_qty") else None
-    price = _numeric(_field(raw, "price")) if _present(raw, "price") else None
-    avg_fill = _numeric(_field(raw, "avg_fill_price")) if _present(raw, "avg_fill_price") else None
-    side_code = _numeric(_field(raw, "side")) if _present(raw, "side") else None
+    def number(key):
+        # `numeric(raw.qty)`：字段缺失时 JS 取到 undefined -> NaN -> null；显式 null 是 0
+        return _js.numeric(_js.field(raw, key)) if _js.present(raw, key) else None
+
+    qty = number("qty")
+    cum_qty = number("cum_qty")
+    avg_fill = number("avg_fill_price")
+    side_code = number("side")
+    amount = None
+    if cum_qty is not None and avg_fill is not None:
+        # `${...}`：`Math.round(cumQty * avgFill * 100) / 100`。JSON 层面非有限值会变成 null
+        # （JSON.stringify(NaN/Infinity) === "null"），_js.json_number 统一处理。
+        amount = _js.json_number(_js.js_round(cum_qty * avg_fill * 100) / 100)
     return {
-        "order_id": _stringify(_field(raw, "order_id")),   # `String(raw.order_id ?? "")`
-        "symbol": _stringify(_field(raw, "symbol")),   # `String(raw.symbol ?? "")`
-        "name": _stringify(_field(raw, "stock_name")),  # `String(raw.stock_name ?? "")`
-        # `SIDE_LABELS[sideCode] ?? null`：数值键命中；未命中用 get 的 None
-        "side": SIDE_LABELS.get(side_code) if _hashable(side_code) else None,
+        "order_id": _js.stringify(_js.field(raw, "order_id")),   # `String(raw.order_id ?? "")`
+        "symbol": _js.stringify(_js.field(raw, "symbol")),   # `String(raw.symbol ?? "")`
+        "name": _js.stringify(_js.field(raw, "stock_name")),  # `String(raw.stock_name ?? "")`
+        # `SIDE_LABELS[sideCode] ?? null`：数值键命中；未命中/None 用 get 的 None
+        "side": SIDE_LABELS.get(side_code),
         "side_code": side_code,
         "qty": qty,
         "filled_qty": cum_qty,
-        "price": price,
+        "price": number("price"),
         "avg_fill_price": avg_fill,
-        # 金额用「已成交数量 × 成交均价」——两个数都来自券商原文（JS:
-        # `Math.round(cumQty * avgFill * 100) / 100`）
-        "amount": (_js_round(cum_qty * avg_fill * 100) / 100
-                   if cum_qty is not None and avg_fill is not None else None),
+        "amount": amount,
         "fill": _fill_state(qty, cum_qty),
-        "status_code": _numeric(_field(raw, "status")) if _present(raw, "status") else None,
-        "ordered_at": _micro_time(_field(raw, "create_time")),
-        "updated_at": _micro_time(_field(raw, "update_time")),
+        "status_code": number("status"),
+        "ordered_at": _micro_time(_js.field(raw, "create_time")),
+        "updated_at": _micro_time(_js.field(raw, "update_time")),
         "seen_at": seen_at if seen_at is not None else None,
     }
-
-
-def _hashable(value):
-    return isinstance(value, (str, int, float, bool)) or value is None
 
 
 def _order_sort_key(row):
     """broker_trades.js:181-182：`String(b.ordered_at ?? b.seen_at ?? "").localeCompare(...)` 倒序。
 
     `??` 是空值合并而非逻辑或：ordered_at 为 "" 时**不**回退到 seen_at（有意差异 6：
-    用 _js_nullish 明确区分 None 与假值，Python 的 `or` 做不到这一点）。
+    用 _js.js_nullish 明确区分 None 与假值，Python 的 `or` 做不到这一点）。
     """
-    return _template(_js_nullish(row.get("ordered_at"), row.get("seen_at"), ""))
+    return _js.template(_js.js_nullish(row.get("ordered_at"), row.get("seen_at"), ""))
 
-
-def _query_tool_order(query_tools):
-    """JS 对象键枚举序（有意差异 4）：整数样式键（0 ≤ n < 2^32-1）优先且按数值升序。"""
-    if not query_tools:
-        return []
-    integer_keys, string_keys = [], []
-    for key in query_tools:
-        if re.fullmatch(r"(0|[1-9]\d{0,9})", key) and int(key) < 4294967294:
-            integer_keys.append(key)
-        else:
-            string_keys.append(key)
-    integer_keys.sort(key=int)
-    return integer_keys + string_keys
 
 
 def summarize(activity):
@@ -322,10 +222,10 @@ def summarize(activity):
                 errors += 1
                 continue
             order_responses += 1
-            raw_orders = _field(parsed["data"], "orders")
+            raw_orders = _js.field(parsed["data"], "orders")
             order_list = raw_orders if isinstance(raw_orders, list) else []
             for raw in order_list:
-                row = _order_row(raw, _field(entry, "at"))
+                row = _order_row(raw, _js.field(entry, "at"))
                 if not row["order_id"]:
                     continue
                 # 同一订单会在多次查询里重复出现，且状态会演进：保留**最后一次观测**
@@ -334,17 +234,17 @@ def summarize(activity):
 
         label = action_label(name)
         if label:
-            ok = parsed["ok"] and not _truthy(_field(entry, "is_error"))
+            ok = parsed["ok"] and not _js.truthy(_js.field(entry, "is_error"))
             data = parsed["data"] if parsed["ok"] else None
-            order_id = _field(data, "order_id") if parsed["ok"] else None
+            order_id = _js.field(data, "order_id") if parsed["ok"] else None
             actions.append({
-                "at": _field(entry, "at") if _field(entry, "at") is not None else None,
+                "at": _js.field(entry, "at") if _js.field(entry, "at") is not None else None,
                 "action": label,
                 # `parsed.ok ? (parsed.data?.order_id ?? null) : null`
-                "order_id": _js_nullish(order_id) if parsed["ok"] else None,
+                "order_id": _js.js_nullish(order_id) if parsed["ok"] else None,
                 "ok": ok,
-                "detail": "" if ok else _js_nullish(parsed.get("reason"), "失败"),
-                "entry_id": _field(entry, "id") if _field(entry, "id") is not None else None,
+                "detail": "" if ok else _js.js_nullish(parsed.get("reason"), "失败"),
+                "entry_id": _js.field(entry, "id") if _js.field(entry, "id") is not None else None,
             })
             if not ok:
                 errors += 1
@@ -353,7 +253,7 @@ def summarize(activity):
         # 其余一律视为查询：只计数，不逐条铺开
         tool = name if name else "unknown"
         query_tools[tool] = query_tools.get(tool, 0) + 1
-        if _truthy(_field(entry, "is_error")):
+        if _js.truthy(_js.field(entry, "is_error")):
             errors += 1
 
     # 用**我们自己记录到的**动作补全生命周期：撤单/改单成功过就标注出来。
@@ -369,13 +269,15 @@ def summarize(activity):
 
     orders = sorted(orders_by_id.values(), key=_order_sort_key, reverse=True)
 
-    tool_rows = [{"tool": tool, "count": query_tools[tool]} for tool in _query_tool_order(query_tools)]
+    # JS 对象键枚举序（有意差异 4）：整数样式键（array index）优先且按数值升序
+    tool_rows = [{"tool": tool, "count": query_tools[tool]}
+                 for tool in _js.object_entry_order(query_tools)]
     # `sort((a, b) => b.count - a.count)`：稳定排序保持同计数项的插入顺序
     tool_rows.sort(key=lambda row: -row["count"])
 
     return {
         "orders": orders,
-        "actions": sorted(actions, key=lambda row: _template(_js_nullish(row.get("at"), "")),
+        "actions": sorted(actions, key=lambda row: _js.template(_js.js_nullish(row.get("at"), "")),
                           reverse=True),
         "queries": {
             "count": sum(query_tools.values()),

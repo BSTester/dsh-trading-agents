@@ -28,13 +28,17 @@
 # labels.js 的键值，防止这第四份漂移。
 #
 # 有意差异（诚实边界）：
-#   1. zh() 对「不可作为字典键」的值（dict/list/set）不回退到 Python 的 canonical 实现
-#      （那里 `value in table` 会抛 TypeError），而是按 labels.js 的 `hasOwnProperty` 语义
-#      返回 fallback/原值。JSON 载荷里这类值不会出现在结论字段上。
-#   2. 大小写不敏感查找同 labels.js:42 `Object.keys(dict).find(...)`：命中**第一个**键，
-#      而不是 canonical zh 的「最后一个」。SIDE 表只有整数键，字符串值不参与小写回退。
+#   1. `Object.prototype.hasOwnProperty.call(dict, value)` 会把 value 强制成**对象键**再查表
+#      （ToPropertyKey -> ToString）：`zh("SIDE", "1")` 与 `zh("SIDE", 1)` 一样命中，
+#      `zh("SIDE", true)` 查的是键 "true"（不命中 -> 返回 true 本身）。本实现按同一规则
+#      把表键与查询值都过一遍 js_key_string()（补遗 B 审查项 3）。
+#   2. 大小写不敏感查找同 labels.js:42 `Object.keys(dict).find(...)`：命中**第一个**键。
 #   3. value is None 时返回 fallback（labels.js:37 的 `value == null` 覆盖 null 与
-#      undefined），调用方未传 fallback 时返回 None，与 JS 的 undefined 对应。
+#      undefined）；fallback 缺省时返回原值。Python 无法区分「未传 fallback」与「显式传
+#      null」（JS 里 `fallback === undefined` 才返回原值），服务侧没有传 null fallback 的
+#      调用点，因此按前者解释。
+#   4. 查不到时原样返回未知值（不吞枚举），fallback 仅在该参数非 None 时生效。
+from server import _js
 
 
 SIGNAL = {"BUY": "买入", "SELL": "卖出", "HOLD": "观望"}
@@ -65,22 +69,25 @@ TABLES = {"SIGNAL": SIGNAL, "ACTION": ACTION, "SIDE": SIDE, "TRADE_TYPE": TRADE_
           "METRIC": METRIC, "GRID_AXIS": GRID_AXIS, "STRATEGY": STRATEGY}
 
 
-def _hashable(value):
-    """labels.js:39 `hasOwnProperty(dict, value)` 的前提：值能当键。"""
-    return isinstance(value, (str, int, float, bool, tuple)) or value is None
-
-
 def zh(table, value, fallback=None):
-    """labels.js:36-46：按表翻译；查不到原样返回（不吞掉未知值，便于发现新枚举）。"""
+    """labels.js:36-46：按表翻译；查不到原样返回（不吞掉未知值，便于发现新枚举）。
+
+    `hasOwnProperty` 的键强制转换是关键：JS 对象的键永远是字符串，所以 `zh("SIDE", "1")`
+    命中 SIDE[1]，而 `zh("SIDE", True)` 查键 "true" 不命中、返回 True 本身（不是「买入」）。
+    若直接 `value in {1: ...}`，Python 会把 True 当成 1（hash 相同）而错误命中。
+    """
     if value is None:
         return fallback
     dictionary = TABLES.get(table) or {}
-    if _hashable(value) and value in dictionary:
-        return dictionary[value]
+    key = _js.js_key_string(value)
+    for existing, label in dictionary.items():
+        if _js.js_key_string(existing) == key:
+            return label
     if isinstance(value, str):
         # 大小写不敏感：历史记录里 BUY / buy / Buy 都出现过
-        for key, label in dictionary.items():
-            if isinstance(key, str) and key.lower() == value.lower():
+        lowered = value.lower()
+        for existing, label in dictionary.items():
+            if _js.js_key_string(existing).lower() == lowered:
                 return label
     return value if fallback is None else fallback
 

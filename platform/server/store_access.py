@@ -24,6 +24,8 @@
 #   scripts/workbench_admin.mjs:14-25       hoursArg/ageMinutes -> _hours_to_ms/admin_runs
 #   plugins/workbench/src/endpoints.js:12-33 ENDPOINTS          -> endpoints()
 # 本模块只用标准库；不写回任何 Node 侧尚未写入的键，错误语义（消息、类型）对齐 Node。
+# JS 语义助手（真值、字段访问）统一来自 server/_js.py：store_access/summary/audit_chain 不再
+# 各留一份，避免补遗 B 移植审查抓到的那种漂移（同一语义两处两种答案）。
 #
 # 有意差异（诚实边界，须与 Node 行为区分；规格 §八-7 与补遗任务 B 明文允许）：
 #   1. 只读快照：snapshot() 不调用 flushObservations()（store.js:206）。trading-observations/
@@ -44,7 +46,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from server import summary
+from server import _js, summary
 
 # store.js:9-13
 LIMIT = 100
@@ -94,24 +96,6 @@ def mode_value(mode):
     if mode != "sim" and mode != "live":
         raise WorkbenchError("Invalid account mode; expected sim/live")
     return mode
-
-
-def _truthy(value):
-    """JS 真值语义（JSON 不会产生 undefined/NaN）：None/False/0/"" 为假，其余为真。"""
-    if value is None or value is False:
-        return False
-    if isinstance(value, (int, float)):
-        return value != 0
-    if isinstance(value, str):
-        return value != ""
-    return True
-
-
-def _field(row, key):
-    """JS `row.key` 语义：非对象的行取不到字段（undefined -> None）。"""
-    if isinstance(row, dict):
-        return row.get(key)
-    return None
 
 
 def _now_ms():
@@ -245,13 +229,17 @@ def read_store(home):
     if (state.get("version") != 1
             or not all(isinstance(state.get(key), list) for key in ("runs", "reports", "previews", "activity"))
             # `!state.broker || typeof state.broker !== "object"`：空对象 {} 合法（JS 真值）
-            or not _truthy(broker) or not isinstance(broker, (dict, list))):
+            or not _js.truthy(broker) or not isinstance(broker, (dict, list))):
         raise WorkbenchError("Invalid workbench state; restore a valid backup")
     return state
 
 
-def _update(home, fn, after_commit=None):
-    """store.js:108-129 update：独占写锁 -> 读 -> 改 -> 截断到 LIMIT -> 原子写 -> 放锁。"""
+def _update(home, fn):
+    """store.js:108-129 update：独占写锁 -> 读 -> 改 -> 截断到 LIMIT -> 原子写 -> 放锁。
+
+    没有 after_commit 钩子：调用方全都只要返回值（Node 侧 `update()` 同样直接返回 result），
+    加一个无人使用的钩子只会成为下一处漂移点（补遗 B 审查次要项）。
+    """
     home = Path(home)
     home.mkdir(parents=True, exist_ok=True)
     lock = lock_file(home)
@@ -266,8 +254,6 @@ def _update(home, fn, after_commit=None):
             state[key] = state[key][-LIMIT:]
         # JSON.stringify 等价：紧凑分隔符 + 不转义非 ASCII，尽量与 Node 写出的字节同形。
         _atomic_write(store_file(home), json.dumps(state, ensure_ascii=False, separators=(",", ":")))
-        if after_commit is not None:
-            after_commit(result)
         return result
     finally:
         os.close(fd)
@@ -284,7 +270,7 @@ def _event(state, value):
 
 def _by_mode_desc(rows, mode):
     """store.js:209/212-214 `.filter(row => row.mode === mode).reverse()`。"""
-    return [row for row in reversed(rows) if _field(row, "mode") == mode]
+    return [row for row in reversed(rows) if _js.field(row, "mode") == mode]
 
 
 def snapshot(home):
@@ -339,7 +325,8 @@ def switch_mode(home, mode=None, expected_mode=None, confirmation=None):
 
 
 def admin_status(home):
-    """workbench_admin.mjs:28-31 status：数据文件路径与四张表的计数。"""
+    """服务侧新 API（Node 侧没有对应的 store 方法）：形状照 workbench_admin.mjs:28-31 的
+    status 打印——数据文件路径与四张表的计数，让面板不必解析 CLI 文本。"""
     state = read_store(home)
     return {
         "file": str(store_file(home)),
@@ -351,17 +338,18 @@ def admin_status(home):
 
 
 def admin_runs(home, now=None):
-    """workbench_admin.mjs:21-25/33-39 runs：状态与年龄（started_at 解析失败 -> None）。"""
+    """服务侧新 API（Node 侧没有对应的 store 方法）：形状照 workbench_admin.mjs:21-25/33-39
+    的 runs 打印——每条 run 的状态与年龄（started_at 解析失败 -> None，对应 "年龄未知"）。"""
     state = read_store(home)
     current = _now_ms() if now is None else now
     rows = []
     for run in state["runs"]:
-        started = _parse_ms(_field(run, "started_at"))
+        started = _parse_ms(_js.field(run, "started_at"))
         rows.append({
-            "id": _field(run, "id"),
-            "status": _field(run, "status"),
-            "ticker": _field(run, "ticker"),
-            "mode": _field(run, "mode"),
+            "id": _js.field(run, "id"),
+            "status": _js.field(run, "status"),
+            "ticker": _js.field(run, "ticker"),
+            "mode": _js.field(run, "mode"),
             "age_minutes": None if started is None else (current - started) / 60_000,
         })
     return rows
@@ -373,16 +361,16 @@ def admin_cancel_run(home, run_id):
 
     def apply(state):
         nonlocal settled
-        run = next((row for row in state["runs"] if _field(row, "id") == run_id), None)
+        run = next((row for row in state["runs"] if _js.field(row, "id") == run_id), None)
         if run is None:
             raise WorkbenchError(f"Unknown run: {run_id}")
-        if _field(run, "status") != "running":
-            raise WorkbenchError(f"Run is already settled: {_field(run, 'status')}")
+        if _js.field(run, "status") != "running":
+            raise WorkbenchError(f"Run is already settled: {_js.field(run, 'status')}")
         run["status"] = "cancelled"
         run["settled_at"] = _iso_now()
-        _event(state, {"kind": "research_cancelled", "mode": _field(run, "mode"),
-                       "ticker": _field(run, "ticker"), "run_id": _field(run, "id"),
-                       "session_id": _field(run, "session_id")})
+        _event(state, {"kind": "research_cancelled", "mode": _js.field(run, "mode"),
+                       "ticker": _js.field(run, "ticker"), "run_id": _js.field(run, "id"),
+                       "session_id": _js.field(run, "session_id")})
         settled = dict(run)
 
     _update(home, apply)
@@ -397,16 +385,16 @@ def admin_cancel_stale(home, hours=2, now=None):
 
     def apply(state):
         for run in state["runs"]:
-            if _field(run, "status") != "running":
+            if _js.field(run, "status") != "running":
                 continue
-            started = _parse_ms(_field(run, "started_at"))
+            started = _parse_ms(_js.field(run, "started_at"))
             if started is not None and current - started >= older_than_ms:
                 run["status"] = "cancelled"
                 run["settled_at"] = _iso_now()
-                _event(state, {"kind": "research_cancelled", "mode": _field(run, "mode"),
-                               "ticker": _field(run, "ticker"), "run_id": _field(run, "id"),
-                               "session_id": _field(run, "session_id")})
-                cancelled.append(_field(run, "id"))
+                _event(state, {"kind": "research_cancelled", "mode": _js.field(run, "mode"),
+                               "ticker": _js.field(run, "ticker"), "run_id": _js.field(run, "id"),
+                               "session_id": _js.field(run, "session_id")})
+                cancelled.append(_js.field(run, "id"))
 
     _update(home, apply)
     return cancelled
@@ -425,22 +413,22 @@ def admin_prune_runs(home, hours=2, now=None):
         published = set()
         for row in state["reports"]:
             for key in ("id", "run_id"):
-                value = _field(row, key)
-                if _truthy(value) and isinstance(value, (str, int, float)):
+                value = _js.field(row, key)
+                if _js.truthy(value) and isinstance(value, (str, int, float)):
                     published.add(value)
         kept = []
         for run in state["runs"]:
-            if _field(run, "status") != "running":
+            if _js.field(run, "status") != "running":
                 kept.append(run)
                 continue
-            started = _parse_ms(_field(run, "started_at"))
+            started = _parse_ms(_js.field(run, "started_at"))
             if started is None or current - started < older_than_ms:
                 kept.append(run)
                 continue
-            if _field(run, "id") in published:
+            if _js.field(run, "id") in published:
                 kept.append(run)
                 continue
-            removed.append(_field(run, "id"))
+            removed.append(_js.field(run, "id"))
         state["runs"] = kept
 
     _update(home, apply)

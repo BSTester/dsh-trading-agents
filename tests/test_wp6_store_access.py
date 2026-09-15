@@ -1,10 +1,11 @@
 """WP6 补遗 B1 差分测试：store 访问层 Python 移植（平台侧只读快照/模式切换/管理动作）。
 
 对照基准是 plugins/workbench/src/store.js 与 scripts/workbench_admin.mjs 的实际行为；
-用例逐条钉死字段名、过滤/倒序、2h 派生阈值、锁协议、错误消息。全部离线、临时 DSH_HOME。
+用例逐条钉死字段名、过滤/倒序、2h 派生阈值、锁协议、错误消息。全部离线，临时 home 目录
+显式传给每个 API——store_access 自己**不读** DSH_HOME（那是 config.py 的职责，见
+tests/test_wp6_service_locks.py），所以这里不再改环境变量。
 """
 import json
-import os
 import stat
 import sys
 import tempfile
@@ -52,14 +53,8 @@ class StoreAccessBase(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
         self.home = Path(self._tmp.name)
-        self._previous_home = os.environ.get("DSH_HOME")
-        os.environ["DSH_HOME"] = str(self.home)
 
     def tearDown(self):
-        if self._previous_home is None:
-            os.environ.pop("DSH_HOME", None)
-        else:
-            os.environ["DSH_HOME"] = self._previous_home
         self._tmp.cleanup()
 
     # —— 夹具 ——

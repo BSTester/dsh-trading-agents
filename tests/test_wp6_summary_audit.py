@@ -1,31 +1,57 @@
-"""WP6 补遗 B2 差分测试：交易概要 / 审计链的 Python 移植。
+"""WP6 补遗 B2 差分测试：交易概要 / 审计链 / 中文标签的 Python 移植。
 
-对照基准是 plugins/workbench/src/broker_trades.js 与 plugins/workbench/src/audit.js 的**实际
-运行结果**，不是对 JS 源码的二次解读：
+对照基准是 plugins/workbench/src/broker_trades.js、plugins/workbench/src/audit.js 与
+plugins/workbench/src/labels.js 的**实际运行结果**，不是对 JS 源码的二次解读：
 
   * 每个 fixture 的 Python 字典由本文件顶部的夹具函数构造（与 tests/broker-trades.test.mjs /
     tests/audit.test.mjs 的 entry()/ORDER/envelope 形状逐字对应）；
   * 同一组 fixture 送进 Node 侧真实函数，把返回的完整 JSON 快照压进 _NODE_REFERENCE_B64；
   * test_node_reference_parity 对每个 fixture 做 `self.assertEqual(python_out, node_out)` 递归比较，
-    test_node_shape_parity 再递归比对键集（含 null 的位置与数组元素形状）。
+    test_node_shape_parity 再递归比对键集**与叶子数值类型**（integer / float 分开）。
 
 Node 参照物是一次性探针（不入库）的产物，可复现方式：
 
-  1. 写一个 .mjs：构造与下面 _activity()/_snapshot() 完全相同的 fixture，调用
-     summarizeBrokerActivity / buildAuditChain / extractBrokerFields，`JSON.stringify(out)` 到 stdout；
-  2. `node <probe>.mjs > node-out.json`；
-  3. `base64.b64encode(zlib.compress(json.dumps(json.load(open('node-out.json')),
-     ensure_ascii=False, separators=(',', ':')).encode(), 9))` 得到 _NODE_REFERENCE_B64。
+  1. 用 Python 导入本模块，把夹具函数 `_activity() / _audits() / _max_entries_cases() /
+     _field_cases() / _label_cases()` 的返回值 `json.dumps` 成 fixtures.json（maxEntries 组
+     只在输入里**存在** `maxEntries` 键时才写这个键，见 _run()）；
+  2. 探针 .mjs 用 pathToFileURL `import` 上面三个 JS 模块，按分组调用
+     `summarizeBrokerActivity` / `buildAuditChain({snapshot,trades,maxEntries})` /
+     `extractBrokerFields` / `zh(table, value[, fallback])`；每组先过一次
+     `JSON.parse(JSON.stringify(...))` 再算 shapeOf()——JS 里值为 undefined 的键会被
+     stringify 丢掉、NaN/Infinity 会变成 null，参照物描述的是**线上 JSON** 的形状；
+     shapeOf 的叶子分类是 `Number.isInteger(v) && Math.abs(v) < 1e21 ? "integer" : "float"`
+     （对齐 JSON.stringify 的整数/指数形式切换点，见 platform/server/_js.py:json_number）；
+  3. `node <probe>.mjs fixtures.json node-out.json`；
+  4. `base64.b64encode(zlib.compress(json.dumps(json.load(open('node-out.json')),
+     ensure_ascii=False, separators=(',', ':')).encode(), 9))` 得到 _NODE_REFERENCE_B64；
+  5. 复算校验：把第 4 步的结果与内嵌串逐字段比对（审查者在 /tmp/wp6probe/ 留下的
+     probe.mjs/regen.mjs + verify_reference.py 就是这套流程的现成实现）。
 
-参照物里 auditsMaxEntries 是 audit.js `maxEntries` 参数的等价用例（buildAuditChain({...input, maxEntries: n})）。
+参照物有七个分组：summaries / summaryShapes / audits / auditShapes / fields /
+auditsMaxEntries / labels。auditsMaxEntries 是 audit.js `maxEntries` 参数的等价用例
+（buildAuditChain({...input, maxEntries: n})）。
 
-有意差异（Python 比 Node 更保守的三处，已单独用注释与断言钉住，不计入等值比较的 fixture）：
+补遗 B 审查点：F1 `{"s":null}` 判失败、F2 content 取**首个** text part、F3 array index 上界
+4294967294、F6 Number("0b101")/("0o17")/拒绝 "1_000"、F7 整数值返回 int（形状守护分
+integer/float）、F8/F9 String(number)（1e-7 而非 1e-07）与 toFixed 平局、F10 空数组真值、
+F11 缺失 vs 显式 null 的模板、F12 `(b.atMs ?? 0)` 的 null 排序、F13 Object.entries 整数键提前。
+
+有意差异（Python 比 Node 更保守的地方，已单独用注释与断言钉住，不计入等值比较的 fixture）：
   * 环状 value：audit.js 靠 JSON.parse 爆栈 + visited<200 兜底；Python 用幂等已访问集合直接
     有界终止，两者最终都只产出 ticker/status/orderId = null（test_cyclic_value_terminates）。
   * activity 里出现 null 元素：JS `entry.is_error`（broker_trades.js:163）会抛 TypeError，
-    Python 侧 _field() 取不到字段、按「无名查询」计数，不抛错（test_null_activity_entry_is_tolerated）。
+    Python 侧 _js.field() 取不到字段、按「无名查询」计数，不抛错（test_null_activity_entry_is_tolerated）。
+  * orders 数组里出现 null 元素：JS `raw.qty`（broker_trades.js:87）会抛 TypeError，Python
+    侧无 order_id 直接丢弃（test_null_order_element_is_dropped）。
+  * audit 的 activity 里出现非对象元素：**JS 也不抛**（audit.js:108 早退，见 audit_chain.py
+    有意差异 5），两边都过滤掉，差异用例 activity_non_objects 反而证明了这一点。
   * 非数组入参（undefined/null/{}）两边都返回空概要，但 Node 只覆盖 undefined/null；Python 额外
     容忍 dict/字符串/整数（test_non_array_inputs_are_empty）。
+  * `zh` 的 fallback：Python 的 None 同时表示「未传 fallback」与 JS 的 null fallback，
+    服务侧没有传 null fallback 的调用点（labels.py 有意差异 3）。
+  * maxEntries 的 null：Node 显式 null 得空时间线，Python 的 None 按缺省 120 处理
+    （audit_chain.py 有意差异 7，理由是 `payload.get("maxEntries")` 的调用方安全），
+    见 test_max_entries_null_is_the_documented_difference。
 """
 import base64
 import json
@@ -36,6 +62,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "platform"))
+from server import _js  # noqa: E402
 from server import audit_chain as ac  # noqa: E402
 from server import labels as labels_py  # noqa: E402
 from server import summary  # noqa: E402
@@ -222,6 +249,68 @@ def _activity():
                 {"order_id": "t5", "qty": "2", "cum_qty": "0.1", "avg_fill_price": "0.05"},
                 {"order_id": "t6", "qty": "2", "cum_qty": "0.1", "avg_fill_price": "0.15"},
             ]}}, {"id": "n4"})],
+        # F6：Number() 的字面量语义（0b/0o/0x、拒绝下划线、BOM 与 Python 特有空白）
+        "numeric_string_forms": [
+            _entry("sim_trade_history_order_list", {"ret_code": 0, "data": {"orders": [
+                {"order_id": "b1", "symbol": "X", "qty": "0b101", "cum_qty": "0b101",
+                 "price": "0o17", "avg_fill_price": "0o17"},
+                {"order_id": "b2", "symbol": "Y", "qty": "1_000", "cum_qty": "1",
+                 "price": "0x1_0", "avg_fill_price": "2"},
+                {"order_id": "b3", "symbol": "Z", "qty": "1e2", "cum_qty": "0.5e1",
+                 "price": " 12 ", "avg_fill_price": "-0x10"},
+                {"order_id": "b4", "symbol": "W", "qty": "\ufeff12", "cum_qty": "\u001c12",
+                 "price": "01", "avg_fill_price": ".5"},
+            ]}}, {"id": "nf1"})],
+        # F4：cum_qty × avg_fill_price × 100 恰为 0.5 -> Math.round 得 0.01（Python round 得 0）
+        "amount_half_up": [
+            _entry("sim_trade_history_order_list", {"ret_code": 0, "data": {"orders": [
+                {"order_id": "h1", "symbol": "X", "qty": "1", "cum_qty": "1",
+                 "avg_fill_price": "0.005"},
+                {"order_id": "h2", "symbol": "Y", "qty": "1", "cum_qty": "1",
+                 "avg_fill_price": "0.015"},
+                {"order_id": "h3", "symbol": "Z", "qty": "1", "cum_qty": "0.1",
+                 "avg_fill_price": "-0.05"},
+            ]}}, {"id": "hu1"})],
+        # 金额溢出为 Infinity -> JSON.stringify 写 null（Python 不能写出 Infinity 字面量）
+        "non_finite_amount": [
+            _entry("sim_trade_history_order_list", {"ret_code": 0, "data": {"orders": [
+                {"order_id": "o1", "symbol": "X", "qty": "1e308", "cum_qty": "1e308",
+                 "avg_fill_price": "1e308"},
+            ]}}, {"id": "nf2"})],
+        # F1：s 显式为 null（JS `!== undefined` -> String(null)="null" != "ok" -> 失败）
+        "s_null_marker": [
+            _entry("sim_trade_input_order", {"s": None, "d": {"order_id": "sn-1"}}, {"id": "sm1"})],
+        # F2：首个 type=text 的 part 的 text 不是字符串 -> 失败（不得继续往后找）
+        "first_text_part_not_string": [{
+            "id": "fts1", "at": "2026-09-12T10:10:19.517Z", "kind": "broker_response",
+            "tool": "mcp__futu__sim_trade_input_order", "mode": "sim", "is_error": False,
+            "value": {"content": [{"type": "text", "text": None},
+                                  {"type": "text",
+                                   "text": '{"ret_code":0,"data":{"order_id":"nst-1"}}'}]},
+        }],
+        # F8：`ret=${ret_code}` 走 JS String(number)：1.0 是 "1" 不是 "1.0"
+        "ret_code_float": [
+            _entry("sim_trade_input_order", {"ret_code": 1.0, "ret_msg": "boom"},
+                   {"is_error": True, "id": "rc1"})],
+        # F3：array index 上界是 2^32-2（4294967294 仍是整数键，4294967295 不是）
+        "query_numeric_keys": [
+            _entry("1", {"ret_code": 0, "data": {}}, {"id": "qk1"}),
+            _entry("10", {"ret_code": 0, "data": {}}, {"id": "qk2"}),
+            _entry("2", {"ret_code": 0, "data": {}}, {"id": "qk3"}),
+            _entry("abc", {"ret_code": 0, "data": {}}, {"id": "qk4"}),
+            _entry("01", {"ret_code": 0, "data": {}}, {"id": "qk5"}),
+            _entry("4294967294", {"ret_code": 0, "data": {}}, {"id": "qk6"}),
+            _entry("4294967295", {"ret_code": 0, "data": {}}, {"id": "qk7"}),
+        ],
+        # tool 字段的 String() 强转：true -> "true"、[] -> ""、7 -> "7"
+        "tool_name_coercions": [
+            {"id": "tn1", "at": "2026-09-12T10:10:19.517Z", "kind": "event", "mode": "sim",
+             "tool": True, "is_error": False},
+            {"id": "tn2", "at": "2026-09-12T10:10:19.517Z", "kind": "event", "mode": "sim",
+             "tool": [], "is_error": False},
+            {"id": "tn3", "at": "2026-09-12T10:10:19.517Z", "kind": "event", "mode": "sim",
+             "tool": 7, "is_error": False},
+        ],
         "hostile_entries": ["x", [], {"tool": "mcp__futu__sim_trade_cash_info"}],
         "non_dict_elements": ["x", [], 42, True],
         "empty": [],
@@ -292,6 +381,79 @@ def _audits():
             {"id": "u6", "at": "2026-09-10T09:05:00Z", "tool": "mcp__futu__trading_order_place",
              "is_error": True, "value": {}}]}, "trades": {}},
         "empty": {"snapshot": {}, "trades": {}},
+        # F11：trades 行缺 shares/price 键 -> JS 插 "undefined"；显式 null -> "null"
+        "trade_missing_optional_keys": {
+            "snapshot": {"previews": [], "activity": []},
+            "trades": {"trades": [
+                {"date": "2026-09-11", "action": "BUY", "ticker": "600519"},
+                {"date": "2026-09-11", "action": "SELL", "ticker": None, "shares": None,
+                 "price": None, "fee": None, "return": None},
+            ]}},
+        # F9：`(t.return * 100).toFixed(2)` 的平局（0.00125 -> "0.13"）与 ToNumber 强转
+        "to_fixed_tie": {
+            "snapshot": {"previews": [], "activity": []},
+            "trades": {"trades": [
+                {"date": "2026-09-11", "action": "BUY", "ticker": "600519", "shares": 1, "price": 1,
+                 "return": 0.00125},
+                {"date": "2026-09-11", "action": "SELL", "ticker": "600519", "shares": 1, "price": 1,
+                 "return": "0.5"},
+                {"date": "2026-09-11", "action": "BUY", "ticker": "600519", "shares": 1, "price": 1,
+                 "return": "abc"},
+            ]}},
+        # F10：`strategy_label || strategy` 是**真值**判断（[] 为真），`??` 只看 null/undefined；
+        #      同时覆盖 `String(number)`（1e-7 -> "1e-7"）
+        "falsy_strategy_label": {
+            "snapshot": {"previews": [
+                {"id": "f1", "kind": "signal", "at": "2026-09-10T00:00:00Z",
+                 "value": {"ticker": "600519", "signal": "BUY", "price": 1e-7,
+                           "strategy_label": [], "strategy": "ma_cross"}},
+                {"id": "f2", "kind": "signal", "at": "2026-09-11T00:00:00Z",
+                 "value": {"ticker": "00700", "signal": "BUY", "price": 1,
+                           "strategy_label": "", "strategy": "rsi"}},
+                {"id": "f3", "kind": "signal", "at": "2026-09-12T00:00:00Z",
+                 "value": {"ticker": "600519", "signal": "SELL", "price": 1,
+                           "strategy_label": 0, "strategy": "rsi"}}], "activity": []},
+            "trades": {}},
+        # F12：`(b.atMs ?? 0) - (a.atMs ?? 0)`——null 当 0，负数 atMs 排在 null 之后
+        "negative_epoch_and_null_at": {
+            "snapshot": {"previews": [], "activity": [
+                {"id": "null_at", "at": None, "tool": "mcp__futu__sim_trade_input_order",
+                 "is_error": False, "value": {"data": {"order_id": "n1"}}}]},
+            "trades": {"trades": [
+                {"date": "1960-01-01", "action": "BUY", "ticker": "600519", "shares": 1,
+                 "price": 1}]}},
+        # F7：`Date.parse` 的时间值是整数毫秒，亚毫秒按 floor 落到毫秒（含 1970 年前）
+        "sub_millisecond_at": {
+            "snapshot": {"previews": [
+                {"id": "sm", "kind": "signal", "at": "2026-09-10T09:35:00.123456Z",
+                 "value": {"ticker": "600519", "signal": "BUY", "price": 1}}], "activity": []},
+            "trades": {"trades": [
+                {"date": "1960-01-01T00:00:00.0005Z", "action": "BUY", "ticker": "600519",
+                 "shares": 1, "price": 1},
+                {"date": "2026-09-10T09:35:00.1234567Z", "action": "SELL", "ticker": "600519",
+                 "shares": 1, "price": 1}]}},
+        # 有意差异 8：`signal-${index}` 的下标是**过滤后**的位置（audit.js:68-70 先 filter 后 map）
+        "signal_index_after_filter": {
+            "snapshot": {"previews": [
+                {"id": "b1", "kind": "backtest", "at": "2026-09-10T00:00:00Z",
+                 "value": {"ticker": "600519"}},
+                {"kind": "signal", "at": "2026-09-10T01:00:00Z",
+                 "value": {"ticker": "600519", "signal": "BUY", "price": 1}}], "activity": []},
+            "trades": {}},
+        # audit.js:114 `id: a.id`：字段缺失时 JS 是 undefined，JSON.stringify 丢掉整个键
+        "missing_activity_id": {
+            "snapshot": {"previews": [], "activity": [
+                {"at": "2026-09-10T09:00:00Z", "tool": "mcp__futu__sim_trade_input_order",
+                 "is_error": False, "value": {"data": {"order_id": "1"}}}]},
+            "trades": {}},
+        # 有意差异 5：audit 里的非对象元素在 JS 也在 108 行早退，两边都过滤
+        "activity_non_objects": {
+            "snapshot": {"previews": [], "activity": [
+                None, "order", 42, True,
+                {"id": "ok", "at": "2026-09-10T09:00:00Z",
+                 "tool": "mcp__futu__sim_trade_input_order", "is_error": False,
+                 "value": {"data": {"order_id": "1"}}}]},
+            "trades": {}},
         "shared_signal": {"snapshot": {"previews": [
             {"id": "s1", "kind": "signal", "at": "2026-09-10T00:00:00Z",
              "value": {"ticker": "600519", "signal": "BUY", "price": 1}},
@@ -309,8 +471,23 @@ def _audits():
 
 
 def _max_entries_cases():
-    return {"two": {**_audits()["signal_chain"], "maxEntries": 2},
-            "zero": {**_audits()["signal_chain"], "maxEntries": 0}}
+    """maxEntries 的等价用例（JS 的 ToIntegerOrInfinity + slice 端点语义）。
+
+    `maxEntries: null` **不在**这张差分表里：那是 audit_chain.py 有意差异 7（Python 的 None
+    一律按「没传」-> 120，见 test_max_entries_null_is_the_documented_difference）。
+    """
+    base = _audits()["signal_chain"]
+    return {
+        "two": {**base, "maxEntries": 2},
+        "zero": {**base, "maxEntries": 0},            # 与 JS 的 null 同结果，可显式表达
+        "negative": {**base, "maxEntries": -1},       # 去掉最后一条
+        "fractional": {**base, "maxEntries": 2.7},    # ToIntegerOrInfinity -> 2
+        "numeric_string": {**base, "maxEntries": "2"},
+        "boolean_true": {**base, "maxEntries": True},
+        "empty_list": {**base, "maxEntries": []},     # ToNumber([]) -> 0
+        "nan_like_object": {**base, "maxEntries": {}},  # ToNumber({}) -> NaN -> 0
+        "no_key": {k: v for k, v in base.items()},    # 没传 -> 默认 120
+    }
 
 
 def _field_cases():
@@ -327,7 +504,35 @@ def _field_cases():
         "null_value": None,
         "array_value": {"items": [{"id": 7, "state": "OPEN"}]},
         "boolean_id": {"id": True, "code": 42, "status": 5},
+        # F13：Object.entries 的整数样式键提前（先扫键 "2" 的子树 -> ticker 取 BBB）
+        "numeric_string_keys": {"10": {"symbol": "AAA"}, "2": {"symbol": "BBB"}},
+        "mixed_key_order": {"b": {"symbol": "FIRST"}, "2": {"symbol": "SECOND"},
+                            "10": {"symbol": "THIRD"}, "01": {"symbol": "FOURTH"}},
     }
+
+
+def _label_cases():
+    """labels.js:36-46 zh() 的用例：table / value / fallback（hasFallback 区分「没传」）。
+
+    期望值同样是 Node 真实运行结果（参照物的 labels 分组），不是对源码的二次解读——
+    hasOwnProperty 会把 value 强制成对象键，这是 Python 的 `value in dict` 做不到的。
+    """
+    def case(table, value, fallback=None, has_fallback=False):
+        return {"table": table, "value": value, "fallback": fallback,
+                "hasFallback": has_fallback}
+
+    return [
+        case("SIDE", "1"), case("SIDE", 1), case("SIDE", 1.0), case("SIDE", 2),
+        case("SIDE", True), case("SIDE", False), case("SIDE", "true"),
+        case("SIDE", "01"), case("SIDE", "1.0"), case("SIDE", 3), case("SIDE", 2.5),
+        case("SIDE", [1]), case("SIDE", []), case("SIDE", {"a": 1}),
+        case("SIDE", "1", "其他", True),
+        case("ACTION", "BUY"), case("ACTION", "buy"), case("ACTION", "Buy"),
+        case("ACTION", "WHAT"), case("ACTION", "WHAT", "其他", True),
+        case("ACTION", None), case("ACTION", None, "其他", True),
+        case("NO_SUCH_TABLE", "X"),
+        case("SIGNAL", "hold"), case("METRIC", "SHARPE"), case("TRADE_TYPE", "Buy"),
+    ]
 
 
 def _activity_cases_meta():
@@ -352,6 +557,14 @@ def _activity_cases_meta():
         "missing_order_id": "broker_trades.js:93/138-139 无 order_id 丢弃",
         "orders_sorted_desc": "broker_trades.js:181-182 orders 按时间倒序",
         "numeric_coercions": "broker_trades.js:65-68 numeric + 86-110 orderRow 原文语义",
+        "numeric_string_forms": "broker_trades.js:65-68 Number()：0b/0o/0x、拒绝 1_000 下划线、BOM 空白",
+        "amount_half_up": "broker_trades.js:103 Math.round 半数向 +∞（0.005×100 恰为 0.5）",
+        "non_finite_amount": "broker_trades.js:103 金额溢出 -> JSON.stringify 写 null",
+        "s_null_marker": "broker_trades.js:49 `parsed.s !== undefined`：显式 null 判失败",
+        "first_text_part_not_string": "broker_trades.js:36-37 find 首个 text part 后判类型",
+        "ret_code_float": "broker_trades.js:47 `${parsed.ret_code}` 走 String(number)",
+        "query_numeric_keys": "broker_trades.js:189 对象整数样式键提前（2^32-2 上界）",
+        "tool_name_coercions": "broker_trades.js:57 `String(entry?.tool ?? '')`",
         "hostile_entries": "broker_trades.js:119/126-164 非对象行按「无名查询」处理",
         "non_dict_elements": "broker_trades.js:119 rows 里的非对象元素",
         "empty": "broker_trades.js:166-174 空输入零事实",
@@ -368,6 +581,14 @@ def _audit_cases_meta():
         "window_boundary": "audit.js:13/142-152 7 天窗口边界（含与含前）",
         "order_named_unknown": "audit.js:107-112 order 命名但只读后缀被排除",
         "empty": "audit.js:66-73 空输入",
+        "trade_missing_optional_keys": "audit.js:90 缺失 -> undefined 与显式 null 的模板差异",
+        "to_fixed_tie": "audit.js:92 `(t.return * 100).toFixed(2)` 平局与 ToNumber 强转",
+        "falsy_strategy_label": "audit.js:77 `||` 真值 + `??` 空值合并（空数组为真）",
+        "negative_epoch_and_null_at": "audit.js:166 `(b.atMs ?? 0) - (a.atMs ?? 0)` null 当 0",
+        "sub_millisecond_at": "audit.js:18-23 Date.parse 的时间值是整数毫秒（亚毫秒 floor）",
+        "signal_index_after_filter": "audit.js:68-70 filter 后再 map，兜底 id 用过滤后下标",
+        "missing_activity_id": "audit.js:114 `id: a.id` 缺失 -> JSON.stringify 丢键",
+        "activity_non_objects": "audit.js:104-108 非对象元素在 108 行早退（不抛）",
         "shared_signal": "audit.js:141-152 取最近的不晚于它的信号",
     }
 
@@ -375,62 +596,68 @@ def _audit_cases_meta():
 # ---------------------------------------------------------------- Node 参照物
 # 生成方式见文件头。压缩后存入，避免 8 万字符的 JSON 字面量把测试文件淹没。
 _NODE_REFERENCE_B64 = (
-    "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"
+    "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"
+    "tz7/b4Px+OHx2ffng9qa1vX/l/ti9oXg=="
 )
 
 
@@ -439,13 +666,20 @@ def _node_reference():
 
 
 def _leaf_kind(value):
-    """叶子类型描述（与 Node 探针的 shapeOf 对叶子端的取名一致）。"""
+    """叶子类型描述（与 Node 探针的 shapeOf 对叶子端的取名一致）。
+
+    数值分 integer/float 两种：JS 侧按 `Number.isInteger(v) && Math.abs(v) < 1e21` 判定
+    （即 JSON.stringify 是否走整数形式），Python 侧按 int/float 判定。补遗 B F7 要求所有
+    **计算产出**的整数值返回 int，这里就是那道防回归的闸门。
+    """
     if value is None:
         return "null"
     if value is True or value is False:
         return "boolean"
-    if isinstance(value, (int, float)):
-        return "number"
+    if isinstance(value, int):
+        return "integer"
+    if isinstance(value, float):
+        return "float"
     if isinstance(value, str):
         return "string"
     raise AssertionError(f"形状守护遇到意外叶子：{value!r}")
@@ -479,7 +713,7 @@ class NodeParityBase(unittest.TestCase):
 
 class SummaryDifferentialTest(NodeParityBase):
     def test_node_reference_parity(self):
-        """22 组 activity fixture：Python summarize() == Node summarizeBrokerActivity()。"""
+        """每组 activity fixture：Python summarize() == Node summarizeBrokerActivity()。"""
         reference = self.reference["summaries"]
         cases = _activity()
         self.assertEqual(set(cases), set(reference), "fixture 名与参照物不一致（探针未同步）")
@@ -497,11 +731,12 @@ class SummaryDifferentialTest(NodeParityBase):
 
 class AuditDifferentialTest(NodeParityBase):
     def _run(self, name, inputs):
-        return ac.build_audit_chain(inputs["snapshot"], inputs.get("trades"),
-                                    inputs.get("maxEntries"))
+        # 键不存在 == JS 的 undefined（默认 120）；键存在且为 null == JS 的 null（0 条）
+        max_entries = inputs["maxEntries"] if "maxEntries" in inputs else None
+        return ac.build_audit_chain(inputs["snapshot"], inputs.get("trades"), max_entries)
 
     def test_node_reference_parity(self):
-        """9 组 snapshot/trades：Python build_audit_chain() == Node buildAuditChain()。"""
+        """每组 snapshot/trades：Python build_audit_chain() == Node buildAuditChain()。"""
         reference = self.reference["audits"]
         cases = _audits()
         self.assertEqual(set(cases), set(reference), "fixture 名与参照物不一致（探针未同步）")
@@ -516,11 +751,31 @@ class AuditDifferentialTest(NodeParityBase):
                 _assert_keys(self, f"audits.{name}", reference[name], self._run(name, inputs))
 
     def test_max_entries_parameter(self):
-        """audit.js:167 `.slice(0, maxEntries)`：2 条 / 0 条截断与 Node 一致。"""
+        """audit.js:167 `.slice(0, maxEntries)`：截断、null、负数、小数、字符串、布尔与缺省。"""
         reference = self.reference["auditsMaxEntries"]
         for name, inputs in _max_entries_cases().items():
             with self.subTest(case=name):
                 self.assertEqual(self._run(name, inputs), reference[name])
+        cases = _max_entries_cases()
+        lengths = {name: len(self._run(name, inputs)["entries"])
+                   for name, inputs in cases.items()}
+        self.assertEqual(lengths["empty_list"], 0)
+        self.assertEqual(lengths["nan_like_object"], 0)
+        self.assertEqual(lengths["no_key"], 4)          # 缺省 120，四条全留
+        self.assertEqual(lengths["two"], 2)
+        self.assertEqual(lengths["negative"], 3)
+        self.assertEqual(lengths["boolean_true"], 1)
+        self.assertEqual(lengths["fractional"], 2)
+        self.assertEqual(lengths["numeric_string"], 2)
+
+    def test_max_entries_null_is_the_documented_difference(self):
+        """有意差异 7：Node 实测 `maxEntries: null` -> `.slice(0, null)` -> 0 条；
+        Python 的 None 按「没传」-> 120 -> 4 条（理由见 audit_chain.py：`payload.get(...)`
+        在客户端没传字段时也是 None，当 null 用会静默清空时间线）。要 null 语义传 0。
+        """
+        inputs = {**_audits()["signal_chain"], "maxEntries": None}
+        self.assertEqual(len(self._run("explicit_null", inputs)["entries"]), 4)
+        self.assertEqual(len(self._run("zero", {**_audits()["signal_chain"], "maxEntries": 0})["entries"]), 0)
 
     def test_extract_broker_fields(self):
         """audit.js:35-60 extractBrokerFields：前缀/后缀剥除、信封解开、非对象回退。"""
@@ -536,6 +791,23 @@ class AuditDifferentialTest(NodeParityBase):
             with self.subTest(case=name):
                 keys = ac.extract_broker_fields(_field_cases()[name]).keys()
                 self.assertEqual(set(keys), {"ticker", "status", "orderId"})
+
+    def test_label_lookup_parity(self):
+        """labels.js:36-46 zh()：hasOwnProperty 的键强制转换也是差分项。"""
+        reference = self.reference["labels"]
+        cases = _label_cases()
+        self.assertEqual(len(cases), len(reference), "labels fixture 数与参照物不一致")
+        for index, case in enumerate(cases):
+            with self.subTest(case=(case["table"], case["value"], case["fallback"])):
+                result = (labels_py.zh(case["table"], case["value"], case["fallback"])
+                          if case["hasFallback"]
+                          else labels_py.zh(case["table"], case["value"]))
+                expected = reference[index]
+                if expected["has"]:
+                    self.assertEqual(result, expected["value"])
+                else:
+                    # JS 返回 undefined；Python 用 None 表示（没有用例返回 JS null）
+                    self.assertIsNone(result)
 
 
 class SummaryBehaviourTest(unittest.TestCase):
@@ -554,6 +826,10 @@ class SummaryBehaviourTest(unittest.TestCase):
         self.assertEqual(row["fill"], "全部成交")
         self.assertEqual(row["amount"], 93040)         # 200 × 465.2，全部来自券商原文
         self.assertEqual(row["status_code"], 4)        # 状态原码保留，不猜标签
+        # F7：计算产出的整数值必须是 int（JSON.stringify 写 93040 而不是 93040.0）
+        for key in ("qty", "filled_qty", "side_code", "status_code", "amount"):
+            self.assertIsInstance(row[key], int, f"{key} 应为 int")
+        self.assertIsInstance(row["price"], float)   # 465.2 不是整数，保持 float
         self.assertEqual(row["ordered_at"], "2026-01-16T07:54:42.000Z")
         self.assertEqual(row["updated_at"], "2026-01-16T07:59:31.000Z")
 
@@ -578,6 +854,77 @@ class SummaryBehaviourTest(unittest.TestCase):
         self.assertEqual(rows["t4"]["amount"], 4.02)
         self.assertEqual(rows["t5"]["amount"], 0.01)   # Python round() 会得 0.0
         self.assertEqual(rows["t6"]["amount"], 0.02)
+
+    def test_amount_half_up_on_exact_tie(self):
+        """F4 鉴别力：cum_qty×avg_fill_price×100 **恰为** 0.5 时才区分 Math.round 与 round()。
+
+        numeric_coercions 的 t5 是 0.1×0.05×100 = 0.5000000000000001，银行家舍入也进到 1，
+        所以它证明不了 _js_round。这里 h1 是 1×0.005×100 = 0.5（二进制精确），JS 得 0.01、
+        Python round() 得 0.0；h3 是 0.1×(-0.05)×100 = -0.5000000000000001 -> -0.01。
+        """
+        rows = {row["order_id"]: row for row in
+                summary.summarize(_activity()["amount_half_up"])["orders"]}
+        self.assertEqual(rows["h1"]["amount"], 0.01)
+        self.assertEqual(rows["h2"]["amount"], 0.02)
+        self.assertEqual(rows["h3"]["amount"], -0.01)
+
+    def test_non_finite_amount_serializes_as_null(self):
+        """broker_trades.js:103 溢出成 Infinity 时，JSON.stringify 写的是 null（F7）。"""
+        row = summary.summarize(_activity()["non_finite_amount"])["orders"][0]
+        self.assertIsNone(row["amount"])
+        self.assertEqual(row["fill"], "全部成交")
+        self.assertEqual(row["qty"], 1e308)          # 文件透传的大数仍是 float
+        self.assertIsInstance(row["qty"], float)
+
+    def test_ret_code_uses_js_number_string(self):
+        """F8：`ret=${ret_code} ${ret_msg ?? ""}`——JSON 里的 1.0 是 JS 数值 1，文案 "ret=1"."""
+        action = summary.summarize(_activity()["ret_code_float"])["actions"][0]
+        self.assertFalse(action["ok"])
+        self.assertEqual(action["detail"], "ret=1 boom")
+
+    def test_explicit_null_s_marker_fails(self):
+        """F1：broker_trades.js:49 是 `parsed.s !== undefined`，显式 null 也算「存在」."""
+        actions = summary.summarize(_activity()["s_null_marker"])["actions"]
+        self.assertEqual(len(actions), 1)
+        self.assertFalse(actions[0]["ok"])
+        self.assertIsNone(actions[0]["order_id"])
+        self.assertEqual(actions[0]["detail"], "s=null")
+        self.assertEqual(summary.summarize(_activity()["s_null_marker"])["counts"]["errors"], 1)
+
+    def test_content_uses_first_text_part(self):
+        """F2：audit 同款 find 语义——首个 text part 的 text 不是字符串就失败，不继续往后找."""
+        entry = _activity()["first_text_part_not_string"][0]
+        self.assertEqual(summary.business_data(entry), {"ok": False, "reason": "无文本内容"})
+        action = summary.summarize(_activity()["first_text_part_not_string"])["actions"][0]
+        self.assertFalse(action["ok"])
+        self.assertEqual(action["detail"], "无文本内容")
+
+    def test_numeric_follows_js_number_literals(self):
+        """F6：0b101=5、0o17=15、1_000/-0x10/0x1_0 是 NaN、BOM 是空白而 \\x1c 不是。"""
+        rows = {row["order_id"]: row for row in
+                summary.summarize(_activity()["numeric_string_forms"])["orders"]}
+        self.assertEqual((rows["b1"]["qty"], rows["b1"]["filled_qty"], rows["b1"]["price"]), (5, 5, 15))
+        self.assertEqual(rows["b1"]["amount"], 75)
+        self.assertIsNone(rows["b2"]["qty"])          # "1_000" -> NaN（Python float() 会给 1000）
+        self.assertIsNone(rows["b2"]["price"])        # "0x1_0" -> NaN
+        self.assertEqual(rows["b2"]["avg_fill_price"], 2)
+        self.assertEqual((rows["b3"]["qty"], rows["b3"]["filled_qty"]), (100, 5))
+        self.assertIsNone(rows["b3"]["avg_fill_price"])   # "-0x10" -> NaN（不带符号的非十进制）
+        self.assertEqual(rows["b4"]["qty"], 12)           # "\ufeff12"：JS 把 BOM 当空白
+        self.assertIsNone(rows["b4"]["filled_qty"])       # "\x1c12"：JS 不把 \x1c 当空白
+
+    def test_query_tool_order_array_index_upper_bound(self):
+        """F3：array index 是 0 ≤ n < 2^32-1，所以 4294967294 仍提前、4294967295 不提前。"""
+        tools = summary.summarize(_activity()["query_numeric_keys"])["queries"]["tools"]
+        self.assertEqual([row["tool"] for row in tools],
+                         ["1", "2", "10", "4294967294", "abc", "01", "4294967295"])
+
+    def test_tool_name_uses_string_coercion(self):
+        result = summary.summarize(_activity()["tool_name_coercions"])
+        self.assertEqual([row["tool"] for row in result["queries"]["tools"]],
+                         ["7", "true", "unknown"])
+        self.assertEqual(summary.tool_name({"tool": True}), "true")
+        self.assertEqual(summary.tool_name({"tool": []}), "")
 
     def test_dedupe_keeps_last_observation(self):
         result = summary.summarize(_activity()["dedupe_keeps_last"])
@@ -674,11 +1021,21 @@ class SummaryBehaviourTest(unittest.TestCase):
 
     def test_null_activity_entry_is_tolerated(self):
         """有意差异：broker_trades.js:163 对 null 元素 `entry.is_error` 抛 TypeError，
-        Python 侧 _field() 取不到字段 -> 按无名查询计数，服务进程不该因一条脏记录 500。"""
+        Python 侧 _js.field() 取不到字段 -> 按无名查询计数，服务进程不该因一条脏记录 500。"""
         result = summary.summarize([None])
         self.assertEqual(result["queries"], {"count": 1, "tools": [{"tool": "unknown", "count": 1}]})
         self.assertEqual(result["counts"], {"responses": 1, "order_responses": 0, "orders": 0,
                                             "actions": 0, "errors": 0})
+
+    def test_null_order_element_is_dropped(self):
+        """有意差异：broker_trades.js:87 `raw.qty` 对 null 结算行抛 TypeError（没有可选链），
+        Python 侧取不到 order_id 直接丢弃（F5 的同一族注释）。"""
+        activity = [_entry("sim_trade_history_order_list", {"ret_code": 0, "data": {
+            "orders": [None, {"order_id": "ok-1", "symbol": "X", "qty": "1", "cum_qty": "1"}]}},
+            {"id": "no1"})]
+        result = summary.summarize(activity)
+        self.assertEqual([row["order_id"] for row in result["orders"]], ["ok-1"])
+        self.assertEqual(result["counts"]["errors"], 0)
 
     def test_business_data_envelopes(self):
         one = {"value": {"content": [{"type": "text", "text": '{"ret_code":0,"data":{"a":1}}'}]}}
@@ -798,6 +1155,56 @@ class AuditBehaviourTest(unittest.TestCase):
         self.assertIsNone(chain["entries"][0]["ticker"])
         self.assertIsNone(chain["entries"][0]["order_id"])
 
+    def test_trade_detail_distinguishes_missing_from_null(self):
+        """F11：audit.js:90 `${t.shares} @ ${t.price}` 对缺失键插 "undefined"，显式 null 插 "null"."""
+        chain = ac.build_audit_chain(**_audits()["trade_missing_optional_keys"])
+        details = [entry["detail"] for entry in chain["entries"]]
+        self.assertIn("买入 undefined @ undefined", details)
+        self.assertIn("卖出 null @ null", details)
+
+    def test_to_fixed_ties_round_like_js(self):
+        """F9：`(t.return * 100).toFixed(2)`——0.00125 -> "0.13"（Python f-string 会得 "0.12"），
+        并且 `* 100` 是 ToNumber 强转（"0.5" -> 50、"abc" -> NaN -> "NaN"）。"""
+        chain = ac.build_audit_chain(**_audits()["to_fixed_tie"])
+        details = [entry["detail"] for entry in chain["entries"]]
+        self.assertIn("买入 1 @ 1 · 收益 0.13%", details)
+        self.assertIn("卖出 1 @ 1 · 收益 50.00%", details)
+        self.assertIn("买入 1 @ 1 · 收益 NaN%", details)
+
+    def test_falsy_strategy_label_uses_js_truthiness(self):
+        """F10：`strategy_label || strategy` 里 [] 为真，而 `${strategy_label ?? strategy}` 取 [] -> ""."""
+        chain = ac.build_audit_chain(**_audits()["falsy_strategy_label"])
+        details = {entry["id"]: entry["detail"] for entry in chain["entries"]}
+        self.assertEqual(details["f1"], "买入 @ 1e-7 · ")   # [] 为真 -> 拼 " · "，模板给空串
+        self.assertEqual(details["f2"], "买入 @ 1 · ")      # "" || "rsi" -> 真，但 ?? 取 ""
+        self.assertEqual(details["f3"], "卖出 @ 1 · 0")     # 0 || "rsi" -> 真，?? 取 0
+
+    def test_null_at_ms_sorts_as_zero(self):
+        """F12：audit.js:166 `(b.atMs ?? 0) - (a.atMs ?? 0)`——null 当 0，排在负数之后."""
+        chain = ac.build_audit_chain(**_audits()["negative_epoch_and_null_at"])
+        self.assertEqual([entry["id"] for entry in chain["entries"]], ["null_at", "fill-0-1960-01-01"])
+        self.assertEqual(chain["entries"][0]["atMs"], None)
+        self.assertEqual(chain["entries"][1]["atMs"], -315619200000)
+
+    def test_signal_index_counts_filtered_previews(self):
+        """有意差异 8：audit.js:68-70 先 filter 再 map，所以兜底 id 的下标是过滤后的位置."""
+        chain = ac.build_audit_chain(**_audits()["signal_index_after_filter"])
+        self.assertEqual([entry["id"] for entry in chain["entries"] if entry["kind"] == "signal"],
+                         ["signal-0"])
+
+    def test_missing_activity_id_omits_the_key(self):
+        """audit.js:114 `id: a.id` 缺失 -> undefined -> JSON.stringify 丢掉整个键（F11 同族）."""
+        chain = ac.build_audit_chain(**_audits()["missing_activity_id"])
+        self.assertEqual(len(chain["entries"]), 1)
+        self.assertNotIn("id", chain["entries"][0])
+
+    def test_extract_broker_fields_uses_object_entries_order(self):
+        """F13：audit.js:45 Object.entries 把整数样式键提前，决定谁先提供 symbol/id."""
+        found = ac.extract_broker_fields(_field_cases()["numeric_string_keys"])
+        self.assertEqual(found["ticker"], "BBB")   # 键 "2" 先于 "10"
+        mixed = ac.extract_broker_fields(_field_cases()["mixed_key_order"])
+        self.assertEqual(mixed["ticker"], "SECOND")   # "2" -> "10" -> 然后才是 "b"/"01"
+
     def test_extract_broker_fields_returns_fixed_keys(self):
         found = ac.extract_broker_fields({"data": {"code": "HK.00700", "order_id": 42,
                                                    "status": "FILLED"}})
@@ -809,13 +1216,126 @@ class AuditBehaviourTest(unittest.TestCase):
         self.assertEqual(aliases, {"ticker": "000001", "status": "NEW", "orderId": "9"})
 
     def test_time_parsing_is_iso_only(self):
-        """有意差异 2：只认 ISO-8601（Node Date.parse 还认 RFC 2822 等）。"""
-        self.assertEqual(ac._to_ms("2026-09-10"), 1788998400000.0)
-        self.assertEqual(ac._to_ms("2026-09-10T09:35:00Z"), 1789032900000.0)
-        self.assertEqual(ac._to_ms("2026-09-10T09:35:00+08:00"), 1789004100000.0)
+        """有意差异 2：只认 ISO-8601（Node Date.parse 还认 RFC 2822 等）。
+
+        返回值是 int（Date.parse 的毫秒是整数，JSON.stringify 不带小数点，补遗 B F7）。
+        """
+        self.assertEqual(ac._to_ms("2026-09-10"), 1788998400000)
+        self.assertEqual(ac._to_ms("2026-09-10T09:35:00Z"), 1789032900000)
+        self.assertEqual(ac._to_ms("2026-09-10T09:35:00+08:00"), 1789004100000)
+        for stamp in ("2026-09-10", "2026-09-10T09:35:00Z"):
+            self.assertIsInstance(ac._to_ms(stamp), int)
+        # 亚毫秒与 1970 年前的向下取整（Node 实测：.0005 -> 整毫秒、.123456 -> 123）
+        self.assertEqual(ac._to_ms("2026-09-10T09:35:00.123456Z"), 1789032900123)
+        self.assertEqual(ac._to_ms("2026-09-10T09:35:00.1234567Z"), 1789032900123)
+        self.assertEqual(ac._to_ms("1960-01-01T00:00:00.0005Z"), -315619200000)
         for hostile in (None, "", 0, "not-a-date", "2026/09/10", "10 Sep 2026 09:35:00 GMT"):
             with self.subTest(value=hostile):
                 self.assertIsNone(ac._to_ms(hostile))
+
+
+class JsHelperTest(unittest.TestCase):
+    """platform/server/_js.py：三个模块共用的 JS 语义助手。
+
+    期望值全部来自实际运行 Node 的结果（探针见文件头说明），不是对 JS 规范的转述：
+    `String(1e-7)`、`(0.125).toFixed(2)`、`Number("0b101")`、`Object.keys` 的枚举序。
+    """
+
+    def test_js_number_str_matches_js_string(self):
+        cases = {
+            1e-7: "1e-7", 1e-6: "0.000001", 1e-5: "0.00001", 1e-4: "0.0001",
+            0.1 + 0.2: "0.30000000000000004", 100.0: "100", -0.0: "0", 2.5: "2.5",
+            -2.5: "-2.5", 1e20: "100000000000000000000", 1e21: "1e+21",
+            5e-324: "5e-324", 1.7976931348623157e308: "1.7976931348623157e+308",
+            123456789012345680000: "123456789012345680000", 1 / 3: "0.3333333333333333",
+        }
+        for value, expected in cases.items():
+            with self.subTest(value=value):
+                self.assertEqual(_js.js_number_str(value), expected)
+        self.assertEqual(_js.js_number_str(100), "100")          # int 输入不走浮点分支
+        self.assertEqual(_js.js_number_str(float("nan")), "NaN")
+        self.assertEqual(_js.js_number_str(float("inf")), "Infinity")
+        # Python 的 repr() 会写出 "1e-07"（前导零的指数），JS 从不这样写
+        self.assertNotIn("e-0", _js.js_number_str(1e-7))
+
+    def test_fixed_matches_to_fixed(self):
+        cases = [(0.125, "0.13"), (-0.125, "-0.13"), (0.135, "0.14"), (1.005, "1.00"),
+                 (0.00125, "0.00"), (-0.00125, "-0.00"), (-0.001, "-0.00"), (0.0, "0.00"),
+                 (100, "100.00"), (2.5, "2.50"), (1e21, "1e+21"), (1e22, "1e+22"),
+                 (float("nan"), "NaN"), (float("-inf"), "-Infinity")]
+        for value, expected in cases:
+            with self.subTest(value=value):
+                self.assertEqual(_js.fixed(value), expected)
+        # 平局（双精度里恰好是 .5）时 Python 的 f-string 是银行家舍入，必须分叉：
+        # JS "0.13" / f"{0.125:.2f}" 是 "0.12"。0.135 不是平局（实际是 0.13500...0888），两边都是 0.14。
+        self.assertEqual(_js.fixed(0.125), "0.13")
+        self.assertEqual(f"{0.125:.2f}", "0.12")
+
+    def test_numeric_matches_js_number(self):
+        cases = {"0b101": 5, "0B101": 5, "0o17": 15, "0O17": 15, "0x1f": 31, "0X1F": 31,
+                 "1_000": None, "0x1_0": None, "0b_101": None, "0o_17": None,
+                 "-0x10": None, "+0x10": None, "0b2": None, "0o8": None,
+                 " 12 ": 12, "1e2": 100, "0.5e1": 5, "": 0, "  ": 0, ".5": 0.5, "1.": 1,
+                 "+1": 1, "-1.5": -1.5, "inf": None, "Infinity": None, "+Infinity": None,
+                 "-Infinity": None, "nan": None, "\ufeff12": 12, "\u001c12": None,
+                 "1,000": None, "1e": None, "0x": None, "0b": None, "0o": None, "01": 1,
+                 "１２": None, "١٢": None, "1e1000": None}
+        for text, expected in cases.items():
+            with self.subTest(text=text):
+                self.assertEqual(_js.numeric(text), expected)
+        self.assertEqual(_js.numeric(None), 0)         # Number(null) === 0
+        self.assertEqual(_js.numeric(True), 1)         # Number(true) === 1
+        self.assertIsInstance(_js.numeric("200"), int)  # F7：整数值是 int
+        self.assertIsInstance(_js.numeric(1.5), float)
+
+    def test_template_and_stringify(self):
+        self.assertEqual(_js.template(None), "null")
+        self.assertEqual(_js.stringify(None), "")
+        self.assertEqual(_js.template(_js.UNDEFINED), "undefined")
+        self.assertEqual(_js.stringify(_js.UNDEFINED), "")
+        self.assertEqual(_js.template([]), "")                       # String([]) === ""
+        self.assertEqual(_js.template([1, 2]), "1,2")                # String([1,2]) === "1,2"
+        self.assertEqual(_js.template([None]), "")                   # join 把 null 当空串
+        self.assertEqual(_js.template([{}, [1, [2]]]), "[object Object],1,2")
+        self.assertEqual(_js.template({}), "[object Object]")
+        self.assertEqual(_js.template(True), "true")
+        self.assertEqual(_js.template(1e-7), "1e-7")
+        self.assertEqual(_js.js_nullish(0, "x"), 0)                  # ?? 不回退假值
+        self.assertEqual(_js.js_nullish([], "x"), [])
+        self.assertIsNone(_js.js_nullish(None, _js.UNDEFINED))
+
+    def test_truthy_follows_js_not_python(self):
+        """空数组/空对象在 JS 里为真——summary 与 audit_chain 曾各写了一份相反的实现。"""
+        for value in ([], {}, [0], {"a": None}, "x", 1, -1):
+            with self.subTest(value=value):
+                self.assertTrue(_js.truthy(value))
+        for value in (None, False, 0, 0.0, "", float("nan"), _js.UNDEFINED):
+            with self.subTest(value=value):
+                self.assertFalse(_js.truthy(value))
+
+    def test_object_entry_order(self):
+        self.assertEqual(_js.object_entry_order({"10": 1, "2": 2, "abc": 3, "01": 4,
+                                                 "4294967294": 5, "4294967295": 6, "0": 7}),
+                         ["0", "2", "10", "4294967294", "abc", "01", "4294967295"])
+        # 非字符串键按 ToPropertyKey 强转后判定（Python dict 允许 int/bool 键）
+        self.assertEqual(_js.object_entry_order({10: 1, 2: 2, "b": 3}), [2, 10, "b"])
+
+    def test_js_round_is_half_up(self):
+        self.assertEqual(_js.js_round(0.5), 1)      # Python round(0.5) === 0
+        self.assertEqual(_js.js_round(-0.5), 0)     # JS Math.round(-0.5) 是 -0
+        self.assertEqual(_js.js_round(2.5), 3)
+        self.assertEqual(_js.js_round(-2.5), -2)
+        self.assertEqual(_js.js_round(float("inf")), float("inf"))
+
+    def test_json_number_is_json_stringify_typed(self):
+        self.assertEqual(_js.json_number(93040.0), 93040)
+        self.assertIsInstance(_js.json_number(93040.0), int)
+        self.assertEqual(_js.json_number(0.01), 0.01)
+        self.assertEqual(_js.json_number(1e20), 100000000000000000000)
+        self.assertEqual(_js.json_number(1e21), 1e21)      # >= 1e21 时 JS 写指数形式
+        self.assertIsInstance(_js.json_number(1e21), float)
+        self.assertIsNone(_js.json_number(float("inf")))   # JSON.stringify(Infinity) === "null"
+        self.assertIsNone(_js.json_number(float("nan")))
 
 
 class LabelsMirrorTest(unittest.TestCase):
@@ -863,8 +1383,29 @@ class LabelsMirrorTest(unittest.TestCase):
         self.assertIsNone(labels_py.zh("ACTION", None))
         self.assertEqual(labels_py.zh("ACTION", None, "其他"), "其他")
         self.assertEqual(labels_py.zh("NO_SUCH_TABLE", "X"), "X")
-        # 有意差异 1：不可哈希的值不抛 TypeError，按 fallback 处理
+        # 查不到时返回原值本身（JS 里 hasOwnProperty({}, {a:1}) 查的是 "[object Object]"）
         self.assertEqual(labels_py.zh("ACTION", {"a": 1}, "其他"), "其他")
+        self.assertEqual(labels_py.zh("ACTION", {"a": 1}), {"a": 1})
+
+    def test_zh_uses_has_own_property_key_coercion(self):
+        """labels.js:39 `hasOwnProperty(dict, value)` 会把 value 强制成对象键。
+
+        `zh("SIDE", "1")` 命中 SIDE[1]（JS 键 "1"），而 `zh("SIDE", true)` 查的是键 "true"，
+        不命中 -> 返回 true 本身。Python 的 `True in {1: "买入"}` 会因 hash(True)==hash(1)
+        错误命中，这一条就是那道闸门（Node 实测见参照物的 labels 分组）。
+        """
+        self.assertEqual(labels_py.zh("SIDE", "1"), "买入")
+        self.assertEqual(labels_py.zh("SIDE", 1), "买入")
+        self.assertEqual(labels_py.zh("SIDE", 1.0), "买入")
+        self.assertIs(labels_py.zh("SIDE", True), True)       # 不是「买入」
+        self.assertIs(labels_py.zh("SIDE", False), False)
+        self.assertEqual(labels_py.zh("SIDE", "true"), "true")
+        self.assertEqual(labels_py.zh("SIDE", "01"), "01")    # 键不是规范数字串，不回退
+        self.assertEqual(labels_py.zh("SIDE", 3), 3)
+        self.assertEqual(labels_py.zh("SIDE", 2.5), 2.5)
+        self.assertEqual(labels_py.zh("SIDE", [1]), "买入")   # ToPropertyKey([1]) === "1"
+        self.assertEqual(labels_py.zh("SIDE", []), [])        # ToPropertyKey([]) === ""
+        self.assertEqual(labels_py.zh("SIDE", {"a": 1}), {"a": 1})
 
     def test_labeled_prefers_explicit_label(self):
         self.assertEqual(labels_py.labeled("BUY", "人工买入", "ACTION"), "人工买入")
