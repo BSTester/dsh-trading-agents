@@ -54,12 +54,12 @@
 ### 3.1 盘点方法与对等性定义
 
 - 盘点基准（2026-09-15，代码为证）：`plugins/workbench/src/endpoints.js` 20 端点、`client.js` 11 页签、`scripts/workbench_admin.mjs` 5 维护动作、`store.js` snapshot/switchMode。
-- **对等**定义为：面板能做的每一件事，在 MCP 面上存在一个工具，且 HTTP 端点与 MCP 工具在服务进程内**调用同一批处理函数**（同一 `(endpoint, payload) -> {ok, value|error}` envelope）。与 legacy 面板的对等 = 同一数据文件协议、同一批 Python 计算脚本（同参数同解析）、同一指令目录协议；行为对等由 §5.2 审批回归矩阵逐条验证。工具面新增能力 = 维护动作 5 项（原仅 shell 脚本可达）。
+- **对等**定义为：面板能做的每一件事，在 MCP 面上存在一个工具，且 HTTP 端点与 MCP 工具在服务进程内**调用同一批处理函数**（同一 `(endpoint, payload) -> {ok, value|error}` envelope）。与 legacy 面板的对等 = 同一数据文件协议、同一批 Python 计算脚本（同参数同解析）、同一指令目录协议；行为对等由 §5.2 审批回归矩阵逐条验证。工具面新增能力 = 维护动作 5 项（原仅 shell 脚本可达）+ `confirmation` 读工具（2026-09-15 业务确认修订）；**唯一有意排除的端点是 `confirm-decide`**（人工决定通道）。
 - 工具面**白名单之外无任何工具**：无任意执行、无 shell、无文件读写、无 LLM、无 token 读取。tools/list 快照测试锁定总数与名单（§5.2 T6）。
 
-### 3.2 端点 → 工具映射总表（20 个）
+### 3.2 端点 → 工具映射总表（21 个；22 端点中 `confirm-decide` 有意排除）
 
-服务名 `quantwb`；Harness 内呈现为 `mcp__quantwb__<tool>`。`refresh?: boolean` 映射为载荷 `_refresh`（显式旁路 TTL 缓存）；输出为 handler 原样 envelope `{ok, value?, cached?, cached_at?, error?{code,message}}`。TTL 沿用 `CACHE_TTL_MS`（同一缓存实例，分钟级不重复取数）。
+服务名 `quantwb`；Harness 内呈现为 `mcp__quantwb__<tool>`。工具面共 **26 个**（下表 21 个端点工具 + §3.4 的 5 个维护工具）；**`confirm-decide` 有意不进工具面**：它是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发（2026-09-15 业务确认修订，规格 §5.1 A2/A7）。`refresh?: boolean` 映射为载荷 `_refresh`（显式旁路 TTL 缓存）；输出为 handler 原样 envelope `{ok, value?, cached?, cached_at?, error?{code,message}}`。TTL 沿用 `CACHE_TTL_MS`（同一缓存实例，分钟级不重复取数）。
 
 | # | 工具名 | 输入（* 必填） | 输出最小字段 | 错误码 | TTL |
 |---|---|---|---|---|---|
@@ -80,6 +80,7 @@
 | 15 | `instrument` | ticker* | ticker + 标的解析信息 | trading/analytics-unavailable | 10m |
 | 16 | `quality` | ticker* | ticker + 质量报告 | trading/analytics-unavailable | 60m |
 | 17 | `plan` | — | plans, alerts, mode | trading/core-unavailable | 1m |
+| 20b | `confirmation` | — | pending, ttl_ms | —（直读，不缓存） | 0 |
 | 18 | `plan_execute` ⚠ | plan_hash*（action=execute 时）, expected_mode*, confirmation?, action(execute/cancel/kill/unkill) | {queued: true, nonce, action} | trading/invalid-operation | 0（不缓存） |
 | 19 | `schedule` | — | heartbeat, jobs | trading/core-unavailable | 30s |
 | 20 | `reconcile` | — | diffs, tca | trading/core-unavailable | 5m |
@@ -231,13 +232,13 @@ platform/web/
 | 链 | 内容 | 现状锚点 |
 |---|---|---|
 | A1 | 账户模式互斥：sim 模式拒 `account_*`/`trading_*`；live 模式拒 `sim_trade_*` | `policy.js` guard |
-| A2 | live 写操作原生审批：`trading_*` 在 pre-execute 强制 `{kind:"ask"}`；`sim_trade_*` 永不 ask | `policy.js` pre-execute |
+| A2 | live 写操作**业务确认**（2026-09-15 修订）：`trading_*` 在 pre-execute 由插件自己发起 `store.requestConfirmation`，等人从工作台作答，**永不返回 `{kind:"ask"}`**；`sim_trade_*` 永不确认。原设计的 `ask` 在 full-access（`policy="never"`）下会被 `approval.decide()` 直接 rejected，表现为「用户拒绝了」而实际没人被问过 | `policy.js` pre-execute + `store.requestConfirmation` / `confirm-decide` 端点；**服务侧须移植同语义**（`requestConfirmation`/`confirmationView`/`decideConfirmation` + `confirmation`/`confirm-decide` 路由） |
 | A3 | 模式切换双保险：live 需口令「确认实盘」+ `expected_mode` 一致 + 无在途租约；切换不授权下单；**MCP 通道 switch_mode 只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝**（模型自填口令被通道规则封死） | `store.switchMode` + manifest 通道规则 |
 | A4 | 计划执行窄门：live 需口令「确认执行」+ `plan_hash` + `expected_mode` 复核；成功仅 `queued`；daemon 侧 kill 文件 + 风控 8 规则兜底 | rpc plan-execute 分支 + commands + risk |
 | A5 | `quant_switch` 只能切 sim；模型不能代替用户确认实盘 | engine tools |
 | A6 | 在途租约：`enterBrokerCall` 期间拒绝模式切换 | store 租约 |
-| A7 | 工具面白名单封闭：MCP 25 工具无 shell/exec/token 类；HTTP 20 端点白名单外 404 语义（Unknown operation） | manifest 锁定测试 |
-| A8 | 前端无下单面：AntD Web 仅可调 `/api/wb/*` 20 端点，无券商直连代码 | 静态检查 + 代码评审 |
+| A7 | 工具面白名单封闭：MCP **26 工具**（20 端点 + `confirmation` 读工具 + 5 维护）无 shell/exec/token 类；**`confirm-decide` 不进 MCP 工具面**（人工决定通道，防模型自批实盘单）；HTTP **22 端点**白名单外 404 语义 | manifest 锁定测试 + Python R5 |
+| A8 | 前端无下单面：AntD Web 仅可调 `/api/wb/*` 22 端点（含 `confirmation`/`confirm-decide`，后者仅由用户点击触发），无券商直连代码 | 静态检查 + 代码评审 |
 
 WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 FastAPI 进程内**必须调用同一批处理函数**（HTTP 路由与 MCP 工具是同一函数的两个薄壳），使 A3/A4 在新入口上零新增逻辑——这是回归方案的核心架构手段。注意：A3/A4 的服务端处理函数是 **Python 移植版**（与 Node Host 的 `store.switchMode`/plan-execute 分支行为逐条等价），其等价性由 R3/R4 的 Python 回归逐断言钉死。
 
@@ -248,12 +249,13 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 | 用例 | 断言 |
 |---|---|
 | R1 | sim 下 guard 拒 `mcp__futu__account_positions`（消息含「账户模式」）；live 下拒 `sim_trade_*`（经 `installTradingPolicy` 假 ctx 驱动） |
-| R2 | live 下 `trading_*` pre-execute 返回 `ask` 且 reason 含「真实账户操作」；`sim_trade_*` 放行不 ask |
+| R2 | live 下 `trading_*` pre-execute **不返回 `ask`**，而是产生一笔待确认；工作台批准 → `allow`，拒绝/超时 → `deny`；`sim_trade_*` 放行且不产生待确认 |
 
 **Python 层**（全部离线，临时 DSH_HOME）——服务面回归（R3–R6 对 FastAPI 处理函数 / TestClient 重写）+ 既有 P 系列：
 
 | 用例 | 断言（文件：`tests/test_wp6_service_approval.py`） |
 |---|---|
+| R2′ | 服务侧业务确认：HTTP `confirmation` 读待确认项（含 ttl）；`confirm-decide` 批准/拒绝改变 `confirmationView()`；**MCP 工具面不含 `confirm_decide`**（模型无法自批实盘单，R5 断言） |
 | R3 | 服务层 `switch_mode`：无口令 live 拒绝；错口令拒绝；对口令成功且 `order_authorized:false`；`expected_mode` 过期拒绝；租约期间拒绝；**MCP 工具 `switch_mode` 对 mode:"live" 无论口令一律拒绝（trading/live-switch-web-only）** |
 | R4 | 服务层 `plan_execute`：live 无口令拒绝；带口令 → `{queued:true,nonce}`；指令文件落盘含 `plan_hash/expected_mode` 且**不含口令字段**；action 四映射到白名单指令；白名单外 action 拒绝 |
 | R5 | 工具面封闭：FastMCP tools/list 恰 25；端点工具集 ≡ ENDPOINTS（从 endpoints.js 文本提取）；无黑名单名（exec/shell/file/token/write_file） |

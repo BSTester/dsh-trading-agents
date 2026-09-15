@@ -30,6 +30,10 @@ export const ENDPOINTS = [
   "plan-execute",
   "schedule",
   "reconcile",
+  // 实盘业务确认：读待确认项 / 提交用户的决定。两者都不进缓存——
+  // 缓存住"待确认"会让界面显示一个已经处理掉的请求。
+  "confirmation",
+  "confirm-decide",
 ];
 
 /**
@@ -55,6 +59,7 @@ export const ENDPOINT_SHAPE = {
   quality: ["ticker"],
   // WP4：plan-execute 是动作端点（排队即返回），不进缓存形状表
   plan: ["plans", "alerts"],
+  confirmation: ["pending"],
   schedule: ["heartbeat", "jobs"],
   reconcile: ["diffs", "tca"],
 };

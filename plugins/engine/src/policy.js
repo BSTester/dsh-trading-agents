@@ -17,12 +17,36 @@ export function installTradingPolicy(ctx) {
   });
   ctx.on("tools/pre-execute", async (exec, next) => {
     const decision = await next();
-    if (decision.kind === "deny") return decision;
+    // 先尊重下游守卫：别人 deny/ask 的结论不归我们改
+    if (decision.kind !== "allow") return decision;
     const account = accountTool(exec.name);
-    if (account?.write) {
-      return { kind: "ask", reason: `真实账户操作，必须在 Harness 确认完整参数（模式切换不是下单授权）：\n${exec.name}\n${JSON.stringify(exec.arguments)}` };
-    }
-    return decision;
+    if (!account?.write) return decision;
+
+    // 实盘写操作 → **本插件自己的业务确认**，不经过 DSH 的 approval 系统。
+    //
+    // 为什么不返回 {kind:"ask"}：权限确认回答的是"这个动作准不准做"，由会话的
+    // approval policy 裁决，而 full-access（policy="never"）下
+    // `approval.decide()` 会直接 rejected —— 连问都不问，表现为
+    // `the user rejected tool ...`，看起来像用户拒绝，实际没人被问过。
+    // "这笔业务参数对不对"是交易动作的固有环节（像转账要输密码），
+    // 不该因为系统设成免打扰就静默失败。
+    //
+    // 确认由工作台界面作答（requestConfirmation 等人点按钮），此处据结果
+    // 返回 allow/deny，权限系统全程无从介入。
+    const outcome = await store.requestConfirmation({
+      tool: exec.name,
+      mode: account.mode,
+      args: exec.arguments,
+      session_id: String(exec.agent?.session?.id ?? "unknown"),
+      signal: exec.signal,
+    });
+    if (outcome.decision === "approved") return decision;
+    return {
+      kind: "deny",
+      reason: `实盘操作未获确认（${outcome.reason}）。`
+        + `这不是权限问题，而是必须由用户在工作台逐笔确认订单参数；`
+        + `请把订单摘要交给用户，等其在「交易工作台」确认后重试：${exec.name}`,
+    };
   });
   ctx.on("tools/execute", async (exec, next) => {
     const account = accountTool(exec.name);

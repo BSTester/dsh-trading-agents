@@ -724,3 +724,61 @@ test("每条预览先给中文结论，原始 JSON 只作可核对证据", async
   assert.match(text, /labeled\(v\.signal, v\.signal_label, "SIGNAL"\)/, "信号未走中文标签");
   assert.match(text, /v\.execution_source_label \?\? zh\("EXECUTION_SOURCE"/, "口径未走中文标签");
 });
+
+// ================= 实盘业务确认弹窗 =================
+
+test("确认弹窗必须在抽屉关闭时也能弹出", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  // 挂在 Dashboard 顶层（与 FAB 同级），而不是抽屉内部：
+  // 抽屉关着时如果弹不出来，请求只能等到超时被拒。
+  assert.match(source, /h\(ConfirmGate, \{ rpc \}\)/, "ConfirmGate 未挂载");
+  const dashboard = source.slice(source.indexOf("function Dashboard({ rpc })"));
+  const gateIndex = dashboard.indexOf("h(ConfirmGate");
+  const drawerIndex = dashboard.indexOf('className: `tw-drawer');
+  assert.ok(gateIndex > 0 && gateIndex < drawerIndex,
+    "ConfirmGate 必须在抽屉容器之前渲染，不能依赖抽屉打开状态");
+});
+
+test("确认弹窗是只读的：没有输入框，只有确认/拒绝两个按钮", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function ConfirmGate("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.doesNotMatch(text, /h\("input"/, "确认弹窗不得有输入框——工作台仍应是无下单入口的面板");
+  assert.doesNotMatch(text, /setState|setPrice|setQty/, "确认弹窗不得能改订单参数");
+  // 只有两个动作按钮
+  const buttons = [...text.matchAll(/h\("button"/g)].length;
+  assert.equal(buttons, 2, `确认弹窗应恰有确认/拒绝两个按钮，实际 ${buttons} 个`);
+  assert.match(text, /decide\("rejected"\)/);
+  assert.match(text, /decide\("approved"\)/);
+  // 只提交编号与结论，没有任何下单参数
+  assert.match(text, /request\(rpc, "confirm-decide", \{ id: pending\.id, decision \}/,
+    "作答只应携带编号与结论");
+});
+
+test("确认弹窗轮询比 snapshot 快，否则用户以为没反应", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const snapshot = Number(source.match(/SNAPSHOT_POLL_MS = ([\d_]+)/)[1].replace(/_/g, ""));
+  const confirm = Number(source.match(/CONFIRM_POLL_MS = ([\d_]+)/)[1].replace(/_/g, ""));
+  assert.ok(confirm < snapshot / 10, `确认轮询 ${confirm}ms 应远快于 snapshot ${snapshot}ms`);
+  assert.match(source, /request\(rpc, "confirmation", \{\}/, "未轮询 confirmation 端点");
+});
+
+test("确认弹窗显示超时倒计时，并说明超时按拒绝处理", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function ConfirmGate("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /秒后自动拒绝/, "缺少倒计时");
+  assert.match(text, /已超时，按拒绝处理/, "缺少超时说明");
+  assert.match(text, /expires_at/, "未使用服务端给的到期时间");
+});
+
+test("确认弹窗明确声明它不改价、不代下单", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const body = source.slice(source.indexOf("function ConfirmGate("));
+  const end = body.indexOf("\n    function ", 10);
+  const text = end === -1 ? body : body.slice(0, end);
+  assert.match(text, /不会改价、改量或代下单/, "缺少能力边界声明");
+  assert.match(text, /切换账户模式不等于授权下单/, "缺少授权边界声明");
+});
