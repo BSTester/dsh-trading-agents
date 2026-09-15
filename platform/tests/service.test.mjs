@@ -53,7 +53,7 @@ test("token 配置后 API 需要 Bearer；healthz 豁免", async (t) => {
   assert.equal((await fetch(`${url}/healthz`)).status, 200);
 });
 
-test("静态托管：dist 文件可取，SPA 兜底 index.html，未构建回退 404 不崩", async (t) => {
+test("静态托管：dist 文件可取，SPA 兜底 index.html", async (t) => {
   const home = await mkdtemp(path.join(os.tmpdir(), "wp6-dist-"));
   const dist = path.join(home, "dist");
   await mkdir(path.join(dist, "assets"), { recursive: true });
@@ -71,4 +71,13 @@ test("静态托管：dist 文件可取，SPA 兜底 index.html，未构建回退
   const noDist = await fetch(`${url}/healthz`);
   assert.equal(noDist.status, 200);
   await rm(home, { recursive: true, force: true });
+});
+
+test("未构建 dist：静态请求 404 envelope（trading/not-found），服务不崩", async (t) => {
+  const { url } = await withServer(t);
+  const missing = await fetch(`${url}/some/route`);
+  assert.equal(missing.status, 404);
+  const body = await missing.json();
+  assert.equal(body.error.code, "trading/not-found");
+  assert.equal((await fetch(`${url}/healthz`)).status, 200);
 });

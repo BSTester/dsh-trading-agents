@@ -16,7 +16,7 @@ const MIME = {
 function serveStatic(res, dist, urlPath, fallback = true) {
   const relative = decodeURIComponent(urlPath === "/" ? "/index.html" : urlPath);
   const target = path.normalize(path.join(dist, relative));
-  if (!target.startsWith(dist)) {
+  if (target !== dist && !target.startsWith(dist + path.sep)) {
     return sendJson(res, 403, { ok: false, error: { code: "trading/forbidden", message: "路径非法", details: {} } });
   }
   if (!existsSync(target) || statSync(target).isDirectory()) {
