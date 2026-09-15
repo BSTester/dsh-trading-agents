@@ -5,6 +5,7 @@
 > 全局约定（UI 文案规范 2.1 / 依赖锁定协议 2.2 / 工程约定 2.3）见 `2026-09-14-platform-plan-index.md`，本规格同等受其约束。
 > 实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（本规格 §六 验收标准为其验收门；计划末尾「补遗」为架构变更后的任务重排）。
 > **修订（2026-09-15，用户第二次决策）**：服务后端改为 **FastAPI（Python）单进程**——HTTP API、MCP、静态前端同进程启动，不单独配前端服务。原 Node 服务方案（§二 图、§3.1 对等机制、§3.6 传输实现、§3.7 Node SDK 选型）退役，相关小节已同步修订。
+> **修订（2026-09-16，并入 main 业务确认模型）**：main `624ccd0` 把实盘写操作从「Harness 原生审批」改为**插件自己发起的业务确认**（用户在 Harness 内 legacy 工作台面板作答，不再返回 `{kind:"ask"}`）；本分支经合并提交 `29912b4` 并入该语义，服务侧移植见提交 `228ea90`——工具面 25 → **26 个**、端点 20 → **22 个**（其中 `confirm-decide` 有意不进工具面）。§1.1 / §3 / §4.5 / §5.1 A2 / §5.3 / §六 / §八 已按此口径修订。
 
 ## 一、目标与非目标
 
@@ -110,7 +111,7 @@
 | 调度 | ScheduleTab | schedule, reconcile, plan_execute(kill/unkill) | 心跳状态点（>5 分钟标红）、作业表、告警列表、kill 开关 |
 | 审计 | AuditView + AuditChainCard + SourcesCard | audit, sources, reconcile | 三级链路展开、原始响应核对区 |
 
-结论：每个页签的全部数据均可由 §3.2 的 20 个工具组合取得——**MCP 面能完整重建面板**，对等性成立。
+结论：每个页签的全部数据均可由 §3.2 的 21 个端点工具组合取得——**MCP 面能完整重建面板**，对等性成立。
 
 ### 3.4 维护工具（5 个，来自 `workbench_admin.mjs` 能力提升）
 
@@ -208,7 +209,12 @@ platform/web/
 1. 模式切换：sim→live 必须输入「确认实盘」；`expected_mode` 随请求；成功后显示 `order_authorized: false`；
 2. 计划执行：frozen 状态才可执行；live 必须输入「确认执行」；提交后仅显示「已提交，等待 daemon 回写状态…」并轮询 `plan`；
 3. kill 开关：激活/解除均走 `plan_execute` 的 kill/unkill 动作；解除文案注明「人工确认后解除」；
-4. 全站页头常驻 SIM/LIVE 徽章 + 一行免责声明。
+4. 全站页头常驻 SIM/LIVE 徽章 + 一行免责声明；
+5. **业务确认（live 写操作）本期不在独立 Web 实现界面**：确认是**进程内存态**（§5.1 末段、§八-8），
+   Harness 会话发起的待确认在服务进程里读不到（`pending` 诚实地为 `null`），服务进程自身当前
+   也没有实盘写路径去发起确认——建一个长期空白的确认界面会让人误以为「无需确认」。因此过渡期
+   的实盘写确认**仍在 Harness 内 legacy 工作台面板作答**；将来若把请求/裁决落到共享文件以支持
+   跨进程，该界面必须同时标注这条可见性限制（§5.1「页面责任」）。
 
 ### 4.6 构建与托管（单进程）
 
@@ -232,12 +238,12 @@ platform/web/
 | 链 | 内容 | 现状锚点 |
 |---|---|---|
 | A1 | 账户模式互斥：sim 模式拒 `account_*`/`trading_*`；live 模式拒 `sim_trade_*` | `policy.js` guard |
-| A2 | live 写操作**业务确认**（2026-09-15 修订）：`trading_*` 在 pre-execute 由插件自己发起 `store.requestConfirmation`，等人从工作台作答，**永不返回 `{kind:"ask"}`**；`sim_trade_*` 永不确认。原设计的 `ask` 在 full-access（`policy="never"`）下会被 `approval.decide()` 直接 rejected，表现为「用户拒绝了」而实际没人被问过 | `policy.js` pre-execute + `store.requestConfirmation` / `confirm-decide` 端点；**服务侧须移植同语义**（`requestConfirmation`/`confirmationView`/`decideConfirmation` + `confirmation`/`confirm-decide` 路由） |
+| A2 | live 写操作**业务确认**（2026-09-15 修订）：`trading_*` 在 pre-execute 由插件自己发起 `store.requestConfirmation`，等人从工作台作答，**永不返回 `{kind:"ask"}`**；`sim_trade_*` 永不确认。原设计的 `ask` 在 full-access（`policy="never"`）下会被 `approval.decide()` 直接 rejected，表现为「用户拒绝了」而实际没人被问过 | `policy.js` pre-execute + `store.requestConfirmation` / `confirm-decide` 端点；**服务侧已移植同语义**（`store_access.request_confirmation`/`confirmation_view`/`decide_confirmation` + `confirmation`/`confirm-decide` 两条路由，提交 `228ea90`） |
 | A3 | 模式切换双保险：live 需口令「确认实盘」+ `expected_mode` 一致 + 无在途租约；切换不授权下单；**MCP 通道 switch_mode 只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝**（模型自填口令被通道规则封死） | `store.switchMode` + manifest 通道规则 |
 | A4 | 计划执行窄门：live 需口令「确认执行」+ `plan_hash` + `expected_mode` 复核；成功仅 `queued`；daemon 侧 kill 文件 + 风控 8 规则兜底 | rpc plan-execute 分支 + commands + risk |
 | A5 | `quant_switch` 只能切 sim；模型不能代替用户确认实盘 | engine tools |
 | A6 | 在途租约：`enterBrokerCall` 期间拒绝模式切换 | store 租约 |
-| A7 | 工具面白名单封闭：MCP **26 工具**（20 端点 + `confirmation` 读工具 + 5 维护）无 shell/exec/token 类；**`confirm-decide` 不进 MCP 工具面**（人工决定通道，防模型自批实盘单）；HTTP **22 端点**白名单外 404 语义 | manifest 锁定测试 + Python R5 |
+| A7 | 工具面白名单封闭：MCP **26 工具**（22 端点中 **21 个端点工具** + 5 维护动作，`confirm-decide` 有意排除）无 shell/exec/token 类；**`confirm-decide` 不进 MCP 工具面**（人工决定通道，防模型自批实盘单）；HTTP **22 端点**白名单外 404 语义 | manifest 锁定测试 + Python R5 |
 | A8 | 前端无下单面：AntD Web 仅可调 `/api/wb/*` 22 端点（含 `confirmation`/`confirm-decide`，后者仅由用户点击触发），无券商直连代码 | 静态检查 + 代码评审 |
 
 WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 FastAPI 进程内**必须调用同一批处理函数**（HTTP 路由与 MCP 工具是同一函数的两个薄壳），使 A3/A4 在新入口上零新增逻辑——这是回归方案的核心架构手段。注意：A3/A4 的服务端处理函数是 **Python 移植版**（与 Node Host 的 `store.switchMode`/plan-execute 分支行为逐条等价），其等价性由 R3/R4 的 Python 回归逐断言钉死。
@@ -288,6 +294,11 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 4. live 下对话请求一个 `mcp__futu__trading_*` 写工具 → **不再出现 Harness 原生审批卡**，而是由插件发起业务确认：Harness 内工作台面板出现待确认（中文订单摘要），批准/拒绝各演练一次（批准 → 放行，拒绝/超时 → deny）；同一笔在独立 Web 的 `confirmation` 端点上**看不到**（跨进程内存态，见 §5.1 末段）；
 5. 独立 Web 计划页 live 执行：无口令拒；带口令 → queued；`scripts/drills.sh` kill 演练联动拒单。
 
+> **第 4 步的跨进程前提（执行者必读）**：独立 Web 的 `confirmation`/`confirm-decide` 只在
+> **其自身进程内**有效。Harness 会话里 `trading_*` 写操作触发的待确认，在独立 Web 上**读不到**
+> （`pending` 诚实地为 `null`，不是「无需确认」），该笔只能在 Harness 内 legacy 工作台面板作答；
+> 服务进程自身也没有实盘写路径去发起确认。详见 §4.5:5、§5.1 末段与 §八-8。
+
 ### 5.4 preset 行替换明细（6c）
 
 | 文件 | 变更 |
@@ -307,7 +318,7 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 1. 全量离线套件全绿：`~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'`；`node --test tests/*.test.mjs`（R3–R6 服务面回归已迁移 Python；`platform/tests/*.test.mjs` 已随 Node 服务层退役）；
 2. §5.2 矩阵 R1–R6 / P1–P3 / S1–S4 逐条对应提交留档；
 3. 独立 Web 11 页签在真实数据（或如实降级态）下可用；文案规范 grep 自查 0 命中；
-4. MCP tools/list = 25 且无黑名单工具（对等性与封闭性双断言）；
+4. MCP tools/list = 26 且无黑名单工具（对等性与封闭性双断言）；
 5. 人工会话回归清单 5 步留痕；
 6. 文档修订（§七）与实现一致（抽查每个文档提到的路径/端点存在）；
 7. live 准入仍按 P4 清单，人工评估项保持未勾选。
@@ -332,3 +343,4 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 5. **K 线/热力图移植失真**：几何纯函数带测试移植，视觉回归靠人工清单比对。
 6. **本规格不改台账/审计保留口径**：各列表仍最近 100 项，完整审计仍在 Harness 会话。
 7. **store 双实现并存（FastAPI 架构的固有代价）**：Harness 进程内的 Node Host（观察记录合并、面板写路径）与服务进程内的 Python 访问层（快照读、switch-mode、管理动作）操作同一份 `trading-workbench.json`，依赖既有原子写 + 独占锁协议互斥。诚实边界：Python 侧快照读**不合并** pending observations（留给 Host 完成），合并前的观察不计入快照；`trade_summary`/`audit` 链为 Python 移植版，其与 Node 原实现的等价性由移植测试（差分用例）钉死。双实现漂移是长期风险，legacy 面板移除后 Node 侧写路径只剩观察记录，届时收敛为单一实现。
+8. **业务确认的跨进程边界（诚实清单，2026-09-15 业务确认修订）**：实盘写操作的确认是**进程内存态**（`store.js` 刻意不落盘，进程重启后无人回答；持久化的只有 `activity` 事件留痕），Harness 进程与 FastAPI 服务进程**各持一份待确认表、互不可见**：Harness 会话发起的待确认，独立 Web 的 `confirmation` 端点读不到（`pending` 诚实地为 `null`，不是「无需确认」）；服务进程自身当前也**没有实盘写路径**去发起确认，因此两侧不会互相作答。过渡期口径：实盘写确认**由 Harness 内 legacy 工作台面板作答**，独立 Web 本期**不实现确认界面**（空白界面会误导，§4.5:5）。将来若要跨进程，需把请求/裁决落到共享文件（复用现有原子写 + 租约协议），且**必须同时改 Node 侧**；届时任何展示待确认列表的界面都必须标注这条可见性限制（§5.1「页面责任」）。

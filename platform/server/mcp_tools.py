@@ -387,7 +387,7 @@ TOOLS = (
         "reconcile", "对账快照：最近差异、TCA 摘要、告警列表。", "reconcile", (REFRESH,),
     ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----
-    # 不经 RPC handler，直调 store_access 的 admin_*（与 20 端点同库同锁）；Node 侧对应
+    # 不经 RPC handler，直调 store_access 的 admin_*（与 22 端点同库同锁）；Node 侧对应
     # WorkbenchStore 的 cancelRun/cancelStaleRuns/pruneAbandonedRuns。
     ToolDefinition(
         "admin_status", "工作台数据维护：数据文件路径与各类记录数量。", None, (),

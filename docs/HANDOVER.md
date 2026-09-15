@@ -26,10 +26,10 @@
 | 研究引擎 | 不再私建无取数能力的 LLM 循环；`run_trading_analysis` 启动记录，Harness 完成研究，`research_publish` 发布 |
 | 发布约束 | 校验 run、会话、标的、当前模式、五档评级、报告与带时间的来源；不猜测评级 |
 | 工作台 Host | 根级 `tradingWorkbench` 服务，持久报告/预览/响应；认证后的 Harness Connection RPC |
-| 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，20 端点）+ `/mcp`（streamable-http，25 工具）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
+| 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，22 端点）+ `/mcp`（streamable-http，26 工具；`confirm-decide` 有意不进工具面）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
 | 工作台 Client | 正确的 Host/Client 双入口、宿主 React module factory；结果卡片与面板，不需重建 Harness Web |
 | 交易动态 | 观察原生账户工具最终响应；打开面板时每 3 秒刷新快照；不伪装券商成交推送 |
-| 模式切换 | 用户在面板明确确认 live，携带预期旧模式；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |
+| 模式切换 | 用户在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）明确确认 live，携带预期旧模式；legacy 面板过渡期保留同款口令流程；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |
 | 执行策略 | 账户工具按 sim/live 拒绝不匹配调用；真实写工具经**工作台业务确认**（独立于权限审批，任何档位下都必须确认）；不允许模型走其他通道绕过 |
 | 量化 | 修正风险/成本/成交时序；本地模拟与券商数据分离，失败不能回退为零价格或虚构资产 |
 | 安装 | Bash/PowerShell 共用插件安装流程，包路径、失败退出、幂等启用与更新行为可重复核对 |
@@ -80,7 +80,7 @@ Python 用标准库 unittest，行情与账户使用隔离样本/临时目录，
 PowerShell 安装器，也未启动完整 Harness Web。后续券商模拟订单实测见下节。
 
 本地合约成立不等于完整部署验收。仍需在目标 Harness 版本、实际操作系统和新会话中
-确认 preset 发现、插件加载、原生审批、客户端加载及真实数据接口行为。
+确认 preset 发现、插件加载、工作台业务确认（legacy 面板作答）、客户端加载及真实数据接口行为。
 
 ### 2026-09-12：富途模拟账户实测
 
@@ -194,6 +194,14 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   `<DSH_HOME>/trading-workbench.json`、模式文件 `trading-account-mode` 与指令目录
   `trading-commands/`；写路径靠既有**原子写 + 独占锁**互斥，两处同时切换模式的竞态由
   `expected_mode` 复核兜底（后到者拒绝）。排查数据不一致时先确认没有两个进程同时在写。
+- **实盘写确认 = 工作台业务确认（2026-09-15 main 修订）**：live 的 `trading_*` 写操作由插件
+  在 pre-execute 自己发起确认，用户在 **Harness 内 legacy 工作台面板**作答（**不再走 Harness
+  原生审批**，`policy.js` 永不返回 `{kind:"ask"}`；`sim_trade_*` 永不确认）。确认是**进程内存态**
+  （刻意不落盘），**跨进程不可见**：Harness 会话发起的待确认，独立 Web 的 `confirmation` 端点
+  读到的是 `pending: null`——那是「读不到」，不是「无需确认」；服务进程自身也没有实盘写路径
+  去发起确认。**独立 Web 暂无确认界面**（有意不做，长期空白界面会误导），过渡期一律回 Harness
+  面板作答；将来若要跨进程，需把请求/裁决落到共享文件且**同时改 Node 侧**
+  （见 `docs/architecture.md` 的「业务确认的跨进程边界」与规格 §4.5:5、§八-8）。
 - **Python 侧快照的诚实边界（WP6）**：服务进程的 store 访问层只读
   `trading-workbench.json`，**不合并** pending observations（合并仍由 Harness Host 完成），
   因此合并前的账户响应不会出现在独立 Web 快照里；`trade_summary`/`audit` 链是 Node

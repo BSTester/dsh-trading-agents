@@ -23,7 +23,7 @@
 ## 平台服务（FastAPI 单进程，WP6）
 
 工作台独立服务：**一个进程**承载 HTTP API（`POST /api/wb/<endpoint>`）、MCP
-（`/mcp`，streamable-http，25 工具，Harness 侧工具名 `mcp__quantwb__*`）与前端静态托管
+（`/mcp`，streamable-http，26 工具，Harness 侧工具名 `mcp__quantwb__*`）与前端静态托管
 （`platform/web/dist`）。默认 `127.0.0.1:8397`，loopback 绑定，可选静态 token。
 
 ### 依赖安装（一次性，需联网）

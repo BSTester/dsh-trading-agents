@@ -167,11 +167,20 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 
 要让 Harness 会话直接调用工作台能力，把 `agent.cordis.yml` 里 `quant-platform-mcp` 行的
 `disabled: true` 改成 `false`，然后**新建会话**（已挂载的会话不会重新读取组合）：会话内
-出现 `mcp__quantwb__*` 共 25 个工具，与 Web 同源（HTTP 与 MCP 调用同一批处理函数）。
+出现 `mcp__quantwb__*` 共 26 个工具，与 Web 同源（HTTP 与 MCP 调用同一批处理函数；
+`confirm-decide` 有意不进工具面，模型不能自批实盘单）。
 实盘切换只能在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）
 输入口令「确认实盘」完成，成功后提示带 `order_authorized: false`；`switch_mode` 工具
 只接受切到 sim（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
 [docs/RUNBOOK.md](docs/RUNBOOK.md) 的「平台服务」一节。
+
+实盘**写操作**的确认由**工作台业务确认**承载（不再走 Harness 原生审批）：会话里调用
+`mcp__futu__trading_*` 时，待确认项出现在 **Harness 内 legacy 工作台面板**（中文订单摘要，
+批准/拒绝各一次）。确认是**进程内存态**，Harness 进程与独立服务进程各持一份、**互不可见**——
+独立 Web 的 `confirmation` 端点读到的是 `pending: null`（是「读不到」，不是「无需确认」），
+服务进程自身也没有实盘写路径去发起确认。因此**独立 Web 暂无确认界面**（有意不做），过渡期
+一律回 Harness 面板作答；将来要跨进程需把请求/裁决落到共享文件并同时改 Node 侧
+（见 [docs/architecture.md](docs/architecture.md) 的「业务确认的跨进程边界」）。
 
 ## 工作台与指令示例
 
@@ -281,12 +290,14 @@ quote:read quote:write trade:read trade:write accid:...
 ```
 
 即**多授了 `trade:write`**。所以不要指望通过收窄 `scope` 参数来限制权限——真正的执行边界是
-本仓库自己的两层：**账户模式互斥（默认 sim）** + **Harness 原生实盘审批**。
+本仓库自己的两层：**账户模式互斥（默认 sim）** + **工作台业务确认（实盘写操作逐笔由用户在
+legacy 面板作答；独立服务侧的确认通道见 [docs/architecture.md](docs/architecture.md) 的「业务确认的跨进程边界」）**。
 这带来一个必须知道的推论：模式守卫是**插件级**的，凭据本身允许写操作；
 若绕过插件直接以 HTTP 调券商接口（本仓库明令禁止），模式守卫不会拦你。请在授权页面上
 按需选择权限，并始终经由 Harness 的工具体系下单。
 
-**安全说明**：未设置模式时默认模拟盘；完整插件模式下有账户工具守卫与 Harness 原生实盘审批，
+**安全说明**：未设置模式时默认模拟盘；完整插件模式下有账户工具守卫与**工作台业务确认**
+（实盘写操作在 legacy 面板逐笔作答，独立于权限档位），
 会话仍需逐笔复述并确认订单。仅安装 skill 不具备插件级守卫。日常建议只授权只读 scope。
 
 ## 模拟盘 / 实盘互斥开关

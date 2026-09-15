@@ -29,7 +29,7 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 面板移除另行提交。
 
 ```text
-用户 ↔ Harness 对话 / 原生审批
+用户 ↔ Harness 对话 / 工作台业务确认（legacy 面板作答）
           │
           ├─ trading-agents skill + Harness 子代理
           │    └─ 富途 MCP / fin_news / fin_sentiment / web 取数
@@ -48,7 +48,7 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 
           独立服务进程（platform/，FastAPI + uvicorn 单进程）
             ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
-            ├─ /mcp（mcp SDK streamable-http，25 工具）→ Harness 的 mcp__quantwb__*
+            ├─ /mcp（mcp SDK streamable-http，26 工具）→ Harness 的 mcp__quantwb__*
             └─ 静态托管 platform/web/dist；同一份 store/模式/指令文件
                （双进程无网络互通，靠原子写 + 文件锁互斥）
 ```
@@ -89,7 +89,7 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 | `plugins/datasource/python` | **统一数据层**：唯一的富途 MCP 客户端、行情路由与回测核心，被 engine/workbench 共同依赖（不是 Harness 插件） |
 | `plugins/core/python/trading_core` | **量化平台核心库**（非 Harness 插件）：PIT 存储/日历/同步/质量（WP1）、因子/策略/组合回测/walk-forward（WP2）、风控八规则/计划冻结/OMS 状态机/券商适配/对账/TCA（WP3）、daemon 调度/指令目录/告警（WP4） |
 | `trading_core` daemon | 无 LLM 单进程守护进程（`python -m trading_core daemon`）：按交易日历触发作业链（sync→质量→信号→计划、对账→TCA→摘要）、心跳落 `~/.dsh/trading-daemon.json`（> 5 分钟未刷新工作台标红）、轮询指令目录 `~/.dsh/trading-commands/`、告警分级落 `alerts` 表（WP4） |
-| `platform/` 独立服务进程（WP6） | FastAPI/uvicorn **单进程**：`POST /api/wb/<endpoint>`（envelope 契约，20 端点）+ `/mcp`（mcp SDK streamable-http，**25 工具**）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/5 个 `admin_*` 维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
+| `platform/` 独立服务进程（WP6） | FastAPI/uvicorn **单进程**：`POST /api/wb/<endpoint>`（envelope 契约，22 端点）+ `/mcp`（mcp SDK streamable-http，**26 工具** = 22 端点中 21 个端点工具 + 5 个 `admin_*` 维护动作；**`confirm-decide` 有意不进工具面**，防模型自批实盘单）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/业务确认/维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
 
 `plugins/trading-agents` 是旧的未启用脚手架，不是当前执行引擎。
 workbench 包通过 `dsh.bundle.patch` 插入根级 Host 行；fin-data/engine 是普通插件包，
@@ -312,6 +312,11 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 - 两进程共享的是数据文件（store JSON、指令目录）与只读快照，**确认表不在共享之列**；
   若将来需要跨进程作答，正确做法是把请求/裁决落到共享文件（复用现有原子写与租约协议），
   那是一项需要同时改 Node 侧的变更。
+- **独立 Web 本期不建确认界面**（WP6 范围，有意不做）：服务侧确认通道本身完整
+  （`confirmation` 读、`confirm-decide` 答），但服务进程当前**没有实盘写路径**去发起确认，
+  而 Harness 会话发起的确认它在跨进程下读不到——放一个长期空白的界面会让人误读为
+  「无需确认」。过渡期实盘写确认一律在 **Harness 内 legacy 工作台面板**作答
+  （规格 §4.5:5、§八-8）；将来落共享文件后再实现该界面，并同时带上本条限制标注。
 
 `confirmation` 与 `confirm-decide` 因此是**同一进程内**的读/答两端，不是跨进程确认总线；
 页面若展示待确认列表，必须同时标注这条限制（服务侧看不到 Harness 的待确认）。

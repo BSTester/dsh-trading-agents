@@ -3,6 +3,15 @@
 > **面向 AI 代理的工作者：** 必需子技能：使用 superpowers:subagent-driven-development（推荐）或 superpowers:executing-plans 逐任务实现此计划。步骤使用复选框（`- [ ]`）语法跟踪进度。
 > **全局约定**：见 `2026-09-14-platform-plan-index.md`。**本包含前端 UI 任务，2.1 UI 文案规范强制执行**。
 > **规格**：`docs/superpowers/specs/2026-09-15-wp6-standalone-service.md`（验收标准 = 规格 §六；工具面清单 = 规格 §三；通道分级规则 = 规格 §3.2 ⚠ 注）。
+>
+> **修订状态（读本文件前必看，2026-09-16）**：本计划已被两次修订覆盖——
+> ①**架构修订**（2026-09-15 第二次用户决策，`68fbfab`）：服务后端由 Node 改为 **FastAPI（Python）
+> 单进程**，Node 服务层随补遗任务 E（`aaa5f42`）退役，见文末「补遗」；
+> ②**并入 main 业务确认模型**（2026-09-16，合并 `29912b4` + 服务侧移植 `228ea90`）：实盘写操作由
+> Harness 原生审批改为**插件自己的业务确认**，工具面 25 → **26 工具**、端点 20 → **22 端点**
+> （`confirm-decide` 有意不进工具面）。
+> 因此下面「目标 / 架构 / 技术栈 / 任务 0–4 / 补遗任务 D」里的 `Node 服务进程`、`25 工具`、
+> `20 端点` 等均为**当时的历史口径**（保留不删），现行口径以规格、补遗任务 E 与验收记录 §8 为准。
 
 **目标：** 独立 Node 服务进程（MCP streamable-http 25 工具 + HTTP API + 静态托管）+ Ant Design Pro 形态前端（11 页签）+ preset 行替换与审批回归矩阵。
 
@@ -1852,7 +1861,7 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 > 故步骤 1–3 一律保持 `- [ ]`，证据位留空于「WP6 验收记录」§5。
 
 - [ ] **步骤 1**：用户机器上启用 preset 的 `quant-platform-mcp` 行（`disabled: false`）并启动服务；新建 Harness 会话
-- [ ] **步骤 2**：执行规格 §5.3 人工清单 5 步（工具面出现 / MCP live 拒绝 / Web 口令切 live / trading_* 原生审批卡 / plan_execute 窄门 + kill 演练），证据粘贴进「WP6 验收记录」
+- [ ] **步骤 2**：执行规格 §5.3 人工清单 5 步（工具面出现 26 工具 / MCP 拒绝切 live / Web 口令切 live / `trading_*` 写操作在 legacy 工作台面板出现业务确认（非原生审批卡）/ plan_execute 窄门 + kill 演练），证据粘贴进「WP6 验收记录」
 - [ ] **步骤 3**：全部通过后在「WP6 验收记录」标记 WP6 验收完成；任何一步失败 → 按 §5.5 回滚 preset 行（`disabled: true`）并修复重跑
 
 ## WP6 验收记录（2026-09-16 回填）
@@ -1861,7 +1870,8 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 > （其父 `044d0ce`）；最终整体审查修复提交见 §1 提交表末行（本次修复后 HEAD）。
 > Python `~/.dsh/trading-venv`（3.13.5），Node v22.23.2 / npm 10.9.8。
 > **本记录的证据全部来自上述 worktree 的真实运行，先跑后抄**；凡未执行者一律标注「待办」，不预填。
-> §2 的三套数字为最终审查修复后的复跑值（Python 642 / Node 181 / 前端 193）。
+> §2 的三套数字为最终审查修复后的复跑值（Python 642 / Node 181 / 前端 193）；
+> **2026-09-16 合并 main 业务确认修订后的复跑值（Python 669 / Node 202 / 前端 193）与新增偏差见 §8**。
 > live 准入仍按 `docs/P4-live-trading.md` 清单人工评估，人工项保持未勾选。
 
 ### 1. 分支与提交清单
@@ -2162,15 +2172,18 @@ HTTP 404（前端 endpoints.js 预检会先拦；404 文案保留兜底）
 
 | # | 步骤（规格 §5.3） | 结果 | 证据 |
 |---|---|---|---|
-| 1 | 新建 Harness 会话，`mcp__quantwb__*` 25 工具出现在 tools 列表 | 待执行 | |
+| 1 | 新建 Harness 会话，`mcp__quantwb__*` **26 工具**出现在 tools 列表（核对无 `confirm_decide`） | 待执行 | |
 | 2 | sim 下调 `switch_mode(live, expected=sim)`（带/不带口令各一次）→ 一律拒绝 `trading/live-switch-web-only`，模式不变 | 待执行 | |
 | 3 | 独立 Web 切 live：输入口令「确认实盘」→ 页头 LIVE 徽章；`quant_switch` 仍拒 live | 待执行 | |
-| 4 | live 下对话请求一个 `mcp__futu__trading_*` 工具 → 出现 Harness 原生审批卡（确认/拒绝各一次） | 待执行 | |
+| 4 | live 下对话请求一个 `mcp__futu__trading_*` 写工具 → **不出现 Harness 原生审批卡**，而是由插件发起业务确认：**Harness 内 legacy 工作台面板**出现待确认（中文订单摘要），批准/拒绝各一次；同一笔在独立 Web 的 `confirmation` 上读不到（跨进程内存态） | 待执行 | |
 | 5 | 独立 Web 计划页 live 执行：无口令拒；带口令 → queued；`scripts/drills.sh` kill 演练联动拒单 | 待执行 | |
 
-（步骤 1/2 的**自动等价物**已由 S1/S2 在真实 uvicorn + mcp 客户端上通过：tools/list=25、
-live 一律拒且模式文件不落地；步骤 4 的审批链由 R1/R2 在假 ctx 上驱动 `policy.js` 通过。
-但「真实 Harness 会话 + preset 行 + 原生审批卡 UI」只能由用户在场确认，不能由自动用例代替。）
+（步骤 1/2 的**自动等价物**已由 S1/S2 在真实 uvicorn + mcp 客户端上通过：tools/list=26、
+不含 `confirm_decide`、live 一律拒且模式文件不落地；步骤 4 的确认链由 R1/R2 在假 ctx 上驱动
+`policy.js` 通过，服务侧语义由 R2′ 的 7 条用例覆盖。
+但「真实 Harness 会话 + preset 行 + legacy 工作台面板的确认作答 UI」只能由用户在场确认，
+不能由自动用例代替；**第 4 步的跨进程前提**见规格 §5.3 末段：独立 Web 读不到 Harness 的
+待确认（`pending: null`），该笔只能回 Harness 面板作答。）
 
 ### 6. 执行偏差与已知限制
 
@@ -2250,7 +2263,7 @@ live 一律拒且模式文件不落地；步骤 4 的审批链由 R1/R2 在假 c
     服务端 404 分支文案保留作兜底。
 ### 6bis. 收尾期观察（2026-09-16）
 
-- **Python 套件单次失败未复现**：收尾期一次全量 `unittest discover`（642 用例）报 1 例失败，但未捕获用例名；随后连续 7 次全量运行均 `OK (skipped=1)`（含 4 次专门盯守）。可疑面是既有的端口保留/子进程类用例竞态（非 WP6 新增用例）。记录为**待观察**：若再现请先留用例名。
+- **Python 套件单次失败未复现**：收尾期一次全量 `unittest discover`（642 用例）报 1 例失败，但未捕获用例名；随后连续 7 次全量运行均 `OK (skipped=1)`（含 4 次专门盯守）。可疑面是既有的端口保留/子进程类用例竞态（非 WP6 新增用例）。记录为**待观察**：若再现请先留用例名。**（2026-09-16 已定位根因，见 §8-18：`tests/test_install.py` 的假 tarball 带 gzip mtime，与内容寻址去重相冲。）**
 - **最终整体审查的阻断项已修复**：独立 Web 缺模式切换入口（初版计划未为规格 §4.5:1 配置任务）→ 已在 `83376ae` 补齐「页头徽章 → 账户模式对话框」窄门（口令「确认实盘」+ `expected_mode` + `order_authorized:false` 展示），并补 `snapshot.endpoints` 声明预检；对应偏差 13/14。
 - **规格 §4.6 命令补 venv 前缀**：`cd platform && ~/.dsh/trading-venv/bin/python -m server.run`（系统 Python 会静默降级取数）。
 
@@ -2260,6 +2273,88 @@ live 一律拒且模式文件不落地；步骤 4 的审批链由 R1/R2 在假 c
 `docs/P4-live-trading.md`「实盘前必须满足」的 9 项人工评估条件与本次新增第 10 项
 （「独立 Web + MCP 入口审批回归（§5.3 人工清单 5 步）通过」）
 **全部保持未勾选**；WP6 交付的是服务形态与审批回归的自动证据，不升级任何实盘能力。
+
+### 8. 合并 main 并发修订（2026-09-16）
+
+> 本节记录并入 `main` 业务确认模型后的口径与复跑数字，**取代** §2/§3/§5 中合并前的旧数字
+> （旧：Python 642 / Node 181 / 前端 193）；§5 人工清单的步骤 1/4 也已按新模型改写。
+
+**提交链**：
+
+| 提交 | 内容 |
+|---|---|
+| main `624ccd0` | 把实盘写操作从「Harness 原生审批 `{kind:"ask"}`」改为**插件自己发起的业务确认**：`policy.js` pre-execute 调 `store.requestConfirmation`，用户从工作台作答；`endpoints.js` 新增 `confirmation`/`confirm-decide`（端点 20 → 22）；`store.js` 新增内存态待确认表（刻意不落盘）与订单摘要渲染；Node 侧新增 `tests/business-confirmation.test.mjs` 等用例 |
+| 合并 `29912b4` | 本分支并入 main（规格合并两侧修订）：本分支此前的 FastAPI 架构修订与 main 的业务确认修订并存 |
+| 服务侧移植 `228ea90` | `store_access.py` 移植同语义（`request_confirmation`/`confirmation_view`/`decide_confirmation`，按 home 分槽的**进程内内存态**）；`app.py` 新增 `confirmation`（空载荷、**不进缓存**）与 `confirm-decide`（白名单 `id`/`decision`）两条路由，端点集随 `endpoints.js` 变为 **22**；`mcp_tools.py` 新增 `confirmation` 读工具、`TOOL_COUNT` 25 → **26**、`MCP_EXCLUDED_ENDPOINTS = {"confirm-decide"}` |
+
+**提取口径修正（同一提交）**：main 在 `endpoints.js` 的 `ENDPOINTS` 数组里加了一条含 ASCII 双引号的注释，裸字符串正则会把它误当成第 23 个端点（并进入 HTTP 白名单）；`store_access.endpoints()` 与 `tests/test_wp6_tables_lock.py::js_endpoint_list()` 均改为**先剥 `//` 行注释再提取**（两处口径必须一致）。
+
+**复跑数字（本节所在提交前实测，2026-09-16）**：
+
+```console
+$ node --test tests/*.test.mjs
+# tests 202
+# pass 202
+# fail 0
+
+$ ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'
+Ran 669 tests in 105.887s
+
+OK (skipped=1)
+
+$ npm --prefix platform/web test
+# tests 193
+# pass 193
+# fail 0
+
+$ npm --prefix platform/web run build
+vite v6.4.3 building for production...
+✓ 3875 modules transformed.
+dist/index.html                    0.33 kB │ gzip:   0.26 kB
+dist/assets/index-wm-fo7sR.js  1,351.27 kB │ gzip: 427.64 kB
+✓ built in 1m 24s
+```
+
+（Node 181 → 202 是 main 并入的业务确认/客户端/策略用例；Python 642 → 669 是服务侧移植新增的 `R2′` 7 条与锁/表用例；前端 193 与合并前同值。本次文档改动**前后各复跑一次**，Node 202/0 与 Python 669 `OK (skipped=1)` 两次同值——以下命令块取其中一次的原始输出。）
+
+**新增验收对照（补 §3 表）**：
+
+| 验收项 | 状态 | 证据 |
+|---|---|---|
+| 业务确认服务侧（规格 §5.2 R2′） | ✅ | `tests/test_wp6_service_approval.py::R2ConfirmationTests`（7 用例）：HTTP `confirmation` 空载荷且**不进缓存**、`confirm-decide` 非法输入信封、批准/拒绝改变 `confirmationView()`、`activity` 事件留痕、**只有本进程发起的待确认可见** |
+| `confirm_decide` 不在 MCP 工具面（R5/S1） | ✅ | `R5ToolSurfaceTests::test_confirmation_read_tool_is_present_and_confirm_decide_is_absent`（22 − 1 = 21 个端点工具 + 5 维护 = 26，且名单无 `confirm_decide`）、`test_confirm_decide_is_not_a_tool_and_never_reaches_any_channel`（直接调 `confirm_decide` 即抛错）、`S1` 的 `test_s1_initialize_and_tool_surface` / `test_s1_confirmation_tool_is_read_only`（真实 uvicorn + mcp 客户端 tools/list = 26） |
+| 跨进程边界诚实声明 | ✅ | 规格 §4.5:5、§5.1 末段、§八-8；`docs/architecture.md` 端点表后的「业务确认的跨进程边界」；`docs/HANDOVER.md` 接手注意；`README.md` 服务小节 |
+
+**偏差清单追加（补 §6）**：
+
+15. **独立 Web 确认界面暂缓（有意不实现）**：确认是**进程内存态**（规格 §5.1 末段、§八-8），
+    Harness 会话发起的待确认在服务进程里读不到（`pending: null`），而服务进程自身也没有实盘写
+    路径去发起确认——建一个长期空白的确认界面会让人误读为「无需确认」。过渡期实盘写确认一律在
+    **Harness 内 legacy 工作台面板**作答；将来落共享文件后再实现该界面，并同时改 Node 侧。
+16. **服务侧确认通道当前无生产者**：`confirmation`/`confirm-decide` 语义完整并有 R2′ 7 条用例
+    钉死，但服务进程没有 live 写路径会发起确认，因此独立 Web 实际读到的始终是 `pending: null`；
+    该通道是为将来跨进程方案预留的接口面（现有用例用**后台线程发起**的方式驱动验证）。
+17. **两套测试不可并发跑**：`tests/test_install.py` 在仓库根建临时目录（`.install-test-*`），
+    与 Node 侧扫描仓库根的用例互相干扰；顺序跑即绿（本节数字即顺序跑的结果）。
+18. **`tests/test_install.py` 存在与本次改动无关的偶发失败（已定位根因，本次不改）**：本节复跑中
+    Python 全量套件出现过 1 次失败——`test_pack_absolute_paths_root_host_first_and_persistent_sources`
+    断言 `trading-plugin-packages/*.tgz` 数 = `PLUGINS + LIBRARIES`（6），实际得到 **12**。
+    根因是**测试替身不确定**：假 `npm pack` 用 `tarfile.open(path, "w:gz")` 写真实 tar.gz，
+    gzip 头带**当前 mtime**，而 `scripts/install_plugins.py:326-328` 按 tarball 字节做
+    **内容寻址**（`sha256(content)`）；两次安装若跨过 1 秒边界，同一插件就得到两个不同摘要 →
+    去重失效 → 文件数翻倍。隔离复跑已验证：带退出码的 7 次
+    `~/.dsh/trading-venv/bin/python -B -m unittest tests.test_install` 中 1 次失败、其余通过；
+    全量套件 2 次中 1 次失败（同一断言），失败那次之后的全量复跑
+    `Ran 669 tests … OK (skipped=1)`。这解释了
+    §6bis 那条「单次失败未复现」，属既有测试的时序敏感问题，**不是 WP6 代码回归**；修复方向是让
+    假 tarball 内容确定（固定 gzip mtime），属测试代码改动，本次不动。
+
+**本次文档修订范围（仅文档与注释，无服务/前端行为改动）**：规格（头部修订行 + §1.1/§3.2/§3.3/
+§4.5/§5.1 A2/§5.2/§5.3/§六/§八）、本计划（顶部修订状态、任务 14 步骤 2、§5 人工清单步骤 1/4、
+执行顺序补注与本节）、`docs/architecture.md`、`docs/HANDOVER.md`、`README.md`、
+`docs/RUNBOOK.md`、`docs/P4-live-trading.md`、`docs/superpowers/specs/2026-09-14-quant-platform-design.md`
+的陈旧计数与审批措辞同步；另修 `platform/server/mcp_tools.py:390` 的一处**注释**计数
+（「与 20 端点同库同锁」→ 22 端点），无行为变化。
 
 ## 执行说明（面向调度者）
 
@@ -2347,6 +2442,12 @@ live 一律拒且模式文件不落地；步骤 4 的审批链由 R1/R2 在假 c
 ### 执行顺序与依赖
 
 A → B → C → D → E 严格串行（同 worktree）；任务 12（页面批 3）与本补遗无文件交集，可在 E 之后执行。任务 13 文档修订范围新增：architecture.md/RUNBOOK/README 的启动命令改为 `cd platform && python -m server.run`（或 `python platform/server/run.py`；标准库 `platform` 遮蔽，`python -m platform.server.run` 不可用）、依赖改为 platform/requirements.txt、补「单进程、无独立前端服务」表述、任务 7 审查的两条措辞建议（通道分级措辞对齐、mcp 行启用指引）。
+
+> **补遗之外的新增任务（2026-09-16，main 并发修订合并后）**：`main` 把实盘写操作从 Harness
+> 原生审批改为**插件自己的业务确认**，故在任务 E（Node 服务层退役）之后新增一项**服务侧业务确认
+> 移植任务**，落地于提交 `228ea90`（`confirmation`/`confirm-decide` 路由、内存态待确认表、
+> `confirmation` 读工具，工具面 25 → 26；`confirm-decide` 有意不进工具面）。本任务不在补遗
+> A–E 的原始排期内，任务清单与差异见本文件末尾「业务确认移植」段落与验收记录 §8。
 
 > **任务 E 已执行（Node 服务层已退役）**：本计划任务 0–4 段落里的 `platform/server/*.mjs`、
 > `platform/tests/*.test.mjs`、`platform/package.json` 与其 `node --test platform/tests/...`
