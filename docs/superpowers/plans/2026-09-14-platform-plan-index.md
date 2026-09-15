@@ -75,4 +75,6 @@ WP1（§13.2 六项）、WP2（估值字段路径复用 `workbench/python/factor
 2. 工作台 UI 用 **Ant Design Pro** 重实现（脱离 Harness 面板宿主，独立 Web）；
 3. Harness 定位不变：入口 = 决策与操作确认；固定信息收集由服务定时跑。
 落地：6a mcp_server（工具面=工作台全功能清单）；6b Ant Design Pro 前端 + 服务 HTTP；
-6c preset 行替换与审批回归。规格与实现计划在新会话按既有流程产出。
+6c preset 行替换与审批回归。
+规格：`docs/superpowers/specs/2026-09-15-wp6-standalone-service.md`（2026-09-15 产出，前端形态经用户确认为 Vite + antd5 + ProComponents）。
+实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（验收记录见其末节）。
