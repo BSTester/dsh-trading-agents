@@ -1,9 +1,16 @@
 """调度守护进程（规格 §8.1）：无 LLM 单进程；按交易日历触发作业链；
-心跳落 ~/.dsh/trading-daemon.json；指令目录轮询在 commands 模块。"""
+心跳落 ~/.dsh/trading-daemon.json；指令目录轮询分派见 handle_command。
+
+边界（规格 §8.4 恢复原则）：cancel_plan 只本地撤销未提交（draft/frozen）订单，
+在途订单留给对账兜底，绝不自动清除 unknown 状态。
+kill 文件约定 ~/.dsh/trading-kill（WP3 risk.py ctx["kill_path"] 同一事实）。"""
 import json
+import os
+import subprocess
+import sys
 from pathlib import Path
 
-from . import store
+from . import alerts, execute, store
 
 JOBS_DEFAULT = {
     "SH": [{"name": "sync_bars", "at": "16:00", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
@@ -14,6 +21,12 @@ JOBS_DEFAULT = {
     "US": [{"name": "sync_bars", "at": "05:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]}],
 }
 
+# 风控参数默认值：镜像 engine/python/risk_config.py 的 DEFAULTS（venv 只链接
+# trading_core/trading_datasource，engine 模块不可直接 import，故此处镜像键名，
+# 变更时必须两处同步）。~/.dsh/trading-risk.json 覆盖默认值，未知键直接报错。
+RISK_DEFAULTS = {"risk_per_trade": 0.01, "stop_atr_mult": 2.0, "max_positions": 5,
+                 "daily_loss_limit_pct": 0.03, "max_position_pct": 0.25}
+
 
 def heartbeat_path(home):
     return Path(home) / "trading-daemon.json"
@@ -21,6 +34,10 @@ def heartbeat_path(home):
 
 def commands_dir(home):
     return Path(home) / "trading-commands"
+
+
+def kill_path(home):
+    return Path(home) / "trading-kill"
 
 
 def write_heartbeat(home, payload):
@@ -31,6 +48,37 @@ def write_heartbeat(home, payload):
     tmp.replace(p)
 
 
+def platform_config(home):
+    """~/.dsh/trading-platform.json（调度表/关注池，规格 §架构 config.py 口径）。
+    缺失/损坏按空配置跑，不阻塞调度；关注池空时占位作业跳过并告警。"""
+    p = Path(home) / "trading-platform.json"
+    try:
+        return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def resolve_command(cmd, home):
+    """替换 @watchlist 占位为配置关注池；关注池为空返回 None（调用方跳过该作业）。"""
+    cmd = list(cmd)
+    if "@watchlist" in cmd:
+        watchlist = ",".join(platform_config(home).get("watchlist") or [])
+        if not watchlist:
+            return None
+        cmd[cmd.index("@watchlist")] = watchlist
+    return cmd
+
+
+def _subprocess_runner(cmd):
+    """cmd 形式作业的默认执行体：venv 同解释器跑 CLI 子进程（单作业 15 分钟超时）。"""
+    home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+    resolved = resolve_command(cmd, home)
+    if resolved is None:
+        return {"skipped": "关注池为空"}
+    return subprocess.run([sys.executable, "-m", "trading_core", *resolved],
+                          timeout=900).returncode
+
+
 def tick(conn, home, jobs=None, now=None):
     """一轮调度：对每个市场判断「今日为交易日 且 当前时间 ≥ at 且 今日未跑」，
     满足则执行并记录。now 注入便于假时钟测试。"""
@@ -39,7 +87,13 @@ def tick(conn, home, jobs=None, now=None):
     state = store.kv_get(conn, "daemon:state", default={"ran": {}})
     stamp = now()
     for market, chain in jobs.items():
-        if not store.is_trading_day(conn, market, stamp[:10]):
+        try:
+            trading_day = store.is_trading_day(conn, market, stamp[:10])
+        except RuntimeError as error:  # 日历未同步：跳过该市场并告警，不拖垮循环
+            alerts.emit(conn, home=str(home), level="warn", title="日历未同步",
+                        detail=str(error)[:160])
+            continue
+        if not trading_day:
             continue
         for job in chain:
             key = f"{market}:{job['name']}:{stamp[:10]}"
@@ -55,12 +109,134 @@ def tick(conn, home, jobs=None, now=None):
 
 
 def _run_job(conn, job, home, runner=None):
-    """fn 形式直接调用（测试注入）；cmd 形式经 runner 跑 CLI 子进程（任务 4 接线）。"""
+    """fn 形式直接调用（测试注入）；cmd 形式经 runner 跑 CLI 子进程。
+    conn 允许为 None（纯 runner 注入的探测式调用），此时跳过 kv 记账。"""
     if "fn" in job:
         job["fn"]({"conn": conn, "home": home})
-    elif runner:
-        runner(job["cmd"])
-    store.kv_set(conn, "daemon:last_job", job["name"])
+    else:
+        (runner or _subprocess_runner)(job["cmd"])
+    if conn is not None:
+        store.kv_set(conn, "daemon:last_job", job["name"])
+
+
+def handle_command(conn, home, cmd, executor=None, runner=None):
+    """commands.poll 的分派器：白名单 5 种指令（规格 §8.2）。永不抛出——
+    错误以 result 返回，交由 poll 移入 processed/，避免毒丸指令每轮重试。"""
+    home = str(home)
+    type_ = cmd.get("type")
+    try:
+        if type_ == "kill":
+            kill_path(home).touch()
+            return {"ok": True}
+        if type_ == "unkill":
+            kill_path(home).unlink(missing_ok=True)
+            return {"ok": True}
+        if type_ == "run_job":
+            name = cmd.get("job")
+            job = next((j for chain in JOBS_DEFAULT.values() for j in chain
+                        if j["name"] == name), None)
+            if job is None:
+                return {"ok": False, "error": f"未知作业 {name}"}
+            _run_job(conn, job, home, runner=runner)
+            return {"ok": True}
+        if type_ == "execute_plan":
+            return (executor or _default_executor)(conn, home, cmd)
+        if type_ == "cancel_plan":
+            return _cancel_plan(conn, cmd)
+        return {"ok": False, "error": f"未知指令 {type_}"}
+    except Exception as error:  # noqa: BLE001 —— 指令级失败不阻塞轮询循环
+        return {"ok": False, "error": str(error)[:160]}
+
+
+def _default_executor(conn, home, cmd):
+    return _execute_plan(conn, home, cmd)
+
+
+def risk_config(home):
+    """~/.dsh/trading-risk.json 覆盖 RISK_DEFAULTS；未知键报错（静默失效更危险）。"""
+    cfg = dict(RISK_DEFAULTS)
+    p = Path(home) / "trading-risk.json"
+    if p.exists():
+        overlay = json.loads(p.read_text(encoding="utf-8"))
+        unknown = set(overlay) - set(RISK_DEFAULTS)
+        if unknown:
+            raise ValueError(f"未知风控字段：{', '.join(sorted(unknown))}")
+        cfg.update(overlay)
+    return cfg
+
+
+def _last_close(conn, symbol, as_of):
+    bars = store.read_bars(conn, symbol, "1d", as_of=as_of, limit=1)
+    return bars[-1]["c"] if bars else None
+
+
+def _execute_plan(conn, home, cmd, broker_call=None, equity=None, today=None,
+                  calendar_ok=None, price_of=None, stop_dist_of=None):
+    """execute_plan 默认实现：按 content_hash 找冻结/已批准计划 → execute.run。
+
+    券商通道必须注入（broker_call = futu_mcp.call_tool 同签名的 callable）；
+    未注入一律拒绝执行——宁可拒绝，也不在无券商事实的情况下下单。
+    权益/持仓/日亏损为离线保守默认（对齐 cli plan-build 离线口径），真实通道
+    接入由运维层注入 broker_call 与 equity 覆盖（WP5）。
+    """
+    plan_hash = cmd.get("plan_hash")
+    if not plan_hash:
+        return {"ok": False, "error": "缺少 plan_hash"}
+    if broker_call is None:
+        return {"ok": False, "error": "daemon 未接入券商通道（需注入 broker_call）"}
+    if store.is_halted(conn):
+        return {"ok": False, "error": "熔断生效：先查明原因并 clear_halt 后再执行"}
+    row = conn.execute(
+        "SELECT plan_id, mode FROM plans WHERE content_hash=?"
+        " AND status IN ('frozen','approved') ORDER BY created_at DESC LIMIT 1",
+        (plan_hash,)).fetchone()
+    if row is None:
+        return {"ok": False, "error": f"无可执行计划 hash={plan_hash}"}
+    home = str(home)
+    stamp = _real_now()
+    day = today or stamp[:10]
+    if calendar_ok is None:
+        market_row = conn.execute(
+            "SELECT market FROM orders WHERE plan_id=? ORDER BY rowid LIMIT 1",
+            (row["plan_id"],)).fetchone()
+        try:
+            calendar_ok = store.is_trading_day(conn, (market_row or {"market": "SH"})["market"], day)
+        except RuntimeError:
+            calendar_ok = False  # 日历缺失：不放行（宁可不执行）
+    if price_of is None:
+        price_of = lambda s: _last_close(conn, s, stamp)  # noqa: E731
+    if stop_dist_of is None:
+        stop_dist_of = lambda s: None  # noqa: E731 —— 保守口径：风险额按全额名义计
+    ctx = {"mode": row["mode"], "kill_path": str(kill_path(home)),
+           "equity": equity if equity is not None else 1_000_000.0,
+           "positions_value": {}, "positions_count": 0, "day_pnl_pct": 0.0,
+           "is_trading_day": bool(calendar_ok), "config": risk_config(home)}
+    result = execute.run(conn, row["plan_id"], plan_hash, ctx, broker_call,
+                         price_of=price_of, stop_dist_of=stop_dist_of)
+    return {"ok": True, "plan_id": row["plan_id"], **result}
+
+
+def _cancel_plan(conn, cmd):
+    """撤余单：只本地撤销 draft/frozen（未提交）；在途订单不动，留给对账兜底。"""
+    plan_hash = cmd.get("plan_hash")
+    row = conn.execute(
+        "SELECT plan_id FROM plans WHERE content_hash=? ORDER BY created_at DESC LIMIT 1",
+        (plan_hash,)).fetchone() if plan_hash else None
+    if row is None:
+        return {"ok": False, "error": f"计划不存在 hash={plan_hash}"}
+    cancelled, untouched = [], []
+    for o in store.get_open_orders(conn, row["plan_id"]):
+        if o["status"] in ("draft", "frozen"):
+            oms_cancel(conn, o["client_order_id"])
+            cancelled.append(o["client_order_id"])
+        else:
+            untouched.append({"id": o["client_order_id"], "status": o["status"]})
+    return {"ok": True, "cancelled": cancelled, "untouched": untouched}
+
+
+def oms_cancel(conn, client_order_id):
+    from . import oms
+    oms.transition(conn, client_order_id, "cancelled", err="cancel_plan")
 
 
 def _real_now():

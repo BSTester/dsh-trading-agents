@@ -87,7 +87,40 @@ def build_parser():
     s.add_argument("--local", required=True)
     s.add_argument("--broker", required=True)
     _add_db(s)
+
+    s = sub.add_parser("daemon", help="调度守护进程（--once 跑一轮；默认常驻轮询）")
+    s.add_argument("--once", action="store_true", help="只跑一轮调度 + 指令轮询后退出")
+    s.add_argument("--interval", type=int, default=60, help="常驻轮询秒数（默认 60）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    _add_db(s)
     return p
+
+
+def _daemon_round(conn, home):
+    """常驻循环的一轮：调度 + 指令轮询；处理失败的指令告警（文件仍移入 processed/）。"""
+    from . import alerts, commands
+    from . import daemon as daemon_mod
+    daemon_mod.tick(conn, home)
+    issues = []
+    for item in commands.poll(home, handler=lambda cmd: daemon_mod.handle_command(conn, home, cmd)):
+        if item.get("error"):
+            issues.append({"file": item.get("file"), "error": item["error"]})
+            alerts.emit(conn, home=str(home), level="warn",
+                        title="指令处理失败", detail=item["error"])
+    return issues
+
+
+def _daemon_loop(conn, home, once=False, interval=60):
+    """--once 跑一轮返回摘要；默认常驻 interval 秒轮询，Ctrl-C 优雅退出。"""
+    import time
+    while True:
+        issues = _daemon_round(conn, home)
+        if once:
+            return {"once": True, "issues": issues}
+        try:
+            time.sleep(interval)
+        except KeyboardInterrupt:
+            return {"stopped": True, "issues": issues}
 
 
 def main(argv=None):
@@ -155,6 +188,10 @@ def main(argv=None):
             result = {"diffs": reconcile.compare(
                 conn, json.loads(Path(args.local).read_text()),
                 json.loads(Path(args.broker).read_text()))}
+        elif args.cmd == "daemon":
+            import os
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = _daemon_loop(conn, home, once=args.once, interval=args.interval)
         else:  # pragma: no cover - argparse 已约束
             raise ValueError(f"未知子命令 {args.cmd}")
     finally:
