@@ -79,3 +79,39 @@ test("S3 业务失败走 ok:false envelope（isError=false）；HTTP 与 MCP sna
   assert.equal(viaMcpValue.mode, httpValue.mode);
   assert.deepEqual(viaMcpValue.endpoints, httpValue.endpoints);
 });
+
+test("陈旧 session id 的非 initialize 请求：404/-32001 且不创建会话", async (t) => {
+  const { url } = await withMcpServer(t);
+  // 与 initialize 后的真实 id 对比：真实 id 前先手工带 stale 头打一发普通请求
+  const stale = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", "mcp-session-id": "stale" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+  });
+  assert.equal(stale.status, 404);
+  assert.equal(stale.headers.get("mcp-session-id"), null);   // 未派发新会话 id
+  const staleBody = await stale.json();
+  assert.equal(staleBody.error.code, -32001);
+  assert.equal(staleBody.error.message, "Session not found");
+  assert.equal(staleBody.id, 1);
+  // 会话未创建的旁证：不带 session id 的 initialize 仍正常走通（会话表未被占位/污染）
+  const client = new Client({ name: "wp6-test", version: "0.0.0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(url)));
+  t.after(() => client.close());
+  const tools = await client.listTools();
+  assert.equal(tools.tools.length, TOOL_COUNT);
+});
+
+test("无 session id 的非 initialize 请求：400/-32000", async (t) => {
+  const { url } = await withMcpServer(t);
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ jsonrpc: "2.0", id: 7, method: "ping" }),
+  });
+  assert.equal(response.status, 400);
+  const body = await response.json();
+  assert.equal(body.error.code, -32000);
+  assert.equal(body.error.message, "Server not initialized");
+  assert.equal(body.id, 7);
+});

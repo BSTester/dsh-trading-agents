@@ -16,18 +16,40 @@ test("S1-S4 真实进程：initialize/tools=25/通道分级/HTTP 同值", async 
     stdio: ["ignore", "pipe", "inherit"],
   });
   t.after(async () => {
-    child.kill("SIGTERM");
+    // 先等子进程真正退出再 rm(home)：上一版 kill 后立刻删目录，进程可能还挂着
+    // （server.close 等活动连接），rm 与退出赛跑留下临时目录/僵尸进程。
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGTERM");
+      await Promise.race([
+        new Promise((resolve) => child.once("exit", resolve)),
+        new Promise((resolve) => setTimeout(resolve, 3000).unref()),
+      ]);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+    }
     await rm(home, { recursive: true, force: true });
   });
+  // stdout 按行缓冲：data 事件分片可能把一行 boot JSON 截成多段，按 \n 切完整行再解析
   const ready = new Promise((resolve, reject) => {
+    let buffer = "";
     child.stdout.on("data", (chunk) => {
-      const line = String(chunk).split("\n").find((row) => row.startsWith("{"));
-      if (line) { try { resolve(JSON.parse(line)); } catch (error) { reject(error); } }
+      buffer += String(chunk);
+      const lines = buffer.split("\n");
+      buffer = lines.pop();   // 保留最后不完整段，等下一个分片
+      for (const line of lines) {
+        if (line.startsWith("{")) {
+          try { resolve(JSON.parse(line)); } catch (error) { reject(error); }
+          return;   // boot JSON 只需解析一次
+        }
+      }
     });
+    child.on("error", reject);
     child.on("exit", () => reject(new Error("服务进程提前退出")));
   });
-  const boot = await Promise.race([ready, new Promise((_, reject) =>
-    setTimeout(() => reject(new Error("服务 10s 未就绪")), 10_000))]);
+  let bootTimer;
+  const boot = await Promise.race([ready, new Promise((_, reject) => {
+    bootTimer = setTimeout(() => reject(new Error("服务 10s 未就绪")), 10_000);
+    bootTimer.unref();   // 超时兜底不得拖住测试进程退出
+  })]).finally(() => clearTimeout(bootTimer));   // boot 即到：清掉 10s 定时器
   assert.equal(boot.ok, true);
   assert.equal(boot.tools, 25);
 

@@ -19,6 +19,12 @@ const handle = createRpcHandler(store, deps);   // 一份 handler：HTTP 与 MCP
 const manifest = buildManifest({ handle, store });
 const server = createService({ store, handle, mcp: createMcpEndpoint({ manifest }), config, endpoints: ENDPOINTS });
 
+// EADDRINUSE 等监听失败：友好退出（exit code 1），不留悬挂进程
+server.on("error", (error) => {
+  console.error(JSON.stringify({ ok: false, service: "quant-platform", error: String(error?.message ?? error) }));
+  process.exit(1);
+});
+
 server.listen(config.port, config.host, () => {
   const { port } = server.address();
   console.log(JSON.stringify({
@@ -31,5 +37,9 @@ server.listen(config.port, config.host, () => {
 });
 
 for (const signal of ["SIGINT", "SIGTERM"]) {
-  process.on(signal, () => server.close(() => process.exit(0)));
+  process.on(signal, () => {
+    server.close(() => process.exit(0));
+    // 活动请求（上游取数）可能挂住 close 回调；5s 后强收，重复信号也能退出
+    setTimeout(() => { server.closeAllConnections?.(); process.exit(0); }, 5000).unref();
+  });
 }
