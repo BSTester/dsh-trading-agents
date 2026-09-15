@@ -122,3 +122,33 @@ def _ep(conn, symbol, as_of):
     """EP = 市盈率倒数（字段 pe_ttm，锁定表口径），方向统一"越大越看多"。"""
     v = store.read_valuations(conn, symbol, as_of).get("pe_ttm")
     return (1.0 / v) if v and v > 0 else None
+
+
+def cross_sectional_zscore(values, mad_bound=3.0):
+    """横截面 z-score，MAD 去极值（规格 §5.1）。返回 {key: z}。"""
+    if len(values) < 3:
+        return {k: None for k in values}
+    xs = sorted(values.values())
+    med = xs[len(xs) // 2]
+    mad = sorted(abs(x - med) for x in xs)[len(xs) // 2] or 1e-12
+    clipped = {k: med + max(-mad_bound, min(mad_bound, (v - med) / (1.4826 * mad))) * (1.4826 * mad)
+               for k, v in values.items()}
+    mean = sum(clipped.values()) / len(clipped)
+    var = sum((v - mean) ** 2 for v in clipped.values()) / (len(clipped) - 1)
+    std = math.sqrt(var) or 1e-12
+    return {k: (v - mean) / std for k, v in clipped.items()}
+
+
+def composite_score(per_symbol_factors, weights):
+    """{symbol: {factor: raw}} × {factor: weight} → {symbol: score}。
+    因子方向在注册时已统一（越大越看多），此处不再翻方向。"""
+    out = {}
+    for symbol, fv in per_symbol_factors.items():
+        num = den = 0.0
+        for name, w in weights.items():
+            v = fv.get(name)
+            if v is not None:
+                num += w * v
+                den += abs(w)
+        out[symbol] = num / den if den else None
+    return out

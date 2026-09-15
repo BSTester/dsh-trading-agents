@@ -36,6 +36,18 @@ class FactorsTest(unittest.TestCase):
         self.assertEqual(factors.REGISTRY["ep"](self.conn, "SH.600519", "2026-07-18"), 1 / 22.5)
         self.assertIsNone(factors.REGISTRY["ep"](self.conn, "SH.600519", "2026-07-01"))
 
+    def test_zscore_mad_winsorize(self):
+        vals = {"A": 1.0, "B": 1.1, "C": 0.9, "D": 1.05, "E": 100.0}  # E 为离群
+        z = factors.cross_sectional_zscore(vals)
+        # 计划修正：MAD 截断后 E 仍是截面最大值，原断言 |z_E|<|z_B| 恒不成立；
+        # 等价可判定性质——离群点被夹住（与正常点 z 差距有界，不裁剪时 ≈2.23），
+        # 且正常点保持分散（不裁剪时整截面被压扁，Spread 仅 ≈0.007）
+        self.assertLess(z["E"] - z["B"], 2.0)
+        pack = [z[k] for k in ("A", "B", "C", "D")]
+        self.assertGreater(max(pack) - min(pack), 1.0)
+        score = factors.composite_score({"A": {"f1": 1.0}, "B": {"f1": 2.0}}, weights={"f1": 1.0})
+        self.assertGreater(score["B"], score["A"])
+
 
 if __name__ == "__main__":
     unittest.main()
