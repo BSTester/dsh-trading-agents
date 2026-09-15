@@ -227,7 +227,7 @@ platform/web/
 | 链 | 内容 | 现状锚点 |
 |---|---|---|
 | A1 | 账户模式互斥：sim 模式拒 `account_*`/`trading_*`；live 模式拒 `sim_trade_*` | `policy.js` guard |
-| A2 | live 写操作原生审批：`trading_*` 在 pre-execute 强制 `{kind:"ask"}`；`sim_trade_*` 永不 ask | `policy.js` pre-execute |
+| A2 | live 写操作**业务确认**（2026-09-15 修订）：`trading_*` 在 pre-execute 由插件自己发起 `store.requestConfirmation`，等人从工作台作答，**永不返回 `{kind:"ask"}`**；`sim_trade_*` 永不确认。原设计的 `ask` 在 full-access（`policy="never"`）下会被 `approval.decide()` 直接 rejected，表现为「用户拒绝了」而实际没人被问过 | `policy.js` pre-execute + `store.requestConfirmation` / `confirm-decide` 端点 |
 | A3 | 模式切换双保险：live 需口令「确认实盘」+ `expected_mode` 一致 + 无在途租约；切换不授权下单；**MCP 通道 switch_mode 仅限 sim→sim**（模型自填口令被通道规则封死） | `store.switchMode` + manifest 通道规则 |
 | A4 | 计划执行窄门：live 需口令「确认执行」+ `plan_hash` + `expected_mode` 复核；成功仅 `queued`；daemon 侧 kill 文件 + 风控 8 规则兜底 | rpc plan-execute 分支 + commands + risk |
 | A5 | `quant_switch` 只能切 sim；模型不能代替用户确认实盘 | engine tools |
@@ -244,7 +244,7 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）**必�
 | 用例 | 断言 |
 |---|---|
 | R1 | sim 下 guard 拒 `mcp__futu__account_positions`（消息含「账户模式」）；live 下拒 `sim_trade_*`（经 `installTradingPolicy` 假 ctx 驱动） |
-| R2 | live 下 `trading_*` pre-execute 返回 `ask` 且 reason 含「真实账户操作」；`sim_trade_*` 放行不 ask |
+| R2 | live 下 `trading_*` pre-execute **不返回 `ask`**，而是产生一笔待确认；工作台批准 → `allow`，拒绝/超时 → `deny`；`sim_trade_*` 放行且不产生待确认 |
 | R3 | `switch_mode`：无口令 live 拒绝；错口令拒绝；对口令成功且 `order_authorized:false`；`expected_mode` 过期拒绝；租约期间拒绝（WorkbenchBusyError）；**MCP manifest 的 switch_mode 对 mode:"live" 无论口令一律拒绝（trading/live-switch-web-only）** |
 | R4 | `plan_execute`：live 无口令拒绝；带口令 → `{queued:true,nonce}`；指令文件落盘含 `plan_hash/expected_mode` 且**不含口令字段**；action 四映射到白名单指令 |
 | R5 | manifest：恰 25 工具；端点工具集 ≡ ENDPOINTS；无黑名单名（exec/shell/file/token/write_file） |

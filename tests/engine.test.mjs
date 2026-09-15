@@ -48,17 +48,39 @@ test("model cannot enable live with an argument; quant preview is cached without
   assert.equal(store.snapshot().previews[0].kind, "signal");
 });
 
-test("policy rejects opposite account, requires Harness approval for live writes, records results", async (t) => {
+test("policy 拦反向账户；实盘写操作走业务确认而非 Harness 审批；结果照记", async (t) => {
   const { ctx, hooks, store, exec } = await setup(t);
   installTradingPolicy(ctx);
-  const live = { ...exec, name: "mcp__futu__trading_order_place", arguments: { ticker: "AAPL", quantity: 1 } };
+  const live = { ...exec, name: "mcp__futu__trading_input_order",
+    arguments: { acc_id: "A1", market: 100, symbol: "AAPL", order_type: 1, order_side: 1, qty: 1 } };
   assert.match(hooks.get("guard")(live), /sim/);
   assert.equal(hooks.get("guard")({ ...exec, name: "fin_news" }), undefined);
   store.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
   assert.match(hooks.get("guard")({ ...exec, name: "mcp__futu__sim_trade_input_order" }), /live/);
-  const decision = await hooks.get("tools/pre-execute")(live, async () => ({ kind: "allow" }));
-  assert.equal(decision.kind, "ask");
-  assert.match(decision.reason, /AAPL/);
+
+  // 实盘写操作：产生**业务确认**，并且**绝不返回 ask**。
+  // ask 会落到会话的审批档位上，full-access（policy="never"）下被静默 rejected，
+  // 表现为"用户拒绝了"，实际没人被问过。
+  const settling = hooks.get("tools/pre-execute")(live, async () => ({ kind: "allow" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  const pending = store.confirmationView();
+  assert.ok(pending, "实盘写操作必须产生一笔待确认");
+  assert.equal(pending.operation, "下单");
+  assert.equal(pending.summary.fields.find((f) => f.label === "标的").value, "AAPL");
+
+  store.decideConfirmation({ id: pending.id, decision: "approved" });
+  const decision = await settling;
+  assert.notEqual(decision.kind, "ask", "不能返回 ask：那会受会话审批档位影响");
+  assert.equal(decision.kind, "allow");
+
+  // 用户拒绝 → deny，且说明这是业务确认
+  const rejecting = hooks.get("tools/pre-execute")(live, async () => ({ kind: "allow" }));
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  store.decideConfirmation({ id: store.confirmationView().id, decision: "rejected" });
+  const refused = await rejecting;
+  assert.equal(refused.kind, "deny");
+  assert.match(refused.reason, /工作台/);
+
   const denied = await hooks.get("tools/pre-execute")(live, async () => ({ kind: "deny", reason: "other policy" }));
   assert.equal(denied.kind, "deny");
   await hooks.get("tools/execute")(live, async () => {

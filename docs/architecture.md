@@ -53,7 +53,7 @@ Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台嵌�
 | 根目录 preset | 新建「交易智囊模式」，组合 persona、原生工具、skill 和 MCP |
 | `skills/trading-agents/SKILL.md` | Harness 主会话与子代理执行 12 角色、6 阶段研究，数据不足显式说明 |
 | `plugins/engine/src/tools.js` | `run_trading_analysis` 启动记录、`research_publish` 发布有来源的报告、量化结果保存 |
-| `plugins/engine/src/policy.js` | 拒绝跨模式账户工具；真实写操作经过 Harness 审批；记录最终工具响应 |
+| `plugins/engine/src/policy.js` | 拒绝跨模式账户工具；真实写操作走**工作台业务确认**（不返回 `ask`，与权限档位无关）；记录最终工具响应 |
 | `plugins/workbench/src/index.js` | 根级 Host 插件，提供 `tradingWorkbench` 服务与认证后的 Connection RPC |
 | `plugins/workbench/src/store.js` | JSON 持久结果、原子替换、写锁、账户调用租约、模式隔离 |
 | `plugins/workbench/src/client.js` | Harness 原生 module factory，使用宿主 React；`shell.overlay` 面板及 `tool.call.toolview` 卡片 |
@@ -235,7 +235,7 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
 - 账户调用持有 `trading-call-*.active` 租约，期间拒绝切换；
   多个 Host 进程和恢复脚本共用文件边界。
 - `mcp__futu__sim_trade_*` 仅 sim；`account_*`、`trading_*` 仅 live；
-  真实写操作在会话摘要确认之外经过 Harness 原生审批。
+  真实写操作在会话摘要确认之外，还必须在工作台逐笔点确认（业务确认，独立于 Harness 权限审批）。
 
 这是插件管理的 MCP 工具边界，不是操作系统沙箱。拥有宿主 shell、文件权限或券商凭据
 的人仍能绕过插件，因此禁止模型绕路，日常只授只读权限，不能宣称已经具备完整实盘安全保证。

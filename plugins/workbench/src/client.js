@@ -14,6 +14,14 @@ window.__ModuleLoader__.load({
 
     const STYLE_ID = "dsh-trading-workbench-style";
     const CSS = `
+/* 实盘业务确认闸门：必须盖在抽屉之上（抽屉 z-index 71），
+   并且只在有待确认项时出现。只读展示 + 两个按钮，没有输入框。 */
+.tw-gate{position:fixed;inset:0;z-index:90;display:flex;align-items:center;justify-content:center;padding:24px;background:rgba(0,0,0,.44)}
+.tw-gate-card{width:min(560px,94vw);max-height:86vh;overflow:auto;display:flex;flex-direction:column;gap:10px;padding:18px 20px;border-radius:14px;background:var(--dsw-alias-bg-layer-1,Canvas);color:var(--dsw-alias-label-primary,CanvasText);border:1px solid var(--dsw-alias-border-l2,GrayText);box-shadow:0 24px 64px rgba(0,0,0,.42)}
+.tw-gate-head{display:flex;align-items:center;gap:10px;font-size:15px}
+.tw-gate-head .tw-meta{margin-left:auto}
+.tw-gate-actions{display:flex;justify-content:flex-end;gap:10px;margin-top:4px}
+.tw-gate-card .tw-kv{grid-template-columns:1fr}
 .tw-fab{position:fixed;right:18px;bottom:18px;z-index:60;display:inline-flex;align-items:center;gap:8px;padding:10px 16px;border-radius:999px;cursor:pointer;font-size:13px;font-weight:600;color:var(--dsw-alias-label-primary,CanvasText);background:var(--dsw-alias-button-elevated-fill,ButtonFace);border:1px solid var(--dsw-alias-border-l2,GrayText);box-shadow:0 6px 20px rgba(0,0,0,.18);transition:transform .12s ease,background .12s ease}
 .tw-fab:hover{transform:translateY(-1px);background:var(--dsw-alias-interactive-bg-hover,ButtonFace)}
 .tw-dot{width:8px;height:8px;border-radius:50%;background:var(--dsw-alias-state-success-primary,#2ea043)}
@@ -139,7 +147,10 @@ window.__ModuleLoader__.load({
 
     const KNOWN_ENDPOINTS = ["snapshot", "switch-mode", "series", "equity", "positions",
       "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit",
-      "sources", "instrument", "quality", "plan", "plan-execute", "schedule", "reconcile"];
+      "sources", "instrument", "quality", "plan", "plan-execute", "schedule", "reconcile",
+      // 实盘业务确认：读待确认项 / 提交决定。两者都不进 CLIENT_TTL_MS——
+      // 缓存住"待确认"会让界面拿到一个已经处理掉的请求。
+      "confirmation", "confirm-decide"];
 
     // 面板是查看用途，不需要实时。结果缓存在内存里，切页签/重开面板不再重复请求；
     // Host 侧另有 TTL 缓存，两层都命中时连 python 子进程都不会启动。
@@ -153,6 +164,9 @@ window.__ModuleLoader__.load({
     const CACHE_MAX_ENTRIES = 60;
     /** 兜底轮询间隔：面板是查看用途，切页签有缓存，不需要秒级刷新。 */
     const SNAPSHOT_POLL_MS = 60_000;
+    // 实盘业务确认的轮询间隔：它卡住的是一个正在等回答的工具调用，
+    // 60 秒一次的 snapshot 太慢，用户会以为没反应。
+    const CONFIRM_POLL_MS = 1_500;
 
     // K 线周期预设。实测：一次富途往返无论周期都是约 2.8-5.1 秒、约 29 KB，
     // 因此分钟级并不比日线贵——差别只在"一次调用能看多长"。
@@ -1959,6 +1973,95 @@ ol.sources code{font-size:11.5px}
                   `${row.created_at}${row.detail ? ` · ${row.detail}` : ""}`))) })));
     }
 
+    /**
+     * 实盘业务确认闸门。
+     *
+     * 这是**唯一**能批准实盘操作的地方，对应 Host 侧 policy.js 里的
+     * `store.requestConfirmation`。它与 DSH 的权限审批完全无关：
+     * 权限问的是"这个动作准不准做"，这里问的是"这笔单子对不对"。
+     *
+     * 三条硬约束：
+     *   1. 不依赖抽屉开合 —— 抽屉关着也必须弹出，否则请求只能等到超时被拒；
+     *   2. **只读**：没有输入框、没有改价改量，用户能做的只有"确认/拒绝"，
+     *      所以工作台依然是"无下单入口"的面板，只是多了一道必经的业务闸门；
+     *   3. 超时按拒绝处理（fail-closed），倒计时如实显示。
+     */
+    function ConfirmGate({ rpc }) {
+      const [pending, setPending] = React.useState(null);
+      const [busy, setBusy] = React.useState(false);
+      const [failure, setFailure] = React.useState("");
+      const [tick, setTick] = React.useState(0);
+
+      React.useEffect(() => {
+        let alive = true;
+        const controller = new AbortController();
+        let timer;
+        const poll = async () => {
+          try {
+            const value = await request(rpc, "confirmation", {}, controller.signal, { force: true });
+            if (alive) { setPending(value?.pending ?? null); setFailure(""); }
+          } catch (error) {
+            // 旧 Host 没有这个端点（进程早于插件更新）时静默：不该在界面上刷错误
+            if (alive && !/Unsupported|404|Unknown/i.test(String(error?.message ?? ""))) {
+              setFailure(String(error?.message ?? error));
+            }
+          } finally {
+            if (alive) timer = setTimeout(poll, CONFIRM_POLL_MS);
+          }
+        };
+        poll();
+        return () => { alive = false; controller.abort(); clearTimeout(timer); };
+      }, [rpc]);
+
+      // 倒计时每秒刷新；没有待确认项时不必跑
+      React.useEffect(() => {
+        if (!pending) return undefined;
+        const timer = setInterval(() => setTick((v) => v + 1), 1_000);
+        return () => clearInterval(timer);
+      }, [pending]);
+
+      const decide = async (decision) => {
+        if (!pending || busy) return;
+        setBusy(true); setFailure("");
+        try {
+          await request(rpc, "confirm-decide", { id: pending.id, decision }, undefined, { force: true });
+          setPending(null);
+          setTick((v) => v + 1);
+        } catch (error) {
+          setFailure(String(error?.message ?? error));
+        } finally { setBusy(false); }
+      };
+
+      if (!pending) return null;
+      const fields = pending.summary?.fields ?? [];
+      const raw = pending.summary?.raw ?? {};
+      const left = Math.max(0, Math.round((Date.parse(pending.expires_at) - Date.now()) / 1000));
+      return h("div", { className: "tw-gate", role: "alertdialog", "aria-modal": "true",
+        "aria-label": "实盘操作确认" },
+        h("section", { className: "tw-gate-card" },
+          h("header", { className: "tw-gate-head" },
+            h("span", { className: "tw-tag sell" }, "实盘"),
+            h("strong", null, `请确认这笔${pending.operation}`),
+            h("span", { className: "tw-meta" }, left > 0 ? `${left} 秒后自动拒绝` : "已超时，按拒绝处理")),
+          h("div", { className: "tw-kv" }, fields.map((field) =>
+            h("div", { key: field.label, className: "tw-kv-item" },
+              h("div", { className: "tw-kv-k" }, field.label),
+              h("div", { className: "tw-kv-v" }, field.value)))),
+          h("details", { className: "tw-item" },
+            h("summary", null, "券商原始参数（可核对，未做翻译）"),
+            h("div", { className: "tw-item-body" },
+              h("pre", { className: "tw-pre" }, JSON.stringify(raw, null, 2)))),
+          failure && h("p", { className: "tw-alert" }, `提交失败：${failure}`),
+          h("p", { className: "tw-hint" },
+            "确认只表示这笔参数无误；工作台不会改价、改量或代下单。"
+            + "切换账户模式不等于授权下单。"),
+          h("div", { className: "tw-gate-actions" },
+            h("button", { type: "button", className: "tw-btn danger", disabled: busy,
+              onClick: () => decide("rejected") }, "拒绝"),
+            h("button", { type: "button", className: "tw-btn primary", disabled: busy,
+              onClick: () => decide("approved") }, busy ? "提交中…" : "确认这笔操作"))) );
+    }
+
     function Dashboard({ rpc }) {
       const [open, setOpen] = React.useState(false);
       const [tab, setTab] = React.useState("market");
@@ -2023,6 +2126,8 @@ ol.sources code{font-size:11.5px}
         h("button", { type: "button", className: "tw-fab", "aria-expanded": open, title: "交易工作台",
           onClick: () => setOpen((v) => !v) },
           h("span", { className: `tw-dot${live ? " live" : ""}` }), open ? "收起工作台" : "交易工作台"),
+        // 业务确认与抽屉开合无关：抽屉关着也得能弹出来
+        h(ConfirmGate, { rpc }),
         h("div", { className: `tw-scrim${open ? " open" : ""}`, onClick: () => setOpen(false) }),
         h("aside", { className: `tw-drawer${open ? " open" : ""}`, role: "dialog", "aria-label": "交易工作台", "aria-hidden": !open },
           h("header", { className: "tw-top" },
@@ -2097,7 +2202,7 @@ ol.sources code{font-size:11.5px}
       internals: { readCache, writeCache, invalidateCaches, KNOWN_ENDPOINTS, CLIENT_TTL_MS,
         Card, cardEmpty, numeric, percent, percentValue,
         parseMarkdown, renderBlocks, blocksToHtml, Markdown, ReportDetail, Paged,
-        zh, labeled, ZH,
+        zh, labeled, ZH, ConfirmGate,
         barIndexAt, tooltipLeft, compactNumber,
         servedEndpoints: () => servedEndpoints, cacheSize: () => endpointCache.size,
         missingEndpoints: () => [...missingEndpoints] } };

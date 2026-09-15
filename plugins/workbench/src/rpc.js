@@ -1,4 +1,4 @@
-import { WorkbenchError } from "./store.js";
+import { CONFIRM_TTL_MS, WorkbenchError } from "./store.js";
 import { buildAuditChain } from "./audit.js";
 import { ENDPOINTS, matchesShape } from "./endpoints.js";
 import { createTtlCache } from "./cache.js";
@@ -110,6 +110,19 @@ export function createRpcHandler(store, deps = {}) {
           throw new WorkbenchError("Unexpected switch-mode field");
         }
         return { ok: true, value: store.switchMode(payload) };
+      }
+      if (endpoint === "confirmation") {
+        if (Object.keys(payload).length !== 0) throw new WorkbenchError("confirmation takes no payload");
+        // 内存态直读，不进缓存：缓存住"待确认"会让界面拿到已经处理掉的请求
+        return { ok: true, value: { pending: store.confirmationView(),
+          ttl_ms: CONFIRM_TTL_MS } };
+      }
+      if (endpoint === "confirm-decide") {
+        if (Object.keys(payload).some(key => !["id", "decision"].includes(key))) {
+          throw new WorkbenchError("Unexpected confirm-decide field");
+        }
+        // 这是唯一能批准实盘操作的通道；载荷只有编号与结论，没有下单参数
+        return { ok: true, value: store.decideConfirmation(payload) };
       }
       if (endpoint === "equity" || endpoint === "positions" || endpoint === "correlation") {
         const allowed = endpoint === "correlation" ? ["tickers", "window"] : ["mode", "window"];

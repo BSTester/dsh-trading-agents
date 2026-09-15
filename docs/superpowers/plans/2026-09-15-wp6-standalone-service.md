@@ -875,18 +875,29 @@ test("R1 模式互斥：sim 拒 live 类工具；live 拒 sim 类工具", async 
   assert.equal(guards[0](execOf("mcp__futu__account_positions")), undefined);
 });
 
-test("R2 live 写操作强制原生审批（ask）；sim 写不 ask", async (t) => {
+// R2 已按 2026-09-15 修订（规格 §5.1 A2）：实盘写操作走**业务确认**，
+// 不返回 ask —— ask 在 full-access（policy="never"）下会被 approval.decide()
+// 直接 rejected，表现为"用户拒绝了"而实际没人被问过。
+test("R2 live 写操作走业务确认而非原生审批；sim 写不确认", async (t) => {
   await inTempHome(t);
   const store = new WorkbenchStore();
   await store.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
   const { ctx, hooks } = fakeHarness(store);
   installTradingPolicy(ctx);
   const next = async () => ({ kind: "allow" });
-  const ask = await hooks["tools/pre-execute"][0](execOf("mcp__futu__trading_modify_order"), next);
-  assert.equal(ask.kind, "ask");
-  assert.match(ask.reason, /真实账户操作/);
+  const settling = hooks["tools/pre-execute"][0](
+    execOf("mcp__futu__trading_modify_order", { acc_id: "A1", market: 1, order_id: "1", qty: 100 }), next);
+  await new Promise((r) => setTimeout(r, 20));
+  const pending = store.confirmationView();
+  assert.ok(pending, "实盘写操作必须产生待确认");
+  assert.equal(pending.operation, "改单");
+  store.decideConfirmation({ id: pending.id, decision: "approved" });
+  const decision = await settling;
+  assert.notEqual(decision.kind, "ask", "不能返回 ask：那会受会话审批档位影响");
+  assert.equal(decision.kind, "allow");
   const sim = await hooks["tools/pre-execute"][0](execOf("mcp__futu__sim_trade_place_order"), next);
   assert.equal(sim.kind, "allow");
+  assert.equal(store.confirmationView(), null, "sim 写操作不应产生待确认");
 });
 
 test("R3 switch_mode：口令/expected_mode/租约/MCP 通道分级", async (t) => {
