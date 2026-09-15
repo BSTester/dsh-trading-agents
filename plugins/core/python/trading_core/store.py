@@ -12,7 +12,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 2  # v2：+valuations（WP2 估值因子按日落库）
+SCHEMA_VERSION = 3  # WP2 预留 2（并行分支）；WP3 落 3：plans/orders/fills/risk_checks 四表
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars(
@@ -40,6 +40,21 @@ CREATE TABLE IF NOT EXISTS valuations(
   symbol TEXT NOT NULL, day TEXT NOT NULL, field TEXT NOT NULL,
   value REAL NOT NULL, source TEXT NOT NULL,
   PRIMARY KEY(symbol, day, field)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS plans(
+  plan_id TEXT PRIMARY KEY, as_of TEXT NOT NULL, mode TEXT NOT NULL,
+  strategy_id TEXT NOT NULL, target TEXT NOT NULL, content_hash TEXT NOT NULL,
+  status TEXT NOT NULL, created_at TEXT NOT NULL, approved_at TEXT, approved_by TEXT);
+CREATE TABLE IF NOT EXISTS orders(
+  client_order_id TEXT PRIMARY KEY, plan_id TEXT, symbol TEXT NOT NULL,
+  market TEXT NOT NULL, side TEXT NOT NULL, qty INTEGER NOT NULL,
+  price REAL, status TEXT NOT NULL, broker_order_id TEXT, mode TEXT NOT NULL,
+  created_at TEXT NOT NULL, updated_at TEXT NOT NULL, err TEXT);
+CREATE TABLE IF NOT EXISTS fills(
+  fill_id TEXT PRIMARY KEY, client_order_id TEXT NOT NULL, price REAL NOT NULL,
+  qty INTEGER NOT NULL, traded_at TEXT, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS risk_checks(
+  id INTEGER PRIMARY KEY AUTOINCREMENT, plan_id TEXT, symbol TEXT, rule INTEGER NOT NULL,
+  allowed INTEGER NOT NULL, reason TEXT, checked_at TEXT NOT NULL);
 """
 
 
@@ -254,3 +269,127 @@ def read_valuations(conn, symbol, as_of):
         " (SELECT MAX(day) FROM valuations WHERE symbol=? AND day<=?)",
         (symbol, symbol, as_of)).fetchall()
     return {r["field"]: r["value"] for r in rows}
+
+
+# ---------------------------------------------------------------------------
+# v3：执行闭环（plans/orders/fills/risk_checks，规格 §6）。时间一律 UTC+8 字符串。
+# ---------------------------------------------------------------------------
+
+_OPEN_STATES = ("draft", "frozen", "submitting", "submitted", "partial", "unknown")
+
+
+def _now():
+    import datetime as _dt
+    tz8 = _dt.timezone(_dt.timedelta(hours=8))
+    return _dt.datetime.now(tz8).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def insert_plan(conn, plan_id, as_of, mode, strategy_id, target, content_hash,
+                status="frozen", approved_at=None, approved_by=None):
+    conn.execute(
+        "INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,content_hash,"
+        "status,created_at,approved_at,approved_by) VALUES(?,?,?,?,?,?,?,?,?,?)",
+        (plan_id, as_of, mode, strategy_id,
+         json.dumps(target, ensure_ascii=False), content_hash, status, _now(),
+         approved_at, approved_by))
+    conn.commit()
+
+
+def upsert_plan_status(conn, plan_id, status):
+    conn.execute("UPDATE plans SET status=? WHERE plan_id=?", (status, plan_id))
+    conn.commit()
+
+
+def get_plan(conn, plan_id):
+    row = conn.execute("SELECT * FROM plans WHERE plan_id=?", (plan_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"计划不存在 {plan_id}")
+    plan = dict(row)
+    plan["target"] = json.loads(plan["target"])
+    return plan
+
+
+def list_plans(conn):
+    rows = conn.execute("SELECT * FROM plans ORDER BY created_at, plan_id").fetchall()
+    out = []
+    for row in rows:
+        plan = dict(row)
+        plan["target"] = json.loads(plan["target"])
+        out.append(plan)
+    return out
+
+
+def insert_order(conn, client_order_id, plan_id, symbol, market, side, qty, price,
+                 mode, status="draft", broker_order_id=None):
+    now = _now()
+    conn.execute(
+        "INSERT INTO orders(client_order_id,plan_id,symbol,market,side,qty,price,"
+        "status,broker_order_id,mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+        (client_order_id, plan_id, symbol, market, side, int(qty), price, status,
+         broker_order_id, mode, now, now))
+    conn.commit()
+
+
+def update_order_status(conn, client_order_id, status, broker_order_id=None, err=None):
+    conn.execute(
+        "UPDATE orders SET status=?, broker_order_id=COALESCE(?,broker_order_id),"
+        " err=COALESCE(?,err), updated_at=? WHERE client_order_id=?",
+        (status, broker_order_id, err, _now(), client_order_id))
+    conn.commit()
+
+
+def get_orders_by_plan(conn, plan_id):
+    return conn.execute(
+        "SELECT * FROM orders WHERE plan_id=? ORDER BY rowid", (plan_id,)).fetchall()
+
+
+def get_open_orders(conn, plan_id=None):
+    sql = ("SELECT * FROM orders WHERE status IN "
+           f"({','.join('?' * len(_OPEN_STATES))})")
+    params = list(_OPEN_STATES)
+    if plan_id is not None:
+        sql += " AND plan_id=?"
+        params.append(plan_id)
+    return conn.execute(sql + " ORDER BY rowid", params).fetchall()
+
+
+def insert_fill(conn, fill_id, client_order_id, price, qty, traded_at=None):
+    conn.execute(
+        "INSERT INTO fills(fill_id,client_order_id,price,qty,traded_at,created_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (fill_id, client_order_id, price, int(qty), traded_at, _now()))
+    conn.commit()
+
+
+def fills_by_order(conn, client_order_id):
+    return conn.execute(
+        "SELECT * FROM fills WHERE client_order_id=? ORDER BY rowid",
+        (client_order_id,)).fetchall()
+
+
+def insert_risk_check(conn, plan_id, symbol, rule, allowed, reason=""):
+    conn.execute(
+        "INSERT INTO risk_checks(plan_id,symbol,rule,allowed,reason,checked_at)"
+        " VALUES(?,?,?,?,?,?)",
+        (plan_id, symbol, int(rule), 1 if allowed else 0, reason, _now()))
+    conn.commit()
+
+
+def risk_checks_by_plan(conn, plan_id):
+    return conn.execute(
+        "SELECT * FROM risk_checks WHERE plan_id=? ORDER BY id",
+        (plan_id,)).fetchall()
+
+
+def set_halt(conn, active, reason=None):
+    kv_set(conn, "halt:active", {"active": bool(active), "reason": reason,
+                                 "set_at": _now()})
+
+
+def is_halted(conn):
+    value = kv_get(conn, "halt:active")
+    return bool(value and value.get("active"))
+
+
+def clear_halt(conn):
+    set_halt(conn, False, reason=None)

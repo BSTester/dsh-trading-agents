@@ -860,3 +860,92 @@ if __name__ == "__main__":
 
 - 离线端到端测试输出：（执行时粘贴）
 - sim 冒烟原始响应（脱敏后）：（执行时粘贴）
+
+---
+
+## WP3 验收记录（2026-09-14，feat/wp3 分支，代理执行）
+
+### 离线部分（已完成）
+
+**分支：** `feat/wp3`（自 main `0b3eefa` 拉出）；**执行方式：** 逐任务严格 TDD（先失败测试后实现），每任务一 commit。
+
+**任务 0–8 提交：**
+
+| 任务 | commit | 内容 |
+|---|---|---|
+| 0 | `6cadafd` | WP3 依赖锁定与存储迁移 v3（plans/orders/fills/risk_checks） |
+| 1 | `4217267` | 风控硬拦截八规则 |
+| 2 | `14340f2` | 计划生成与冻结（content_hash） |
+| 3 | `5b8b57d` | OMS 状态机（迁移白名单+幂等在途唯一） |
+| 4 | `d999fcf` | 模拟盘适配器（下单/撤单/持仓，超时→unknown） |
+| 5 | `bcb042b` | 执行编排（预检→提交→熔断撤余单） |
+| 6 | `16ad168` | 对账判定与 TCA 落库聚合 |
+| 7 | `00e2a7f` | plan-build/reconcile-diff CLI |
+| 8 | `ef7f67f` | WP3 状态机端到端（测试） |
+| 9 | （本提交） | 验收记录（离线部分）；sim 冒烟待用户在场执行 |
+
+**离线端到端测试输出：**
+
+```
+$ ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_core_wp3_e2e -v
+test_full_state_machine (tests.test_core_wp3_e2e.E2eTest.test_full_state_machine) ... ok
+test_halt_cancels_remaining_orders (tests.test_core_wp3_e2e.E2eTest.test_halt_cancels_remaining_orders)
+规格规则 7 后半：熔断 → 撤计划内剩余未提交订单 + 置 halt。 ... ok
+----------------------------------------------------------------------
+Ran 2 tests in 0.021s    OK
+```
+
+**全量回归（离线套件）：**
+
+```
+$ ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'
+Ran 315 tests in ~15s    OK
+```
+
+连续 3 轮全量 315/315 通过（首轮曾出现 1 次失败，经 3 轮复跑未复现，且无任何测试断言
+SCHEMA_VERSION 旧值，判定为安装类环境测试偶发，与本次改动无关）。
+
+**覆盖盘点：** 新增 8 个测试文件 33 项：locks+store v3+CLI（10）、risk（10）、planner（2）、
+oms（5）、broker（6）、execute（1）、reconcile+tca（6）、e2e（2，含计划场景之外的
+熔断撤余单正向用例）。任务 0 的 store v3 读写函数全部有离线回环测试。
+
+### sim 真实冒烟（任务 9 步骤 1）：**待用户在场执行**
+
+按 P4 口径（对话逐笔确认）执行计划所列四步：日历就绪 → 最小数量
+`sim_trade_input_order` 下单/查询/撤单/资金核对 → 故意断网 60s 观察适配器返回
+unknown 不重发 → 原始响应 JSON 记入 `docs/P4-live-trading.md` 联调小节。
+本记录中该项留空：**待用户在场执行**。
+
+### 与计划的偏差（均已按「修正确的一方」处理）
+
+- **D1 风控规则 8 放行 `executing`**：计划给的 execute.run 向 pre_trade_checks 传
+  `plan_status="executing"`，但计划的 risk.py 规则 8 只接受 frozen/approved——
+  二者自相矛盾（会使计划自带的任务 5/任务 8 测试全部被规则 8 拦截）。按规格
+  §6.1 生命周期（draft→frozen→approved→executing 冻结后内容不变），规则 8 放行
+  frozen/approved/executing 三态，expired/cancelled/draft 仍拒绝；execute.run 保持
+  如实传 `executing`。
+- **D2 状态机允许 draft/frozen → cancelled**：规格规则 7「撤计划内剩余订单」要求
+  未提交订单可本地撤销，计划给的 TRANSITIONS 白名单缺该边，熔断分支会抛
+  ValueError。已补白名单（不涉及券商调用）。
+- **D3 oms 测试补 `submitting` 步**：计划测试 `frozen→unknown` 直接跳步，违反
+  规格 §6.2 白名单（unknown 只发生在提交环节）。以规格为准修测试。
+- **D4 任务 7 CLI 测试落位**：计划要求测试放 `tests/test_core_cli.py`，该文件是
+  WP1 既有文件且不在本分支文件所有权清单内，测试改放
+  `tests/test_core_wp3_locks.py`（Wp3CliCommands 类）。
+- **D5 测试文件补 `__main__` 块**：`tests/test_suite_hygiene.py` 强制每个测试文件
+  有 `if __name__` 块且其后不得有测试定义；计划的测试片段未带，已按仓库规范补齐。
+- **D6 任务 9 commit message**：计划未给任务 9 的提交信息，采用
+  `docs(plans): WP3 验收记录（离线部分）`。
+- **D7 任务 5 测试注释修正**：计划注释称 600519「被规则5+规则7 拦截」，实际
+  ctx（day_pnl=-0.005）只触发规则 5；断言不变，注释改为实况，并补 halted=False
+  断言。
+- **D8 execute 补 draft→frozen 步**：计划给的 execute.run 直接 `draft→submitting`，
+  违反规格 §6.2 状态机（`draft→frozen→submitting`）；已在执行入口把在途 draft 单
+  统一升 frozen（对应「订单归属已冻结计划」），再进入提交流程。
+
+### 备注
+
+- 本轮 WP2 并行分支已迁出至独立 worktree（`/home/penn/workspace/dsh-wp2`，
+  分支 feat/wp2）；本分支独占主工作目录。合并时：`store.py` 的 SCHEMA_VERSION
+  以本分支的 3 为准并保留两方表（WP2 升 2 的表 + WP3 四表）；`cli.py` 双方均为
+  纯追加，按序保留即可。
