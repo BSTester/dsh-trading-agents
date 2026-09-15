@@ -134,7 +134,7 @@ window.__ModuleLoader__.load({
 
     const KNOWN_ENDPOINTS = ["snapshot", "switch-mode", "series", "equity", "positions",
       "correlation", "sensitivity", "risk", "trades", "events", "factors", "ic", "audit",
-      "sources", "instrument", "quality"];
+      "sources", "instrument", "quality", "plan", "plan-execute", "schedule", "reconcile"];
 
     // 面板是查看用途，不需要实时。结果缓存在内存里，切页签/重开面板不再重复请求；
     // Host 侧另有 TTL 缓存，两层都命中时连 python 子进程都不会启动。
@@ -143,6 +143,7 @@ window.__ModuleLoader__.load({
       correlation: 10 * 60_000, sensitivity: 30 * 60_000, risk: 5 * 60_000, trades: 60_000,
       events: 30 * 60_000, factors: 10 * 60_000, ic: 10 * 60_000, audit: 60_000,
       sources: 2 * 60_000, quality: 30 * 60_000,
+      plan: 30_000, schedule: 15_000, reconcile: 2 * 60_000,
     };
     const CACHE_MAX_ENTRIES = 60;
     /** 兜底轮询间隔：面板是查看用途，切页签有缓存，不需要秒级刷新。 */

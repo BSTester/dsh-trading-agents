@@ -2,6 +2,9 @@ import { WorkbenchError } from "./store.js";
 import { buildAuditChain } from "./audit.js";
 import { ENDPOINTS, matchesShape } from "./endpoints.js";
 import { createTtlCache } from "./cache.js";
+import { createCoreBridge } from "./corebridge.js";
+import { writeCommand } from "./commandbus.js";
+import { pythonHome } from "./pycore.js";
 
 // 结果缓存：面板是查看用途，不需要实时。这些接口背后是 python 子进程与富途调用，
 // 每次切页签都重跑既慢又浪费额度，因此在本层做 TTL 缓存（默认值，按接口粒度）。
@@ -22,6 +25,10 @@ export const CACHE_TTL_MS = {
   audit: 2 * 60_000,
   sources: 5 * 60_000,
   quality: 60 * 60_000,
+  // WP4：调度态是低频变化的面板数据；心跳/作业给短 TTL，对账给中等 TTL
+  plan: 60_000,
+  schedule: 30_000,
+  reconcile: 5 * 60_000,
 };
 /** 稳定序列化：键顺序不影响缓存命中。 */
 function stableKey(payload) {
@@ -56,6 +63,11 @@ export function createRpcFetchHandler(store, endpoint, deps = {}) {
 
 export function createRpcHandler(store, deps = {}) {
   const cache = deps.cache ?? createTtlCache(deps);
+  const bridge = deps.corebridge ?? createCoreBridge();
+  const bus = deps.commandBus ?? { writeCommand };
+  // plan-execute 的动作 → 白名单指令类型映射（规格 §8.2，5 种）
+  const EXECUTE_ACTIONS = { execute: "execute_plan", cancel: "cancel_plan",
+    kill: "kill", unkill: "unkill" };
 
   /** 缓存包装：命中则直接返回，并把「数据算于何时」一并告知客户端。 */
   const cached = async (endpoint, payload, force, produce, errorCode) => {
@@ -156,6 +168,45 @@ export function createRpcHandler(store, deps = {}) {
           return { ok: false, error: { code: "trading/analytics-unavailable",
             message: String(error?.message ?? error).slice(0, 300), details: {} } };
         }
+      }
+      if (endpoint === "plan" || endpoint === "schedule" || endpoint === "reconcile") {
+        // 只读端点：经 pycore 子命令取 trading-core 快照，Host 不直读 SQLite。
+        // plan 额外并入账户模式（live 口令门槛由 plan-execute 分支复核）。
+        if (Object.keys(payload).length !== 0) {
+          throw new WorkbenchError(`${endpoint} takes no payload`);
+        }
+        const produce = endpoint === "plan"
+          ? async () => ({ ...(await bridge.plan()), mode: store.snapshot().mode })
+          : () => bridge[endpoint]();
+        return await cached(endpoint, payload, forceRefresh, produce, "trading/core-unavailable");
+      }
+      if (endpoint === "plan-execute") {
+        // 唯一受约束执行入口（规格 §8.3 边界变更）：校验 → 原子写指令文件即返回，
+        // 不等待执行结果；执行状态由 plan 端点轮询。live 必须口令「确认执行」。
+        if (Object.keys(payload).some(key => !["plan_hash", "expected_mode", "confirmation", "action"].includes(key))) {
+          throw new WorkbenchError("Unexpected plan-execute field");
+        }
+        const action = payload.action ?? "execute";
+        const type = EXECUTE_ACTIONS[action];
+        if (!type) throw new WorkbenchError(`Unknown plan-execute action: ${action}`);
+        const commandPayload = {};
+        if (type === "execute_plan") {
+          if (typeof payload.plan_hash !== "string" || !payload.plan_hash) {
+            throw new WorkbenchError("plan-execute requires plan_hash");
+          }
+          if (payload.expected_mode !== store.snapshot().mode) {
+            throw new WorkbenchError(`模式已变化：期望 ${payload.expected_mode}，当前 ${store.snapshot().mode}，请刷新后重试`);
+          }
+          if (store.snapshot().mode === "live" && payload.confirmation !== "确认执行") {
+            throw new WorkbenchError("实时账户执行需输入口令「确认执行」");
+          }
+          commandPayload.plan_hash = payload.plan_hash;
+          commandPayload.expected_mode = payload.expected_mode;
+        } else if (type === "cancel_plan" && typeof payload.plan_hash === "string") {
+          commandPayload.plan_hash = payload.plan_hash;
+        }
+        const nonce = await bus.writeCommand(pythonHome(), type, commandPayload);
+        return { ok: true, value: { queued: true, nonce, action } };
       }
       if (endpoint === "series") {
         if (Object.keys(payload).some(key => !["ticker", "period", "limit"].includes(key))) {

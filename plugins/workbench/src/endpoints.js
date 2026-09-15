@@ -26,6 +26,10 @@ export const ENDPOINTS = [
   "sources",
   "instrument",
   "quality",
+  "plan",
+  "plan-execute",
+  "schedule",
+  "reconcile",
 ];
 
 /**
@@ -49,6 +53,10 @@ export const ENDPOINT_SHAPE = {
   sources: ["sources"],
   instrument: ["ticker"],
   quality: ["ticker"],
+  // WP4：plan-execute 是动作端点（排队即返回），不进缓存形状表
+  plan: ["plans", "alerts"],
+  schedule: ["heartbeat", "jobs"],
+  reconcile: ["diffs", "tca"],
 };
 
 /** 载荷是否具备该接口的最小字段；未知接口一律放行。 */

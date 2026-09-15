@@ -93,6 +93,19 @@ def build_parser():
     s.add_argument("--interval", type=int, default=60, help="常驻轮询秒数（默认 60）")
     s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
     _add_db(s)
+
+    # ── WP4 只读快照：Host 工作台经 pycore 取数的唯一通道（Node 不直读 SQLite）──
+    s = sub.add_parser("snapshot-plan", help="计划快照（plans+orders+预检+告警，只读）")
+    s.add_argument("--limit", type=int, default=10, help="告警条数（默认 10）")
+    _add_db(s)
+
+    s = sub.add_parser("snapshot-schedule", help="调度快照（心跳/作业/kill/halt，只读）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    _add_db(s)
+
+    s = sub.add_parser("snapshot-reconcile", help="对账快照（差异/TCA/计划→订单→成交链，只读）")
+    s.add_argument("--limit", type=int, default=5, help="链路包含的计划数（默认 5）")
+    _add_db(s)
     return p
 
 
@@ -185,9 +198,24 @@ def main(argv=None):
                                               prices=prices, as_of=args.as_of)
         elif args.cmd == "reconcile-diff":
             from . import reconcile
-            result = {"diffs": reconcile.compare(
+            diffs = reconcile.compare(
                 conn, json.loads(Path(args.local).read_text()),
-                json.loads(Path(args.broker).read_text()))}
+                json.loads(Path(args.broker).read_text()))
+            # 最新差异落 kv：snapshot-reconcile 的工作台取数口径（对账差异持久化）
+            store.kv_set(conn, "reconcile:latest",
+                         {"diffs": diffs, "at": _dt.datetime.now().isoformat(timespec="seconds")})
+            result = {"diffs": diffs}
+        elif args.cmd == "snapshot-plan":
+            from . import snapshots
+            result = snapshots.plan_snapshot(conn, alert_limit=args.limit)
+        elif args.cmd == "snapshot-schedule":
+            import os
+            from . import snapshots
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = snapshots.schedule_snapshot(conn, home)
+        elif args.cmd == "snapshot-reconcile":
+            from . import snapshots
+            result = snapshots.reconcile_snapshot(conn, chain_limit=args.limit)
         elif args.cmd == "daemon":
             import os
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
