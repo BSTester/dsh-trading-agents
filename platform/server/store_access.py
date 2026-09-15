@@ -307,7 +307,10 @@ def pending_observations(home):
 
 
 # WP7 起服务自有的端点（legacy 面板源 endpoints.js 不再回写，见 endpoints() 说明）。
-WP7_ENDPOINTS = ("factors-history",)
+# 任务 2：factors-history；任务 3：受约束交易工具（写三个走交易闸门 + Web 确认卡片，
+# 读三个 mode 约束直通 broker——均不进 TTL/形状表，与 plan-execute 同类）。
+WP7_ENDPOINTS = ("factors-history", "trade_place", "trade_modify", "trade_cancel",
+                 "account_positions", "account_orders", "account_funds")
 
 
 def endpoints():

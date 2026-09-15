@@ -154,12 +154,17 @@ class EndpointTableLockTests(unittest.TestCase):
         self.assertEqual(caches.ENDPOINT_SHAPE["factors-history"], ["snapshots"])
 
     def test_endpoint_list_matches_endpoints_js_plus_wp7_delta(self):
-        """legacy JS 清单（22）+ WP7 服务自有端点 ≡ store_access.endpoints()（23）。"""
+        """legacy JS 清单（22）+ WP7 服务自有端点 ≡ store_access.endpoints()（29）。"""
         endpoints = js_endpoint_list(ENDPOINTS_JS)
         self.assertEqual(len(endpoints), 22)
         self.assertEqual(endpoints[-2:], ["confirmation", "confirm-decide"])
         self.assertEqual(store_access.endpoints(), endpoints + list(WP7_ENDPOINTS))
-        self.assertEqual(len(store_access.endpoints()), 23)
+        self.assertEqual(len(store_access.endpoints()), 22 + len(store_access.WP7_ENDPOINTS))
+        self.assertEqual(len(store_access.endpoints()), 29)
+        # WP7 任务 3 增量逐项钉死（写三个 + 读三个，与 mcp_tools.ENDPOINT_TOOL_ENDPOINTS 对齐）
+        self.assertEqual(list(store_access.WP7_ENDPOINTS),
+                         ["factors-history", "trade_place", "trade_modify", "trade_cancel",
+                          "account_positions", "account_orders", "account_funds"])
 
     def test_analytics_endpoints_are_declared_by_endpoints_js(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))

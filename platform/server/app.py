@@ -52,7 +52,7 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
-from server import audit_chain, caches, compute, mcp_tools, store_access
+from server import audit_chain, caches, compute, mcp_tools, store_access, trading
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -118,6 +118,14 @@ PLAN_EXECUTE_FIELDS = ("plan_hash", "expected_mode", "confirmation", "action")
 SERIES_FIELDS = ("ticker", "period", "limit")
 # WP7：因子快照历史的载荷只有 limit（1..120 校验在 compute.factors_history）
 FACTORS_HISTORY_FIELDS = ("limit",)
+# WP7 任务 3：受约束交易工具的载荷白名单（逐工具定义；与 mcp_tools 的 params 同形）。
+# 交易工具的载荷刻意**不含 mode**（模式只认模式文件，杜绝声明模式旁路）也不含口令
+# （live 授权=Web 业务确认卡片，不是对话口令）；client_order_id 是幂等编号（可省）。
+TRADE_PLACE_FIELDS = ("symbol", "side", "qty", "price", "client_order_id")
+TRADE_MODIFY_FIELDS = ("order_id", "symbol", "side", "qty", "price", "client_order_id")
+TRADE_CANCEL_FIELDS = ("order_id", "symbol", "client_order_id")
+# 账户查询只受模式约束直通 broker；mode 缺省读模式文件（实时查询，不进缓存）
+ACCOUNT_QUERY_FIELDS = ("mode",)
 
 
 def error_envelope(code, message, status):
@@ -153,7 +161,8 @@ def _check_fields(endpoint, payload, allowed):
         raise WorkbenchError(f"Unexpected {endpoint} field")
 
 
-def create_handler(home, analytics=None, series=None, core=None, command_home=None):
+def create_handler(home, analytics=None, series=None, core=None, command_home=None,
+                   trade=None):
     """``rpc.js:64-231 createRpcHandler`` 的 Python 等价物；返回 ``handle(endpoint, payload)``。
 
     - ``analytics``：``{endpoint: callable(payload, force) -> value}``（缺省走 compute 子进程，
@@ -161,7 +170,9 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
       对应 ``createRpcHandler(store, deps).deps.analytics``）；
     - ``series``：``callable(ticker, period, limit) -> value``（缺省 compute.series）；
     - ``core``：``{name: callable() -> value}``，name ∈ snapshot-plan/schedule/reconcile；
-    - ``command_home``：指令落盘根，缺省 ``home``（服务侧 DSH_HOME）。
+    - ``command_home``：指令落盘根，缺省 ``home``（服务侧 DSH_HOME）；
+    - ``trade``（WP7 任务 3）：``TradeGate``（缺省按 home 构造默认闸门，broker 经
+      ``trading_core.broker`` + ``trading_datasource``；测试注入替身即可离线）。
     """
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
@@ -173,6 +184,8 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 for name in compute.SNAPSHOT_COMMANDS}
         # WP7：因子快照历史走同一 core 桥（limit 由路由透传，compute 侧校验）
         core["factors-history"] = lambda limit=30: compute.factors_history(limit)
+    if trade is None:
+        trade = trading.TradeGate(home)
     write_home = home if command_home is None else command_home
 
     def handle(endpoint, raw_payload):
@@ -280,6 +293,31 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 # 口令字段到此为止：绝不进入 command_payload（规格 §5.2 P3）
                 nonce = compute.write_command(write_home, type_, command_payload)
                 return {"ok": True, "value": {"queued": True, "nonce": nonce, "action": action}}
+            if endpoint == "trade_place":
+                # WP7 任务 3：受约束交易写路径——闸门（模式→风控 8 规则→kill→业务确认）
+                # 在 server/trading.py，唯一触达 broker 的放行方式是 Web 确认卡片批准。
+                # **响应可能是长阻塞**：live 下确认 TTL=120s（store_access.CONFIRM_TTL_MS，
+                # 到期自动拒绝 fail-closed），HTTP 路由经 asyncio.to_thread 阻塞等判决。
+                # 与 preset 的关系：agent.cordis.yml 的 quant-platform-mcp 行
+                # toolCallTimeoutMs=120000 与确认 TTL 同值——模型侧会在 120s 先看到
+                # 工具超时，而闸门继续等到 TTL 到期按拒绝收尾，订单绝不会在无批准下
+                # 提交；任务 5（一键安装）建议把该行调到 180000 留出作答余量。
+                # 与 plan-execute 同类：动作端点不进 ENDPOINT_SHAPE/CACHE_TTL_MS 表
+                # （写操作与实时查询一律 TTL 0，不落任何缓存）。
+                _check_fields(endpoint, payload, TRADE_PLACE_FIELDS)
+                return trade.place(payload)
+            if endpoint == "trade_modify":
+                # 同上：完整闸门链 + Web 确认；改单在 broker 层=撤旧+重下（TOOL-LIMITS）
+                _check_fields(endpoint, payload, TRADE_MODIFY_FIELDS)
+                return trade.modify(payload)
+            if endpoint == "trade_cancel":
+                _check_fields(endpoint, payload, TRADE_CANCEL_FIELDS)
+                return trade.cancel(payload)
+            if endpoint in ("account_positions", "account_orders", "account_funds"):
+                # 账户查询：只受模式约束直通 broker（mode 缺省读模式文件）；
+                # broker 异常在闸门内信封化为 trading/broker-unavailable，不 500。
+                _check_fields(endpoint, payload, ACCOUNT_QUERY_FIELDS)
+                return getattr(trade, endpoint.replace("account_", ""))(payload.get("mode"))
             if endpoint == "series":
                 _check_fields(endpoint, payload, SERIES_FIELDS)
                 # series.js:28 的解构默认只在 undefined 时生效：null/"" 交给 compute.series

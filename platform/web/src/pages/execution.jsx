@@ -1,5 +1,10 @@
-// 执行页：券商交易事实（snapshot.trade_summary，读时归纳不写盘）+ 本地台账成交（trades）。
+// 执行页：券商交易事实（snapshot.trade_summary，读时归纳不写盘）+ 本地台账成交（trades）
+// + 待确认实盘操作卡片（WP7 任务 3：服务进程内业务确认的 Web 作答入口）。
 // 字段依据（页面每个取值路径均可指到源码行）：
+//   confirmation → server/store_access.py confirmation_view：{id, at, expires_at, mode,
+//     tool, operation(下单/改单/撤单), session_id, status, summary{fields,raw}}；
+//     TTL 120 秒（CONFIRM_TTL_MS），超时服务端按拒绝收尾（fail-closed）。
+//   批准/拒绝 → confirm-decide（唯一能批准实盘操作的通道；载荷只有 id 与 decision）。
 //   snapshot.trade_summary → plugins/workbench/src/broker_trades.js summarizeBrokerActivity：
 //     orders[{order_id, symbol, name, side(1=买入/2=卖出，由 summary 按工具 schema 给出，
 //       未知为 null), side_code, qty, filled_qty(cum_qty), price(委托价), avg_fill_price,
@@ -17,7 +22,9 @@
 // 「只归纳、不推测」：缺字段一律 —，不补默认值；状态码原样展示，不猜标签；
 // 台账模式取 snapshot.value.mode（当前账户模式），切换模式不授权下单。
 import React from "react";
-import { Alert, Card, Collapse, Space, Statistic, Table, Tag, Typography } from "antd";
+import { Alert, App, Button, Card, Collapse, Space, Statistic, Table, Tag, Typography } from "antd";
+import { callApi } from "../services/api.js";
+import { decideDisabled, remainingSeconds, summaryLines } from "../services/confirm.js";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 
 /** ISO 时间 → 展示（分钟精度）；缺失显示「时间未知」（与旧客户端一致，不编造）。 */
@@ -85,6 +92,74 @@ function RawResponseItems({ activity }) {
     </Space>);
 }
 
+/** 待确认实盘操作卡片（WP7 任务 3）：10s 轮询 + 1s 倒计时；唯一人工批准通道的页面侧。
+ *  文案三类白名单：安全合规（批准=授权该笔实盘操作）/ 操作反馈（已批准、已拒绝、等待确认中）
+ *  / 字段标签（operation、工具、摘要行、剩余秒数）。 */
+function ConfirmationCard() {
+  const { message } = App.useApp();
+  const confirmation = useEndpoint("confirmation");
+  const pending = confirmation.value?.pending ?? null;
+  // 倒计时秒针：只在有待确认时走秒，卸载/无单即清（setInterval 必须有对应 cleanup）
+  const [now, setNow] = React.useState(() => Date.now());
+  React.useEffect(() => {
+    if (!pending) return undefined;
+    setNow(Date.now());
+    const tick = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(tick);
+  }, [pending?.id]);
+  // 10s 轮询兜底：卡片展示期间即使无人操作也能及时看到超时消失
+  React.useEffect(() => {
+    if (!pending) return undefined;
+    const timer = setInterval(() => confirmation.refresh(), 10_000);
+    return () => clearInterval(timer);
+  }, [confirmation.refresh, pending?.id]);
+  const [busy, setBusy] = React.useState(false);
+
+  if (confirmation.error) {
+    return <Typography.Text type="danger">待确认读取失败：{confirmation.error}</Typography.Text>;
+  }
+  if (!pending) return null;
+  const seconds = remainingSeconds(pending.expires_at, now);
+  const disabled = decideDisabled(pending, now) || busy;
+  const decide = async (decision) => {
+    setBusy(true);
+    try {
+      await callApi("confirm-decide", { id: pending.id, decision });
+      message.success(decision === "approved" ? "已批准" : "已拒绝");
+      confirmation.refresh();
+    } catch (error) {
+      message.error(`作答失败：${error.message || error}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <Card type="inner" title={`待确认实盘操作：${pending.operation ?? "实盘写操作"}`}
+      extra={(
+        <Space size={8}>
+          <Tag color="orange">等待确认中</Tag>
+          <Typography.Text type={seconds === null || seconds <= 0 ? "danger" : "warning"}>
+            {seconds === null ? "剩余时间未知" : `剩余 ${seconds} 秒`}
+          </Typography.Text>
+        </Space>)}>
+      <Typography.Paragraph type="warning" style={{ marginBottom: 8 }}>
+        批准即授权该笔实盘操作；拒绝或 120 秒超时按拒单处理（fail-closed）。
+      </Typography.Paragraph>
+      <Space direction="vertical" size={2} style={{ width: "100%", marginBottom: 8 }}>
+        <Typography.Text>工具：{pending.tool ?? "—"}</Typography.Text>
+        <Typography.Text>模式：{pending.mode ?? "—"}</Typography.Text>
+        {summaryLines(pending.summary).map((line) => (
+          <Typography.Text key={line}>{line}</Typography.Text>))}
+      </Space>
+      <Space size="small">
+        <Button type="primary" danger disabled={disabled} onClick={() => decide("approved")}>
+          批准
+        </Button>
+        <Button disabled={busy} onClick={() => decide("rejected")}>拒绝</Button>
+      </Space>
+    </Card>);
+}
+
 export default function ExecutionPage() {
   const snapshot = useSnapshotPoll();
   const summary = snapshot.value?.trade_summary ?? null;
@@ -107,13 +182,13 @@ export default function ExecutionPage() {
           <Typography.Text type="danger">快照读取失败：{snapshot.error}</Typography.Text>)}
         {snapshot.value?.notice && (
           <Typography.Text type="secondary">{snapshot.value.notice}</Typography.Text>)}
-        {/* 跨进程边界（必须如实标注，2026-09-15 业务确认修订）：实盘写操作的业务确认是
-            「此刻等人回答」的进程内存态，Harness 进程与服务进程各持一份、互不可见。
-            本页（独立 Web）看不到 Harness 会话里发起的待确认，那笔只能在 Harness 内的工作台
-            面板作答；确认列表界面将来上线时必须保留这句标注（规格 §5.1 A2 末段）。 */}
+        {/* 待确认实盘操作：确认是服务进程内存态——本卡片覆盖 WP7 交易闸门（服务进程
+            发起）的待确认；Harness 会话内发起的确认仍只在 Harness 的工作台面板可见。 */}
+        <ConfirmationCard />
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          实盘写操作需在工作台逐笔确认；确认是进程内存态——
-          本页看不到 Harness 会话内发起的待确认，那笔请在 Harness 内的工作台面板作答。
+          交易确认是进程内存态：上面的卡片只显示本服务进程发起的待确认（经 trade_* 工具
+          或计划执行发起）；Harness 会话内发起的待确认本页看不到，请在 Harness 内的工作台
+          面板作答。
         </Typography.Text>
 
         <Card type="inner" title="券商订单（按订单号去重，保留最后一次观测）"
@@ -144,7 +219,7 @@ export default function ExecutionPage() {
             <Typography.Text type="secondary">
               {snapshot.loading
                 ? "动作记录加载中…"
-                : "暂无动作记录；下单/改单/撤单请在 Harness 会话中完成并确认。"}
+                : "暂无动作记录；下单/改单/撤单经工作台的 trade_* 工具或计划执行发起。"}
             </Typography.Text>
           ) : (
             <Table size="small"

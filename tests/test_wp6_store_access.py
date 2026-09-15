@@ -264,13 +264,18 @@ class SnapshotTest(StoreAccessBase):
 
     def test_endpoints_manifest_is_23_and_cached(self):
         endpoints = sa.endpoints()
-        # 22 legacy（endpoints.js 文本提取）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS）
+        # 22 legacy（endpoints.js 文本提取）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS；
+        # 任务 3 起含 factors-history + 6 个交易端点，共 29）
         expected = 22 + len(sa.WP7_ENDPOINTS)
         self.assertEqual(len(endpoints), expected)
+        self.assertEqual(expected, 29)
         self.assertEqual(endpoints[0], "snapshot")
-        self.assertEqual(endpoints[-1], "factors-history")
+        self.assertEqual(endpoints[-7], "factors-history")
+        self.assertEqual(endpoints[-6:],
+                         ["trade_place", "trade_modify", "trade_cancel",
+                          "account_positions", "account_orders", "account_funds"])
         # 业务确认两端点必须在白名单里（HTTP 面据此注册路由）
-        self.assertEqual(endpoints[-3:-1], ["confirmation", "confirm-decide"])
+        self.assertEqual(endpoints[-9:-7], ["confirmation", "confirm-decide"])
         self.assertEqual(len(set(endpoints)), expected)
         self.assertEqual(endpoints, sa.endpoints())
         # 缓存返回副本：调用方改动不会污染下一次

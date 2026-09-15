@@ -1,10 +1,10 @@
-"""WP7 任务 2：``factors-history`` 查询（HTTP 端点 + MCP 工具，工具面 27）。全部离线注入。
+"""WP7 任务 2：``factors-history`` 查询（HTTP 端点 + MCP 工具；工具面在任务 3 起 33）。全部离线注入。
 
 * compute：``factors_history(limit)`` 跑 ``python -m trading_core factors-history --limit N``，
   解析与 snapshot_cli 同一出口（parse_stdout：error 键 → ComputeError）；
 * app：路由 ``factors-history``——字段白名单 ["limit"]、limit 1..120 缺省 30、
   shape ["snapshots"]、TTL 5m、错误码 trading/core-unavailable（经 caches.cached）；
-* MCP：工具 ``factors_history`` 进工具面（26 → 27），端点工具集 ≡ 端点清单 − 排除集。
+* MCP：工具 ``factors_history`` 进工具面（任务 2 时 26 → 27），端点工具集 ≡ 端点清单 − 排除集。
 """
 import json
 import subprocess
@@ -170,8 +170,9 @@ class FactorsHistoryAppWiringTest(FactorsHistoryTestBase):
 
 class FactorsHistoryMcpToolTest(FactorsHistoryTestBase):
     def test_tool_surface_is_27_and_includes_factors_history(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 27)
-        self.assertEqual(len(mcp_tools.TOOLS), 27)
+        # WP7 任务 3 起工具面扩到 33；本用例改钉「 factors_history 在面内」这一增量事实
+        self.assertEqual(mcp_tools.TOOL_COUNT, 33)
+        self.assertEqual(len(mcp_tools.TOOLS), 33)
         self.assertIn("factors_history", mcp_tools.TOOL_NAMES)
         self.assertEqual(mcp_tools.ENDPOINT_TOOL_ENDPOINTS["factors_history"],
                          "factors-history")

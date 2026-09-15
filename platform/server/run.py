@@ -46,20 +46,21 @@ SERVICE = "quant-platform"
 def tool_count():
     """工具面清单长度（Node 原实现（已退役）的 ``manifest.length``）。
 
-    正常路径是 ``len(mcp_tools.TOOLS)``（当前 26 项）；导入失败/清单缺失时回退到常量
-    ``mcp_tools.TOOL_COUNT``（仍取不到则用下面这个兜底数字，只为就绪行不至于崩溃）。
+    唯一事实来源是 ``mcp_tools.TOOLS``/``TOOL_COUNT``；清单读不到时如实报 0，让就绪行
+    立刻暴露故障。**不再维护兜底字面量**——先前的 26 曾连续两轮没跟上工具面扩张
+    （27→33），每加一个工具就要同步一个裸数字的「维护点」本身就是缺陷（2026-09 修订）。
     """
     try:
         from server import mcp_tools  # noqa: PLC0415
     except ImportError:
-        return 26
+        return 0
     tools = getattr(mcp_tools, "TOOLS", None)
     if tools is None:
-        return getattr(mcp_tools, "TOOL_COUNT", 26)
+        return getattr(mcp_tools, "TOOL_COUNT", 0)
     try:
         return len(tools)
     except TypeError:
-        return getattr(mcp_tools, "TOOL_COUNT", 26)
+        return getattr(mcp_tools, "TOOL_COUNT", 0)
 
 
 def ready_line(address, config):

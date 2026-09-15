@@ -1,17 +1,20 @@
-# WP6 补遗任务 D：MCP 工具面（27 工具，WP7 任务 2 起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
+# WP6 补遗任务 D：MCP 工具面（33 工具，WP7 任务 3 起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
 #
-# 唯一事实来源：本文件的 ``TOOLS`` 清单（22 端点工具 + 5 维护工具）。MCP 工具不复制任何
+# 唯一事实来源：本文件的 ``TOOLS`` 清单（28 端点工具 + 5 维护工具）。MCP 工具不复制任何
 # 业务逻辑：端点工具一律 ``handle(endpoint, payload)``（app.create_handler 的产物，与 HTTP
 # 面同一个实例），维护工具一律 ``store_api.admin_*``——两条通道对同一 payload 因此必然同源
 # （规格 §5.1 A3/A4 的结构保证）。
 #
 # **``confirm-decide`` 有意不进工具面**（规格 §5.1 A7，2026-09-15 业务确认修订）：
-# HTTP 面 23 端点里有 22 个各有一个 MCP 工具，唯一被排除的就是 ``confirm-decide``。
+# HTTP 面 WP6 时 23 端点里有 22 个各有一个 MCP 工具（WP7 任务 3 起 29 端点 28 工具），
+# 唯一被排除的始终是 ``confirm-decide``。
 # 理由是通道分级：它是**唯一能批准实盘操作**的通道，必须只由独立 Web 上的用户点击触发。
 # 若把它做成工具，模型就能"自己发起、自己批准"，业务确认会退化成模型自批实盘单——
 # 与 A2 要守的"人回答这笔业务参数对不对"完全相反。``confirmation`` 是**只读**待确认列表，
 # 进工具面没有这个风险（描述里也写明模型不应也不能自行批准），故保留为读工具。
 # 常量 ``MCP_EXCLUDED_ENDPOINTS`` 是这条规则的唯一落点，R5/S1 都按它断言。
+# WP7 任务 3 新增 trade_* 写工具后这条边界更关键：trade_* 能**发起**确认并阻塞等待，
+# 但批准仍只有 Web 的 confirm-decide 可达——模型发起、人批准，两侧合起来才是完整闸门。
 #
 # 通道分级（规格 §3.2 ⚠，补遗 A 已锁定错误码）：``switch_mode`` 在本层封死 live——
 # 模型可见的通道不得持有实盘切换能力，``mode == "live"`` 无论 ``confirmation`` 为何直接返回
@@ -28,7 +31,7 @@
 # SDK 适配结论（mcp 2.2.0 实测，非推测）：
 #   * ``from mcp.server.mcpserver import MCPServer``（2.x 由 FastMCP 更名）；
 #   * 注册面是 ``MCPServer.add_tool(fn, name=..., description=..., structured_output=...)``，
-#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 27 个工具共用一个
+#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 33 个工具共用一个
 #     ``**kwargs`` 派发函数 + 每个工具自带的 ``__signature__`` 表达字段集，注解即契约；
 #   * ``MCPServer.list_tools/call_tool`` 是 async；``streamable_http_app()`` 返回的 Starlette
 #     app 自带 ``lifespan=session_manager.run()``，挂载时须并入主 app 的 lifespan；
@@ -73,9 +76,9 @@ from server import store_access
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
 
-# 工具面总数：22 端点工具（§3.2 + WP7 factors-history，23 端点扣除有意排除的
-# confirm-decide）+ 5 维护工具（§3.4）。锁定测试断言 27 恒成立。
-TOOL_COUNT = 27
+# 工具面总数：28 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
+# 工具；29 端点扣除有意排除的 confirm-decide）+ 5 维护工具（§3.4）。锁定测试断言 33 恒成立。
+TOOL_COUNT = 33
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
 # ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
@@ -144,6 +147,8 @@ _TYPES = {
     "mode": Literal["sim", "live"],
     "period": Literal["1m", "5m", "15m", "30m", "60m", "1d"],
     "action": Literal["execute", "cancel", "kill", "unkill"],
+    # WP7 任务 3：交易方向（broker.py place 的 side 口径，1=BUY 2=SELL 由闸门映射）
+    "side": Literal["BUY", "SELL"],
 }
 
 
@@ -180,9 +185,9 @@ class Param:
         )
 
 
-def req(name, kind, description):
-    """必填字段（规格 §3.2 输入列的 ``*``）。"""
-    return Param(name, kind, description, required=True)
+def req(name, kind, description, minimum=None, maximum=None):
+    """必填字段（规格 §3.2 输入列的 ``*``）；minimum/maximum 透传（WP7 交易工具数量下限）。"""
+    return Param(name, kind, description, required=True, minimum=minimum, maximum=maximum)
 
 
 def opt(name, kind, description, minimum=None, maximum=None):
@@ -213,7 +218,8 @@ class ToolDefinition:
 
 
 # ---------------------------------------------------------------------------
-# 27 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history，逐项对应）
+# 33 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history 与 6 个
+# 受约束交易工具，逐项对应）
 # ---------------------------------------------------------------------------
 # 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
 # 字段顺序也保持原实现顺序（inputSchema 的 properties 顺序因此稳定可比）。
@@ -396,8 +402,77 @@ TOOLS = (
             REFRESH,
         ),
     ),
+    # ---- WP7 任务 3：受约束交易工具（写三个走完整闸门链 + Web 确认卡片）----
+    # 闸门链：模式文件 → 风控 8 规则（kill 是规则 1）→ 业务确认（唯一放行方式）→ broker。
+    # 提交后阻塞等待用户在独立 Web 确认卡片作答；确认 TTL 120 秒，超时自动拒绝
+    # （fail-closed）。工具描述必须把这条边界讲清楚：模型能发起、只有人能批准。
+    ToolDefinition(
+        "trade_place",
+        "受约束下单（临时订单，限价）：过完整闸门链（模式文件→风控 8 规则→kill→业务确认）"
+        "后提交券商。提交后需在独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
+        "live 下确认前本工具阻塞等待；模式只认账户模式文件（载荷不带 mode）。",
+        "trade_place",
+        (
+            req("symbol", "str", "标的代码，如 SH.600519（支持 SH/SZ/BJ/HK/US 前缀）"),
+            req("side", "side", "方向：BUY=买入 / SELL=卖出"),
+            req("qty", "int", "数量（股，>=1）", minimum=1),
+            req("price", "number", "限价（>0）"),
+            opt("client_order_id", "str", "幂等编号：同一编号重复提交只执行一次，不重复下单"),
+        ),
+    ),
+    ToolDefinition(
+        "trade_modify",
+        "受约束改单（=撤旧单+按新参数重下，因券商改单接口不可靠）：过完整闸门链"
+        "（模式→风控 8 规则→kill→业务确认）后执行，风控按新参数全额预检。提交后需在"
+        "独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。",
+        "trade_modify",
+        (
+            req("order_id", "str", "要改的券商订单号"),
+            req("symbol", "str", "标的代码，如 SH.600519"),
+            req("side", "side", "新单方向：BUY/SELL"),
+            req("qty", "int", "新单数量（股，>=1；不做「仅改价格」的部分语义）", minimum=1),
+            req("price", "number", "新单限价（>0）"),
+            opt("client_order_id", "str", "幂等编号（标识这次改单产生的新单登记）"),
+        ),
+    ),
+    ToolDefinition(
+        "trade_cancel",
+        "受约束撤单：过闸门（kill/模式/交易日三规则真实约束；撤单不新增敞口）后向券商"
+        "提交撤单。撤错单同样是业务错误，故同样需在独立 Web 确认卡片批准；TTL 120 秒"
+        "超时自动拒绝（fail-closed）。",
+        "trade_cancel",
+        (
+            req("order_id", "str", "要撤销的券商订单号"),
+            req("symbol", "str", "标的代码（用于定位市场与账户）"),
+            opt("client_order_id", "str", "幂等编号（仅作调用方追踪）"),
+        ),
+    ),
+    # ---- WP7 任务 3：账户查询（mode 约束直通 broker，实时查询不进缓存）----
+    ToolDefinition(
+        "account_positions",
+        "券商真实持仓（按账户列出，不跨账户/币种合并；失败账户列入 errors）。"
+        "mode 缺省读账户模式文件；实时查询不缓存。",
+        "account_positions",
+        (opt("mode", "mode", "账户模式，缺省读模式文件"),),
+    ),
+    ToolDefinition(
+        "account_orders",
+        "券商订单历史（按账户列出，固定最近 30 天窗口——该工具不带时间范围会静默返回"
+        " no data，见 TOOL-LIMITS）。mode 缺省读账户模式文件；实时查询不缓存。",
+        "account_orders",
+        (opt("mode", "mode", "账户模式，缺省读模式文件"),),
+    ),
+    ToolDefinition(
+        "account_funds",
+        "券商资金（按账户列出：可用资金/总资产等原始字段）。mode 缺省读账户模式文件；"
+        "实时查询不缓存。",
+        "account_funds",
+        (opt("mode", "mode", "账户模式，缺省读模式文件"),),
+    ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----
-    # 不经 RPC handler，直调 store_access 的 admin_*（与 22 端点同库同锁）；Node 侧对应
+    # 不经 RPC handler，直调 store_access 的 admin_*（与全部端点同库同锁；WP6 口径 23
+    # 端点、WP7 任务 3 起 29 端点——2026-09 修订：原文「与 22 端点同库同锁」计数未随
+    # 业务确认修订同步，此处更正并注明维护点=端点清单变化时同步本注释）；Node 侧对应
     # WorkbenchStore 的 cancelRun/cancelStaleRuns/pruneAbandonedRuns。
     ToolDefinition(
         "admin_status", "工作台数据维护：数据文件路径与各类记录数量。", None, (),
@@ -429,7 +504,7 @@ if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时
 # 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
 TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 
-# 22 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
+# 28 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 
@@ -571,7 +646,7 @@ class BoundTool:
 
 
 def build_tools(handle, store_api):
-    """27 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
+    """33 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
 
     ``handle`` 必须是 ``app.create_handler`` 的产物——与 HTTP 面同一个实例（规格 §5.2 R6）。
     """
@@ -597,7 +672,7 @@ def _bind(definition, handle, store_api):
 
 
 def register(server: MCPServer, handle, store_api=None):
-    """把 27 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
+    """把 33 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
 
     ``store_api`` 在生产路径上由 create_app 显式传入；缺省 None 只为单测里手搓 server 的便利
     （此时维护工具调用会抛 AttributeError，并按程序异常包成 tool-failed）。
