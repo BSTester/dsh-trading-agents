@@ -116,6 +116,8 @@ EXECUTE_ACTIONS = {
 SWITCH_MODE_FIELDS = ("mode", "expected_mode", "confirmation")
 PLAN_EXECUTE_FIELDS = ("plan_hash", "expected_mode", "confirmation", "action")
 SERIES_FIELDS = ("ticker", "period", "limit")
+# WP7：因子快照历史的载荷只有 limit（1..120 校验在 compute.factors_history）
+FACTORS_HISTORY_FIELDS = ("limit",)
 
 
 def error_envelope(code, message, status):
@@ -169,6 +171,8 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
     if core is None:
         core = {name: (lambda name=name: compute.snapshot_cli(name))
                 for name in compute.SNAPSHOT_COMMANDS}
+        # WP7：因子快照历史走同一 core 桥（limit 由路由透传，compute 侧校验）
+        core["factors-history"] = lambda limit=30: compute.factors_history(limit)
     write_home = home if command_home is None else command_home
 
     def handle(endpoint, raw_payload):
@@ -236,6 +240,17 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                     return value
 
                 return caches.cached(endpoint, payload, force, produce, "trading/core-unavailable")
+            if endpoint == "factors-history":
+                # WP7：因子快照历史（服务定时收集的只读面板数据），与 plan/schedule/reconcile
+                # 同走 core 桥 + TTL 缓存；limit 区间校验在 compute.factors_history
+                # （ComputeError 交 cached() 落成 trading/core-unavailable）。
+                _check_fields(endpoint, payload, FACTORS_HISTORY_FIELDS)
+                provider = core.get("factors-history")
+                if provider is None:
+                    raise WorkbenchError("Core bridge unavailable")
+                return caches.cached(endpoint, payload, force,
+                                     lambda: provider(payload.get("limit")),
+                                     "trading/core-unavailable")
             if endpoint == "plan-execute":
                 # rpc.js:183-210：唯一受约束执行入口；校验通过后原子写指令文件即返回
                 _check_fields(endpoint, payload, PLAN_EXECUTE_FIELDS)
@@ -304,9 +319,9 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         from server import scheduler as scheduler_module
         scheduler = scheduler_module.Scheduler(scheduler_module.build_tick(home), interval=60.0)
 
-    # MCP 工具面（补遗任务 D）：26 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
+    # MCP 工具面（补遗任务 D）：27 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
     # 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的 home 绑定门面。
-    # 22 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
+    # 23 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
     mcp_server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
     bound_tools = mcp_tools.register(mcp_server, handle, mcp_tools.StoreApi(home))
     # json_response=True 对齐 Node 版 enableJsonResponse：无 SSE 依赖，普通 JSON 响应。
@@ -378,11 +393,13 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         """Node 原实现（已退役）：豁免认证的存活探针（不判方法，任何方法同响应）。
 
         WP7 任务 1：附带调度器存活态——``alive`` 线程是否在跑，``last_error`` 最近一次
-        tick 异常记录（成功不清除，None 即从未出错）。
+        tick 异常记录（成功不清除，None 即从未出错）。截断 ≤300 字符对齐既有
+        ``str(error)[:300]`` 惯例；全量 traceback 属于日志语义，这里只留故障存在性的证据。
         """
+        last_error = scheduler.last_error
         return {"ok": True, "mode": read_mode(home),
                 "scheduler": {"alive": bool(scheduler.alive),
-                              "last_error": scheduler.last_error}}
+                              "last_error": None if last_error is None else str(last_error)[:300]}}
 
     @app.post("/api/wb/{endpoint}")
     async def workbench(endpoint: str, request: Request):

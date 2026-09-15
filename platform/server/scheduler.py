@@ -1,6 +1,11 @@
 # 服务内调度器（WP7 任务 1）：吸收 trading_core.daemon 的常驻循环。
 # 协议原样复用：daemon.tick / JOBS_DEFAULT / 心跳文件 / 指令目录；
 # daemon CLI（python -m trading_core daemon）保留为手动/兼容入口。
+#
+# 运维语义（两句）：
+#   1. tick-first：启动即先跑一轮再等间隔（_loop 先 tick 后 wait），不空等第一个周期；
+#   2. 启动即补跑当日到期作业；与 daemon CLI 共享 kv `daemon:state` 的 ran 标记，
+#      同日作业不重复执行（服务与手动 daemon 先后跑同一天也只执行一次）。
 import sys
 import threading
 import traceback
@@ -21,8 +26,13 @@ class Scheduler:
     """固定间隔线程：每轮调用 tick()，异常记录不杀线程。"""
 
     def __init__(self, tick, interval=60.0):
+        # interval<=0 直接拒绝（间隔语义失真比启动失败更危险）；正数照单全收，
+        # 亚秒间隔也真实生效（重复 tick 的时长由配置者自担）。
+        interval = float(interval)
+        if interval <= 0:
+            raise ValueError("interval must be positive")
         self._tick = tick
-        self._interval = max(1.0, float(interval))
+        self._interval = interval
         self._stop = threading.Event()
         self._thread = None
         self.last_error = None

@@ -1,12 +1,12 @@
-# WP6 补遗任务 D：MCP 工具面（26 工具）与通道分级（规格 §3.2 / §3.4 / §3.6）。
+# WP6 补遗任务 D：MCP 工具面（27 工具，WP7 任务 2 起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
 #
-# 唯一事实来源：本文件的 ``TOOLS`` 清单（21 端点工具 + 5 维护工具）。MCP 工具不复制任何
+# 唯一事实来源：本文件的 ``TOOLS`` 清单（22 端点工具 + 5 维护工具）。MCP 工具不复制任何
 # 业务逻辑：端点工具一律 ``handle(endpoint, payload)``（app.create_handler 的产物，与 HTTP
 # 面同一个实例），维护工具一律 ``store_api.admin_*``——两条通道对同一 payload 因此必然同源
 # （规格 §5.1 A3/A4 的结构保证）。
 #
 # **``confirm-decide`` 有意不进工具面**（规格 §5.1 A7，2026-09-15 业务确认修订）：
-# HTTP 面 22 端点里有 21 个各有一个 MCP 工具，唯一被排除的就是 ``confirm-decide``。
+# HTTP 面 23 端点里有 22 个各有一个 MCP 工具，唯一被排除的就是 ``confirm-decide``。
 # 理由是通道分级：它是**唯一能批准实盘操作**的通道，必须只由独立 Web 上的用户点击触发。
 # 若把它做成工具，模型就能"自己发起、自己批准"，业务确认会退化成模型自批实盘单——
 # 与 A2 要守的"人回答这笔业务参数对不对"完全相反。``confirmation`` 是**只读**待确认列表，
@@ -28,7 +28,7 @@
 # SDK 适配结论（mcp 2.2.0 实测，非推测）：
 #   * ``from mcp.server.mcpserver import MCPServer``（2.x 由 FastMCP 更名）；
 #   * 注册面是 ``MCPServer.add_tool(fn, name=..., description=..., structured_output=...)``，
-#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 26 个工具共用一个
+#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 27 个工具共用一个
 #     ``**kwargs`` 派发函数 + 每个工具自带的 ``__signature__`` 表达字段集，注解即契约；
 #   * ``MCPServer.list_tools/call_tool`` 是 async；``streamable_http_app()`` 返回的 Starlette
 #     app 自带 ``lifespan=session_manager.run()``，挂载时须并入主 app 的 lifespan；
@@ -48,7 +48,7 @@
 # 与 Node 侧的**有意差异**登记（上一条「哨兵默认值 / 显式 null」之外，此处登记 schema 形状）：
 #   * **``anyOf`` 与 PTC / run_code 退化（补遗 D 审查实测）**：``Param.annotation()`` 用
 #     ``base | None``，使每个可选字段的 inputSchema 变成 ``anyOf``（基类型分支 +
-#     ``{"type": "null"}`` 分支）。dsh-tools 支持的 schema 子集**不含 anyOf**，故 26 个工具里
+#     ``{"type": "null"}`` 分支）。dsh-tools 支持的 schema 子集**不含 anyOf**，故 27 个工具里
 #     23 个（全部含可选字段者；只有 ``admin_status`` / ``admin_runs`` / ``admin_cancel_run``
 #     三个无可选字段）在 **PTC / run_code 模式**下入参类型静默退化为 ``Any``。
 #     **native 模式不受影响**：注册通过、schema 原样透传、调用正常（S1 与 R5 的
@@ -56,7 +56,7 @@
 #     若要根治需去掉 ``| None``（只动 ``Param.annotation()`` 一处）：实测（mcp 2.2.0）schema
 #     随即变单分支，且 ``description``/``minimum``/``maximum`` 仍在分支上——代价不是「丢失
 #     可选字段描述/区间」，而是 null 分支消失、显式 null 改由 schema 层拒绝（与 Node/zod
-#     ``.optional()`` 趋同），因此要重新核对 26 个工具的载荷语义。本次补遗只披露，不改。
+#     ``.optional()`` 趋同），因此要重新核对 27 个工具的载荷语义。本次补遗只披露，不改。
 import inspect
 import json
 import warnings
@@ -73,9 +73,9 @@ from server import store_access
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
 
-# 工具面总数：21 端点工具（§3.2，22 端点扣除有意排除的 confirm-decide）+ 5 维护工具（§3.4）。
-# 锁定测试断言 26 恒成立。
-TOOL_COUNT = 26
+# 工具面总数：22 端点工具（§3.2 + WP7 factors-history，23 端点扣除有意排除的
+# confirm-decide）+ 5 维护工具（§3.4）。锁定测试断言 27 恒成立。
+TOOL_COUNT = 27
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
 # ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
@@ -213,7 +213,7 @@ class ToolDefinition:
 
 
 # ---------------------------------------------------------------------------
-# 26 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25，逐项对应）
+# 27 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history，逐项对应）
 # ---------------------------------------------------------------------------
 # 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
 # 字段顺序也保持原实现顺序（inputSchema 的 properties 顺序因此稳定可比）。
@@ -386,6 +386,16 @@ TOOLS = (
     ToolDefinition(
         "reconcile", "对账快照：最近差异、TCA 摘要、告警列表。", "reconcile", (REFRESH,),
     ),
+    ToolDefinition(
+        "factors_history",
+        "因子快照历史：按日期倒序的横截面因子快照（payload.tickers 为 {代码:{因子:值}}），"
+        "来自服务定时收集——每交易日收盘作业链自动落库，无需手动触发。",
+        "factors-history",
+        (
+            opt("limit", "int", "最多返回快照条数（1..120，默认 30）", minimum=1, maximum=120),
+            REFRESH,
+        ),
+    ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----
     # 不经 RPC handler，直调 store_access 的 admin_*（与 22 端点同库同锁）；Node 侧对应
     # WorkbenchStore 的 cancelRun/cancelStaleRuns/pruneAbandonedRuns。
@@ -419,7 +429,7 @@ if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时
 # 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
 TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 
-# 21 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
+# 22 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 
@@ -561,7 +571,7 @@ class BoundTool:
 
 
 def build_tools(handle, store_api):
-    """26 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
+    """27 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
 
     ``handle`` 必须是 ``app.create_handler`` 的产物——与 HTTP 面同一个实例（规格 §5.2 R6）。
     """
@@ -587,7 +597,7 @@ def _bind(definition, handle, store_api):
 
 
 def register(server: MCPServer, handle, store_api=None):
-    """把 26 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
+    """把 27 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
 
     ``store_api`` 在生产路径上由 create_app 显式传入；缺省 None 只为单测里手搓 server 的便利
     （此时维护工具调用会抛 AttributeError，并按程序异常包成 tool-failed）。

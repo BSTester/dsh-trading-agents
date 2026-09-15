@@ -262,18 +262,20 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(sa.store_file(self.home).read_bytes(), before)
         self.assert_no_lock_left()
 
-    def test_endpoints_manifest_is_22_and_cached(self):
+    def test_endpoints_manifest_is_23_and_cached(self):
         endpoints = sa.endpoints()
-        self.assertEqual(len(endpoints), 22)
+        # 22 legacy（endpoints.js 文本提取）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS）
+        expected = 22 + len(sa.WP7_ENDPOINTS)
+        self.assertEqual(len(endpoints), expected)
         self.assertEqual(endpoints[0], "snapshot")
-        self.assertEqual(endpoints[-1], "confirm-decide")
+        self.assertEqual(endpoints[-1], "factors-history")
         # 业务确认两端点必须在白名单里（HTTP 面据此注册路由）
-        self.assertEqual(endpoints[-2:], ["confirmation", "confirm-decide"])
-        self.assertEqual(len(set(endpoints)), 22)
+        self.assertEqual(endpoints[-3:-1], ["confirmation", "confirm-decide"])
+        self.assertEqual(len(set(endpoints)), expected)
         self.assertEqual(endpoints, sa.endpoints())
         # 缓存返回副本：调用方改动不会污染下一次
         endpoints.append("bogus")
-        self.assertEqual(len(sa.endpoints()), 22)
+        self.assertEqual(len(sa.endpoints()), expected)
 
     def test_snapshot_reports_pending_observations_without_merging(self):
         """有意差异 1：Python 只读快照不 flushObservations，pending 计数照抄文件系统。"""
@@ -315,7 +317,7 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(snap["mode"], "sim")
         self.assertEqual(snap["runs"], [])
         self.assertEqual(snap["activity"], [])
-        self.assertEqual(len(snap["endpoints"]), 22)
+        self.assertEqual(len(snap["endpoints"]), 22 + len(sa.WP7_ENDPOINTS))
         self.assertIsNone(snap["confirmation"])
         self.assertFalse(sa.store_file(self.home).exists())  # 只读：连空 store 都不落盘
 

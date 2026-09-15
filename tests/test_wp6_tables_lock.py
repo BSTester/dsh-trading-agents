@@ -14,9 +14,12 @@ JS 源被改动而 Python 没跟上时立刻红。Python 侧一律直接 import 
 本文件因 ``FileNotFoundError`` 变成整套测试的红。
 
 覆盖：
-  * rpc.js ``CACHE_TTL_MS`` ↔ ``caches.CACHE_TTL_MS``（业务确认两端点**都不在**表里 = TTL 0）；
-  * endpoints.js ``ENDPOINT_SHAPE`` ↔ ``caches.ENDPOINT_SHAPE``（含 ``confirmation: ["pending"]``）；
-  * endpoints.js ``ENDPOINTS`` ↔ ``store_access.endpoints()``（22 端点，含 confirmation/confirm-decide）；
+  * rpc.js ``CACHE_TTL_MS`` ↔ ``caches.CACHE_TTL_MS``（业务确认两端点**都不在**表里 = TTL 0；
+    WP7 起服务自有端点不回写 legacy JS，按「JS 表 + WP7 增量 ≡ Python 表」比对）；
+  * endpoints.js ``ENDPOINT_SHAPE`` ↔ ``caches.ENDPOINT_SHAPE``（含 ``confirmation: ["pending"]``
+    与 WP7 增量 ``factors-history: ["snapshots"]``）；
+  * endpoints.js ``ENDPOINTS`` + ``store_access.WP7_ENDPOINTS`` ↔ ``store_access.endpoints()``
+    （22 legacy + WP7 增量，含 confirmation/confirm-decide）；
   * rpc.js 各端点 allowed 字段表 ↔ ``app.ANALYTICS_ENDPOINTS`` / ``SWITCH_MODE_FIELDS``
     / ``CONFIRM_DECIDE_FIELDS`` / ``PLAN_EXECUTE_FIELDS`` / ``SERIES_FIELDS``
     / ``EMPTY_PAYLOAD_ENDPOINTS``；
@@ -37,6 +40,13 @@ from server import app as app_module  # noqa: E402
 from server import caches, compute, store_access  # noqa: E402
 
 SRC = ROOT / "plugins" / "workbench" / "src"
+# WP7 起服务自有端点不回写 legacy 面板源（三张表的比对基准 = JS 字面量 + 本增量）。
+WP7_ENDPOINTS = store_access.WP7_ENDPOINTS
+
+
+def without_wp7(table):
+    """Python 表去掉 WP7 增量后的 legacy 部分（与 JS 字面量逐项比对用）。"""
+    return {name: value for name, value in table.items() if name not in WP7_ENDPOINTS}
 
 
 def read(name):
@@ -120,8 +130,10 @@ def js_guard_lists(text):
 
 class CacheTtlLockTests(unittest.TestCase):
     def test_cache_ttl_table_matches_rpc_js(self):
-        self.assertEqual(js_cache_ttls(RPC_JS), dict(caches.CACHE_TTL_MS))
+        self.assertEqual(js_cache_ttls(RPC_JS), without_wp7(dict(caches.CACHE_TTL_MS)))
         self.assertEqual(js_cache_ttls(RPC_JS)["instrument"], 10 * 60_000)
+        # WP7 增量逐项钉死：JS 表不含、Python 表含且值锁定
+        self.assertEqual(caches.CACHE_TTL_MS.get("factors-history"), 5 * 60_000)
 
     def test_business_confirmation_endpoints_are_not_cached(self):
         """业务确认两端点 TTL 恒为 0：rpc.js 的 CACHE_TTL_MS 本就不含它们，Python 侧同样不加。
@@ -137,14 +149,17 @@ class CacheTtlLockTests(unittest.TestCase):
 
 class EndpointTableLockTests(unittest.TestCase):
     def test_shape_table_matches_endpoints_js(self):
-        self.assertEqual(js_shape_table(ENDPOINTS_JS), dict(caches.ENDPOINT_SHAPE))
+        self.assertEqual(js_shape_table(ENDPOINTS_JS), without_wp7(dict(caches.ENDPOINT_SHAPE)))
         self.assertEqual(caches.ENDPOINT_SHAPE["confirmation"], ["pending"])
+        self.assertEqual(caches.ENDPOINT_SHAPE["factors-history"], ["snapshots"])
 
-    def test_endpoint_list_matches_endpoints_js(self):
+    def test_endpoint_list_matches_endpoints_js_plus_wp7_delta(self):
+        """legacy JS 清单（22）+ WP7 服务自有端点 ≡ store_access.endpoints()（23）。"""
         endpoints = js_endpoint_list(ENDPOINTS_JS)
-        self.assertEqual(endpoints, store_access.endpoints())
         self.assertEqual(len(endpoints), 22)
         self.assertEqual(endpoints[-2:], ["confirmation", "confirm-decide"])
+        self.assertEqual(store_access.endpoints(), endpoints + list(WP7_ENDPOINTS))
+        self.assertEqual(len(store_access.endpoints()), 23)
 
     def test_analytics_endpoints_are_declared_by_endpoints_js(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))

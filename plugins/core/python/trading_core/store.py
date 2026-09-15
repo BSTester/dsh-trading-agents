@@ -58,6 +58,8 @@ CREATE TABLE IF NOT EXISTS risk_checks(
 CREATE TABLE IF NOT EXISTS alerts(
   id INTEGER PRIMARY KEY AUTOINCREMENT, level TEXT NOT NULL, title TEXT NOT NULL,
   detail TEXT, created_at TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0);
+CREATE TABLE IF NOT EXISTS factor_snapshots(
+  date TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL);
 """
 
 
@@ -396,3 +398,28 @@ def is_halted(conn):
 
 def clear_halt(conn):
     set_halt(conn, False, reason=None)
+
+
+# ---------------------------------------------------------------------------
+# WP7：因子快照（服务调度每日收盘收集）。表与 WP4 alerts 同一先例——
+# CREATE TABLE IF NOT EXISTS 幂等追加，SCHEMA_VERSION 不动（v3 语义不变）。
+# ---------------------------------------------------------------------------
+
+
+def save_factor_snapshot(conn, date, payload):
+    """按日 upsert 因子快照（同日期覆盖）：payload 存 JSON，created_at 恒为本次写入时刻。"""
+    conn.execute(
+        "INSERT INTO factor_snapshots(date,payload,created_at) VALUES(?,?,?)"
+        " ON CONFLICT(date) DO UPDATE SET payload=excluded.payload,"
+        " created_at=excluded.created_at",
+        (date, json.dumps(payload, ensure_ascii=False), _now()))
+    conn.commit()
+
+
+def list_factor_snapshots(conn, limit=30):
+    """倒序（最新在前）返回 [{date, payload(反序列化对象), created_at}]。"""
+    rows = conn.execute(
+        "SELECT date,payload,created_at FROM factor_snapshots ORDER BY date DESC LIMIT ?",
+        (int(limit),)).fetchall()
+    return [{"date": r["date"], "payload": json.loads(r["payload"]),
+             "created_at": r["created_at"]} for r in rows]

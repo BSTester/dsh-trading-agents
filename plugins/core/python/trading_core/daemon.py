@@ -13,12 +13,18 @@ from pathlib import Path
 from . import alerts, execute, store
 
 JOBS_DEFAULT = {
+    # WP7：每个有作业的市场收盘链末尾追加 factors_snapshot（先让数据作业落库，
+    # 快照再吃当日数据）；cmd 形式走既有 runner——@watchlist 替换 / 900s 超时 /
+    # 失败告警语义与协议零改动。
     "SH": [{"name": "sync_bars", "at": "16:00", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "sync_fundamentals", "at": "16:00", "cmd": ["fundamentals", "--tickers", "@watchlist"]},
             {"name": "merge_announcements", "at": "16:05", "cmd": ["merge-announcements", "--period", "@latest-quarter"]},
-            {"name": "quality", "at": "16:10", "cmd": ["quality", "--market", "SH"]}],
-    "HK": [{"name": "sync_bars", "at": "16:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]}],
-    "US": [{"name": "sync_bars", "at": "05:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]}],
+            {"name": "quality", "at": "16:10", "cmd": ["quality", "--market", "SH"]},
+            {"name": "factors_snapshot", "at": "16:15", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]}],
+    "HK": [{"name": "sync_bars", "at": "16:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
+            {"name": "factors_snapshot", "at": "16:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]}],
+    "US": [{"name": "sync_bars", "at": "05:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
+            {"name": "factors_snapshot", "at": "05:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]}],
 }
 
 # 风控参数默认值：镜像 engine/python/risk_config.py 的 DEFAULTS（venv 只链接

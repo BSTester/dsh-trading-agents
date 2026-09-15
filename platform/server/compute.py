@@ -384,6 +384,23 @@ def snapshot_cli(name, timeout=SNAPSHOT_TIMEOUT, runner=None):
                         completed.stderr)
 
 
+def factors_history(limit=30, timeout=SNAPSHOT_TIMEOUT, runner=None):
+    """WP7：``python -m trading_core factors-history --limit N``（解析同 snapshot_cli）。
+
+    limit 缺省/None → 30；越界或非整数报 ``Invalid limit (1..120)``（ComputeError 与
+    全模块同一失败语义，app 侧经 caches.cached 落成 trading/core-unavailable）。
+    CLI 的失败信封 ``{ok:false, error}`` 由 parse_stdout 的 error 键分支接住。
+    """
+    number = 30 if limit is None else limit
+    if not _is_int(number) or number < 1 or number > 120:
+        raise ComputeError("Invalid limit (1..120)")
+    command = [PYTHON, "-m", "trading_core", "factors-history", "--limit", str(number)]
+    spawn = _spawn if runner is None else runner
+    completed = spawn(command, timeout)
+    return parse_stdout("trading_core factors-history", completed.stdout,
+                        completed.returncode, completed.stderr)
+
+
 def command_home(home):
     """指令目录根：``$DSH_HOME``（pycore.js:9-11 pythonHome）。"""
     return Path(home if home is not None else os.environ.get("DSH_HOME") or Path.home() / ".dsh")

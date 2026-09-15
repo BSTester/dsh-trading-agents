@@ -49,6 +49,8 @@ CACHE_TTL_MS = {
     "plan": 60_000,
     "schedule": 30_000,
     "reconcile": 5 * 60_000,
+    # WP7：因子快照按日收集，5 分钟 TTL 足够面板新鲜度（legacy rpc.js 不回写）
+    "factors-history": 5 * 60_000,
 }
 
 # endpoints.js:46-65 的端点最小字段（plan-execute 是动作端点，不进缓存形状表）
@@ -72,6 +74,8 @@ ENDPOINT_SHAPE = {
     "confirmation": ["pending"],
     "schedule": ["heartbeat", "jobs"],
     "reconcile": ["diffs", "tca"],
+    # WP7：因子快照历史（服务定时收集），最小字段只有一个快照数组
+    "factors-history": ["snapshots"],
 }
 
 # cache.js:17-18 的两个默认上限

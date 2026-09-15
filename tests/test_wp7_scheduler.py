@@ -26,6 +26,32 @@ class SchedulerThreadTest(unittest.TestCase):
         self.assertEqual(len(calls), count_after_stop, "stop 后不得再 tick")
         self.assertFalse(s.alive or s._thread.is_alive())
 
+    def test_non_positive_interval_is_rejected(self):
+        """序言修复：interval<=0 直接拒绝，不得静默钳制（亚秒间隔要真实生效）。"""
+        for bad in (0, -1, 0.0, -0.5):
+            with self.assertRaises(ValueError, msg=bad):
+                scheduler.Scheduler(lambda: None, interval=bad)
+
+    def test_small_interval_ticks_have_sub_second_median_gap(self):
+        """序言修复：interval=0.05 相邻 tick 间距中位数 < 0.5s——证明小间隔真实生效，
+        而不是被钳制成 1s 慢慢爬（任务 1 审查：max(1.0, interval) 掩盖了重复 tick 语义）。"""
+        ticks = []
+        done = threading.Event()
+
+        def tick():
+            ticks.append(time.monotonic())
+            if len(ticks) >= 8:
+                done.set()
+
+        s = scheduler.Scheduler(tick, interval=0.05)
+        s.start()
+        self.assertTrue(done.wait(5), "0.05s 间隔应在 5s 内跑满 8 个 tick")
+        s.stop()
+        gaps = sorted(b - a for a, b in zip(ticks, ticks[1:]))
+        self.assertGreater(len(gaps), 0)
+        self.assertLess(gaps[len(gaps) // 2], 0.5,
+                        f"中位间距 {gaps[len(gaps) // 2]:.3f}s 表明间隔被钳制")
+
     def test_tick_exception_does_not_kill_thread(self):
         state = {"n": 0}
         event = threading.Event()
@@ -89,6 +115,20 @@ class HealthzSchedulerTest(unittest.TestCase):
                 body = client.get("/healthz").json()
             self.assertEqual(body["scheduler"], {"alive": True, "last_error": "boom"})
             self.assertEqual(stub.calls, ["start", "stop"], "lifespan 应启停注入的调度器")
+
+    def test_healthz_truncates_last_error_to_300_chars(self):
+        """序言修复：healthz 的 last_error 截断 ≤300 字符（对齐 str(error)[:300] 惯例）。"""
+        from fastapi.testclient import TestClient
+        from server import app as app_module
+        with tempfile.TemporaryDirectory() as tmp:
+            stub = IdleScheduler(alive=True, error="x" * 500)
+            app = app_module.create_app(home=tmp, dist=str(Path(tmp) / "dist-missing"),
+                                        scheduler=stub)
+            client = TestClient(app)
+            body = client.get("/healthz").json()
+        last_error = body["scheduler"]["last_error"]
+        self.assertEqual(len(last_error), 300)
+        self.assertTrue(last_error.startswith("xxx"))
 
     def test_default_create_app_has_idle_scheduler_state(self):
         from fastapi.testclient import TestClient

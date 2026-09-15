@@ -40,6 +40,8 @@ ENDPOINTS = [
     "instrument", "quality", "plan", "plan-execute", "schedule", "reconcile",
     # 2026-09-15 业务确认：读待确认（不进缓存）+ 唯一的人工批准通道
     "confirmation", "confirm-decide",
+    # WP7：因子快照历史（服务定时收集），与 store_access.WP7_ENDPOINTS 同步
+    *store_access.WP7_ENDPOINTS,
 ]
 
 
@@ -154,7 +156,7 @@ class ContractTests(Base):
         body = response.json()
         self.assertTrue(body["ok"])
         self.assertEqual(body["value"]["endpoints"], ENDPOINTS)
-        self.assertEqual(len(body["value"]["endpoints"]), 22)
+        self.assertEqual(len(body["value"]["endpoints"]), 22 + len(store_access.WP7_ENDPOINTS))
         self.assertEqual(body["value"]["mode"], "sim")
         self.assertIn("generated_at", body["value"])
 
@@ -703,7 +705,7 @@ class ConfirmationRoutesTests(Base):
         self.fail("3 秒内未出现待确认项")
 
     def test_both_endpoints_are_whitelisted_and_snapshot_declares_them(self):
-        self.assertEqual(len(store_access.endpoints()), 22)
+        self.assertEqual(len(store_access.endpoints()), 22 + len(store_access.WP7_ENDPOINTS))
         self.assertIn("confirmation", store_access.endpoints())
         self.assertIn("confirm-decide", store_access.endpoints())
         declared = self.post(self.client, "snapshot").json()["value"]["endpoints"]
@@ -856,7 +858,7 @@ class StaticTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": f"http://127.0.0.1:{port}",
                                 "mcp": f"http://127.0.0.1:{port}/mcp",
-                                "tools": 26, "auth": "loopback-only"})
+                                "tools": 27, "auth": "loopback-only"})
 
     def test_bad_encoding_is_400(self):
         dist = self.make_dist()
@@ -1089,7 +1091,9 @@ class ComputeBridgeTests(Base):
         self.assertEqual(caches.CACHE_TTL_MS["plan"], 60_000)
         self.assertEqual(caches.CACHE_TTL_MS["schedule"], 30_000)
         self.assertEqual(caches.CACHE_TTL_MS["reconcile"], 5 * 60_000)
-        self.assertEqual(len(caches.CACHE_TTL_MS), 17)
+        # WP7 任务 2：+factors-history（5m，服务自有端点，不在 legacy rpc.js 表里）
+        self.assertEqual(caches.CACHE_TTL_MS["factors-history"], 5 * 60_000)
+        self.assertEqual(len(caches.CACHE_TTL_MS), 18)
         self.assertEqual(caches.CACHE_TTL_MS["quality"], 60 * 60_000)
 
     def test_shape_table_and_matcher(self):
@@ -1392,7 +1396,7 @@ class RunEntryTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": "http://127.0.0.1:41234",
                                 "mcp": "http://127.0.0.1:41234/mcp",
-                                "tools": 26, "auth": "loopback-only"})
+                                "tools": 27, "auth": "loopback-only"})
         line = run_module.ready_line(("127.0.0.1", 8397),
                                      {"port": 8397, "host": "127.0.0.1", "token": "t"})
         self.assertEqual(line["auth"], "token")

@@ -306,11 +306,19 @@ def pending_observations(home):
     return [name for name in names if name.endswith(".json")]
 
 
+# WP7 起服务自有的端点（legacy 面板源 endpoints.js 不再回写，见 endpoints() 说明）。
+WP7_ENDPOINTS = ("factors-history",)
+
+
 def endpoints():
-    """endpoints.js:12-37 的 22 端点清单；从 JS 文本正则提取，首次调用缓存（单一事实来源）。
+    """endpoints.js:12-37 的 22 端点清单 + WP7 服务自有端点；从 JS 文本正则提取，首次调用缓存。
 
     先剥 ``//`` 行注释：main 在数组内加的业务确认注释里带 ASCII 双引号（``"待确认"``），
     不剥注释会被字符串正则误认成一个端点（实测 23 项，且会把 ``待确认`` 放进 HTTP 白名单）。
+
+    WP7 起新增端点不再回写 legacy 面板源（endpoints.js 冻结，删除另行决策）：
+    服务自有端点在 ``WP7_ENDPOINTS`` 登记，追加在 legacy 清单之后；锁定测试按
+    「JS 清单 + WP7 增量 ≡ 本函数结果」比对。
     """
     global _ENDPOINTS_CACHE
     if _ENDPOINTS_CACHE is None:
@@ -319,7 +327,7 @@ def endpoints():
         if block is None:
             raise WorkbenchError("Cannot read endpoints manifest: plugins/workbench/src/endpoints.js")
         body = re.sub(r"//[^\n]*", "", block.group(1))
-        _ENDPOINTS_CACHE = re.findall(r'"([^"]+)"', body)
+        _ENDPOINTS_CACHE = re.findall(r'"([^"]+)"', body) + list(WP7_ENDPOINTS)
     return list(_ENDPOINTS_CACHE)
 
 

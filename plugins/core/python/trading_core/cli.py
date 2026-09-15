@@ -1,7 +1,8 @@
 """python -m trading_core 单入口：全部子命令输出 JSON，便于 Harness 对话读取。
 
 网络类子命令（calendar/sync-bars/backfill/adjustments/fundamentals/merge-announcements/universe）
-直连真实渠道；quality 只读本地库。默认库路径 $DSH_HOME/trading-data/trading.sqlite。
+直连真实渠道；quality/factors-snapshot/factors-history 只动本地库（WP7 因子快照按日收集与查询）。
+默认库路径 $DSH_HOME/trading-data/trading.sqlite。
 """
 import argparse
 import datetime as _dt
@@ -106,6 +107,16 @@ def build_parser():
     s = sub.add_parser("snapshot-reconcile", help="对账快照（差异/TCA/计划→订单→成交链，只读）")
     s.add_argument("--limit", type=int, default=5, help="链路包含的计划数（默认 5）")
     _add_db(s)
+
+    # ── WP7：因子快照（收盘作业链定时收集 + 历史查询；只动本地库）──
+    s = sub.add_parser("factors-snapshot", help="横截面因子快照（factors.REGISTRY 全量，落 factor_snapshots）")
+    s.add_argument("--tickers", required=True, help="逗号分隔")
+    s.add_argument("--date", default=_dt.date.today().isoformat(), help="as_of，YYYY-MM-DD（默认今天）")
+    _add_db(s)
+
+    s = sub.add_parser("factors-history", help="因子快照历史（按日期倒序，只读）")
+    s.add_argument("--limit", type=int, default=30, help="最多返回条数（默认 30）")
+    _add_db(s)
     return p
 
 
@@ -134,6 +145,29 @@ def _daemon_loop(conn, home, once=False, interval=60):
             time.sleep(interval)
         except KeyboardInterrupt:
             return {"stopped": True, "issues": issues}
+
+
+def _factors_snapshot(conn, tickers, date):
+    """WP7：横截面因子快照——factors.REGISTRY 全量因子逐标的计算，payload 落库。
+
+    因子计算唯一入口是 trading_core/factors.py 的既有实现（fn(conn, symbol, as_of)
+    -> float|None，输入只有 PIT store 与 as_of），此处只做编排不另写计算；测试经替换
+    REGISTRY 注入替身。任一计算异常或全部因子无数据时抛错（不落库），由调用方落
+    {ok:false, error} 信封。
+    """
+    from . import factors
+    tickers = [t for t in tickers if t]
+    if not tickers:
+        raise ValueError("tickers 为空")
+    registry = factors.REGISTRY
+    per_ticker = {t: {name: fn(conn, t, date) for name, fn in registry.items()}
+                  for t in tickers}
+    if all(value is None for row in per_ticker.values() for value in row.values()):
+        raise RuntimeError(f"无可用因子数据（{len(tickers)} 标的，as_of={date}）")
+    payload = {"date": date, "tickers": per_ticker, "computed_at": store._now(),
+               "note": f"registry={','.join(registry)}"}
+    store.save_factor_snapshot(conn, date, payload)
+    return {"ok": True, "date": date, "tickers": len(per_ticker)}
 
 
 def main(argv=None):
@@ -216,6 +250,19 @@ def main(argv=None):
         elif args.cmd == "snapshot-reconcile":
             from . import snapshots
             result = snapshots.reconcile_snapshot(conn, chain_limit=args.limit)
+        elif args.cmd == "factors-snapshot":
+            # 无数据/计算失败：{ok:false, error} + 非零退出（daemon runner 只看退出码，
+            # 干净 JSON 让调用方拿得到原因，而不是一屏 traceback）。
+            try:
+                result = _factors_snapshot(
+                    conn, [t.strip() for t in args.tickers.split(",") if t.strip()], args.date)
+            except Exception as error:  # noqa: BLE001 —— 失败信封即本子命令的输出契约
+                print(json.dumps({"ok": False, "error": str(error)[:300]},
+                                 ensure_ascii=False, indent=1))
+                return 1
+        elif args.cmd == "factors-history":
+            result = {"ok": True, "snapshots": store.list_factor_snapshots(conn,
+                                                                          limit=args.limit)}
         elif args.cmd == "daemon":
             import os
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
