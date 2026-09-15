@@ -27,7 +27,7 @@
       - Always label uncertainty and data timestamps. Analysis is research, not investment advice; say so in the final output.
       - Trading actions default to simulation. A real (live) order requires the user's explicit confirmation of the full order summary, twice, before any call. Never place a live order without that confirmation.
       - Persist every final decision to .tradingagents/memory.md in the workspace, and read past lessons for the same ticker before concluding a new analysis.
-      - Harness is the only conversation and instruction entry. The trading workbench displays reports, observed broker responses and quant previews; it has no chat or order-entry controls.
+      - Harness is the only conversation and instruction entry. The standalone trading workbench (http://127.0.0.1:8397, start with: node platform/server/start.mjs) displays reports, observed broker responses and quant previews; it has no chat or order-entry controls. The quantwb MCP tools expose the same workbench capabilities for queries and maintenance. Live-mode switching is web-only (the quantwb switch_mode tool rejects it); the plan-execution gate still requires the user's typed confirmation before any call.
       - RESEARCH PATH only: when the user explicitly asks for deep research, call run_trading_analysis to open a research record, then perform the trading-agents skill workflow with Harness tools and subagents. It does not generate a report for you. Publish the completed, sourced report with research_publish using the returned run id. Do NOT call it for fast-path signal/backtest questions.
       - Read trading_status before account operations. Only the user may enable live mode in the workbench. Switching mode does not authorize an order. Never bypass the native tool policy by invoking broker endpoints through shell or HTTP.
       - Quant previews and local simulation ledgers are not broker positions or fills. For current broker state, use the matching Futu account query tools in this Harness conversation.
@@ -159,3 +159,18 @@
       Authorization: !!js "(() => { try { const om = process.getBuiltinModule('node:os'); const fs = process.getBuiltinModule('node:fs'); const home = process.env.DSH_HOME || om.homedir() + '/.dsh'; const t = fs.readFileSync(home + '/futu-token', 'utf8').trim(); if (t) return 'Bearer ' + t; } catch (e) { if (e.code !== 'ENOENT') throw e; } return 'Bearer ' + (process.env.FUTU_MCP_TOKEN ?? ''); })()"
     failOnStartupError: false
     toolCallTimeoutMs: 60000
+
+# ── 量化平台独立服务（WP6：MCP 工具面 = 工作台全功能，规格见
+#    docs/superpowers/specs/2026-09-15-wp6-standalone-service.md） ─────────────
+# 需先启动服务：node platform/server/start.mjs（未启动时本行安静降级）。
+# 通道分级：quantwb 的 switch_mode 仅限 live→sim；实盘切换只能在独立 Web 由用户输入口令。
+
+- id: quant-platform-mcp
+  name: '@deepseek-ai/dsh-mcp-client'
+  disabled: true
+  config:
+    serverName: quantwb
+    transport: streamable-http
+    url: http://127.0.0.1:8397/mcp
+    failOnStartupError: false
+    toolCallTimeoutMs: 120000

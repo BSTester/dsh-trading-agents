@@ -1,3 +1,6 @@
+# 该行必须保留：tradingWorkbench 服务是 engine 账户策略（policy.js 模式互斥/原生审批/调用租约）
+# 的进程内锚。WP6 起面板 UI 由独立服务（platform/）接管，本 Host 行与 legacy 面板过渡期并存，
+# 面板移除另行提交（规格 §5.4）。
 - insert:
     - id: trading-workbench
       name: '@bstester/dsh-trading-workbench'
