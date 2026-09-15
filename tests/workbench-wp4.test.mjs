@@ -140,3 +140,40 @@ test("commandbus mirrors the python whitelist and writes pending atomically", as
   assert.equal(body.plan_hash, "h1");
   assert.equal(Object.keys(COMMANDS).length, 5);
 });
+
+// ── 任务 6/7/8：计划与调度页签、审计链路 ─────────────────────────────────────
+
+function tabSource(source, name, nextName) {
+  const start = source.indexOf(`function ${name}(`);
+  const end = source.indexOf(`function ${nextName}(`);
+  return source.slice(start, end > start ? end : undefined);
+}
+
+test("client ships plan tab wired into nav and dispatch", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /\{ id: "plan", label: "计划" \},/);
+  assert.match(source, /function PlanTab\(/);
+  assert.match(source, /tab === "plan" && h\(PlanTab/);
+  assert.match(source, /request\(rpc, "plan"/);
+});
+
+test("client ships schedule tab wired into nav and dispatch", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  assert.match(source, /\{ id: "schedule", label: "调度" \},/);
+  assert.match(source, /function ScheduleTab\(/);
+  assert.match(source, /tab === "schedule" && h\(ScheduleTab/);
+  assert.match(source, /request\(rpc, "schedule"/);
+});
+
+test("plan tab keeps the live gate: exact phrase, frozen-only execute, cancel action", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const tab = tabSource(source, "PlanTab", "ScheduleTab");
+  assert.match(tab, /=== "frozen"/, "只有冻结计划可执行");
+  assert.match(tab, /=== "live"/, "实盘门槛判断");
+  assert.match(tab, /"确认执行"/, "实盘口令必须逐字匹配");
+  assert.match(tab, /action: "cancel"/, "取消计划走受约束动作");
+  assert.match(tab, /content_hash/, "执行必须带计划哈希");
+  assert.match(tab, /expected_mode/, "执行必须带期望模式");
+  // 页签文案规范（全局约定 2.1）：正文只保留数据事实/操作反馈/安全口令
+  assert.doesNotMatch(tab, /规格|设计稿|示例|宁可|窄门|token/);
+});

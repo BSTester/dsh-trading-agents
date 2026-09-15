@@ -66,6 +66,11 @@ window.__ModuleLoader__.load({
 .tw-kv-item{padding:8px 10px;border-radius:8px;background:var(--dsw-alias-bg-base,Canvas);border:1px solid var(--dsw-alias-border-l1,GrayText)}
 .tw-kv-k{font-size:11px;color:var(--dsw-alias-label-tertiary,GrayText)}
 .tw-kv-v{font-size:14px;font-weight:700;margin-top:2px}
+.tw-table{width:100%;border-collapse:collapse;font-size:12px}
+.tw-table th{text-align:left;padding:6px 8px;color:var(--dsw-alias-label-secondary,GrayText);font-weight:600;border-bottom:1px solid var(--dsw-alias-border-l1,GrayText);white-space:nowrap}
+.tw-table td{padding:6px 8px;border-bottom:1px solid var(--dsw-alias-border-l1,GrayText)}
+.tw-table tr:last-child td{border-bottom:none}
+.tw-num{text-align:right;font-variant-numeric:tabular-nums}
 .tw-item{border:1px solid var(--dsw-alias-border-l1,GrayText);border-radius:8px;background:var(--dsw-alias-bg-base,Canvas)}
 .tw-item>summary{cursor:pointer;padding:8px 10px;font-size:12px;font-weight:600;display:flex;align-items:center;gap:8px;list-style:none}
 .tw-item>summary::-webkit-details-marker{display:none}
@@ -997,7 +1002,9 @@ ol.sources code{font-size:11.5px}
       { id: "portfolio", label: "组合" }, { id: "risk", label: "风险" },
       { id: "factors", label: "因子" },
       { id: "execution", label: "执行" }, { id: "research", label: "研究" },
-      { id: "events", label: "事件" }, { id: "audit", label: "审计" },
+      { id: "events", label: "事件" },
+      { id: "plan", label: "计划" }, { id: "schedule", label: "调度" },
+      { id: "audit", label: "审计" },
     ];
 
     /** K 线卡片：周期切换 + 蜡烛图。按需取数，两层缓存（客户端 TTL + Host TTL）。 */
@@ -1771,6 +1778,87 @@ ol.sources code{font-size:11.5px}
         h("p", { className: "tw-hint" }, "审计仅记录 Harness 观察到的响应与本地台账；实盘成交请以券商成交查询为准。"));
     }
 
+    // 计划页：当前冻结计划的目标→订单 diff、逐单预检结论、受约束执行入口。
+    // 设计依据见 docs/superpowers/plans/2026-09-14-wp4-scheduler-workbench.md 任务 6
+    // 与规格 §8.3（注释，不上屏）。live 门槛：冻结态 + 模式一致 + 口令逐字匹配。
+    function PlanTab({ rpc }) {
+      const [plan, setPlan] = React.useState(null);
+      const [error, setError] = React.useState("");
+      const [confirmText, setConfirmText] = React.useState("");
+      const [busy, setBusy] = React.useState(false);
+      const [notice, setNotice] = React.useState("");
+      const [revision, setRevision] = React.useState(0);
+      const load = React.useCallback(() => {
+        request(rpc, "plan", {}).then((value) => { setPlan(value); setError(""); })
+          .catch((failure) => setError(failure.message));
+      }, [rpc]);
+      React.useEffect(() => { load(); }, [load, revision]);
+
+      const act = (payload, doneMessage) => {
+        setBusy(true); setNotice("");
+        request(rpc, "plan-execute", payload)
+          .then(() => setNotice(doneMessage))
+          .catch((failure) => setNotice(`提交失败：${failure.message}`))
+          .finally(() => { setBusy(false); setRevision((v) => v + 1); });
+      };
+      if (error) {
+        return h(Card, { title: "计划" }, h("p", { className: "tw-alert" }, `计划读取失败：${error}`));
+      }
+      if (!plan) {
+        return h(Card, { title: "计划" }, h("p", { className: "tw-empty" }, "读取中…"));
+      }
+      const current = (plan.plans ?? [])[0];
+      const live = plan.mode === "live";
+      const frozen = current?.status === "frozen";
+      const orders = current?.orders ?? [];
+      const canExecute = frozen && !busy && (!live || confirmText === "确认执行");
+      return h(React.Fragment, null,
+        h(Card, { title: "当前计划", count: orders.length,
+          empty: cardEmpty({ loading: false, error: "", count: current ? 1 : 0,
+            fallback: "还没有计划：在 Harness 中生成并冻结计划后显示在这里。" }) },
+          current && h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "账户模式"),
+              h("div", { className: "tw-kv-v" },
+                h("span", { className: `tw-badge${live ? " live" : ""}` }, live ? "实盘" : "模拟盘"))),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "计划"),
+              h("div", { className: "tw-kv-v" }, current.plan_id)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "状态"),
+              h("div", { className: "tw-kv-v" }, current.status)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "内容哈希"),
+              h("div", { className: "tw-kv-v" }, current.content_hash)),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "冻结时间"),
+              h("div", { className: "tw-kv-v" }, current.created_at))),
+          orders.length > 0 && h("table", { className: "tw-table" },
+            h("thead", null, h("tr", null,
+              ["标的", "方向", "数量", "限价", "状态", "预检"].map((c) => h("th", { key: c }, c)))),
+            h("tbody", null, orders.map((o) =>
+              h("tr", { key: o.client_order_id },
+                h("td", null, o.symbol),
+                h("td", null, o.side === "BUY" ? "买入" : "卖出"),
+                h("td", { className: "tw-num" }, String(o.qty)),
+                h("td", { className: "tw-num" }, String(o.price ?? "—")),
+                h("td", null, o.status),
+                h("td", null, o.risk_verdict ?? "—"))))),
+          current && h("p", { className: "tw-meta" }, `历史计划共 ${(plan.plans ?? []).length} 个`)),
+        current && frozen && h(Card, { title: "执行" },
+          live && h("div", { className: "tw-toolbar" },
+            h("input", { className: "tw-input", value: confirmText, placeholder: "输入「确认执行」",
+              onChange: (e) => setConfirmText(e.target.value), autoComplete: "off",
+              "aria-label": "确认执行" }),
+            h("span", { className: "tw-meta" }, "实时账户执行需逐字输入口令复核。")),
+          h("div", { className: "tw-toolbar" },
+            h("button", { type: "button", className: "tw-btn primary", disabled: !canExecute,
+              onClick: () => act({ plan_hash: current.content_hash, expected_mode: plan.mode,
+                ...(live ? { confirmation: confirmText } : {}) },
+                "已写入执行指令，等待 daemon 处理；状态以本页刷新为准。") },
+              live ? "执行（实时账户）" : "执行计划"),
+            h("button", { type: "button", className: "tw-btn", disabled: busy,
+              onClick: () => act({ plan_hash: current.content_hash, expected_mode: plan.mode,
+                action: "cancel" },
+                "已写入取消指令：未提交订单将被撤销，在途订单以对账为准。") }, "取消计划")),
+          notice && h("p", { className: "tw-meta" }, notice)));
+    }
+
     function Dashboard({ rpc }) {
       const [open, setOpen] = React.useState(false);
       const [tab, setTab] = React.useState("market");
@@ -1872,6 +1960,8 @@ ol.sources code{font-size:11.5px}
               !detail && snapshot && tab === "execution" && h(ExecutionView, { rpc, snapshot }),
               !detail && snapshot && tab === "research" && h(ResearchView, { rpc, snapshot, ticker, onOpenReport: setDetail }),
               !detail && tab === "events" && h(EventsView, { rpc, ticker }),
+              !detail && snapshot && tab === "plan" && h(PlanTab, { rpc }),
+              !detail && snapshot && tab === "schedule" && h(ScheduleTab, { rpc }),
               !detail && snapshot && tab === "audit" && h(AuditView, { rpc, snapshot }),
               snapshot && h("div", { className: "tw-row" },
                 h("p", { className: "tw-hint" },
