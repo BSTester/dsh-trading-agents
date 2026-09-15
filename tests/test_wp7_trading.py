@@ -11,6 +11,8 @@
   * 幂等：同一 client_order_id 重复提交不重复下单（对齐 OMS：cid 主键 + 在途查重）；
   * 查询直通：account_positions/orders/funds 受 mode 约束；broker 抛错 → 信封不 500；
   * 默认 broker 适配（FutuBroker）sim 分支：工具名/参数对齐 trading_core.broker 锁定表；
+  * live 写前置拒绝：默认适配器（supports_live_write=False）确认零调用、broker 零调用、
+    不落 OMS/风控行；声明支持 live 写的适配器才走完整确认流；
   * HTTP 路由：白名单、信封透传、写端点不进缓存。
 """
 import sys
@@ -49,7 +51,14 @@ def fixed_ctx(**over):
 
 
 class FakeBroker:
-    """计数替身：记录每次 (op, 入参)；error 注入时抛异常模拟 broker 故障。"""
+    """计数替身：记录每次 (op, 入参)；error 注入时抛异常模拟 broker 故障。
+
+    supports_live_write=True：替身模拟「已接入 live 写的自定义适配器」，既有 live
+    用例（确认流/拒绝流/改撤单）因此继续走完整闸门链不回归；默认适配器
+    （FutuBroker，supports_live_write=False）的确认前快速拒绝见 LiveWriteGateTest。
+    """
+
+    supports_live_write = True
 
     def __init__(self, error=None, place_result=None):
         self.calls = []
@@ -317,6 +326,65 @@ class ConfirmFlowTest(GateTestBase):
         self.assertIn("拒绝", out["error"]["message"])
         self.assertEqual(self.broker.calls, [])
         self.assertEqual(self.order_row("CID-REJ")["status"], "cancelled")
+
+
+class LiveWriteGateTest(GateTestBase):
+    """live 写前置拒绝（审查必修 2）：默认适配器在确认之前快速失败——不发起确认、
+    不产生待确认、不落 OMS/风控行；声明支持 live 写的适配器才走完整确认流。"""
+
+    def test_default_adapter_live_write_rejects_before_confirm_and_broker(self):
+        self.set_mode("live")
+        self.assertFalse(trading.FutuBroker.supports_live_write)
+        broker = trading.FutuBroker()  # 不注入 _call：一旦被触达就会惰性导入并暴露
+        gate = trading.TradeGate(str(self.home), broker=broker, confirm=self.confirm,
+                                 ctx_builder=fixed_ctx())
+        cases = [("place", dict(ORDER)),
+                 ("modify", {"order_id": "1", **ORDER}),
+                 ("cancel", {"order_id": "1", "symbol": "SH.600519"})]
+        for op, payload in cases:
+            with self.subTest(op=op):
+                out = getattr(gate, op)(payload)
+                self.assertFalse(out["ok"])
+                self.assertEqual(out["error"]["code"], "trading/broker-unavailable")
+                self.assertIn("当前仅 sim 可交易", out["error"]["message"])
+                self.assertEqual(self.confirm.requests, [], "确认零调用")
+                self.assertIsNone(broker._call, "broker 零触达（惰性导入未触发）")
+        # 快速失败不落任何痕迹：无订单行、无风控留痕、无待确认
+        conn = core_store.connect(core_store.db_path(str(self.home)))
+        try:
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 0)
+            self.assertEqual(conn.execute("SELECT COUNT(*) FROM risk_checks").fetchone()[0], 0)
+        finally:
+            conn.close()
+        self.assertIsNone(store_access.confirmation_view(str(self.home)))
+
+    def test_adapter_without_supports_live_write_attr_is_treated_as_unsupported(self):
+        """鸭子类型适配器未声明 supports_live_write → 按「不支持」处理（fail-safe）。"""
+        self.set_mode("live")
+
+        class BareBroker:
+            def place(self, order, mode):  # pragma: no cover —— 断言不得触达
+                raise AssertionError("live 写不得触达未声明支持的适配器")
+
+        gate = trading.TradeGate(str(self.home), broker=BareBroker(),
+                                 confirm=self.confirm, ctx_builder=fixed_ctx())
+        out = gate.place(dict(ORDER))
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "trading/broker-unavailable")
+        self.assertEqual(self.confirm.requests, [])
+
+    def test_adapter_declaring_live_write_support_goes_through_confirmation(self):
+        """自定义适配器 supports_live_write=True → 走完整确认流：批准后恰好一次下单。"""
+        self.set_mode("live")
+        confirm = FakeConfirm(outcome={"decision": "approved", "id": "c1",
+                                       "reason": "用户在工作台确认"})
+        gate = self.gate(confirm=confirm)
+        self.assertTrue(type(gate.broker).supports_live_write)
+        out = gate.place(dict(ORDER, client_order_id="CID-LIVE-SUPPORTED"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(len(confirm.requests), 1, "支持 live 写也必须过业务确认")
+        self.assertEqual(self.broker.count("place"), 1)
+        self.assertEqual(self.order_row("CID-LIVE-SUPPORTED")["status"], "submitted")
 
 
 class IdempotencyTest(GateTestBase):

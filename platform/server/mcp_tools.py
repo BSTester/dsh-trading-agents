@@ -406,11 +406,15 @@ TOOLS = (
     # 闸门链：模式文件 → 风控 8 规则（kill 是规则 1）→ 业务确认（唯一放行方式）→ broker。
     # 提交后阻塞等待用户在独立 Web 确认卡片作答；确认 TTL 120 秒，超时自动拒绝
     # （fail-closed）。工具描述必须把这条边界讲清楚：模型能发起、只有人能批准。
+    # live 写通道未接入（默认适配器 supports_live_write=False）：三个写工具在确认
+    # 之前即被闸门拒绝（trading/broker-unavailable），描述里如实写明，免得模型
+    # 在 live 下发起一笔注定被拒、还要占用确认通道的提交。
     ToolDefinition(
         "trade_place",
         "受约束下单（临时订单，限价）：过完整闸门链（模式文件→风控 8 规则→kill→业务确认）"
         "后提交券商。提交后需在独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
-        "live 下确认前本工具阻塞等待；模式只认账户模式文件（载荷不带 mode）。",
+        "live 写通道尚未接入（提交会被拒绝）；当前仅 sim 可交易。"
+        "模式只认账户模式文件（载荷不带 mode）。",
         "trade_place",
         (
             req("symbol", "str", "标的代码，如 SH.600519（支持 SH/SZ/BJ/HK/US 前缀）"),
@@ -424,7 +428,8 @@ TOOLS = (
         "trade_modify",
         "受约束改单（=撤旧单+按新参数重下，因券商改单接口不可靠）：过完整闸门链"
         "（模式→风控 8 规则→kill→业务确认）后执行，风控按新参数全额预检。提交后需在"
-        "独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。",
+        "独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
+        "live 写通道尚未接入（提交会被拒绝）；当前仅 sim 可交易。",
         "trade_modify",
         (
             req("order_id", "str", "要改的券商订单号"),
@@ -439,7 +444,7 @@ TOOLS = (
         "trade_cancel",
         "受约束撤单：过闸门（kill/模式/交易日三规则真实约束；撤单不新增敞口）后向券商"
         "提交撤单。撤错单同样是业务错误，故同样需在独立 Web 确认卡片批准；TTL 120 秒"
-        "超时自动拒绝（fail-closed）。",
+        "超时自动拒绝（fail-closed）。live 写通道尚未接入（提交会被拒绝）；当前仅 sim 可交易。",
         "trade_cancel",
         (
             req("order_id", "str", "要撤销的券商订单号"),

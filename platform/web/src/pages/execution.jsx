@@ -107,12 +107,14 @@ function ConfirmationCard() {
     const tick = setInterval(() => setNow(Date.now()), 1000);
     return () => clearInterval(tick);
   }, [pending?.id]);
-  // 10s 轮询兜底：卡片展示期间即使无人操作也能及时看到超时消失
+  // 10s 轮询：无条件常驻（挂载即起，不以 pending 早退）。useEndpoint 只在挂载时取一次，
+  // 若轮询以「无待确认」早退，常态下卡片永不轮询——trade_place 新产生的待确认必须刷新
+  // 页面才出现（WP7 任务 3 审查必修 1）。refresh 是稳定回调，全生命周期只挂这一个定时器；
+  // 有待确认时同一间隔也足以让超时消失及时可见。
   React.useEffect(() => {
-    if (!pending) return undefined;
     const timer = setInterval(() => confirmation.refresh(), 10_000);
     return () => clearInterval(timer);
-  }, [confirmation.refresh, pending?.id]);
+  }, [confirmation.refresh]);
   const [busy, setBusy] = React.useState(false);
 
   if (confirmation.error) {

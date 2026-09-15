@@ -77,6 +77,11 @@ LIVE_WRITE_REFUSAL = (
     "未实现 live 执行（铁律：不另写富途协议）。live 写路径待后续任务接入券商通道"
 )
 
+# live 写的闸门前置拒绝（TradeGate._write 在业务确认**之前**快速失败）：适配器未声明
+# supports_live_write 时，live 写走完确认也注定被 _live_guard 拒绝——先置拒绝让确认
+# 不被花在注定被拒的单上：不发起确认、不产生待确认、不落任何 OMS/风控行。
+LIVE_WRITE_UNAVAILABLE = "live 写通道尚未接入券商执行协议；当前仅 sim 可交易"
+
 
 class BrokerUnavailable(RuntimeError):
     """券商通道不可用/未接入：适配层「确定未发出」的故障才抛这一类。"""
@@ -154,7 +159,9 @@ def default_ctx_builder(conn, mode, order, operation, home, today):
         # 拒掉权益远大于默认值的合法单（宁可错拒，注释披露给后续任务接真值）。
         "equity": 1_000_000.0,
         # 持仓市值表/持仓数：同上取不到真值，空表意味着规则 5/6 只对「本单全额名义」
-        # 生效（不会因为低估持仓而放行超限单；但也不会拦下叠加超限——如实披露）。
+        # 生效——低估持仓的后果是**拦不住叠加超限**（存量持仓不可见，规则 5/6 看不到
+        # 已有市值）；单笔名义被规则 4 封顶（对照 risk.py：stop_dist=None 时风险额按
+        # 全额名义对 equity×risk_per_trade 封顶），故 fail-open 幅度有界（如实披露）。
         "positions_value": {},
         "positions_count": 0,
         # 日内盈亏：取不到真值给 0.0（不触发规则 7 熔断口径）；熔断落库（store.set_halt）
@@ -291,6 +298,11 @@ class FutuBroker:
       ``{"status": "unknown"}``（铁律：超时→查询不重放），只有「确定未发出」的故障
       才抛 BrokerUnavailable——闸门据此决定 OMS 落 unknown（在途待查询）还是 rejected。
     """
+
+    # 适配器契约：是否实现 live 写路径。默认 False（本类只做 sim 写 + live/sim 查询）；
+    # TradeGate._write 据此在业务确认之前拒绝 live 写（不发起确认、不产生待确认）。
+    # 接入了 live 写的适配器必须显式声明 True，才会走完整确认流到达 broker。
+    supports_live_write = False
 
     def __init__(self, call=None):
         self._call = call  # None → 首次调用时惰性导入 futu_mcp.call_tool
@@ -570,6 +582,12 @@ class TradeGate:
             mode = store_access.read_mode(self.home)
         except WorkbenchError as error:
             return _envelope_fail("trading/order-rejected", f"账户模式非法：{error}")
+        # 2.5) live 写前置拒绝：适配器未声明 supports_live_write 时，确认通过后也注定
+        #      被 FutuBroker._live_guard 拒绝——在确认之前快速失败，不发起确认、不产生
+        #      待确认、不落 OMS/风控行。getattr 对未声明该属性的鸭子类型适配器按
+        #      「不支持」处理（fail-safe：没显式声明支持 live 写，就不得写 live）。
+        if mode == "live" and not getattr(self.broker, "supports_live_write", False):
+            return _envelope_fail("trading/broker-unavailable", LIVE_WRITE_UNAVAILABLE)
         # 3) 幂等编号：调用方提供则复用（重复提交不重复下单），否则生成（OMS uuid 口径）
         cid = clean.get("client_order_id") or uuid.uuid4().hex
         conn = self._conn()
