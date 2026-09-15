@@ -1,7 +1,8 @@
 // WP6 锁定测试（规格 §3.7）：工具面总数/名单、端点对等、能力黑名单、服务常量。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { ENDPOINT_TOOLS, ADMIN_TOOLS, TOOL_COUNT, TOOL_NAME_BLACKLIST } from "../server/manifest.mjs";
+import path from "node:path";
+import { ENDPOINT_TOOLS, ADMIN_TOOLS, TOOL_COUNT, TOOL_NAME_BLACKLIST, buildManifest } from "../server/manifest.mjs";
 import { ENDPOINTS } from "../../plugins/workbench/src/endpoints.js";
 import { DEFAULTS } from "../server/config.mjs";
 
@@ -33,8 +34,39 @@ test("wp6 服务常量锁定：8397/127.0.0.1/无默认 token", () => {
   assert.equal(DEFAULTS.token, null);
 });
 
+test("wp6 服务配置：env 覆盖在缺文件时同样生效；env=0 合法；env 非法端口忽略", async () => {
+  const { mkdtemp, rm } = await import("node:fs/promises");
+  const os = await import("node:os");
+  const home = await mkdtemp(path.join(os.tmpdir(), "wp6-config-"));
+  const { loadConfig } = await import("../server/config.mjs");
+  const previous = process.env.TRADING_SERVICE_PORT;
+  try {
+    process.env.TRADING_SERVICE_PORT = "0";
+    assert.equal(loadConfig(home).port, 0);            // 缺文件 + env 生效（冒烟测试的关键路径）
+    process.env.TRADING_SERVICE_PORT = "99999";
+    assert.equal(loadConfig(home).port, 8397);         // 非法 env 忽略
+  } finally {
+    if (previous === undefined) delete process.env.TRADING_SERVICE_PORT;
+    else process.env.TRADING_SERVICE_PORT = previous;
+    await rm(home, { recursive: true, force: true });
+  }
+});
+
+test("wp6 黑名单守卫：规格点名词条在列；分段匹配能拦合成名", () => {
+  for (const required of ["exec", "shell", "token", "write_file"]) {
+    assert.ok(TOOL_NAME_BLACKLIST.includes(required), required);
+  }
+  const matches = (name) => {
+    const lower = name.toLowerCase();
+    return TOOL_NAME_BLACKLIST.some((banned) =>
+      lower === banned || lower.split(/[^a-z0-9]+/).includes(banned));
+  };
+  assert.ok(matches("run_shell"));
+  assert.ok(matches("exec_cmd"));
+  assert.ok(!matches("plan_execute"));
+});
+
 test("wp6 admin 工具：store 同步抛错包装为 ok:false envelope", async () => {
-  const { buildManifest } = await import("../server/manifest.mjs");
   const manifest = buildManifest({ handle: async () => ({ ok: true, value: {} }),
     store: { read: () => { throw new Error("数据文件损坏"); } } });
   const result = await manifest.find((tool) => tool.name === "admin_status").call({});

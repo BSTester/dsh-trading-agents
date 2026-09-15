@@ -6,7 +6,7 @@
   "description": "量化平台独立服务：MCP 工具面（=工作台全功能）+ HTTP API + 前端托管（WP6）",
   "scripts": {
     "start": "node server/start.mjs",
-    "test": "node --test tests/*.test.mjs",
+    "test": "node --test tests/",
     "web:build": "npm --prefix web run build"
   },
   "dependencies": {

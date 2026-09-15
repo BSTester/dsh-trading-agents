@@ -33,7 +33,7 @@ export const ENDPOINT_TOOLS = [
   endpointTool("snapshot", "snapshot", "工作台全量快照：账户模式、研报、研究 run、量化预览、交易响应、去重订单事实（trade_summary）、在途调用与缺失端点清单。无券商数据时明确为空。", {}),
   {
     kind: "endpoint", name: "switch_mode", endpoint: "switch-mode",
-    description: "切换账户模式，仅限 live→sim（回模拟盘）。sim→live 被本工具拒绝：实盘切换只能由用户在独立 Web（http://127.0.0.1:8397）输入口令「确认实盘」完成。切换模式不授权任何订单。",
+    description: "切换账户模式，仅限 live→sim（回模拟盘）。sim→live 被本工具拒绝：实盘切换只能由用户在独立 Web（默认 http://127.0.0.1:8397，端口随服务配置）输入口令「确认实盘」完成。切换模式不授权任何订单。",
     input: {
       mode: z.enum(["sim", "live"]).describe("目标模式（本工具只接受 sim）"),
       expected_mode: z.enum(["sim", "live"]).describe("调用方所见当前模式，防过期数据误切换"),
