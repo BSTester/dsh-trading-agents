@@ -1778,3 +1778,72 @@ preset 翻动留待用户部署时执行，本验收不做。
   （分页信封实测 6 页，`has_more/next_key` 与实现一致）。
 - 环境备注：venv `.pth` 解析的是安装快照——datasource 改动后必须刷新快照
   （重跑 install 或 rsync），否则 CLI 跑在旧代码上（本次 universe=50 即此因）。
+
+### K1 修复（方案 A）执行记录（2026-09-15）
+
+**改动说明**（TDD，先红后绿）：
+
+- `market.py`：新增 `load_raw_bars(ticker, period="1d", limit=2000)`——富途
+  ≤370 根/页、`end` 游标向后翻页（cursor 初始今天，其后取本批最早日期的前一天）、
+  按 t 合并去重；凑满 limit / 历史翻尽（空页）/ 游标不再前移（防死循环）即停；
+  首批即失败按 load_bars 风格抛 `RuntimeError`；返回
+  `(bars, "futu/raw_chunk", False)`。`fetch_futu` 增加可选参 `end=None`（缺省
+  今天，向后兼容）。
+- **根因再发现（本轮关键实证）**：富途 MCP `quote_history_kline` 带
+  `autype` 参数（tools/list schema 实测）：0=不复权 / **1=前复权（服务端默认）**
+  / 2=后复权。**不传 autype 拿到的是前复权**——「走富途」不等于「拿到原始价」，
+  这才是 K1 的真正根因。因此 `fetch_futu` 再增 `autype=None` 可选参，
+  `load_raw_bars` 必须显式 `autype="0"`；实测 SH.600519 end=2026-06-25：
+  autype=0 → close 1212.10（原始价），autype=1/缺省 → 1184.0758（前复权）。
+- `sync.py`：`backfill_bars` 默认 loader 改 `load_raw_bars`，docstring 更新
+  「回填走富途原始价分块——复权口径由 adjustments 表派生（规格 §4.2 规则 2）」；
+  `sync_bars_incremental` 未动（见下方告警②）。
+- 测试：`test_data_layer.py` 增 `RawChunkTests` 6 条（分页合并/跨页去重/游标
+  逐块前移/ktype=2 且 autype="0"/三种终止路径/首批空页与通道故障抛
+  RuntimeError/`fetch_futu` 缺省参数向后兼容）；`test_core_sync.py` 增 1 条
+  （backfill 默认路径经 patch 验证确实调用 `load_raw_bars` 并落库）。
+  TDD 红灯实证：6 条 `AttributeError: no attribute 'load_raw_bars'`、
+  autype 断言 `None != '0'`，随后转绿。
+
+**测试**：全量 `unittest discover` **Ran 273 tests — OK**（修复前基线 266 OK，
+净增 7 条全绿；含既有 sync 回填断点续传测试注入 loader 不受影响）。
+
+**存量清洗与重灌**（真实富途 MCP，库 `~/.dsh/trading-data/trading.sqlite`）：
+
+- 第一轮清洗 6000 行（3 标的 × 2000；注意：存量行符号是 W2 修复前灌入的
+  **裸码** 600519/00700/AAPL，DELETE 需同时覆盖裸码与 futu 格式，任务给的
+  只含 futu 格式的 DELETE 实际匹配 0 行）+ 游标 kv `backfill:bars:1d` 复位
+  （否则断点续传会静默跳过全部标的）。
+- 第一轮重灌暴露 autype 问题（source 已是 futu/raw_chunk 但 600519
+  仍 1184.0758）→ 实现 `autype="0"` 后**二次清洗 6660 行 + 重灌**。
+- 终态：`SELECT source, COUNT(*) FROM bars GROUP BY source` →
+  **`futu/raw_chunk | 6660`**（唯一来源）；每标的 2220 行（370×6 整页，
+  ≥2000 即停不截断），起止 SH.600519 2017-07-26..2026-09-14 /
+  HK.00700 2017-09-06..2026-09-15 / US.AAPL 2017-11-10..2026-09-14，
+  符号均为 futu 格式。
+
+**600519 抽查对照（2026-06-25 close）**：
+
+| 来源 | close | 口径 |
+|---|---|---|
+| 修复前库内（akshare/sina qfq） | 1184.08 | 前复权 ❌ |
+| 富途 autype 缺省（=1 前复权） | 1184.0758 | 前复权 ❌ |
+| 富途 autype=0（本轮落库） | **1212.10** | **不复权 ✅**（抽查行 1184.08 已不存在） |
+
+00700 421.40 / AAPL 275.15 同日抽查：00700 与原 Yahoo 值一致（06-25 后无除权，
+前复权=原始，交叉印证）；AAPL 274.9129→275.15（复权差异肉眼可见）。
+
+**告警与如实记录**：
+
+1. **600519 未触发空页终止**：三标的均在凑满 limit（2220≥2000）时截止，
+   没有翻到真实历史起点，空页终止路径由离线测试覆盖、真实通道未走到——
+   如实记录，不宣称验证过。
+2. **增量口径遗留（需用户定夺，本轮未动）**：实测证明 `sync_bars_incremental`
+   经 `load_bars`→`fetch_futu`（不带 autype）落库的同样是**前复权**——任务
+   前提「增量 ≤370 本就走富途原始价」不成立。若维持现状，下个交易日的增量
+   同步会把前复权行写入全原始价的表（混源，且前复权值随分红漂移）。建议
+   后续把增量默认 loader 也钉为 `load_raw_bars`（needed≤370 时恰为单页
+   autype=0 取数，行为等价、口径统一，约一行改动 + 测试）。本轮严格按任务
+   范围未动 `sync_bars_incremental`，在此之前应暂停增量同步作业。
+3. 执行过程环境注：改动后按「环境备注」rsync 刷新了 `~/.dsh/trading-python/`
+   快照并验证 venv 解析到新代码后才跑真实冒烟（否则 CLI 跑旧代码）。
