@@ -26,7 +26,7 @@
 
 **文件：** 修改 `plugins/datasource/python/trading_datasource/market.py`（INDEX_SYMBOLS 加 csi800）；测试 `tests/test_core_wp2_locks.py`
 
-- [ ] 步骤 1：写失败测试 `tests/test_core_wp2_locks.py`：
+- [x] 步骤 1：写失败测试 `tests/test_core_wp2_locks.py`：
 
 ```python
 """WP2 依赖锁定：上游 schema 漂移时这里的断言会先红（规格 §2.2 协议）。"""
@@ -50,15 +50,15 @@ if __name__ == "__main__":
     unittest.main()
 ```
 
-- [ ] 步骤 2：运行确认 FAIL（csi800 不存在）：`~/.dsh/trading-venv/bin/python -B -m unittest tests.test_core_wp2_locks -v`
-- [ ] 步骤 3：`market.py` 的 `INDEX_SYMBOLS` 追加 `"csi800": "SH.000906"`
-- [ ] 步骤 4：重跑 PASS；`git commit -m "feat(core): WP2 依赖锁定（中证800/估值来源）"`
+- [x] 步骤 2：运行确认 FAIL（csi800 不存在）：`~/.dsh/trading-venv/bin/python -B -m unittest tests.test_core_wp2_locks -v`
+- [x] 步骤 3：`market.py` 的 `INDEX_SYMBOLS` 追加 `"csi800": "SH.000906"`
+- [x] 步骤 4：重跑 PASS；`git commit -m "feat(core): WP2 依赖锁定（中证800/估值来源）"`
 
 ### 任务 1：store v2 —— valuations 表
 
 **文件：** 修改 `store.py`（_SCHEMA、SCHEMA_VERSION=2、两个函数）；测试追加 `tests/test_core_store.py`
 
-- [ ] 步骤 1：追加失败测试：
+- [x] 步骤 1：追加失败测试：
 
 ```python
     def test_valuations_pit(self):
@@ -72,7 +72,7 @@ if __name__ == "__main__":
             store.read_valuations(self.conn, "SH.600519", as_of=None)
 ```
 
-- [ ] 步骤 2：确认 FAIL；步骤 3：`store.py` 实现——`_SCHEMA` 追加：
+- [x] 步骤 2：确认 FAIL；步骤 3：`store.py` 实现——`_SCHEMA` 追加：
 
 ```sql
 CREATE TABLE IF NOT EXISTS valuations(
@@ -101,13 +101,13 @@ def read_valuations(conn, symbol, as_of):
     return {r["field"]: r["value"] for r in rows}
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): valuations 表（schema v2，PIT 读取）"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): valuations 表（schema v2，PIT 读取）"`
 
 ### 任务 2：因子注册表（价格域）
 
 **文件：** 创建 `factors.py`；测试 `tests/test_core_factors.py`
 
-- [ ] 步骤 1：失败测试（合成 bars 验证动量/波动数值与注册表）：
+- [x] 步骤 1：失败测试（合成 bars 验证动量/波动数值与注册表）：
 
 ```python
 """因子注册表单测：注册机制 + 价格域因子数值（合成序列，手算对照）。"""
@@ -142,7 +142,7 @@ class FactorsTest(unittest.TestCase):
         self.assertIsNone(v)  # 历史不足 → None（宁缺毋假），上层记 missing
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现 `factors.py`：
+- [x] 步骤 2：FAIL；步骤 3：实现 `factors.py`：
 
 ```python
 """因子注册表：@factor 注册，统一签名 fn(conn, futu_symbol, as_of) -> float|None。
@@ -196,13 +196,13 @@ factor("momentum_120")(_momentum(120))
 factor("volatility_20")(_volatility(20))
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): 因子注册表与价格域因子"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): 因子注册表与价格域因子"`
 
 ### 任务 3：估值因子收敛 + 估值同步
 
 **文件：** 修改 `factors.py`（valuation 因子，委托 `workbench/python/factors.py::valuation_values` 的收敛实现）、`sync.py`（`sync_valuations`）、测试 `tests/test_core_factors.py`
 
-- [ ] 步骤 1：失败测试（假 fetcher 返回样例估值 dict，验证落库与因子读取）：
+- [x] 步骤 1：失败测试（假 fetcher 返回样例估值 dict，验证落库与因子读取）：
 
 ```python
     def test_valuation_factor_reads_store(self):
@@ -211,7 +211,7 @@ factor("volatility_20")(_volatility(20))
         self.assertIsNone(factors.REGISTRY["ep"](self.conn, "SH.600519", "2026-07-01"))
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现——`factors.py` 追加（EP=市盈率倒数，口径统一"越大越看多"）：
+- [x] 步骤 2：FAIL；步骤 3：实现——`factors.py` 追加（EP=市盈率倒数，口径统一"越大越看多"）：
 
 ```python
 @factor("ep")
@@ -221,13 +221,13 @@ def _ep(conn, symbol, as_of):
 ```
 
 `sync.py` 追加 `sync_valuations(conn, symbols, fetcher=None)`：对每个 futu symbol 调用收敛后的估值实现（把 `workbench/python/factors.py::valuation_values` 的实现体迁入 `trading_core.factors.valuation_values`，workbench 侧改为薄委托），返回 `{field: value}` 后 `store.upsert_valuations(conn, symbol, today, fields, "futu/valuation")`。迁移时**旧测试改指向新位置**（`tests/` 里引用 valuation_values 的用例同步更新 import）。
-- [ ] 步骤 4：PASS；步骤 5：`git commit -m "feat(core): 估值因子收敛进 core 并按日落库"`
+- [x] 步骤 4：PASS；步骤 5：`git commit -m "feat(core): 估值因子收敛进 core 并按日落库"`
 
 ### 任务 4：横截面标准化与复合打分
 
 **文件：** 修改 `factors.py`；测试追加
 
-- [ ] 步骤 1：失败测试：
+- [x] 步骤 1：失败测试：
 
 ```python
     def test_zscore_mad_winsorize(self):
@@ -238,7 +238,7 @@ def _ep(conn, symbol, as_of):
         self.assertGreater(score["B"], score["A"])
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现 `factors.py`：
+- [x] 步骤 2：FAIL；步骤 3：实现 `factors.py`：
 
 ```python
 def cross_sectional_zscore(values, mad_bound=3.0):
@@ -271,13 +271,13 @@ def composite_score(per_symbol_factors, weights):
     return out
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): 横截面 z-score(MAD) 与复合打分"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): 横截面 z-score(MAD) 与复合打分"`
 
 ### 任务 5：IC / RankIC 与五分位分层
 
 **文件：** 修改 `factors.py`；测试追加
 
-- [ ] 步骤 1：失败测试（已知单调序列 → RankIC=1.0；分层 Q1>Q5）：
+- [x] 步骤 1：失败测试（已知单调序列 → RankIC=1.0；分层 Q1>Q5）：
 
 ```python
     def test_rank_ic_perfect_monotonic(self):
@@ -293,7 +293,7 @@ def composite_score(per_symbol_factors, weights):
         self.assertGreater(q["Q5"], q["Q1"])
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现（追加）：
+- [x] 步骤 2：FAIL；步骤 3：实现（追加）：
 
 ```python
 def _rank(values):
@@ -324,13 +324,13 @@ def quintile_returns(factor_values, forward_returns, buckets=5):
     return out
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): RankIC 与五分位分层"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): RankIC 与五分位分层"`
 
 ### 任务 6：策略注册表
 
 **文件：** 创建 `strategies.py`；测试 `tests/test_core_strategies.py`
 
-- [ ] 步骤 1：失败测试：
+- [x] 步骤 1：失败测试：
 
 ```python
 """策略注册表：单标的策略移植 + 横截面策略 target_weights。"""
@@ -376,7 +376,7 @@ class StrategiesTest(unittest.TestCase):
         self.assertIn(strat.signal(self.conn, "SH.600519", "2026-09-13"), ("BUY", "SELL", "HOLD"))
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现 `strategies.py`：
+- [x] 步骤 2：FAIL；步骤 3：实现 `strategies.py`：
 
 ```python
 """策略注册表（规格 §5.2）：universe(as_of) → target_weights(as_of)。
@@ -471,13 +471,13 @@ class MomentumValueTop5:
         return {s: w for s in ranked}
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): 策略注册表（rsi/ma_cross 移植 + momentum_value_top5）"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): 策略注册表（rsi/ma_cross 移植 + momentum_value_top5）"`
 
 ### 任务 7：组合回测引擎
 
 **文件：** 创建 `portfolio.py`；测试 `tests/test_core_portfolio.py`
 
-- [ ] 步骤 1：失败测试（合成 6 标的 × 300 日：引擎跑通、指标齐全、约束生效）：
+- [x] 步骤 1：失败测试（合成 6 标的 × 300 日：引擎跑通、指标齐全、约束生效）：
 
 ```python
 """组合回测：月度再平衡、成本、A股约束、基准对比。全部合成数据离线。"""
@@ -522,7 +522,7 @@ class BacktestTest(unittest.TestCase):
         self.assertEqual(r["summary"]["param_groups"], 1)  # 静态策略也如实报组数
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现 `portfolio.py`：
+- [x] 步骤 2：FAIL；步骤 3：实现 `portfolio.py`：
 
 ```python
 """多标的组合回测（规格 §5.3）：月度再平衡 + 成本 + A股现实约束 + 基准对比。
@@ -654,13 +654,13 @@ def _metrics(curve, turnover, bench):
             "param_groups": 1}
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): 组合回测引擎（月度再平衡+约束+基准）"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): 组合回测引擎（月度再平衡+约束+基准）"`
 
 ### 任务 8：walk-forward 与参数敏感性
 
 **文件：** 创建 `walkforward.py`；测试 `tests/test_core_walkforward.py`
 
-- [ ] **步骤 1：失败测试**（`tests/test_core_walkforward.py`）——合成数据上跑 3 折：OOS 拼接曲线长度 = 测试窗 × 折数；`param_groups` 字段如实报告网格大小；敏感性网格形状 5×5：
+- [x] **步骤 1：失败测试**（`tests/test_core_walkforward.py`）——合成数据上跑 3 折：OOS 拼接曲线长度 = 测试窗 × 折数；`param_groups` 字段如实报告网格大小；敏感性网格形状 5×5：
 
 ```python
 """walk-forward：训练 504/测试 63/步长 63 可配置为小窗口做离线测试（90/20/20）。"""
@@ -688,7 +688,7 @@ class WfTest(unittest.TestCase):
         self.assertEqual(len(result["folds"]), 3)
 ```
 
-- [ ] **步骤 2：FAIL**；**步骤 3：实现 `walkforward.py`**：
+- [x] **步骤 2：FAIL**；**步骤 3：实现 `walkforward.py`**：
 
 ```python
 """walk-forward（规格 §5.3）：每折仅用训练窗选参，测试窗拼接为 OOS 曲线；
@@ -753,13 +753,13 @@ def _eval_window(conn, inst, start, end, benchmark):
     return portfolio.run(conn, inst, start=start, end=end, benchmark=benchmark)
 ```
 
-- [ ] **步骤 4：PASS**；`git commit -m "feat(core): walk-forward 与参数敏感性（多重检验自曝）"`
+- [x] **步骤 4：PASS**；`git commit -m "feat(core): walk-forward 与参数敏感性（多重检验自曝）"`
 
 ### 任务 9：CLI 子命令 + 离线端到端
 
 **文件：** 修改 `cli.py`（`ic`/`backtest` 子命令）；创建 `tests/test_core_wp2_e2e.py`
 
-- [ ] 步骤 1：失败测试（合成库上 `backtest` 子命令输出含 `summary.oos_sharpe` 与 `param_groups`）；步骤 2：FAIL；步骤 3：`cli.py` 追加两个子命令：
+- [x] 步骤 1：失败测试（合成库上 `backtest` 子命令输出含 `summary.oos_sharpe` 与 `param_groups`）；步骤 2：FAIL；步骤 3：`cli.py` 追加两个子命令：
 
 ```python
     s = sub.add_parser("ic", help="因子 RankIC 序列")
@@ -805,10 +805,45 @@ def _eval_window(conn, inst, start, end, benchmark):
                                      start=args.start, end=args.end)
 ```
 
-- [ ] 步骤 4：PASS；步骤 5：`git commit -m "feat(core): ic/backtest CLI 子命令与 WP2 端到端测试"`
+- [x] 步骤 4：PASS；步骤 5：`git commit -m "feat(core): ic/backtest CLI 子命令与 WP2 端到端测试"`
 
 ### WP2 验收记录（执行时填写）
 
-- 横截面策略 OOS 报告 JSON 原文：（执行时粘贴）
-- IC 检验输出 JSON 原文：（执行时粘贴）
-- 多重检验自曝字段 `param_groups` 值：（执行时填写）
+> 2026-09-14 执行（分支 feat/wp2，worktree 隔离）。取证方式：离线合成库（8 标的 × 150 交易日 + 基准 + 估值）走 `trading_core` CLI 真实子命令，与 `tests/test_core_wp2_e2e.py` 同一口径。全量回归 `unittest discover -s tests -p 'test_*.py'`：**293 tests OK**（执行两次确认稳定）。
+
+- 横截面策略 OOS 报告 JSON 原文：
+
+```json
+{
+ "folds": [
+  {"train_end": "2025-04-15", "test_end": "2025-05-10", "params": {"top_n": 3}, "oos_sharpe": 0.506},
+  {"train_end": "2025-05-10", "test_end": "2025-06-05", "params": {"top_n": 5}, "oos_sharpe": 0.406},
+  {"train_end": "2025-06-05", "test_end": "2025-06-25", "params": {"top_n": 5}, "oos_sharpe": 1.09}
+ ],
+ "oos_curve": [
+  {"t": "2025-04-16", "equity": 1081616.266},
+  {"t": "2025-04-17", "equity": 1081102.486},
+  {"t": "2025-04-18", "equity": 1049277.248},
+  "...共 60 点（测试窗 20 × 3 折）"
+ ],
+ "summary": {"param_groups": 2, "folds": 3, "oos_sharpe": 0.667, "train": 90, "test": 20, "step": 20}
+}
+```
+
+- IC 检验输出 JSON 原文：
+
+```json
+{"factor": "momentum_60", "rank_ic": 1.0, "samples": 5}
+```
+
+- 多重检验自曝字段 `param_groups` 值：**2**（grid `top_n∈[3,5]`，与 walk-forward summary 如实上报一致）
+
+#### 执行偏差披露（计划与实际矛盾，修正确的一方）
+
+1. **共享工作目录冲突**：并行 WP3 代理与执行代理共用同一 checkout 且中途切换分支（reflog 证据），WP2 全部工作隔离到独立 worktree `/home/penn/workspace/dsh-wp2`、提交在 `feat/wp2` 分支。
+2. **任务 2/3 测试符号口径**：因子统一收 futu 符号（`SH.600519`），计划测试骨架按裸码 `600519` 落库与其自身的因子调用矛盾 → 测试落库改 futu 符号；`ep` 因子读 `pe_ttm`（依赖锁定表"字段路径以 valuation_values 实测实现为准"，计划 ep 草稿读 `pe` 与之矛盾）。
+3. **任务 3 迁移连带**：`tests/test_data_layer.py::test_valuation_fallback_is_a_share_only` 改指向 `trading_core/factors.py`（计划既定"旧测试改指向新位置"）；另加断言锁定 workbench 薄委托不得复活第二份实现。`valuation_values` 增加 `fetcher`/`akshare_module` 注入口（离线测试，仓库既有模式），online 缺省行为逐字不变。
+4. **任务 4 断言修正**：计划断言 `|z_E|<|z_B|` 与其自身实现数学矛盾（MAD 截断后离群点仍是截面最大值，E=1.51>B=0.26），改为等价可判定性质：截断后离群点与正常点 z 差距有界（<2.0，不裁剪≈2.23）+ 正常点保持分散（Spread>1.0，不裁剪≈0.007）。
+5. **任务 6**：`rsi_signal`/`ma_cross_signal` 实际返回逐 bar 信号 Series 而非标量，`signal()` 统一取 as_of（末根 bar）状态；`trading_datasource.backtest` 导入改调用时惰性解析（库模块不强依赖 sys.path）；测试文件补 datasource 路径。
+6. **任务 7/8/9 测试 fixture**：引擎交易日取自 `store.trading_days`（WP1 设计：日历硬依赖），计划测试骨架漏日历 → setUp 补 `upsert_calendar`。任务 8 数据 300 日会产出 10 折与计划断言 3 折矛盾 → 数据裁为 150 日恰好 3 折，保住断言与意图；另修 `int(d)` → `int(d[8:])` 笔误。
+7. **引擎健壮性**：`_metrics` 的 IR 在 excess 零方差（空仓等合法状态）除零 → 如实报 0；持仓估值改用最近可用收盘（停牌日不中断）。walkforward summary 增加 `oos_sharpe`（各折均值，OOS 报告头牌指标，任务 9 e2e 依赖）。
