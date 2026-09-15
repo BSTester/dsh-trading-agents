@@ -3,6 +3,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "datasource" / "python"))
@@ -94,6 +95,19 @@ class BarsSyncTest(unittest.TestCase):
     def test_incremental_rejects_intraday(self):
         with self.assertRaises(ValueError):
             sync.sync_bars_incremental(self.conn, "600519", "5m", loader=lambda t, p, l: ([], "x", False))
+
+    def test_backfill_default_loader_is_futu_raw_chunk(self):
+        """K1 方案 A：不注入 loader 时回填必须走富途原始价分块，而非复权路由 load_bars。
+
+        此前默认 load_bars 长历史路由落库的是复权价（新浪 qfq/Yahoo auto_adjusted），
+        违反规格 §4.2 规则 2「落库一律原始价 + 因子表」。
+        """
+        with patch.object(sync, "load_raw_bars") as raw:
+            raw.return_value = (_bars("2026-09-10", "2026-09-11"), "futu/raw_chunk", False)
+            summary = sync.backfill_bars(self.conn, ["600519"], sleep_seconds=0)
+        self.assertEqual(summary["ok"], ["600519"])
+        raw.assert_called_once_with("600519", "1d", sync.BACKFILL_LIMIT)
+        self.assertEqual(store.last_bar_date(self.conn, "SH.600519", "1d"), "2026-09-11")
 
 
 REHAB_SAMPLE = {"rehabs": [

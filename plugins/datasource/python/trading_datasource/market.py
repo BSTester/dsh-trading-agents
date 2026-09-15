@@ -16,7 +16,7 @@
 import json
 import os
 import re
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from .futu_mcp import FutuUnavailable, call_tool
@@ -118,17 +118,30 @@ def write_cache(ticker, period, payload):
 
 # ---- 各数据源 ----
 
-def fetch_futu(ticker, period, limit):
-    """富途历史 K 线（全市场、分钟/日线）。"""
-    data = call_tool("quote_history_kline",
-                     {"symbol": to_futu_symbol(ticker),
-                      "ktype": PERIOD_TO_FUTU_KTYPE[period],
-                      "num": min(limit, FUTU_MAX_BARS),
-                      "end": date.today().isoformat()},
+class FutuEmptyKline(FutuUnavailable):
+    """富途返回空 K 线。对 load_bars 是「此源不可用」的普通回退；
+    对 load_raw_bars 是「历史翻尽」的正常终止信号——两者语义不同，须可区分。"""
+
+
+def fetch_futu(ticker, period, limit, end=None, autype=None):
+    """富途历史 K 线（全市场、分钟/日线）。end 缺省=今天（向后兼容）。
+
+    autype：None=不带该键（服务端默认 1=前复权，load_bars 历史口径不变）；
+    "0"=不复权（原始价，落库口径，见 load_raw_bars）；"2"=后复权。
+    实测（2026-09-15，tools/list schema）：不传 autype 拿到的是前复权价——
+    这正是 K1 的根因，「走富途」不等于「拿到原始价」。
+    """
+    arguments = {"symbol": to_futu_symbol(ticker),
+                 "ktype": PERIOD_TO_FUTU_KTYPE[period],
+                 "num": min(limit, FUTU_MAX_BARS),
+                 "end": end or date.today().isoformat()}
+    if autype is not None:
+        arguments["autype"] = autype
+    data = call_tool("quote_history_kline", arguments,
                      client_name="trading-datasource/market")
     rows = (data or {}).get("kline_list") or []
     if not rows:
-        raise FutuUnavailable("富途返回空 K 线")
+        raise FutuEmptyKline("富途返回空 K 线")
     bars = []
     for row in rows:
         if period == "1d":
@@ -239,4 +252,42 @@ def load_bars(ticker, period="1d", limit=300, cached=None):
     if cached is not None and cached.get("bars"):
         return cached["bars"], str(cached.get("source")) + "(缓存)", True
     raise RuntimeError(f"取数失败：{str(failure)[:160]}")
+
+
+def load_raw_bars(ticker, period="1d", limit=2000):
+    """富途**原始价**分块：≤FUTU_MAX_BARS 根/页、以 end 游标向后翻页、按 t 合并去重。
+
+    回填专用（K1 方案 A）：富途单次上限 370 根给不了长历史，而长历史路由
+    （新浪 qfq / Yahoo auto_adjusted）给的是复权价，违反规格 §4.2 规则 2
+    「落库一律原始价 + 因子表」——复权口径改由 adjustments 表派生。
+    终止条件：凑满 limit 根 / 历史翻尽（空页）/ 游标不再前移（防死循环）。
+    首批即失败或为空按 load_bars 风格抛 RuntimeError；返回 (bars, "futu/raw_chunk", False)。
+    必须显式 autype="0"：富途服务端默认 1=前复权，不传则整场修复形同虚设。
+    """
+    if period not in PERIOD_TO_FUTU_KTYPE:
+        raise ValueError(f"不支持的周期：{period}")
+    limit = normalize_limit(limit)
+    cursor = date.today().isoformat()
+    merged = {}
+    while len(merged) < limit:
+        try:
+            bars, _source = fetch_futu(ticker, period, FUTU_MAX_BARS, end=cursor,
+                                       autype="0")
+        except FutuEmptyKline as error:
+            if not merged:
+                raise RuntimeError(f"取数失败：{error}") from error
+            break                                   # 历史翻尽：正常终止
+        except Exception as error:  # noqa: BLE001 - 通道故障按 load_bars 风格上报
+            raise RuntimeError(f"取数失败：{str(error)[:160]}") from error
+        before = len(merged)
+        for bar in bars:
+            merged.setdefault(bar["t"], bar)        # 页边界重叠：按 t 去重
+        earliest = min(bar["t"] for bar in bars)[:10]
+        previous = (date.fromisoformat(earliest) - timedelta(days=1)).isoformat()
+        if previous >= cursor or len(merged) == before:
+            break                                   # 游标不再前移 / 本批无新增：防死循环
+        cursor = previous
+    if not merged:
+        raise RuntimeError(f"取数失败：{ticker} 无任何原始价 K 线")
+    return [merged[key] for key in sorted(merged)], "futu/raw_chunk", False
 

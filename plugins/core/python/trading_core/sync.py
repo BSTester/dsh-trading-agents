@@ -9,7 +9,7 @@ import re
 import time
 
 from trading_datasource.futu_mcp import call_tool
-from trading_datasource.market import load_bars, to_futu_symbol
+from trading_datasource.market import load_bars, load_raw_bars, to_futu_symbol
 
 from . import store
 
@@ -17,7 +17,7 @@ _TZ8 = _dt.timezone(_dt.timedelta(hours=8))  # 富途毫秒时间戳按 UTC+8 �
 
 SLEEP_SECONDS = 0.5            # 富途通道调用间隔；测试注入 0
 PROGRESS_KEY_BACKFILL = "backfill:bars:1d"
-BACKFILL_LIMIT = 2000          # market.MAX_BARS 上限内（路由层自动换源满足长历史）
+BACKFILL_LIMIT = 2000          # market.MAX_BARS 上限内（load_raw_bars 分块拼满长历史）
 
 
 def _sleep(seconds):
@@ -49,10 +49,11 @@ def sync_bars_incremental(conn, ticker, period="1d", loader=None):
 
 def backfill_bars(conn, tickers, period="1d", limit=BACKFILL_LIMIT,
                   loader=None, sleep_seconds=None, progress_key=PROGRESS_KEY_BACKFILL):
-    """全量回填：每标的一次 load_bars（路由层自动满足长历史）；失败记录不中断；
-    kv 游标（done/failed）支持断点续传——重复调用只处理未完成标的。
+    """全量回填：每标的一次 load_raw_bars——富途原始价分块（≤370 根/页向后翻页），
+    复权口径由 adjustments 表派生（规格 §4.2 规则 2：落库一律原始价 + 因子表）；
+    失败记录不中断；kv 游标（done/failed）支持断点续传——重复调用只处理未完成标的。
     前置：存量长历史缺口先 backfill 一次；增量入口（sync_bars_incremental）只覆盖近期窗口。"""
-    loader = loader or load_bars
+    loader = loader or load_raw_bars
     sleep_seconds = SLEEP_SECONDS if sleep_seconds is None else sleep_seconds
     progress = store.kv_get(conn, progress_key, default={"done": [], "failed": {}})
     done = list(progress.get("done", []))

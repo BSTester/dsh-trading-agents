@@ -13,6 +13,7 @@ import json
 import os
 import sys
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -203,6 +204,130 @@ class RoutingTests(unittest.TestCase):
         self.assertEqual(calls, ["sina"])
         self.assertEqual(source, "akshare/sina")
         self.assertFalse(stale)
+
+
+def _futu_daily_row(yyyymmdd, close):
+    """构造富途 quote_history_kline 的一行日线（date 为 8 位数字串的实测形状）。"""
+    return {"date": yyyymmdd, "open": close - 1, "high": close + 1,
+            "low": close - 2, "close": close, "volume": 1000}
+
+
+class RawChunkTests(unittest.TestCase):
+    """load_raw_bars（K1 方案 A）：富途 ≤370 根分块向后翻页取**原始价**。
+
+    背景：回填此前经 load_bars 长历史路由拿到的是复权价（新浪 qfq / Yahoo
+    auto_adjusted），违反规格 §4.2 规则 2「落库一律原始价 + 因子表」——
+    这里锁住分块合并、按 t 去重、游标逐块前移与三种终止路径。
+    全部离线：假 call_tool 按页发数。
+    """
+
+    def _patched_pages(self, pages):
+        """按调用次序发页；记录每次调用的 (tool 名, 参数)。"""
+        calls = []
+
+        def fake_call_tool(name, args, **kwargs):
+            calls.append((name, dict(args)))
+            return pages[len(calls) - 1]
+
+        return patch.object(market, "call_tool", side_effect=fake_call_tool), calls
+
+    def test_chunks_merge_dedup_and_stop_at_history_end(self):
+        """两页有重叠 + 空页终止：合并去重、游标取「本批最早日期的前一天」、ktype=2。"""
+        pages = [
+            # 第一页（end=今天）：最新 3 根
+            {"kline_list": [_futu_daily_row("20260107", 7), _futu_daily_row("20260106", 6),
+                            _futu_daily_row("20260105", 5)]},
+            # 第二页（end=2026-01-04）：更早 2 根 + 页边界重叠 1 根 → 按 t 去重
+            {"kline_list": [_futu_daily_row("20260105", 5), _futu_daily_row("20251231", 31),
+                            _futu_daily_row("20251230", 30)]},
+            # 历史翻尽：空页 → 正常终止，不报错
+            {"kline_list": []},
+        ]
+        patched, calls = self._patched_pages(pages)
+        with patched:
+            bars, source, stale = market.load_raw_bars("600519", "1d", 2000)
+
+        self.assertEqual(source, "futu/raw_chunk")
+        self.assertFalse(stale)
+        self.assertEqual([b["t"] for b in bars],
+                         ["2025-12-30", "2025-12-31", "2026-01-05",
+                          "2026-01-06", "2026-01-07"])
+        self.assertEqual(bars[0]["c"], 30.0)   # 去重保留的是同一根原始价，不被复权值覆盖
+        self.assertEqual([name for name, _ in calls], ["quote_history_kline"] * 3)
+        ends = [args["end"] for _, args in calls]
+        self.assertEqual(ends[0], date.today().isoformat())  # 首块从今天向前
+        self.assertEqual(ends[1], "2026-01-04")              # 本批最早(01-05)的前一天
+        self.assertEqual(ends[2], "2025-12-29")              # 逐块前移
+        for _, args in calls:
+            self.assertEqual(args["ktype"], 2, "1d 必须映射富途 ktype=2")
+            self.assertEqual(args.get("autype"), "0",
+                             "必须显式 autype=0（不复权）——富途服务端默认 autype=1 前复权，"
+                             "不传就会落库复权价（K1 的根因）")
+            self.assertEqual(args["num"], market.FUTU_MAX_BARS)
+            self.assertEqual(args["symbol"], "SH.600519")
+
+    def test_stops_when_cursor_stops_moving(self):
+        """富途无视 end 每次都回同一页时必须终止（防死循环），不得永远翻下去。"""
+        page = {"kline_list": [_futu_daily_row("20260107", 7), _futu_daily_row("20260106", 6),
+                               _futu_daily_row("20260105", 5)]}
+        patched, calls = self._patched_pages([page, page, page, page])
+        with patched:
+            bars, _source, _stale = market.load_raw_bars("600519", "1d", 2000)
+
+        self.assertEqual(len(calls), 2, "第二批无进展（游标不再前移）就必须停")
+        self.assertEqual(len(bars), 3)
+
+    def _page(self, end_day, count):
+        """以 end_day 为最新一根、向前数 count 个自然日的假富途页（原始价形状）。"""
+        base = date.fromisoformat(end_day)
+        return {"kline_list": [_futu_daily_row((base - timedelta(days=i)).strftime("%Y%m%d"),
+                                               100 + i) for i in range(count)]}
+
+    def test_stops_when_limit_reached_without_extra_page(self):
+        """凑满 limit 根即停：不再多发一页请求，也不截断已合并的整页。
+
+        limit 与 load_bars 同口径经 normalize_limit（下限 MIN_BARS=20），
+        故用 10+10 两页对齐 20 根边界。
+        """
+        patched, calls = self._patched_pages([self._page("2026-01-15", 10),
+                                              self._page("2025-12-22", 10)])
+        with patched:
+            bars, _source, _stale = market.load_raw_bars("600519", "1d", 20)
+        self.assertEqual(len(calls), 2, "10 根 < 20 根才翻第二页；20 根凑满不再翻第三页")
+        self.assertEqual(len(bars), 20, "凑满即停：整页合并不截断")
+
+    def test_first_batch_failure_raises_runtime_error(self):
+        """首批就失败（通道故障）必须按 load_bars 风格抛 RuntimeError，不返回空冒充成功。"""
+        with patch.object(market, "call_tool",
+                          side_effect=futu_mcp.FutuUnavailable("MCP 请求失败：timeout")):
+            with self.assertRaises(RuntimeError) as caught:
+                market.load_raw_bars("600519", "1d", 2000)
+        self.assertIn("取数失败", str(caught.exception))
+
+    def test_empty_history_on_first_batch_is_an_error_not_empty_success(self):
+        """首批即空 K 线：0 行「成功」是假成功，必须报错（宁缺毋假）。"""
+        with patch.object(market, "call_tool", return_value={"kline_list": []}):
+            with self.assertRaises(RuntimeError):
+                market.load_raw_bars("688888", "1d", 2000)
+
+    def test_fetch_futu_without_autype_keeps_legacy_server_default(self):
+        """不传 autype 时 fetch_foutu 维持旧行为（不带该键，服务端默认前复权）。
+
+        load_bars 供回测/展示消费，复权口径不因本次修复而变——原始价只由
+        load_raw_bars 显式声明（落库口径，规格 §4.2 规则 2）。
+        """
+        captured = {}
+
+        def fake_call_tool(name, args, **kwargs):
+            captured.update(args)
+            return {"kline_list": [{"date": "20260625", "open": 1, "high": 2,
+                                    "low": 0.5, "close": 1.5, "volume": 10}]}
+
+        with patch.object(market, "call_tool", side_effect=fake_call_tool):
+            bars, source = market.fetch_futu("600519", "1d", 5)
+        self.assertEqual(source, "futu/quote_history_kline")
+        self.assertEqual(captured["end"], date.today().isoformat(), "end 缺省=今天（向后兼容）")
+        self.assertNotIn("autype", captured)
 
 
 class FutuClientTests(unittest.TestCase):
