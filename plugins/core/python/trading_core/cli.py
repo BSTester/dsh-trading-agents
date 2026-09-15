@@ -57,6 +57,22 @@ def build_parser():
     s.add_argument("--start", required=True)
     s.add_argument("--end", required=True)
     _add_db(s)
+
+    s = sub.add_parser("ic", help="因子 RankIC 序列")
+    s.add_argument("--factor", default="momentum_60")
+    s.add_argument("--symbols", required=True)
+    s.add_argument("--as-of", required=True)
+    s.add_argument("--horizon", type=int, default=20)
+    _add_db(s)
+
+    s = sub.add_parser("backtest", help="walk-forward 组合回测")
+    s.add_argument("--strategy", default="momentum_value_top5")
+    s.add_argument("--start", required=True)
+    s.add_argument("--end", required=True)
+    s.add_argument("--train", type=int, default=504)
+    s.add_argument("--test", type=int, default=63)
+    s.add_argument("--step", type=int, default=63)
+    _add_db(s)
     return p
 
 
@@ -88,6 +104,27 @@ def main(argv=None):
             result = quality.full_report(conn, args.market,
                                          [t.strip() for t in args.symbols.split(",") if t.strip()],
                                          args.start, args.end)
+        elif args.cmd == "ic":
+            from . import factors
+            vals = {s.strip(): factors.REGISTRY[args.factor](conn, s.strip(), args.as_of)
+                    for s in args.symbols.split(",")}
+            vals = {k: v for k, v in vals.items() if v is not None}
+            # 前向收益：取 as_of 之后的窗口（近似口径——交易日对齐由 bars 本身保证）
+            as_of2 = (_dt.date.fromisoformat(args.as_of)
+                      + _dt.timedelta(days=args.horizon * 2)).isoformat()
+            fwd = {}
+            for s in vals:
+                bars = store.read_bars(conn, s, "1d", as_of=as_of2, limit=args.horizon)
+                if len(bars) >= 2:
+                    fwd[s] = bars[-1]["c"] / bars[0]["c"] - 1
+            result = {"factor": args.factor, "rank_ic": factors.rank_ic(vals, fwd),
+                      "samples": len(vals)}
+        elif args.cmd == "backtest":
+            from . import walkforward
+            result = walkforward.run(conn, strategy_id=args.strategy, train=args.train,
+                                     test=args.test, step=args.step,
+                                     grid={"top_n": [3, 5]},
+                                     start=args.start, end=args.end)
         else:  # pragma: no cover - argparse 已约束
             raise ValueError(f"未知子命令 {args.cmd}")
     finally:
