@@ -1733,11 +1733,39 @@ ol.sources code{font-size:11.5px}
       fill: { label: "成交", cls: "hold" },
     };
 
+    // 审计三级链路（计划 → 订单 → 成交）：数据来自 reconcile 只读端点，
+    // 逐级 details 展开；既有时间线仍保留，本卡插入在其前面。
+    function AuditChainCard({ rpc, revision }) {
+      const reconcile = useEndpoint(rpc, "reconcile", {}, [rpc, revision]);
+      const chain = reconcile.data?.chain ?? [];
+      return h(Card, { title: "计划 → 订单 → 成交", count: chain.length,
+        empty: cardEmpty({ loading: reconcile.loading, error: reconcile.error,
+          count: chain.length, fallback: "暂无链路数据：执行计划后可在此逐级下钻。" }) },
+        chain.map((plan) =>
+          h("details", { key: plan.plan_id, className: "tw-item" },
+            h("summary", null,
+              `${plan.plan_id} · ${plan.mode} · ${plan.status} · ${plan.created_at}`),
+            h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
+              (plan.orders ?? []).map((o) =>
+                h("details", { key: o.client_order_id, className: "tw-item" },
+                  h("summary", null,
+                    `${o.symbol} ${o.side === "BUY" ? "买入" : "卖出"} ${o.qty} @ ${o.price ?? "—"} · ${o.status}`),
+                  h("div", { className: "tw-item-body", style: { paddingTop: "6px" } },
+                    h("div", { className: "tw-meta" },
+                      `订单 ${o.client_order_id}`
+                      + (o.broker_order_id ? ` · 券商单号 ${o.broker_order_id}` : "")),
+                    (o.fills ?? []).length === 0 && h("div", { className: "tw-meta" }, "无成交"),
+                    (o.fills ?? []).map((f, i) =>
+                      h("div", { key: i, className: "tw-meta" },
+                        `成交 ${f.qty} @ ${f.price}${f.traded_at ? ` · ${f.traded_at}` : ""}`)))))))));
+    }
+
     function AuditView({ rpc, snapshot }) {
       const audit = useEndpoint(rpc, "audit", {}, [rpc, snapshot.mode, snapshot.generated_at]);
       const entries = audit.data?.entries ?? [];
       const stats = audit.data?.stats;
       return h(React.Fragment, null,
+        h(AuditChainCard, { rpc, revision: snapshot.generated_at }),
         h(Card, { title: "链路统计",
           empty: stats ? undefined : cardEmpty({ loading: audit.loading, error: audit.error,
             count: 0, fallback: "暂无链路数据" }) },

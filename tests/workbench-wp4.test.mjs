@@ -181,6 +181,19 @@ test("schedule tab shows heartbeat freshness, alerts, kill switch without design
   assert.doesNotMatch(tab, /规格|设计稿|示例|宁可|窄门|token/);
 });
 
+test("audit view renders three-level plan→order→fill chain from reconcile data", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const chain = tabSource(source, "AuditChainCard", "AuditView");
+  assert.match(source, /function AuditChainCard\(/);
+  assert.match(source, /h\(AuditChainCard, \{ rpc, revision/);
+  assert.match(chain, /reconcile/, "链路数据来自 reconcile 端点");
+  assert.match(chain, /chain/, "计划→订单→成交 三级");
+  assert.match(chain, /fills/, "成交层");
+  // 计划要求的保留项：功能性说明文案不被清理
+  assert.match(source, /原始券商响应/);
+  assert.doesNotMatch(chain, /规格|设计稿|示例|宁可|窄门|token/);
+});
+
 test("plan tab keeps the live gate: exact phrase, frozen-only execute, cancel action", async () => {
   const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
   const tab = tabSource(source, "PlanTab", "ScheduleTab");
