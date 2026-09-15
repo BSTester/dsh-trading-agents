@@ -6,6 +6,7 @@
 > 实现计划：`docs/superpowers/plans/2026-09-15-wp6-standalone-service.md`（本规格 §六 验收标准为其验收门；计划末尾「补遗」为架构变更后的任务重排）。
 > **修订（2026-09-15，用户第二次决策）**：服务后端改为 **FastAPI（Python）单进程**——HTTP API、MCP、静态前端同进程启动，不单独配前端服务。原 Node 服务方案（§二 图、§3.1 对等机制、§3.6 传输实现、§3.7 Node SDK 选型）退役，相关小节已同步修订。
 > **修订（2026-09-16，并入 main 业务确认模型）**：main `624ccd0` 把实盘写操作从「Harness 原生审批」改为**插件自己发起的业务确认**（用户在 Harness 内 legacy 工作台面板作答，不再返回 `{kind:"ask"}`）；本分支经合并提交 `29912b4` 并入该语义，服务侧移植见提交 `228ea90`——工具面 25 → **26 个**、端点 20 → **22 个**（其中 `confirm-decide` 有意不进工具面）。§1.1 / §3 / §4.5 / §5.1 A2 / §5.3 / §六 / §八 已按此口径修订。
+> **再修订（2026-09-16，WP7 任务 4）**：富途写类（`sim_trade_*`/`trading_*` 的下单/改单/撤单）在 Harness 内改由 **policy guard 一律拒绝并指引工作台通道**（不分模式）；pre-execute 的业务确认分支退役（store 三方法与 `confirmation`/`confirm-decide` 端点保留：legacy 面板过渡期 + 服务侧同语义）。§5.1 A2 与 §5.2 Node 层 R2 已再修订。
 
 ## 一、目标与非目标
 
@@ -238,7 +239,7 @@ platform/web/
 | 链 | 内容 | 现状锚点 |
 |---|---|---|
 | A1 | 账户模式互斥：sim 模式拒 `account_*`/`trading_*`；live 模式拒 `sim_trade_*` | `policy.js` guard |
-| A2 | live 写操作**业务确认**（2026-09-15 修订）：`trading_*` 在 pre-execute 由插件自己发起 `store.requestConfirmation`，等人从工作台作答，**永不返回 `{kind:"ask"}`**；`sim_trade_*` 永不确认。原设计的 `ask` 在 full-access（`policy="never"`）下会被 `approval.decide()` 直接 rejected，表现为「用户拒绝了」而实际没人被问过 | `policy.js` pre-execute + `store.requestConfirmation` / `confirm-decide` 端点；**服务侧已移植同语义**（`store_access.request_confirmation`/`confirmation_view`/`decide_confirmation` + `confirmation`/`confirm-decide` 两条路由，提交 `228ea90`） |
+| A2 | **futu 写类被 policy 拒绝并指引工作台通道**（WP7 收窄，2026-09-16 再修订）：`sim_trade_*`/`trading_*` 的下单/改单/撤单动词在 guard **不分模式一律拒绝**（文案含「请通过工作台交易（quantwb 的 trade_* 工具，或计划执行）」），Harness 内**不可达**且不产生任何待确认；**业务确认的服务侧实现用于工作台 `trade_*` 工具（Web 确认卡片作答）**。历史（2026-09-15 修订，已被取代）：`trading_*` 曾在 pre-execute 发起 `store.requestConfirmation`（永不返回 `{kind:"ask"}`——ask 在 full-access（`policy="never"`）下会被 `approval.decide()` 直接 rejected，表现为「用户拒绝了」而实际没人被问过）。Node 侧 store 三方法与 `confirmation`/`confirm-decide` 端点**保留**（legacy 面板过渡期 + 服务侧 Python 移植同语义） | `policy.js` guard（拒绝 + 指引）+ Node `store.requestConfirmation`/`confirm-decide` 端点（legacy，保留）；**服务侧同语义**（`store_access.request_confirmation`/`confirmation_view`/`decide_confirmation` + `confirmation`/`confirm-decide` 两条路由，提交 `228ea90`），现服务于工作台 `trade_*` 工具 |
 | A3 | 模式切换双保险：live 需口令「确认实盘」+ `expected_mode` 一致 + 无在途租约；切换不授权下单；**MCP 通道 switch_mode 只接受切到 sim（live→sim 回模拟盘）、sim→live 一律拒绝**（模型自填口令被通道规则封死） | `store.switchMode` + manifest 通道规则 |
 | A4 | 计划执行窄门：live 需口令「确认执行」+ `plan_hash` + `expected_mode` 复核；成功仅 `queued`；daemon 侧 kill 文件 + 风控 8 规则兜底 | rpc plan-execute 分支 + commands + risk |
 | A5 | `quant_switch` 只能切 sim；模型不能代替用户确认实盘 | engine tools |
@@ -248,7 +249,7 @@ platform/web/
 
 WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 FastAPI 进程内**必须调用同一批处理函数**（HTTP 路由与 MCP 工具是同一函数的两个薄壳），使 A3/A4 在新入口上零新增逻辑——这是回归方案的核心架构手段。注意：A3/A4 的服务端处理函数是 **Python 移植版**（与 Node Host 的 `store.switchMode`/plan-execute 分支行为逐条等价），其等价性由 R3/R4 的 Python 回归逐断言钉死。
 
-**业务确认的跨进程边界（A2 的服务侧移植，必须如实标注）**：确认是「此刻等人回答」的**内存态**（`store.js:136` 刻意不落盘），因此 **Harness 进程与服务进程各持一份待确认表，互不可见**。服务侧 `confirmation`/`confirm-decide`（Python `store_access.request_confirmation/confirmation_view/decide_confirmation`）只反映**服务自身处理函数发起**的确认；Harness 会话里 `trading_*` 写操作触发的确认在独立 Web 上读不到（`pending` 诚实地为 `null`，不是「不需要确认」），**该笔只能回 Harness 内的工作台面板作答**。两进程共享的是数据文件与只读快照，确认表不在共享之列。
+**业务确认的跨进程边界（A2 的服务侧移植，必须如实标注）**：确认是「此刻等人回答」的**内存态**（`store.js:136` 刻意不落盘），因此 **Harness 进程与服务进程各持一份待确认表，互不可见**。服务侧 `confirmation`/`confirm-decide`（Python `store_access.request_confirmation/confirmation_view/decide_confirmation`）只反映**服务自身处理函数发起**的确认；Harness 会话里 `trading_*` 写操作触发的确认在独立 Web 上读不到（`pending` 诚实地为 `null`，不是「不需要确认」），**该笔只能回 Harness 内的工作台面板作答**。两进程共享的是数据文件与只读快照，确认表不在共享之列。**WP7 后 Harness 进程已不再发起确认**（futu 写类在 guard 即拒），这段限制只剩历史意义：服务侧的待确认表现在只装工作台 `trade_*` 工具的提交。
 - 页面/文档责任：任何展示待确认列表的界面必须同时标注这条限制（服务侧看不到 Harness 的待确认）。
 - 最小缓解（本次不做，规格以 main 的 Node 实现为准）：主会话继续在 Harness 面板作答；将来若要跨进程，把请求/裁决落到共享文件（复用现有原子写 + 租约协议），届时须同时改 Node 侧。
 
@@ -259,7 +260,7 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 | 用例 | 断言 |
 |---|---|
 | R1 | sim 下 guard 拒 `mcp__futu__account_positions`（消息含「账户模式」）；live 下拒 `sim_trade_*`（经 `installTradingPolicy` 假 ctx 驱动） |
-| R2 | live 下 `trading_*` pre-execute **不返回 `ask`**，而是产生一笔待确认；工作台批准 → `allow`，拒绝/超时 → `deny`；`sim_trade_*` 放行且不产生待确认 |
+| R2 | live 下 futu 写类（`trading_*`/`sim_trade_*` 的下单/改单/撤单动词）guard **拒绝并含工作台指引**（「请通过工作台交易」），**不分模式**；不产生任何待确认；pre-execute 只透传（不再发起业务确认）；`mcp__futu__*` 只读放行（读类模式互斥见 R1）。（2026-09-16 WP7 再修订；2026-09-15 版「业务确认而非 ask」断言退役） |
 
 **Python 层**（全部离线，临时 DSH_HOME）——服务面回归（R3–R6 对 FastAPI 处理函数 / TestClient 重写）+ 既有 P 系列：
 

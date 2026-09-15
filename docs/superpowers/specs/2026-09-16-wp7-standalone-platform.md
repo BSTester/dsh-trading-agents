@@ -37,7 +37,7 @@
 1. **调度进服务**：`trading_core.daemon` 的作业链改为服务内线程驱动（`daemon.tick`/JOBS/心跳/告警协议原样复用，`daemon` CLI 保留为手动/兼容入口）；「固定信息收集由服务定时跑」就此落地。
 2. **因子快照定时收集**：每个交易日收盘后自动跑因子/信号并落 `factors_history`，可按日期回看（新端点 `factors-history` + MCP 工具）。
 3. **交易集成进服务**：新增受约束交易工具（`trade_place/trade_modify/trade_cancel` + `account_positions/account_orders/account_funds`），写操作前置链 = 模式 → 风控 8 规则 → kill → **业务确认（Web UI 作答，进程内）** → broker。WP6 的「确认跨进程不可见」问题就此消解（写路径与 Web 同进程）。
-4. **Harness 写通道收窄**：`policy.js` 对 futu 写类工具改为拒绝并指引工作台（消息含工作台通道指引）；研究只读不受影响。
+4. **Harness 写通道收窄**：`policy.js` 对 futu 写类工具改为拒绝并指引工作台（消息含工作台通道指引）；研究只读不受影响。**已实现（本任务，2026-09-16：`plugins/engine/src/policy.js` guard 收窄 + `tests/wp7-policy.test.mjs`；pre-execute 业务确认分支退役，store 三方法与 `confirmation`/`confirm-decide` 端点保留）**。
 5. **一键安装**：`install/HARNESS_SETUP.md` 提示词 + 安装器扩展，粘贴进 Harness 新会话即可完成「对话模式 preset + 服务依赖 + Web 构建 + 服务启动 + MCP 行启用 + 工具面验证」。
 
 ## 三、边界（不做）

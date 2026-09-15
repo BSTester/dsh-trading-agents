@@ -131,19 +131,27 @@ for the requested market`。
 
 ## 七、按设计拦截的调用（不是故障）
 
-sim 模式下 9 个实盘账户查询工具与 4 个实盘下单工具会被 `policy.js` 拒绝；
-错误信息里含「账户模式」，这是**预期行为**，要操作实盘需先在工作台显式切换模式。
+**WP7 收窄（2026-09-16）**：富途**写类**工具——下单/改单/撤单动词
+（`*_input_order` / `*_place_order` / `*_order_place` / `*_modify_order` / `*_cancel_order`，
+覆盖 `sim_trade_*` 与 `trading_*` 两族，即本体检口径下的 4 个实盘下单工具及对应 sim 工具）
+在 Harness 内被 `policy.js` guard **一律拒绝，不分 sim/live**，消息为
+「富途写通道已收窄至工作台：请通过工作台交易（quantwb 的 trade_* 工具，或计划执行）；
+模式外的账户查询请用工作台工具」。这是**预期行为**：写路径唯一在工作台服务
+（`trade_place`/`trade_modify`/`trade_cancel`，业务确认由独立 Web 确认卡片作答）。
 
-实盘写操作另有一道**业务确认**（`store.requestConfirmation`）：工具会阻塞，
-等用户在工作台点确认/拒绝，最长 120 秒，超时按拒绝处理，返回的是一句
-「实盘操作未获确认（…）。这不是权限问题…」。
+**读类不受影响，但保留模式互斥**：9 个实盘账户查询工具（`account_*`）与 sim 查询
+（`sim_trade_position_list` / `sim_trade_cash_info` / `sim_trade_history_order_list` /
+`sim_trade_max_buy_sell` / `sim_trade_account_list`）仍按模式桶校验——sim 模式拒实盘查询、
+live 模式拒 sim 查询，错误信息含「账户模式」；模式外的账户查询请用工作台（quantwb
+`account_positions` 等）。
 
-**注意它与 Harness 权限审批的区别**（曾把两者混为一谈，导致 full-access 档位下
-实盘永远下不出去）：
+**业务确认的归属（历史教训保留）**：实盘写操作的业务确认（`store.requestConfirmation`，
+阻塞等作答、120 秒超时按拒绝）曾是 Node 侧 pre-execute 的职责；WP7 起确认移至**工作台
+服务侧**（`store_access.request_confirmation` + Web 确认卡片，服务于 `trade_*` 工具），
+Node 侧 store 三方法与 `confirmation`/`confirm-decide` 端点**保留**（legacy 面板过渡期 +
+服务侧 Python 移植同语义）。它与 Harness 权限审批的区别这一教训仍然成立：
 - 权限审批回答"这个动作准不准做"，由会话的 approval policy 裁决；
   full-access（`policy="never"`）下 `approval.decide()` **直接返回 rejected，连问都不问**，
   表现为 `the user rejected tool ...`——看起来像用户拒绝了，实际没人被问过。
-- 业务确认回答"这笔参数对不对"，由交易插件自己发起、工作台界面作答，
-  **与权限档位无关**，任何档位下都必须确认。
-
-因此 `policy.js` 对实盘写操作**不再返回 `{kind:"ask"}`**，也就不会落到审批档位上。
+- 业务确认回答"这笔参数对不对"，**与权限档位无关**，任何档位下都必须确认。
+因此 policy 对写类的拒绝是 deny（guard 即拒）而非 `{kind:"ask"}`，不会落到审批档位上。

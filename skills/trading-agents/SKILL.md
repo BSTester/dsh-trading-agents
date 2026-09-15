@@ -18,7 +18,10 @@ description: TradingAgents 多角色投研流水线（12角色/6阶段）——�
 
 ## Harness 与工作台的职责
 
-- **唯一指令入口是 Harness**。取数、子代理研究、复盘、下单与撤单都在当前对话中进行；不创建独立聊天、交易表单或绕过 MCP 的 HTTP/脚本下单路径。
+- **唯一指令入口是 Harness**。取数、子代理研究、复盘都在当前对话中进行；下单与撤单走
+  **工作台通道**（quantwb trade_* 工具需 Web 确认，或计划执行）——富途写工具
+  （`sim_trade_*`/`trading_*`）已被收窄，在 Harness 里调用会被拒绝并指引工作台；
+  不创建独立聊天、交易表单或绕过 MCP 的 HTTP/脚本下单路径。
 - 完整安装后，先调用 `run_trading_analysis(ticker)` 取得研究记录 `id`。该工具仅启动记录，不调用私有 LLM、不替你取数或完成分析。保留 `id`，继续执行下面的完整流程。
 - 完成终审后调用 `research_publish(run_id, ticker, rating, report, sources)`。`sources` 至少一项，每项含 `name`、`as_of`（数据时间）和 `reference`（URL 或 Harness 工具记录）。没有可靠数据时不得编造报告或用默认 Hold 掩盖失败。
 - `trading_status` 返回工作台快照；`quant_signal`、`quant_backtest`、`quant_report` 的结果自动保存为量化预览，均不下单。本地模拟台账不是富途模拟账户。
@@ -77,8 +80,12 @@ description: TradingAgents 多角色投研流水线（12角色/6阶段）——�
 4. 读取 `.tradingagents/memory.md`（若存在），摘出该标的的历史决策与教训，供后续阶段注入。
 5. **确定唯一账户（互斥开关，有富途工具时必做）**：运行
    `python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py"` 读取当前账户模式。
-   - 输出 `sim` → 本次只使用模拟盘工具（`sim_trade_*`），**绝不**触碰真实账户工具；
-   - 输出 `live` → 本次只使用真实账户工具（`account_*` / `trading_*`），**绝不**触碰模拟盘工具。
+   - 输出 `sim` → 本次只使用模拟盘**查询**工具（`sim_trade_position_list` 等），
+     **绝不**触碰真实账户工具；
+   - 输出 `live` → 本次只使用真实账户**查询**工具（`account_*`），**绝不**触碰模拟盘工具。
+   两族里的**写类**（下单/改单/撤单：`*_input_order`/`*_place_order`/`*_order_place`/
+   `*_modify_order`/`*_cancel_order`）已被 WP7 收窄——Harness 内一律被拒并指引工作台，
+   研究阶段只用查询，不动仓位。
    两种账户类型永不并存操作；切 live 必须由用户在工作台输入「确认实盘」，模型不得用
    脚本替代确认。切回 sim 可用 `quant_switch(mode="sim")`。然后按模式取当前持仓与可用资金，重点记录：是否已持有
    该标的及占比、成本价、账户集中度、剩余可用资金。查不到时在提案中注明"未考虑现有持仓"。
@@ -118,7 +125,7 @@ description: TradingAgents 多角色投研流水线（12角色/6阶段）——�
 |---|---|---|---|
 | 取新闻 | `quote_news_search` | **`fin_news`** | 该工具三次不同参数（中文名/代码/英文+lang）均返回 `ret_code:0, data:[]`；而 `fin_news` 走富途源 `sources_status.futu="ok"` 能正常返回 |
 | 取机构评级 | `quote_research_rating_summary` | **`quote_research_analyst_consensus`** | 前者对 `HK.00700` 返回 `pagination.total=0`；后者同一标的返回 43 位分析师、目标均价 663.69 |
-| 改单 | 反复重试 `sim_trade_modify_order` | **撤单 + 重新下单** | 该接口间歇性 `ret_code:-5 backend business error`（同一天有成功也有失败，与价格是否离谱无关）；失败时价格与数量均未生效 |
+| 改单 | 反复重试 `sim_trade_modify_order`（富途写工具已收窄，现只由服务侧经工作台调用） | **撤单 + 重新下单**（工作台 `trade_modify` 已内置此策略） | 该接口间歇性 `ret_code:-5 backend business error`（同一天有成功也有失败，与价格是否离谱无关）；失败时价格与数量均未生效 |
 | 查历史订单 | `account_orders_history` **不传时间范围** | **必须传 `start`/`end`** | 不传时静默返回纯文本 `no data`（不报错、不提示），极易误判成"无历史订单"；补上时间范围后正常返回 |
 
 **A 股实时行情不可用（权限问题，不是故障）**：`order_book` / `rt_data` / `rt_ticker` /
@@ -283,42 +290,38 @@ POSITION: <该账户下的真实持仓与成本，无则省略>
 
 - 历史条目里出现过的拒单信息（例如某次 FAILED 订单的 `last_err_msg`）
   只是**当时那一次**的观察，不是长期规则；
-- 要确认实盘能不能下单，就在用户完成两次确认后**真下一个单**，以返回结果为准；
+- 要确认实盘能不能下单，就经**工作台通道**（`trade_*` 工具 + 用户在 Web 确认卡片
+  批准）真下一笔，以返回结果为准；
 - 被拒时把原始错误原文记进记忆，并标明日期与账户，供后续判断是否仍然成立。
 
 ## 复盘模式
 
 用户说"复盘 <标的>"时：读 memory.md 中该标的 pending 条目 → 用 MCP/web 取决策日至今涨跌 → 为每条生成 2~3 句反思（方向对不对、论点哪些成立、下次怎么办）→ 更新条目为 `[日期 | 标的 | 评级 | +X% | 持有N天]` + REFLECTION。
 
-## 交易执行（可选，默认模拟盘）
+## 交易执行（走工作台通道，默认模拟盘）
 
-用户明确要求下单时：
-1. 确认 `mcp__futu__` 交易工具可用；不可用则说明并停止。
-2. **读取账户模式开关**：`python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py"`。
-   - `sim` → 只用模拟盘工具（`sim_trade_input_order` 等），拒绝任何真实账户操作；
-   - `live` → 只用真实账户写工具（`trading_input_order` / `trading_modify_order` / `trading_cancel_order`）与只读的 `account_*`，拒绝任何模拟盘操作；
-   - 两个账户类型永不并存操作。切 live 由用户在工作台完成；切 sim 用 `quant_switch`。每次重新读取权威模式，不依赖对话里上一次模式。账户调用进行中不能切换。
-3. 展示完整订单摘要（账户类型=当前模式、标的、方向、数量、价格、有效期）。
-4. **必须**获得用户明确肯定回复后才可调用下单工具；模拟盘下单一次确认即可。
-5. 真实盘下单前，无论用户之前说过什么，都要再次逐字复述订单并要求确认。
+用户明确要求下单时：**交易走工作台通道（quantwb trade_* 工具需 Web 确认，或计划执行）；
+富途写工具已被收窄**——在 Harness 里调用 `sim_trade_*`/`trading_*` 的下单/改单/撤单会被
+policy 直接拒绝（文案指引工作台），不要重试，也不要试图绕过。
 
-6. **实盘写操作还有一道必经的业务闸门，在工作台里，不在对话里。**
-
-   调用 `trading_input_order` / `trading_modify_order` / `trading_cancel_order` 时，
-   工具会**阻塞**并等待用户在工作台界面点「确认这笔操作」或「拒绝」，最长 2 分钟，
-   超时按拒绝处理。这与 Harness 的权限审批无关：权限问的是"这个动作准不准做"，
-   工作台问的是"这笔参数对不对"——后者是交易动作的固有环节，**任何权限档位下都必须确认**
-   （full-access 也一样，不会被静默跳过）。
-
-   因此调用前**必须先明确告诉用户去工作台确认**，例如：
-   > 订单摘要：买入 TSLL 4 股 @ 9.30（实盘账户 281756480774050900）。
-   > 请打开「交易工作台」确认这笔操作，我在等你点确认。
+1. **读取账户模式开关**：`python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py"`。
+   两个账户类型永不并存操作；切 live 由用户在独立 Web 完成；切 sim 用 `quant_switch(mode="sim")`。
+   每次重新读取权威模式，不依赖对话里上一次模式。账户调用进行中不能切换。
+2. 把订单转成工作台通道：
+   - **临时订单** → quantwb 的 `trade_place`（symbol/side/qty/price；改单用 `trade_modify`、
+     撤单用 `trade_cancel`）。提交后工具**阻塞等待用户在独立 Web 确认卡片作答**，
+     服务端 TTL 120 秒，超时按拒绝处理（fail-closed）；
+   - **跟随研究计划** → 计划执行（plan-execute）通道，同样需要用户口令确认。
+3. 展示完整订单摘要（账户模式、标的、方向、数量、价格），并在发起前明确告诉用户：
+   > 订单摘要：买入 TSLL 4 股 @ 9.30。请留意「交易工作台」的确认卡片并作答，我在等你批准。
 
    否则用户在对话里看不到任何提示，只会觉得工具卡住了，然后等到超时被拒。
-
-7. 被拒/超时后不要自动重试同一笔。工作台会给出拒绝原因；用户改主意时应由用户
+4. **确认只能由用户在 Web 卡片上产生**。这与 Harness 的权限审批无关：权限问的是
+   "这个动作准不准做"，确认卡片问的是"这笔参数对不对"——后者是交易动作的固有环节，
+   **任何权限档位下都必须**（full-access 也一样，不会被静默跳过）。
+5. 被拒/超时后不要自动重试同一笔。确认卡片会给出拒绝原因；用户改主意时应由用户
    重新发起，而不是模型循环重试。收到超时、拒单或未知状态时**先查订单**
-   （`account_orders_history` 必须传 start/end），确认到底有没有成交，再决定下一步。
-
-8. 不要通过 shell、私有 HTTP 或其他工具绕过这道闸门，也不要试图代替用户作答——
+   （模式内查询工具；`account_orders_history` 必须传 start/end），确认到底有没有成交，
+   再决定下一步。
+6. 不要通过 shell、私有 HTTP 或其他工具绕过这道闸门，也不要试图代替用户作答——
    确认只能由用户在工作台点击产生。

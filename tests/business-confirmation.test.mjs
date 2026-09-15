@@ -1,16 +1,19 @@
 // 实盘业务确认（方案 A）的回归测试。
 //
-// 核心不变量一句话：**实盘写操作永不返回 `{kind:"ask"}`**。
+// **WP7 修订（2026-09-16）**：富途写通道已收窄至工作台——`sim_trade_*`/`trading_*` 的
+// 下单/改单/撤单在 policy.js **guard 一律拒绝**并指引工作台通道（quantwb 的 trade_*
+// 工具，或计划执行），Harness 内**不再发起**业务确认（业务确认移至工作台服务侧：
+// `store_access.request_confirmation` + 独立 Web 确认卡片作答）。
 //
-// 为什么这条最重要：DSH 的审批在 full-access（approval policy = "never"）下会
-// 直接返回 rejected —— `dsh-user-approval` 的 decide() 第一句判断就是
-// `if (effectivePolicy(session) === "never") return "rejected"`，连问都不问。
-// 于是 `{kind:"ask"}` 表现为 `the user rejected tool ...`：看起来像用户拒绝了，
-// 实际没有任何人被问过。
+// 本文件现在验证两层：
+// 1. **store 层确认流保留**（requestConfirmation/confirmationView/decideConfirmation 与
+//    confirmation/confirm-decide 端点）——legacy 面板过渡期 + 服务侧 Python 移植同语义，
+//    按决策**不删**；
+// 2. **策略链新形态**：futu 写类 guard 即拒、不产生任何待确认；pre-execute 只透传。
 //
-// 业务确认回答的是另一个问题（"这笔单子对不对"），所以它由交易插件自己发起、
-// 由工作台界面作答，全程不经过 approval 系统 —— 只要返回的不是 `ask`，
-// 会话的审批档位就影响不到它。
+// 历史不变量「实盘写操作永不返回 {kind:"ask"}」的教训仍成立（full-access 下
+// approval.decide() 直接 rejected，表现为"用户拒绝了"而实际没人被问过）；WP7 后该
+// 路径整体退役：guard 的拒绝是 deny 不是 ask，天然不受会话审批档位影响。
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -61,45 +64,34 @@ const LIVE_ORDER = {
 const execOf = (name, args = {}) => ({ name, arguments: args,
   agent: { session: { id: "s1" } }, signal: new AbortController().signal });
 
-// ===================== 一、接口层：永不 ask =====================
+// ===================== 一、策略链（WP7 收窄后的新形态） =====================
 
-test("实盘写操作返回的不是 ask —— 这是 full-access 下仍能下单的机制保证", async (t) => {
+test("futu 写类在 guard 即被拒绝并指引工作台，且不产生待确认", async (t) => {
   const dir = home(t);
   const store = storeIn(dir);
-  const { preExecute } = harness(store);
+  const { guards, preExecute } = harness(store);
+  const refusal = guards[0]({ name: LIVE_ORDER.name, arguments: LIVE_ORDER.arguments,
+    agent: { session: { id: "s1" } } });
+  assert.match(String(refusal), /请通过工作台交易/);
+  assert.match(String(refusal), /trade_\*/, "必须指引 quantwb 的 trade_* 工具");
+  assert.match(String(refusal), /计划执行/);
+  assert.equal(store.confirmationView(), null, "guard 拒绝不产生待确认");
 
-  const settling = preExecute(execOf(LIVE_ORDER.name, LIVE_ORDER.arguments), ALLOW);
-  await new Promise((r) => setTimeout(r, 30));
-  const view = store.confirmationView();
-  assert.ok(view, "应当产生一笔待确认");
-  assert.equal(view.operation, "下单");
-  // 摘要必须是中文可核对字段
-  const labels = view.summary.fields.map((f) => f.label);
-  for (const field of ["账户", "市场", "标的", "方向", "数量", "价格"]) {
-    assert.ok(labels.includes(field), `摘要缺少「${field}」`);
-  }
-  assert.equal(view.summary.fields.find((f) => f.label === "方向").value, "买入（order_side=1）");
-  assert.equal(view.summary.fields.find((f) => f.label === "市场").value, "100（美股）");
-  // 原始参数一并保留，便于核对
-  assert.equal(view.summary.raw.qty, 4);
-
-  store.decideConfirmation({ id: view.id, decision: "approved" });
-  const decision = await settling;
-  assert.notEqual(decision.kind, "ask", "绝不能返回 ask：那会落到会话的审批档位上被静默拒绝");
+  // 即便（异常情况下）到达 pre-execute，也不再发起业务确认：只透传 next 的结论
+  const decision = await preExecute(execOf(LIVE_ORDER.name, LIVE_ORDER.arguments), ALLOW);
   assert.equal(decision.kind, "allow");
+  assert.equal(store.confirmationView(), null, "pre-execute 不产生待确认");
 });
 
-test("用户拒绝 → deny，且提示这是业务确认不是权限问题", async (t) => {
+test("store 侧作答保留：用户拒绝 → rejected（legacy 语义不删）", async (t) => {
   const dir = home(t);
   const store = storeIn(dir);
-  const { preExecute } = harness(store);
-  const settling = preExecute(execOf(LIVE_ORDER.name, LIVE_ORDER.arguments), ALLOW);
-  await new Promise((r) => setTimeout(r, 30));
+  const settling = store.requestConfirmation({
+    tool: LIVE_ORDER.name, mode: "live", args: LIVE_ORDER.arguments, session_id: "s1" });
   store.decideConfirmation({ id: store.confirmationView().id, decision: "rejected" });
-  const decision = await settling;
-  assert.equal(decision.kind, "deny");
-  assert.match(decision.reason, /工作台/);
-  assert.match(decision.reason, /不是权限问题/);
+  const outcome = await settling;
+  assert.equal(outcome.decision, "rejected");
+  assert.match(outcome.reason, /工作台/, "拒绝理由指向工作台作答");
 });
 
 test("超时按拒绝处理（fail-closed），绝不自动放行", async (t) => {
@@ -192,12 +184,14 @@ test("确认端点不进缓存：处理完的请求不能又被读出来", async
   assert.equal(after.value.pending, null, "已处理完的请求不应再出现");
 });
 
-// ===================== 三、策略链（A1/A2 的新形态）=====================
+// ===================== 三、策略链（A1 保留；A2 已按 WP7 收窄改形） =====================
 
-test("模拟盘写操作从不确认（模拟盘是沙箱）", async (t) => {
+test("模拟盘写操作同样被收窄拒绝：WP7 不分模式，沙箱写也走工作台通道", async (t) => {
   const dir = home(t);
   const store = storeIn(dir, "sim");
-  const { preExecute } = harness(store);
+  const { guards, preExecute } = harness(store);
+  assert.match(String(guards[0]({ name: "mcp__futu__sim_trade_input_order", arguments: { qty: 1 },
+    agent: { session: { id: "s1" } } })), /请通过工作台交易/);
   const decision = await preExecute(execOf("mcp__futu__sim_trade_input_order", { qty: 1 }), ALLOW);
   assert.equal(decision.kind, "allow");
   assert.equal(store.confirmationView(), null, "sim 不应产生待确认");
@@ -226,11 +220,12 @@ test("下游守卫的 deny/ask 不被本插件改写", async (t) => {
   assert.equal(store.confirmationView(), null, "被上游拦下时不该产生待确认");
 });
 
-test("模式互斥仍然生效：sim 模式下拒绝实盘工具", async (t) => {
+test("模式互斥仍然生效：sim 模式下拒绝实盘账户查询（读类；写类已由收窄统一拒绝）", async (t) => {
   const dir = home(t);
   const store = storeIn(dir, "sim");
   const { guards } = harness(store);
-  const refusal = guards[0]({ name: LIVE_ORDER.name, arguments: {}, agent: { session: { id: "s1" } } });
+  const refusal = guards[0]({ name: "mcp__futu__account_positions", arguments: {},
+    agent: { session: { id: "s1" } } });
   assert.match(refusal, /账户模式/);
 });
 
@@ -240,6 +235,8 @@ test("摘要：已知枚举给中文，未知值原样显示并提示核对", ()
   const known = describeOrderArgs("mcp__futu__trading_input_order",
     { acc_id: "A1", market: 1, symbol: "00700", order_side: 2, qty: 100, price: 428.4 });
   const field = (label) => known.fields.find((f) => f.label === label).value;
+  assert.equal(field("账户"), "A1");
+  assert.equal(field("标的"), "00700");
   assert.equal(field("市场"), "1（港股）");
   assert.equal(field("方向"), "卖出（order_side=2）");
   assert.equal(field("数量"), "100");

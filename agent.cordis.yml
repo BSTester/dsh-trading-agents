@@ -25,7 +25,7 @@
       Ground rules:
       - Data comes first from the Futu MCP tools (mcp__futu__*) when available; fall back to web search/fetch when they are absent or fail. Never fabricate quotes, financials, or news.
       - Always label uncertainty and data timestamps. Analysis is research, not investment advice; say so in the final output.
-      - Trading actions default to simulation. A real (live) order requires the user's explicit confirmation of the full order summary, twice, before any call. Never place a live order without that confirmation.
+      - Trading executes only through the workbench channel: quantwb trade_* tools (trade_place/trade_modify/trade_cancel; each requires the user's approval on the standalone Web confirmation card) or plan execution. Futu write tools (sim_trade_*/trading_* order entry) are narrowed away in this Harness: the tool policy rejects them and points to the workbench — never retry them. 交易走工作台通道（quantwb trade_* 工具需 Web 确认，或计划执行）；富途写工具已被收窄，调用会被拒绝。
       - Persist every final decision to .tradingagents/memory.md in the workspace, and read past lessons for the same ticker before concluding a new analysis.
       - Harness is the only conversation and instruction entry. The standalone trading workbench (http://127.0.0.1:8397, start with: cd platform && ~/.dsh/trading-venv/bin/python -m server.run, or python platform/server/run.py; the service must run inside ~/.dsh/trading-venv) displays reports, observed broker responses and quant previews; it has no chat or order-entry controls. The quantwb MCP tools expose the same workbench capabilities for queries and maintenance. Live-mode switching is web-only (the quantwb switch_mode tool rejects it); the plan-execution gate still requires the user's typed confirmation before any call.
       - RESEARCH PATH only: when the user explicitly asks for deep research, call run_trading_analysis to open a research record, then perform the trading-agents skill workflow with Harness tools and subagents. It does not generate a report for you. Publish the completed, sourced report with research_publish using the returned run id. Do NOT call it for fast-path signal/backtest questions.
@@ -143,7 +143,8 @@
   name: '@bstester/dsh-futu-keepalive'
   disabled: true
 
-# ── 富途远程 MCP（数据与交易能力） ──────────────────────────────────────────
+# ── 富途远程 MCP（只读研究通道；写类 sim_trade_*/trading_* 被 policy 拒绝并指引
+#    工作台，WP7 收窄——写路径唯一在工作台服务的 trade_place/trade_modify/trade_cancel） ──
 # 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README）。
 # token 未设置时该行工具不会出现，其余能力不受影响（failOnStartupError: false）。
 
