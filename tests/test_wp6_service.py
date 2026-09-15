@@ -11,6 +11,7 @@
 全部离线：分析层取数在绝大多数用例里被注入的 fake provider 替掉；只有最后一条端到端用例
 调用真实 ``compute.run_script``，且只断言「有 envelope、不是 500」。
 """
+import contextlib
 import io
 import json
 import os
@@ -86,11 +87,13 @@ def completed(stdout, returncode=0, stderr=""):
 
 class Base(unittest.TestCase):
     def setUp(self):
-        caches.clear()
         self._tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self._tmp.cleanup)
         self.home = Path(self._tmp.name) / "home"
         self.home.mkdir(parents=True, exist_ok=True)
+        # 缓存目录隔离：caches 默认写 $DSH_HOME/trading-workbench-cache，测试必须换成临时
+        # home，否则会把用例数据写进真实用户缓存（磁盘层是补遗 C 新增的行为）。
+        caches.configure(home=str(self.home))
 
     def make_app(self, **kwargs):
         kwargs.setdefault("home", str(self.home))
@@ -132,20 +135,37 @@ class ContractTests(Base):
         self.assertIn("generated_at", body["value"])
 
     def test_unknown_endpoint_is_404_before_handle(self):
-        """白名单 404 必须在 handle 之前返回：注入取数替身并断言它一次都没被调用。
+        """白名单 404 必须在 handle 之前返回：patch create_handler 数「handle 被调了几次」。
 
         路由层（``app.py`` 的 ``endpoint not in endpoints``）先返回，因此请求根本到不了
-        handle；这也是「handle 未被调用」在 HTTP 面唯一可观测的证据（handle 在闭包里，
-        无法从外部替换——见 ``test_unknown_operation_message`` 对 handle 层同一边界的覆盖）。
+        handle。这里用 ``create_handler`` 的替身包一层计数（0 = 未知端点全被路由层拦下，
+        1 = 白名单内请求确实触达 handle），比「注入取数替身没被调用」更直接：
+        取数替身只在部分端点上可观测，而 handle 是唯一分发入口。
         """
-        recorder = RecordingProvider()
-        app = self.make_app(analytics=fake_analytics(recorder), series=lambda *a: {})
+        calls = []
+        real = app_module.create_handler
+
+        def spy(*args, **kwargs):
+            handle = real(*args, **kwargs)
+
+            def counted(endpoint, payload):
+                calls.append((endpoint, payload))
+                return handle(endpoint, payload)
+
+            return counted
+
+        with unittest.mock.patch.object(app_module, "create_handler", side_effect=spy):
+            app = self.make_app(analytics=fake_analytics(RecordingProvider()),
+                                series=lambda *a: {})
         client = self.client(app)
         for name in ("nope", "Foo", "snapshot2"):
             response = self.post(client, name)
             self.assertEqual(response.status_code, 404, name)
             self.assertEqual(response.json()["error"]["code"], "trading/unknown-endpoint")
-        self.assertEqual(recorder.calls, [], "白名单 404 必须在取数之前返回")
+        self.assertEqual(calls, [], "白名单 404 必须在 handle 之前返回（计数 0）")
+        # 正对照：白名单内的一次请求必须真的进 handle（计数 1）
+        self.assertEqual(self.post(client, "snapshot").status_code, 200)
+        self.assertEqual([name for name, _ in calls], ["snapshot"])
 
     def test_method_and_media_type_guards(self):
         client = self.client(self.make_app())
@@ -159,6 +179,74 @@ class ContractTests(Base):
                                headers={"Content-Type": "application/json"})
         self.assertEqual(response.status_code, 413)
         self.assertEqual(response.json()["error"]["code"], "trading/payload-too-large")
+
+    def test_non_post_and_multi_segment_paths_use_envelope(self):
+        """P1-1 实测矩阵：绝不能再落到 Starlette 的 ``{"detail": "Method Not Allowed"}``。
+
+        service.mjs:54-83 的判定顺序是「先方法、后格式」：``/api/wb/*`` 下非 POST 一律 405；
+        POST 但路径不是单个 ``[a-z-]+`` 段（含 ``/``、尾斜杠、空段）→ 404 unknown-endpoint；
+        其余路径非 GET → 405「仅 GET」。
+        """
+        client = self.client(self.make_app())
+        for method in ("put", "delete", "options", "get"):
+            response = getattr(client, method)("/api/wb/equity")
+            self.assertEqual(response.status_code, 405, method)
+            self.assertEqual(response.json()["error"],
+                             {"code": "trading/method-not-allowed", "message": "仅 POST",
+                              "details": {}}, method)
+        for path in ("/api/wb/a/b", "/api/wb/snapshot/", "/api/wb/"):
+            response = client.post(path, content="{}",
+                                   headers={"Content-Type": "application/json"})
+            self.assertEqual(response.status_code, 404, path)
+            self.assertEqual(response.json()["error"]["code"], "trading/unknown-endpoint", path)
+        response = client.post("/", content="{}", headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 405)
+        self.assertEqual(response.json()["error"]["message"], "仅 GET")
+        self.assertEqual(response.json()["error"]["code"], "trading/method-not-allowed")
+        # 非 POST 的多段路径在 service.mjs 里同样是 405（方法先于路径格式判定）
+        self.assertEqual(client.put("/api/wb/a/b").status_code, 405)
+
+    def test_body_limit_only_applies_inside_wb_whitelist(self):
+        """P1-2：413 判定在白名单与 content-type 之后，且只作用于 ``/api/wb/*``。"""
+        dist = self.make_dist()
+        client = self.client(self.make_app(dist=str(dist)))
+        big = b"x" * (2 * 1024 * 1024)
+        # 白名单外 + text/plain + 2MB → 先撞 404（不是 413）
+        unknown = client.post("/api/wb/nope", content=big,
+                              headers={"Content-Type": "text/plain"})
+        self.assertEqual(unknown.status_code, 404)
+        self.assertEqual(unknown.json()["error"]["code"], "trading/unknown-endpoint")
+        # 白名单内 + text/plain + 2MB → 415（不是 413）
+        wrong_type = client.post("/api/wb/snapshot", content=big,
+                                 headers={"Content-Type": "text/plain"})
+        self.assertEqual(wrong_type.status_code, 415)
+        # 静态请求声明 2MB 体也必须正常 200（上限不再作用于静态）
+        asset = client.get("/assets/app.js", headers={"Content-Length": str(2 * 1024 * 1024)})
+        self.assertEqual(asset.status_code, 200)
+        self.assertIn("console.log", asset.text)
+
+    def test_chunked_body_over_limit_is_413(self):
+        """Q-3：没有 content-length 的 chunked 请求靠边读边数判定，超限立即 413。"""
+        client = self.client(self.make_app())
+
+        def chunks():
+            for _ in range(3):  # 1.5MB > 1MB，且完全不声明 content-length
+                yield b"x" * (512 * 1024)
+
+        response = client.post("/api/wb/snapshot", content=chunks(),
+                               headers={"Content-Type": "application/json"})
+        self.assertEqual(response.status_code, 413)
+        self.assertEqual(response.json()["error"]["code"], "trading/payload-too-large")
+
+        def small_chunks():
+            yield b'{"pad": "ok"}'
+
+        under = client.post("/api/wb/snapshot", content=small_chunks(),
+                            headers={"Content-Type": "application/json"})
+        self.assertEqual(under.status_code, 200)
+        # snapshot 带载荷 → handle 层的未知操作（说明体确实被读全并解析了）
+        self.assertFalse(under.json()["ok"])
+        self.assertEqual(under.json()["error"]["message"], "Unknown workbench operation")
 
     def test_non_object_payload_is_400(self):
         client = self.client(self.make_app())
@@ -556,6 +644,19 @@ class StaticTests(Base):
         self.assertEqual(asset.status_code, 200)
         self.assertIn("text/javascript", asset.headers["content-type"])
 
+    def test_mime_table_matches_service_mjs(self):
+        """P1-4：只用手写 MIME 表，未收录扩展名 octet-stream，text/* 不加 charset。"""
+        dist = self.make_dist()
+        (dist / "notes.txt").write_text("plain", encoding="utf-8")
+        (dist / "style.css").write_text("body{}", encoding="utf-8")
+        client = self.client(self.make_app(dist=str(dist)))
+        self.assertEqual(client.get("/notes.txt").headers["content-type"],
+                         "application/octet-stream")
+        self.assertEqual(client.get("/style.css").headers["content-type"], "text/css")
+        self.assertEqual(client.get("/assets/app.js").headers["content-type"],
+                         "text/javascript")
+        self.assertEqual(client.get("/").headers["content-type"], "text/html; charset=utf-8")
+
     def test_spa_fallback(self):
         dist = self.make_dist()
         client = self.client(self.make_app(dist=str(dist)))
@@ -792,9 +893,53 @@ class ComputeBridgeTests(Base):
             ic({"tickers": ["600519", "000001"]}, False)
         self.assertEqual(str(caught.exception), "IC 需要 3..8 个标的（横截面相关）")
 
-    def test_run_script_rejects_unknown_script(self):
-        with self.assertRaises(compute.ComputeError):
+    def test_run_script_missing_script_reports_no_json(self):
+        """``run_script`` 没有脚本白名单：它拿到的是不存在的脚本路径，报「无 JSON 输出」。
+
+        真正的白名单在 ``compute.ENDPOINTS``（端点 → 脚本）与 ``SNAPSHOT_COMMANDS``
+        （见 ``test_snapshot_cli_whitelist``），``run_script`` 本身只负责「进程 + JSON + error」。
+        """
+        with self.assertRaises(compute.ComputeError) as caught:
             compute.run_script("nosuchscript.py", [])
+        self.assertIn("nosuchscript.py 无 JSON 输出", str(caught.exception))
+
+    def test_endpoint_timeouts_match_analytics_js(self):
+        """P1-3：逐端点 timeout 对齐 analytics.js（默认 180s，instrument 120s）。"""
+        self.assertEqual(compute.TIMEOUT, 180_000)
+        self.assertEqual(compute.timeout_for("equity"), 180_000)
+        self.assertEqual(compute.timeout_for("trades"), 180_000)
+        self.assertEqual(compute.timeout_for("instrument"), 120_000)
+        seen = {}
+
+        def runner(command, timeout):
+            seen[Path(command[1]).name] = timeout
+            return completed('{"ticker": "600519"}')
+
+        providers = compute.analytics_providers(runner)
+        providers["instrument"]({"ticker": "600519"}, False)
+        providers["equity"]({"mode": "sim"}, False)
+        self.assertEqual(seen, {"instruments.py": 120_000, "analytics.py": 180_000})
+
+    def test_null_only_params_use_js_default_semantics(self):
+        """``or`` → ``??``：只有 null/undefined 才兜底，空串是非法值。
+
+        这里覆盖合法的一侧（None = JS 的 null 走默认），非法空串一侧见
+        ``ParamSemanticsTests``（HTTP 全链路）。
+        """
+        _script, sensitivity, _s = compute.ENDPOINTS["sensitivity"]
+        self.assertEqual(sensitivity({"ticker": "600519", "strategy": None, "metric": None,
+                                      "start": None}, False),
+                         ["--ticker", "600519", "--strategy", "ma_cross",
+                          "--metric", "total_return", "--start", "2023-01-01"])
+        # grid 字段显式 null 与 JS 的 ``value === undefined`` 不同：必须报错
+        with self.assertRaises(compute.ComputeError) as caught:
+            sensitivity({"ticker": "600519", "fast_grid": None}, False)
+        self.assertEqual(str(caught.exception), "Invalid fast_grid")
+        _script, ic, _s = compute.ENDPOINTS["ic"]
+        tickers = {"tickers": ["600519", "000001", "601318"]}
+        self.assertEqual(ic({**tickers, "factor": None}, False),
+                         ["ic", "--tickers", "600519,000001,601318", "--factor", "mom_20",
+                          "--forward", "5", "--window", "250"])
 
     def test_series_validation(self):
         with self.assertRaises(compute.ComputeError) as caught:
@@ -894,8 +1039,230 @@ class ComputeBridgeTests(Base):
         self.assertEqual(third["value"]["config"]["n"], 2)
 
 
+class ParamSemanticsTests(Base):
+    """P1-3：``or`` → ``??``（仅 None 兜底）后的参数校验，走**真实** provider 全链路。
+
+    这些用例刻意不注入分析层：默认 provider 就是 ``compute.DEFAULT_ANALYTICS``，参数校验在
+    起子进程之前完成，因此错误的空值会以失败信封返回、且不会真的 spawn 任何进程。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.client = self.client(self.make_app())
+
+    def test_invalid_empty_values_are_rejected_end_to_end(self):
+        cases = [
+            ("sensitivity", {"ticker": "600519", "strategy": ""}, "Invalid strategy"),
+            ("sensitivity", {"ticker": "600519", "metric": ""}, "Invalid metric"),
+            ("sensitivity", {"ticker": "600519", "fast_grid": None}, "Invalid fast_grid"),
+            ("sensitivity", {"ticker": "600519", "start": ""}, "Invalid start date"),
+            ("ic", {"tickers": ["600519", "000001", "601318"], "factor": ""}, "Invalid factor"),
+            ("series", {"ticker": "600519", "period": None}, "Invalid period"),
+            ("series", {"ticker": "600519", "period": ""}, "Invalid period"),
+            ("plan-execute", {"action": ""}, "Unknown plan-execute action: "),
+        ]
+        for endpoint, payload, message in cases:
+            body = self.post(self.client, endpoint, payload).json()
+            self.assertFalse(body["ok"], (endpoint, payload))
+            self.assertEqual(body["error"]["message"], message, (endpoint, payload))
+
+    def test_null_defaults_still_work_end_to_end(self):
+        """反向对照：显式 null（JS 的 ``null ??``）仍走默认值，不能被误判成非法。"""
+        body = self.post(self.client, "series",
+                         {"ticker": "bad ticker!", "period": None}).json()
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"]["message"], "Invalid ticker")
+
+
+class InnerAnalyticsCacheTests(Base):
+    """Q-2：analytics provider 的 30s 内层缓存（analytics.js:16/62-77）。"""
+
+    def providers(self, runner):
+        return compute.analytics_providers(runner)
+
+    def test_audit_reuses_trades_subprocess(self):
+        calls = []
+
+        def runner(command, timeout):
+            calls.append((list(command), timeout))
+            return completed('{"trades": []}')
+
+        app = self.make_app(analytics=compute.analytics_providers(runner),
+                            series=lambda *a: {},
+                            core={name: (lambda data=name: {"plans": [], "alerts": [],
+                                                            "heartbeat": {}, "jobs": [],
+                                                            "diffs": [], "tca": {}})
+                                  for name in compute.SNAPSHOT_COMMANDS})
+        for _ in range(3):
+            body = app.state.handle("audit", {})
+            self.assertTrue(body["ok"], body)
+        self.assertEqual(len(calls), 1, "30s 内同一 (脚本, 参数) 只应起一次子进程")
+        command, timeout = calls[0]
+        self.assertEqual(Path(command[1]).name, "analytics.py")
+        self.assertEqual(command[2:], ["trades", "--mode", "sim", "--limit", "100"])
+        self.assertEqual(timeout, compute.TIMEOUT)
+
+    def test_inner_cache_key_separates_arguments(self):
+        calls = []
+
+        def runner(command, timeout):
+            calls.append(list(command[2:]))
+            return completed('{"trades": []}')
+
+        providers = self.providers(runner)
+        providers["trades"]({"mode": "sim", "limit": 1}, False)
+        providers["trades"]({"mode": "sim", "limit": 2}, False)
+        providers["trades"]({"mode": "sim", "limit": 1}, False)  # 回到旧参数 → 命中
+        self.assertEqual(len(calls), 2, "参数不同必须各自起进程，参数相同必须复用")
+
+    def test_force_refetch_is_visible_for_positions(self):
+        """positions 的 refresh 会 skipCache（analytics.js:93），并带上 ``--refresh``。"""
+        calls = []
+
+        def runner(command, timeout):
+            calls.append(list(command[2:]))
+            return completed('{"mode": "sim", "groups": []}')
+
+        providers = self.providers(runner)
+        providers["positions"]({"mode": "sim"}, False)
+        providers["positions"]({"mode": "sim"}, False)
+        self.assertEqual(len(calls), 1)
+        providers["positions"]({"mode": "sim"}, True)
+        self.assertEqual(len(calls), 2)
+        self.assertIn("--refresh", calls[1])
+
+    def test_force_does_not_bypass_inner_cache_for_other_endpoints(self):
+        """对齐 analytics.js：``_refresh`` 只绕过外层 TTL；30s 内层缓存照旧命中。
+
+        这是**有意**的移植语义（equity() 不接收 refresh 参数），不是漏传 force。
+        """
+        calls = []
+
+        def runner(command, timeout):
+            calls.append(list(command[2:]))
+            return completed('{"mode": "sim", "points": []}')
+
+        providers = self.providers(runner)
+        providers["equity"]({"mode": "sim"}, False)
+        providers["equity"]({"mode": "sim"}, True)
+        self.assertEqual(len(calls), 1)
+
+
+class DiskCacheTests(unittest.TestCase):
+    """Q-1：caches 的内存 + 磁盘两级（``cache.js`` 等价物）。全部离线，只碰临时目录。"""
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.home = Path(self._tmp.name)
+
+    def cache(self, now=None, **kwargs):
+        return caches.TtlCache(home=str(self.home), now=now, **kwargs)
+
+    def files(self):
+        directory = Path(caches.default_dir(str(self.home)))
+        return sorted(directory.glob("*.json")) if directory.is_dir() else []
+
+    def test_default_dir_follows_home_and_dsh_home(self):
+        self.assertEqual(caches.default_dir("/tmp/x"), "/tmp/x/trading-workbench-cache")
+        with unittest.mock.patch.dict(os.environ, {"DSH_HOME": "/tmp/y"}):
+            self.assertEqual(caches.default_dir(), "/tmp/y/trading-workbench-cache")
+
+    def test_safe_name_matches_cache_js_shape(self):
+        name = caches.safe_name("switch-mode|[]")
+        self.assertRegex(name, r"^switch-mode-[0-9a-f]{16}\.json$")
+        self.assertEqual(caches.safe_name("a/b|[]").split("-")[0], "a_b")
+
+    def test_write_then_new_instance_reads_hit(self):
+        self.cache().write("risk|[]", {"config": {"n": 1}})
+        self.assertTrue(self.files(), "写盘必须真的落文件")
+        fresh = caches.TtlCache(home=str(self.home))
+        hit = fresh.read("risk|[]", 60_000)
+        self.assertEqual(hit["value"], {"config": {"n": 1}})
+        self.assertIn("at", hit)
+
+    def test_expired_entry_is_miss_and_file_is_removed(self):
+        self.cache(now=lambda: 1_000).write("risk|[]", {"config": {}})
+        self.assertTrue(self.files())
+        fresh = caches.TtlCache(home=str(self.home))
+        self.assertIsNone(fresh.read("risk|[]", 60_000, now=61_000))
+        self.assertEqual(self.files(), [], "过期条目必须被删文件（cache.js:52）")
+
+    def test_bad_json_and_non_object_are_miss(self):
+        directory = Path(caches.default_dir(str(self.home)))
+        directory.mkdir(parents=True, exist_ok=True)
+        target = directory / caches.safe_name("risk|[]")
+        for junk in ("{not json", "[1, 2]", '{"value": 1}', '{"at": "yesterday"}'):
+            target.write_text(junk, encoding="utf-8")
+            self.assertIsNone(caches.TtlCache(home=str(self.home)).read("risk|[]", 60_000), junk)
+
+    def test_oversized_entry_stays_in_memory_only(self):
+        cache = self.cache(max_bytes=1024)
+        value = {"config": {"pad": "x" * 4096}}
+        entry = cache.write("risk|[]", value)
+        self.assertEqual(entry["value"], value)
+        self.assertEqual(self.files(), [], "超 maxBytes 只留内存不落盘")
+        self.assertEqual(cache.read("risk|[]", 60_000)["value"], value)
+        self.assertIsNone(caches.TtlCache(home=str(self.home)).read("risk|[]", 60_000))
+
+    def test_ttl_zero_means_no_cache(self):
+        cache = self.cache()
+        cache.write("risk|[]", {"config": {}})
+        self.assertIsNone(cache.read("risk|[]", 0))
+
+    def test_prune_evicts_oldest_beyond_max_files(self):
+        cache = self.cache(max_files=3)
+        for index in range(6):
+            cache.write(f"risk|{index}", {"config": {"n": index}})
+            time.sleep(0.01)  # mtime 淘汰需要可分辨的时间戳
+        self.assertEqual(len(self.files()), 3)
+        names = [path.name for path in self.files()]
+        newest = caches.safe_name("risk|5")
+        self.assertIn(newest, names, "最新写入必须留下")
+        self.assertNotIn(caches.safe_name("risk|0"), names)
+
+    def test_prune_removes_stray_tmp_files(self):
+        directory = Path(caches.default_dir(str(self.home)))
+        directory.mkdir(parents=True, exist_ok=True)
+        stray = directory / "risk-deadbeefdeadbeef.json.1234.abcd.tmp"
+        stray.write_text("partial", encoding="utf-8")
+        self.cache().write("risk|[]", {"config": {}})
+        self.assertFalse(stray.exists(), "崩溃残留的临时文件必须被清掉（cache.js:70-72）")
+
+    def test_module_level_cache_is_isolated_by_configure(self):
+        configured = caches.configure(home=str(self.home))
+        self.assertEqual(configured.directory, caches.default_dir(str(self.home)))
+        caches.write("risk", {}, {"config": {}}, now=5_000)
+        self.assertEqual(caches.read("risk", {}, 60_000, now=5_001), (5_000, {"config": {}}))
+        caches.configure(home=str(self.home / "other"))
+        self.assertIsNone(caches.read("risk", {}, 60_000, now=5_002))
+
+
+class DefaultWiringSmokeTests(Base):
+    """Q-6：不注入任何依赖的冒烟（真 ``python -m trading_core`` 子进程，无网络）。"""
+
+    def test_plan_and_schedule_with_default_wiring(self):
+        client = self.client(self.make_app())  # analytics/series/core 全走默认实现
+        cases = {"plan": {"plans", "alerts", "mode"}, "schedule": {"heartbeat", "jobs"}}
+        for endpoint, fields in cases.items():
+            response = self.post(client, endpoint)
+            self.assertEqual(response.status_code, 200, endpoint)
+            body = response.json()
+            self.assertTrue(body["ok"], (endpoint, body))
+            self.assertTrue(fields <= set(body["value"]), (endpoint, body["value"]))
+            self.assertFalse(body["cached"], endpoint)
+
+    @unittest.skipUnless(os.environ.get("DSH_WP6_SLOW") == "1",
+                         "慢用例（bars.py 真实取数可能 ~10s）：DSH_WP6_SLOW=1 时开启")
+    def test_series_with_default_wiring_optional(self):
+        client = self.client(self.make_app())
+        response = self.post(client, "series", {"ticker": "600519", "period": "1d", "limit": 20})
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("value" if response.json()["ok"] else "error", response.json())
+
+
 class RunEntryTests(Base):
-    """入口：就绪行形状与 uvicorn 配置。"""
+    """入口：就绪行形状、uvicorn 配置、启动失败契约与解释器告警。"""
 
     def test_ready_line_shape(self):
         from server import run as run_module
@@ -931,6 +1298,69 @@ class RunEntryTests(Base):
         with unittest.mock.patch.object(run_module, "build_server", return_value=server):
             self.assertEqual(run_module.main([]), 0)
         self.assertEqual(ran, [True])
+
+    def test_main_reports_eaddrinuse_as_json_and_returns_one(self):
+        """P1-5：占住端口后真跑一次 uvicorn。
+
+        uvicorn 0.53 的 bind 失败走 ``sys.exit(3)``（不是 OSError），因此 ``main()`` 必须捕
+        ``SystemExit`` 才能打印失败单行 JSON 并以 1 退出——旧的 ``except OSError`` 是死代码。
+        """
+        from server import run as run_module
+
+        holder = socket.socket()
+        holder.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        holder.bind(("127.0.0.1", 0))
+        holder.listen(1)
+        self.addCleanup(holder.close)
+        port = holder.getsockname()[1]
+        (self.home / "trading-platform.json").write_text(
+            json.dumps({"service": {"port": port, "host": "127.0.0.1"}}), encoding="utf-8")
+        stderr = io.StringIO()
+        env = {"DSH_HOME": str(self.home), "TRADING_SERVICE_PORT": str(port)}
+        with unittest.mock.patch.dict(os.environ, env):
+            with contextlib.redirect_stderr(stderr):
+                code = run_module.main([])
+        self.assertEqual(code, 1)
+        raw = stderr.getvalue()
+        self.assertIn('"ok": false', raw)
+        failure = [json.loads(line) for line in raw.splitlines() if line.startswith("{")]
+        self.assertTrue(failure, raw)
+        self.assertFalse(failure[-1]["ok"])
+        self.assertEqual(failure[-1]["service"], "quant-platform")
+        self.assertIn(str(port), failure[-1]["error"])
+
+    def test_interpreter_warning_detects_foreign_venv(self):
+        """Q-8：venv 解释器存在且与 sys.executable 不同 → 返回告警行；一致/缺失 → 静默。"""
+        from server import run as run_module
+
+        self.assertIsNone(run_module.interpreter_warning(str(self.home)))
+        binary = self.home / "trading-venv" / "bin"
+        binary.mkdir(parents=True)
+        (binary / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+        warning = run_module.interpreter_warning(str(self.home))
+        self.assertIsNotNone(warning)
+        self.assertEqual(warning["level"], "warning")
+        self.assertIn("trading-venv", warning["message"])
+        # 同一解释器（venv 内启动）不告警
+        (binary / "python").unlink()
+        os.symlink(sys.executable, binary / "python")
+        self.assertIsNone(run_module.interpreter_warning(str(self.home)))
+
+    def test_main_prints_interpreter_warning_to_stderr(self):
+        from server import run as run_module
+
+        binary = self.home / "trading-venv" / "bin"
+        binary.mkdir(parents=True)
+        (binary / "python").write_text("#!/bin/sh\n", encoding="utf-8")
+        app = self.make_app()
+        server = run_module.build_server(app, {"port": 0, "host": "127.0.0.1", "token": None})
+        server.run = lambda: None
+        stderr = io.StringIO()
+        with unittest.mock.patch.dict(os.environ, {"DSH_HOME": str(self.home)}):
+            with unittest.mock.patch.object(run_module, "build_server", return_value=server):
+                with contextlib.redirect_stderr(stderr):
+                    self.assertEqual(run_module.main([]), 0)
+        self.assertIn("trading-venv", stderr.getvalue())
 
 
 if __name__ == "__main__":

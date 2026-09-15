@@ -7,6 +7,13 @@
   * ``start.mjs:36-43`` —— SIGINT/SIGTERM 优雅退出：uvicorn 自带信号处理（等价于 Node 的
     ``server.close()``），``timeout_graceful_shutdown=5`` 对应其 5s 强制回收。
 
+**解释器要求（Q-8）**：服务应在 ``$DSH_HOME/trading-venv`` 内启动
+（``~/.dsh/trading-venv/bin/python -m server.run``）。``compute.PYTHON`` 取
+``sys.executable``，因此用系统 Python 启动服务会让所有分析/核心子进程改用系统解释器
+——缺依赖时只在取数时才暴露，表现为满屏 ``trading/*-unavailable``。为免静默降级，
+``main()`` 在解释器与 venv 不一致时先往 stderr 打一行告警 JSON（不硬失败：集成测试
+与嵌入式调用要用系统 Python 注入替身，硬失败会挡住它们）。
+
 启动方式说明（有意差异 1，必须记录）：任务书写的字面入口 ``python -m platform.server.run``
 在本环境**不可能工作**——``platform`` 是标准库的**模块**（``/usr/lib/python3*/platform.py``），
 ``ModuleNotFoundError: 'platform' is not a package``，即使在仓库根目录执行同样失败
@@ -14,7 +21,7 @@
 ``server`` 包组装（``import platform.server…`` 会被标准库遮蔽——见
 tests/test_wp6_service_locks.py 与 A/B 模块的 ``from server import _js``）。运行方式：
 
-    cd platform && python -m server.run          # 或
+    ~/.dsh/trading-venv/bin/python -m server.run     # cwd = platform/（推荐）
     python -c "import sys; sys.path.insert(0, 'platform'); from server import run; run.main()"
 
 下面的自举让 ``python platform/server/run.py`` 与上面两种方式加载**同一份** ``server`` 包。
@@ -95,16 +102,55 @@ def build_server(app, config, port=None):
                                       log_level="warning", timeout_graceful_shutdown=5), config)
 
 
+def interpreter_warning(home=None):
+    """Q-8：``$DSH_HOME/trading-venv/bin/python`` 存在且与 ``sys.executable`` 不同 → 告警行。
+
+    返回告警 dict（``main()`` 打到 stderr）或 ``None``。刻意不硬失败：测试/嵌入式调用会
+    用系统 Python，但子进程仍按 ``sys.executable`` 行走注入替身（compute.PYTHON）。
+    """
+    venv_python = Path(home if home is not None
+                       else os.environ.get("DSH_HOME") or Path.home() / ".dsh") \
+        / "trading-venv" / "bin" / "python"
+    try:
+        if not venv_python.exists():
+            return None
+        same = os.path.realpath(str(venv_python)) == os.path.realpath(sys.executable)
+    except OSError:  # 路径不可解析时不猜：宁可不告警
+        return None
+    if same:
+        return None
+    return {
+        "level": "warning",
+        "service": SERVICE,
+        "message": f"服务未在 trading-venv 内启动：当前解释器 {sys.executable}，"
+                   f"venv 解释器 {venv_python}；分析/核心子进程将使用当前解释器",
+    }
+
+
 def main(argv=None):
     del argv  # 入口无参数：配置全部来自 env / trading-platform.json（config.mjs 同）
     home = os.environ.get("DSH_HOME")
+    warning = interpreter_warning(home)
+    if warning is not None:
+        print(json.dumps(warning, ensure_ascii=False), file=sys.stderr, flush=True)
     config = load_config(home)
     app = create_app(home)
     server = build_server(app, config)
     try:
         server.run()
-    except OSError as error:  # EADDRINUSE 等：友好退出（exit 1），不留悬挂进程
-        print(json.dumps({"ok": False, "service": SERVICE, "error": str(error)}, ensure_ascii=False))
+    except SystemExit as error:
+        # uvicorn 0.53 的 bind 失败不是 OSError 而是 ``sys.exit(3)``（STARTUP_FAILURE）：
+        # 捕 SystemExit 才能覆盖 EADDRINUSE 这条真实路径（start.mjs:22-24 的等价物）。
+        if error.code in (None, 0):  # 正常退出码不当失败
+            return 0
+        print(json.dumps({"ok": False, "service": SERVICE,
+                          "error": f"服务启动失败（{config.get('host')}:{config.get('port')}）："
+                                   f"uvicorn 退出码 {error.code}"}, ensure_ascii=False),
+              file=sys.stderr, flush=True)
+        return 1
+    except OSError as error:  # 双保险：非 uvicorn 路径的绑定/权限失败同样友好退出
+        print(json.dumps({"ok": False, "service": SERVICE, "error": str(error)},
+                         ensure_ascii=False), file=sys.stderr, flush=True)
         return 1
     return 0
 

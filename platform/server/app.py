@@ -8,7 +8,8 @@
     未知端点与 WorkbenchError → ``trading/invalid-operation`` 信封（rpc.js:225-228）；
   * ``platform/server/service.mjs:42-88`` —— 路由顺序、白名单 404 先于 handle、
     content-type 415、1MB 413、坏 JSON 400、静态托管与 SPA 兜底、500 兜底信封；
-  * ``platform/server/util.mjs`` —— sendJson / authorized / unauthorized 的等价物。
+  * ``platform/server/util.mjs`` —— sendJson / authorized / unauthorized 的等价物；
+  * ``plugins/workbench/src/analytics.js`` —— 逐端点参数构造（在 ``server.compute``）。
 
 与 Node 侧的有意差异（均为「规格更严」而非语义变更）：
   1. ``auth`` 在中间件里统一判定（service.mjs 在每个分支里散着判），但判定条件与豁免面
@@ -18,12 +19,20 @@
      不变式由框架保证而不是约定；handle 内部对未知端点仍抛同样的 WorkbenchError。
   4. 阻塞取数（子进程/文件）经 ``asyncio.to_thread`` 让出事件循环——响应内容不变，
      只是不再阻塞其他请求。
-  5. 405 的 ``detail`` 用 service.mjs 的错误码 ``trading/method-not-allowed``（本任务规格
-     未指定该码，取移植源）。
+  5. 405 的 ``detail`` 用 service.mjs 的错误码 ``trading/method-not-allowed``。
+  6. 静态路径拼接用 ``lstrip('/')``（见 ``_serve_static_sync`` 的说明）。
+  7. 非 POST/非 GET 的兜底路由显式把**所有**方法收进信封（service.mjs:57/83）：
+     ``/api/wb/*`` 下非 POST → 405「仅 POST」，多段/含斜杠路径 → 404 unknown-endpoint，
+     其余路径非 GET → 405「仅 GET」。否则会落到 Starlette 的 ``{"detail": "Method Not
+     Allowed"}``，前端 ``response.json()`` 就拿不到统一信封。
+  8. 体上限（413）只在 ``/api/wb/*`` 分支内判、且在白名单与 content-type 之后
+     （service.mjs:60-75 的顺序），不再对静态与白名单外请求生效；读取时按块计数
+     （``request.stream()``），超限立刻 413，不先整读。
+  9. 静态响应用显式 ``Content-Type`` 头而不是 ``media_type=``：Starlette 会给 ``text/*``
+     追加 ``; charset=utf-8``，而 service.mjs:10-14 的表里只有 ``.html`` 带 charset。
 """
 import asyncio
 import json
-import mimetypes
 import os
 import re
 from pathlib import Path
@@ -38,7 +47,9 @@ from server.store_access import WorkbenchError
 
 Body = dict  # 文档用途：handle 的载荷一律是普通 dict
 
-# service.mjs:10-14 的 MIME 表（未收录的扩展名回落 octet-stream）
+# service.mjs:10-14 的 MIME 表：**只认这张手写表**，未收录扩展名回落 octet-stream。
+# 刻意不用 ``mimetypes.guess_type``：它会读 /etc/mime.types 等主机文件，同一份代码在不同
+# 机器上给出不同 Content-Type（且会给 text/* 追加 charset），与 service.mjs 不可比。
 MIME = {
     ".html": "text/html; charset=utf-8",
     ".js": "text/javascript",
@@ -53,6 +64,11 @@ MIME = {
 
 MAX_PAYLOAD = 1024 * 1024  # util.mjs:2 collectBody 默认上限
 DEFAULT_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+
+# 兜底路由的方法面：service.mjs 对每个路径段都只按「是不是 POST/GET」分派，
+# 其余方法一律落统一信封，因此这里收全 HTTP 方法，绝不再落到 Starlette 的默认 405。
+ALL_METHODS = ("GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD")
+NON_GET_METHODS = ("POST", "PUT", "DELETE", "PATCH", "OPTIONS", "HEAD")
 
 # 分析类端点（rpc.js:114-171）：白名单字段 + 缓存错误码 trading/analytics-unavailable
 ANALYTICS_ENDPOINTS = {
@@ -84,22 +100,7 @@ EXECUTE_ACTIONS = {
 
 SWITCH_MODE_FIELDS = ("mode", "expected_mode", "confirmation")
 PLAN_EXECUTE_FIELDS = ("plan_hash", "expected_mode", "confirmation", "action")
-
-# 分析类端点的默认取数入口（可注入，便于测试替换；Node 侧对应 deps.analytics）
-ANALYTICS_DEFAULT = {
-    "equity": lambda payload, force: compute.analytics("equity", payload, force),
-    "positions": lambda payload, force: compute.analytics("positions", payload, force),
-    "correlation": lambda payload, force: compute.analytics("correlation", payload, force),
-    "sensitivity": lambda payload, force: compute.analytics("sensitivity", payload, force),
-    "risk": lambda payload, force: compute.analytics("risk", payload, force),
-    "trades": lambda payload, force: compute.analytics("trades", payload, force),
-    "events": lambda payload, force: compute.analytics("events", payload, force),
-    "factors": lambda payload, force: compute.analytics("factors", payload, force),
-    "ic": lambda payload, force: compute.analytics("ic", payload, force),
-    "sources": lambda payload, force: compute.analytics("sources", payload, force),
-    "instrument": lambda payload, force: compute.analytics("instrument", payload, force),
-    "quality": lambda payload, force: compute.analytics("quality", payload, force),
-}
+SERIES_FIELDS = ("ticker", "period", "limit")
 
 
 def error_envelope(code, message, status):
@@ -135,14 +136,16 @@ def _check_fields(endpoint, payload, allowed):
 def create_handler(home, analytics=None, series=None, core=None, command_home=None):
     """``rpc.js:64-231 createRpcHandler`` 的 Python 等价物；返回 ``handle(endpoint, payload)``。
 
-    - ``analytics``：``{endpoint: callable(payload, force) -> value}``（缺省走 compute 子进程）；
+    - ``analytics``：``{endpoint: callable(payload, force) -> value}``（缺省走 compute 子进程，
+      即 ``compute.DEFAULT_ANALYTICS``——分析层默认表只有这一份，app 不再另立一份；Node 侧
+      对应 ``createRpcHandler(store, deps).deps.analytics``）；
     - ``series``：``callable(ticker, period, limit) -> value``（缺省 compute.series）；
     - ``core``：``{name: callable() -> value}``，name ∈ snapshot-plan/schedule/reconcile；
     - ``command_home``：指令落盘根，缺省 ``home``（服务侧 DSH_HOME）。
     """
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
-    analytics = dict(ANALYTICS_DEFAULT) if analytics is None else analytics
+    analytics = dict(compute.DEFAULT_ANALYTICS) if analytics is None else analytics
     if series is None:
         series = compute.series
     if core is None:
@@ -206,7 +209,11 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
             if endpoint == "plan-execute":
                 # rpc.js:183-210：唯一受约束执行入口；校验通过后原子写指令文件即返回
                 _check_fields(endpoint, payload, PLAN_EXECUTE_FIELDS)
-                action = payload.get("action") or "execute"
+                # rpc.js:189 ``payload.action ?? "execute"``：只有 null/undefined 才兜底，
+                # ``""`` 必须落到 Unknown plan-execute action（不能像 ``or`` 那样被吞掉）。
+                action = payload.get("action")
+                if action is None:
+                    action = "execute"
                 type_ = EXECUTE_ACTIONS.get(action)
                 if not type_:
                     raise WorkbenchError(f"Unknown plan-execute action: {action}")
@@ -229,11 +236,14 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 nonce = compute.write_command(write_home, type_, command_payload)
                 return {"ok": True, "value": {"queued": True, "nonce": nonce, "action": action}}
             if endpoint == "series":
-                _check_fields(endpoint, payload, ("ticker", "period", "limit"))
+                _check_fields(endpoint, payload, SERIES_FIELDS)
+                # series.js:28 的解构默认只在 undefined 时生效：null/"" 交给 compute.series
+                # 报 Invalid period（不能用 ``or`` 兜底，否则非法值被静默改成 "5m"）。
+                period = payload["period"] if "period" in payload else "5m"
+                limit = payload["limit"] if "limit" in payload else 300
                 return caches.cached(
                     endpoint, payload, force,
-                    lambda: series(payload.get("ticker"), payload.get("period") or "5m",
-                                   payload.get("limit", 300)),
+                    lambda: series(payload.get("ticker"), period, limit),
                     "trading/series-unavailable")
             raise WorkbenchError("Unknown workbench operation")
         except WorkbenchError as error:
@@ -277,20 +287,21 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
     @app.middleware("http")
     async def guard(request, call_next):
-        """认证 + 1MB 体上限（service.mjs:55-79 的顺序：认证 → 上限 → 路由）。"""
+        """认证（service.mjs:47-56 的认证顺序：healthz 豁免 → /mcp 与 /api/* 需 token）。
+
+        体上限刻意不在这里判：service.mjs 的 413 只在 ``/api/wb/*`` 分支内、且在白名单与
+        content-type 之后生效（否则白名单外请求会先撞 413，静态请求也会被请求头误伤）。
+        """
         route = request.url.path
         if (route.startswith("/api/") or route == "/mcp") and not check_auth(
                 request.headers.get("authorization")):
             # util.mjs:27-29：token 缺失/不匹配 → 401 trading/unauthorized
             return error_envelope("trading/unauthorized", "需要 Bearer token", 401)
-        declared = request.headers.get("content-length")
-        if declared and declared.isdigit() and int(declared) > MAX_PAYLOAD:
-            return error_envelope("trading/payload-too-large", "请求体超过 1MB 上限", 413)
         return await call_next(request)
 
-    @app.get("/healthz")
+    @app.api_route("/healthz", methods=list(ALL_METHODS))
     async def healthz():
-        """service.mjs:47-49：豁免认证的存活探针。"""
+        """service.mjs:47-49：豁免认证的存活探针（Node 侧不判方法，任何方法同响应）。"""
         return {"ok": True, "mode": read_mode(home)}
 
     @app.post("/api/wb/{endpoint}")
@@ -302,11 +313,19 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         content_type = request.headers.get("content-type", "").split(";")[0].strip()
         if content_type != "application/json":
             return error_envelope("trading/invalid-operation", "Expected application/json", 415)
-        body = await request.body()
-        if len(body) > MAX_PAYLOAD:
+        declared = request.headers.get("content-length")
+        if declared and declared.isdigit() and int(declared) > MAX_PAYLOAD:
+            # 快路径：声明就超限时不必读体（util.mjs collectBody 同样先看 content-length）
             return error_envelope("trading/payload-too-large", "请求体超过 1MB 上限", 413)
+        body = bytearray()
+        # Q-3：按块计数，超限立即返回，不先把整个体读进内存
+        # （chunked 传输没有 content-length，只能靠边读边数）。
+        async for chunk in request.stream():
+            body.extend(chunk)
+            if len(body) > MAX_PAYLOAD:
+                return error_envelope("trading/payload-too-large", "请求体超过 1MB 上限", 413)
         try:
-            payload = json.loads(body.decode("utf-8") or "{}")
+            payload = json.loads(bytes(body).decode("utf-8") or "{}")
         except (json.JSONDecodeError, UnicodeDecodeError) as error:
             return error_envelope("trading/invalid-operation",
                                   f"请求体不是合法 JSON：{error}", 400)
@@ -316,12 +335,20 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         return JSONResponse(status_code=200, content=await asyncio.to_thread(handle, endpoint,
                                                                             payload))
 
-    @app.get("/api/wb/{endpoint}")
-    async def workbench_get(endpoint: str):
-        """service.mjs:56-58：非 POST 一律 405（错误码取移植源 method-not-allowed）。"""
-        return error_envelope("trading/method-not-allowed", "仅 POST", 405)
+    @app.api_route("/api/wb/{rest:path}", methods=list(ALL_METHODS))
+    async def workbench_fallback(rest: str, request: Request):
+        """``service.mjs:54-63`` 的兜底：方法错误 → 405；多段/含斜杠路径 → 404。
 
-    @app.api_route("/mcp", methods=["GET", "POST"])
+        单段的合法 POST 由上一条路由吃掉，这里只接单段以外的形态：
+          * 非 POST → 405「仅 POST」（service.mjs:56-58 先判方法再判白名单）；
+          * POST 但 ``rest`` 含 ``/``（``a/b``、``snapshot/``、空串）→ 404 unknown-endpoint
+            （service.mjs:60 的 ``^[a-z-]+$`` 判定）。
+        """
+        if request.method != "POST":
+            return error_envelope("trading/method-not-allowed", "仅 POST", 405)
+        return error_envelope("trading/unknown-endpoint", f"未知端点 {rest}", 404)
+
+    @app.api_route("/mcp", methods=list(ALL_METHODS))
     async def mcp_placeholder():
         """任务 D 在此挂真实 MCP；本轮按任务约定给 405 占位。"""
         return error_envelope("trading/method-not-allowed", "MCP 未启用（任务 D 接线）", 405)
@@ -329,7 +356,12 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     @app.get("/{path:path}")
     async def static_files(path: str):
         """``service.mjs:82``：GET 走静态托管 + SPA 兜底。"""
-        return _serve_static(root, path)
+        return await _serve_static(root, path)
+
+    @app.api_route("/{path:path}", methods=list(NON_GET_METHODS))
+    async def non_get_fallback():
+        """``service.mjs:83``：静态路径的非 GET 一律 405「仅 GET」信封。"""
+        return error_envelope("trading/method-not-allowed", "仅 GET", 405)
 
     return app
 
@@ -345,12 +377,22 @@ def _read_mode(home):
 read_mode = _read_mode
 
 
-def _serve_static(root, url_path):
+async def _serve_static(root, url_path):
+    """静态托管的异步外壳：全部文件系统操作（stat/读取）在线程里做，不阻塞事件循环。"""
+    return await asyncio.to_thread(_serve_static_sync, root, url_path)
+
+
+def _serve_static_sync(root, url_path):
     """``service.mjs:16-40 serveStatic``：解码 → 边界防护 → 文件/SPA 兜底 → MIME。
 
     有意差异 6：``service.mjs:23`` 用 Node 的 ``path.join(dist, relative)``，它对以 ``/``
     开头的第二段**不重置**（``join('/a','/b') === '/a/b'``），而 Python 的 ``os.path.join``
     会重置（``'/b'``）——因此这里显式 ``lstrip('/')`` 后再拼接，保持与移植源同一落点。
+
+    有意差异 9：``Content-Type`` 走 ``headers=`` 而不是 ``media_type=``。Starlette 会对
+    ``text/*`` 追加 ``; charset=utf-8``，而 ``service.mjs:10-14`` 的表里只有 ``.html``
+    带 charset（``.js`` 是裸 ``text/javascript``、``.css`` 是裸 ``text/css``）；未收录扩展名
+    一律 ``application/octet-stream``，不做任何猜测。
     """
     try:
         relative = "index.html" if url_path in ("", "/") else _decode(f"/{url_path}")
@@ -373,9 +415,8 @@ def _serve_static(root, url_path):
     except OSError as error:
         # service.mjs:36-38：读取失败 → 500 trading/internal
         return error_envelope("trading/internal", f"静态文件读取失败：{error}"[:300], 500)
-    media_type = MIME.get(os.path.splitext(target)[1]) or (mimetypes.guess_type(target)[0]
-                                                           or "application/octet-stream")
-    return Response(content=content, media_type=media_type)
+    media_type = MIME.get(os.path.splitext(target)[1]) or "application/octet-stream"
+    return Response(content=content, headers={"Content-Type": media_type})
 
 
 _BAD_ESCAPE = re.compile(r"%(?![0-9A-Fa-f]{2})")

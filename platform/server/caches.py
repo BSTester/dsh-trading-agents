@@ -5,15 +5,29 @@
   * ``rpc.js:73-95`` —— cached() 包装：命中（TTL 内且形状合法）→ cached:true，
     未命中 → 取数 → 形状校验 → 写缓存（仅 TTL>0）→ cached:false；
     形状不符抛「{endpoint} 返回的载荷不完整，已按失败处理」，一切异常落成失败信封；
+  * ``plugins/workbench/src/cache.js:26-118`` —— createTtlCache：**内存 + 磁盘两级**缓存
+    （目录 ``$DSH_HOME/trading-workbench-cache``、条目 ``{value, at}``、TTL 过期删文件、
+    ``maxFiles``/``maxBytes``、临时文件唯一名 + rename 原子落盘）；
   * ``plugins/workbench/src/endpoints.js:35-68`` —— ENDPOINT_SHAPE 表与 matchesShape。
 
-有意差异：缓存是**进程内 dict**（Node 侧 rpc.js 用的也是内存 cache.js，语义一致）；
-键与 payload 的稳定序列化照抄 rpc.js:34-37（键排序后成对序列化，键顺序不影响命中）。
+关于磁盘这一级（更正补遗 A/B 的说明）：Node 侧 rpc.js **不是**只内存缓存。``rpc.js:65``
+用 ``createTtlCache(deps)``，而 ``cache.js`` 明确实现了磁盘持久化——目的正是避免「每次重启
+进程缓存全丢，用户重启后第一次点每个页签都要重新等一遍」的冷启动回归（cache.js:1-11）。
+本模块因此同样实现两级：内存命中零开销；内存未命中再读磁盘并回填内存；写盘只在
+JSON 可序列化且不超过 ``maxBytes`` 时进行（大结果只留内存，cache.js:11/103）。
+
+键与 payload 的稳定序列化照抄 rpc.js:34-37（键排序后成对序列化，键顺序不影响命中）；
+磁盘条目名照抄 cache.js:20-24 safeName（``<消毒后的端点>-<sha1(其余段) 前 16 位>.json``）。
 """
+import hashlib
 import json
+import os
+import re
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 # rpc.js:11-32 的 17 个端点 TTL（毫秒）
 CACHE_TTL_MS = {
@@ -57,8 +71,168 @@ ENDPOINT_SHAPE = {
     "reconcile": ["diffs", "tca"],
 }
 
-_CACHE = {}
-_LOCK = threading.Lock()
+# cache.js:17-18 的两个默认上限
+DEFAULT_MAX_BYTES = 2 * 1024 * 1024
+DEFAULT_MAX_FILES = 120
+
+_SAFE_ENDPOINT = re.compile(r"[^a-zA-Z0-9_-]")
+
+
+def default_dir(home=None):
+    """cache.js:29 的目录：``$DSH_HOME/trading-workbench-cache``（``~/.dsh`` 兜底）。
+
+    ``home`` 参数用于测试隔离与嵌入式调用（Node 侧等价物是 ``createTtlCache({dir})``）。
+    """
+    base = home if home is not None else os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+    return os.path.join(str(base), "trading-workbench-cache")
+
+
+def safe_name(key):
+    """cache.js:20-24 safeName：端点消毒 + 其余段 sha1 前 16 位。"""
+    endpoint, _, rest = str(key).partition("|")
+    digest = hashlib.sha1(rest.encode("utf-8")).hexdigest()[:16]
+    return f"{_SAFE_ENDPOINT.sub('_', endpoint)}-{digest}.json"
+
+
+class TtlCache:
+    """``createTtlCache`` 的 Python 等价物：内存 + 磁盘两级，任何异常都当未命中。
+
+    与 cache.js 的对应关系：
+      * ``read(key, ttl)``  —— cache.js:81-90（内存命中 → 磁盘命中并回填内存）；
+      * ``write(key, value, now=None)`` —— cache.js:93-114（内存总是写；可序列化且不超限才落盘）；
+      * ``prune()`` —— cache.js:61-77（清 ``.tmp`` 残骸 + 超过 maxFiles 的按 mtime 淘汰最旧）；
+      * ``max_bytes`` 是**单条目**上限（cache.js:103 ``Buffer.byteLength(payload) > maxBytes``）：
+        超过就只留内存不落盘。cache.js 的磁盘淘汰只按**文件数**（``maxFiles``），这里保持一致。
+    """
+
+    def __init__(self, home=None, directory=None, max_files=None, max_bytes=None, now=None):
+        self._home = home
+        self._directory = directory
+        self.max_files = int(max_files) if max_files else DEFAULT_MAX_FILES
+        self.max_bytes = int(max_bytes) if max_bytes else DEFAULT_MAX_BYTES
+        self._now = now if now is not None else (lambda: time.time() * 1000)
+        self._memory = {}
+        self._lock = threading.Lock()
+        self._disk_ready = False
+
+    @property
+    def directory(self):
+        return self._directory or default_dir(self._home)
+
+    def _ensure_dir(self):
+        """cache.js:35-44 ensureDir：建目录失败后不再反复尝试，一律当未命中。"""
+        if self._disk_ready:
+            return True
+        try:
+            os.makedirs(self.directory, exist_ok=True)
+            self._disk_ready = True
+        except OSError:
+            self._disk_ready = False
+        return self._disk_ready
+
+    def _read_disk(self, name, ttl_ms, current):
+        """cache.js:46-59 readDisk：缺文件/坏 JSON 当未命中；过期删文件后当未命中。"""
+        path = os.path.join(self.directory, name)
+        try:
+            with open(path, "r", encoding="utf-8") as handle:
+                entry = json.load(handle)
+        except (OSError, ValueError, UnicodeDecodeError):  # UnicodeDecodeError ⊂ ValueError
+            return None
+        if not isinstance(entry, dict):
+            return None
+        at = entry.get("at")
+        if isinstance(at, bool) or not isinstance(at, (int, float)):
+            return None
+        if ttl_ms > 0 and current - at >= ttl_ms:
+            try:  # 过期文件删不掉也无所谓（cache.js:52）
+                os.unlink(path)
+            except OSError:
+                pass
+            return None
+        return entry
+
+    def prune(self):
+        """cache.js:61-77：清临时残骸，再按 mtime 从旧到新淘汰到 ``max_files`` 以内。"""
+        try:
+            rows = []
+            with os.scandir(self.directory) as scan:
+                for item in scan:
+                    try:
+                        rows.append((item.name, item.stat().st_mtime))
+                    except OSError:
+                        continue
+        except OSError:
+            return
+        rows.sort(key=lambda row: row[1], reverse=True)
+        doomed = [name for name, _ in rows if name.endswith(".tmp")]
+        doomed += [name for name, _ in rows if not name.endswith(".tmp")][self.max_files:]
+        for name in doomed:
+            try:
+                os.unlink(os.path.join(self.directory, name))
+            except OSError:
+                continue
+
+    def read(self, key, ttl_ms, now=None):
+        """命中返回条目 ``{value, at}``，否则 ``None``（cache.js:81-90）。ttl<=0 = 不缓存。"""
+        if ttl_ms <= 0:
+            return None
+        current = self._now() if now is None else now
+        with self._lock:
+            hit = self._memory.get(key)
+        if hit is not None:
+            if current - hit["at"] < ttl_ms:
+                return hit
+            with self._lock:
+                self._memory.pop(key, None)
+        if not self._ensure_dir():
+            return None
+        entry = self._read_disk(safe_name(key), ttl_ms, current)
+        if entry is not None:
+            with self._lock:
+                self._memory[key] = entry
+        return entry
+
+    def write(self, key, value, now=None):
+        """写两级缓存并返回条目 ``{value, at}``（cache.js:93-114）。"""
+        at = self._now() if now is None else now
+        entry = {"value": value, "at": at}
+        with self._lock:
+            self._memory[key] = entry
+        if not self._ensure_dir():
+            return entry
+        try:
+            payload = json.dumps(entry, ensure_ascii=False)
+        except (TypeError, ValueError):  # 不可序列化的值只留内存（cache.js:99-101）
+            return entry
+        if len(payload.encode("utf-8")) > self.max_bytes:  # 大结果只留内存（cache.js:103）
+            return entry
+        target = os.path.join(self.directory, safe_name(key))
+        try:
+            # 临时名必须唯一：Host 进程与 CLI/测试共用缓存目录，同名 tmp 会互相截断
+            # （cache.js:106-108 的 process.pid + randomBytes）。
+            temp = f"{target}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+            with open(temp, "w", encoding="utf-8") as handle:
+                handle.write(payload)
+            os.replace(temp, target)
+            self.prune()
+        except OSError:  # 写盘失败不影响返回（cache.js:112）
+            pass
+        return entry
+
+    def clear_memory(self):
+        """cache.js:116 clearMemory。"""
+        with self._lock:
+            self._memory.clear()
+
+
+_CACHE = TtlCache()
+
+
+def configure(home=None, max_files=None, max_bytes=None, now=None):
+    """测试/嵌入式：替换模块级缓存实例并返回它（Node 侧对应 ``deps.cache`` 注入）。"""
+    global _CACHE
+    _CACHE = TtlCache(home=home, max_files=max_files, max_bytes=max_bytes, now=now)
+    return _CACHE
 
 
 def stable_key(payload):
@@ -85,30 +259,24 @@ def cache_key(endpoint, payload):
 
 def read(endpoint, payload, ttl_ms, now=None):
     """命中返回 ``(at_ms, value)``，未命中返回 ``None``（rpc.js:76-83 的 cache.read）。"""
-    if ttl_ms <= 0:
-        return None
-    current = time.time() * 1000 if now is None else now
-    with _LOCK:
-        entry = _CACHE.get(cache_key(endpoint, payload))
+    entry = _CACHE.read(cache_key(endpoint, payload), ttl_ms, now)
     if entry is None:
         return None
-    if current - entry["at"] >= ttl_ms:  # rpc.js:64 ``now() - hit.at < CACHE_TTL_MS``
-        return None
-    return entry["at"], entry["value"]
+    return entry["at"], entry.get("value")
 
 
 def write(endpoint, payload, value, now=None):
     """写缓存并返回 ``{"at": ms}``（rpc.js:89 ``cache.write``）。"""
-    at = time.time() * 1000 if now is None else now
-    with _LOCK:
-        _CACHE[cache_key(endpoint, payload)] = {"at": at, "value": value}
-    return {"at": at}
+    entry = _CACHE.write(cache_key(endpoint, payload), value, now)
+    return {"at": entry["at"]}
 
 
 def clear():
-    """测试/诊断用：清空进程内缓存（Node 侧无对应 API，不影响契约）。"""
-    with _LOCK:
-        _CACHE.clear()
+    """测试/诊断用：清空**内存**层（Node 侧对应 cache.js:116 clearMemory）。
+
+    磁盘条目刻意不清：它们的 TTL 与形状校验仍然生效，且跨进程共享正是磁盘层的目的。
+    """
+    _CACHE.clear_memory()
 
 
 def iso_from_ms(at_ms):

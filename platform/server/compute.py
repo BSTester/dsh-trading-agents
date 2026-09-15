@@ -17,12 +17,18 @@
      避免同一事实出现两份实现（失败语义不变：形状不符由 cached() 抛错并按失败处理）。
   3. 校验失败的消息沿用 JS 侧原文（"Invalid mode" 等），只是异常类型换成 ComputeError，
      便于 app.py 统一映射到各端点的错误码。
+  4. 每个 provider 实例自带一层 30s 内层结果缓存（analytics.js:16/62-77 的 ``Map``，
+     含 positions 的 skipCache 例外），见 ``analytics_providers``。
+  5. 白名单集合判定统一加 ``isinstance(str)``：JS 的 ``Set.has``/``includes`` 对任意类型
+     都返回布尔，而 Python 的 ``in frozenset`` 对不可哈希值抛 TypeError。
 """
 import json
 import os
 import re
 import subprocess
 import sys
+import threading
+import time
 from pathlib import Path
 
 # 脚本目录：analytics.js:8 / series.js:8 的 `new URL("../python/", import.meta.url)`。
@@ -31,8 +37,12 @@ SCRIPTS = ROOT / "plugins" / "workbench" / "python"
 # python 可执行：有意差异 1（sys.executable，不硬编码 venv）。
 PYTHON = sys.executable
 
-TIMEOUT = 180_000  # analytics.js:67 execFile timeout 180s
+TIMEOUT = 180_000  # analytics.js:67 execFile 默认 timeout 180s
 SNAPSHOT_TIMEOUT = 60_000  # pycore.js:18 默认 timeout 60s
+# analytics.js 里逐个写死的 timeout：只有 instrument 不用默认值（analytics.js:170 = 120s）
+ENDPOINT_TIMEOUT_MS = {"instrument": 120_000}
+# analytics.js:16 / series.js:13 的内层结果缓存 TTL：同一 (脚本, 参数) 30s 内不重起子进程
+INNER_CACHE_TTL_MS = 30_000
 
 
 class ComputeError(RuntimeError):
@@ -56,9 +66,13 @@ def _is_int(value):
 
 
 def _mode_of(value):
-    """analytics.js:23-27 modeOf：缺省 sim，非法即错。"""
+    """analytics.js:23-27 modeOf：缺省 sim，非法即错。
+
+    ``isinstance(str)`` 是 JS ``MODES.has(value)`` 的严格等价物：非字符串（数组/数字/布尔）
+    在 JS 里一律 false，而在 Python 里直接 ``value in frozenset`` 会对不可哈希值抛 TypeError。
+    """
     mode = "sim" if value is None else value
-    if mode not in MODES:
+    if not isinstance(mode, str) or mode not in MODES:
         raise ComputeError("Invalid mode")
     return mode
 
@@ -85,6 +99,11 @@ def _ticker_list(value, minimum, message):
     if any(not isinstance(item, str) or TICKER.match(item) is None for item in value):
         raise ComputeError("Invalid ticker in list")
     return value
+
+
+def timeout_for(endpoint, default=TIMEOUT):
+    """端点级 timeout（analytics.js:67 默认 180s；instrument 120s，analytics.js:170）。"""
+    return ENDPOINT_TIMEOUT_MS.get(endpoint, default)
 
 
 def _spawn(command, timeout):
@@ -163,26 +182,39 @@ def _sensitivity_args(payload, force):
 
     grid 为空时**不下发**该参数（analytics.js:120-123 的 `if (payload.X_grid)`），
     让 sensitivity.py 用自己声明的默认网格（sensitivity.py:64-67）。
+
+    默认值语义逐条对齐 JS 的 ``??``（只在 null/undefined 时兜底，空串是非法值）：
+      * ``payload.strategy``：none → "ma_cross"，``""`` → Invalid strategy；
+      * ``payload.metric``：none → "total_return"，``""`` → Invalid metric；
+      * ``payload.start``：none → "2023-01-01"，``""`` → Invalid start date；
+      * grid 字段：JS 用 ``value === undefined`` 跳过，因此这里用 ``field not in payload``
+        判定——显式 ``null`` 与 JS 的 ``null`` 一样要报 Invalid <field>。
     """
     ticker = _ticker_of(payload.get("ticker"))
-    strategy = payload.get("strategy") or "ma_cross"
-    if strategy not in STRATEGIES:
+    strategy = payload.get("strategy")
+    if strategy is None:
+        strategy = "ma_cross"
+    if not isinstance(strategy, str) or strategy not in STRATEGIES:
         raise ComputeError("Invalid strategy")
-    metric = payload.get("metric") or "total_return"
-    if metric not in METRICS:
+    metric = payload.get("metric")
+    if metric is None:
+        metric = "total_return"
+    if not isinstance(metric, str) or metric not in METRICS:
         raise ComputeError("Invalid metric")
     for field in ("fast_grid", "slow_grid", "buy_grid", "sell_grid"):
-        value = payload.get(field)
-        if value is None:
+        if field not in payload:
             continue
+        value = payload[field]
         if not isinstance(value, str) or GRID.match(value) is None:
             raise ComputeError(f"Invalid {field}")
         for part in value.split(","):
             number = int(part)
             if number < 1 or number > 500:
                 raise ComputeError(f"Invalid {field} value")
-    start = payload.get("start") or "2023-01-01"
-    if re.match(r"^\d{4}-\d{2}-\d{2}$", start) is None:
+    start = payload.get("start")
+    if start is None:
+        start = "2023-01-01"
+    if not isinstance(start, str) or re.match(r"^\d{4}-\d{2}-\d{2}$", start) is None:
         raise ComputeError("Invalid start date")
     args = ["--ticker", ticker, "--strategy", strategy, "--metric", metric, "--start", start]
     for field, flag in (("fast_grid", "--fast-grid"), ("slow_grid", "--slow-grid"),
@@ -207,10 +239,16 @@ def _factors_args(payload, force):
 
 
 def _ic_args(payload, force):
-    """analytics.js:143-155：``ic --tickers .. --factor .. --forward .. --window ..``（3..8 标的）。"""
+    """analytics.js:143-155：``ic --tickers .. --factor .. --forward .. --window ..``（3..8 标的）。
+
+    ``payload.factor`` 是 JS ``payload.factor ?? "mom_20"``：只有 null/undefined 才兜底，
+    ``""`` 必须报 Invalid factor（不能像 ``or`` 那样被吞成默认值）。
+    """
     tickers = _ticker_list(payload.get("tickers"), 3, "IC 需要 3..8 个标的（横截面相关）")
-    factor = payload.get("factor") or "mom_20"
-    if factor not in FACTORS:
+    factor = payload.get("factor")
+    if factor is None:
+        factor = "mom_20"
+    if not isinstance(factor, str) or factor not in FACTORS:
         raise ComputeError("Invalid factor")
     forward = _int_in_range(payload.get("forward"), 5, 1, 60, "forward")
     window = _int_in_range(payload.get("window"), 250, 80, 1000, "window")
@@ -265,15 +303,39 @@ ENDPOINTS = {
 }
 
 
-def analytics_providers(runner):
+def analytics_providers(runner, now=None):
     """以某个 runner（真实子进程或注入替身）构造 ``{endpoint: callable(payload, force)}``。
 
     这是 ``analytics.js:81-196 createAnalyticsProvider()`` 返回的对象形状：app.py 直接把它
     当作分析层注入；注入替身时整条链路（参数校验 → 子进程 → 解析）保持真实，只换掉进程。
+
+    Q-2：provider 内部还有一层 30s 结果缓存（analytics.js:16/62-64/77）。它与 rpc.js 的
+    TTL 缓存**不是**同一层：rpc.js 的 ``_refresh`` 只绕过外层（TTL 分钟级），而同一
+    (脚本, 参数) 在 30s 内仍由内层直接返回、不重起子进程——audit 端点正是靠它避免每次
+    请求都去取一次 trades 台账（audit 自身不进 rpc.js 的 cached 包装，rpc.js:132-145）。
+    唯一的例外是 positions：``options.refresh`` 会 skipCache（analytics.js:93），
+    因此 ``force`` 对 positions 跳过读内层缓存（仍照常写回）。
     """
+    clock = (lambda: time.time() * 1000) if now is None else now
+    inner = {}
+    lock = threading.Lock()  # app 侧用 to_thread 并发调用，内层缓存必须自己加锁
+
+    def produce(name, script, build, payload, force):
+        args = build(payload or {}, force)
+        key = json.dumps([script, [str(arg) for arg in args]], ensure_ascii=False)
+        with lock:
+            hit = inner.get(key)
+        if (hit is not None and clock() - hit["at"] < INNER_CACHE_TTL_MS
+                and not (name == "positions" and force)):
+            return hit["value"]
+        value = run_script(script, args, timeout=timeout_for(name), runner=runner)
+        with lock:
+            inner[key] = {"at": clock(), "value": value}
+        return value
+
     return {
-        name: (lambda payload, force, script=script, build=build: run_script(
-            script, build(payload or {}, force), runner=runner))
+        name: (lambda payload, force, name=name, script=script, build=build:
+               produce(name, script, build, payload, force))
         for name, (script, build, _source) in ENDPOINTS.items()
     }
 
@@ -291,10 +353,16 @@ def analytics(endpoint, payload=None, force=False):
 
 
 def series(ticker, period="5m", limit=300, runner=None):
-    """``series.js:26-43``：校验（ticker 正则 / period 白名单 / limit 20..2000）→ bars.py → JSON。"""
+    """``series.js:26-43``：校验（ticker 正则 / period 白名单 / limit 20..2000）→ bars.py → JSON。
+
+    period 用 ``isinstance(str)`` 判定：series.js 的 ``PERIODS.has(period)`` 对非字符串一律
+    false，而 Python 的 ``value in frozenset`` 会对不可哈希值抛 TypeError（会漏出非
+    ``Invalid period`` 的失败消息）。显式 ``null``/``""`` 都是 Invalid period（JS 默认值
+    只在 undefined 时生效，见 series.js:28 的解构默认）。
+    """
     if not isinstance(ticker, str) or TICKER.match(ticker) is None:
         raise ComputeError("Invalid ticker")
-    if period not in PERIODS:
+    if not isinstance(period, str) or period not in PERIODS:
         raise ComputeError("Invalid period")
     if not _is_int(limit) or limit < 20 or limit > 2000:
         raise ComputeError("Invalid limit (20..2000)")
