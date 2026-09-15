@@ -134,6 +134,16 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(rows[0]["announced_at"], "2026-08-28")  # 公告日保留
         self.assertEqual(rows[0]["announced_source"], "akshare/yjbb")
 
+    def test_valuations_pit(self):
+        store.upsert_valuations(self.conn, "SH.600519", "2026-09-13",
+                                {"pe": 22.5, "pb": 8.1}, "futu/valuation")
+        store.upsert_valuations(self.conn, "SH.600519", "2026-09-14",
+                                {"pe": 22.1, "pb": 8.0}, "futu/valuation")
+        rows = store.read_valuations(self.conn, "SH.600519", as_of="2026-09-13")
+        self.assertEqual(rows["pe"], 22.5)
+        with self.assertRaises(ValueError):
+            store.read_valuations(self.conn, "SH.600519", as_of=None)
+
 
 if __name__ == "__main__":
     unittest.main()

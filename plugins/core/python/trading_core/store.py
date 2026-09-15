@@ -12,7 +12,7 @@ import json
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2  # v2：+valuations（WP2 估值因子按日落库）
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars(
@@ -36,6 +36,10 @@ CREATE TABLE IF NOT EXISTS calendar(
   market TEXT NOT NULL, day TEXT NOT NULL, trade_date_type TEXT, trade_second INTEGER,
   PRIMARY KEY(market, day)) WITHOUT ROWID;
 CREATE TABLE IF NOT EXISTS kv(key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS valuations(
+  symbol TEXT NOT NULL, day TEXT NOT NULL, field TEXT NOT NULL,
+  value REAL NOT NULL, source TEXT NOT NULL,
+  PRIMARY KEY(symbol, day, field)) WITHOUT ROWID;
 """
 
 
@@ -231,3 +235,22 @@ def kv_set(conn, key, value):
     conn.execute("INSERT OR REPLACE INTO kv(key,value) VALUES(?,?)",
                  (key, json.dumps(value, ensure_ascii=False)))
     conn.commit()
+
+
+def upsert_valuations(conn, symbol, day, fields, source):
+    """估值因子按日落库（schema v2）：{field: value}，None 字段不入库（宁缺毋假）。"""
+    params = [(symbol, day, k, float(v), source) for k, v in fields.items() if v is not None]
+    conn.executemany("INSERT OR REPLACE INTO valuations(symbol,day,field,value,source)"
+                     " VALUES(?,?,?,?,?)", params)
+    conn.commit()
+    return len(params)
+
+
+def read_valuations(conn, symbol, as_of):
+    """PIT 读取：返回 as_of 当日（含）最近一个落库日的 {field: value}；无任何记录返回 {}。"""
+    _require_as_of(as_of)
+    rows = conn.execute(
+        "SELECT field, value FROM valuations WHERE symbol=? AND day="
+        " (SELECT MAX(day) FROM valuations WHERE symbol=? AND day<=?)",
+        (symbol, symbol, as_of)).fetchall()
+    return {r["field"]: r["value"] for r in rows}
