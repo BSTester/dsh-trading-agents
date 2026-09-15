@@ -4,7 +4,9 @@
 Python 客户端的 streamable-http 传输连 ``/mcp``，逐条钉死：
 
   * S1 —— initialize → tools/list 恰 25、名单与 ``mcp_tools.TOOLS`` 一致，且每个工具的
-    inputSchema 字段集/必填集与规格清单逐项一致（additionalProperties:false）；
+    inputSchema 字段集/必填集与规格清单逐项一致（additionalProperties:false）；另有取值域
+    断言：``series.limit`` 的 ``20..2000`` 与 ``series.period`` 的六值枚举（可选字段落在
+    ``anyOf`` 的基类型分支上，见 ``non_null_branch``）；
   * S2 —— call snapshot → ok；call switch_mode(live, confirmation=「确认实盘」) →
     ``trading/live-switch-web-only``，随后 store 模式仍 sim、模式文件未被创建；
   * S3 —— call plan_execute(plan_hash="nope") → queued+nonce（校验在 daemon），指令文件落盘；
@@ -13,7 +15,8 @@ Python 客户端的 streamable-http 传输连 ``/mcp``，逐条钉死：
 
 另加一条超出 S1–S4 的线格式用例：程序异常（数据文件损坏）经 MCP 回 isError=true +
 ``trading/tool-failed``，业务失败回 isError=false + ``trading/*`` 信封（规格 §3.2 错误语义）；
-以及 ``/mcp`` 沿用 HTTP 的 token 中间件（配了 token 就 401，healthz 仍豁免）。
+以及 ``/mcp`` 沿用 HTTP 的 token 中间件（配了 token 就 401，``/mcp/`` 子路径前缀同样受保护，
+healthz 仍豁免）。
 
 SDK 适配（mcp 2.2.0 实测）：客户端传输是 ``mcp.client.streamable_http.streamable_http_client``
 （2.x 由 ``streamablehttp_client`` 更名），yield **两元组** ``(read, write)``；``ClientSession``
@@ -44,6 +47,21 @@ from server.config import load_config  # noqa: E402
 
 START_TIMEOUT = 20
 STABLE_SNAPSHOT_FIELDS = ("mode", "version", "endpoints", "in_flight", "notice")
+NULL_BRANCH = {"type": "null"}
+
+
+def non_null_branch(schema):
+    """取字段 schema 的「基类型分支」：可选字段是 ``anyOf: [基类型, null]``（见 S1 增补说明）。
+
+    必填字段（或将来被拍平的单分支 schema）没有 ``anyOf``，此时原样返回。断言 null 分支存在由
+    调用方按需显式做（S1 增补对 ``limit``/``period`` 各断言一次）。
+    """
+    branches = schema.get("anyOf")
+    if branches is None:
+        return schema
+    non_null = [branch for branch in branches if branch != NULL_BRANCH]
+    assert len(non_null) == 1, f"可选取值域应恰有一个基类型分支：{branches}"
+    return non_null[0]
 
 
 class McpProtocolSmoke(unittest.TestCase):
@@ -140,6 +158,45 @@ class McpProtocolSmoke(unittest.TestCase):
                              set(schema.get("required", [])), tool.name)
             self.assertIs(schema.get("additionalProperties"), False, tool.name)
             self.assertFalse(mcp_tools.is_blacklisted(tool.name), tool.name)
+
+    def test_s1_series_carries_its_value_domain(self):
+        """S1 增补：取值域也随注解发布——``limit`` 区间与 ``period`` 枚举逐值可见。
+
+        结构说明：可选字段的注解是 ``base | None``（``Param.annotation()``），pydantic 因此
+        把基类型**连同约束**放进 ``anyOf[0]``，``anyOf[1]`` 是 ``{"type": "null"}`` 分支；
+        这里按实际结构取「非 null 分支」断言，不假设它被拍平成顶层 ``minimum``/``enum``。
+        """
+        async def runner():
+            async with streamable_http_client(self.url) as (read, write):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    return await session.list_tools()
+
+        listing = asyncio.run(runner())
+        series = next(tool for tool in listing.tools if tool.name == "series")
+        properties = series.input_schema["properties"]
+
+        limit = non_null_branch(properties["limit"])
+        self.assertEqual(limit["minimum"], 20)
+        self.assertEqual(limit["maximum"], 2000)
+        self.assertEqual(limit["type"], "integer")
+        self.assertEqual(properties["limit"]["anyOf"][1], NULL_BRANCH)
+
+        period = non_null_branch(properties["period"])
+        self.assertEqual(period["enum"], ["1m", "5m", "15m", "30m", "60m", "1d"])
+        self.assertEqual(period["type"], "string")
+        self.assertEqual(properties["period"]["anyOf"][1], NULL_BRANCH)
+
+        # 取值域与清单同源：任何带 minimum/maximum 的字段都必须逐值出现在发布 schema 上
+        # （当前只有 series.limit 带区间；加了新区间字段而没落到 schema 时这里立刻红）。
+        definitions = {definition.name: definition for definition in mcp_tools.TOOLS}
+        for tool in listing.tools:
+            for param in definitions[tool.name].params:
+                branch = non_null_branch(tool.input_schema["properties"][param.name])
+                if param.minimum is not None:
+                    self.assertEqual(branch.get("minimum"), param.minimum, tool.name)
+                if param.maximum is not None:
+                    self.assertEqual(branch.get("maximum"), param.maximum, tool.name)
 
     # ---- S2 ----
 
@@ -238,6 +295,32 @@ class McpTokenGuardTests(unittest.TestCase):
                 allowed = client.post("/mcp", json={},
                                       headers={**head, "Authorization": "Bearer s3cret"})
                 self.assertNotEqual(allowed.status_code, 401)
+                self.assertEqual(client.get("/healthz").status_code, 200)
+
+    def test_token_guard_covers_mcp_subpaths(self):
+        """``/mcp`` 的判定是「等值或前缀」：将来 SDK 挂到 ``/mcp/<sub>`` 也不会有未鉴权旁路。
+
+        实现说明：鉴权在中间件里、**先于路由**发生，所以无 token 的子路径请求必然是 401
+        （不是 404）——正是这条保证让它成为「防旁路」而不是「防未知路由」。带 token 时鉴权放行，
+        由路由决定去向：当前 SDK 只在裸 ``/mcp`` 注册路由，``/mcp/anything`` 因此落到静态面的
+        非 GET 兜底 → 405「仅 GET」（这里只断言「不是 401」，不把兜底状态码钉死）。
+        """
+        with tempfile.TemporaryDirectory() as tmp:
+            caches.configure(home=tmp)
+            self.addCleanup(caches.configure)
+            app = app_module.create_app(home=tmp, dist=os.path.join(tmp, "dist-missing"),
+                                        config={"port": 0, "host": "127.0.0.1",
+                                                "token": "s3cret"})
+            head = {"Accept": "application/json, text/event-stream"}
+            with TestClient(app, base_url="http://127.0.0.1:8397") as client:
+                for path in ("/mcp/anything", "/mcp/", "/mcp/session/1"):
+                    with self.subTest(path=path):
+                        denied = client.post(path, json={}, headers=head)
+                        self.assertEqual(denied.status_code, 401)
+                        self.assertEqual(denied.json()["error"]["code"], "trading/unauthorized")
+                        allowed = client.post(path, json={},
+                                              headers={**head, "Authorization": "Bearer s3cret"})
+                        self.assertNotEqual(allowed.status_code, 401)
                 self.assertEqual(client.get("/healthz").status_code, 200)
 
 

@@ -13,7 +13,9 @@
 
 与 Node 侧的有意差异（均为「规格更严」而非语义变更）：
   1. ``auth`` 在中间件里统一判定（service.mjs 在每个分支里散着判），但判定条件与豁免面
-     完全一致：token 非空时 ``/api/*`` 与 ``/mcp`` 需 ``Authorization: Bearer <token>``。
+     完全一致：token 非空时 ``/api/*`` 与 ``/mcp``（含 ``/mcp/...`` 任何子路径）需
+     ``Authorization: Bearer <token>``。``/mcp`` 用「等值或前缀」判定而不是等值：SDK 将来若在
+     ``/mcp`` 下加子路径，前缀判定保证新路径仍在鉴权分支内，不出现未鉴权旁路。
   2. ``/mcp`` 是真实 MCP streamable-http 端点（补遗任务 D）。SDK 的 ``streamable_http_app()``
      自带 ``lifespan=lambda app: session_manager.run()``，因此并入主 app 的 lifespan；路由用
      「插进主 router」而不是 ``app.mount()``（见 ``create_app`` 里的有意差异 10）。
@@ -320,8 +322,10 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         content-type 之后生效（否则白名单外请求会先撞 413，静态请求也会被请求头误伤）。
         """
         route = request.url.path
-        if (route.startswith("/api/") or route == "/mcp") and not check_auth(
-                request.headers.get("authorization")):
+        # ``/mcp`` 的判定必须是「等值或前缀」：SDK 目前只注册裸 ``/mcp``，但将来若挂到
+        # ``/mcp/<sub>`` 子路径，纯等值判定会让那些请求绕过鉴权直接落到路由层。
+        protected = route.startswith("/api/") or route == "/mcp" or route.startswith("/mcp/")
+        if protected and not check_auth(request.headers.get("authorization")):
             # util.mjs:27-29：token 缺失/不匹配 → 401 trading/unauthorized
             return error_envelope("trading/unauthorized", "需要 Bearer token", 401)
         return await call_next(request)
@@ -380,7 +384,8 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # ``/mcp/...``，裸 ``/mcp`` 会由 redirect_slashes 变成 307 跳转；MCP 客户端（含
     # dsh-mcp-client）对 307 的跟随策略不由我们掌握，且每次会话都多一跳。这里把 SDK 的
     # 路由**原样插进主 app 的 router**（路径仍是 ``/mcp``），位置固定在静态兜底之前，
-    # 语义与挂载等价且没有跳转。token 中间件的判定路径 ``/mcp`` 因此仍然精确命中。
+    # 语义与挂载等价且没有跳转。token 中间件的判定路径 ``/mcp`` 与 ``/mcp/`` 前缀因此仍然
+    # 精确命中（见 guard 的「等值或前缀」说明）。
     app.router.routes.extend(mcp_app.routes)
 
     @app.get("/{path:path}")

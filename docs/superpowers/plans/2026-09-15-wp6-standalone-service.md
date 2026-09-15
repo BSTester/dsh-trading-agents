@@ -1898,9 +1898,15 @@ git commit -m "docs: WP6 文档修订（架构/RUNBOOK/README/HANDOVER/P4/索引
 - 挂载：streamable-http app 挂到 `/mcp`（注意 SDK 的 session manager lifespan 需并入主 app lifespan——以 SDK 版本文档/源码为准）。
 - 测试：
   - `tests/test_wp6_mcp.py`（S1–S4）：uvicorn 线程起真实 app（TRADING_SERVICE_PORT=0）→ `mcp` Python 客户端 streamablehttp 连接 → initialize/tools=25/snapshot ok/switch_mode live 拒（模式仍 sim）/plan_execute queued/HTTP-MCP 稳定字段同值/未知端点 404；
-  - `tests/test_wp6_service_approval.py`：R3 全矩阵（含 MCP 通道分级）、R4 全矩阵、R5（tools 名单 ≡ 清单 + 黑名单）、R6。
+  - `tests/test_wp6_service_approval.py`：R3 全矩阵（含 MCP 通道分级）、R4 全矩阵、R5（tools 名单 ≡ 清单 + 黑名单 + 5 个维护工具在真 run store 上的行为与 `hours` 阈值语义）、R6。
 - 验证：新测试全 PASS；Python 全量 discover 全绿；Node 184/0 不回归。
 - Commit：`feat(platform): FastMCP 工具面（25 工具/通道分级）挂载与协议冒烟`
+
+> **执行偏差披露（补遗任务 D 落地结果，2026-09-16 补记）**：
+> 1. `refresh`：20 个端点工具（含 `switch_mode`）比规格 §3.2 **表内输入列**多带 `refresh?: boolean`（严格超集——规格只在 §3.2 表头统一声明；映射 `_refresh`，`switch_mode` 不缓存故实际被忽略）；5 个维护工具与 §3.4 表一致、不带 `refresh`。
+> 2. `switch_mode` 的 `mode` 描述落地为「目标模式（本工具只接受 sim）」（与上文第 212 行一致）；审查建议更精确的「本工具只接受切到 sim」，语义等价，本次不改。
+> 3. `hours` 阈值语义锚 `scripts/workbench_admin.mjs` 的 `hoursArg()`（`<=0`/非法 → 默认 2h；`0.5` → 0.5h），原先只写在 `mcp_tools._store_call` 的代码注释里，现补进本计划，并由 `tests/test_wp6_service_approval.py::R5AdminToolTests` 逐条钉死。
+> 4. `anyOf`/PTC 退化：可选字段注解是 `base | None`，dsh-tools 子集不含 `anyOf`，25 个工具里 22 个在 PTC/run_code 模式下入参类型静默退化为 `Any`；native 模式不受影响（注册/schema 透传/调用正常）。若要根治需去掉 `| None`（详见 `platform/server/mcp_tools.py` 文件头的差异登记），本次只披露。
 
 ### 补遗任务 E：审批回归重排 + Node 服务退役
 

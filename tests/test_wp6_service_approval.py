@@ -8,7 +8,9 @@
   * R4 —— 服务层 ``plan_execute``：live 无口令拒、带口令 → queued+nonce、指令文件含
     plan_hash/expected_mode 且无口令字段、action 四映射、白名单外 action 拒；
   * R5 —— 工具面封闭：tools/list 恰 25、名单 ≡ mcp_tools 清单、端点工具集 ≡ store_access.endpoints()、
-    输入字段与规格 §3.2/§3.4 逐项一致、无黑名单名、未知名不触达 handle；
+    输入字段与规格 §3.2/§3.4 逐项一致、无黑名单名、未知名不触达 handle；增补 5 个维护工具在真
+    run 的临时 store 上的全量行为（status/runs/cancel_run/cancel_stale/prune_runs）与 ``hours``
+    阈值语义（锚 ``scripts/workbench_admin.mjs`` 的 ``hoursArg``）；
   * R6 —— HTTP 与 MCP 同源：``app.state.handle`` 同一实例、同一 TTL 缓存、同一 payload 同结果。
 
 MCP 会话客户端（``mcp.client.streamable_http``）只在真进程 loopback 场景才有意义，本文件走
@@ -20,6 +22,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -65,6 +68,21 @@ SPEC_FIELDS = {
     "admin_cancel_stale": ((), ("hours",)),
     "admin_prune_runs": ((), ("hours",)),
 }
+
+
+def iso_hours_ago(hours):
+    """store.js 形状的 ``started_at``（UTC、毫秒精度、``Z`` 结尾）：``hours`` 小时前。"""
+    moment = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
+
+def run_row(run_id, hours_ago=0.0, status="running", started_at=None, mode="sim"):
+    """一条真 run（字段与 store.js 写入的一致），供维护工具用例落盘。"""
+    return {
+        "id": run_id, "ticker": "AAPL", "session_id": f"session-{run_id}", "mode": mode,
+        "status": status,
+        "started_at": started_at if started_at is not None else iso_hours_ago(hours_ago),
+    }
 
 
 class RecordingStore:
@@ -138,6 +156,22 @@ class Base(unittest.TestCase):
         body = mcp_tools.result_payload(result)
         self.assertFalse(result.is_error, body)
         return body
+
+    def write_store(self, runs=(), reports=()):
+        """把真 run/研报落成 store 文件（格式与 ``store_access.read_store`` 的校验一致）。"""
+        store_access.store_file(self.home).write_text(
+            json.dumps({"version": 1, "runs": list(runs), "reports": list(reports),
+                        "previews": [], "activity": [], "broker": {}}, ensure_ascii=False),
+            encoding="utf-8")
+
+    def store_state(self):
+        return json.loads(store_access.store_file(self.home).read_text(encoding="utf-8"))
+
+    def run_statuses(self):
+        return {row["id"]: row["status"] for row in self.store_state()["runs"]}
+
+    def run_ids(self):
+        return [row["id"] for row in self.store_state()["runs"]]
 
 
 class R3SwitchModeTests(Base):
@@ -376,6 +410,24 @@ class R5ToolSurfaceTests(Base):
         self.assertTrue(mcp_tools.is_blacklisted("exec_cmd"))
         self.assertTrue(mcp_tools.is_blacklisted("token"))
 
+    def test_forbid_extra_fields_leaves_foreign_tools_untouched(self):
+        """改动面收窄：同进程里**先注册的别的工具**不被本模块的 extra=forbid 顺手改写。"""
+        server = MCPServer(name="foreign", version="0")
+
+        def foreign_tool(alpha: str) -> str:
+            return alpha
+
+        server.add_tool(foreign_tool, name="foreign_tool", description="同进程的另一个工具")
+        before = {tool.name: tool.input_schema
+                  for tool in asyncio.run(server.list_tools())}["foreign_tool"]
+        self.assertIsNot(before.get("additionalProperties"), False)
+        mcp_tools.register(server, recording_handle()[0], mcp_tools.StoreApi(self.home))
+        schemas = {tool.name: tool.input_schema for tool in asyncio.run(server.list_tools())}
+        self.assertEqual(len(schemas), 26)
+        self.assertEqual(schemas["foreign_tool"], before,
+                         "本模块只应封闭自己注册的 25 个工具")
+        self.assertIs(schemas["series"]["additionalProperties"], False)
+
     def test_unknown_tool_never_reaches_the_handle(self):
         handle, calls = recording_handle()
         server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
@@ -407,6 +459,97 @@ class R5ToolSurfaceTests(Base):
         status = self.mcp_call(self.app, "admin_status", {})
         self.assertTrue(status["ok"])
         self.assertEqual(status["value"]["runs"], 0)
+
+
+class R5AdminToolTests(Base):
+    """R5 增补：5 个维护工具全量 + ``hours`` 阈值语义（MCP 工具调用与 store_access 直调各覆盖）。
+
+    阈值语义锚 ``scripts/workbench_admin.mjs`` 的 ``hoursArg()``：``Number.isFinite(v) && v > 0``
+    才采用 ``v`` 小时，否则退回默认 2h；Python 侧同一份实现是 ``store_access._hours_to_ms``。
+    夹具是真 run 的临时 store（数据文件由 ``store_access`` 原样读写，不经任何替身）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        self.app = self.make_app()
+
+    def seed(self, reports=()):
+        """超时 / 未超时、running / 已结算、``started_at`` 解析失败（年龄未知）各一条。"""
+        self.write_store(runs=(
+            run_row("r_45m", hours_ago=0.75),
+            run_row("r_90m", hours_ago=1.5),
+            run_row("r_3h", hours_ago=3.0),
+            run_row("r_done", hours_ago=3.0, status="completed"),
+            run_row("r_bad", started_at="not-a-date"),
+        ), reports=reports)
+
+    def test_admin_status_and_runs_read_the_real_store(self):
+        self.seed(reports=[{"id": "r_3h", "mode": "sim"}])
+        status = self.mcp_call(self.app, "admin_status", {})
+        self.assertEqual(status["value"], {
+            "file": str(store_access.store_file(self.home)),
+            "runs": 5, "reports": 1, "previews": 0, "activity": 0,
+        })
+        rows = {row["id"]: row for row in self.mcp_call(self.app, "admin_runs", {})["value"]}
+        self.assertEqual(set(rows), {"r_45m", "r_90m", "r_3h", "r_done", "r_bad"})
+        self.assertEqual(rows["r_3h"]["status"], "running")
+        self.assertEqual(rows["r_3h"]["ticker"], "AAPL")
+        self.assertEqual(rows["r_3h"]["mode"], "sim")
+        self.assertAlmostEqual(rows["r_3h"]["age_minutes"], 180, delta=1)
+        self.assertIsNone(rows["r_bad"]["age_minutes"], "started_at 解析失败 → 年龄未知")
+
+    def test_admin_cancel_run_marks_cancelled_and_keeps_the_record(self):
+        self.seed()
+        body = self.mcp_call(self.app, "admin_cancel_run", {"run_id": "r_3h"})
+        self.assertEqual(body["value"]["status"], "cancelled")
+        self.assertEqual(self.run_statuses()["r_3h"], "cancelled")
+        self.assertEqual(len(self.run_ids()), 5, "取消只标记，不删记录")
+        for run_id in ("r_3h", "nope"):  # 已结算 / 未知 id 都是业务失败（isError=false）
+            with self.subTest(run_id=run_id):
+                failed = self.mcp_call(self.app, "admin_cancel_run", {"run_id": run_id})
+                self.assertFalse(failed["ok"])
+                self.assertEqual(failed["error"]["code"], mcp_tools.INVALID_OPERATION_CODE)
+
+    def test_admin_cancel_stale_only_touches_timed_out_running(self):
+        self.seed()
+        body = self.mcp_call(self.app, "admin_cancel_stale", {"hours": 1})
+        self.assertEqual(body["value"], ["r_90m", "r_3h"])
+        self.assertEqual(self.run_statuses(), {"r_45m": "running", "r_90m": "cancelled",
+                                               "r_3h": "cancelled", "r_done": "completed",
+                                               "r_bad": "running"})
+
+    def test_admin_cancel_stale_accepts_sub_hour_thresholds(self):
+        """``hours=0.5`` 就是 0.5h：不能被抬成 1h/2h（``hoursArg`` 只在 ``v > 0`` 时采用）。"""
+        self.seed()
+        body = self.mcp_call(self.app, "admin_cancel_stale", {"hours": 0.5})
+        self.assertEqual(body["value"], ["r_45m", "r_90m", "r_3h"])
+
+    def test_admin_prune_runs_removes_only_timed_out_orphans(self):
+        self.seed(reports=[{"id": "r_3h", "mode": "sim"}])
+        body = self.mcp_call(self.app, "admin_prune_runs", {"hours": 1})
+        self.assertEqual(body["value"], ["r_90m"], "有研报的 r_3h、未超时的 r_45m 必须保留")
+        self.assertEqual(self.run_ids(), ["r_45m", "r_3h", "r_done", "r_bad"])
+
+    def test_hours_bounds_fall_back_to_two_hours_via_store_access(self):
+        """直调 store_access：``0``/负数/非法 → 默认 2h；``0.5`` → 0.5h，与 MCP 侧同一份实现。"""
+        for hours in (0, -1, 0.0, "abc", None, float("nan"), float("inf")):
+            with self.subTest(hours=hours):
+                self.seed()
+                self.assertEqual(store_access.admin_cancel_stale(self.home, hours=hours), ["r_3h"])
+        self.seed()
+        self.assertEqual(store_access.admin_cancel_stale(self.home, hours=0.5),
+                         ["r_45m", "r_90m", "r_3h"])
+
+    def test_prune_hours_and_report_keys_via_store_access(self):
+        """直调 store_access：``run_id`` 键的研报也算已发布（挡住孤儿判定）；``0`` 退回 2h。"""
+        self.seed(reports=[{"id": "rep_other", "run_id": "r_3h", "mode": "sim"}])
+        self.assertEqual(store_access.admin_prune_runs(self.home, hours=1), ["r_90m"])
+        self.assertIn("r_3h", self.run_ids())
+        self.seed()
+        self.assertEqual(store_access.admin_prune_runs(self.home, hours=0), ["r_3h"])
+        self.seed()
+        self.assertEqual(store_access.admin_prune_runs(self.home, hours=0.5),
+                         ["r_45m", "r_90m", "r_3h"])
 
 
 class R6SameSourceTests(Base):

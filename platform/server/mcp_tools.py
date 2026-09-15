@@ -36,6 +36,19 @@
 #     ``default: null``（与 z.optional() 同形）。显式传 null 会被当作「调用方给了 null」继续
 #     下传（Node 侧 zod 的 ``.optional()`` 没有 null 分支，会在 schema 层拒绝）——差异只落在
 #     非法输入的处理位置，合法调用的载荷逐键一致。
+#
+# 与 Node 侧的**有意差异**登记（上一条「哨兵默认值 / 显式 null」之外，此处登记 schema 形状）：
+#   * **``anyOf`` 与 PTC / run_code 退化（补遗 D 审查实测）**：``Param.annotation()`` 用
+#     ``base | None``，使每个可选字段的 inputSchema 变成 ``anyOf``（基类型分支 +
+#     ``{"type": "null"}`` 分支）。dsh-tools 支持的 schema 子集**不含 anyOf**，故 25 个工具里
+#     22 个（全部含可选字段者；只有 ``admin_status`` / ``admin_runs`` / ``admin_cancel_run``
+#     三个无可选字段）在 **PTC / run_code 模式**下入参类型静默退化为 ``Any``。
+#     **native 模式不受影响**：注册通过、schema 原样透传、调用正常（S1 与 R5 的
+#     ``test_published_schemas_are_closed`` 都按原生 schema 断言，即其证据）。
+#     若要根治需去掉 ``| None``（只动 ``Param.annotation()`` 一处）：实测（mcp 2.2.0）schema
+#     随即变单分支，且 ``description``/``minimum``/``maximum`` 仍在分支上——代价不是「丢失
+#     可选字段描述/区间」，而是 null 分支消失、显式 null 改由 schema 层拒绝（与 Node/zod
+#     ``.optional()`` 趋同），因此要重新核对 25 个工具的载荷语义。本次补遗只披露，不改。
 import inspect
 import json
 import warnings
@@ -378,6 +391,9 @@ TOOLS = (
 if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时立即炸掉，不留隐患
     raise AssertionError(f"工具面清单应为 {TOOL_COUNT} 项，实际 {len(TOOLS)} 项")
 
+# 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
+TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
+
 # 20 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints()）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
@@ -564,14 +580,27 @@ def register(server: MCPServer, handle, store_api=None):
     return bound
 
 
-def _forbid_extra_fields(server):
+def _forbid_extra_fields(server, own_names=TOOL_NAMES):
     """规格 §3.6：inputSchema 必须 ``additionalProperties:false``（超集字段在 schema 层拒绝）。
 
     SDK 的公开注册面用固定 config 的 ``ArgModelBase`` 建参模型，没有注入 ``extra=forbid`` 的
     口子，因此注册后按**同一个参模型**再算一次 schema：校验面（extra 拒绝）与发布面
     （additionalProperties:false）仍出自同一份 pydantic 模型，不会各说各话。
+
+    只遍历**本模块注册面**（``own_names`` 缺省 = ``TOOL_NAMES``）而不是 ``_tools`` 的全量：
+    同进程里还可能有别的 MCP 工具（其他行、测试内手搓的 server），它们的 ``arg_model`` 不属于
+    本次注册，不能被这里顺手改写；``.get()`` 对缺失名宽容，因此与注册顺序/子集解耦。
+
+    私有面依赖（mcp 2.2.0 实测）：``server._tool_manager._tools`` / ``tool.fn_metadata.arg_model``
+    / ``tool.parameters``。**SDK 升级时必须由 R5 ``test_published_schemas_are_closed`` 兜住**——
+    私有面改名或变形会让 ``additionalProperties`` 不再为 false，该用例（以及 S1 的同名断言）
+    立刻红，不会静默放宽。
     """
-    for tool in server._tool_manager._tools.values():  # noqa: SLF001 —— SDK 没有公开口子
+    manager = server._tool_manager  # noqa: SLF001 —— SDK 没有公开口子
+    for name in own_names:
+        tool = manager._tools.get(name)
+        if tool is None or tool.fn_metadata is None:
+            continue  # 非本模块注册（无参模型）或被改名遮蔽：不动它，封闭性由上引用例兜底
         model = tool.fn_metadata.arg_model
         model.model_config["extra"] = "forbid"
         model.model_rebuild(force=True)
@@ -581,6 +610,7 @@ def _forbid_extra_fields(server):
 __all__ = [
     "ENDPOINT_TOOL_ENDPOINTS", "INVALID_OPERATION_CODE", "LIVE_SWITCH_CODE", "LIVE_SWITCH_MESSAGE",
     "SERVER_NAME", "SERVER_VERSION", "StoreApi", "TOOLS", "TOOL_COUNT", "TOOL_FAILED_CODE",
-    "TOOL_NAME_BLACKLIST", "BoundTool", "Param", "ToolDefinition", "build_tools", "dispatch",
-    "failure", "is_blacklisted", "payload_of", "register", "result_payload", "tool_result",
+    "TOOL_NAME_BLACKLIST", "TOOL_NAMES", "BoundTool", "Param", "ToolDefinition", "build_tools",
+    "dispatch", "failure", "is_blacklisted", "payload_of", "register", "result_payload",
+    "tool_result",
 ]
