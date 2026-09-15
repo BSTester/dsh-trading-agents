@@ -31,8 +31,9 @@ MAX_BARS = 2000
 MIN_BARS = 20
 
 # 指数/基准代码映射（2026-09-14 实测，规格 §13.2）：标普指数代码无效，用 SPY ETF 代理。
-INDEX_SYMBOLS = {"csi300": "SH.000300", "hsi": "HK.800000", "ixic": "US..IXIC",
-                 "dji": "US..DJI", "sp500_proxy": "US.SPY"}
+# csi800=SH.000906：WP2 基准/宇宙扩展（2026-09-14 实调返回「CSI 800 Index」，依赖锁定表）
+INDEX_SYMBOLS = {"csi300": "SH.000300", "csi800": "SH.000906", "hsi": "HK.800000",
+                 "ixic": "US..IXIC", "dji": "US..DJI", "sp500_proxy": "US.SPY"}
 
 
 def is_a_share(ticker):
