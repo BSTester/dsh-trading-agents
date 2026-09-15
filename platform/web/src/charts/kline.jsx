@@ -3,7 +3,8 @@
 // 适配：React 改 import；h() 改 JSX；tw-* className 改内联样式；
 // barIndexAt/tooltipLeft/compactNumber 从 ./geometry.js import（client.js 本地定义不再复制）。逻辑零改动。
 import React from "react";
-import { useCanvasChart, CHART_STYLE } from "./line.jsx";
+import { useCanvasChart } from "./line.jsx";
+import { CHART_STYLE } from "./theme.js";
 import { barIndexAt, tooltipLeft, compactNumber } from "./geometry.js";
 
 /** K 线图的绘制留白：命中判定与绘制共用同一套，避免两处各写一份而错位。 */

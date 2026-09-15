@@ -1,7 +1,8 @@
 // 热力图。移植自 plugins/workbench/src/client.js L533-567（HeatmapChart）。
 // 适配：React 改 import；h() 改 JSX；tw-* className 改内联样式（见 theme.js）。逻辑零改动。
 import React from "react";
-import { useCanvasChart, CHART_STYLE } from "./line.jsx";
+import { useCanvasChart } from "./line.jsx";
+import { CHART_STYLE } from "./theme.js";
 
 export function HeatmapChart({ rowLabels, colLabels, tickers, matrix, unit = "" }) {
   const rows = rowLabels ?? tickers ?? [];

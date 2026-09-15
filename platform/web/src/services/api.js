@@ -43,8 +43,8 @@ export async function callApi(endpoint, payload = {}, { refresh = false } = {}) 
   let body;
   try {
     body = await response.json();
-  } catch {
-    throw new Error(`服务响应异常（HTTP ${response.status}）`);
+  } catch (error) {
+    throw new Error(`服务响应异常（HTTP ${response.status}）：${error.message}`);
   }
   if (!body.ok) throw new Error(body.error?.message || body.error?.code || "请求失败");
   // 审查修复：TTL=0 的端点（snapshot）不写缓存——缓存写入必须带有效期
