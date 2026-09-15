@@ -13,6 +13,7 @@
 import React from "react";
 import { Alert, Card, Descriptions, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
+import { num, pctOf, maskedAccount } from "../services/format.jsx";
 
 const RISK_FIELDS = [
   { key: "risk_per_trade", label: "单笔风险占权益比例", format: "pct" },
@@ -22,19 +23,12 @@ const RISK_FIELDS = [
   { key: "max_position_pct", label: "单一标的最大仓位占权益比例", format: "pct" },
 ];
 
-function num(value, digits = 2) {
-  if (value === null || value === undefined || value === "") return "—";
-  const parsed = Number(value);
-  return Number.isFinite(parsed)
-    ? parsed.toLocaleString("zh-CN", { maximumFractionDigits: digits })
-    : String(value);
-}
-
 function formatRiskValue(value, format) {
   if (value === null || value === undefined) return "—";
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return String(value);
-  if (format === "pct") return `${(parsed * 100).toFixed(2)}%`;
+  // pct：配置值为比例（risk_config.py DEFAULTS，如 0.01），×100 换算收拢到 pctOf
+  if (format === "pct") return pctOf(parsed);
   if (format === "mult") return `${parsed.toFixed(1)} × ATR`;
   return String(value);
 }
@@ -46,13 +40,6 @@ function riskItems(config) {
     .filter((key) => !RISK_FIELDS.some((field) => field.key === key))
     .map((key) => ({ key, label: key, format: "raw" }));
   return [...known, ...extra];
-}
-
-/** 账户末四位脱敏；悬停显示账户名。 */
-function maskedAccount(accId, title) {
-  const id = typeof accId === "string" ? accId : "";
-  const masked = id ? `…${id.slice(-4)}` : "—";
-  return title ? <span title={title}>{masked}</span> : masked;
 }
 
 function PortfolioRisk({ positions }) {

@@ -8,20 +8,13 @@
 import React from "react";
 import { Card, Descriptions, Input, Select, Space, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
+import { num } from "../services/format.jsx";
 import { KLineChart } from "../charts/kline.jsx";
 
 const PERIODS = [
   { value: "1d", label: "日线" }, { value: "60m", label: "60分" },
   { value: "15m", label: "15分" }, { value: "5m", label: "5分" }, { value: "1m", label: "1分" },
 ];
-
-function num(value, digits = 2) {
-  if (value === null || value === undefined || value === "") return "—";
-  const parsed = Number(value);
-  return Number.isFinite(parsed)
-    ? parsed.toLocaleString("zh-CN", { maximumFractionDigits: digits })
-    : String(value);
-}
 
 function pct(value) {
   const parsed = Number(value);
@@ -61,8 +54,9 @@ export default function MarketPage() {
   const [ticker, setTicker] = React.useState("");
   const [query, setQuery] = React.useState("");
   const [period, setPeriod] = React.useState("1d");
-  const series = useEndpoint("series", query ? { ticker: query, period, limit: 250 } : {}, [query, period]);
-  const instrument = useEndpoint("instrument", query ? { ticker: query } : {}, [query]);
+  // 未输入标的时 payload 为 null：hook 跳过请求（服务端对空 ticker 会直接报错）。
+  const series = useEndpoint("series", query ? { ticker: query, period, limit: 250 } : null, [query, period]);
+  const instrument = useEndpoint("instrument", query ? { ticker: query } : null, [query]);
   return (
     <Card title="行情" extra={(
       <Space>

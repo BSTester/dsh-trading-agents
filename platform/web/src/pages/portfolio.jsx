@@ -12,36 +12,15 @@
 //     sharpe, trades, note}
 // 模式切换只是查看视角（本地 state），不调 switch-mode；模式切换永不授权下单。
 import React from "react";
-import { Alert, Card, Col, Row, Space, Statistic, Table, Tag, Tooltip, Typography } from "antd";
+import { Alert, Card, Col, Row, Space, Statistic, Table, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
+import { num, pctOf, maskedAccount } from "../services/format.jsx";
 import { LineChart } from "../charts/line.jsx";
 
 const MODES = [
   { value: "sim", label: "模拟 sim" },
   { value: "live", label: "实盘 live" },
 ];
-
-function num(value, digits = 2) {
-  if (value === null || value === undefined || value === "") return "—";
-  const parsed = Number(value);
-  return Number.isFinite(parsed)
-    ? parsed.toLocaleString("zh-CN", { maximumFractionDigits: digits })
-    : String(value);
-}
-
-/** 比例 → 百分数显示（纯单位换算，非指标计算）。 */
-function pctOf(ratio) {
-  const parsed = Number(ratio);
-  if (ratio === null || ratio === undefined || !Number.isFinite(parsed)) return "—";
-  return `${(parsed * 100).toFixed(2)}%`;
-}
-
-/** 账户末四位脱敏；悬停显示账户名。 */
-function maskedAccount(accId, title) {
-  const id = typeof accId === "string" ? accId : "";
-  const masked = id ? `…${id.slice(-4)}` : "—";
-  return title ? <Tooltip title={title}><span>{masked}</span></Tooltip> : masked;
-}
 
 export default function PortfolioPage() {
   const [mode, setMode] = React.useState("sim");
