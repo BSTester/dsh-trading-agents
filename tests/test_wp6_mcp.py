@@ -65,6 +65,25 @@ def non_null_branch(schema):
     return non_null[0]
 
 
+class IdleScheduler:
+    """WP7 调度器替身：start/stop 空转，healthz 恒报空闲。
+
+    本文件起**真实** uvicorn（lifespan 必跑），不注入就会启动真调度线程——tick 会连
+    SQLite/写心跳；注入替身后用例保持与 WP6 时期同一份 I/O 面。
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.alive = False
+        self.last_error = None
+
+    def start(self):
+        self.calls.append("start")
+
+    def stop(self):
+        self.calls.append("stop")
+
+
 class McpProtocolSmoke(unittest.TestCase):
     """S1–S4：一个真实服务进程 + 官方客户端（类级共享，方法间共享同一份临时 home）。"""
 
@@ -80,7 +99,8 @@ class McpProtocolSmoke(unittest.TestCase):
         # 写进真实用户缓存（与 tests/test_wp6_service.py 同一手法）。
         caches.configure(home=str(cls.home))
         cls.app = app_module.create_app(home=str(cls.home),
-                                        dist=str(Path(cls._tmp.name) / "dist-missing"))
+                                        dist=str(Path(cls._tmp.name) / "dist-missing"),
+                                        scheduler=IdleScheduler())
         # 就绪行同款装配：配置里的 port=0 由内核分配，避免与真实服务撞端口。
         cls.server = run.build_server(cls.app, load_config(str(cls.home)))
         cls.thread = threading.Thread(target=cls.server.run, daemon=True)
@@ -299,7 +319,8 @@ class McpTokenGuardTests(unittest.TestCase):
             self.addCleanup(caches.configure)
             app = app_module.create_app(home=tmp, dist=os.path.join(tmp, "dist-missing"),
                                         config={"port": 0, "host": "127.0.0.1",
-                                                "token": "s3cret"})
+                                                "token": "s3cret"},
+                                        scheduler=IdleScheduler())
             head = {"Accept": "application/json, text/event-stream"}
             with TestClient(app, base_url="http://127.0.0.1:8397") as client:
                 denied = client.post("/mcp", json={}, headers=head)
@@ -323,7 +344,8 @@ class McpTokenGuardTests(unittest.TestCase):
             self.addCleanup(caches.configure)
             app = app_module.create_app(home=tmp, dist=os.path.join(tmp, "dist-missing"),
                                         config={"port": 0, "host": "127.0.0.1",
-                                                "token": "s3cret"})
+                                                "token": "s3cret"},
+                                        scheduler=IdleScheduler())
             head = {"Accept": "application/json, text/event-stream"}
             with TestClient(app, base_url="http://127.0.0.1:8397") as client:
                 for path in ("/mcp/anything", "/mcp/", "/mcp/session/1"):

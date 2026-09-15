@@ -36,6 +36,9 @@
      （``request.stream()``），超限立刻 413，不先整读。
   9. 静态响应用显式 ``Content-Type`` 头而不是 ``media_type=``：Starlette 会给 ``text/*``
      追加 ``; charset=utf-8``，而已退役 Node 原实现的表里只有 ``.html`` 带 charset。
+  10. WP7 任务 1：服务内调度器（``server/scheduler.py``，吸收 daemon 常驻循环）。装配走
+      ``create_app(scheduler=...)``——None 才建真调度器（测试注入替身即可禁用）；启停并入
+      lifespan，``/healthz`` 附带 ``scheduler: {alive, last_error}``。
 """
 import asyncio
 import contextlib
@@ -281,8 +284,13 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
     return handle
 
 
-def create_app(home=None, dist=None, config=None, analytics=None, series=None, core=None):
-    """组装 FastAPI 应用（沿用 Node 原实现已退役的组装顺序：一份 handle 共享）。"""
+def create_app(home=None, dist=None, config=None, analytics=None, series=None, core=None,
+               scheduler=None):
+    """组装 FastAPI 应用（沿用 Node 原实现已退役的组装顺序：一份 handle 共享）。
+
+    ``scheduler``（WP7 任务 1）：传入即用（测试注入替身/禁用）；None 才建真调度器
+    （``Scheduler(build_tick(home), interval=60.0)``），lifespan 启停、/healthz 上报。
+    """
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
     home = str(home)
@@ -290,6 +298,11 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     config = load_config(home) if config is None else config
     handle = create_handler(home, analytics=analytics, series=series, core=core)
     endpoints = store_access.endpoints()
+    if scheduler is None:
+        # 延迟导入：注入替身的调用（绝大多数测试）不必承担 trading_core 的导入
+        # （与 compute._load_write_command 的惰性口径一致）。
+        from server import scheduler as scheduler_module
+        scheduler = scheduler_module.Scheduler(scheduler_module.build_tick(home), interval=60.0)
 
     # MCP 工具面（补遗任务 D）：26 工具注册进 MCPServer，端点工具与 HTTP 面共用同一个 handle
     # 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的 home 绑定门面。
@@ -308,15 +321,23 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         ``/mcp`` 的每个请求都会因 ``self._task_group is None`` 失败。SDK 的
         ``StreamableHTTPSessionManager.run()`` 每个实例只能进一次，因此进程内只建一个
         MCPServer（``app.state.mcp``），由 uvicorn 的 lifespan 驱动。
+
+        WP7 任务 1：同处启停服务内调度器——start 在 MCP lifespan 之前，stop 放
+        finally（MCP 启动失败也要停线程）；stop 自带 join，优雅退出不悬挂。
         """
-        async with mcp_app.router.lifespan_context(mcp_app):
-            yield
+        _app.state.scheduler.start()
+        try:
+            async with mcp_app.router.lifespan_context(mcp_app):
+                yield
+        finally:
+            _app.state.scheduler.stop()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.home = home
     app.state.dist = str(root)
     app.state.config = config
     app.state.handle = handle
+    app.state.scheduler = scheduler
     app.state.mcp = mcp_server
     app.state.mcp_app = mcp_app
     app.state.mcp_tools = bound_tools
@@ -354,8 +375,14 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
     @app.api_route("/healthz", methods=list(ALL_METHODS))
     async def healthz():
-        """Node 原实现（已退役）：豁免认证的存活探针（不判方法，任何方法同响应）。"""
-        return {"ok": True, "mode": read_mode(home)}
+        """Node 原实现（已退役）：豁免认证的存活探针（不判方法，任何方法同响应）。
+
+        WP7 任务 1：附带调度器存活态——``alive`` 线程是否在跑，``last_error`` 最近一次
+        tick 异常记录（成功不清除，None 即从未出错）。
+        """
+        return {"ok": True, "mode": read_mode(home),
+                "scheduler": {"alive": bool(scheduler.alive),
+                              "last_error": scheduler.last_error}}
 
     @app.post("/api/wb/{endpoint}")
     async def workbench(endpoint: str, request: Request):

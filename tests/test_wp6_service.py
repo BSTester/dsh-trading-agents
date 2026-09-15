@@ -87,6 +87,25 @@ def completed(stdout, returncode=0, stderr=""):
     return SimpleNamespace(stdout=stdout, returncode=returncode, stderr=stderr)
 
 
+class IdleScheduler:
+    """WP7 调度器替身：start/stop 只记账不调度，healthz 恒报空闲。
+
+    Base.make_app 默认注入它，避免用例期起真调度线程触真实 SQLite/作业链；
+    需要验证默认装配的用例自行传 ``scheduler=None`` 之外的值或显式覆盖。
+    """
+
+    def __init__(self):
+        self.calls = []
+        self.alive = False
+        self.last_error = None
+
+    def start(self):
+        self.calls.append("start")
+
+    def stop(self):
+        self.calls.append("stop")
+
+
 class Base(unittest.TestCase):
     def setUp(self):
         self._tmp = tempfile.TemporaryDirectory()
@@ -100,6 +119,9 @@ class Base(unittest.TestCase):
     def make_app(self, **kwargs):
         kwargs.setdefault("home", str(self.home))
         kwargs.setdefault("dist", str(Path(self._tmp.name) / "dist-missing"))
+        # WP7：默认注入空转调度器——不进 lifespan 的用例本来就不会启动它，注入后连
+        # 「构造真调度器（惰性导入 trading_core）」这一步也省掉，测试保持离线纯替身。
+        kwargs.setdefault("scheduler", IdleScheduler())
         return app_module.create_app(**kwargs)
 
     def client(self, app):
@@ -262,7 +284,9 @@ class ContractTests(Base):
         client = self.client(self.make_app())
         response = client.get("/healthz")
         self.assertEqual(response.status_code, 200)
-        self.assertEqual(response.json(), {"ok": True, "mode": "sim"})
+        # WP7：healthz 附带调度器存活态（替身未启动 → alive=False、last_error=None）。
+        self.assertEqual(response.json(), {"ok": True, "mode": "sim",
+                                           "scheduler": {"alive": False, "last_error": None}})
 
     def test_token_required_for_api_and_static_exempt(self):
         dist = self.make_dist()
