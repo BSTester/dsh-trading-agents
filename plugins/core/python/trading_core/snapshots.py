@@ -68,7 +68,8 @@ def schedule_snapshot(conn, home):
             "jobs": jobs}
 
 
-def reconcile_snapshot(conn, chain_limit=5):
+def reconcile_snapshot(conn, chain_limit=5, alert_limit=20):
+    from . import alerts
     from . import tca
     latest = store.kv_get(conn, "reconcile:latest", default={"diffs": [], "at": None}) or {}
     diffs = latest.get("diffs") or []
@@ -87,5 +88,7 @@ def reconcile_snapshot(conn, chain_limit=5):
         chain.append({"plan_id": p["plan_id"], "mode": p["mode"], "status": p["status"],
                       "created_at": p["created_at"],
                       "orders": _orders_of(conn, p["plan_id"], with_fills=True)})
+    # 规格 §8.3：reconcile 端点输出包含告警列表（调度页展示）
     return {"diffs": diffs, "diffs_at": latest.get("at"),
-            "tca": {"rows": tca_rows, "avg_bps": avg_bps}, "chain": chain}
+            "tca": {"rows": tca_rows, "avg_bps": avg_bps},
+            "alerts": alerts.list_recent(conn, limit=alert_limit), "chain": chain}

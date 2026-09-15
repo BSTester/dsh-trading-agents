@@ -146,7 +146,10 @@ test("commandbus mirrors the python whitelist and writes pending atomically", as
 function tabSource(source, name, nextName) {
   const start = source.indexOf(`function ${name}(`);
   const end = source.indexOf(`function ${nextName}(`);
-  return source.slice(start, end > start ? end : undefined);
+  const slice = source.slice(start, end > start ? end : undefined);
+  // 文案规范只约束页面渲染字符串；设计意图写在注释里是规范要求的行为，
+  // 因此检查前先剥掉行注释。
+  return slice.replace(/^\s*\/\/.*$/gm, "");
 }
 
 test("client ships plan tab wired into nav and dispatch", async () => {
@@ -162,7 +165,20 @@ test("client ships schedule tab wired into nav and dispatch", async () => {
   assert.match(source, /\{ id: "schedule", label: "调度" \},/);
   assert.match(source, /function ScheduleTab\(/);
   assert.match(source, /tab === "schedule" && h\(ScheduleTab/);
-  assert.match(source, /request\(rpc, "schedule"/);
+  assert.match(source, /useEndpoint\(rpc, "schedule"/);
+});
+
+test("schedule tab shows heartbeat freshness, alerts, kill switch without design copy", async () => {
+  const source = await readFile(new URL("../plugins/workbench/src/client.js", import.meta.url), "utf8");
+  const tab = tabSource(source, "ScheduleTab", "Dashboard");
+  assert.match(tab, /5 \* 60_000/, "心跳 5 分钟阈值标红（数据事实提示）");
+  assert.match(tab, /act\("kill"/, "激活 kill switch 走受约束动作");
+  assert.match(tab, /act\("unkill"/, "解除走受约束动作");
+  assert.match(tab, /request\(rpc, "plan-execute", \{ action \}/, "动作统一经 plan-execute");
+  assert.match(tab, /alerts/, "告警列表来自 reconcile 端点");
+  assert.match(tab, /halt/, "熔断状态行");
+  // 页签文案规范（全局约定 2.1）
+  assert.doesNotMatch(tab, /规格|设计稿|示例|宁可|窄门|token/);
 });
 
 test("plan tab keeps the live gate: exact phrase, frozen-only execute, cancel action", async () => {

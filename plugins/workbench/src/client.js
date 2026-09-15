@@ -1859,6 +1859,78 @@ ol.sources code{font-size:11.5px}
           notice && h("p", { className: "tw-meta" }, notice)));
     }
 
+    // 调度页：daemon 心跳新鲜度、作业历史、告警分级、kill switch 与熔断状态。
+    // 设计依据见计划任务 7 与规格 §8.1/§8.4（注释，不上屏）。心跳距今超过
+    // 5 分钟按失联展示（数据事实提示，规格既定阈值）。
+    function ScheduleTab({ rpc }) {
+      const [revision, setRevision] = React.useState(0);
+      const [busy, setBusy] = React.useState(false);
+      const [notice, setNotice] = React.useState("");
+      const schedule = useEndpoint(rpc, "schedule", {}, [rpc, revision]);
+      const reconcile = useEndpoint(rpc, "reconcile", {}, [rpc, revision]);
+      const hb = schedule.data?.heartbeat ?? {};
+      const hbMs = typeof hb.heartbeat === "string" && hb.heartbeat
+        ? Date.parse(String(hb.heartbeat).replace(" ", "T")) : NaN;
+      const stale = !Number.isFinite(hbMs) || (Date.now() - hbMs) > 5 * 60_000;
+      const killActive = schedule.data?.kill === true;
+      const halted = schedule.data?.halt === true;
+      const act = (action, doneMessage) => {
+        setBusy(true); setNotice("");
+        request(rpc, "plan-execute", { action })
+          .then(() => setNotice(doneMessage))
+          .catch((failure) => setNotice(`提交失败：${failure.message}`))
+          .finally(() => { setBusy(false); setRevision((v) => v + 1); });
+      };
+      const jobs = schedule.data?.jobs ?? [];
+      const alerts = reconcile.data?.alerts ?? [];
+      const alertTag = { critical: "sell", warn: "hold" };
+      return h(React.Fragment, null,
+        h(Card, { title: "daemon 状态" },
+          schedule.error && h("p", { className: "tw-alert" }, `读取失败：${schedule.error}`),
+          h("div", { className: "tw-kv" },
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "心跳"),
+              h("div", { className: "tw-kv-v" },
+                h("span", { className: `tw-dot${stale ? " live" : ""}`, style: { display: "inline-block", marginRight: "6px" } }),
+                hb.heartbeat ?? "无心跳")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "状态"),
+              h("div", { className: "tw-kv-v" }, stale ? "心跳失联（>5 分钟）" : "正常")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "kill switch"),
+              h("div", { className: "tw-kv-v" },
+                killActive ? "生效中：拒绝一切订单" : "未激活")),
+            h("div", { className: "tw-kv-item" }, h("div", { className: "tw-kv-k" }, "日内熔断"),
+              h("div", { className: "tw-kv-v" },
+                halted ? "已触发：撤余单并暂停执行" : "未触发"))),
+          h("div", { className: "tw-toolbar" },
+            killActive
+              ? h("button", { type: "button", className: "tw-btn primary", disabled: busy,
+                  onClick: () => act("unkill", "已写入解除指令，等待 daemon 处理。") }, "解除")
+              : h("button", { type: "button", className: "tw-btn danger", disabled: busy,
+                  onClick: () => act("kill", "已写入激活指令，等待 daemon 处理；生效后拒绝一切订单。") },
+                  "激活 kill switch"),
+            h("button", { type: "button", className: "tw-btn", disabled: busy,
+              onClick: () => setRevision((v) => v + 1) }, "刷新"),
+            notice && h("span", { className: "tw-meta" }, notice))),
+        h(Card, { title: "作业历史", count: jobs.length,
+          empty: cardEmpty({ loading: schedule.loading, error: schedule.error,
+            count: jobs.length, fallback: "暂无作业记录：daemon 运行后按交易日历产生。" }) },
+          jobs.length > 0 && h("table", { className: "tw-table" },
+            h("thead", null, h("tr", null, ["时间", "作业"].map((c) => h("th", { key: c }, c)))),
+            h("tbody", null, jobs.slice(0, 20).map((row) =>
+              h("tr", { key: row.job },
+                h("td", null, row.ran),
+                h("td", null, row.job)))))),
+        h(Card, { title: "告警", count: alerts.length,
+          empty: cardEmpty({ loading: reconcile.loading, error: reconcile.error,
+            count: alerts.length, fallback: "暂无告警。" }) },
+          h(Paged, { items: alerts, pageSize: 8, empty: "暂无告警。",
+            render: (row, i) => h("div", { key: i, className: "tw-item" },
+              h("div", { className: "tw-item-body", style: { paddingTop: "8px" } },
+                h("span", { className: `tw-tag ${alertTag[row.level] ?? ""}` }, row.level),
+                ` ${row.title}`,
+                h("div", { className: "tw-meta" },
+                  `${row.created_at}${row.detail ? ` · ${row.detail}` : ""}`))) })));
+    }
+
     function Dashboard({ rpc }) {
       const [open, setOpen] = React.useState(false);
       const [tab, setTab] = React.useState("market");

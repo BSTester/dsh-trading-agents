@@ -92,11 +92,13 @@ class SnapshotReconcileTest(SnapshotTestBase):
         store.kv_set(self.conn, "reconcile:latest",
                      {"diffs": [{"symbol": "SH.600519", "kind": "qty", "local": 100, "broker": 99}],
                       "at": "2026-09-13 10:05:00"})
+        alerts.emit(self.conn, home=str(self.home), level="critical", title="对账差异", detail="qty")
         from trading_core import tca
         tca.record(self.conn, "c1", "SH.600519", arrival=100.0, filled=100.5, side="BUY")
         out = self._cli(["snapshot-reconcile"])
         self.assertEqual(out["diffs"][0]["kind"], "qty")
         self.assertEqual(out["tca"]["rows"][0]["symbol"], "SH.600519")
+        self.assertEqual(out["alerts"][0]["level"], "critical")   # 规格 §8.3：对账页含告警列表
         chain = out["chain"][0]
         self.assertEqual(chain["plan_id"], "P1")
         self.assertEqual(chain["orders"][0]["client_order_id"],
