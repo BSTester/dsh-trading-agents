@@ -83,4 +83,5 @@ WP1（§13.2 六项）、WP2（估值字段路径复用 `workbench/python/factor
 ## WP7 独立量化平台（已立项，2026-09-16 用户决策）
 
 合并 WP6 后重构为**完整独立版本**：工作台（FastAPI 单进程）自带调度与因子快照定时收集（吸收 daemon）、自带富途通道（账户/交易/行情的权威通道，写路径唯一：mode→风控→kill→业务确认）；Harness 只做大脑（研究/决策/分析），富途直连降级为只读研究通道（写类被 policy 拒绝并指引工作台）；提供一键安装提示词（`install/HARNESS_SETUP.md`）。
-规格：`docs/superpowers/specs/2026-09-16-wp7-standalone-platform.md`；计划：`docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md`（验收记录见其末节）。
+规格：`docs/superpowers/specs/2026-09-16-wp7-standalone-platform.md`；计划：`docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md`。
+验收记录：**`docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md` 末节「WP7 验收记录」**（任务 1-6 提交清单、全量测试证据、规格 §四 验收对照表、已知限制、人工验收留位）。

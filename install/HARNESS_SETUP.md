@@ -45,6 +45,8 @@
    python3 scripts/install_plugins.py link --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"
 6. 启用平台行：编辑 agent.cordis.yml：
    - 把「- id: quant-platform-mcp」一行的 disabled: true 改为 disabled: false；
+   - 保持该行 toolCallTimeoutMs: 180000（trade_* 写工具的确认 TTL 为 120s，超时自动拒绝
+     即 fail-closed；多出的 60s 给用户在 Web 确认卡片作答与子进程取数留余量）；
    - 确认「- id: fin-data」与「- id: trading-engine」两行为 disabled: false
      （仓库默认已是 false，确认即可）；
    - 不要动其他行：futu-keepalive 等保持原状。
@@ -108,7 +110,7 @@
 | 3 插件安装 | `python3 scripts/install_plugins.py install --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | 安装 web profile 工作台 Host 与投研/数据插件，激活 preset 工具行 | 重复安装覆盖同版本包 |
 | 4 平台安装器 | `python3 scripts/install_platform.py --home "$HOME/.dsh"` | 五行 JSON 摘要：`venv`/`deps`/`web`/`service`/`verify` | venv 已存在 → `already-exists`；dist 新于 src → 跳过重建；端口在跑 → `already-running` |
 | 5 数据层链接 | `python3 scripts/install_plugins.py link --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | 把 `trading_core`/`trading_datasource` 写入 venv（.pth） | 每次合并 WP 分支后重新 link 一次 |
-| 6 启用行 | 编辑 `agent.cordis.yml` | `quant-platform-mcp` 行 `disabled: false`；`fin-data`/`trading-engine` 确认 `disabled: false` | 只改这一行，`futu-keepalive` 不动 |
+| 6 启用行 | 编辑 `agent.cordis.yml` | `quant-platform-mcp` 行 `disabled: false`；`fin-data`/`trading-engine` 确认 `disabled: false` | 只改 quant-platform-mcp 行的 disabled，`toolCallTimeoutMs: 180000` 保持不动（确认 TTL 120s + 作答余量）；`futu-keepalive` 不动 |
 | 7 启动服务 | `cd platform && "$HOME/.dsh/trading-venv/bin/python" -m server.run`（后台） | 单行 JSON：`{"ok":true,"service":"quant-platform","url":…,"tools":…}` | 已在跑则跳过（第 4 步会报 `already-running`） |
 | 8 验证 | `curl -fsS http://127.0.0.1:8397/healthz` | `{"ok":true,"mode":"sim","scheduler":{…}}` | 只读探测 |
 | 9 新会话验证 | 用户新建 Harness 会话 | 工具面出现 `mcp__quantwb__*`（如 `trading_status`） | 行加载发生在会话创建时 |

@@ -167,20 +167,41 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 
 要让 Harness 会话直接调用工作台能力，把 `agent.cordis.yml` 里 `quant-platform-mcp` 行的
 `disabled: true` 改成 `false`，然后**新建会话**（已挂载的会话不会重新读取组合）：会话内
-出现 `mcp__quantwb__*` 共 26 个工具，与 Web 同源（HTTP 与 MCP 调用同一批处理函数；
+出现 `mcp__quantwb__*` 共 33 个工具，与 Web 同源（HTTP 与 MCP 调用同一批处理函数；
 `confirm-decide` 有意不进工具面，模型不能自批实盘单）。
 实盘切换只能在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）
 输入口令「确认实盘」完成，成功后提示带 `order_authorized: false`；`switch_mode` 工具
 只接受切到 sim（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
 [docs/RUNBOOK.md](docs/RUNBOOK.md) 的「平台服务」一节。
 
-实盘**写操作**的确认由**工作台业务确认**承载（不再走 Harness 原生审批）：会话里调用
-`mcp__futu__trading_*` 时，待确认项出现在 **Harness 内 legacy 工作台面板**（中文订单摘要，
-批准/拒绝各一次）。确认是**进程内存态**，Harness 进程与独立服务进程各持一份、**互不可见**——
-独立 Web 的 `confirmation` 端点读到的是 `pending: null`（是「读不到」，不是「无需确认」），
-服务进程自身也没有实盘写路径去发起确认。因此**独立 Web 暂无确认界面**（有意不做），过渡期
-一律回 Harness 面板作答；将来要跨进程需把请求/裁决落到共享文件并同时改 Node 侧
-（见 [docs/architecture.md](docs/architecture.md) 的「业务确认的跨进程边界」）。
+实盘**写操作**的确认由**工作台业务确认**承载（不再走 Harness 原生审批）：WP7 起 Harness
+会话内的富途写工具（`mcp__futu__sim_trade_*`/`trading_*` 的下单/改单/撤单动词）被工具
+策略**一律拒绝并指引工作台**，不会产生待确认项；真实下单走 `mcp__quantwb__trade_*` 工具，
+待确认项出现在**独立 Web 的确认卡片**（中文订单摘要，批准/拒绝各一次；TTL 120s 超时按
+拒绝收尾）。历史上 Harness 会话侧发起、legacy 面板作答的确认路径已随收窄不可达（面板
+确认 UI 保留至退役）。跨进程的历史约束与设计参考见
+[docs/architecture.md](docs/architecture.md) 的「业务确认」两节。
+
+## WP7：独立量化平台（服务内调度 / 因子收集 / 交易闸门）
+
+WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立量化平台**，Harness 只做大脑：
+
+- **服务内调度器**：吸收 daemon 常驻循环——按交易日历自动跑作业链
+  （sync→质量→信号→计划、对账→TCA→摘要，各市场收盘链末尾追加因子快照），
+  心跳/告警协议不变；启动即补跑当日到期作业（与手动 daemon 共享去重标记，不重复执行）；
+  daemon CLI 保留为手动入口。
+- **因子快照定时收集**：每个交易日收盘后自动跑因子/信号落 `factors_history`，
+  按日期回看走 `factors-history` 端点 / `mcp__quantwb__factors_history` 工具 / CLI。
+- **交易闸门 + 受约束交易工具**：`trade_place/trade_modify/trade_cancel` 与
+  `account_positions/account_orders/account_funds`（工具面 27→33）。写操作前置链 =
+  账户模式 → 风控 8 规则（kill 文件=规则 1）→ **业务确认（Web 确认卡片作答，进程内）**
+  → broker 适配；live 券商写协议未接入，live 下 `trade_*` 提交即拒（当前设计内行为）。
+- **Harness 富途写通道收窄**：`mcp__futu__sim_trade_*`/`trading_*` 写类被工具策略
+  一律拒绝并指引工作台（未知动词 fail-closed）；只读研究不受影响。
+- **一键安装**：把 `install/HARNESS_SETUP.md` 的提示词整段发给一个 Harness 会话，
+  即可完成「依赖 → Web 构建 → 服务启动 → preset 行启用 → 工具面验证」全流程
+  （幂等，可分层跳过）。
+
 
 ## 工作台与指令示例
 

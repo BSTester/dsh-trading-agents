@@ -1,10 +1,12 @@
 # 架构与交互边界
 
-> **状态标注（WP6 修订，2026-09-15）：** 本文涉及 daemon、`plan`/`plan-execute`/`schedule`/`reconcile`
-> 四个 RPC 的描述按 WP4 计划规格撰写，**WP4/WP5 合并后已实测**（回归见 `tests/workbench-wp4.test.mjs`、
-> `tests/test_core_wp4_e2e.py`、`tests/test_core_wp4_snapshots.py`）。WP6 起工作台前端由
-> `platform/` **独立服务进程（FastAPI 单进程）**托管，Harness 内 legacy 面板过渡期并存；
-> 验收记录见 `docs/superpowers/plans/2026-09-15-wp6-standalone-service.md` 末节。
+> **状态标注（WP7 修订，2026-09-16）：** WP6 的独立服务（FastAPI 单进程）升级为**独立量化
+> 平台**：服务内调度器（吸收 daemon 常驻循环）、因子快照定时收集与 `factors-history`、
+> 交易闸门 + 受约束交易工具（工具面 27→33）、Harness 富途写通道收窄（policy 拒绝并指引）、
+> 一键安装（`install/HARNESS_SETUP.md`）。规格/验收见
+> `docs/superpowers/specs/2026-09-16-wp7-standalone-platform.md` 与
+> `docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md` 末节验收记录。
+> WP6 及更早的修订标注保留在后文相应位置。
 
 ## 结论性字段的中文标签
 
@@ -29,36 +31,35 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 面板移除另行提交。
 
 ```text
-用户 ↔ Harness 对话 / 工作台业务确认（legacy 面板作答）
-          │
-          ├─ trading-agents skill + Harness 子代理
-          │    └─ 富途 MCP / fin_news / fin_sentiment / web 取数
-          │
-          ├─ engine：启动研究 → 发布研报；量化预览；账户工具守卫
-          │    └─ Python 量化计算（不替代券商成交）
-          │
-          └─ 原生富途账户/交易工具 → 观察最终响应
-                    │
-                    ▼
-          workbench Host：持久结果与模式（Harness 进程内）
-                    │ Harness Connection RPC（legacy 面板，过渡期）
-                    ▼
-          workbench Client：结果卡片 + 展示面板 + 模式切换（legacy 通道，过渡期）
-                            模式切换的正式入口是独立 Web 页头徽章（见下）
-
-          独立服务进程（platform/，FastAPI + uvicorn 单进程）
-            ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
-            ├─ /mcp（mcp SDK streamable-http，26 工具）→ Harness 的 mcp__quantwb__*
-            └─ 静态托管 platform/web/dist；同一份 store/模式/指令文件
-               （双进程无网络互通，靠原子写 + 文件锁互斥）
+用户 ↔ Harness 对话 / 工作台业务确认（服务进程内 Web 卡片作答；legacy 面板确认 UI
+      │                          对 futu 写已不可达，保留至面板退役）
+      ├─ trading-agents skill + Harness 子代理
+      │    └─ 富途 MCP（只读研究）/ fin_news / fin_sentiment / web 取数
+      │
+      ├─ engine：启动研究 → 发布研报；量化预览；futu 写类 guard 拒绝并指引工作台
+      │    └─ Python 量化计算（不替代券商成交）
+      │
+      └─ quantwb trade_*/account_* 工具 → 观察最终响应（写需服务进程内业务确认）
+                │
+                ▼
+      独立服务进程（platform/，FastAPI + uvicorn 单进程；WP7 独立量化平台）
+        ├─ 服务内调度器（吸收 daemon 作业链：sync→quality→factors_snapshot；
+        │   心跳/告警协议不变，daemon CLI 保留为手动入口）
+        ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
+        ├─ /mcp（mcp SDK streamable-http，33 工具）→ Harness 的 mcp__quantwb__*
+        ├─ 交易闸门：mode → 风控 8 规则（kill=规则 1）→ 业务确认（Web 卡片，进程内）
+        │   └ broker 适配（sim 下单/改单/撤单/查询；live 写协议未接入=提交即拒）
+        └─ 静态托管 platform/web/dist；同一份 store/模式/指令文件
+           （与 Harness 进程无网络互通，靠原子写 + 文件锁互斥）
 ```
 
 **明确不做**：第二个聊天窗口、浏览器直接持有富途 token、
 插件私建 LLM 对话循环、工作台 RPC 任意执行工具或 shell。
 独立 Web **无聊天、无逐单下单/撤单表单、无 shell/LLM/token 接口**。
-工作台的下单边界已从「无任何下单入口」变更为「**恰好一个受约束执行入口——
-执行已冻结计划**」：唯一写路径是指令文件（白名单 5 种指令），live 需口令复核，
-对话侧保留等价 `plan_execute`，两条入口汇聚同一核心函数、同一套风控；
+工作台的下单边界自 WP6 的「唯一写路径=指令文件」演进为 WP7 的「**两条受约束写路径**」：
+①执行已冻结计划（指令文件白名单 5 种指令，live 需口令复核，对话侧保留等价
+`plan_execute`）；②WP7 新增的受约束 `trade_*` 交易工具（闸门链见 `platform/` 行：
+模式→风控 8 规则→kill→业务确认，Web 卡片作答）。两条入口都有前置约束与留痕，
 逐单下单/撤单表单仍然不做。
 
 **双进程数据约定（WP6）**：服务进程与 Harness 进程共享同一份
@@ -74,6 +75,19 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 成功后显示 `order_authorized: false`；与 `quant_switch`「模型不能代替用户确认实盘」
 同一条不变量。
 
+### 富途通道分级（WP7 决策）
+
+**服务 = 账户/交易/行情的权威通道；Harness 直连富途 = 只读研究通道。**
+
+| 通道 | 定位 | 写语义 |
+|---|---|---|
+| 服务进程（`trading_datasource.futu_mcp`，quantwb 工具面 + Web + 定时作业） | 账户/交易/行情/PIT 同步/因子数据的**权威通道**，token/续期/限速单一实现 | 唯一写路径：闸门链（模式→风控 8 规则→kill→业务确认）后的 `trade_*` + 计划执行 |
+| Harness 直连富途（`mcp__futu__*`） | **只读研究**：新闻/板块/筹码/资讯等自由探索 | `trading_*`/`sim_trade_*` 写类被 policy 拒绝并指引工作台（`trading_*` 族未知动词按写拒绝=**fail-closed**；`sim_trade_*` 未知动词按读处理——sim 写伤害有界，已知 4 个写动词仍按写拒绝） |
+
+理由（规格 §一）：①单一凭据/续期/限速；②写路径唯一——mode 文件、风控 8 规则、kill、
+业务确认、审计只实现一次；③PIT 存储与因子计算在服务侧，数据就近；④Harness=大脑，
+交易通道不属于它。
+
 ## 组件职责
 
 | 组件 | 责任 |
@@ -81,15 +95,15 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 | 根目录 preset | 新建「交易智囊模式」，组合 persona、原生工具、skill 和 MCP |
 | `skills/trading-agents/SKILL.md` | Harness 主会话与子代理执行 12 角色、6 阶段研究，数据不足显式说明 |
 | `plugins/engine/src/tools.js` | `run_trading_analysis` 启动记录、`research_publish` 发布有来源的报告、量化结果保存 |
-| `plugins/engine/src/policy.js` | 拒绝跨模式账户工具；真实写操作走**工作台业务确认**（不返回 `ask`，与权限档位无关）；记录最终工具响应 |
+| `plugins/engine/src/policy.js` | 拒绝跨模式账户工具；WP7 收窄：futu 写类（`sim_trade_*`/`trading_*` 的下单/改单/撤单动词）guard **一律拒绝并指引工作台**（不返回 `ask`，与权限档位无关；`trading_*` 族未知动词按写拒绝=**fail-closed**，`sim_trade_*` 未知动词按读处理——sim 写伤害有界）；记录最终工具响应 |
 | `plugins/workbench/src/index.js` | 根级 Host 插件，提供 `tradingWorkbench` 服务与认证后的 Connection RPC |
 | `plugins/workbench/src/store.js` | JSON 持久结果、原子替换、写锁、账户调用租约、模式隔离 |
 | `plugins/workbench/src/client.js` | Harness 原生 module factory，使用宿主 React；`shell.overlay` 面板及 `tool.call.toolview` 卡片 |
 | `plugins/engine/python` | 量化计算与本地模拟台账的权威实现 |
 | `plugins/datasource/python` | **统一数据层**：唯一的富途 MCP 客户端、行情路由与回测核心，被 engine/workbench 共同依赖（不是 Harness 插件） |
 | `plugins/core/python/trading_core` | **量化平台核心库**（非 Harness 插件）：PIT 存储/日历/同步/质量（WP1）、因子/策略/组合回测/walk-forward（WP2）、风控八规则/计划冻结/OMS 状态机/券商适配/对账/TCA（WP3）、daemon 调度/指令目录/告警（WP4） |
-| `trading_core` daemon | 无 LLM 单进程守护进程（`python -m trading_core daemon`）：按交易日历触发作业链（sync→质量→信号→计划、对账→TCA→摘要）、心跳落 `~/.dsh/trading-daemon.json`（> 5 分钟未刷新工作台标红）、轮询指令目录 `~/.dsh/trading-commands/`、告警分级落 `alerts` 表（WP4） |
-| `platform/` 独立服务进程（WP6） | FastAPI/uvicorn **单进程**：`POST /api/wb/<endpoint>`（envelope 契约，22 端点）+ `/mcp`（mcp SDK streamable-http，**26 工具** = 22 端点中 21 个端点工具 + 5 个 `admin_*` 维护动作；**`confirm-decide` 有意不进工具面**，防模型自批实盘单）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/业务确认/维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
+| `trading_core` daemon | 无 LLM 单进程守护进程（`python -m trading_core daemon`）：按交易日历触发作业链（sync→质量→信号→计划、对账→TCA→摘要，WP7 起各市场链末尾追加 `factors_snapshot`）、心跳落 `~/.dsh/trading-daemon.json`（> 5 分钟未刷新工作台标红）、轮询指令目录 `~/.dsh/trading-commands/`、告警分级落 `alerts` 表（WP4）。**WP7 起常驻循环由平台服务内调度器承担（见 `platform/` 行）；daemon CLI 保留为手动/兼容入口，与调度器共享 kv `daemon:state` 的 ran 标记，同日作业不重复执行** |
+| `platform/` 独立服务进程（WP6，WP7 独立量化平台） | FastAPI/uvicorn **单进程**，WP7 起承载四块新增职责：**①服务内调度器**（`server/scheduler.py`：daemon 作业链 sync→quality→factors_snapshot 原样复用，tick-first——启动即先跑一轮并补跑当日到期作业，与手动 daemon 共享 ran 标记不重复执行；心跳/告警协议不变；线程随 lifespan 启停，`/healthz` 附 `scheduler:{alive,last_error}`，`last_error` 保留最近一次异常、成功不清除、300 字符截断）；**②富途交易闸门**（`server/trading.py`：模式文件→风控 8 规则（kill 文件=规则 1）→业务确认（`store_access.request_confirmation` 进程内阻塞，**Web 确认卡片作答**，TTL 120s 超时=拒绝 fail-closed）→broker 适配（sim 下单/改单/撤单=撤旧重下/查询；live 写协议未接入=确认前即拒，`trading/broker-unavailable`）；OMS 落 `orders`/`risk_checks` 表，超时→unknown 只查询不重放）；**③受约束交易工具**（`trade_place/trade_modify/trade_cancel` + `account_positions/account_orders/account_funds`，工具面 27→**33**）；**④`factors-history`**（定时快照按交易日落 `factor_snapshots` 表，HTTP/CLI/`mcp__quantwb__factors_history` 三路同源）。既有职责不变：`POST /api/wb/<endpoint>`（envelope 契约，22+7 端点）+ `/mcp`（mcp SDK streamable-http，**33 工具**；**`confirm-decide` 有意不进工具面**，防模型自批实盘单）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/业务确认/维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*`/`factors-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
 
 `plugins/trading-agents` 是旧的未启用脚手架，不是当前执行引擎。
 workbench 包通过 `dsh.bundle.patch` 插入根级 Host 行；fin-data/engine 是普通插件包，
@@ -265,8 +279,10 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
   不再通过脚本启用 live。
 - 账户调用持有 `trading-call-*.active` 租约，期间拒绝切换；
   多个 Host 进程和恢复脚本共用文件边界。
-- `mcp__futu__sim_trade_*` 仅 sim；`account_*`、`trading_*` 仅 live；
-  真实写操作在会话摘要确认之外，还必须在工作台逐笔点确认（业务确认，独立于 Harness 权限审批）。
+- `mcp__futu__sim_trade_*` 仅 sim；`account_*`、`trading_*` 仅 live（WP7 收窄后：两族
+  **写类动词不分模式一律拒绝**并指引工作台，见「富途通道分级」）；真实写操作唯一路径是
+  工作台 `trade_*` 工具——服务进程内逐笔业务确认（Web 卡片作答，独立于 Harness 权限审批）
+  或执行已冻结计划（口令复核）。
 
 这是插件管理的 MCP 工具边界，不是操作系统沙箱。拥有宿主 shell、文件权限或券商凭据
 的人仍能绕过插件，因此禁止模型绕路，日常只授只读权限，不能宣称已经具备完整实盘安全保证。
@@ -280,7 +296,7 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 
 **WP6 起同一批端点在 `platform/` 独立服务进程内以 `POST /api/wb/<endpoint>` 暴露**
 （envelope 契约不变：`{ok, value?, cached?, cached_at?, error?{code,message,details}}`）；
-`/mcp` 的 26 个 MCP 工具与 HTTP 路由在该进程内调用**同一批 Python 处理函数**
+`/mcp` 的 33 个 MCP 工具与 HTTP 路由在该进程内调用**同一批 Python 处理函数**
 （同一 `(endpoint, payload) -> envelope`），行为对等由代码结构 + 审批回归矩阵共同保障。
 `snapshot` / `switch-mode` 之外，WP4 新增 4 个受约束端点
 （读侧一律经只读子命令取数，Node 侧经 `pycore`、Python 侧经 `trading_core snapshot-*`
@@ -296,9 +312,26 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 | `reconcile` | `{}` | 最近对账差异、TCA 摘要、告警列表 |
 | `confirmation` | `{}`（空载荷，**不进缓存**） | `{pending, ttl_ms}`；`pending` 为待用户确认的实盘写操作（编号、工具、中文订单摘要、创建/到期时间）或 `null` |
 | `confirm-decide` | `{id, decision: "approved"\|"rejected"}` | 提交用户的决定；**唯一能批准实盘操作的通道**，只由独立 Web 的用户点击触发（不进 MCP 工具面） |
+| `factors-history`（WP7） | `{limit?}`（1..120，TTL 5m 缓存） | 定时收集的因子快照历史（按交易日倒序） |
+| `trade_place` / `trade_modify` / `trade_cancel`（WP7） | `{symbol[, side, qty, price, order_id, client_order_id]}` | 经交易闸门链的写操作；失败一律信封化 `trading/order-rejected` / `trading/broker-unavailable` / `trading/invalid-operation`，绝不 500 |
+| `account_positions` / `account_orders` / `account_funds`（WP7） | `{mode?}` | 券商账户查询直通（模式文件约束；不进任何缓存；失败账户列入 `errors` 不掩盖） |
 
-除 `plan-execute`（执行已冻结计划，白名单指令落盘）与 `confirm-decide`（人工批准）外，
-不开放下单、shell、LLM 或 token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
+除 `plan-execute`（执行已冻结计划，白名单指令落盘）、`confirm-decide`（人工批准）与
+WP7 的 `trade_*` 写端点（必须通过交易闸门链：模式→风控 8 规则→kill→业务确认）外，
+不开放 shell、LLM 或 token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
+
+**业务确认表述统一（WP7 修订，2026-09-16）**：全仓库的「工作台业务确认」自 WP7 起只有
+两条路径，表述以此为准——
+
+1. **工作台 `trade_*` 工具 → 服务进程内确认**：`trade_place/trade_modify/trade_cancel`
+   触发的确认在**服务进程内**发起（`store_access.request_confirmation`），用户在**独立 Web
+   的确认卡片**作答（`confirmation`/`confirm-decide` 端点，同进程，无跨进程问题）。
+   这是当前**唯一可达**的实盘写确认路径（TTL 120s 超时=拒绝，fail-closed）。
+2. **legacy 面板的确认 UI**：futu 写通道收窄后（engine guard 对 futu 写一律拒绝），
+   Harness 会话侧**不再产生**新的 futu 写确认——面板的确认 UI 对 futu 写已**不可达**，
+   仅为历史留痕与面板退役前的过渡保留。
+
+下文的「跨进程边界」清单按 WP6 时点撰写，作为路径②的历史依据与将来跨进程化的设计参考保留。
 
 **业务确认的跨进程边界（诚实清单，2026-09-15 业务确认修订）**：实盘写操作的确认是
 “此刻等人回答”的**内存态**，刻意不落盘（进程重启后无人回答，落盘会让陈旧请求复活；

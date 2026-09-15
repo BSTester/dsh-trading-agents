@@ -3,6 +3,10 @@
 > **WP4 状态标注（WP5 修订）：** 「七、接手操作注意」新增的 daemon 指令目录/kill 文件/
 > 心跳文件运维操作按 WP4 计划规格撰写，**以 WP4 合并后实测为准**（逐步操作见
 > [RUNBOOK.md](RUNBOOK.md)）。
+> **WP7 状态标注（2026-09-16）：** 服务内调度器（吸收 daemon）、因子快照收集与
+> `factors-history`、交易闸门 + 受约束交易工具（工具面 33）、富途写通道收窄、一键安装
+> 已落地（提交清单与测试证据见
+> `docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md` 末节「WP7 验收记录」）。
 
 ## 一、目标与不可改变的边界
 
@@ -194,7 +198,7 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   `<DSH_HOME>/trading-workbench.json`、模式文件 `trading-account-mode` 与指令目录
   `trading-commands/`；写路径靠既有**原子写 + 独占锁**互斥，两处同时切换模式的竞态由
   `expected_mode` 复核兜底（后到者拒绝）。排查数据不一致时先确认没有两个进程同时在写。
-- **实盘写确认 = 工作台业务确认（2026-09-15 main 修订）**：live 的 `trading_*` 写操作由插件
+- **实盘写确认 = 工作台业务确认（2026-09-15 main 修订；⚠️ WP7 收窄后该路径对 futu 写不可达，见条目末尾标注）**：live 的 `trading_*` 写操作由插件
   在 pre-execute 自己发起确认，用户在 **Harness 内 legacy 工作台面板**作答（**不再走 Harness
   原生审批**，`policy.js` 永不返回 `{kind:"ask"}`；`sim_trade_*` 永不确认）。确认是**进程内存态**
   （刻意不落盘），**跨进程不可见**：Harness 会话发起的待确认，独立 Web 的 `confirmation` 端点
@@ -202,6 +206,9 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   去发起确认。**独立 Web 暂无确认界面**（有意不做，长期空白界面会误导），过渡期一律回 Harness
   面板作答；将来若要跨进程，需把请求/裁决落到共享文件且**同时改 Node 侧**
   （见 `docs/architecture.md` 的「业务确认的跨进程边界」与规格 §4.5:5、§八-8）。
+  ⚠️ **WP7 起该路径对 futu 写已不可达**：guard 对 futu 写类一律拒绝，实盘写确认唯一路径是
+  服务进程内发起 + Web 确认卡片作答（即 `docs/architecture.md`「业务确认表述统一（WP7 修订）」
+  的路径①）；本条保留作历史依据与跨进程化设计参考。
 - **Python 侧快照的诚实边界（WP6）**：服务进程的 store 访问层只读
   `trading-workbench.json`，**不合并** pending observations（合并仍由 Harness Host 完成），
   因此合并前的账户响应不会出现在独立 Web 快照里；`trade_summary`/`audit` 链是 Node
@@ -213,3 +220,29 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   装在 `~/.dsh/trading-venv`）；启动 `cd platform && ~/.dsh/trading-venv/bin/python -m server.run`；
   未构建 `platform/web/dist` 时 `GET /` 404，取数类工具全报 `trading/*-unavailable`
   多为服务未用 venv 解释器启动。
+- **调度线程随服务 lifespan 启停（WP7）**：`Scheduler` 是服务进程内的 daemon 线程，
+  服务停=调度停（systemd 只需管服务进程）；tick-first——启动即补跑当日到期作业，
+  与手动 daemon CLI 共享 `daemon:state` 的 ran 标记（同日作业不重复执行）。
+  `/healthz` 的 `scheduler.last_error` 保留最近一次 tick 异常、**成功不自动清除**——
+  它是「最近一次出错记录」不是「当前是否故障」；确认恢复看 `alive: true` 与后续作业留痕，
+  抹掉旧记录只能重启服务。
+- **交易闸门的 fail-open 有界口径（WP7）**：闸门在业务确认通过前对 broker 保持零调用，
+  风控 ctx 的敞口字段取**保守默认**（equity=1_000_000、持仓市值空表、持仓数 0、日亏 0），
+  由此有两个**窄口**：①真实权益远小于默认值的**微小账户**——规则 4 的单笔名义封顶按默认
+  权益计（1_000_000×risk_per_trade 1% = **1 万名义**），对小账户偏松；②**叠加场景**——
+  存量持仓不可见，规则 5/6 只对本单全额名义生效，拦不住与已有持仓叠加的超限。
+  两口都受规则 4 的 1 万名义封顶**限界**（宁可错拒也不放大敞口）；接真实盯市数据是后续任务，
+  接入前不要把这层风控当完整敞口约束。
+- **futu 写动词 fail-closed 收紧（WP7）**：`trading_*` 族**未知动词按写拒绝**（实盘不能赌），
+  `sim_trade_*` 族未知动词按读处理（sim 写伤害有界，已知 4 个写动词仍按写拒绝）；
+  上游新增写动词不会被当读放行。只读研究不受影响。
+- **确认 TTL 与 `toolCallTimeoutMs` 的关系（WP7）**：服务端确认 TTL=120s
+  （`store_access.CONFIRM_TTL_MS`），到期按拒绝收尾（fail-closed）；preset 的
+  `quant-platform-mcp` 行 `toolCallTimeoutMs: 180000` = TTL 120s + 子进程取数余量——
+  模型侧即使超时，服务端闸门仍把订单按未批准拒绝收尾，**不存在「模型超时导致订单悬空」**。
+  改 TTL 时两边要一起评估。
+- **安装器幂等要点（WP7）**：`scripts/install_platform.py` 五步（venv/deps/web/service/verify）
+  重复运行安全——venv 已存在报 `already-exists`、dist 新于 src 跳过重建、8397 已有服务报
+  `already-running`，都是正常行为不是错误；`--skip-venv/--skip-deps/--skip-web/--skip-all`
+  分层跳过，任一步 `ok=false` 退出码 1；`--dry-run` 零副作用可预览。`install_plugins.py link`
+  在每次合并 WP 分支后要重跑一次，否则 venv 里的 core/datasource 是旧副本。

@@ -46,11 +46,25 @@
 2. 不做逐单下单 Web 表单（Web 的交易入口=确认卡片+计划执行；会话内临时交易走 MCP 交易工具+确认卡片）；
 3. 不做多用户/远程访问（仍 loopback + 可选 token）；
 4. daemon CLI 与既有指令目录协议保持兼容，不破坏 WP4 验收口径。
+5. **live 写协议未接入（WP7 交付口径）**：broker 适配只实现 sim 写 + live/sim 查询；
+   live 下 `trade_*` **提交即拒**（确认前快速失败，`trading/broker-unavailable`，
+   文案「live 写通道尚未接入券商执行协议；当前仅 sim 可交易」）。这是**当前设计内行为，
+   不是缺陷**——WP3 只锁定 `trading_order_place` 的 schema，按「不另写富途协议」铁律如实拒绝。
+   接入属后续任务：实现 live 适配器（显式声明 `supports_live_write`）+ 复跑闸门回归 +
+   sim→live 冒烟，并按 `docs/P4-live-trading.md` 准入清单第 11 项人工评估。
 
 ## 四、验收标准
 
+> 逐条标注（WP7 任务 6，2026-09-16）：「已实现」附提交；「待人工」为需要真实环境/真实
+> 通道/人在场的部分，证据留位见计划末节「WP7 验收记录」。
+
 1. 服务启动后：调度器按交易日历自动跑作业链并写心跳；收盘后 `factors_history` 有当日快照；`factors-history` 端点/工具可按日期查询；
+   —— **已实现**（`0611b5b` 调度器 + `85871a6` 因子收集/`factors-history`；作业链组装/心跳/三路查询由注入式测试钉住）。**待人工**：真实交易日收盘快照落库与心跳刷新的现场观察。
 2. live 模式下 `trade_place`（经 MCP）→ Web 出现待确认卡片 → 批准后订单进入 broker 适配（sim 冒烟）；拒绝/超时 → 拒单且留痕；kill 文件 → 一切订单拒绝；
+   —— **已实现**（`a05aedd` 闸门/确认卡片 + `7762386` 卡片常驻轮询与 live 前置拒绝；闸门链注入式测试全绿：确认批准/拒绝/TTL、kill=规则 1、OMS/风控留痕；live 写前置拒绝见 §三-5）。**待人工**：真实富途 sim 通道的端到端冒烟（测试内为 mock broker）。
 3. Harness 内 `mcp__futu__trading_*` 被拒且消息指引工作台；`mcp__futu__*` 只读研究不受影响；
+   —— **已实现**（`09a0940`：policy guard 收窄 + `tests/wp7-policy.test.mjs`；拒绝文案含工作台指引，未知动词 fail-closed）。**待人工**：新会话现场复核工具面行为。
 4. 全新环境按 `install/HARNESS_SETUP.md` 提示词操作可完成安装并验证工具面；
+   —— **已实现**（`756d320`：`install/HARNESS_SETUP.md` 提示词 + `scripts/install_platform.py`，五步幂等可分层跳过，`test_core_wp7_install` 覆盖）。**待人工**：全新环境端到端按提示词走一遍。
 5. 全量测试（Python/Node/web）全绿；文案规范 grep 零命中。
+   —— **已实现**（本提交：Python/Node/web 三套 + 前端构建的全量数字见计划末节「WP7 验收记录」；页面文案由 grep 断言钉住）。

@@ -175,7 +175,7 @@
     url: http://127.0.0.1:8397/mcp
     failOnStartupError: false
     # trade_place/trade_modify/trade_cancel（WP7 任务 3）在 live 下会阻塞到确认 TTL
-    # 120s（服务端超时=拒绝，fail-closed）。本行 120000 与该 TTL 同值：模型侧会先看到
-    # 工具超时，而服务端闸门继续等到 TTL 到期按拒绝收尾，订单不会在无批准下提交；
-    # WP7 任务 5（一键安装）建议把本行调到 180000，给用户留出作答余量。
-    toolCallTimeoutMs: 120000
+    # 120s，超时自动拒绝（fail-closed）。本行 180000 = 确认 TTL 120s + 子进程取数余量：
+    # 用户在 Web 卡片作答的窗口不受模型侧超时挤压，取数类调用也有喘息；确认 TTL 到期
+    # 服务端闸门仍按拒绝收尾，订单不会在无批准下提交。
+    toolCallTimeoutMs: 180000

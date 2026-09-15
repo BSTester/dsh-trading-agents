@@ -2,6 +2,9 @@
 
 > **状态标注：** 本文涉及 daemon、指令目录、心跳文件、工作台页面的步骤按 WP4 计划规格撰写，**以 WP4 合并后实测为准**；「演练记录」小节**待 WP4 daemon 合并后执行**回填。
 > kill switch 演练内核（`scripts/drills.sh`）与风控联动已落地（WP5 任务 1），可先行执行。
+> **WP7（2026-09-16）**：daemon 常驻循环由**平台服务内调度器**承担（随服务进程存活，
+> daemon CLI 保留为手动入口），场景 1 的「daemon 崩溃重启」对应平台服务进程的重启；
+> 其余协议（心跳/指令目录/kill/告警）不变。
 
 恢复原则（规格 §8.4，P4 延续）：daemon 崩溃 systemd 重启；执行中断订单留 `unknown` 由对账兜底；**先查券商再动手，不自动清除未知在途状态，不自动平仓**。
 
@@ -20,10 +23,10 @@
 | 数据依赖核验 | `scripts/verify-data-deps.py` | 约定：富途侧发版异常（internal error 面扩大）时**先跑本脚本**定位漂移面 |
 | kill 演练 | `scripts/drills.sh` | 建 kill → 断言风控拒单 → 清除，输出 JSON，无残留 |
 
-## 平台服务（FastAPI 单进程，WP6）
+## 平台服务（FastAPI 单进程，WP6；WP7 独立量化平台）
 
 工作台独立服务：**一个进程**承载 HTTP API（`POST /api/wb/<endpoint>`）、MCP
-（`/mcp`，streamable-http，26 工具，Harness 侧工具名 `mcp__quantwb__*`）与前端静态托管
+（`/mcp`，streamable-http，33 工具，Harness 侧工具名 `mcp__quantwb__*`）与前端静态托管
 （`platform/web/dist`）。默认 `127.0.0.1:8397`，loopback 绑定，可选静态 token。
 
 ### 依赖安装（一次性，需联网）
@@ -52,7 +55,7 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
   用系统 Python 启动会让分析/核心子进程改用系统解释器；`run.py` 在解释器与 venv
   不一致时向 stderr 打一行告警 JSON（不硬失败）。
 - 启动成功打印**单行 JSON**：`{"ok": true, "service": "quant-platform", "url": ...,
-  "mcp": ".../mcp", "tools": 25, "auth": "loopback-only"}`。
+  "mcp": ".../mcp", "tools": 33, "auth": "loopback-only"}`。
 
 ### 配置
 
@@ -69,7 +72,7 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 ### 健康检查与冒烟
 
 ```bash
-curl -s http://127.0.0.1:8397/healthz            # {"ok":true,"mode":"sim"}
+curl -s http://127.0.0.1:8397/healthz            # {"ok":true,"mode":"sim","scheduler":{"alive":true,"last_error":null}}
 curl -s -X POST http://127.0.0.1:8397/api/wb/snapshot \
   -H 'content-type: application/json' -d '{}'    # envelope：{"ok":true,"value":{...}}
 curl -s -D - -o /dev/null http://127.0.0.1:8397/  # 200 + text/html; charset=utf-8（dist/index.html）
@@ -83,6 +86,61 @@ curl -s -D - -o /dev/null http://127.0.0.1:8397/  # 200 + text/html; charset=utf
 确认 preset 的 `quant-platform-mcp` 行已启用、服务已起、新会话已新建
 （`failOnStartupError: false`，服务未起时安静降级）；取数类工具全报
 `trading/*-unavailable` → 多因服务不是用 venv 解释器启动。
+
+### 服务内调度器（WP7）
+
+调度器随服务 lifespan 启停（服务停则调度停，`systemd` unit 只需管服务进程一个）：
+`create_app` 缺省装配 `Scheduler(build_tick(home), interval=60)`——daemon 线程每 60s 一轮
+tick，协议原样复用 `trading_core.daemon.tick`/`JOBS_DEFAULT`/心跳路径/告警落库；
+daemon CLI（`python -m trading_core daemon`）保留为手动入口。
+
+- **tick-first 与补跑**：启动即先跑一轮再等间隔——当日已到期的作业立即补跑，不空等下一个周期。与手动 daemon 共享 kv `daemon:state` 的 ran 标记（键 `市场:作业名:日期`），**同日作业不重复执行**（服务与手动 daemon 先后跑同一天也只执行一次）。
+- **心跳/告警协议不变**：`~/.dsh/trading-daemon.json` 的 `heartbeat`（> 5 分钟未刷新工作台标红）；告警仍分级落 `alerts` 表。
+- **`/healthz` 的 `scheduler` 字段**：`{"alive": bool, "last_error": str|null}`。`last_error` 保留**最近一次** tick 异常（300 字符截断）、**成功不自动清除**——它表示「最近一次出错记录」，不是「上一轮是否出错」；确认已恢复看 `alive: true` 与此后新日期作业是否正常留痕，需要抹掉旧记录只能重启服务。
+- **tick 异常不杀线程**：单轮异常记录进 `last_error` 后继续下一轮；连续多轮同一 `last_error` → 查对应 `trading_core` 子命令与 SQLite 库（`trading-data/trading.sqlite`）。
+
+### factors-history 查询（WP7）
+
+因子快照由调度器每个交易日收盘后自动落 `factor_snapshots` 表（作业链末尾的
+`factors_snapshot`：SH 16:15 / HK 16:35 / US 05:35，`--tickers @watchlist`；
+非交易日或日历未同步不跑，失败落 `alerts`）。三条等价查询路径：
+
+```bash
+# HTTP（TTL 5m 缓存；limit 1..120，默认 30）
+curl -s -X POST http://127.0.0.1:8397/api/wb/factors-history \
+  -H 'content-type: application/json' -d '{"limit": 10}'
+# CLI（与 HTTP/MCP 同源，JSON 输出）
+~/.dsh/trading-venv/bin/python -B -m trading_core factors-history --limit 10
+# MCP：Harness 会话内调用 mcp__quantwb__factors_history {limit}
+```
+
+缺当日快照先查调度器：`/healthz` 的 `scheduler` 字段 + `alerts` 表该日 `factors_snapshot`
+告警；再查 `factor_snapshots` 表确认落库情况。
+
+### 交易闸门排障（WP7）
+
+写路径 `trade_place/trade_modify/trade_cancel` 全链留痕（改单=撤旧重下），排查顺序：
+
+1. **看拒绝原因**：响应 `error.message` 信封化（绝不 500），错误码族
+   `trading/order-rejected`（参数/模式/风控/确认/查重）、`trading/broker-unavailable`
+   （券商通道异常/未接入）、`trading/invalid-operation`（载荷非法）。两张表对账：
+   ```bash
+   sqlite3 ~/.dsh/trading-data/trading.sqlite \
+     "SELECT client_order_id,symbol,side,qty,status,mode,updated_at FROM orders ORDER BY updated_at DESC LIMIT 10;"
+   sqlite3 ~/.dsh/trading-data/trading.sqlite \
+     "SELECT rule,allowed,reason,created_at FROM risk_checks ORDER BY id DESC LIMIT 10;"
+   ```
+   （风控 8 规则拒绝时 `risk_checks.allowed=0`，`reason` 即中文原因；`orders` 状态机迁移
+   白名单见场景 2。）
+2. **kill 文件**：`~/.dsh/trading-kill` 存在即规则 1 拒绝一切订单；`unkill` = 人工确认后删除。
+3. **业务确认 TTL 120s**：live 写在 Web 确认卡片等待用户作答，TTL 到期由服务按**拒绝**收尾
+   （fail-closed，订单迁 `cancelled`）；preset 行 `toolCallTimeoutMs: 180000` = TTL 120s +
+   作答与子进程取数余量——模型侧超时不代表服务端放弃，最终以闸门信封为准。
+4. **live 写未接入（当前设计内行为，不是故障）**：live 下 `trade_*` 提交即拒——
+   `error.code=trading/broker-unavailable`，文案「live 写通道尚未接入券商执行协议；
+   当前仅 sim 可交易」。接 broker 前只允许 sim 下单；准入评估见 `docs/P4-live-trading.md`。
+5. **订单 `unknown`（提交超时）**：铁律只查询不重放，走场景 2 对账兜底。
+
 
 ### systemd unit 样例
 
