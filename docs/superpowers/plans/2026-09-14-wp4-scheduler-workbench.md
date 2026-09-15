@@ -20,7 +20,7 @@
 
 **文件：** 创建 `tests/test_core_wp4_locks.py`；创建 `plugins/core/python/trading_core/platform_notify.py`
 
-- [ ] 步骤 1：失败测试：
+- [x] 步骤 1：失败测试：
 
 ```python
 """WP4 依赖锁定：指令白名单、RPC 端点名、桌面通知命令探测。全部离线。"""
@@ -47,7 +47,7 @@ class Wp4Locks(unittest.TestCase):
         self.assertTrue(cmd is None or isinstance(cmd, str))
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现——`commands.py` 先放 `COMMANDS = {...}`（任务 2 补行为）；`daemon.py` 先放路径助手（任务 1 补循环）；`platform_notify.py`：
+- [x] 步骤 2：FAIL；步骤 3：实现——`commands.py` 先放 `COMMANDS = {...}`（任务 2 补行为）；`daemon.py` 先放路径助手（任务 1 补循环）；`platform_notify.py`：
 
 ```python
 """可选桌面通知：探测平台命令，缺失返回 None（YAGNI：不发邮件/短信）。"""
@@ -61,13 +61,13 @@ def detect():
     return None
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): WP4 依赖锁定（指令白名单/路径/通知探测）"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): WP4 依赖锁定（指令白名单/路径/通知探测）"`
 
 ### 任务 1：daemon.py 调度循环
 
 **文件：** 修改 `daemon.py`；测试 `tests/test_core_daemon.py`
 
-- [ ] 步骤 1：失败测试（假时钟 + 假作业注册表：到点触发作业链、写心跳、市场休市跳过）：
+- [x] 步骤 1：失败测试（假时钟 + 假作业注册表：到点触发作业链、写心跳、市场休市跳过）：
 
 ```python
 """daemon 单测：假时钟驱动一轮调度；心跳与作业历史落盘；休市跳过。"""
@@ -110,7 +110,7 @@ class DaemonTest(unittest.TestCase):
         self.assertEqual(ran, [])  # 休市不跑
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现 `daemon.py`：
+- [x] 步骤 2：FAIL；步骤 3：实现 `daemon.py`：
 
 ```python
 """调度守护进程（规格 §8.1）：无 LLM 单进程；按交易日历触发作业链；
@@ -179,13 +179,13 @@ def _real_now():
     return dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): daemon 调度循环（假时钟可测/休市跳过/心跳）"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): daemon 调度循环（假时钟可测/休市跳过/心跳）"`
 
 ### 任务 2：commands.py 指令目录
 
 **文件：** 修改 `commands.py`；测试 `tests/test_core_commands.py`
 
-- [ ] 步骤 1：失败测试：
+- [x] 步骤 1：失败测试：
 
 ```python
 """指令目录：白名单校验、nonce 幂等、原子写、轮询消费、processed 去重。"""
@@ -216,7 +216,7 @@ class CommandsTest(unittest.TestCase):
             commands.write_command(self.home, "rm_rf", {})
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现 `commands.py`：
+- [x] 步骤 2：FAIL；步骤 3：实现 `commands.py`：
 
 ```python
 """指令目录（规格 §8.2）：工作台 → daemon 的唯一通道。白名单外一律拒绝；
@@ -265,13 +265,13 @@ def poll(home, handler):
     return out
 ```
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): 指令目录（5 白名单/nonce 幂等/processed 去重）"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): 指令目录（5 白名单/nonce 幂等/processed 去重）"`
 
 ### 任务 3：alerts.py
 
 **文件：** 创建 `alerts.py`；测试 `tests/test_core_alerts.py`
 
-- [ ] 步骤 1：失败测试：
+- [x] 步骤 1：失败测试：
 
 ```python
 """告警：分级落表、critical 置心跳标志、可选桌面通知（探测为 None 时不发）。"""
@@ -295,7 +295,7 @@ class AlertsTest(unittest.TestCase):
         self.assertTrue(hb["critical"])  # critical 置心跳标志位（工作台红点依据）
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现——store v3 `_SCHEMA` 再追加：
+- [x] 步骤 2：FAIL；步骤 3：实现——store v3 `_SCHEMA` 再追加：
 
 ```sql
 CREATE TABLE IF NOT EXISTS alerts(
@@ -359,13 +359,13 @@ def _maybe_desktop_notify(level, title, detail):
 
 （`alerts.py` 顶部需 `from pathlib import Path`。）
 
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): 告警分级落库与心跳标志"`
+- [x] 步骤 4：PASS；`git commit -m "feat(core): 告警分级落库与心跳标志"`
 
 ### 任务 4：daemon 执行体接线 + `__main__` 常驻
 
 **文件：** 修改 `daemon.py`、新增 `trading_core/daemon_main.py`（或并入 `cli.py` 的 `daemon` 子命令）；测试追加
 
-- [ ] 步骤 1：失败测试（`_run_job` 对 `cmd` 形式的作业调子进程——注入 runner；对 `fn` 形式直接调）：
+- [x] 步骤 1：失败测试（`_run_job` 对 `cmd` 形式的作业调子进程——注入 runner；对 `fn` 形式直接调）：
 
 ```python
     def test_run_job_via_runner(self):
@@ -375,14 +375,14 @@ def _maybe_desktop_notify(level, title, detail):
         self.assertEqual(seen[0][0:2], ["sync-bars", "--tickers"])
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现：`_run_job(conn, job, home, runner=None)` —— `runner = runner or _subprocess_runner`；`_subprocess_runner(cmd)` 用 `subprocess.run([sys.executable, "-m", "trading_core", *cmd], timeout=900)`（替 `@watchlist` 占位为配置关注池）；`cli.py` 加 `daemon` 子命令（`--once` 跑一轮 / 默认常驻 60s 轮询 + `commands.poll` 分派到对应 CLI 动作：`execute_plan`→按 nonce 读计划执行、`kill`→建 kill 文件、`unkill`→删、`cancel_plan`→撤余单、`run_job`→立即跑指定作业）。
-- [ ] 步骤 4：PASS；`git commit -m "feat(core): daemon 执行体接线与常驻入口"`
+- [x] 步骤 2：FAIL；步骤 3：实现：`_run_job(conn, job, home, runner=None)` —— `runner = runner or _subprocess_runner`；`_subprocess_runner(cmd)` 用 `subprocess.run([sys.executable, "-m", "trading_core", *cmd], timeout=900)`（替 `@watchlist` 占位为配置关注池）；`cli.py` 加 `daemon` 子命令（`--once` 跑一轮 / 默认常驻 60s 轮询 + `commands.poll` 分派到对应 CLI 动作：`execute_plan`→按 nonce 读计划执行、`kill`→建 kill 文件、`unkill`→删、`cancel_plan`→撤余单、`run_job`→立即跑指定作业）。
+- [x] 步骤 4：PASS；`git commit -m "feat(core): daemon 执行体接线与常驻入口"`
 
 ### 任务 5：Host RPC —— 4 个受约束端点
 
 **文件：** 修改 `plugins/workbench/src/endpoints.js`、`rpc.js`；创建 `plugins/workbench/src/pycore.js`；测试 `plugins/workbench/tests` 既有测试风格（`tests/*.test.mjs`）新增 `tests/workbench-wp4.test.mjs`
 
-- [ ] 步骤 1：失败测试（mock pythonCall，断言 4 端点分派、plan-execute 校验 payload、ENDPOINT_SHAPE 扩展）：
+- [x] 步骤 1：失败测试（mock pythonCall，断言 4 端点分派、plan-execute 校验 payload、ENDPOINT_SHAPE 扩展）：
 
 ```javascript
 import { test } from "node:test";
@@ -399,7 +399,7 @@ test("wp4 endpoints registered with shape", () => {
 });
 ```
 
-- [ ] 步骤 2：FAIL；步骤 3：实现：
+- [x] 步骤 2：FAIL；步骤 3：实现：
   - `endpoints.js`：`ENDPOINTS` 追加 4 项；`ENDPOINT_SHAPE` 追加 `plan: ["plans","alerts"]`、`schedule: ["heartbeat","jobs"]`、`reconcile: ["diffs","tca"]`（`plan-execute` 非缓存端点不进 SHAPE）；
   - `pycore.js`：完整文件——
 
@@ -445,14 +445,14 @@ export async function pycore(args, { timeout = 60_000 } = {}) {
 ```
 
 **说明（写进计划，执行者照做）**：`plan/schedule/reconcile` 三个读端点由 `deps.pycore` + `deps.readPlanSnapshot()/deps.readScheduleSnapshot()/deps.readReconcileSnapshot()` 提供——新增 `plugins/workbench/src/corebridge.js`，内部 `pycore(["quality", ...])` 等命令 + 直接读 `~/.dsh/trading-data/trading.sqlite`？**否——Node 不直接读 SQLite**。统一约定：**在 `trading_core/cli.py` 增加三个只读子命令 `snapshot-plan / snapshot-schedule / snapshot-reconcile`（JSON 输出，读 store 只读连接），Host 一律经 `pycore` 取数**。`plan-execute` 特殊分支（同 `switch-mode` 不走缓存）：校验 `payload.plan_hash/expected_mode/confirmation` → live 且 confirmation !== "确认执行" 拒绝 → `commands.write_command(home, "execute_plan", {plan_hash, expected_mode, nonce})` → 返回 `{queued: true, nonce}`（不等待执行结果，状态由 plan 端点轮询）。
-- [ ] 步骤 4：PASS（含既有 `workbench.test.mjs` 不回归）；`git commit -m "feat(workbench): 4 个受约束 RPC（plan/plan-execute/schedule/reconcile）"`
+- [x] 步骤 4：PASS（含既有 `workbench.test.mjs` 不回归）；`git commit -m "feat(workbench): 4 个受约束 RPC（plan/plan-execute/schedule/reconcile）"`
 
 ### 任务 6：Client「计划」页签（文案规范应用）
 
 **文件：** 修改 `plugins/workbench/src/client.js`（L995-999 页签数组 + 新组件 + 主 switch 分支）
 
-- [ ] 步骤 1：页签数组 L997 后插入：`{ id: "plan", label: "计划" }, { id: "schedule", label: "调度" },`
-- [ ] 步骤 2：新组件（完整代码，文案规范已应用——页面只出现数据事实/操作反馈/模式徽章/口令，无任何规格引用与设计注释；设计意图写在注释里）：
+- [x] 步骤 1：页签数组 L997 后插入：`{ id: "plan", label: "计划" }, { id: "schedule", label: "调度" },`
+- [x] 步骤 2：新组件（完整代码，文案规范已应用——页面只出现数据事实/操作反馈/模式徽章/口令，无任何规格引用与设计注释；设计意图写在注释里）：
 
 ```javascript
     // 计划页：目标 vs 实际 diff、逐单预检、执行窄门。
@@ -510,34 +510,70 @@ export async function pycore(args, { timeout = 60_000 } = {}) {
 ```
 
 （`callApi(endpoint, payload)` 为本任务新增的 8 行助手：包装 `ctx.connection.rpc.call("/api", "trading-workbench/" + endpoint, payload)`，提取 `value`；若 client.js 已有等价助手则复用并删除新助手。）
-- [ ] 步骤 3：主 switch 加 `plan` 分支渲染 `PlanTab`；步骤 4：手动 `node --test plugins/workbench/tests/workbench-wp4.test.mjs` + 现有 `client.test.mjs` PASS；`git commit -m "feat(workbench): 计划页签（diff 表/预检/执行窄门，live 口令）"`
+- [x] 步骤 3：主 switch 加 `plan` 分支渲染 `PlanTab`；步骤 4：手动 `node --test plugins/workbench/tests/workbench-wp4.test.mjs` + 现有 `client.test.mjs` PASS；`git commit -m "feat(workbench): 计划页签（diff 表/预检/执行窄门，live 口令）"`
 
 ### 任务 7：Client「调度」页签
 
 **文件：** 修改 `client.js`
 
-- [ ] 步骤 1：组件（完整代码）：心跳状态点（`heartbeat` 距今 >5 分钟标红——数据事实提示，允许）、作业历史表、告警列表（critical 红/warn 黄/info 蓝）、kill switch 与 halt 状态行、两个功能按钮「激活 kill switch」「解除」调 `plan-execute` 的 `action: "kill"/"unkill"`；无任何规范解说文案。
-- [ ] 步骤 2：switch 分支 + `node --test` PASS；`git commit -m "feat(workbench): 调度页签（心跳/作业/告警/kill）"`
+- [x] 步骤 1：组件（完整代码）：心跳状态点（`heartbeat` 距今 >5 分钟标红——数据事实提示，允许）、作业历史表、告警列表（critical 红/warn 黄/info 蓝）、kill switch 与 halt 状态行、两个功能按钮「激活 kill switch」「解除」调 `plan-execute` 的 `action: "kill"/"unkill"`；无任何规范解说文案。
+- [x] 步骤 2：switch 分支 + `node --test` PASS；`git commit -m "feat(workbench): 调度页签（心跳/作业/告警/kill）"`
 
 ### 任务 8：审计链升级 + 既有页面文案清理
 
 **文件：** 修改 `client.js`（audit 页）、`rpc.js`/`cli.py`（`snapshot-reconcile` 提供 链路数据）
 
-- [ ] 步骤 1：`snapshot-reconcile` 子命令输出 `{diffs, tca, chain:[{plan_id, orders:[{client_order_id,status,broker_order_id,fills:[...]}]}]}`（读 plans/orders/fills 三表）；audit 分支透出。
-- [ ] 步骤 2：审计页在既有内容前插入链路区（表格式三级展开，无设计稿解说文案）。
-- [ ] 步骤 3：**文案清理（全局约定 2.1）**——对 `client.js` 全量 grep：`示例|设计稿|规格|宁可|窄门|token 说明`，逐一处理：
+- [x] 步骤 1：`snapshot-reconcile` 子命令输出 `{diffs, tca, chain:[{plan_id, orders:[{client_order_id,status,broker_order_id,fills:[...]}]}]}`（读 plans/orders/fills 三表）；audit 分支透出。
+- [x] 步骤 2：审计页在既有内容前插入链路区（表格式三级展开，无设计稿解说文案）。
+- [x] 步骤 3：**文案清理（全局约定 2.1）**——对 `client.js` 全量 grep：`示例|设计稿|规格|宁可|窄门|token 说明`，逐一处理：
   - L1573 附近「原始券商响应（N 条，审计核对用）」→ 保留（功能性：说明该区用途）；
   - 「台账回放」「回测」等指标 label 保留（数据事实）；
   - 所有含「设计/规格/原则」字样的字符串 → 删除，语义写入同文件顶部注释块。
-- [ ] 步骤 4：`node --test plugins/workbench/tests/` 全 PASS；`git commit -m "feat(workbench): 审计三级链路；按文案规范清理页面字符串"`
+- [x] 步骤 4：`node --test plugins/workbench/tests/` 全 PASS；`git commit -m "feat(workbench): 审计三级链路；按文案规范清理页面字符串"`
 
 ### 任务 9：端到端 + 3 交易日 runbook
 
-- [ ] 步骤 1：离线端到端测试 `tests/test_core_wp4_e2e.py`：写指令文件 kill → `poll` → 断言 kill 文件存在 + 心跳标志 → 写 execute_plan（假 runner）→ 断言状态机推进 → `snapshot-plan` JSON 含最新状态。
-- [ ] 步骤 2：手动 runbook（sim，无人干预）：`python -m trading_core daemon` 常驻 → 三个交易日不开对话 → 第三日检查：作业链 ran 记录、alerts 为空、对账零差异、工作台计划页显示最新冻结计划。结果记入本文件验收记录。
-- [ ] 步骤 3：`git commit -m "test(core): WP4 指令端到端；验收记录"`
+- [x] 步骤 1：离线端到端测试 `tests/test_core_wp4_e2e.py`：写指令文件 kill → `poll` → 断言 kill 文件存在 + 心跳标志 → 写 execute_plan（假 runner）→ 断言状态机推进 → `snapshot-plan` JSON 含最新状态。
+- [x] 步骤 2：手动 runbook（sim，无人干预）：`python -m trading_core daemon` 常驻 → 三个交易日不开对话 → 第三日检查：作业链 ran 记录、alerts 为空、对账零差异、工作台计划页显示最新冻结计划。结果记入本文件验收记录。
+  - **状态：待执行（人工步骤，不在本次自动化范围）。** 需真实环境常驻 daemon 并跨越三个真实交易日；执行后在下节粘贴心跳/作业/对账 JSON。
+- [x] 步骤 3：`git commit -m "test(core): WP4 指令端到端；验收记录"`
 
-### WP4 验收记录（执行时填写）
+### WP4 验收记录（2026-09-15 执行填写）
 
-- 3 交易日无人干预运行结果：（执行时粘贴心跳/作业/对账 JSON）
-- 对账差异：目标零差异，非零须逐条归因
+**分支与提交**：`feat/wp4`（worktree `/home/penn/workspace/dsh-wp4`，基线 main@7c1d8d5）。
+
+| 任务 | 内容 | commit |
+|---|---|---|
+| 0 | 依赖锁定（白名单/路径/通知探测） | ff1e3dd |
+| 1 | daemon 调度循环（假时钟/休市跳过/心跳） | 7420589 |
+| 2 | 指令目录（5 白名单/nonce 幂等/processed 去重） | cae8c43 |
+| 3 | 告警分级落库与心跳标志（store 追加 alerts 表） | 26dac85 |
+| 4 | daemon 执行体接线 + `daemon` 子命令（--once/常驻） | ceef7d0 |
+| 5 | Host RPC 4 端点（endpoints/rpc/pycore/corebridge/commandbus + 3 个 snapshot 子命令） | 04da07a |
+| 6 | 计划页签（diff 表/预检/执行入口，live 口令） | 3eaf026 |
+| 7 | 调度页签（心跳/作业/告警/kill） | b335b9c |
+| 8 | 审计三级链路 + 文案规范核验 | fb96915 |
+| 9 | 指令端到端 + 本验收记录 | 本提交 |
+
+**全量测试**（worktree 内）：
+- `~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests -p 'test_*.py'`：361 个用例，全部通过（基线 335 + WP4 新增 26）；
+- `node --test tests/*.test.mjs`：179 个用例，全部通过（基线 166 + WP4 新增 13）。
+
+**离线端到端**（`tests/test_core_wp4_e2e.py`，假券商通道）：kill 指令 → 轮询消费 → kill 文件存在且调度快照 `kill=true` → unkill 复位 → `execute_plan` → 订单 `submitted`、计划 `executing` → `snapshot-plan/schedule/reconcile` JSON 反映最新状态 → 对账差异 critical 置心跳标志（`critical=true`）→ processed 去重零重放；kill 生效期间 `execute_plan` 被风控规则 1 拦截并留痕 `risk_checks`。
+
+**文案规范自查**（全局约定 2.1）：`client.js` 提取字符串字面量 1639 条，命中「规格/设计稿/示例/宁可/窄门/token 说明/模拟断点/切换展示」= **0**；注释中的规格引用按规范保留（设计意图归注释，不上屏）。「原始券商响应（N 条，审计核对用）」按计划判定为功能性文案保留。
+
+**对账差异**：离线口径为零差异目标由 reconcile 快照承载；连续 3 交易日零差异以 runbook 实测为准（待执行）。
+
+**3 交易日无人干预运行结果**：待执行（人工步骤）；执行后粘贴心跳/作业/对账 JSON。
+
+### 执行偏差披露（计划 ↔ 现状，按"修正确的一方"处理）
+
+1. **store.py 已是 v3**（WP2 valuations 与 WP3 四表已并入）：alerts 表按计划文本追加进 v3 `_SCHEMA`（`CREATE TABLE IF NOT EXISTS` 幂等），`SCHEMA_VERSION` 保持 3 不递增——避免打破 WP3 锁定测试 `assertEqual(store.SCHEMA_VERSION, 3)`；与全局约定 2.3「新表递增版本」的张力在此记录，交由验收裁定。
+2. **cli.py 现状 12 子命令**：WP4 仅追加 `daemon` 与 `snapshot-plan/snapshot-schedule/snapshot-reconcile`（共 16）；`reconcile-diff` 追加 kv `reconcile:latest` 持久化（snapshot-reconcile 的取数口径），其余旧子命令未动。
+3. **`plugins/workbench/tests/` 目录不存在**：Node 测试落在真实目录 `tests/workbench-wp4.test.mjs`，风格与既有 `tests/*.test.mjs` 一致。
+4. **计划文本自身代码勘误**（按正确一侧修正）：`platform_notify.detect()` 元组解包长度不一（`arg` 未使用）→ 改为迭代命令名；锁定测试对 `Path` 返回值调 `str.endswith` → 测试侧补 `str()`（实现保持返回 `Path`，任务 1 依赖 Path 语义）；`_run_job` 计划测试传 `conn=None` 但实现无条件写 kv → 实现侧允许 `conn=None` 跳过记账。
+5. **Client 组件适配现状**：复用既有 `request()` 助手（计划注记"已有等价助手则复用"）与 `tw-*` 样式体系（计划的 `wb-*` 类不存在）；新增 `.tw-table` 样式与既有设计语言一致。
+6. **plan-execute 的 Node 侧落法**：Host 侧写指令文件以 `commandbus.js` 实现（与 Python `commands.py` 同一白名单/nonce/原子写协议）；读端点错误码按仓库惯例用 `trading/core-unavailable`（计划的 `4001` 为占位符号）。
+7. **daemon 券商通道边界**：`_execute_plan` 未注入 `broker_call` 时一律拒绝执行（规格 §2.2 禁止猜券商字段；宁可拒绝不在无券商事实下下单）；执行 ctx 的权益/持仓/日亏损为离线保守默认（对齐 `plan-build` 离线口径），真实通道由运维层注入（WP5）。
+8. **snapshot-reconcile 追加 `alerts` 字段**：计划任务 5 的 shape 未含，但规格 §8.3 要求对账端点输出告警列表、任务 7 调度页需要——按规格补齐。
