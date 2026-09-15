@@ -26,10 +26,12 @@ def _sleep(seconds):
 
 
 def sync_bars_incremental(conn, ticker, period="1d", loader=None):
-    """仅支持 1d：增量按自然日折算根数，分钟级请用 backfill_bars（period 透传）。"""
+    """仅支持 1d：增量按自然日折算根数，分钟级请用 backfill_bars（period 透传）。
+    增量与回填统一富途原始价（autype=0），复权由 adjustments 派生。
+    """
     if period != "1d":
         raise ValueError("增量同步仅支持 1d（分钟级根数无法按自然日折算）")
-    loader = loader or load_bars
+    loader = loader or load_raw_bars
     symbol = to_futu_symbol(ticker)   # 落库统一 futu 格式；loader 仍收原 ticker
     last = store.last_bar_date(conn, symbol, period)
     if last is None:
