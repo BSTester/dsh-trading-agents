@@ -5,7 +5,13 @@ export function collectBody(req, limit = 1024 * 1024) {
     let size = 0;
     req.on("data", (chunk) => {
       size += chunk.length;
-      if (size > limit) { reject(new Error("payload too large")); req.destroy(); return; }
+      if (size > limit) {
+        const error = new Error("payload too large");
+        error.code = "payload-too-large";   // util 不拆 socket；响应权在 service
+        reject(error);
+        req.removeAllListeners("data");     // 停止接收，但不断连
+        return;
+      }
       chunks.push(chunk);
     });
     req.on("end", () => resolve(Buffer.concat(chunks).toString("utf8")));

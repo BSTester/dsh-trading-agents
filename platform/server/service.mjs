@@ -14,7 +14,12 @@ const MIME = {
 };
 
 function serveStatic(res, dist, urlPath, fallback = true) {
-  const relative = decodeURIComponent(urlPath === "/" ? "/index.html" : urlPath);
+  let relative;
+  try {
+    relative = decodeURIComponent(urlPath === "/" ? "/index.html" : urlPath);
+  } catch {
+    return sendJson(res, 400, { ok: false, error: { code: "trading/invalid-operation", message: "路径编码非法", details: {} } });
+  }
   const target = path.normalize(path.join(dist, relative));
   if (target !== dist && !target.startsWith(dist + path.sep)) {
     return sendJson(res, 403, { ok: false, error: { code: "trading/forbidden", message: "路径非法", details: {} } });
@@ -26,7 +31,12 @@ function serveStatic(res, dist, urlPath, fallback = true) {
     return serveStatic(res, dist, "/index.html", false);  // SPA 路由兜底
   }
   res.writeHead(200, { "Content-Type": MIME[path.extname(target)] ?? "application/octet-stream" });
-  createReadStream(target).pipe(res);
+  const stream = createReadStream(target);
+  stream.on("error", () => {
+    if (res.headersSent) res.destroy();
+    else sendJson(res, 500, { ok: false, error: { code: "trading/internal", message: "静态文件读取失败", details: {} } });
+  });
+  stream.pipe(res);
 }
 
 export function createService({ store, handle, mcp, config, dist, endpoints }) {
@@ -59,6 +69,9 @@ export function createService({ store, handle, mcp, config, dist, endpoints }) {
         try {
           payload = JSON.parse((await collectBody(req)) || "{}");
         } catch (error) {
+          if (error?.code === "payload-too-large") {
+            return sendJson(res, 413, { ok: false, error: { code: "trading/payload-too-large", message: "请求体超过 1MB 上限", details: {} } });
+          }
           return sendJson(res, 400, { ok: false, error: { code: "trading/invalid-operation", message: `请求体不是合法 JSON：${error.message}`, details: {} } });
         }
         if (!payload || typeof payload !== "object" || Array.isArray(payload)) {

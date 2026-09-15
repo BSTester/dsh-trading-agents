@@ -81,3 +81,14 @@ test("未构建 dist：静态请求 404 envelope（trading/not-found），服务
   assert.equal(body.error.code, "trading/not-found");
   assert.equal((await fetch(`${url}/healthz`)).status, 200);
 });
+
+test("超限请求体：413 envelope（不再是连接重置）", async (t) => {
+  const { url } = await withServer(t);
+  const big = "x".repeat(1024 * 1024 + 10);
+  const response = await fetch(`${url}/api/wb/snapshot`, {
+    method: "POST", headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pad: big }) });
+  assert.equal(response.status, 413);
+  assert.equal((await response.json()).error.code, "trading/payload-too-large");
+  assert.equal((await fetch(`${url}/healthz`)).status, 200);   // 服务存活
+});
