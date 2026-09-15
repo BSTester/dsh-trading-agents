@@ -1,5 +1,7 @@
 # 架构与交互边界
 
+> **WP4 状态标注（WP5 修订）：** 本文涉及 daemon、`plan`/`plan-execute`/`schedule`/`reconcile` 四个 RPC 的描述按 WP4 计划规格撰写，**以 WP4 合并后实测为准**。
+
 ## 结论性字段的中文标签
 
 结论（信号、买卖方向、评级、持仓状态、数据源状态、回测口径）在产出侧一律附
@@ -37,8 +39,12 @@ Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台嵌�
           workbench Client：结果卡片 + 展示面板 + 模式切换
 ```
 
-**明确不做**：第二个聊天窗口、工作台下单/撤单表单、浏览器直接持有富途 token、
+**明确不做**：第二个聊天窗口、浏览器直接持有富途 token、
 插件私建 LLM 对话循环、工作台 RPC 任意执行工具或 shell。
+工作台的下单边界已从「无任何下单入口」变更为「**恰好一个受约束执行入口——
+执行已冻结计划**」：唯一写路径是指令文件（白名单 5 种指令），live 需口令复核，
+对话侧保留等价 `plan_execute`，两条入口汇聚同一核心函数、同一套风控；
+逐单下单/撤单表单仍然不做。
 
 ## 组件职责
 
@@ -53,6 +59,8 @@ Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台嵌�
 | `plugins/workbench/src/client.js` | Harness 原生 module factory，使用宿主 React；`shell.overlay` 面板及 `tool.call.toolview` 卡片 |
 | `plugins/engine/python` | 量化计算与本地模拟台账的权威实现 |
 | `plugins/datasource/python` | **统一数据层**：唯一的富途 MCP 客户端、行情路由与回测核心，被 engine/workbench 共同依赖（不是 Harness 插件） |
+| `plugins/core/python/trading_core` | **量化平台核心库**（非 Harness 插件）：PIT 存储/日历/同步/质量（WP1）、因子/策略/组合回测/walk-forward（WP2）、风控八规则/计划冻结/OMS 状态机/券商适配/对账/TCA（WP3）、daemon 调度/指令目录/告警（WP4） |
+| `trading_core` daemon | 无 LLM 单进程守护进程（`python -m trading_core daemon`）：按交易日历触发作业链（sync→质量→信号→计划、对账→TCA→摘要）、心跳落 `~/.dsh/trading-daemon.json`（> 5 分钟未刷新工作台标红）、轮询指令目录 `~/.dsh/trading-commands/`、告警分级落 `alerts` 表（WP4） |
 
 `plugins/trading-agents` 是旧的未启用脚手架，不是当前执行引擎。
 workbench 包通过 `dsh.bundle.patch` 插入根级 Host 行；fin-data/engine 是普通插件包，
@@ -234,18 +242,25 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
 
 ## Host / Client 协议与存储
 
-工作台通过原生 `ctx.connection.fetch.register` 注册两条精确 POST 路由，
+工作台通过原生 `ctx.connection.fetch.register` 注册精确 POST 路由，
 Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 采用 Harness 的请求/响应 envelope，继承 Connection 的信任、认证和生命周期。
 不占用 Gateway 的共享 interceptor，也不创建额外 Web 服务。
-仅开放两个 endpoint：
+`snapshot` / `switch-mode` 之外，WP4 新增 4 个受约束端点
+（读侧一律经 `pycore` 调 `trading_core` 只读子命令取数，Node 不直接读 SQLite；
+写侧只落指令目录，不直接操作业务状态）：
 
 | Endpoint | 输入 | 输出 |
 |---|---|---|
 | `snapshot` | `{}` | 当前 mode、研报、研究记录、量化预览、交易响应、快照时间 |
 | `switch-mode` | `{mode, expected_mode, confirmation?}` | 实际 mode 与 `order_authorized: false` |
+| `plan` | `{}` | 当前/历史计划：目标 vs 实际 diff、逐单风控报告、状态时间线 |
+| `plan-execute` | `{plan_hash, expected_mode, confirmation?}` | live 需口令「确认执行」；服务端复核冻结状态/hash/mode；成功只返回 `{queued, nonce}`，状态经 `plan` 轮询 |
+| `schedule` | `{}` | daemon 心跳、作业历史、下次运行 |
+| `reconcile` | `{}` | 最近对账差异、TCA 摘要、告警列表 |
 
-不开放 `execute`、下单、shell、LLM 或 token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
+除 `plan-execute`（执行已冻结计划，白名单指令落盘）外，不开放下单、shell、LLM 或
+token 读取接口。所有页面内容按文本呈现，不执行研报中的 HTML。
 
 默认数据根目录 `~/.dsh`，可用 `DSH_HOME` 覆盖。`trading-workbench.json` 保存版本化快照，
 各列表最多保留最近 100 项；这不是完整审计档案，完整过程仍在 Harness 会话记录中。
@@ -265,5 +280,6 @@ Connection RPC、工具守卫/结果事件、客户端 `./client` 导出和 modu
 
 优先级：安装/宿主集成验收 → 数据源与量化正确性 → 富途模拟盘成交/对账 →
 告警、审计、熔断及恢复 → 样本外策略评估 → 人工决定是否小额实盘。
-港美历史数据、多市场交易规则、券商实时推送、自动对账、自动调度和生产级熔断仍需后续实现；
+券商实时推送、港美历史数据与多市场交易规则仍需后续实现；本地对账/调度/熔断告警
+由 WP3–WP4 交付（以 WP4 合并后实测为准，恢复演练见 [RUNBOOK.md](RUNBOOK.md)）；
 面板可用不代表已达到实盘准入条件。
