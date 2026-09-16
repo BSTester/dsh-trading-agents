@@ -262,25 +262,27 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(sa.store_file(self.home).read_bytes(), before)
         self.assert_no_lock_left()
 
-    def test_endpoints_manifest_is_23_and_cached(self):
+    def test_endpoints_manifest_is_52_and_cached(self):
         endpoints = sa.endpoints()
-        # 37 项 = 22 项基础清单（WP7 面板退役后冻结在 sa._BASE_ENDPOINTS，原序=已删
+        # 52 项 = 22 项基础清单（WP7 面板退役后冻结在 sa._BASE_ENDPOINTS，原序=已删
         # endpoints.js 的数组原序）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS；任务 3
         # 起含 factors-history + 6 个交易端点）+ WP8 富途实时直通 8 端点
-        # （store_access.FUTU_ENDPOINTS）。整表钉死见 test_wp6_tables_lock。
+        # （store_access.FUTU_ENDPOINTS）+ WP8 OpenAPI 行情 9 端点 + WP8 任务 3 的
+        # OpenAPI 交易只读 6 端点。整表钉死见 test_wp6_tables_lock。
         expected = (22 + len(sa.WP7_ENDPOINTS) + len(sa.FUTU_ENDPOINTS)
-                    + len(sa.WP8_MARKET_ENDPOINTS))
+                    + len(sa.WP8_MARKET_ENDPOINTS) + len(sa.WP8_TRADE_ENDPOINTS))
         self.assertEqual(len(endpoints), expected)
-        self.assertEqual(expected, 46)
+        self.assertEqual(expected, 52)
         self.assertEqual(endpoints[0], "snapshot")
-        self.assertEqual(endpoints[-24], "factors-history")
-        self.assertEqual(endpoints[-23:-17],
+        self.assertEqual(endpoints[-30], "factors-history")
+        self.assertEqual(endpoints[-29:-23],
                          ["trade_place", "trade_modify", "trade_cancel",
                           "account_positions", "account_orders", "account_funds"])
-        self.assertEqual(endpoints[-17:-9], list(sa.FUTU_ENDPOINTS))
-        self.assertEqual(endpoints[-9:], list(sa.WP8_MARKET_ENDPOINTS))
+        self.assertEqual(endpoints[-23:-15], list(sa.FUTU_ENDPOINTS))
+        self.assertEqual(endpoints[-15:-6], list(sa.WP8_MARKET_ENDPOINTS))
+        self.assertEqual(endpoints[-6:], list(sa.WP8_TRADE_ENDPOINTS))
         # 业务确认两端点必须在白名单里（HTTP 面据此注册路由）
-        self.assertEqual(endpoints[-26:-24], ["confirmation", "confirm-decide"])
+        self.assertEqual(endpoints[-32:-30], ["confirmation", "confirm-decide"])
         self.assertEqual(len(set(endpoints)), expected)
         self.assertEqual(endpoints, sa.endpoints())
         # 缓存返回副本：调用方改动不会污染下一次
@@ -329,7 +331,7 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(snap["activity"], [])
         self.assertEqual(len(snap["endpoints"]),
                          22 + len(sa.WP7_ENDPOINTS) + len(sa.FUTU_ENDPOINTS)
-                         + len(sa.WP8_MARKET_ENDPOINTS))
+                         + len(sa.WP8_MARKET_ENDPOINTS) + len(sa.WP8_TRADE_ENDPOINTS))
         self.assertIsNone(snap["confirmation"])
         self.assertFalse(sa.store_file(self.home).exists())  # 只读：连空 store 都不落盘
 

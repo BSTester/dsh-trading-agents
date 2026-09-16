@@ -214,6 +214,25 @@ def load_channel(home=None):
     return channel if channel in (CHANNEL_MCP, CHANNEL_OPENAPI) else CHANNEL_MCP
 
 
+def openapi_ready(credential_path=None):
+    """OpenAPI 凭据是否可用（**行情与交易两条链共用的唯一判定**）。
+
+    oauth → access_token/refresh_token 至少有一个（可刷新）；
+    appkey → app_key 与 private_key_path 齐备；其余（文件缺失/坏 JSON/mode 未配置）→ False。
+    """
+    from trading_datasource.futu_openapi import CredentialStore  # noqa: PLC0415
+    try:
+        cred = CredentialStore(credential_path).load()
+    except (OSError, ValueError):
+        return False
+    mode = cred.get("mode")
+    if mode == "oauth":
+        return bool(cred.get("access_token") or cred.get("refresh_token"))
+    if mode == "appkey":
+        return bool(cred.get("app_key") and cred.get("private_key_path"))
+    return False
+
+
 class FutuDataError(RuntimeError):
     """直通层失败：``kind`` ∈ unavailable/business/parameter/openapi-unavailable 决定信封码。"""
 
@@ -366,20 +385,14 @@ class FutuData:
         return self._market_built
 
     def _openapi_ready(self):
-        """channel=openapi 时凭据是否可用（注入 market 替身视为可用）。"""
+        """channel=openapi 时凭据是否可用（注入 market 替身视为可用）。
+
+        判定逻辑在模块级 ``openapi_ready``（与 server/trading.py 的 OpenAPI 交易链共用
+        同一份实现，避免两条链对「凭据可用」给出两种答案）。
+        """
         if self._market_override is not None:
             return True
-        from trading_datasource.futu_openapi import CredentialStore  # noqa: PLC0415
-        try:
-            cred = CredentialStore(self._credential_path).load()
-        except (OSError, ValueError):
-            return False
-        mode = cred.get("mode")
-        if mode == "oauth":
-            return bool(cred.get("access_token") or cred.get("refresh_token"))
-        if mode == "appkey":
-            return bool(cred.get("app_key") and cred.get("private_key_path"))
-        return False
+        return openapi_ready(self._credential_path)
 
     def _tool(self):
         if self._call is None:

@@ -1,6 +1,6 @@
-# WP6 补遗任务 D：MCP 工具面（50 工具，WP8 任务 2 起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
+# WP6 补遗任务 D：MCP 工具面（56 工具，WP8 任务 3 起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
 #
-# 唯一事实来源：本文件的 ``TOOLS`` 清单（45 端点工具 + 5 维护工具；46 端点扣除有意
+# 唯一事实来源：本文件的 ``TOOLS`` 清单（51 端点工具 + 5 维护工具；52 端点扣除有意
 # 排除的 confirm-decide）。MCP 工具不复制任何业务逻辑：端点工具一律
 # ``handle(endpoint, payload)``（app.create_handler 的产物，与 HTTP 面同一个实例），
 # 维护工具一律 ``store_api.admin_*``——两条通道对同一 payload 因此必然同源
@@ -8,7 +8,8 @@
 #
 # **``confirm-decide`` 有意不进工具面**（规格 §5.1 A7，2026-09-15 业务确认修订）：
 # HTTP 面 WP6 时 23 端点里有 22 个各有一个 MCP 工具（WP7 任务 3 起 29 端点 28 工具，
-# WP8 富途直通起 37 端点 36 工具，WP8 任务 2 起 46 端点 45 工具），
+# WP8 富途直通起 37 端点 36 工具，WP8 任务 2 起 46 端点 45 工具，WP8 任务 3 起
+# 52 端点 51 工具），
 # 唯一被排除的始终是 ``confirm-decide``。
 # 理由是通道分级：它是**唯一能批准实盘操作**的通道，必须只由独立 Web 上的用户点击触发。
 # 若把它做成工具，模型就能"自己发起、自己批准"，业务确认会退化成模型自批实盘单——
@@ -33,7 +34,7 @@
 # SDK 适配结论（mcp 2.2.0 实测，非推测）：
 #   * ``from mcp.server.mcpserver import MCPServer``（2.x 由 FastMCP 更名）；
 #   * 注册面是 ``MCPServer.add_tool(fn, name=..., description=..., structured_output=...)``，
-#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 50 个工具共用一个
+#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 56 个工具共用一个
 #     ``**kwargs`` 派发函数 + 每个工具自带的 ``__signature__`` 表达字段集，注解即契约；
 #   * ``MCPServer.list_tools/call_tool`` 是 async；``streamable_http_app()`` 返回的 Starlette
 #     app 自带 ``lifespan=session_manager.run()``，挂载时须并入主 app 的 lifespan；
@@ -78,10 +79,11 @@ from server import store_access
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
 
-# 工具面总数：45 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
-# 工具 + WP8 富途实时直通 8 个 + WP8 任务 2 的 9 个行情工具；46 端点扣除有意排除的
-# confirm-decide）+ 5 维护工具（§3.4）。锁定测试断言 50 恒成立。
-TOOL_COUNT = 50
+# 工具面总数：51 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
+# 工具 + WP8 富途实时直通 8 个 + WP8 任务 2 的 9 个行情工具 + WP8 任务 3 的 6 个
+# OpenAPI 交易只读工具；52 端点扣除有意排除的 confirm-decide）+ 5 维护工具（§3.4）。
+# 锁定测试断言 56 恒成立。
+TOOL_COUNT = 56
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
 # ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
@@ -152,6 +154,15 @@ _TYPES = {
     "action": Literal["execute", "cancel", "kill", "unkill"],
     # WP7 任务 3：交易方向（broker.py place 的 side 口径，1=BUY 2=SELL 由闸门映射）
     "side": Literal["BUY", "SELL"],
+    # WP8 任务 3：OpenAPI 交易枚举（naming-dictionary 原文；取值与
+    # trading_datasource.futu_openapi.OpenApiTrade 的常量集合逐项一致，锁定测试比对）。
+    # order_type 8 枚举（NONE=未知不列入，模型不得构造）；trd_market 8 枚举；
+    # exchange 14 枚举（官方无北交所——北交所标的的撤单/改单在服务端如实拒绝）。
+    "order_type": Literal["LIMIT", "MARKET", "AUCTION", "AUCTION_LIMIT", "STOP",
+                          "STOP_LIMIT", "MARKET_IF_TOUCHED", "LIMIT_IF_TOUCHED"],
+    "trd_market": Literal["HK", "US", "SG", "HKCC", "CA", "FUTURES", "JP", "KR"],
+    "exchange": Literal["US", "SEHK", "SGX", "SSE", "SZSE", "JP", "CA", "CME", "CBOT",
+                        "NYMEX", "COMEX", "CBOE", "HKFE", "KR"],
     # WP8 富途直通：对象入参（option_screen 的 filter；option_chain 的 field_filter）。
     # 顶层模型仍 additionalProperties:false（_forbid_extra_fields），对象**内部**的键
     # 由 server/futu_data.py 的内键白名单校验——嵌套 dict 不进封闭模型。
@@ -225,7 +236,7 @@ class ToolDefinition:
 
 
 # ---------------------------------------------------------------------------
-# 50 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history、6 个
+# 56 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history、6 个
 # 受约束交易工具，逐项对应）
 # ---------------------------------------------------------------------------
 # 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
@@ -413,14 +424,17 @@ TOOLS = (
     # 闸门链：模式文件 → 风控 8 规则（kill 是规则 1）→ 业务确认（唯一放行方式）→ broker。
     # 提交后阻塞等待用户在独立 Web 确认卡片作答；确认 TTL 120 秒，超时自动拒绝
     # （fail-closed）。工具描述必须把这条边界讲清楚：模型能发起、只有人能批准。
-    # live 写通道未接入（默认适配器 supports_live_write=False）：三个写工具在确认
-    # 之前即被闸门拒绝（trading/broker-unavailable），描述里如实写明，免得模型
-    # 在 live 下发起一笔注定被拒、还要占用确认通道的提交。
+    # WP8 任务 3 起 live 写可落地：futu_channel=openapi 且已配置凭据时走 REST，券商侧的
+    # need_order_confirm 由服务端在人工批准之后自动完成（两层确认合一；工具面**没有**券商
+    # 确认入口，模型不能自批）。未配置 OpenAPI（默认部署）时 live 写仍在确认之前被闸门
+    # 拒绝（trading/broker-unavailable），描述里如实写明，免得模型在 live 下发起一笔
+    # 注定被拒、还要占用确认通道的提交。
     ToolDefinition(
         "trade_place",
         "受约束下单（临时订单，限价）：过完整闸门链（模式文件→风控 8 规则→kill→业务确认）"
         "后提交券商。提交后需在独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
-        "live 写通道尚未接入（提交会被拒绝）；当前仅 sim 可交易。"
+        "live 写需 futu_channel=openapi 且已配置凭据（券商二次确认由服务端在人工批准后"
+        "自动完成）；未配置时 live 提交会被拒绝，当前仅 sim 可交易。"
         "模式只认账户模式文件（载荷不带 mode）。",
         "trade_place",
         (
@@ -433,10 +447,11 @@ TOOLS = (
     ),
     ToolDefinition(
         "trade_modify",
-        "受约束改单（=撤旧单+按新参数重下，因券商改单接口不可靠）：过完整闸门链"
-        "（模式→风控 8 规则→kill→业务确认）后执行，风控按新参数全额预检。提交后需在"
-        "独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
-        "live 写通道尚未接入（提交会被拒绝）；当前仅 sim 可交易。",
+        "受约束改单：过完整闸门链（模式→风控 8 规则→kill→业务确认）后执行，风控按新参数"
+        "全额预检。提交后需在独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
+        "sim 分支=撤旧单+按新参数重下（券商模拟改单接口不可靠）；live（OpenAPI）非 A 股"
+        "直接原生改单，A 股官方不支持改单（如实拒绝，请改走撤单+重新下单）。"
+        "live 写需 futu_channel=openapi 且已配置凭据；未配置时 live 提交会被拒绝。",
         "trade_modify",
         (
             req("order_id", "str", "要改的券商订单号"),
@@ -451,7 +466,8 @@ TOOLS = (
         "trade_cancel",
         "受约束撤单：过闸门（kill/模式/交易日三规则真实约束；撤单不新增敞口）后向券商"
         "提交撤单。撤错单同样是业务错误，故同样需在独立 Web 确认卡片批准；TTL 120 秒"
-        "超时自动拒绝（fail-closed）。live 写通道尚未接入（提交会被拒绝）；当前仅 sim 可交易。",
+        "超时自动拒绝（fail-closed）。live 写需 futu_channel=openapi 且已配置凭据；"
+        "未配置时 live 提交会被拒绝，当前仅 sim 可交易。",
         "trade_cancel",
         (
             req("order_id", "str", "要撤销的券商订单号"),
@@ -480,6 +496,106 @@ TOOLS = (
         "实时查询不缓存。",
         "account_funds",
         (opt("mode", "mode", "账户模式，缺省读模式文件"),),
+    ),
+    # ---- WP8 任务 3：OpenAPI 交易只读端点（6 个；字段与 app.py 的
+    # OPENAPI_TRADE_FIELDS 白名单逐键同形）----
+    # 全部**实时直通**（TTL 0，不进缓存）、受模式约束（mode 缺省读模式文件）。通道要求：
+    # trading-platform.json 的 futu_channel=openapi 且已配置凭据（scripts/futu_auth.py
+    # --openapi）；mcp 通道下这些工具返回 trading/openapi-unavailable 并给出替代路径——
+    # 描述里如实写明，免得模型在 mcp 部署下反复试错。sim 模式没有对应 REST 面（OpenAPI
+    # 交易接口只覆盖实盘业务账户），sim 请用 account_orders/account_positions/account_funds。
+    ToolDefinition(
+        "trade_max_qty",
+        "最大可交易量（OpenAPI 交易链，需 futu_channel=openapi）：按授权账户列出 "
+        "max_cash_buy/max_cash_and_margin_buy/max_position_sell/max_sell_short/max_buy_back "
+        "等原始字段；order_type 必填（LIMIT/MARKET/…），带 order_id 时查该订单的最大可改"
+        "数量。mcp 通道下返回 openapi-unavailable（可用 account_* 替代）。",
+        "trade_max_qty",
+        (
+            req("code", "str", "标的代码，如 US.AAPL / HK.00700 / SH.600519"),
+            req("order_type", "order_type", "订单类型（LIMIT/MARKET/AUCTION/AUCTION_LIMIT/"
+                                            "STOP/STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED）"),
+            opt("price", "number", "非市价单的价格（3 位小数，超出截断）"),
+            opt("order_id", "str", "要查最大可改数量的券商订单号（省略=查新单）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+        ),
+    ),
+    ToolDefinition(
+        "orders_open",
+        "未完成订单（OpenAPI 交易链，需 futu_channel=openapi）：含最近 24 小时已成交/"
+        "已撤单；分页用 page_flag，返回 completed=true 表示本批已取尽。"
+        "mcp 通道下返回 openapi-unavailable（可用 account_orders 替代）。",
+        "orders_open",
+        (
+            req("market", "trd_market", "交易市场：HK/US/SG/HKCC/CA/FUTURES/JP/KR"),
+            opt("page_flag", "str", "分页游标，空串=从头开始（用响应里的 page_flag 续页）"),
+            opt("page_size", "int", "每页条数 10..100（缺省 50）", minimum=10,
+                maximum=100),
+            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+        ),
+    ),
+    ToolDefinition(
+        "orders_history",
+        "历史订单（OpenAPI 交易链，需 futu_channel=openapi）：start/end 是创建时间的"
+        "**微秒**时间戳（都省略=官方 0/0 组合语义，近 90 天）；分页用 page_flag。"
+        "mcp 通道下返回 openapi-unavailable（可用 account_orders 替代）。",
+        "orders_history",
+        (
+            req("market", "trd_market", "交易市场：HK/US/SG/HKCC/CA/FUTURES/JP/KR"),
+            opt("code", "str", "只返回该标的的订单（省略=全部）"),
+            opt("start", "int", "创建时间起点（微秒时间戳）"),
+            opt("end", "int", "创建时间终点（微秒时间戳，须晚于 start）"),
+            opt("page_flag", "str", "分页游标，空串=从头开始"),
+            opt("page_size", "int", "每页条数 10..100（缺省 50）", minimum=10,
+                maximum=100),
+            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+        ),
+    ),
+    ToolDefinition(
+        "orders_detail",
+        "订单详情（OpenAPI 交易链，需 futu_channel=openapi）：同一批 order_ids 必须属于"
+        "同一个 exchange（最多 49 个）；服务端对每个授权账户各查一次，订单出现在持有它的"
+        "账户分组里。mcp 通道下返回 openapi-unavailable（可用 account_orders 替代）。",
+        "orders_detail",
+        (
+            req("exchange", "exchange", "交易所：US/SEHK/SGX/SSE/SZSE/JP/CA/CME/CBOT/"
+                                        "NYMEX/COMEX/CBOE/HKFE/KR"),
+            req("order_ids", "str_list", "订单号列表，1..49 个（同一 exchange）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+        ),
+    ),
+    ToolDefinition(
+        "deals_today",
+        "当日成交（OpenAPI 交易链，需 futu_channel=openapi）：order_fills 原始字段"
+        "（trd_side/deal_id/order_id/qty/price/成交对手方等）；分页用 page_flag。"
+        "mcp 通道下返回 openapi-unavailable（成交历史可用 account_orders 的订单状态"
+        "间接核对）。",
+        "deals_today",
+        (
+            req("market", "trd_market", "交易市场：HK/US/SG/HKCC/CA/FUTURES/JP/KR"),
+            opt("page_flag", "str", "分页游标，空串=从头开始"),
+            opt("page_size", "int", "每页条数 10..100（缺省 50）", minimum=10,
+                maximum=100),
+            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+        ),
+    ),
+    ToolDefinition(
+        "deals_history",
+        "历史成交（OpenAPI 交易链，需 futu_channel=openapi）：start/end 是**更新**时间的"
+        "微秒时间戳（都省略=近 90 天）；page_size 上界 50（与订单页的 100 不同）。"
+        "mcp 通道下返回 openapi-unavailable（成交历史可用 account_orders 的订单状态"
+        "间接核对）。",
+        "deals_history",
+        (
+            req("market", "trd_market", "交易市场：HK/US/SG/HKCC/CA/FUTURES/JP/KR"),
+            opt("code", "str", "只返回该标的的成交（省略=全部）"),
+            opt("start", "int", "更新时间起点（微秒时间戳）"),
+            opt("end", "int", "更新时间终点（微秒时间戳，须晚于 start）"),
+            opt("page_flag", "str", "分页游标，空串=从头开始"),
+            opt("page_size", "int", "每页条数 10..50（缺省 50）", minimum=10,
+                maximum=50),
+            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+        ),
     ),
     # ---- WP8：富途实时数据直通（8 个；取数在 server/futu_data.py，实时零缓存）----
     # 数据由服务端**实时**经富途托管 MCP 通道获取（skills 不再回退直连富途）；全部实时
@@ -699,7 +815,7 @@ if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时
 # 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
 TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 
-# 45 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
+# 51 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 
@@ -841,7 +957,7 @@ class BoundTool:
 
 
 def build_tools(handle, store_api):
-    """50 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
+    """56 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
 
     ``handle`` 必须是 ``app.create_handler`` 的产物——与 HTTP 面同一个实例（规格 §5.2 R6）。
     """
@@ -867,7 +983,7 @@ def _bind(definition, handle, store_api):
 
 
 def register(server: MCPServer, handle, store_api=None):
-    """把 50 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
+    """把 56 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
 
     ``store_api`` 在生产路径上由 create_app 显式传入；缺省 None 只为单测里手搓 server 的便利
     （此时维护工具调用会抛 AttributeError，并按程序异常包成 tool-failed）。

@@ -126,6 +126,21 @@ TRADE_MODIFY_FIELDS = ("order_id", "symbol", "side", "qty", "price", "client_ord
 TRADE_CANCEL_FIELDS = ("order_id", "symbol", "client_order_id")
 # 账户查询只受模式约束直通 broker；mode 缺省读模式文件（实时查询，不进缓存）
 ACCOUNT_QUERY_FIELDS = ("mode",)
+# WP8 任务 3：OpenAPI 交易只读端点的载荷白名单（逐端点定义；与 mcp_tools 的工具字段
+# 逐键同形，锁定测试比对）。这些端点是**读类**：只受模式约束（mode 缺省读模式文件），
+# 业务参数（code/market/exchange/page_flag/...）整体下传 trading.TradeGate._read；
+# 时间戳是微秒整数、枚举（order_type/trd_market/exchange）在 mcp_tools 的 schema 层
+# 与 OpenApiTrade 的方法层各拒一次（坏参数零网络往返）。实时直通，不进任何缓存。
+OPENAPI_TRADE_FIELDS = {
+    "trade_max_qty": ("code", "order_type", "price", "order_id", "mode"),
+    "orders_open": ("market", "page_flag", "page_size", "mode"),
+    "orders_history": ("market", "code", "start", "end", "page_flag", "page_size",
+                       "mode"),
+    "orders_detail": ("exchange", "order_ids", "mode"),
+    "deals_today": ("market", "page_flag", "page_size", "mode"),
+    "deals_history": ("market", "code", "start", "end", "page_flag", "page_size",
+                      "mode"),
+}
 # WP8 富途实时直通端点的载荷白名单（深校验在 server/futu_data.py：code 归一/必填/内键）。
 # 实时类 TTL 0，不进 CACHE_TTL_MS/ENDPOINT_SHAPE；WP8 任务 2 的基本五类
 # （info_basicinfo/info_trading_days/info_search/info_market_state/quote_history_kline_v2）
@@ -349,6 +364,13 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 # broker 异常在闸门内信封化为 trading/broker-unavailable，不 500。
                 _check_fields(endpoint, payload, ACCOUNT_QUERY_FIELDS)
                 return getattr(trade, endpoint.replace("account_", ""))(payload.get("mode"))
+            if endpoint in OPENAPI_TRADE_FIELDS:
+                # WP8 任务 3：OpenAPI 交易只读端点（6 个）——载荷白名单在这里拒，模式
+                # 约束与通道路由在 trade._read（broker 缺 OpenAPI 通道时信封为
+                # trading/openapi-unavailable，指引 scripts/futu_auth.py --openapi）。
+                # 实时直通：不进 caches.cached（TTL 0，与 account_* 同类）。
+                _check_fields(endpoint, payload, OPENAPI_TRADE_FIELDS[endpoint])
+                return getattr(trade, endpoint)(payload)
             if endpoint in futu_data.FUTU_TOOLS:
                 # WP8 富途实时直通：skills 需要而本地无缓存的数据由服务端实时经富途获取。
                 # 浅白名单在这里拒（与其他端点同形），深校验（code 归一/必填/内键/上游
@@ -399,10 +421,10 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         from server import scheduler as scheduler_module
         scheduler = scheduler_module.Scheduler(scheduler_module.build_tick(home), interval=60.0)
 
-    # MCP 工具面（WP6 补遗 D + WP7 + WP8）：50 工具注册进 MCPServer，端点工具与 HTTP 面
+    # MCP 工具面（WP6 补遗 D + WP7 + WP8）：56 工具注册进 MCPServer，端点工具与 HTTP 面
     # 共用同一个 handle 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的
     # home 绑定门面。
-    # 46 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
+    # 52 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
     mcp_server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
     bound_tools = mcp_tools.register(mcp_server, handle, mcp_tools.StoreApi(home))
     # json_response=True 对齐 Node 版 enableJsonResponse：无 SSE 依赖，普通 JSON 响应。

@@ -12,6 +12,25 @@
 #   * 业务确认        → server.store_access 确认三方法（进程内，TTL 超时=拒绝）
 #   * 富途通道        → trading_datasource.futu_mcp.call_tool（惰性导入）
 #
+# WP8 任务 3（交易链路统一至富途 OpenAPI）：在**不改闸门链**的前提下给写路径接上 REST
+# 交易面（trading_datasource.futu_openapi.OpenApiTrade，13 方法）：
+#
+#   * 通道路由：``trading-platform.json`` 的 ``futu_channel``（**默认 mcp**）为
+#     ``openapi`` 且 OpenAPI 凭据可用时，live 写与 live 账户查询走 REST；否则
+#     完全沿用 WP7 行为（live 写先置拒绝 trading/broker-unavailable、sim 走既有
+#     sim_trade_* 工具）。默认（无凭据）行为零变化是硬约束（不变式 2）。
+#   * 两层确认合一：live 下**闸门内的业务确认（Web 卡片）是唯一人工批准**；券商侧
+#     ``need_order_confirm`` 由 broker 在人工批准之后**自动**调 order_confirm 完成
+#     （用户已批准本单参数，不再二次打扰）。confirm 失败一律落 ``unknown``：
+#     订单在券商侧已挂起、confirm 结果不确定，铁律「先查询不重放」——**绝不重发下单**。
+#     本模块**不新增模型可调用的 trade_confirm 工具**（工具面里没有券商确认入口）。
+#   * 改单策略：官方 ``PUT /orders/{order_id}`` 支持原生改单 → live 非 A 股直接改单
+#     （不再「撤旧重下」）；官方明示**不支持改 A 股订单**（modify-order 页）→ A 股
+#     改单如实拒绝并给出替代路径（先 trade_cancel 再 trade_place，两笔独立批准）。
+#     sim 路径不变（TOOL-LIMITS：sim_trade_modify_order 间歇性 -5 → 撤单+重下）。
+#   * 新增 6 个 OpenAPI 只读端点/工具（trade_max_qty/orders_open/orders_history/
+#     orders_detail/deals_today/deals_history）：mode 约束 + REST 直通，**不进缓存**。
+#
 # 错误码族（与既有 trading/* 一致）：
 #   trading/order-rejected     参数/模式/风控/确认/OMS 查重等「拒单」类失败
 #   trading/broker-unavailable 券商通道异常（适配器/网络/未接入）
@@ -41,6 +60,7 @@ except ImportError:
     from trading_core import risk as core_risk
     from trading_core import store as core_store
 
+from server import futu_data
 from server import store_access
 from server.store_access import WorkbenchError
 
@@ -71,20 +91,70 @@ PREFIX_MARKET_ID = {"SH": 3, "SZ": 3, "BJ": 3, "HK": 1, "US": 100}
 
 _SYMBOL_RE = re.compile(r"^([A-Z]+)\.\S+$")
 
-# live 写路径的如实拒绝（见 FutuBroker 的说明）。
+# live 写路径的如实拒绝（见 FutuBroker 的说明）：**只对 mcp 通道的 FutuBroker 成立**——
+# futu_channel=openapi 且凭据可用时 live 写由 OpenApiBroker 走 REST（WP8 任务 3）。
 LIVE_WRITE_REFUSAL = (
-    "实盘下单/改单/撤单的券商适配未实现：WP3 只锁定 trading_order_place 的 schema，"
-    "未实现 live 执行（铁律：不另写富途协议）。live 写路径待后续任务接入券商通道"
+    "实盘下单/改单/撤单在当前通道未接入券商执行：FutuBroker 只做 sim 写与账户查询"
+    "（WP3 锁定 trading_order_place 的 schema；live 写由 OpenApiBroker 承担，需"
+    " futu_channel=openapi 且已配置 OpenAPI 凭据）"
 )
 
 # live 写的闸门前置拒绝（TradeGate._write 在业务确认**之前**快速失败）：适配器未声明
 # supports_live_write 时，live 写走完确认也注定被 _live_guard 拒绝——先置拒绝让确认
 # 不被花在注定被拒的单上：不发起确认、不产生待确认、不落任何 OMS/风控行。
-LIVE_WRITE_UNAVAILABLE = "live 写通道尚未接入券商执行协议；当前仅 sim 可交易"
+LIVE_WRITE_UNAVAILABLE = ("live 写通道未接入券商执行协议（futu_channel=openapi 且已配置"
+                          " OpenAPI 凭据后启用）；当前仅 sim 可交易")
+
+# ---------------------------------------------------------------------------
+# WP8 任务 3：OpenAPI 交易链（通道路由 + 6 个只读端点）常量
+# ---------------------------------------------------------------------------
+# OpenAPI 凭据缺失的固定指引（与 server/futu_data.py 同一条文案，指向授权脚本）。
+OPENAPI_AUTH_HINT = "（运行 scripts/futu_auth.py --openapi 完成 OAuth/AppKey 配置）"
+# OpenAPI 交易通道不可用的信封码（与 futu_data 行情通道同码族；写路径的通道失败仍是
+# trading/broker-unavailable —— 闸门既有语义不变）。
+OPENAPI_UNAVAILABLE_CODE = "trading/openapi-unavailable"
+
+# 市场前缀 → OpenAPI 授权账户的 enable_market（naming-dictionary#enable-market：
+# 1=HK 2=US 4=ChinaStock 5=Futures 6=SG 12=CA 15=JP 18=KR）。**与 sim 的
+# PREFIX_MARKET_ID 数字口径不同**（那是券商模拟账户的 market_id：HK 1/A 股 3/US 100），
+# 两套数字各自来自各自通道的实测/文档，不互相换算。
+OPENAPI_ENABLE_MARKET = {"HK": 1, "US": 2, "SH": 4, "SZ": 4, "BJ": 4}
+
+# 市场前缀 → OpenAPI exchange（naming-dictionary#exchange）。官方枚举没有北交所（BJ）：
+# 北交所标的的撤单/改单据此如实拒绝（不伪造 exchange 值），下单不受影响（place 只用 code）。
+OPENAPI_EXCHANGE = {"SH": "SSE", "SZ": "SZSE", "HK": "SEHK", "US": "US"}
+
+# A 股前缀（官方 modify-order 页：Does not support modifying A-share orders）。
+A_SHARE_PREFIXES = frozenset({"SH", "SZ", "BJ"})
+
+# enable_market 数字 → trd_market（naming-dictionary#trd-market 的官方枚举覆盖到的那些）。
+ENABLE_MARKET_TO_TRD = {1: "HK", 2: "US", 4: "HKCC", 5: "FUTURES", 6: "SG", 12: "CA",
+                        15: "JP", 18: "KR"}
+# 逆映射：trd_market → enable_market（6 个只读查询按市场挑账户）。
+TRD_MARKET_TO_ENABLE = {market: code for code, market in ENABLE_MARKET_TO_TRD.items()}
+
+# 6 个 OpenAPI 只读端点/工具（工具面与端点清单增量，锁定测试逐个比对）。
+OPENAPI_TRADE_ENDPOINTS = ("trade_max_qty", "orders_open", "orders_history",
+                           "orders_detail", "deals_today", "deals_history")
+
+# 只读新工具在 mcp 通道/未配置凭据/sim 模式下的如实拒绝文案（同一份，避免两处漂移）。
+OPENAPI_ONLY_HINT = ("该查询属于 OpenAPI 交易链（trading-platform.json 的 "
+                     "futu_channel=openapi 且已配置凭据）" + OPENAPI_AUTH_HINT
+                     + "；mcp 通道下可用 account_orders/account_positions/account_funds")
 
 
 class BrokerUnavailable(RuntimeError):
     """券商通道不可用/未接入：适配层「确定未发出」的故障才抛这一类。"""
+
+
+class OpenApiUnavailable(BrokerUnavailable):
+    """OpenAPI 交易通道不可用（channel≠openapi / 凭据缺失 / sim 模式无 REST 面）。
+
+    单独子类是为了让**只读** OpenAPI 端点/工具的失败信封用
+    ``trading/openapi-unavailable``（与 server/futu_data.py 的行情通道同码族，指引用户
+    去 ``scripts/futu_auth.py --openapi``）；写路径的通道失败仍是
+    ``trading/broker-unavailable``（闸门既有语义，不变）。
+    """
 
 
 def _now():
@@ -280,10 +350,10 @@ def _check_order(operation, clean, mode):
 
 
 # ---------------------------------------------------------------------------
-# 默认 broker 适配（唯一的富途协议接触面）
+# broker 适配（唯一的富途协议接触面）
 # ---------------------------------------------------------------------------
 class FutuBroker:
-    """gate→broker 接口（place/modify/cancel/positions/orders/funds）的默认实现。
+    """gate→broker 接口（place/modify/cancel/positions/orders/funds）的 WP7 实现。
 
     * sim 分支复用 trading_core.broker 的锁定工具名（WP3 依赖锁定表，实测口径）；
       账户按 sim_trade_account_list 的 market_id 解析（P4 教训：market 缺省会报错）。
@@ -291,9 +361,10 @@ class FutuBroker:
       （plugins/workbench/python/positions.py live_groups）、account_orders_history 与
       account_funds（docs/TOOL-LIMITS.md 实测：订单历史必须带 start/end，否则静默
       返回纯文本 no data）。
-    * live 写路径：WP3 有意只锁定 trading_order_place 的 schema、不实现执行
-      （docs/superpowers/plans/2026-09-14-wp3-execution.md 依赖锁定表）。按「不另写
-      富途协议」的铁律，这里如实拒绝（BrokerUnavailable），不新写 live 协议。
+    * live 写路径：本类**不实现**（WP3 只锁定 trading_order_place 的 schema）；
+      ``supports_live_write`` 恒 False，闸门在业务确认之前就拒绝 live 写。
+      WP8 任务 3 起 live 写由 ``OpenApiBroker``（channel=openapi + 凭据）承担——
+      原样的 FutuBroker 仍是 mcp 通道与 sim 路径的实现（不变式 2：默认行为零变化）。
     * **适配器契约**（闸门正确性依赖它）：调用层超时必须在本层消化成
       ``{"status": "unknown"}``（铁律：超时→查询不重放），只有「确定未发出」的故障
       才抛 BrokerUnavailable——闸门据此决定 OMS 落 unknown（在途待查询）还是 rejected。
@@ -494,6 +565,551 @@ class FutuBroker:
         return {"mode": mode, "source": f"futu/{tool}", "as_of": _iso_now(),
                 "groups": groups, "errors": errors}
 
+    # ---- WP8 任务 3：OpenAPI 交易只读端点（mcp 通道没有对应数据面 → 如实拒绝）----
+    # 这 6 个方法只在 OpenApiBroker（channel=openapi）里有真实实现；这里保留同名方法，
+    # 使「未配置 OpenAPI 的默认部署」拿到 trading/openapi-unavailable 的**可执行指引**，
+    # 而不是 AttributeError 被信封化成一句含糊的通道异常。
+    def trade_max_qty(self, payload, mode=None):
+        """见 OpenApiBroker.trade_max_qty（需要 futu_channel=openapi）。"""
+        raise OpenApiUnavailable(f"trade_max_qty 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
+
+    def orders_open(self, payload, mode=None):
+        """见 OpenApiBroker.orders_open（需要 futu_channel=openapi）。"""
+        raise OpenApiUnavailable(f"orders_open 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
+
+    def orders_history(self, payload, mode=None):
+        """见 OpenApiBroker.orders_history（需要 futu_channel=openapi）。"""
+        raise OpenApiUnavailable(f"orders_history 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
+
+    def orders_detail(self, payload, mode=None):
+        """见 OpenApiBroker.orders_detail（需要 futu_channel=openapi）。"""
+        raise OpenApiUnavailable(f"orders_detail 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
+
+    def deals_today(self, payload, mode=None):
+        """见 OpenApiBroker.deals_today（需要 futu_channel=openapi）。"""
+        raise OpenApiUnavailable(f"deals_today 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
+
+    def deals_history(self, payload, mode=None):
+        """见 OpenApiBroker.deals_history（需要 futu_channel=openapi）。"""
+        raise OpenApiUnavailable(f"deals_history 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
+
+
+# ---------------------------------------------------------------------------
+# WP8 任务 3：OpenAPI 交易适配器（live 写 + live 查询走 REST；sim/MCP 委托 FutuBroker）
+# ---------------------------------------------------------------------------
+# OpenApiTrade 类的惰性单例（只读枚举常量的单一源；避免在模块导入期拉起 cryptography）。
+_TRADE_CLS = None
+
+
+def _trade_class():
+    """``trading_datasource.futu_openapi.OpenApiTrade`` 类（惰性导入）。"""
+    global _TRADE_CLS
+    if _TRADE_CLS is None:
+        from trading_datasource.futu_openapi import OpenApiTrade as cls  # noqa: PLC0415
+        _TRADE_CLS = cls
+    return _TRADE_CLS
+
+
+def _order_id(value):
+    """从信封 d 里取订单号（place_order / order_confirm 都返回 {order_id: ...}）。"""
+    if isinstance(value, dict):
+        order_id = value.get("order_id")
+        return None if order_id in (None, "") else str(order_id)
+    return None
+
+
+def _err_text(error, limit=160):
+    """OpenAPI 错误 → 面向调用方的一句话（errcode 有值就带上）。"""
+    errcode = getattr(error, "errcode", None)
+    errmsg = getattr(error, "errmsg", None) or str(error)
+    return f"errcode={errcode}：{str(errmsg)[:limit]}" if errcode is not None \
+        else str(errmsg)[:limit]
+
+
+def _classify_openapi_error(error, label):
+    """OpenAPI 写路径异常 → 结果 dict；非 OpenAPI 异常返回 ``None``（调用方原样上抛）。
+
+    分类顺序与官方语义一一对应（惰性导入异常类：platform 服务默认不拉 cryptography）：
+      * ``OrderConfirmRequired``（need_order_confirm=true）→ ``{"need_confirm": exc}``：
+        订单在券商侧**已挂起**，必须走 order_confirm，**绝不重发下单**；
+      * ``TransportError`` → ``unknown``：请求可能已到达券商（铁律：先查询，不重放）；
+      * ``OpenApiError`` → ``rejected``：业务错误信封，券商未接受本单。
+    """
+    from trading_datasource.futu_openapi import (  # noqa: PLC0415
+        OpenApiError, OrderConfirmRequired, TransportError)
+    if isinstance(error, OrderConfirmRequired):
+        return {"need_confirm": error}
+    if isinstance(error, TransportError):
+        return {"status": "unknown",
+                "err": f"{label}传输异常：{_err_text(error)}（先查询，不重放）"}
+    if isinstance(error, OpenApiError):
+        return {"status": "rejected", "err": f"{label}被拒：{_err_text(error)}"}
+    return None
+
+
+class OpenApiBroker:
+    """WP8 任务 3 的通道路由适配器：OpenAPI REST（live）+ WP7 FutuBroker（sim/MCP）。
+
+    ``FutuBroker`` 接口的子集超集，闸门（TradeGate）看到的契约完全一致（place/modify/
+    cancel/positions/orders/funds），另加 6 个 OpenAPI 只读方法。分流规则（逐条披露）：
+
+    * ``channel != openapi`` → 一切照旧走 FutuBroker（含 live 写的 _live_guard 拒绝）；
+    * ``channel == openapi`` 且 ``mode == live`` → live 写与 live 账户查询走 REST；
+    * ``mode == sim`` → **始终**走 FutuBroker 的 sim_trade_* 路径：官方 REST 交易面
+      只覆盖实盘业务账户（``/accounts/authorized_trd_accs`` 返回实盘账户；模拟账户在
+      另一套 sim-trade 端点里，本任务不接），因此 sim 语义不因通道切换而改变；
+    * ``channel == openapi`` 但凭据缺失 → ``supports_live_write`` 为 False，live 写在
+      **确认之前**被闸门拒绝（WP7 的 trading/broker-unavailable，确认零调用）；
+      live 只读查询则抛 OpenApiUnavailable（trading/openapi-unavailable，指引授权），
+      **不静默回退 MCP**（与 server/futu_data.py 的行情通道同一取舍）。
+
+    注入口径与 futu_data.FutuData 一致：注入 ``trade`` 替身即钉住 openapi 通道（测试
+    确定性），注入 ``call`` 给委托的 FutuBroker（MCP 替身）。
+    """
+
+    def __init__(self, home=None, call=None, trade=None, channel=None,
+                 credential_path=None, legacy=None):
+        self.home = home
+        self._trade_override = trade
+        self._credential_path = credential_path
+        self._legacy = legacy if legacy is not None else FutuBroker(call=call)
+        self._trade_built = None
+        # 通道钉死口径与 futu_data.FutuData 一致：注入 trade 替身 → openapi，
+        # 注入 call 替身（MCP）→ mcp，二者都没有才惰性读 futu_channel 配置。
+        if channel is not None:
+            self._channel = channel
+        elif trade is not None:
+            self._channel = futu_data.CHANNEL_OPENAPI
+        elif call is not None:
+            self._channel = futu_data.CHANNEL_MCP
+        else:
+            self._channel = None
+
+    # ---- 通道层 ----
+    @property
+    def channel(self):
+        if self._channel is None:
+            self._channel = futu_data.load_channel(self.home)
+        return self._channel
+
+    @property
+    def trade(self):
+        """OpenAPI 交易后端（注入替身优先；缺省 OpenApiTrade + 默认凭据路径）。"""
+        if self._trade_override is not None:
+            return self._trade_override
+        if self._trade_built is None:
+            from trading_datasource.futu_openapi import (  # noqa: PLC0415
+                CredentialStore, OpenApiClient, OpenApiTrade)
+            self._trade_built = OpenApiTrade(
+                OpenApiClient(CredentialStore(self._credential_path)))
+        return self._trade_built
+
+    def _openapi_ready(self):
+        """channel=openapi 时凭据是否可用（注入 trade 替身视为可用）。"""
+        if self._trade_override is not None:
+            return True
+        return futu_data.openapi_ready(self._credential_path)
+
+    @property
+    def supports_live_write(self):
+        """动态能力：凭据可能后配/失效，因此是属性而不是类常量（闸门每次现读）。"""
+        return self.channel == futu_data.CHANNEL_OPENAPI and self._openapi_ready()
+
+    def _route(self, mode):
+        """返回 "openapi" | "legacy"；openapi 通道缺凭据时抛 OpenApiUnavailable。"""
+        if self.channel != futu_data.CHANNEL_OPENAPI or mode != "live":
+            return "legacy"
+        if not self._openapi_ready():
+            raise OpenApiUnavailable(
+                f"OpenAPI 凭据缺失（~/.dsh/futu-openapi.json）{OPENAPI_AUTH_HINT}")
+        return "openapi"
+
+    def _read_route(self, name, mode):
+        """6 个只读新工具的通道判定（mcp/sim/无凭据 → 如实拒绝，不静默回退 MCP）。"""
+        if self.channel != futu_data.CHANNEL_OPENAPI:
+            raise OpenApiUnavailable(f"{name} 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
+        if mode != "live":
+            raise OpenApiUnavailable(
+                f"{name} 只覆盖实盘业务账户（OpenAPI 交易接口不含模拟账户）；"
+                "sim 模式请用 account_positions/account_orders/account_funds")
+        if not self._openapi_ready():
+            raise OpenApiUnavailable(
+                f"OpenAPI 凭据缺失（~/.dsh/futu-openapi.json）{OPENAPI_AUTH_HINT}")
+        return True
+
+    # ---- 账户解析（OpenAPI 面）----
+    def _accounts(self):
+        """授权交易账户列表（Account 对象，含 account_id/enable_market）。"""
+        data = self.trade.authorized_accounts()
+        accounts = data.get("accounts") if isinstance(data, dict) else data
+        return [account for account in (accounts or [])
+                if isinstance(account, dict) and account.get("account_id")]
+
+    @staticmethod
+    def _enable_codes(account):
+        """账户的 enable_market 归一成 int 集合（通道可能给 int 或数字字符串）。"""
+        codes = set()
+        for value in account.get("enable_market") or []:
+            try:
+                codes.add(int(value))
+            except (TypeError, ValueError):
+                continue
+        return codes
+
+    def _markets_of(self, account):
+        """账户可交易的 trd_market 列表（enable_market 数字 → 官方 trd_market 名）。"""
+        return [ENABLE_MARKET_TO_TRD[code] for code in sorted(self._enable_codes(account))
+                if code in ENABLE_MARKET_TO_TRD]
+
+    def _enable_of_symbol(self, symbol):
+        """标的 → 所需 enable_market 数字（前缀无法识别即拒绝，零网络往返）。"""
+        prefix = str(symbol or "").strip().upper().split(".", 1)[0]
+        want = OPENAPI_ENABLE_MARKET.get(prefix)
+        if want is None:
+            raise ValueError(f"标的市场前缀无法识别：{symbol!r}（支持 SH/SZ/BJ/HK/US）")
+        return prefix, want
+
+    def _account_for(self, symbol):
+        """按标的市场挑授权账户（第一个 enable_market 命中的账户；多账户口径见 note）。"""
+        _prefix, want = self._enable_of_symbol(symbol)
+        for account in self._accounts():
+            if want in self._enable_codes(account):
+                return str(account["account_id"])
+        raise BrokerUnavailable(
+            f"没有可交易 {symbol} 市场的授权账户（enable_market 未含 {want}）；"
+            "先在富途开通对应市场的交易账户")
+
+    def _per_account(self, route):
+        """逐账户直通（单账户失败不掩盖）：groups 与 errors 各归其位。"""
+        groups, errors = [], []
+        for account in self._accounts():
+            acc_id = str(account["account_id"])
+            try:
+                groups.append({"acc_id": acc_id, **route(acc_id, account)})
+            except ValueError:
+                raise  # 参数类错误对所有账户一致 → 由闸门信封成 invalid-operation
+            except Exception as error:  # noqa: BLE001 —— 单账户失败不掩盖
+                errors.append({"acc_id": acc_id, "reason": str(error)[:160]})
+        return groups, errors
+
+    def _per_market(self, payload, name, route):
+        """按 payload['market']（trd_market）挑账户并逐账户调 route(acc_id, market)。"""
+        market = payload.get("market")
+        if not isinstance(market, str) or not market.strip():
+            raise ValueError(f"{name} 需要 market（trd_market 枚举，如 HK/US/HKCC）")
+        market = market.strip().upper()
+        if market not in _trade_class().TRD_MARKETS:
+            raise ValueError(f"market 取值非法：{market!r}"
+                             f"（允许：{sorted(_trade_class().TRD_MARKETS)}）")
+        groups, errors = [], []
+        for account in self._accounts():
+            if market not in self._markets_of(account):
+                continue
+            acc_id = str(account["account_id"])
+            try:
+                groups.append({"acc_id": acc_id, "market": market, **route(acc_id, market)})
+            except ValueError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                errors.append({"acc_id": acc_id, "market": market,
+                               "reason": str(error)[:160]})
+        if not groups and not errors:
+            errors.append({"acc_id": None, "market": market,
+                           "reason": f"没有启用 {market} 市场的授权账户"})
+        return groups, errors
+
+    # ---- 写路径（live → REST；sim/mcp → FutuBroker）----
+    def place(self, order, mode):
+        if self._route(mode) == "legacy":
+            return self._legacy.place(order, mode)
+        trade = self.trade
+        acc_id = self._account_for(order["symbol"])
+        try:
+            data = trade.place_order(acc_id=acc_id, code=order["symbol"], qty=order["qty"],
+                                     price=order["price"], side=order["side"],
+                                     order_type="LIMIT", time_in_force="DAY")
+        except Exception as error:  # noqa: BLE001 —— 分类见 _classify_openapi_error
+            outcome = _classify_openapi_error(error, "下单")
+            if outcome is None:
+                raise
+            if "need_confirm" in outcome:
+                return self._confirm(trade, acc_id, outcome["need_confirm"], None, "place")
+            return {"acc_id": acc_id, **outcome}
+        return {"status": "submitted", "broker_order_id": _order_id(data),
+                "acc_id": acc_id, "confirmed": False, "raw": data}
+
+    def modify(self, order, mode):
+        if self._route(mode) == "legacy":
+            return self._legacy.modify(order, mode)
+        symbol = order["symbol"]
+        prefix = str(symbol).strip().upper().split(".", 1)[0]
+        exchange = OPENAPI_EXCHANGE.get(prefix)
+        if exchange is None:
+            return {"status": "rejected", "broker_order_id": None,
+                    "err": f"官方 OpenAPI exchange 枚举不含 {prefix}（{symbol}）："
+                           "撤单/改单暂不支持该市场"}
+        if prefix in A_SHARE_PREFIXES:
+            # 官方 modify-order 页明示不支持改 A 股订单 → 如实拒绝 + 给替代路径（不静默
+            # 换成「撤旧重下」：那会把一次批准变成两笔真实委托，超出用户批准的语义）。
+            return {"status": "rejected", "broker_order_id": None,
+                    "err": "官方 OpenAPI 改单不支持 A 股（SSE/SZSE 沪深港通）；"
+                           "请先 trade_cancel 再 trade_place（两笔独立批准）"}
+        trade = self.trade
+        acc_id = self._account_for(symbol)
+        try:
+            data = trade.modify_order(acc_id=acc_id, order_id=order["order_id"],
+                                      exchange=exchange, qty=order["qty"],
+                                      price=order["price"])
+        except Exception as error:  # noqa: BLE001
+            outcome = _classify_openapi_error(error, "改单")
+            if outcome is None:
+                raise
+            if "need_confirm" in outcome:
+                return self._confirm(trade, acc_id, outcome["need_confirm"], None, "modify",
+                                     fallback_order_id=order["order_id"])
+            return {"acc_id": acc_id, **outcome}
+        return {"status": "submitted", "broker_order_id": order["order_id"],
+                "acc_id": acc_id, "confirmed": False, "raw": data}
+
+    def cancel(self, order, mode):
+        if self._route(mode) == "legacy":
+            return self._legacy.cancel(order, mode)
+        symbol = order["symbol"]
+        prefix = str(symbol).strip().upper().split(".", 1)[0]
+        exchange = OPENAPI_EXCHANGE.get(prefix)
+        if exchange is None:
+            return {"status": "rejected", "order_id": order["order_id"],
+                    "err": f"官方 OpenAPI exchange 枚举不含 {prefix}（{symbol}）："
+                           "撤单暂不支持该市场"}
+        trade = self.trade
+        acc_id = self._account_for(symbol)
+        try:
+            data = trade.cancel_order(acc_id=acc_id, order_id=order["order_id"],
+                                      exchange=exchange)
+        except Exception as error:  # noqa: BLE001
+            outcome = _classify_openapi_error(error, "撤单")
+            if outcome is None:
+                raise
+            if "need_confirm" in outcome:
+                # 官方撤单页未列 need_order_confirm；若券商如此返回，仍按「用户已在卡片批准
+                # 本操作」自动确认（同一批准覆盖同一操作，不额外打扰用户）。
+                return self._confirm(trade, acc_id, outcome["need_confirm"], None, "cancel",
+                                     fallback_order_id=order["order_id"])
+            return {"order_id": order["order_id"], **outcome}
+        return {"status": "cancelled", "order_id": order["order_id"], "acc_id": acc_id,
+                "raw": data}
+
+    def _confirm(self, trade, acc_id, need, placed, operation, fallback_order_id=None):
+        """券商侧二次确认（两层确认合一的第二层）——**只调 order_confirm，绝不重发下单**。
+
+        用户已在 Web 卡片批准本单参数（业务确认），因此这里自动完成券商确认。失败一律
+        落 ``unknown``：订单在券商侧**已挂起**（place/modify）且 confirm 结果不确定，
+        铁律「先查询不重放」；confirm_id 缺失同样 unknown（不猜、不重发）。
+        """
+        confirm_id = getattr(need, "confirm_id", None)
+        base = {"acc_id": acc_id, "broker_order_id": _order_id(placed)
+                or fallback_order_id, "confirm_id": confirm_id, "need_order_confirm": True}
+        if not confirm_id:
+            return {**base, "status": "unknown",
+                    "err": f"{operation} 需券商二次确认但信封未带 confirm_id："
+                           "订单在券商侧挂起待确认（先查单，勿重发下单）"}
+        try:
+            confirmed = trade.order_confirm(acc_id=acc_id, confirm_id=confirm_id)
+        except Exception as error:  # noqa: BLE001
+            from trading_datasource.futu_openapi import (  # noqa: PLC0415
+                OpenApiError, TransportError)
+            if not isinstance(error, (OpenApiError, TransportError)):
+                raise
+            kind = "传输异常" if isinstance(error, TransportError) else "失败"
+            return {**base, "status": "unknown",
+                    "err": f"券商二次确认{kind}：{_err_text(error)}"
+                           "（订单在券商侧挂起/可能已生效；先查单，勿重发下单）"}
+        return {**base, "status": "submitted",
+                "broker_order_id": _order_id(confirmed) or base["broker_order_id"],
+                "confirmed": True, "raw": confirmed}
+
+    # ---- 账户查询（live → REST；sim/mcp → FutuBroker）----
+    def positions(self, mode):
+        if self._route(mode) == "legacy":
+            return self._legacy.positions(mode)
+        groups, errors = self._per_account(
+            lambda acc_id, account: {
+                "market": account.get("enable_market"),
+                "positions": self.trade.positions(acc_id) or []})
+        groups = [group for group in groups if group["positions"]]
+        return {"mode": mode, "source": "futu/openapi:positions", "as_of": _iso_now(),
+                "groups": groups, "errors": errors,
+                "note": "券商返回的真实持仓（OpenAPI REST；按账户列出，不跨账户/币种合并）；"
+                        "失败账户列入 errors，不掩盖。"}
+
+    def orders(self, mode):
+        """订单历史：OpenAPI 的 ``/orders_history`` 必填 trd_market → 按「账户×市场」列。
+
+        不带 start/end（官方组合语义 0/0 = 近 90 天）；每账户每市场取第一页（page_size=100），
+        并把 page_flag/completed 一并给出，需要翻页用 orders_history 工具。
+        """
+        if self._route(mode) == "legacy":
+            return self._legacy.orders(mode)
+        groups, errors = [], []
+        for account in self._accounts():
+            acc_id = str(account["account_id"])
+            markets = self._markets_of(account)
+            if not markets:
+                errors.append({"acc_id": acc_id,
+                               "reason": "账户未声明可交易市场（enable_market）"})
+                continue
+            for market in markets:
+                try:
+                    data = self.trade.history_orders(acc_id, market, page_flag="",
+                                                    page_size=100) or {}
+                except Exception as error:  # noqa: BLE001 —— 单账户单市场失败不掩盖
+                    errors.append({"acc_id": acc_id, "market": market,
+                                   "reason": str(error)[:160]})
+                    continue
+                groups.append({"acc_id": acc_id, "market": market,
+                               "rows": data.get("orders") or [],
+                               "page_flag": data.get("page_flag"),
+                               "completed": data.get("completed")})
+        return {"mode": mode, "source": "futu/openapi:orders_history",
+                "as_of": _iso_now(), "window": {"start": None, "end": None},
+                "groups": groups, "errors": errors,
+                "note": "订单历史按账户×市场列出（OpenAPI 默认窗口：服务端 90 天；"
+                        "不带 start/end 即官方 0/0 组合语义）。"}
+
+    def funds(self, mode):
+        if self._route(mode) == "legacy":
+            return self._legacy.funds(mode)
+        groups, errors = self._per_account(
+            lambda acc_id, account: {
+                "market": account.get("enable_market"),
+                "cash": self.trade.account_funds(acc_id)})
+        return {"mode": mode, "source": "futu/openapi:funds", "as_of": _iso_now(),
+                "groups": groups, "errors": errors,
+                "note": "账户资金（OpenAPI REST；currency 未指定时官方按账户默认币种返回）"}
+
+    # ---- WP8 任务 3：6 个只读端点（OpenAPI REST 直通）----
+    def _read_envelope(self, mode, source, groups, errors, note):
+        return {"mode": mode, "source": source, "as_of": _iso_now(),
+                "groups": groups, "errors": errors, "note": note}
+
+    def trade_max_qty(self, payload, mode):
+        """GET /accounts/{acc_id}/acctradinginfo —— 最大可交易量（逐账户列出）。"""
+        self._read_route("trade_max_qty", mode)
+        symbol = payload.get("code")
+        prefix, want = self._enable_of_symbol(symbol)
+        code = str(symbol).strip().upper()
+        groups, errors = [], []
+        for account in self._accounts():
+            if want not in self._enable_codes(account):
+                continue
+            acc_id = str(account["account_id"])
+            try:
+                data = self.trade.max_trade_qty(acc_id, code, payload.get("order_type"),
+                                                price=payload.get("price"),
+                                                order_id=payload.get("order_id"))
+            except ValueError:
+                raise
+            except Exception as error:  # noqa: BLE001
+                errors.append({"acc_id": acc_id, "reason": str(error)[:160]})
+                continue
+            groups.append({"acc_id": acc_id, "market": prefix, "code": code,
+                           "max": data or {}})
+        if not groups and not errors:
+            errors.append({"acc_id": None,
+                           "reason": f"没有可交易 {prefix} 市场的授权账户"})
+        return self._read_envelope(
+            mode, "futu/openapi:acctradinginfo", groups, errors,
+            "最大可交易量（OpenAPI REST；max_cash_buy/max_position_sell 等原始字段）；"
+            "带 order_id 时查该订单的最大可改数量（官方要求两次查询间隔 > 0.5s）。")
+
+    def orders_open(self, payload, mode):
+        """GET /accounts/{acc_id}/orders —— 未完成订单（含最近 24h 已成交/已撤）。"""
+        self._read_route("orders_open", mode)
+        groups, errors = self._per_market(
+            payload, "orders_open",
+            lambda acc_id, market: self._paged(self.trade.open_orders, acc_id, market,
+                                               payload, "orders"))
+        return self._read_envelope(
+            mode, "futu/openapi:orders", groups, errors,
+            "未完成订单（OpenAPI REST；含最近 24 小时已成交/已撤单）；分页游标 page_flag，"
+            "completed=true 表示本批已取尽。")
+
+    def orders_history(self, payload, mode):
+        """GET /accounts/{acc_id}/orders_history —— 历史订单（start/end 微秒）。"""
+        self._read_route("orders_history", mode)
+        groups, errors = self._per_market(
+            payload, "orders_history",
+            lambda acc_id, market: self._paged(self.trade.history_orders, acc_id, market,
+                                               payload, "orders",
+                                               filters=("code", "start", "end")))
+        return self._read_envelope(
+            mode, "futu/openapi:orders_history", groups, errors,
+            "历史订单（OpenAPI REST；start/end 为创建时间微秒时间戳，官方 0/0 组合=近 90 天）"
+            "；分页游标 page_flag。")
+
+    def orders_detail(self, payload, mode):
+        """POST /accounts/{acc_id}/orders/detail —— 订单详情（逐账户问同一批订单号）。"""
+        self._read_route("orders_detail", mode)
+        groups, errors = self._per_account(
+            lambda acc_id, account: {
+                "rows": self.trade.order_details(
+                    acc_id, payload.get("exchange"), payload.get("order_ids")) or []})
+        return self._read_envelope(
+            mode, "futu/openapi:orders_detail", groups, errors,
+            "订单详情（OpenAPI REST；同一批 order_ids 需属于同一 exchange）；"
+            "授权账户逐个查询，订单出现在持有它的那个账户分组里。")
+
+    def deals_today(self, payload, mode):
+        """GET /accounts/{acc_id}/order_fills —— 当日成交。"""
+        self._read_route("deals_today", mode)
+        groups, errors = self._per_market(
+            payload, "deals_today",
+            lambda acc_id, market: self._paged(self.trade.today_deals, acc_id, market,
+                                               payload, "order_fills"))
+        return self._read_envelope(
+            mode, "futu/openapi:order_fills", groups, errors,
+            "当日成交（OpenAPI REST；order_fills 原始字段 trd_side/deal_id/qty/price 等）。")
+
+    def deals_history(self, payload, mode):
+        """GET /accounts/{acc_id}/fills_history —— 历史成交（page_size 上界 50）。"""
+        self._read_route("deals_history", mode)
+        groups, errors = self._per_market(
+            payload, "deals_history",
+            lambda acc_id, market: self._paged(self.trade.history_deals, acc_id, market,
+                                               payload, "order_fills",
+                                               filters=("code", "start", "end")))
+        return self._read_envelope(
+            mode, "futu/openapi:fills_history", groups, errors,
+            "历史成交（OpenAPI REST；start/end 为更新时间微秒时间戳，page_size 上界 50）。")
+
+    def _paged(self, call, acc_id, market, payload, rows_key, filters=()):
+        """分页查询的公共取数形状：rows + page_flag + completed（缺一不伪造）。
+
+        ``filters`` 是该端点支持的官方可选过滤字段（orders_history/fills_history 的
+        code/start/end）；只在调用方真的给了值时才下传，省略字段由官方按缺省处理。
+        """
+        kwargs = {"page_flag": payload.get("page_flag", ""),
+                  "page_size": payload.get("page_size")}
+        for name in filters:
+            if payload.get(name) is not None:
+                kwargs[name] = payload[name]
+        data = call(acc_id, market, **kwargs) or {}
+        return {"rows": data.get(rows_key) or [],
+                "page_flag": data.get("page_flag"),
+                "completed": data.get("completed")}
+
+
+def default_broker(home=None):
+    """TradeGate 的默认适配器：``futu_channel=openapi`` → OpenApiBroker，否则 WP7 FutuBroker。
+
+    默认（未配置 openapi 通道/凭据）返回的仍是 **原样的 FutuBroker**：live 写先置拒绝、
+    sim 走 sim_trade_* 工具、live 查询走 account_* 工具——WP7 行为逐字不变（不变式 2）。
+    """
+    if futu_data.load_channel(home) == futu_data.CHANNEL_OPENAPI:
+        return OpenApiBroker(home=home)
+    return FutuBroker()
+
+
 
 # ---------------------------------------------------------------------------
 # 交易闸门
@@ -503,7 +1119,9 @@ class TradeGate:
 
     依赖注入（构造参数，测试全部可替换）：
       * broker       —— place/modify/cancel/positions/orders/funds 接口
-                        （缺省 FutuBroker：trading_core.broker + futu_mcp.call_tool）；
+                        （缺省 ``default_broker(home)``：futu_channel=openapi 时是
+                        OpenApiBroker（live 走 REST），否则是 WP7 的 FutuBroker——
+                        trading_core.broker + futu_mcp.call_tool）；
       * confirm      —— 确认三方法绑定（缺省 StoreConfirm = store_access）；
       * risk_fn      —— 缺省 trading_core.risk.pre_trade_checks（8 规则唯一实现）；
       * ctx_builder  —— risk ctx 构造（缺省 default_ctx_builder，披露见其注释）；
@@ -518,7 +1136,7 @@ class TradeGate:
     def __init__(self, home, broker=None, confirm=None, risk_fn=None, ctx_builder=None,
                  conn_factory=None, confirm_ttl_ms=None, today=None):
         self.home = str(home)
-        self.broker = broker if broker is not None else FutuBroker()
+        self.broker = broker if broker is not None else default_broker(self.home)
         self.confirm = confirm if confirm is not None else StoreConfirm()
         self.risk_fn = risk_fn if risk_fn is not None else core_risk.pre_trade_checks
         self.ctx_builder = ctx_builder if ctx_builder is not None else default_ctx_builder
@@ -556,6 +1174,58 @@ class TradeGate:
             return _envelope_fail("trading/invalid-operation", f"账户模式非法：{error}")
         try:
             value = getattr(self.broker, name)(mode)
+        except OpenApiUnavailable as error:
+            # OpenAPI 通道缺失（channel=openapi 但没凭据）：指引去授权，不冒充通道异常
+            return _envelope_fail(OPENAPI_UNAVAILABLE_CODE, str(error))
+        except Exception as error:  # noqa: BLE001 —— 信封化，绝不 500
+            return _envelope_fail("trading/broker-unavailable", f"券商通道异常：{error}")
+        return _envelope_ok(value)
+
+    # ---- WP8 任务 3：OpenAPI 交易只读路径（mode 约束 + REST 直通，不进任何缓存）----
+    # 端点名 = 工具名 = 本类方法名 = broker 方法名（同一字符串，便于逐项对照锁定测试）；
+    # 载荷里的业务参数（code/market/exchange/page_flag/...）整体下传，mode 单独走模式约束。
+    def trade_max_qty(self, payload=None):
+        return self._read("trade_max_qty", payload)
+
+    def orders_open(self, payload=None):
+        return self._read("orders_open", payload)
+
+    def orders_history(self, payload=None):
+        return self._read("orders_history", payload)
+
+    def orders_detail(self, payload=None):
+        return self._read("orders_detail", payload)
+
+    def deals_today(self, payload=None):
+        return self._read("deals_today", payload)
+
+    def deals_history(self, payload=None):
+        return self._read("deals_history", payload)
+
+    def _read(self, name, payload):
+        """OpenAPI 只读工具的闸门：模式约束（模式文件或载荷 mode）→ broker 只读方法。
+
+        与 ``_query`` 的差别只有两点：载荷带业务参数（整体下传），以及三类失败分别映射
+        为 ``trading/openapi-unavailable``（通道缺失/需授权）、``trading/invalid-operation``
+        （broker 侧参数白名单，坏参数零网络往返）与 ``trading/broker-unavailable``（其余）。
+        读操作不落 OMS、不做幂等、不进缓存（与 account_* 同类）。
+        """
+        payload = payload if isinstance(payload, dict) else {}
+        mode = payload.get("mode")
+        try:
+            if mode is None:
+                mode = store_access.read_mode(self.home)
+            else:
+                store_access.mode_value(mode)
+        except WorkbenchError as error:
+            return _envelope_fail("trading/invalid-operation", f"账户模式非法：{error}")
+        args = {key: value for key, value in payload.items() if key != "mode"}
+        try:
+            value = getattr(self.broker, name)(args, mode)
+        except OpenApiUnavailable as error:
+            return _envelope_fail(OPENAPI_UNAVAILABLE_CODE, str(error))
+        except ValueError as error:
+            return _envelope_fail("trading/invalid-operation", str(error))
         except Exception as error:  # noqa: BLE001 —— 信封化，绝不 500
             return _envelope_fail("trading/broker-unavailable", f"券商通道异常：{error}")
         return _envelope_ok(value)

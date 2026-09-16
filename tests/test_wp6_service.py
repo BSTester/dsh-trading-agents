@@ -46,6 +46,8 @@ ENDPOINTS = [
     *store_access.FUTU_ENDPOINTS,
     # WP8 任务 2：OpenAPI 行情接入，与 store_access.WP8_MARKET_ENDPOINTS 同步
     *store_access.WP8_MARKET_ENDPOINTS,
+    # WP8 任务 3：OpenAPI 交易只读端点，与 store_access.WP8_TRADE_ENDPOINTS 同步
+    *store_access.WP8_TRADE_ENDPOINTS,
 ]
 
 
@@ -162,7 +164,8 @@ class ContractTests(Base):
         self.assertEqual(body["value"]["endpoints"], ENDPOINTS)
         self.assertEqual(len(body["value"]["endpoints"]),
                         22 + len(store_access.WP7_ENDPOINTS) + len(store_access.FUTU_ENDPOINTS)
-                        + len(store_access.WP8_MARKET_ENDPOINTS))
+                        + len(store_access.WP8_MARKET_ENDPOINTS)
+                        + len(store_access.WP8_TRADE_ENDPOINTS))
         self.assertEqual(body["value"]["mode"], "sim")
         self.assertIn("generated_at", body["value"])
 
@@ -713,7 +716,8 @@ class ConfirmationRoutesTests(Base):
     def test_both_endpoints_are_whitelisted_and_snapshot_declares_them(self):
         self.assertEqual(len(store_access.endpoints()), 22 + len(store_access.WP7_ENDPOINTS)
                         + len(store_access.FUTU_ENDPOINTS)
-                        + len(store_access.WP8_MARKET_ENDPOINTS))
+                        + len(store_access.WP8_MARKET_ENDPOINTS)
+                        + len(store_access.WP8_TRADE_ENDPOINTS))
         self.assertIn("confirmation", store_access.endpoints())
         self.assertIn("confirm-decide", store_access.endpoints())
         declared = self.post(self.client, "snapshot").json()["value"]["endpoints"]
@@ -866,7 +870,7 @@ class StaticTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": f"http://127.0.0.1:{port}",
                                 "mcp": f"http://127.0.0.1:{port}/mcp",
-                                "tools": 50, "auth": "loopback-only"})
+                                "tools": 56, "auth": "loopback-only"})
 
     def test_bad_encoding_is_400(self):
         dist = self.make_dist()
@@ -1405,7 +1409,7 @@ class RunEntryTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": "http://127.0.0.1:41234",
                                 "mcp": "http://127.0.0.1:41234/mcp",
-                                "tools": 50, "auth": "loopback-only"})
+                                "tools": 56, "auth": "loopback-only"})
         line = run_module.ready_line(("127.0.0.1", 8397),
                                      {"port": 8397, "host": "127.0.0.1", "token": "t"})
         self.assertEqual(line["auth"], "token")

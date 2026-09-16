@@ -1,4 +1,4 @@
-"""WP8 任务 2：富途 OpenAPI 行情接入 + 通道路由 + 工具面 41→50。
+"""WP8 任务 2：富途 OpenAPI 行情接入 + 通道路由 + 工具面 41→50（任务 3 起 56）。
 
 全部离线（OpenAPI 客户端与 OpenApiMarket、MCP 通道均用计数替身）。覆盖：
 
@@ -13,7 +13,7 @@
   info_trading_days/info_search/info_market_state/quote_history_kline_v2）：参数
   白名单 → 双后端；TTL 0（实时四类）/ 5m（基本四类）/ 10m（历史 K 线 v2）；
 * 归一化 fixture：两通道产出同形状（rt_quote/order_book/capital_flow 三例对拍）；
-* 工具面 50 锁定 + 端点清单 46 锁定。
+* 工具面 50 锁定（WP8 任务 3 起 56）+ 端点清单 46 锁定（任务 3 起 52）。
 
 官方文档记录（2026-09-16 web_fetch 实抓，路径前缀 ``/api/v1.0/quote``）：
   market-snapshot  POST /quote/snapshot            body {code_list 1..400}
@@ -746,11 +746,11 @@ class AppRoutingTest(CacheIsolatedTest):
 
 
 class ToolSurfaceTest(unittest.TestCase):
-    """工具面 50 锁定 + 9 新工具契约。"""
+    """工具面 50 锁定（WP8 任务 3 起 56）+ 9 新工具契约。"""
 
-    def test_tool_surface_is_50(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 50)
-        self.assertEqual(len(mcp_tools.TOOLS), 50)
+    def test_tool_surface_is_56(self):
+        self.assertEqual(mcp_tools.TOOL_COUNT, 56)
+        self.assertEqual(len(mcp_tools.TOOLS), 56)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(WP8_MARKET_ENDPOINTS), names)
         self.assertNotIn("confirm-decide", names)
@@ -806,12 +806,13 @@ class ToolSurfaceTest(unittest.TestCase):
             tool = next(t for t in mcp_tools.TOOLS if t.name == name)
             self.assertIn("实时", tool.description, name)
 
-    def test_endpoint_registry_is_46(self):
+    def test_endpoint_registry_is_52(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 46)
+        self.assertEqual(len(endpoints), 52)
         self.assertEqual(tuple(store_access.WP8_MARKET_ENDPOINTS), WP8_MARKET_ENDPOINTS)
-        self.assertEqual(endpoints[-9:], list(WP8_MARKET_ENDPOINTS))
-        self.assertEqual(len(set(endpoints)), 46)
+        # WP8 任务 3 起尾部再追加 6 个 OpenAPI 交易只读端点（行情 9 项落在其前）
+        self.assertEqual(endpoints[-15:-6], list(WP8_MARKET_ENDPOINTS))
+        self.assertEqual(len(set(endpoints)), 52)
 
 
 class RealChannelComparisonTest(unittest.TestCase):

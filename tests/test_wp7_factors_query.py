@@ -1,4 +1,4 @@
-"""WP7 任务 2：``factors-history`` 查询（HTTP 端点 + MCP 工具；工具面在 WP8 任务 2 起 50）。全部离线注入。
+"""WP7 任务 2：``factors-history`` 查询（HTTP 端点 + MCP 工具；工具面在 WP8 任务 3 起 56）。全部离线注入。
 
 * compute：``factors_history(limit)`` 跑 ``python -m trading_core factors-history --limit N``，
   解析与 snapshot_cli 同一出口（parse_stdout：error 键 → ComputeError）；
@@ -170,9 +170,9 @@ class FactorsHistoryAppWiringTest(FactorsHistoryTestBase):
 
 class FactorsHistoryMcpToolTest(FactorsHistoryTestBase):
     def test_tool_surface_is_27_and_includes_factors_history(self):
-        # WP8 任务 2 起工具面扩到 50；本用例改钉「 factors_history 在面内」这一增量事实
-        self.assertEqual(mcp_tools.TOOL_COUNT, 50)
-        self.assertEqual(len(mcp_tools.TOOLS), 50)
+        # WP8 任务 3 起工具面扩到 56；本用例改钉「 factors_history 在面内」这一增量事实
+        self.assertEqual(mcp_tools.TOOL_COUNT, 56)
+        self.assertEqual(len(mcp_tools.TOOLS), 56)
         self.assertIn("factors_history", mcp_tools.TOOL_NAMES)
         self.assertEqual(mcp_tools.ENDPOINT_TOOL_ENDPOINTS["factors_history"],
                          "factors-history")

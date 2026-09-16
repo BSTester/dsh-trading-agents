@@ -30,7 +30,10 @@ HTTP 传输可注入（``OpenApiClient(..., http=request_fn)``）：
 URLError/超时/连接重置等传输异常包装为 ``TransportError``（OpenApiError 子类）。
 
 仅授权流程（scripts/futu_auth.py --openapi）负责注册/浏览器授权/落盘；本模块负责
-凭据读写与带认证的请求。测试见 tests/test_wp8_openapi_client.py（离线注入）。
+凭据读写与带认证的请求。本模块另含两个 REST 方法组：``OpenApiMarket``（WP8 任务 2，
+行情）与 ``OpenApiTrade``（WP8 任务 3，交易/订单/成交/账户）。测试见
+tests/test_wp8_openapi_client.py、tests/test_wp8_market.py、tests/test_wp8_trading.py
+（离线注入）。
 """
 import base64
 import hashlib
@@ -501,6 +504,70 @@ class OpenApiClient:
 
 
 # ---------------------------------------------------------------------------
+# REST 方法组共用参数校验（OpenApiMarket / OpenApiTrade 唯一实现）
+# ---------------------------------------------------------------------------
+class _RestValidators:
+    """REST 方法组共用参数校验器（``OpenApiMarket`` / ``OpenApiTrade`` 唯一实现）。
+
+    约定：``None`` = 调用方未提供；必填字段缺省即拒（本地 ``ValueError``，消息面向
+    调用方）；枚举/区间在此拒绝，坏参数**不触达网络**；请求体经 ``_body`` 去 None
+    （官方接口按缺省处理省略字段）。严格度对齐官方文档：未知枚举值一律拒绝。
+    """
+
+    _REQUIRED = object()  # 「必填枚举」哨兵：default=None 表示可省略（请求体去 None）
+
+    def _codes(self, codes, count_max):
+        """批量 code_list 校验：1..count_max 个非空字符串（官方 invalid_parameter 面）。"""
+        if not isinstance(codes, list) or not 1 <= len(codes) <= count_max:
+            raise ValueError(
+                f"code_list 必须是 1..{count_max} 个标的代码的列表（如 HK.00700）")
+        for code in codes:
+            if not isinstance(code, str) or not code.strip():
+                raise ValueError(f"code_list 元素必须是非空字符串，得到：{code!r}")
+        return list(codes)
+
+    def _int_in(self, value, low, high, name, default=None):
+        """整数区间校验：None 走 default；越界/类型错拒绝（bool 是 int 的子类，排除）。"""
+        if value is None:
+            if default is None:
+                raise ValueError(f"{name} 必填（{low}..{high} 的整数）")
+            return default
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or not low <= value <= high:
+            raise ValueError(f"{name} 必须是 {low}..{high} 的整数")
+        return value
+
+    def _enum_in(self, value, allowed, name, default=_REQUIRED):
+        """枚举校验：None 走 default；default 为哨兵时视为必填。"""
+        if value is None:
+            if default is self._REQUIRED:
+                raise ValueError(f"{name} 必填，取值之一：{sorted(allowed)}")
+            return default
+        if value not in allowed:
+            raise ValueError(f"{name} 取值非法：{value!r}（允许：{sorted(allowed)}）")
+        return value
+
+    def _date(self, value, name, required=False):
+        """yyyy-MM-dd 日期校验（含日历有效性）。"""
+        if value is None or value == "":
+            if required:
+                raise ValueError(f"{name} 必填（yyyy-MM-dd）")
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{name} 必须是 yyyy-MM-dd 字符串")
+        try:
+            import datetime as _dt
+            _dt.date.fromisoformat(value)
+        except ValueError:
+            raise ValueError(f"{name} 不是合法日期：{value!r}（yyyy-MM-dd）") from None
+        return value
+
+    def _body(self, mapping):
+        """去掉 None 值的请求体（官方接口按缺省处理省略字段）。"""
+        return {key: value for key, value in mapping.items() if value is not None}
+
+
+# ---------------------------------------------------------------------------
 # OpenApiMarket：行情 REST 方法组（WP8 任务 2）
 # ---------------------------------------------------------------------------
 # 路径与参数逐项对照官方文档（2026-09-16 web_fetch 实抓，前缀 /api/v1.0/quote）：
@@ -512,7 +579,7 @@ class OpenApiClient:
 # 三个分页端点（capital_flow_history/option_screen/history_kline）用 request_meta 把
 # 信封顶层 pagination 并入返回值——与 MCP 通道 futu_mcp._unwrap 的形状一致，使
 # futu_data 的双通道路由可以产出同形状响应（归一化 fixture 见 tests/test_wp8_market.py）。
-class OpenApiMarket:
+class OpenApiMarket(_RestValidators):
     """富途行情 OpenAPI（REST）方法组：WP8 任务 2 的 OpenAPI 后端唯一入口。
 
     每个方法对应一个官方 REST 端点（方法名 = futu_data.OPENAPI_METHODS 的登记值）；
@@ -562,58 +629,8 @@ class OpenApiMarket:
         self.client = client
 
     # ------------------------------------------------------------ 校验助手
-
-    def _codes(self, codes, count_max):
-        """批量 code_list 校验：1..count_max 个非空字符串（官方 invalid_parameter 面）。"""
-        if not isinstance(codes, list) or not 1 <= len(codes) <= count_max:
-            raise ValueError(
-                f"code_list 必须是 1..{count_max} 个标的代码的列表（如 HK.00700）")
-        for code in codes:
-            if not isinstance(code, str) or not code.strip():
-                raise ValueError(f"code_list 元素必须是非空字符串，得到：{code!r}")
-        return list(codes)
-
-    def _int_in(self, value, low, high, name, default=None):
-        """整数区间校验：None 走 default；越界/类型错拒绝（bool 是 int 的子类，排除）。"""
-        if value is None:
-            if default is None:
-                raise ValueError(f"{name} 必填（{low}..{high} 的整数）")
-            return default
-        if isinstance(value, bool) or not isinstance(value, int) \
-                or not low <= value <= high:
-            raise ValueError(f"{name} 必须是 {low}..{high} 的整数")
-        return value
-
-    _REQUIRED = object()  # 「必填枚举」哨兵：default=None 表示可省略（请求体去 None）
-
-    def _enum_in(self, value, allowed, name, default=_REQUIRED):
-        """枚举校验：None 走 default；default 为哨兵时视为必填。"""
-        if value is None:
-            if default is self._REQUIRED:
-                raise ValueError(f"{name} 必填，取值之一：{sorted(allowed)}")
-            return default
-        if value not in allowed:
-            raise ValueError(f"{name} 取值非法：{value!r}（允许：{sorted(allowed)}）")
-        return value
-
-    def _date(self, value, name, required=False):
-        """yyyy-MM-dd 日期校验（含日历有效性）。"""
-        if value is None or value == "":
-            if required:
-                raise ValueError(f"{name} 必填（yyyy-MM-dd）")
-            return None
-        if not isinstance(value, str):
-            raise ValueError(f"{name} 必须是 yyyy-MM-dd 字符串")
-        try:
-            import datetime as _dt
-            _dt.date.fromisoformat(value)
-        except ValueError:
-            raise ValueError(f"{name} 不是合法日期：{value!r}（yyyy-MM-dd）") from None
-        return value
-
-    def _body(self, mapping):
-        """去掉 None 值的请求体（官方接口按缺省处理省略字段）。"""
-        return {key: value for key, value in mapping.items() if value is not None}
+    # _codes/_int_in/_enum_in/_date/_body 五个通用校验器来自 _RestValidators
+    # （与 OpenApiTrade 共用一份实现）；下面只有行情专有的助手。
 
     def _merge_pagination(self, d, pagination):
         """信封顶层 pagination 并入 d（对齐 futu_mcp._unwrap；无分页原样返回）。"""
@@ -842,3 +859,427 @@ class OpenApiMarket:
         d, pagination = self.client.request_meta(
             "POST", "/api/v1.0/quote/option-screen", json_body=body)
         return self._merge_pagination(d, pagination)
+
+
+# ---------------------------------------------------------------------------
+# OpenApiTrade：交易 REST 方法组（WP8 任务 3）
+# ---------------------------------------------------------------------------
+# 13 个方法与官方路径/参数逐项对照（2026-09-16 web_fetch 实抓 .md 原文，前缀 /api/v1.0）：
+#   下单        POST   /accounts/{acc_id}/orders            body {code! qty! side! order_type!
+#                                                            time_in_force! price? session?
+#                                                            aux_price? lot_type? remark?
+#                                                            order_class? multi_leg_info?}
+#   改单        PUT    /accounts/{acc_id}/orders/{order_id}  body {exchange! qty! price! aux_price?}
+#   撤单        DELETE /accounts/{acc_id}/orders/{order_id}  query {exchange!}
+#   二次确认    POST   /accounts/{acc_id}/order_confirm      body {confirm_id!}
+#   最大可交易量 GET    /accounts/{acc_id}/acctradinginfo    query {code! order_type! price? order_id?}
+#   未完成订单  GET    /accounts/{acc_id}/orders             query {trd_market! page_flag! page_size? 10..100}
+#   历史订单    GET    /accounts/{acc_id}/orders_history     query {trd_market! page_flag! code? start?
+#                                                            end? page_size? 10..100}
+#   订单详情    POST   /accounts/{acc_id}/orders/detail      body {exchange! order_ids!（<50 个）}
+#   当日成交    GET    /accounts/{acc_id}/order_fills        query {trd_market! page_flag! page_size? 10..100}
+#   历史成交    GET    /accounts/{acc_id}/fills_history      query {trd_market! page_flag! code? start?
+#                                                            end? page_size? 10..50}
+#   授权账户    GET    /accounts/authorized_trd_accs         （无路径/查询参数）
+#   账户资金    GET    /accounts/{acc_id}/funds              query {currency?}
+#   持仓        GET    /accounts/{acc_id}/positions          query {code? pl_ratio_min? pl_ratio_max?}
+#
+# 信封：交易侧与行情侧同一信封（``{"s":"ok","d":...}`` / ``{"s":"error","errcode",
+# "errmsg","jump_url"?,"need_order_confirm"?,"confirm_id"?}``），由 client.request 统一
+# 解析——need_order_confirm=true 抛 ``OrderConfirmRequired``（订单在券商侧**已挂起**，
+# 调 order_confirm 放行；**禁止对原请求重发**）。
+#
+# 文档与实现的差异登记（不猜，逐条给出源码依据）：
+#   * funds 的 ``currency`` 在官方参数表标 Required=Yes，但同页 curl 示例未传该参数
+#     → 本层按**可选**处理（按 Required 会与官方示例直接冲突），并在 docstring 登记。
+#   * 改单官方明示「Does not support modifying A-share orders」→ **本层只做事实透传**
+#     不在传输层预判市场（传输层只忠实实现文档契约；「A 股改单怎么办」是交易闸门的策略，
+#     在 platform/server/trading.py 里决定并写明给调用方的替代路径）。
+#   * exchange 官方枚举没有北交所（BJ）→ 本层不自行扩枚举（strict：未知值拒绝）；
+#     北交所标的的撤单/改单因此会在此被拒（如实暴露，不伪造 exchange 值）。
+#   * ``multi_leg_info`` 在 place-order 参数表标类型 ``MultiLegInfo``（对象），而
+#     naming-dictionary 的 ``Order.multi_leg_info`` 是 ``list[MultiLegInfo]``（响应侧）
+#     → 本层请求侧**对象与对象列表都接受、原样透传**，内键按 naming-dictionary 白名单
+#     校验（多腿订单两种形态在真实通道的取舍以实测为准，见 tests/test_wp8_trading.py）。
+#   * 时间戳参数（orders_history/fills_history 的 start/end）官方单位是**微秒**
+#     → 本层只校验非负整数，不做单位换算（调用方给什么传什么）。
+#   * ``positions`` 与 ``order_details`` 的响应 ``d`` 是**数组**（其余是对象）→
+#     本层原样返回，不做形状包装。
+class OpenApiTrade(_RestValidators):
+    """富途交易 OpenAPI（REST）方法组：WP8 任务 3 的 OpenAPI 交易后端唯一入口。
+
+    每个方法对应一个官方 REST 端点；参数名与官方文档一致（code/qty/price/side/
+    order_type/time_in_force/session/aux_price/lot_type/remark/order_class/
+    multi_leg_info/trd_market/page_flag/page_size/exchange/order_ids/...）。调用方必须
+    先配好凭据（``~/.futu-openapi.json``，OAuth 或 AppKey），否则 client.request 抛
+    ``OpenApiError``。参数白名单 = 方法签名（未知关键字 Python 直接 TypeError），
+    枚举/区间/必填在下单前本地拒绝（ValueError），坏参数零网络往返。
+    """
+
+    #: side 枚举（naming-dictionary#trd-side；NONE=未知，不作为下单值）
+    SIDES = frozenset({"BUY", "SELL", "SELL_SHORT", "BUY_BACK"})
+    #: order_type 枚举（naming-dictionary#order-type；NONE=未知，不作为下单值）
+    ORDER_TYPES = frozenset({"LIMIT", "MARKET", "AUCTION", "AUCTION_LIMIT", "STOP",
+                             "STOP_LIMIT", "MARKET_IF_TOUCHED", "LIMIT_IF_TOUCHED"})
+    #: 必须带触发价的订单类型（place-order 页：aux_price required when order type is ...）
+    AUX_PRICE_ORDER_TYPES = frozenset({"STOP", "STOP_LIMIT", "MARKET_IF_TOUCHED",
+                                       "LIMIT_IF_TOUCHED"})
+    #: time_in_force 枚举（naming-dictionary#time-in-force；NONE=未知）
+    TIME_IN_FORCE = frozenset({"DAY", "GTC"})
+    #: 美股交易时段枚举（naming-dictionary#trading-session；NONE=未知）——仅美股适用
+    SESSIONS = frozenset({"RTH", "RTH+Pre/Post-Mkt", "OVERNIGHT", "ALL_DAY"})
+    #: lot_type 枚举（naming-dictionary#lot-type；仅港股适用）
+    LOT_TYPES = frozenset({"ODD", "ROUND"})
+    #: order_class 枚举（naming-dictionary#order-class）
+    ORDER_CLASSES = frozenset({"NORMAL", "MLEG"})
+    #: exchange 枚举（naming-dictionary#exchange）
+    EXCHANGES = frozenset({"US", "SEHK", "SGX", "SSE", "SZSE", "JP", "CA", "CME",
+                           "CBOT", "NYMEX", "COMEX", "CBOE", "HKFE", "KR"})
+    #: trd_market 枚举（naming-dictionary#trd-market；NONE=未知）
+    TRD_MARKETS = frozenset({"HK", "US", "SG", "HKCC", "CA", "FUTURES", "JP", "KR"})
+    #: currency 枚举（naming-dictionary#currency；NONE=未知）
+    CURRENCIES = frozenset({"HKD", "USD", "CNH", "JPY", "SGD", "KRW"})
+    #: security_type 枚举（naming-dictionary#security-type）
+    SECURITY_TYPES = frozenset({"STOCK", "OPTION", "FUTURES", "MULTILEG_OPTION"})
+    #: option_strategy 枚举（naming-dictionary#option-strategy；拼写 CalenderSpread 为官方原文）
+    OPTION_STRATEGIES = frozenset({
+        "Covered", "VerticalSpread", "Straddle", "Strangle", "Collar", "Butterfly",
+        "Condor", "IronButterfly", "IronCondor", "CalenderSpread", "DiagonalSpread",
+        "Customize"})
+    #: MultiLegInfo / OrderLegInfo 的字段白名单（naming-dictionary）
+    MULTI_LEG_KEYS = ("option_strategy", "underlying_symbol", "underlying_stock_name",
+                      "leg_infos")
+    MULTI_LEG_REQUIRED = ("option_strategy", "underlying_symbol", "leg_infos")
+    LEG_KEYS = ("leg_symbol", "leg_exchange", "leg_ratio_qty", "leg_side",
+                "leg_security_type", "leg_stock_name", "leg_hp_multiplier",
+                "leg_avg_fill_price")
+    LEG_REQUIRED = ("leg_symbol", "leg_exchange", "leg_ratio_qty", "leg_side",
+                    "leg_security_type")
+    #: remark 的 UTF-8 字节上限（place-order 页：maximum length 64 bytes）
+    REMARK_MAX_BYTES = 64
+    #: order_ids 数量上限（order detail 页：length should be less than 50）
+    MAX_ORDER_IDS = 49
+    #: 分页 page_size 区间（orders/orders_history/order_fills: 10-100；
+    #: fills_history: 10-50 —— 官方两页给的上界不同，各自钉死）
+    PAGE_SIZE_RANGE = (10, 100)
+    PAGE_SIZE_HISTORY_DEALS = (10, 50)
+
+    #: code 形状（exchange.symbol，如 US.AAPL / HK.00700 / SH.600519）
+    _SYMBOL_RE = re.compile(r"^[A-Z0-9]{1,6}\.[A-Za-z0-9._]+$")
+
+    def __init__(self, client):
+        self.client = client
+
+    # ------------------------------------------------------------ 校验助手（交易专有）
+
+    def _acc_id(self, value):
+        """acc_id 进路径：非空字符串且不含路径分隔符/空白（避免拼出意外路径）。"""
+        return self._path_token(value, "acc_id")
+
+    @staticmethod
+    def _path_token(value, name):
+        if not isinstance(value, str) or not value.strip():
+            raise ValueError(f"{name} 必须是非空字符串")
+        text = value.strip()
+        if any(char in text for char in "/?#") or any(char.isspace() for char in text):
+            raise ValueError(f"{name} 含非法字符（不得含 / ? # 或空白）：{text[:40]!r}")
+        return text
+
+    def _symbol(self, code):
+        """标的代码校验（官方 exchange.symbol 形状）。"""
+        if not isinstance(code, str) or not self._SYMBOL_RE.fullmatch(code.strip().upper()):
+            raise ValueError(f"code 形如 US.AAPL/HK.00700/SH.600519，得到：{code!r}")
+        return code.strip().upper()
+
+    def _text(self, value, name, required=True, default=None):
+        """数量/价格/编号：官方声明为 string（本层接受数值并转字符串）。"""
+        if value is None or (isinstance(value, str) and not value.strip()):
+            if required:
+                raise ValueError(f"{name} 必填")
+            return default
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ValueError(f"{name} 必须是字符串或数值，得到：{value!r}")
+        return str(value).strip()
+
+    def _micros(self, value, name):
+        """微秒时间戳：非负整数（官方单位微秒，本层不换算）。"""
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} 必须是非负整数（微秒时间戳）")
+        return value
+
+    def _page_flag(self, value):
+        """page_flag 必填但可为空串（空串=从头开始，官方原文）。"""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("page_flag 必须是字符串（空串=从头开始）")
+        return value
+
+    def _page_size(self, value, bounds):
+        if value is None:
+            return None
+        return self._int_in(value, bounds[0], bounds[1], "page_size")
+
+    def _remark(self, value):
+        if value is None:
+            return None
+        if not isinstance(value, str):
+            raise ValueError("remark 必须是字符串")
+        if len(value.encode("utf-8")) > self.REMARK_MAX_BYTES:
+            raise ValueError(f"remark 的 UTF-8 长度不得超过 {self.REMARK_MAX_BYTES} 字节")
+        return value
+
+    def _multi_leg(self, value):
+        """多腿信息内键白名单 + 必填校验（对象或对象列表都接受，原样透传）。"""
+        if value is None:
+            return None
+        items = value if isinstance(value, list) else [value]
+        if not items:
+            raise ValueError("multi_leg_info 不能为空")
+        for item in items:
+            if not isinstance(item, dict):
+                raise ValueError("multi_leg_info 必须是对象或对象列表")
+            unknown = sorted(set(item) - set(self.MULTI_LEG_KEYS))
+            if unknown:
+                raise ValueError(f"multi_leg_info 含未支持字段：{unknown}")
+            for field in self.MULTI_LEG_REQUIRED:
+                if item.get(field) in (None, ""):
+                    raise ValueError(f"multi_leg_info.{field} 必填")
+            self._enum_in(item["option_strategy"], self.OPTION_STRATEGIES,
+                          "multi_leg_info.option_strategy")
+            legs = item["leg_infos"]
+            if not isinstance(legs, list) or not legs:
+                raise ValueError("multi_leg_info.leg_infos 必须是至少一条腿的列表")
+            for leg in legs:
+                if not isinstance(leg, dict):
+                    raise ValueError("multi_leg_info.leg_infos 元素必须是对象")
+                unknown = sorted(set(leg) - set(self.LEG_KEYS))
+                if unknown:
+                    raise ValueError(f"multi_leg_info.leg_infos 含未支持字段：{unknown}")
+                for field in self.LEG_REQUIRED:
+                    if leg.get(field) in (None, ""):
+                        raise ValueError(f"multi_leg_info.leg_infos.{field} 必填")
+                self._enum_in(leg["leg_exchange"], self.EXCHANGES,
+                              "multi_leg_info.leg_infos.leg_exchange")
+                self._enum_in(leg["leg_side"], self.SIDES,
+                              "multi_leg_info.leg_infos.leg_side")
+                self._enum_in(leg["leg_security_type"], self.SECURITY_TYPES,
+                              "multi_leg_info.leg_infos.leg_security_type")
+        return value
+
+    # ------------------------------------------------------------ 交易（Trade）
+
+    def place_order(self, acc_id, code, qty, side, order_type, time_in_force,
+                    price=None, session=None, aux_price=None, lot_type=None,
+                    remark=None, order_class=None, multi_leg_info=None):
+        """POST /api/v1.0/accounts/{acc_id}/orders —— 下单（官方 place-order 页）。
+
+        需要二次确认时信封抛 ``OrderConfirmRequired``（含 confirm_id/jump_url）：订单在
+        券商侧**已挂起**，调用方须调 order_confirm 完成；**禁止对原请求重发**（会重复下单）。
+        """
+        body = self._body({
+            "code": self._symbol(code),
+            "qty": self._text(qty, "qty"),
+            "side": self._enum_in(side, self.SIDES, "side"),
+            "order_type": self._enum_in(order_type, self.ORDER_TYPES, "order_type"),
+            "time_in_force": self._enum_in(time_in_force, self.TIME_IN_FORCE,
+                                           "time_in_force"),
+            "price": self._text(price, "price", required=False),
+            "session": self._enum_in(session, self.SESSIONS, "session", default=None),
+            "aux_price": self._text(aux_price, "aux_price", required=False),
+            "lot_type": self._enum_in(lot_type, self.LOT_TYPES, "lot_type", default=None),
+            "remark": self._remark(remark),
+            "order_class": self._enum_in(order_class, self.ORDER_CLASSES,
+                                         "order_class", default=None),
+            "multi_leg_info": self._multi_leg(multi_leg_info),
+        })
+        if body["order_type"] in self.AUX_PRICE_ORDER_TYPES and "aux_price" not in body:
+            raise ValueError(
+                f"order_type={body['order_type']} 时 aux_price 必填（官方触发价规则）")
+        if body.get("order_class") == "MLEG" and "multi_leg_info" not in body:
+            raise ValueError("order_class=MLEG 时 multi_leg_info 必填（官方多腿订单规则）")
+        return self.client.request("POST",
+                                   f"/api/v1.0/accounts/{self._acc_id(acc_id)}/orders",
+                                   json_body=body)
+
+    def modify_order(self, acc_id, order_id, exchange, qty, price, aux_price=None):
+        """PUT /api/v1.0/accounts/{acc_id}/orders/{order_id} —— 改单（官方 modify-order 页）。
+
+        官方明示**不支持改 A 股订单**（Does not support modifying A-share orders）：本层
+        忠实透传不做市场预判，拒绝/回退策略由交易闸门决定（platform/server/trading.py）。
+        """
+        body = self._body({
+            "exchange": self._enum_in(exchange, self.EXCHANGES, "exchange"),
+            "qty": self._text(qty, "qty"),
+            "price": self._text(price, "price"),
+            "aux_price": self._text(aux_price, "aux_price", required=False),
+        })
+        return self.client.request(
+            "PUT", f"/api/v1.0/accounts/{self._acc_id(acc_id)}"
+                   f"/orders/{self._path_token(order_id, 'order_id')}",
+            json_body=body)
+
+    def cancel_order(self, acc_id, order_id, exchange):
+        """DELETE /api/v1.0/accounts/{acc_id}/orders/{order_id}?exchange=... —— 撤单。"""
+        query = {"exchange": self._enum_in(exchange, self.EXCHANGES, "exchange")}
+        return self.client.request(
+            "DELETE", f"/api/v1.0/accounts/{self._acc_id(acc_id)}"
+                      f"/orders/{self._path_token(order_id, 'order_id')}",
+            query=query)
+
+    def order_confirm(self, acc_id, confirm_id):
+        """POST /api/v1.0/accounts/{acc_id}/order_confirm —— 券商侧二次确认。
+
+        下单/改单返回 ``need_order_confirm=true`` 后**唯一**的放行方式；成功后返回
+        ``{"order_id": ...}``。对同一 confirm_id 重复调用由券商侧语义兜底（本层不重试）。
+        """
+        return self.client.request(
+            "POST", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/order_confirm",
+            json_body={"confirm_id": self._text(confirm_id, "confirm_id")})
+
+    def max_trade_qty(self, acc_id, code, order_type, price=None, order_id=None):
+        """GET /api/v1.0/accounts/{acc_id}/acctradinginfo —— 最大可交易量。
+
+        带 order_id 时查该订单的最大可改数量（官方要求两次查询间隔 > 0.5s——本层不睡眠、
+        不重试，节奏由调用方控制）。
+        """
+        query = self._body({
+            "code": self._symbol(code),
+            "order_type": self._enum_in(order_type, self.ORDER_TYPES, "order_type"),
+            "price": self._text(price, "price", required=False),
+            "order_id": self._text(order_id, "order_id", required=False),
+        })
+        return self.client.request(
+            "GET", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/acctradinginfo",
+            query=query)
+
+    # ------------------------------------------------------------ 订单（Order）
+
+    def open_orders(self, acc_id, trd_market, page_flag="", page_size=None):
+        """GET /api/v1.0/accounts/{acc_id}/orders —— 未完成订单（含最近 24h 已成交/已撤）。
+
+        响应 ``d``：``{orders: [Order], page_flag: str, completed: bool}``。
+        """
+        query = self._body({
+            "trd_market": self._enum_in(trd_market, self.TRD_MARKETS, "trd_market"),
+            "page_flag": self._page_flag(page_flag),
+            "page_size": self._page_size(page_size, self.PAGE_SIZE_RANGE),
+        })
+        return self.client.request(
+            "GET", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/orders", query=query)
+
+    def history_orders(self, acc_id, trd_market, page_flag="", code=None, start=None,
+                       end=None, page_size=None):
+        """GET /api/v1.0/accounts/{acc_id}/orders_history —— 历史订单。
+
+        start/end 是**创建时间**的微秒时间戳；官方组合语义（0/0 → 近 90 天）由服务端处理，
+        本层不补默认窗口（传什么是什么）。
+        """
+        query = self._body({
+            "trd_market": self._enum_in(trd_market, self.TRD_MARKETS, "trd_market"),
+            "page_flag": self._page_flag(page_flag),
+            "code": self._symbol(code) if code is not None else None,
+            "start": self._micros(start, "start"),
+            "end": self._micros(end, "end"),
+            "page_size": self._page_size(page_size, self.PAGE_SIZE_RANGE),
+        })
+        return self.client.request(
+            "GET", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/orders_history",
+            query=query)
+
+    def order_details(self, acc_id, exchange, order_ids):
+        """POST /api/v1.0/accounts/{acc_id}/orders/detail —— 订单详情（同 exchange 批量）。
+
+        响应 ``d`` 是数组（Order 列表）。order_ids 少于 50 个（官方原文）。
+        """
+        if not isinstance(order_ids, list) or not 1 <= len(order_ids) <= self.MAX_ORDER_IDS:
+            raise ValueError(f"order_ids 必须是 1..{self.MAX_ORDER_IDS} 个订单号的列表")
+        ids = [self._path_token(order_id, "order_ids") for order_id in order_ids]
+        body = {
+            "exchange": self._enum_in(exchange, self.EXCHANGES, "exchange"),
+            "order_ids": ids,
+        }
+        return self.client.request(
+            "POST", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/orders/detail",
+            json_body=body)
+
+    # ------------------------------------------------------------ 成交（Deal）
+
+    def today_deals(self, acc_id, trd_market, page_flag="", page_size=None):
+        """GET /api/v1.0/accounts/{acc_id}/order_fills —— 当日成交。
+
+        响应 ``d``：``{order_fills: [OrderFill], page_flag: str, completed: bool}``。
+        """
+        query = self._body({
+            "trd_market": self._enum_in(trd_market, self.TRD_MARKETS, "trd_market"),
+            "page_flag": self._page_flag(page_flag),
+            "page_size": self._page_size(page_size, self.PAGE_SIZE_RANGE),
+        })
+        return self.client.request(
+            "GET", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/order_fills", query=query)
+
+    def history_deals(self, acc_id, trd_market, page_flag="", code=None, start=None,
+                      end=None, page_size=None):
+        """GET /api/v1.0/accounts/{acc_id}/fills_history —— 历史成交。
+
+        start/end 是**更新时间**的微秒时间戳（与 history_orders 的创建时间不同）；
+        page_size 上界 50（官方 fills_history 页，与 orders 页的 100 不同）。
+        """
+        query = self._body({
+            "trd_market": self._enum_in(trd_market, self.TRD_MARKETS, "trd_market"),
+            "page_flag": self._page_flag(page_flag),
+            "code": self._symbol(code) if code is not None else None,
+            "start": self._micros(start, "start"),
+            "end": self._micros(end, "end"),
+            "page_size": self._page_size(page_size, self.PAGE_SIZE_HISTORY_DEALS),
+        })
+        return self.client.request(
+            "GET", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/fills_history",
+            query=query)
+
+    # ------------------------------------------------------------ 账户（Account）
+
+    def authorized_accounts(self):
+        """GET /api/v1.0/accounts/authorized_trd_accs —— 授权交易账户（无参数）。
+
+        响应 ``d``：``{accounts: [Account]}``；Account 含 ``account_id`` / ``security_firm``
+        / ``enable_market``（list[int]）/ ``acc_type`` 等。
+        """
+        return self.client.request("GET", "/api/v1.0/accounts/authorized_trd_accs")
+
+    def account_funds(self, acc_id, currency=None):
+        """GET /api/v1.0/accounts/{acc_id}/funds —— 账户资金（净资产/购买力等）。
+
+        官方参数表把 ``currency`` 标成必填，但同页 curl 示例未传 → 本层按可选处理
+        （登记见文件头差异清单）；该参数只对期货/综合证券账户生效。
+        """
+        query = self._body({
+            "currency": self._enum_in(currency, self.CURRENCIES, "currency",
+                                      default=None),
+        })
+        return self.client.request(
+            "GET", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/funds", query=query)
+
+    def positions(self, acc_id, code=None, pl_ratio_min=None, pl_ratio_max=None):
+        """GET /api/v1.0/accounts/{acc_id}/positions —— 持仓（响应 ``d`` 是数组）。
+
+        盈亏比例过滤（pl_ratio_min/pl_ratio_max）官方是字符串百分数（如 "10" 表示 ≥+10%）。
+        """
+        low = self._text(pl_ratio_min, "pl_ratio_min", required=False)
+        high = self._text(pl_ratio_max, "pl_ratio_max", required=False)
+        if low is not None and high is not None:
+            try:
+                low_value, high_value = float(low), float(high)
+            except ValueError:
+                raise ValueError("pl_ratio_min/pl_ratio_max 必须是数值字符串") from None
+            if low_value > high_value:
+                raise ValueError("pl_ratio_min 不能大于 pl_ratio_max")
+        query = self._body({
+            "code": self._symbol(code) if code is not None else None,
+            "pl_ratio_min": low,
+            "pl_ratio_max": high,
+        })
+        return self.client.request(
+            "GET", f"/api/v1.0/accounts/{self._acc_id(acc_id)}/positions", query=query)
