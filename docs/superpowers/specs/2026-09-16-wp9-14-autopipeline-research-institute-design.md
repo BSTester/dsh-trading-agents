@@ -1,0 +1,622 @@
+# 量化平台一次建成：sim 全自动流水线 + 流程可视化 + 富途数据面补全 + 研究院闭环（WP9–WP14）
+
+> 状态：设计已与用户逐项确认（2026-09-16），待规格审查后进入实现计划。
+> 前序：WP1–WP8（数据基座/研究层/执行闭环/调度/独立服务/独立平台/OpenAPI 统一）已交付。
+> 缺口依据：§附录 A 的富途 OpenAPI 覆盖审计（2026-09-16，对照 `open.futunn.com/zh-cn/llms.txt`
+> 与官方 API 参考逐一核对）。
+
+## 一、背景与已确认的决策
+
+现有平台的组件层已齐（PIT 数据、因子、回测、计划冻结、风控 8 规则、OMS、对账、TCA、
+审计链、OpenAPI 交易通道），但存在三类缺口：
+
+1. **日常闭环断成三截**：调度链只到数据同步/因子快照为止；计划生成靠手工内联权重；
+   计划执行 sim/live 都要人工点击。
+2. **流程不可见**：工作台各页是信息孤岛，看不出「今日闭环跑到哪一步」。
+3. **数据面覆盖不全**：交易链路 13/13 全覆盖，但研究数据面（F10 深度数据、股票筛选、
+   板块、做空、IPO）覆盖率仅约 15%，且复权/财报/估值/分红/经济日历仍绕道托管 MCP，
+   通道统一没有闭环（详见附录 A）。
+
+本规格把三类缺口一次补齐，并把 Harness 升级为「研究院大脑」。
+
+设计前用户已确认以下决策：
+
+| 决策点 | 选择 |
+|---|---|
+| sim 自动化范围 | **全链路**：策略驱动计划生成 + 自动执行，全程无人点击；live 计划同样自动生成，但执行等人工 |
+| 自动执行时点 | **次日开盘后延迟执行**（每市场可配置，如 SH 09:35）；风控规则 3 决定了收盘后生成的计划当天无法成交 |
+| 流程可视化 | **新增「流程」页签**：每市场一条端到端阶段链，可下钻现有页面 |
+| 总开关 | `auto_pipeline.enabled` **默认 false**；不显式打开不改变任何现有行为 |
+| 接入架构 | **作业链 + 指令文件**：auto_execute 到点后写与人工点击完全相同的 execute_plan 指令，复用既有窄门、processed/ 留痕与幂等 |
+| 资讯/情绪数据 | **PIT 快照落库攒历史** + 演进条款（满 250 交易日启动检验，过门槛转正）；不上来就进信号 |
+| 数据面缺口 | **全部补齐**（例外见 §1.1）：研究富矿端点接入 + sync 通道迁移 + 模拟交易 REST 化 |
+| 研究院定位 | **Harness 研究院闭环**：子代理采集资讯 + 生成因子/规则假设 → 声明式规则提案 → 机械验证门 → 人工批准启用 → 既有流水线执行 |
+| 信息源 | **三分采集面**：fin_news/fin_sentiment（富途常规）+ 富途 OpenAPI（公告/资金流/筹码/F10）+ last30days（社媒广度，可选组件，桥接纪律沿用） |
+| 交付方式 | **一份规格，WP9–WP14 顺序交付**，一次建成；每个 WP 独立验收，全程仓库全绿 |
+
+核心架构原则（全规格的不变量）：**LLM 在研究侧自由，在信号侧匿名**——Harness 负责
+研究什么、采集什么、如何解读，产出经人批准后成为确定性规则；规则一旦上岗即可回测、
+可复现、可审计；LLM 永远不直接产生订单、不写代码进核心库、不能自批自己挖的因子。
+
+### 1.1 缺口补全的例外（明确记录在案）
+
+「全部补齐」指**本项目三市场（A 股/港股/美股）证券与期权范围内的官方功能端点**。以下两类
+例外在附录 A 逐条登记，不在本规格实现范围：
+
+| 例外 | 理由 |
+|---|---|
+| **加密货币全族**（`crypto_trading/*`：账户、下单、订单、成交、推送） | 独立资产类别与账户体系，超出本项目声明的市场范围（三市场证券/ETF/期权）；纳入会引入新的交易通道、风控口径与准入评估，属范围扩张而非缺口补全。**如用户要求，另立规格。** |
+| **窝轮/牛熊证策略化使用** | `warrant-screen` 作为**数据端点**接入（保持 API 面完整），但平台策略、风控与执行不引入窝轮品类 |
+
+## 二、非目标（明确不做）
+
+1. **不改 live 任何确认环节**：点执行 + 口令「确认执行」+ Web 确认卡片，全部不变。
+2. **不做盘中实时/高频**：自动执行是日频时点动作，频率上限沿用 WP7 边界。
+3. **不做逐单自动改撤**：熔断撤余单沿用 execute.run 现状，不新增自动改单逻辑。
+4. **不让 LLM 写代码进核心库**：研究产出只能是声明式规则 JSON；需要新算子时走人工
+   代码审查的核心库 PR，不提供动态执行通道。
+5. **不自动批准**：候选规则的批准按钮只在 Web，不进 MCP 工具面（同 confirm-decide
+   与设置端点先例）——Harness 不能自批。
+6. **不做通知推送新渠道**：沿用 alerts 表 + 可选桌面通知（配置默认关）。
+7. **不引入加密货币**（§1.1）与**不策略化窝轮**（§1.1）。
+
+## 三、总体架构
+
+```
+┌────────────── 研究院（Harness + 子代理，LLM 自由区，WP14）──────────────┐
+│ 采集代理群：公告/资金流/F10（OpenAPI）+ fin_news/fin_sentiment + last30days│
+│ 假设代理：资讯 + PIT 数据 → 候选因子/交易规则（声明式 JSON 提案）           │
+│ 检验代理：跑 ic/t检验/分层/walk-forward → 验证报告                        │
+│ 研报代理：research_publish → 工作台研究页（人工随时对话介入）               │
+└───────────────────────────┬──────────────────────────────────────────┘
+                            ▼ 声明式规则提案
+        ┌──── 验证门（机械，WP14 补全 t 检验/分层/半衰期/换手）────┐
+        │ 未满 250 交易日的资讯因子不得引用；检验不过永留候选池       │
+        └───────────────────────────┬─────────────────────────────┘
+                                    ▼ passed
+        候选池（工作台研究页）→ 人工一键批准 = 启用（sim 生效）
+                                    ▼
+┌── 日常流水线（服务内调度器，无 LLM，WP9）────────────────────────────┐
+│ 收盘后链：sync → fundamentals → merge → quality → factors_snapshot    │
+│         → sentiment_snapshot(WP11) → build_plan（策略→冻结，双模式）   │
+│ 次日开盘+延迟：auto_execute（仅 sim；写 execute_plan 指令 → 既有窄门）  │
+│ 晚间：reconcile → tca → digest（补齐规格 §8.1 未入链部分）             │
+│ 每轮 tick：commands.poll 指令轮询并入（修复单进程断点）                  │
+└───────────────────────────┬──────────────────────────────────────────┘
+                            ▼
+        风控 8 规则（唯一提交入口）→ OMS → broker（sim/live 均 OpenAPI，WP13）
+                            ▼
+┌── 流程页签（WP10）───────────────────────────────────────────────────┐
+│ 每市场一条阶段链：sync/quality/factors/plan/execute/reconcile/digest   │
+│ 只读既有事实（ran 标记 + 表），不造状态；auto_pipeline 开关徽章         │
+└─────────────────────────────────────────────────────────────────────┘
+        ▲ 数据供给：WP12 数据面补全（F10/筛选/板块/做空/IPO/经济日历/自选）
+        ▲ 通道统一：WP13（sync 迁 REST + 模拟交易 REST + 工具面治理）
+```
+
+## 四、WP9：sim 全自动流水线
+
+### 4.1 配置（trading-platform.json 顶层新键）
+
+```json
+"auto_pipeline": {
+  "enabled": false,
+  "strategies": [{"market": "SH", "strategy": "watchlist_rsi", "watchlist": "SH"}],
+  "exec_at": {"SH": "09:35", "HK": "09:45", "US": "22:35"},
+  "reconcile_at": "19:00"
+}
+```
+
+- 缺省无此键 = 功能关闭，现有行为零变化（硬约束）；
+- **每轮 tick 现读配置**（platform_config 已是每轮读文件的既有口径），改配置约 60 秒
+  内生效，无需重启服务；
+- `exec_at` 为北京时间；美股受夏令时影响，默认值按夏令时写，文档注明切换需人工调整
+  （不做自动 DST 换算——诚实简单）；
+- `strategies[].watchlist` 引用 `watchlist` 配置的市场键，关注池为空则跳过并告警。
+
+### 4.2 build_plan 作业（各市场链尾追加，factors_snapshot 之后）
+
+1. **数据就绪门**：对关注池标的按日历校验 bars 新鲜度（复用 quality.freshness/gap_report
+   口径）；不新鲜 → 跳过当日 build_plan + warn 告警（宁缺毋假，延续 §4.3 原则）；
+2. **过期语义落地**：生成新计划前，将 `origin='auto'` 且 `status='frozen'` 且
+   `as_of < 今日` 的旧计划置 `cancelled`（补齐原规格 §6.1「跨日计划 expired」从未实现
+   的语义；**只动 auto 计划，手工计划不碰**）；
+3. **策略产出权重**：`strategy.target_weights(conn, as_of)`，as_of = 最近已收盘交易日；
+4. **计划生成**：`planner.build_and_freeze(conn, mode, strategy_id, target,
+   broker_positions, prices, as_of)`——价格用本地库 PIT 最近收盘（不盘中取数），持仓经
+   broker 只读查询（planner 既有口径：current_positions 一律从券商查询）；
+5. **双模式都生成**：mode 取当前模式文件。sim 计划等待次日 auto_execute；live 计划
+   冻结后等待人工执行（工作台计划页可见，流程与今日一致）。
+
+### 4.3 auto_execute 作业（exec_at 时刻，交易日触发）
+
+**八项守卫，全部满足才写指令；任一不满足 → 跳过 + info 告警（如实留痕）：**
+
+1. `auto_pipeline.enabled == true`；
+2. 模式文件 == sim（live 跳过并告警「计划等待人工执行」——自动生成≠自动执行）；
+3. 无 kill 文件（`~/.dsh/trading-kill` 不存在）；
+4. 无 halt（OMS 熔断状态为清）；
+5. 存在 `origin='auto'` 且 `status='frozen'` 且 `as_of == 最近已收盘交易日` 的计划；
+6. 该计划的市场 == 当前作业市场（per-market 计划，见 4.6）；
+7. 该计划今日未被执行过（kv ran 标记幂等，同 daemon 既有口径）；
+8. `expected_mode` 复核通过（写指令时携带，指令处理侧既有复核兜底）。
+
+通过后 `commands.write_command(home, "execute_plan", {plan_hash, expected_mode})`——
+**与人工点击落完全相同的指令文件**，由指令轮询处理，processed/ 留痕、nonce 幂等、
+逐单风控 8 规则全部复用。自动执行 = 系统代替人点击，不是旁路。
+
+### 4.4 reconcile / digest 入链
+
+`reconcile_at`（默认 19:00）追加 `reconcile → tca → daily_digest` 作业——补齐原规格
+§8.1 写明但一直未入链的「每日固定对账」；sim/live 通用，与执行动作解耦（晚间固定跑）。
+
+### 4.5 指令轮询并入服务内调度器（断点修复）
+
+现状：`commands.poll` 只在独立 daemon CLI 常驻模式里跑；服务内调度器只跑作业链。
+**若独立 daemon 未运行，plan-execute 写下的指令永远无人处理**——这是实测确认的集成
+断点，也是全自动的前置条件。
+
+修复：服务内调度器每轮 tick 末尾调用 `commands.poll`（handler 与 CLI daemon 同一
+分派函数）。双进程并发安全沿用既有协议：文件原子写 + processed/ nonce 去重 + 同名
+文件 replace 原子性；CLI daemon 保留为手动/兼容入口，同日作业靠 kv ran 标记不重复。
+
+### 4.6 计划模型小扩展
+
+- `plans` 表幂等追加两列（沿用 store.py 既有幂等 ALTER 模式，SCHEMA_VERSION 不动）：
+  - `origin TEXT NOT NULL DEFAULT 'manual'`——auto 计划与手工计划的来源隔离依据；
+  - `market TEXT`——auto 计划一计划一市场（匹配 per-market 作业链与 exec_at）；
+    手工计划留空，完全兼容现状。
+- `strategies.py` 补 watchlist 组合适配器（`watchlist_rsi` 等）：扫指定市场关注池，
+  信号 BUY 等权、其余现金；现有 rsi/ma_cross 单标的策略不动。
+
+### 4.7 WP9 验收标志
+
+- 假时钟单测：build_plan 触发/数据不就绪跳过/旧 auto 计划过期；auto_execute 八守卫
+  逐项跳过路径 + 正常路径落指令；live 模式绝不自动执行；kill 存在绝不执行；
+- 端到端：sim 模式下（enabled）假时钟连跑 2 个模拟交易日——收盘链自动生成冻结计划，
+  次日 exec_at 自动写出 execute_plan 指令，指令轮询处理，订单经风控落 OMS，晚间
+  reconcile/digest 完成，全程零人工；
+- 开关关闭时行为与现状逐字节一致（回归）。
+
+## 五、WP10：流程页签
+
+### 5.1 pipeline 端点（GET /api/wb/pipeline，只读）
+
+每市场返回今日各阶段状态，来源全部是既有事实，**只读不造**：
+
+| 阶段 | 事实来源 |
+|---|---|
+| sync / fundamentals / quality / factors / sentiment / build_plan / auto_execute / reconcile / digest | kv `daemon:state` ran 标记（作业名+时间）+ 当日 alerts（失败/跳过原因） |
+| plan | plans 表最新计划（status/as_of/origin/market/订单数） |
+| execute | orders 表按计划聚合的状态分布 |
+
+每阶段 `{status: pending|ok|skipped|failed, at, summary}`；响应含 `auto_pipeline`
+当前配置摘要（enabled/strategies/exec_at）。缓存 TTL 30s。
+
+### 5.2 Web 流程页（pages/pipeline.jsx）
+
+- 每市场一条 antd Steps 横向链，状态着色（完成/跳过/失败/待运行），
+  点击阶段下钻到计划/调度/审计页；
+- 页头：模式徽章（SIM/LIVE）+ auto_pipeline 开关徽章；
+- 开关按钮走 settings 扩展（5.3），页面上明确提示「关闭时流水线不自动运行」。
+
+### 5.3 auto_pipeline 开关（settings_api 扩展）
+
+- `GET/POST auto_pipeline`（载荷白名单 + 结构校验 + 原子写，模式与 openapi_config
+  完全一致）；**两端点不进 MCP 工具面**（同 openapi_config/openapi_test/confirm-decide
+  先例）——模型不能自拨开关。
+
+### 5.4 WP10 验收标志
+
+- 端点形状测试（envelope 契约 + 阶段状态推导的假库用例）；
+- 前端渲染 + 端点声明自检清单更新（endpoints 数组加 pipeline/auto_pipeline）；
+- 开关闭环：页面切换 → 配置文件变化 → 下轮 tick 生效。
+
+## 六、WP11：资讯 PIT 地基
+
+### 6.1 sentiment_snapshots 表 + 每日作业
+
+- 新表 `sentiment_snapshots(date, symbol, source, payload, fetched_at)`——**只存原始
+  事实（原文摘要/声量计数/渠道原文），不打分**（打分算法会漂移，原始数据不会；
+  PIT 一致性优先）；
+- 每日作业 `sentiment_snapshot`（链尾，factors_snapshot 之后）：对关注池标的并行采集，
+  逐源落库、逐源标注：
+  - **fin_sentiment / 千股千评**（fin-data）：A 股常规情绪通道；
+  - **富途 OpenAPI 资讯/公告/社区**（`find-news`/`find-community`，WP12 起并含 F10
+    研究面）：公告类沿用既有 announcements 通道（WP1 merge-announcements 已落
+    `announced_at`），本作业补资讯面快照；
+  - **last30days**（可选组件）：`--emit=json` 结构化输出落库；未安装/未配密钥的来源
+    **缺席标注而非报错**（上游降级语义），桥接纪律原样沿用：证据必须带平台/时间/
+    互动数三要素，不经富途、不经交易闸门；
+- 失败单源跳过并告警，不阻塞其他源；全部失败 → warn 告警（不阻塞后续 build_plan——
+  情绪数据目前不进信号，采集是攒历史，不是当日依赖）。
+
+### 6.2 查询与展示
+
+- `sentiment-history` 查询端点（按标的/日期倒序，同 factors-history 三路同源模式）；
+- 流程页情绪阶段展示「已连续积累 N 天」；因子页增加情绪快照查看入口。
+
+### 6.3 演进条款（写死在规格里）
+
+`sentiment_snapshots` 某因子候选**连续积累 ≥250 交易日**后，可由研究院提出检验申请，
+走 WP14 验证门——与价格因子同一套门槛（IC t 检验显著 + 分层单调 + walk-forward OOS），
+**过门槛转正为正式因子，不过就继续攒或放弃，不搞特殊通道**。转正前，资讯因子不得
+出现在任何启用规则的 factors 列表里（规则解释器机械拒绝未注册/未通过检验的因子引用）。
+
+### 6.4 WP11 验收标志
+
+- 落库/降级/查询单测；last30days 缺席时的降级语义测试；
+- 假时钟：作业入链后 sentiment_snapshots 按交易日累积、流程页阶段联动。
+
+## 七、WP12：富途 OpenAPI 数据面补全
+
+> 目标：把附录 A 列出的**研究数据缺口全部接入权威 OpenAPI 通道**，让 WP14 研究院
+> 开工时数据已就位。所有端点逐条对照官方文档实现；**实施时以官方文档参数为准**
+> （附录 A 给出每项的官方文档 URL 与已验证/待核对标记）。
+
+### 7.1 传输层扩展（trading_datasource.futu_openapi）
+
+新增方法组（与既有 `OpenApiQuote`/`OpenApiTrade` 同构：参数白名单 = 方法签名、
+枚举/区间本地校验、错误码映射复用 `parse_envelope`）：
+
+| 方法组 | 覆盖端点 | 方法与路径（已验证 / 待核对） |
+|---|---|---|
+| `OpenApiScreen` | 股票筛选、窝轮筛选 | `POST /api/v1.0/quote/stock-screen` ✅（`screen_queries`/`retrieve_queries`/`sort`/`sorts`/`next_key`/`limit`≤300/`watchlist_stock_ids`/`holding_stock_ids`/`user_stock_list_mode`）；`POST /api/v1.0/quote/warrant-screen`（待核对） |
+| `OpenApiPlate` | 板块列表、板块成份股 | `GET /api/v1.0/quote/plate-list` ✅（`market`+`plate_class`∈{ALL,INDUSTRY,REGION,CONCEPT,OTHER}；REGION 仅 SH/SZ，否则 `-8 unsupported`）；`GET /api/v1.0/quote/plate-stock`（待核对） |
+| `OpenApiShort` | 每日卖空成交、空头持仓 | `GET /api/v1.0/quote/{symbol}/short/daily-volume` ✅（`count`≤90；仅 HK/US 可卖空证券；无数据 `-10 no_data` 视为空而非错）；`.../short/interest`（待核对） |
+| `OpenApiF10` | 个股深度数据 23 项 | `/api/quote/financials/*` 族（官方 api-reference 归类为「个股深度数据」；**llms.txt 的 `/f10/*.md` 链接已 404，实施时按 api-reference 的真实路径逐一核对**） |
+| `OpenApiBasicData` | 经济日历热门/搜索、证券搜索、所属板块、复权因子 | `economic-calendar/hot`、`economic-calendar/search`、`search`、`{symbol}/owner-plate`、`{symbol}/rehab`（路径待核对；后两项现经托管 MCP） |
+| `OpenApiDerivatives` | 期货信息、期权波动率、行权概率、相关期货 | 期货/期权族补充端点（路径待核对） |
+| `OpenApiIpo` | IPO 列表 | `GET /api/v1.0/quote/ipo-list`（待核对；支持 HK/US/CN/MY/SG） |
+| `OpenApiWatchlist` | 自选列表、自选分组 | `GET` 自选族（待核对） |
+| `OpenApiSimTrade` | 模拟交易 9 端点 | 见 §8（WP13） |
+
+**约束**：传输层不做业务聚合；每个方法只做「参数校验 + 一次 REST 调用 + envelope 解析」，
+与既有 OpenAPI 客户端纪律一致。**待核对路径不得靠猜落地**——实施时先取官方文档确认，
+再写方法与测试；文档与实现不一致时以官方文档为准并登记到 `docs/TOOL-LIMITS.md`。
+
+### 7.2 服务端点面与服务/工具面分层
+
+**新增端点全部进服务 HTTP 端点面（1:1，Web/CLI/测试可逐端点验证）**；
+MCP 工具面按研究价值分档，避免工具数无节制膨胀：
+
+| 档 | 策略 | 端点 |
+|---|---|---|
+| **直通工具**（逐端点 1:1） | 研究高频、语义独立 | `stock_screen`、`plate_list`、`plate_stock`、`short_daily_volume`、`short_interest`、`ipo_list`、`economic_calendar_hot`、`economic_calendar_search`、`info_search_stock`、`info_owner_plate`、`watchlist_list`、`watchlist_groups` |
+| **聚合读工具**（一个工具、白名单 section 枚举） | 结构同质、逐项暴露收益低 | `f10_detail(symbol, section)`：section 枚举映射 23 个 F10 端点；`derivative_detail(symbol, section)` 同理 |
+| **HTTP-only**（不进工具面） | 低频/写类/自选修改 | `modify_user_security`（自选修改，仅 Web 用户操作）、期货信息等低频项 |
+
+- 工具面预算不变量：**直通工具 + 聚合工具合计 ≤ 80**（现 59 → 预计约 78），
+  写入测试断言；新增工具必须显式登记档位与理由；
+- **写端点纪律不变**：只有只读研究端点可批量进工具面；`modify_user_security` 触及
+  用户富途侧数据，仅 Web 端点可达且不复用交易闸门（非交易写）；
+- 端点声明自检（`store_access.endpoints()`）与 `caches.CACHE_TTL_MS` 同步登记：
+  F10/板块/筛选＝静态或低频（TTL 30m–6h，按官方口径与实测确定）；做空数据 TTL 1h；
+  实时族不进缓存（既有纪律）。
+
+### 7.3 数据落库与因子化衔接
+
+- **F10 与做空数据落 PIT 表**（新表，只存原始事实 + 抓取时间 + 来源）：
+  `f10_snapshots(symbol, section, period_end, announced_at, payload, fetched_at)`、
+  `short_snapshots(symbol, date, payload, fetched_at)`——**PIT 钥匙是
+  `announced_at`**（沿用 WP1 财报公告日双源合并口径；与 `fundamentals` 表同纪律）；
+- 每日作业 `research_snapshot`（与 sentiment_snapshot 同链）：对关注池标的抓取
+  F10 关键 section（分析师共识、评级汇总、机构持仓、内部交易、持股变动）与做空数据
+  落库，攒 PIT 历史；**先攒数、后因子化**，与 §6.3 同一套 250 交易日演进条款；
+- 板块归属（`owner-plate`）落 `universe`/板块表用于**行业中性化**（补齐原规格 §5.1
+  缺失的行业中性化能力）——板块列表与成份股按交易日快照落库，防幸存者偏差。
+
+### 7.4 WP12 验收标志
+
+- 传输层：每个新方法真机连通性自检（有凭据环境）+ 无线环境下的参数校验单测；
+- 端点面：逐端点 envelope 形状测试 + 声明自检清单一致；
+- 工具面：预算断言 ≤80、档位登记完整、写端点白名单回归（`modify_user_security`
+  不在 MCP 工具面）；
+- 落库：F10/做空/板块快照按交易日累积，`announced_at` 覆盖率可统计；
+- 降级：`no_data`/`unsupported` 按官方语义如实呈现（空而非错），失败单端点不阻塞链。
+
+## 八、WP13：通道统一收口
+
+### 8.1 sync 作业迁移到 OpenAPI
+
+现状：复权因子（rehab）、财务报表（statements）、估值明细、分红、经济日历仍经托管
+MCP（`trading_datasource.futu_mcp`），`futu_channel: openapi` 未闭环。
+
+迁移：上述 5 项取数在 openapi 通道下走 REST（方法见 §7.1），mcp 通道保留为回退；
+**行为等价由同一批清洗/落库函数保证**（通道只换取数实现，不改落库口径）。迁移后
+`futu_channel: openapi` 为完整通道（行情/交易/同步/推送全 REST）。
+
+### 8.2 模拟交易 REST 化（9 端点）
+
+现状：sim 下单/查单经托管 MCP `sim_trade_*` 工具（TOOL-LIMITS 记录
+`sim_trade_modify_order` 间歇性 `-5`）。
+
+迁移：`OpenApiSimTrade` 接入官方模拟交易 9 端点（账户列表/资金/持仓/下单/改单/撤单/
+订单列表/历史订单/最大买卖量）；`futu_channel=openapi` 时 `core_broker` 的 sim
+实现走 REST，mcp 通道保留回退。**sim 通道能力边界不变**（仅限价当日单，扩展字段
+如实拒绝），改单策略沿用「撤旧重下」（官方模拟改单可靠性待实测，实测通过后可改原生改单，
+登记到 TOOL-LIMITS）。
+
+### 8.3 WP13 验收标志
+
+- 双通道等价性测试：同一请求在 mcp 与 openapi 通道下产出同形落库结果（假件注入）；
+- sim 全链路回归：`futu_channel=openapi` 下 sim 计划→执行→成交→台账一致；
+- 通道回退测试：凭据缺失/通道不可用时按既有语义如实报错，不静默降级。
+
+## 九、WP14：研究院闭环
+
+### 9.1 研究院编排 skill（skills/research-institute/）
+
+Harness 会话内的编排技能，定义四类子代理分工（复用 Harness 原生子代理能力）：
+
+| 子代理 | 职责 | 主要通道 |
+|---|---|---|
+| 采集代理 | 标的/事件的资讯与基本面盘点：公告、资金流、F10、新闻、社媒叙事 | 富途 OpenAPI（只读工具）+ fin_news/fin_sentiment + last30days |
+| 假设代理 | 从资讯 + PIT 数据提出候选因子/交易规则，落声明式提案 | 工作台数据（quantwb 只读工具）+ 采集代理产出 |
+| 检验代理 | 对提案跑验证门（ic/分层/walk-forward），产出验证报告 | rules CLI + 因子检验工具 |
+| 研报代理 | 综合产出研报并发布 | research_publish（研究页可见） |
+
+- **人工随时介入**：对话即介入——问资讯影响、要求深挖、否决假设，都是研究院的
+  正常输入；12 角色深度流程（trading-agents）仍是单标的深度研究的重型入口，
+  研究院 skill 是持续性的因子/规则生产线；
+- 产出落 `rules/` 候选目录 + rules 表（9.3），全程带 research_run_id 溯源。
+
+### 9.2 声明式规则协议（rules JSON）
+
+```json
+{
+  "rule_id": "news_momentum_v1",
+  "hypothesis": "公告超预期 + 资金流入 → 短期动量（研究假设，人话写清）",
+  "factors": ["momentum_20", "capital_flow_3d"],
+  "combine": "zscore_equal_weight",
+  "universe": "watchlist.SH",
+  "top_n": 5,
+  "rebalance": "weekly",
+  "provenance": {
+    "research_run_id": "…", "created_by": "harness",
+    "created_at": "…", "approved_by": null, "approved_at": null
+  }
+}
+```
+
+- **LLM 不写代码**：factors 只能引用已注册因子（REGISTRY 现有 + 核心库 PR 增补），
+  combine 只能用解释器支持的有限算子集（首版：zscore 等权/IC 加权）；需要新算子 =
+  核心库 PR（人工代码审查），不提供 eval/动态执行通道；
+- **未成熟因子机械拒绝**：规则解释器校验 factors 引用——未注册、或注册但未通过
+  检验（如攒数中的资讯/AI 因子）的引用直接拒绝提案（fail-closed）。
+
+### 9.3 rules 表 + 规则解释器
+
+- 新表 `rules(rule_id PRIMARY KEY, spec TEXT, status TEXT, validation TEXT,
+  created_at, approved_at, approved_by)`——status: candidate/validating/passed/failed/
+  enabled/disabled；validation 存最近一次验证报告摘要；
+- 规则解释器（core 新模块 `rule_engine.py`）：rules JSON → Strategy 协议适配实例
+  （universe(as_of) → target_weights(as_of)），机械执行声明；通过的规则批准后即成为
+  `auto_pipeline.strategies` 的合法取值（strategy 填 rule_id）；
+- 验证门补全（ic CLI / factors 扩展）：IC 均值 **t 统计与 p 值**、**5 分位分层收益
+  及单调性判定**、**因子衰减半衰期**、**换手率**；walk-forward OOS 复用既有实现；
+  验证报告落 rules.validation。
+
+### 9.4 候选池与审批（工作台研究页扩展）
+
+- 研究页新增「规则候选池」区：候选规则列表（假设/因子/验证报告/状态）；
+- **人工一键批准 = 启用**（批准按钮只在 Web，不进 MCP 工具面）：批准后 status=enabled，
+  该规则即可被 `auto_pipeline.strategies` 引用，sim 下次 build_plan 即生效；
+  否决 → disabled 留档；
+- 启用随时可停（研究页/流程页开关）；live 模式的执行确认环节不因规则来源有任何变化；
+- 批准是策略上岗的唯一通道：Harness 可以提交一百条提案，没有批准，一条也进不了
+  auto_pipeline。
+
+### 9.5 边界纪律（汇总）
+
+1. LLM 不写代码进核心库（9.2）；
+2. Harness 不能自批（批准只在 Web 端点，不进模型工具面）；
+3. 社媒证据三要素（平台/时间/互动数），取不到标注「未核实」；
+4. 社媒情绪永不直接触发交易（last30days 桥接纪律原样沿用）；
+5. 资讯/F10/做空因子未满 250 交易日不得进规则 factors（§6.3、§7.3 演进条款）；
+6. 一切执行仍过风控 8 规则唯一入口，kill/熔断对自动链同样一票否决。
+
+### 9.6 WP14 验收标志
+
+- 规则解释器单测：声明 → 权重、非法因子引用拒绝、combine 算子白名单；
+- 验证门统计单测：t 统计/分层单调/半衰期在构造数据上的正确性；
+- 审批流闭环：candidate → validating → passed → 人工批准 → enabled → build_plan
+  消费；未批准规则绝不进 auto_pipeline；
+- 工具面回归：MCP 工具清单不含 rules 批准端点；
+- 端到端（假时钟 + sim）：研究院产出一条规则 → 检验通过 → Web 批准 → 次日
+  build_plan 按新规则生成计划 → auto_execute 执行 → 流程页全程可见。
+
+## 十、测试总则
+
+- 既有 52 Python + 17 Node 测试全程保持全绿；每个 WP 附带离线单测（假时钟注入，
+  无网络依赖；last30days/富途通道全部注入假件）；
+- 集成验收：WP9 末做 sim 两交易日无人干预全链路；WP12/WP13 末做双通道等价与
+  数据面逐端点形状；WP14 末做规则从挖掘到执行的端到端演练；
+- live 准入维持 P4 清单人工评估不变，本规格不改变任何 live 准入条件。
+
+## 十一、风险与诚实清单
+
+1. **自动执行的可靠性依赖数据就绪门**：门太松会在坏数据上生成计划（风控与质量检查
+   兜底），太紧会频繁跳过——保守取向：宁可跳过 + 告警，不冒险执行。
+2. **美股 exec_at 与夏令时**：默认值按夏令时写死，冬令时需人工调配置（文档注明）；
+   不做自动 DST 换算。
+3. **last30days 渠道脆弱**：上游发版/密钥失效 → 来源缺席（降级不报错）；情绪采集
+   不进当日信号，链路韧性无影响。
+4. **官方文档链接漂移**（已实测）：`llms.txt` 的 `/f10/*.md` 链接 404，真实路径在
+   `/api/quote/financials/*`。**实施时必须逐端点核对官方文档**，§7.1 标「待核对」的
+   路径不得直接落地；实现与文档不一致登记 TOOL-LIMITS。
+5. **声明式规则表达能力有边界**：复杂假设（条件触发、事件驱动）首版算子集表达不了，
+   需要核心库 PR——这是刻意的摩擦，不是缺陷。
+6. **资讯/F10/做空因子转正周期长**：250 交易日 ≈ 一年，本规格交付时这些因子仍在攒数期；
+   规格保证的是「路径存在」，不承诺「当下可用」。
+7. **工具面膨胀**：直通 + 聚合合计 ≤80 是硬预算；超预算必须走聚合档或 HTTP-only，
+   不允许「顺手加一个工具」。
+8. **指令双进程并发**：CLI daemon 与服务同跑时靠既有原子协议互斥，极端交叉仍可能
+   告警噪音（不产生重复执行——nonce 主键兜底）；文档建议二选一常驻。
+9. **build_plan 持仓查询依赖 broker 可用**：晚间查询失败 → 跳过当日计划 + 告警，
+   次日重试；不做本地台账替代（台账二分原则不变）。
+10. **数据面补全的额度成本**：F10/做空按关注池每日抓取会消耗富途调用额度（限频见
+    官方 rate-limit）；实施时按「关注池规模 × 端点族」估算并给出限速参数，默认只抓
+    关键 section（分析师共识/评级/机构持仓/内部交易/持股变动 + 做空 2 项）。
+
+## 十二、需同步修订的现有文档
+
+| 文档 | 修订内容 |
+|---|---|
+| `docs/architecture.md` | 组件职责表加 rule_engine/研究院 skill/新数据端点族；闭环链路图更新；端点表加 pipeline/auto_pipeline/sentiment-history/rules/F10/筛选/板块/做空；「两条受约束写路径」表述更新为含自动链；工具面计数与档位说明 |
+| `docs/TOOL-LIMITS.md` | 新增各端点的实测口径（经济日历、rehab、F10 族、做空、板块、筛选、模拟交易 REST），官方文档链接漂移登记 |
+| `docs/OPENAPI-FEASIBILITY.md` | 覆盖率审计结论并入（附录 A 摘要） |
+| `README.md` | auto_pipeline 配置样例；研究院用法；目录结构；端点/工具面计数 |
+| `docs/HANDOVER.md` | 开关运维、exec_at 时区注意、规则审批运维、数据面抓取额度 |
+| `docs/RUNBOOK.md` | 全自动演练：kill 中断恢复、开关启停、规则否决回滚、通道回退演练 |
+| `docs/P4-live-trading.md` | live 准入清单不变，补记「live 计划已自动生成，执行仍全人工」事实 |
+
+---
+
+# 附录 A：富途 OpenAPI 覆盖审计（2026-09-16）
+
+> 方法：对照 `https://open.futunn.com/zh-cn/llms.txt` 与官方 API 参考
+> （`/api/overview/api-reference.md`）逐端点核对仓库实现（`platform/server/*.py`、
+> `plugins/datasource/python/trading_datasource/futu_openapi.py`、`mcp_tools.py` 工具面），
+> 对关键新端点现场取官方文档核对参数。
+> **图例**：✅ 已覆盖（OpenAPI REST 权威通道）｜⚠️ 功能可用但走托管 MCP（待迁移）｜
+> ❌ 未覆盖（本规格补齐）｜🚫 明确不做／范围外
+
+## A.1 交易与账户：13/13 全覆盖 ✅
+
+| 端点 | 状态 | 实现 |
+|---|---|---|
+| 下单 place-order | ✅ | `OpenApiTrade.place_order`（8 种 order_type/GTC/时段/触发价/多腿/备注） |
+| 改单 modify-order | ✅ | `modify_order`（官方不支持改 A 股 → 如实拒绝并指引撤+下） |
+| 撤单 cancel-order | ✅ | `cancel_order` |
+| 下单确认 order-confirm | ✅ | `order_confirm`（人工批准后自动调用，失败落 unknown 不重放） |
+| 最大可交易数量 get-max-qty | ✅ | `max_trade_qty` |
+| 账户资金 get-funds | ✅ | `account_funds` |
+| 授权交易账户 get-accounts | ✅ | `authorized_accounts` |
+| 持仓列表 get-positions | ✅ | `positions` |
+| 未完成订单 get-open-orders | ✅ | `open_orders` |
+| 历史订单 get-history-orders | ✅ | `history_orders` |
+| 订单详情 get-order-details | ✅ | `order_details` |
+| 当日成交 get-today-deals | ✅ | `today_deals` |
+| 历史成交 get-history-deals | ✅ | `history_deals` |
+
+**行情/交易事件 WS 推送**：✅ 双通道（`server/futu_push.py`，重连/refresh/事件→OMS，
+断线不补发、对账兜底）。
+
+## A.2 行情：已覆盖（19 REST 端点）✅
+
+实时行情 6/6：股票报价、买卖盘、逐笔成交、分时数据、当前 K 线、市场快照。
+资金流向 3/3：资金流向、资金流向历史、资金分布。
+基础数据 5/9：历史 K 线、市场状态、股票基本信息、交易日、新闻搜索（`find-news`/
+`find-community`）。
+衍生品 2/6：期权链、期权到期日。
+筛选 1/3：期权筛选。
+
+## A.3 缺口清单（WP12 补齐）
+
+### A.3.1 基础数据（4）
+
+| 端点 | 状态 | 官方文档 | 备注 |
+|---|---|---|---|
+| 经济日历热门 | ⚠️→✅ | `/api/quote/basic-data/economic-calendar-hot.md` | 现经托管 MCP（events 页在用） |
+| 经济日历搜索 | ❌ | `/api/quote/basic-data/economic-calendar-search.md` | 宏观事件因子 |
+| 搜索（证券） | ❌ | `/api/quote/basic-data/search.md` | 现 `info_search` 实为新闻搜索 |
+| 所属板块 | ⚠️→✅ | `/api/quote/basic-data/owner-plate.md` | 行业中性化前提；现经 MCP |
+| 复权因子 | ⚠️→✅ | `/api/quote/basic-data/rehab.md` | sync 作业现经 MCP |
+
+### A.3.2 板块（2）
+
+| 端点 | 状态 | 官方文档 | 已验证参数 |
+|---|---|---|---|
+| 板块列表 | ❌ | `/api/quote/plate/plate-list.md` | ✅ `GET /api/v1.0/quote/plate-list?market&plate_class`（ALL/INDUSTRY/REGION/CONCEPT/OTHER；REGION 仅 SH/SZ） |
+| 板块成份股 | ❌ | `/api/quote/plate/plate-stock.md` | 路径待核对 |
+
+### A.3.3 衍生品（4）
+
+期货信息、相关期货、期权波动率、期权行权概率 ❌ —— 官方文档
+`/api/quote/derivatives/{future-info,reference-future,option-volatility,option-exercise-probability}.md`。
+
+### A.3.4 筛选（2）
+
+| 端点 | 状态 | 官方文档 | 已验证参数 |
+|---|---|---|---|
+| 股票筛选 | ❌ | `/api/quote/screening/stock-screen.md` | ✅ `POST /api/v1.0/quote/stock-screen`：`screen_queries`（11 选 1 查询类型）/`retrieve_queries`（9 选 1 取值）/`sort`/`sorts`/`next_key`/`limit`≤300/自选持仓范围；8 市场支持 |
+| 窝轮筛选 | ❌（数据接入，不策略化） | `/api/quote/screening/warrant-screen.md` | 路径待核对 |
+
+### A.3.5 IPO（1）
+
+IPO 列表 ❌ —— `/api/quote/ipo/ipo-list.md`（HK/US/CN/MY/SG）。
+
+### A.3.6 个股深度数据 F10（20 缺失 / 23 总数）
+
+| 端点 | 状态 |
+|---|---|
+| 财务报表 statements | ⚠️→✅（sync 现经 MCP） |
+| 估值明细 valuation-detail | ⚠️→✅（估值因子现经 MCP） |
+| 分红派息 dividends | ⚠️→✅（events 页现经 MCP） |
+| 分析师共识 analyst-consensus | ❌ |
+| 评级汇总 rating-summary | ❌ |
+| 机构持仓 institutional | ❌ |
+| 持股明细 holder-detail | ❌ |
+| 持仓变动 holding-changes | ❌ |
+| 内部持股人 insider-holders | ❌ |
+| 内部交易 insider-trades | ❌ |
+| 股东概况 shareholders-overview | ❌ |
+| 公司高管 company-executives | ❌ |
+| 高管背景 executive-background | ❌ |
+| 公司简介 company-profile | ❌ |
+| 回购 buybacks | ❌ |
+| 拆合股 stock-splits | ❌ |
+| 业绩价格历史 earnings-price-history | ❌ |
+| 业绩价格变动 earnings-price-move | ❌ |
+| 运营效率 operational-efficiency | ❌ |
+| 营收拆分 revenue-breakdown | ❌ |
+| 晨星评级 morningstar | ❌ |
+| 券商席位 top-brokers | ❌ |
+| 板块估值成份股 valuation-plate-stocks | ❌ |
+
+> **文档链接漂移（实测）**：llms.txt 给出的 `/api/quote/f10/*.md` 全部 404；官方 API
+> 参考将本族归入「个股深度数据」，真实路径在 `/api/quote/financials/*`。
+> **实施时逐端点核对真实路径与参数。**
+
+### A.3.7 做空（2）
+
+| 端点 | 状态 | 已验证参数 |
+|---|---|---|
+| 每日做空量 | ❌ | ✅ `GET /api/v1.0/quote/{symbol}/short/daily-volume?count`（≤90；HK 成交维度 / US 持仓维度；仅 HK/US 可卖空证券；`-10 no_data` 视为空；返回累计空头持仓 `aggregated_short`/`aggregated_short_ratio`） |
+| 做空利息 | ❌ | `/api/quote/short/short-interest.md`（路径待核对） |
+
+### A.3.8 自选（3）
+
+自选列表、自选分组 ❌（读取用于关注池导入：把用户富途自选同步为平台关注池候选）；
+修改自选 ❌（**仅 Web 用户操作端点，不进 MCP 工具面**——触及用户富途侧数据，非交易写）。
+
+### A.3.9 模拟交易（9）
+
+模拟账户列表、模拟资金、模拟持仓列表、模拟下单、模拟改单、模拟撤单、模拟订单列表、
+模拟历史订单、模拟最大买卖量：⚠️→✅（WP13 迁 REST；现经托管 MCP `sim_trade_*`）。
+
+### A.3.10 通道不统一残留（5，WP13 收口）
+
+复权因子、财务报表、估值明细、分红派息、经济日历热门——功能可用但走托管 MCP，
+`futu_channel: openapi` 未闭环。
+
+## A.4 范围外（明确不做）
+
+| 类别 | 端点族 | 理由 |
+|---|---|---|
+| 加密货币 | `crypto_trading/*`（账户总余额/授权账户、下单/改单/撤单/最大买卖量、活跃订单/历史订单/订单详情、成交明细/历史成交、WS 推送） | 独立资产类别与账户体系，超出三市场（A/H/US 证券·ETF·期权）范围；纳入需另立规格并重做风控/准入 |
+| 窝轮/牛熊证策略化 | warrant-screen 之外的窝轮交易与策略 | 数据端点接入以保持 API 面完整，但策略/风控/执行不引入该品类 |
+
+## A.5 审计结论
+
+| 层 | 覆盖率 | 结论 |
+|---|---|---|
+| 交易与账户 | **13/13（100%）** | 交易链路完整，无需补 |
+| 行情核心（实时/K线/资金流/期权基础） | 19/约 25（~76%） | 核心可用，衍生品 4 项待补 |
+| 研究数据面（F10/筛选/板块/做空/IPO/经济日历） | 约 3/32（~9%） | **主要缺口，WP12 补齐** |
+| 通道统一 | 5 项残留 | WP13 收口 |
+| 模拟交易 | 功能可用，通道未统一 | WP13 迁 REST |
+
+补齐后：**三市场证券与期权范围内的官方功能端点全部接入权威 OpenAPI 通道**，
+唯一例外为 §1.1 登记的加密货币与窝轮策略化使用。
