@@ -7,7 +7,9 @@
 > **能力清单**：一键安装覆盖「拉代码 → 对话模式（preset 行 + `skills/`）→ 平台服务
 > （venv/依赖/Web 构建/服务启动/验证）→ MCP 集成（quantwb 工作台 + 可选富途只读）」全栈，
 > 并包含**富途官方 skills 参考集成（7 个，数据通道对接工作台，工具清单见
-> `skills/futu-skills/README.md`）**。
+> `skills/futu-skills/README.md`）**；另有一条**可选：last30days 社媒研究技能**
+> （上游近 30 天社媒/全网研究引擎，不随仓库分发，需单独运行
+> `python3 scripts/install_last30days.py`，见 ② 手册第 3c 步）。
 
 ---
 
@@ -130,6 +132,7 @@
 | 2 获取/更新 | `git -C "$REPO_ROOT" pull --ff-only` 或 `git clone --depth 1 …` | 更新/克隆成功 | 已是最新则 `Already up to date.` |
 | 3 插件安装 | `python3 scripts/install_plugins.py install --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | 安装 web profile 工作台 Host 与投研/数据插件，激活 preset 工具行 | 重复安装覆盖同版本包 |
 | 3b skills 就位 | skills/ 随仓库分发（customSkillDirs 直读仓库，无需单独安装）；已安装过对话模式的旧副本跑 `python3 scripts/install_plugins.py update --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | `ls skills/futu-skills` 列出 7 个技能目录与 README.md | update = git pull + preset 行翻转回填，幂等，可重复运行 |
+| 3c last30days（可选） | `python3 scripts/install_last30days.py` | 两行 JSON 摘要：`install`（或 `update`，detail 含 commit SHA）+ `verify`（`skills/last30days/SKILL.md` 存在） | 已存在 → `git pull --ff-only` 更新；`--remove` 删除目录；幂等可重复 |
 | 4 平台安装器 | `python3 scripts/install_platform.py --home "$HOME/.dsh"` | 五行 JSON 摘要：`venv`/`deps`/`web`/`service`/`verify` | venv 已存在 → `already-exists`；dist 新于 src → 跳过重建；端口在跑 → `already-running` |
 | 5 数据层链接 | `python3 scripts/install_plugins.py link --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | 把 `trading_core`/`trading_datasource` 写入 venv（.pth） | 每次合并 WP 分支后重新 link 一次 |
 | 6 启用行 | 编辑 `agent.cordis.yml` | `quant-platform-mcp` 行 `disabled: false`；`fin-data`/`trading-engine` 确认 `disabled: false` | 只改 quant-platform-mcp 行的 disabled，`toolCallTimeoutMs: 180000` 保持不动（确认 TTL 120s + 作答余量）；`futu-keepalive` 不动 |
@@ -137,6 +140,18 @@
 | 7 （备用）手动启动 | `cd platform && "$HOME/.dsh/trading-venv/bin/python" -m server.run`（后台） | 单行 JSON：`{"ok":true,"service":"quant-platform","url":…,"tools":…}` | 已在跑则跳过（第 4 步会报 `already-running`）；新建会话由 platform-autostart 自动拉起，通常无需手动 |
 | 8 验证 | `curl -fsS http://127.0.0.1:8397/healthz` | `{"ok":true,"mode":"sim","scheduler":{…}}` | 只读探测 |
 | 9 新会话验证 | 用户新建 Harness 会话 | 工具面出现 `mcp__quantwb__*`（如 `trading_status`） | 行加载发生在会话创建时 |
+
+**last30days（第 3c 步，可选组件）**：安装器把上游
+[last30days-skill](https://github.com/mvanhorn/last30days-skill)（MIT）clone 到
+`~/.dsh/last30days-skill`，经 preset 的 customSkillDirs 挂载其 `skills/` 子目录（目录缺失时
+该条目静默零技能，不影响其余能力；装完新建会话生效）。**信任边界要如实告知用户**：这是
+第三方代码，会在本机运行（Python 脚本发起网络请求、读取其自身配置），安装前应征得用户
+同意；仓库树不 vendor 上游代码，更新只走 `git pull --ff-only`，不要把本机凭据（浏览器
+Cookie、富途 token 等）传给引擎。免密钥来源（Reddit、Hacker News、Polymarket、GitHub、
+StockTwits）开箱即用；X/YouTube/TikTok/Instagram/Threads/Pinterest/LinkedIn/小红书/
+Perplexity/Brave 等需按上游 README 配置密钥或会话，未配置时对应来源缺席而非报错。
+组合方法论见 `skills/last30days-bridge/SKILL.md`（社媒信号只生成假设，验证走 quantwb
+工作台数据，交易只经工作台确认卡片）。
 
 **会话自动拉起**：preset 行 `platform-autostart` 已默认启用——会话启动自动 `/healthz`
 检测，未启动则以分离进程拉起（日志 `~/.dsh/trading-platform-service.log`）；未安装时仅

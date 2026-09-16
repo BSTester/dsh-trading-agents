@@ -310,6 +310,11 @@ WantedBy=default.target
 
 **预期：** 过期 → 自动续期自愈；续期失效 → `--refresh` 兜底；两者皆失效 → 完整授权，全程不猜字段不硬编码。
 
+## last30days 社媒研究技能排障（可选组件）
+
+- 行为异常先自检：`~/.dsh/trading-venv/bin/python ~/.dsh/last30days-skill/skills/last30days/scripts/last30days.py --preflight`（不读 Cookie 不写文件）；报「目录/引擎不存在」先跑 `python3 scripts/install_last30days.py`，装完新建会话才会挂载。
+- 密钥缺失时的降级面：免密钥来源（Reddit/HN/Polymarket/GitHub/StockTwits）照常可用；X、YouTube、TikTok/Instagram/Threads/Pinterest/LinkedIn、小红书、Perplexity、Brave 未按上游 README 配置密钥/会话时这些来源缺席（简报如实标注），属预期行为而非故障。
+
 ## 演练记录（待 WP4 daemon 合并后执行）
 
 > 以下四场景须在 WP4 daemon 合并、`install_plugins.py link` 同步后按上文步骤实际执行，输出原文（JSON/命令回显）粘贴到对应条目，并回填至 `docs/superpowers/plans/2026-09-14-wp5-ops-acceptance.md` 的 WP5 验收记录。

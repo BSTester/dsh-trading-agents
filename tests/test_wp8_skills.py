@@ -221,5 +221,74 @@ class FutuSkillsReadmeTests(unittest.TestCase):
         self.assertIn("install_plugins.py update", text, "README 必须写明更新路径")
 
 
+# ── last30days 桥接技能（WP8 可选集成；我方所有，内容是组合方法论） ──────────────
+# 上游 last30days-skill clone 到 ~/.dsh/last30days-skill 后由 customSkillDirs 挂载；
+# 上游 SKILL.md 是第三方文件，只校验存在性（在 install_last30days.py 里），不做内容校验。
+BRIDGE_ROOT = _REPO / "skills" / "last30days-bridge"
+BRIDGE_NAME = "futu-last30days-bridge"
+# 文案禁词（历史教训：设计稿口吻/示例数据口吻流入交付文案）。
+FORBIDDEN_COPY = ("设计稿", "示例数据", "宁可", "窄门", "规格")
+# 组合研究流中必须点名的工作台验证工具（须全部真实存在于平台工具面）。
+BRIDGE_VALIDATION_TOOLS = ("rt_quote", "series", "factors", "capital_flow", "events")
+
+
+class Last30daysBridgeSkillTests(unittest.TestCase):
+    """桥接技能 skills/last30days-bridge/SKILL.md：frontmatter、工具引用、组合流与纪律。"""
+
+    def _text(self):
+        return (BRIDGE_ROOT / "SKILL.md").read_text(encoding="utf-8")
+
+    def test_bridge_skill_exists_with_valid_frontmatter(self):
+        skill = BRIDGE_ROOT / "SKILL.md"
+        self.assertTrue(skill.is_file(), f"缺少 {skill.relative_to(_REPO)}")
+        parsed = frontmatter_of(self._text())
+        self.assertIsNotNone(parsed, "bridge/SKILL.md 缺少合法 frontmatter")
+        self.assertEqual(parsed["name"], BRIDGE_NAME,
+                         f"bridge/SKILL.md 的 name 必须是 {BRIDGE_NAME}")
+        self.assertRegex(parsed["name"], HARNESS_SKILL_NAME,
+                         "name 必须符合 Harness 技能名规则（小写字母/数字/连字符）")
+        self.assertRegex(parsed["description"], r"[一-鿿]",
+                         "description 必须是中文一句")
+        self.assertLessEqual(len(parsed["raw"]) + len(parsed["name"])
+                             + len(parsed["description"]), 1024,
+                             "frontmatter 总长不得超过 1024 字符")
+
+    def test_bridge_quantwb_references_are_delivered_tools(self):
+        refs = quantwb_refs(self._text())
+        self.assertTrue(refs, "bridge/SKILL.md 必须引用组合研究流的 quantwb 工具")
+        unknown = sorted(refs - set(mcp_tools.TOOL_NAMES))
+        self.assertEqual(
+            unknown, [],
+            f"bridge/SKILL.md 引用了平台工具面里不存在的 quantwb 工具：{unknown}"
+            f"（合法名单见 platform/server/mcp_tools.py 的 TOOLS，共 {mcp_tools.TOOL_COUNT} 个）")
+        for tool in BRIDGE_VALIDATION_TOOLS:
+            self.assertIn(tool, refs, f"bridge/SKILL.md 的组合研究流必须点名 mcp__quantwb__{tool}")
+
+    def test_bridge_contains_composition_flow_and_trading_discipline(self):
+        text = self._text()
+        for needle in ("组合研究流", "社媒信号不直接触发交易", "假设",
+                       "trade_place", "确认卡片", "数据通道",
+                       "平台", "时间", "互动数", DISCLAIMER):
+            self.assertIn(needle, text, f"bridge/SKILL.md 缺少关键内容：{needle}")
+
+    def test_bridge_mentions_engine_path_and_install_script(self):
+        text = self._text()
+        for needle in ("last30days-skill/skills/last30days/scripts/last30days.py",
+                       "install_last30days.py", "--preflight", "--emit=json", "--discover"):
+            self.assertIn(needle, text, f"bridge/SKILL.md 缺少运行方式关键内容：{needle}")
+
+    def test_bridge_forbidden_copy_words_absent(self):
+        text = self._text()
+        for word in FORBIDDEN_COPY:
+            self.assertNotIn(word, text,
+                             f"bridge/SKILL.md 出现禁词「{word}」（设计稿/示例口吻不得流入交付文案）")
+
+    def test_agent_cordis_yml_mounts_last30days_skills_dir(self):
+        yml = (_REPO / "agent.cordis.yml").read_text(encoding="utf-8")
+        self.assertIn("customSkillDirs", yml)
+        self.assertIn("last30days-skill", yml,
+                      "agent.cordis.yml 的 customSkillDirs 必须挂载 <home>/last30days-skill/skills/")
+
+
 if __name__ == "__main__":
     unittest.main()

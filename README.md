@@ -270,6 +270,8 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 | 4 | AKShare | 本地库 | A 股日线/千股千评等补充 |
 | 5 | Yahoo / 网页搜索 | HTTP | 兜底 |
 
+可选扩展：last30days 社媒研究引擎提供近 30 天社媒/全网叙事的广度面（Reddit/HN/Polymarket/GitHub/YouTube 等免密钥来源开箱即用），`python3 scripts/install_last30days.py` 安装到 `~/.dsh` 后新建会话生效，组合方法论见 [skills/last30days-bridge/SKILL.md](skills/last30days-bridge/SKILL.md)——社媒信号只生成假设，验证与交易一律走工作台通道。
+
 X 与 Reddit 共用同一个专属浏览器登录态（`~/.dsh/x-profile`），**登录一次长期有效**：
 
 ```bash
