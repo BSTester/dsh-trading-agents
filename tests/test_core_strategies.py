@@ -63,6 +63,13 @@ class StrategiesTest(unittest.TestCase):
         strat = strategies.REGISTRY["watchlist_rsi"]
         universe = strat.universe(self.conn, "2026-09-13", home=self.tmp.name)
         self.assertEqual(universe, ["SH.600519", "SZ.300750", "HK.00700"])
+        # 市场维度（K1）：SH 链含 SZ/BJ，HK/US 各自分片互不混入
+        self.assertEqual(strat.universe(self.conn, "2026-09-13", home=self.tmp.name,
+                                        market="SH"), ["SH.600519", "SZ.300750"])
+        self.assertEqual(strat.universe(self.conn, "2026-09-13", home=self.tmp.name,
+                                        market="HK"), ["HK.00700"])
+        self.assertEqual(strat.universe(self.conn, "2026-09-13", home=self.tmp.name,
+                                        market="US"), [])
         # 未配置关注池 → 空（调用方按空处理）
         empty = tempfile.mkdtemp()
         self.assertEqual(strat.universe(self.conn, "2026-09-13", home=empty), [])
@@ -113,6 +120,119 @@ class StrategiesTest(unittest.TestCase):
         empty = tempfile.mkdtemp()
         strat = strategies.REGISTRY["watchlist_rsi"]
         self.assertEqual(strat.target_weights(self.conn, "2026-09-13", home=empty), {})
+
+
+class WatchlistMarketScopingTest(unittest.TestCase):
+    """K1 反证：三市场关注池下每市场各自计数与截断（旧实现在全市场范围算分母/截断，
+
+    ``sorted()`` 下 ``U>S>H`` 使美股恒被截掉——该市场只可能产生退出单，永不建仓）。
+    """
+
+    SYMBOLS = ("SH.600519", "SH.601899", "HK.00005", "HK.00700",
+               "US.AAPL", "US.MSFT")
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.conn = store.connect(str(Path(self.tmp.name) / "t.sqlite"))
+        self.addCleanup(self.conn.close)
+        bars = [{"t": f"2026-{m:02d}-{d:02d}", "o": 10, "h": 10.5, "l": 9.5,
+                 "c": 10 + (i % 40) * 0.05, "v": 100}
+                for i, (m, d) in enumerate([(m, d) for m in range(1, 10)
+                                            for d in range(1, 29)])]
+        for symbol in self.SYMBOLS:
+            store.upsert_bars(self.conn, symbol, "1d", bars, "test")
+        self.strat = strategies.REGISTRY["watchlist_rsi"]
+        self._config({"watchlist": list(self.SYMBOLS)})
+
+    def _config(self, payload):
+        (self.home / "trading-platform.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def _risk(self, **overlay):
+        (self.home / "trading-risk.json").write_text(
+            json.dumps(overlay), encoding="utf-8")
+
+    def _weights(self, **kwargs):
+        with mock.patch.object(type(self.strat), "signal",
+                               lambda self, conn, symbol, as_of: "BUY"):
+            return self.strat.target_weights(self.conn, "2026-09-13",
+                                             home=str(self.home), **kwargs)
+
+    def test_us_not_starved_by_max_positions(self):
+        """三市场各 2 只全 BUY、max_positions=5 → 美股两只都在（旧实现恒为 0）。"""
+        weights = self._weights(market="US")
+        self.assertEqual(weights, {"US.AAPL": 0.25, "US.MSFT": 0.25})
+        self.assertEqual(self._weights(market="HK"),
+                         {"HK.00005": 0.25, "HK.00700": 0.25})
+        self.assertEqual(self._weights(market="SH"),
+                         {"SH.600519": 0.25, "SH.601899": 0.25})
+
+    def test_denominator_counts_only_this_market(self):
+        """分母是本市场 BUY 数（上限放宽到 0.5 后可见）：2 只 → 各 0.5，而非 6 只的 1/6。"""
+        self._risk(max_position_pct=0.5)
+        self.assertEqual(self._weights(market="US"), {"US.AAPL": 0.5, "US.MSFT": 0.5})
+
+    def test_truncation_is_per_market(self):
+        """10 只美股 + max_positions=5 → 只截断本市场，每只 1/10（不被其他市场挤占）。"""
+        extra = [f"US.0000{i}" for i in range(8)]
+        bars = [{"t": f"2026-{m:02d}-{d:02d}", "o": 10, "h": 10.5, "l": 9.5,
+                 "c": 10 + (i % 40) * 0.05, "v": 100}
+                for i, (m, d) in enumerate([(m, d) for m in range(1, 10)
+                                            for d in range(1, 29)])]
+        for symbol in extra:
+            store.upsert_bars(self.conn, symbol, "1d", bars, "test")
+        self._config({"watchlist": list(self.SYMBOLS) + extra})
+        us_all = sorted([s for s in self.SYMBOLS if s.startswith("US.")] + extra)
+        weights = self._weights(market="US")
+        self.assertEqual(list(weights), us_all[:5])
+        self.assertTrue(all(w == 0.1 for w in weights.values()), weights)
+
+
+class WatchlistNamedPoolTest(unittest.TestCase):
+    """I1 反证：``watchlist`` 选池子（缺省 watchlist），指定池不存在 → fail-closed。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        self.conn = store.connect(str(Path(self.tmp.name) / "t.sqlite"))
+        self.addCleanup(self.conn.close)
+        bars = [{"t": f"2026-{m:02d}-{d:02d}", "o": 10, "h": 10.5, "l": 9.5,
+                 "c": 10 + (i % 40) * 0.05, "v": 100}
+                for i, (m, d) in enumerate([(m, d) for m in range(1, 10)
+                                            for d in range(1, 29)])]
+        for symbol in ("US.AAPL", "US.MSFT", "SH.600519"):
+            store.upsert_bars(self.conn, symbol, "1d", bars, "test")
+        self.strat = strategies.REGISTRY["watchlist_rsi"]
+
+    def _config(self, payload):
+        (self.home / "trading-platform.json").write_text(
+            json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+
+    def test_named_pool_selects_symbols(self):
+        """显式池键生效：us_pool 只有 AAPL，缺省池的 MSFT 不入权重。"""
+        self._config({"watchlist": ["US.MSFT"], "us_pool": ["US.AAPL"]})
+        with mock.patch.object(type(self.strat), "signal",
+                               lambda self, conn, symbol, as_of: "BUY"):
+            weights = self.strat.target_weights(self.conn, "2026-09-13",
+                                                home=str(self.home),
+                                                market="US", watchlist="us_pool")
+        self.assertEqual(weights, {"US.AAPL": 0.25})
+
+    def test_missing_explicit_pool_fails_closed(self):
+        """指定的池键不存在 → ValueError（fail-closed：不静默换池子）。"""
+        self._config({"watchlist": ["US.MSFT"]})
+        with self.assertRaises(ValueError):
+            self.strat.universe(self.conn, "2026-09-13", home=str(self.home),
+                                market="US", watchlist="nope_pool")
+
+    def test_missing_default_pool_is_legal_empty(self):
+        """缺省池不存在 = 合法空池（历史配置可能根本没有该键），不抛错。"""
+        self._config({"other": ["US.MSFT"]})
+        self.assertEqual(self.strat.universe(self.conn, "2026-09-13",
+                                             home=str(self.home), market="US"), [])
 
 
 if __name__ == "__main__":

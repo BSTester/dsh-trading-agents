@@ -205,8 +205,60 @@ class PlanAutoTest(unittest.TestCase):
         self.assertEqual({r["symbol"] for r in order_rows}, {"SH.600519", "SZ.300750"})
         self.assertEqual({r["status"] for r in order_rows}, {"draft"})
 
-    # ---- ③ 过期语义 ----
+    def test_strategy_receives_market_and_named_pool(self):
+        """K1/I1 接线证明：plan_auto 把 market 与配置池键传给接受它们的策略。
 
+        策略层的「按市场算分母/截断」由 test_core_strategies 反证；这里只证明
+        编排侧没有把这两个参数丢掉（旧实现只传 home，市场维度无从生效）。
+        """
+        calls = []
+
+        class _Recording:
+            id = "wp9_recording"
+
+            def universe(self, conn, as_of, home=None, market=None, watchlist=None):
+                calls.append(("universe", market, watchlist))
+                return []
+
+            def target_weights(self, conn, as_of, home=None, market=None, watchlist=None):
+                calls.append(("target_weights", market, watchlist))
+                return {"SH.600519": 0.5}
+
+        strategies.REGISTRY["wp9_recording"] = _Recording()
+        self.addCleanup(strategies.REGISTRY.pop, "wp9_recording", None)
+        self._config(strategies_cfg=[{"market": "SH", "strategy": "wp9_recording",
+                                      "watchlist": "sh_pool"}],
+                     watchlist=["SH.600519"])
+        self._calendar()
+        self._bars("SH.600519")
+        call, _ = self._broker()
+
+        result = planner.plan_auto(self.conn, str(self.home), "SH",
+                                   today=TODAY, broker_call=call)
+
+        self.assertTrue(result["ok"], result)
+        self.assertIn(("target_weights", "SH", "sh_pool"), calls)
+        self.assertIn(("universe", "SH", "sh_pool"), calls)
+
+    def test_missing_named_pool_skips_with_warn(self):
+        """I1：显式池键不存在 → 软跳过 + warn（fail-closed，不静默换池子）。"""
+        self._config(strategies_cfg=[{"market": "SH", "strategy": "watchlist_rsi",
+                                      "watchlist": "nope_pool"}],
+                     watchlist=["SH.600519"])
+        self._calendar()
+        self._bars("SH.600519")
+        call, _ = self._broker()
+
+        result = planner.plan_auto(self.conn, str(self.home), "SH",
+                                   today=TODAY, broker_call=call)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("关注池键不存在", result["skipped"])
+        self.assertEqual(self._plan_rows(), [])
+        self.assertTrue(any("策略权重失败" in a["title"] for a in self._alerts("warn")),
+                        self._alerts("warn"))
+
+    # ---- ③ 过期语义 ----
     def test_stale_auto_expired_manual_untouched(self):
         self._config()
         self._calendar()

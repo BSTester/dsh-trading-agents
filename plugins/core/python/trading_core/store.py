@@ -372,8 +372,15 @@ def cancel_stale_auto_plans(conn, today):
 
     只动 origin='auto' 且 status='frozen'——手工计划与其他状态一律不碰
     （跨日计划不可执行，但执行中/已完结的历史保持原状）。沿用写函数即写即提交。
+
+    **订单同步作废（2026-09-16 修订 I2）**：计划冻结时订单已登记为 ``draft``，只改
+    计划状态会留下孤儿单（计划 cancelled、订单仍在途），OMS 台账自相矛盾。故经
+    ``oms.cancel_pending`` 把未提交订单一并置 cancelled（在途订单不动，留给对账）。
+    该口径与工作台 ``cancel_plan`` 指令共用同一实现——两处各写一遍正是缺口的成因。
+
     返回被置 cancelled 的 plan_id 列表（created_at 升序）；幂等（再跑返回 []）。
     """
+    from . import oms  # 惰性：store 是底层模块，跨层调用只在需要时解析
     rows = conn.execute(
         "SELECT plan_id FROM plans WHERE origin='auto' AND status='frozen' AND as_of<?"
         " ORDER BY created_at, rowid", (today,)).fetchall()
@@ -382,6 +389,8 @@ def cancel_stale_auto_plans(conn, today):
         conn.executemany("UPDATE plans SET status='cancelled' WHERE plan_id=?",
                          [(pid,) for pid in ids])
         conn.commit()
+        for plan_id in ids:
+            oms.cancel_pending(conn, plan_id, err="plan_expired")
     return ids
 
 
@@ -452,9 +461,25 @@ def set_halt(conn, active, reason=None):
                                  "set_at": _now()})
 
 
-def is_halted(conn):
+def halt_state(conn):
+    """熔断原始记录 ``{active, reason, set_at}``；未设置返回 None。
+
+    单一读取入口（2026-09-16 修订 I3）：自动执行的守卫与每日 digest 都要显示**原因**
+    ——只暴露 bool（``is_halted``）会让自动链路静默停摆（info 级跳过、页面无原因）。
+    """
     value = kv_get(conn, "halt:active")
-    return bool(value and value.get("active"))
+    return value if isinstance(value, dict) else None
+
+
+def is_halted(conn):
+    state = halt_state(conn)
+    return bool(state and state.get("active"))
+
+
+def halt_summary(conn):
+    """digest/UI 用的熔断摘要：``{"halted": bool, "halt_reason": str|None}``。"""
+    state = halt_state(conn) or {}
+    return {"halted": bool(state.get("active")), "halt_reason": state.get("reason")}
 
 
 def clear_halt(conn):

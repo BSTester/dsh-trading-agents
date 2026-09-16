@@ -270,6 +270,14 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   作业）时，靠它防止收盘后才去执行早盘计划；窗口外会在告警里看到「已超执行窗口」。
   对账差异会置 halt，此时 `auto_execute` 由守卫 4（熔断）拦下并要求人工核对
   （差异只暂停、不自动平仓）；恢复走 RUNBOOK 场景 3。
+  **halt 的可见性与恢复口径（I3）**：守卫 4 现在以 **warn** 级跳过并附
+  `原因 + 设置时间`（原先是 info，自动链路停摆时页面上看不到异常），`daily:digest`
+  同时带 `halted`/`halt_reason` 字段供流程页与运维读取；**halt 永不自动清除**——
+  一次零差异的对账不会解除熔断，必须人工查明原因后 `clear_halt`。
+  关注池/策略配置（I1/ K1）：`strategies[].market` 决定市场范围（SH 链含 SZ/BJ，
+  各市场独立计算权重与 `max_positions` 截断），`strategies[].watchlist` 只选**池键名**
+  （缺省 `watchlist`，可省略）；显式指定的池键不存在 → 当日跳过该策略 + warn 告警
+  （fail-closed，不会静默改用别的池子）。
 - **假时钟 `DSH_FAKE_NOW`（WP9 演练/测试专用）**：格式 `YYYY-MM-DD HH:MM:SS`，
   设置后 daemon 调度与 `plan-auto`/`auto-execute`/`reconcile-daily` 全部按它取时刻
   （子进程作业靠它对齐时间线）。生效时工作台告警列表会出现一条 warn「假时钟生效」——

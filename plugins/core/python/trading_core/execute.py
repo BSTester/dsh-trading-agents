@@ -85,7 +85,7 @@ def run(conn, plan_id, plan_hash, ctx, broker_call, price_of, stop_dist_of):
                                                    "err": out.get("err")})
     if halted:
         store.set_halt(conn, True, reason="daily_loss")
-        for o in store.get_open_orders(conn, plan_id):
-            if o["status"] in ("draft", "frozen"):
-                oms.transition(conn, o["client_order_id"], "cancelled", err="halt")
+        # 撤余单经 oms.cancel_pending（唯一实现，2026-09-16 修订 I2）：本处的
+        # draft/frozen 撤销与 cancel_plan / 计划过期为同一口径，三处共用一份实现。
+        oms.cancel_pending(conn, plan_id, err="halt")
     return {"submitted": submitted, "blocked": blocked, "halted": halted}

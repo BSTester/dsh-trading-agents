@@ -155,18 +155,11 @@ def read_mode(home):
 def symbols_for_market(home, market):
     """关注池里属于该市场链的标的（SH/SZ/BJ 同属 SH 链；大写归一）。
 
-    关注池可能是字符串（逗号分隔）——字符串按字符迭代会静默产出垃圾标的，显式切开。
+    委托 ``watchlist`` 模块的唯一实现（WP9 修订 I4）：读取/切分/市场分片只有一份，
+    原先 planner 与 strategies 各写一遍已漂移出「有/无市场过滤」两种口径。
     """
-    from . import daemon
-    watchlist = daemon.platform_config(home).get("watchlist") or []
-    if isinstance(watchlist, str):
-        watchlist = watchlist.split(",")
-    out = []
-    for raw in watchlist:
-        symbol = str(raw).strip().upper()
-        if symbol and CALENDAR_MARKET.get(symbol.split(".", 1)[0]) == market:
-            out.append(symbol)
-    return out
+    from . import watchlist
+    return watchlist.watchlist_symbols(home, market=market)
 
 
 def _stamp_parts(stamp):
@@ -343,15 +336,28 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     # 过期语义：先作废跨日的 auto 计划，再生成当日计划（只动 auto，手工计划不碰）
     expired = store.cancel_stale_auto_plans(conn, data_date)
 
-    # 组合策略需要 home 读配置，单标的策略没有该参数——按签名显式分派，不靠猜
-    params = inspect.signature(strategy.target_weights).parameters
+    # 组合策略需要 home/market/池键，单标的策略没有这些参数——按签名显式分派，不靠猜。
+    # market 必须传（K1）：策略的分母与 max_positions 截断都在**市场过滤之后**，
+    # 跨市场合并计数会让先排序的市场吃光名额（实测美股恒为 0）。
+    def _strategy_kwargs(fn):
+        params = inspect.signature(fn).parameters
+        kwargs = {}
+        if "home" in params:
+            kwargs["home"] = home
+        if "market" in params:
+            kwargs["market"] = market
+        if "watchlist" in params:
+            kwargs["watchlist"] = entry["watchlist"]
+        return kwargs
+
     try:
         weights = strategy.target_weights(conn, data_date,
-                                         **({"home": home} if "home" in params else {}))
+                                         **_strategy_kwargs(strategy.target_weights))
     except ValueError as error:
-        # 组合策略要读风控配置（权重上限）；trading-risk.json 非法时 risk_config 抛
-        # ValueError——作业契约是「永不抛」，这里按 fail-closed 软跳过并告警
-        # （静默回退默认值会掩盖配置错误：配置非法时宁可当日不生成计划）
+        # 组合策略要读风控配置（权重上限）与命名池（键不存在即配置错误）；
+        # trading-risk.json 非法时 risk_config 抛 ValueError——作业契约是「永不抛」，
+        # 这里按 fail-closed 软跳过并告警（静默回退默认值会掩盖配置错误：
+        # 配置非法时宁可当日不生成计划）
         return skip(f"策略权重计算失败：{str(error)[:120]}", "warn", "策略权重失败")
     target = {s: w for s, w in (weights or {}).items()
               if CALENDAR_MARKET.get(str(s).split(".", 1)[0]) == market}
@@ -361,10 +367,8 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     # 只遍历 target（与既有行为一致），结果标注 managed="target-only" 供运维分辨。
     # universe 读取失败按 fail-closed 软跳过：宁可不生成计划，也不假装「无受管标的」
     # （后者会让已持仓标的继续逃过 diff，正是本修订要消除的缺口）。
-    u_params = inspect.signature(strategy.universe).parameters
     try:
-        universe = strategy.universe(conn, data_date,
-                                     **({"home": home} if "home" in u_params else {}))
+        universe = strategy.universe(conn, data_date, **_strategy_kwargs(strategy.universe))
     except Exception as error:  # noqa: BLE001 —— 作业契约「永不抛」
         return skip(f"策略 universe 读取失败：{str(error)[:120]}", "warn", "策略 universe 失败")
     universe_set = {str(s).strip().upper() for s in (universe or []) if str(s).strip()}

@@ -369,6 +369,35 @@ class ReconcileDailyTest(unittest.TestCase):
         self.assertEqual(latest["untracked"], [])
         self.assertEqual(latest["mode"], "sim")
 
+    def test_digest_carries_halt_state_and_reason(self):
+        """I3：digest 必须暴露实际熔断状态与原因（否则自动停摆不可见）。"""
+        store.set_halt(self.conn, True, reason="reconcile_diff")
+        broker = _FakeBroker(positions_by_market={3: []})
+        reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        digest = store.kv_get(self.conn, "daily:digest")
+        self.assertTrue(digest["halted"])
+        self.assertEqual(digest["halt_reason"], "reconcile_diff")
+
+    def test_clean_run_does_not_clear_existing_halt(self):
+        """I3 反证：零差异**不清**已有 halt——恢复只能由人工 clear_halt 决定。"""
+        store.set_halt(self.conn, True, reason="reconcile_diff")
+        broker = _FakeBroker(positions_by_market={3: []})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["diffs"], [])
+        self.assertTrue(store.is_halted(self.conn))
+        self.assertEqual(store.halt_state(self.conn)["reason"], "reconcile_diff")
+        digest = store.kv_get(self.conn, "daily:digest")
+        self.assertTrue(digest["halted"])
+        self.assertEqual(digest["halt_reason"], "reconcile_diff")
+
+    def test_digest_halt_fields_false_when_clean(self):
+        """无熔断时 digest 字段如实为 False/None（不是缺键）。"""
+        broker = _FakeBroker(positions_by_market={3: []})
+        reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        digest = store.kv_get(self.conn, "daily:digest")
+        self.assertFalse(digest["halted"])
+        self.assertIsNone(digest["halt_reason"])
+
     # ---- ⑤ live 跳过 ----
 
     def test_live_mode_skips_without_broker_calls(self):

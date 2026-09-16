@@ -171,6 +171,24 @@ class AutoExecuteTest(unittest.TestCase):
         self.assertEqual(self._pending(), [])
         self.assertIsNone(self._mark())
 
+    def test_halt_skip_is_warn_with_reason(self):
+        """I3：熔断跳过是 warn 级且带原因/时间——info 会让自动停摆不可见。"""
+        store.set_halt(self.conn, True, reason="daily_loss")
+        self._plan()
+        out = self._run()
+        alerts = self._alerts()
+        self.assertEqual([a["level"] for a in alerts], ["warn"])
+        self.assertEqual(alerts[0]["title"], "熔断生效")
+        self.assertIn("daily_loss", alerts[0]["detail"])
+        self.assertIn("clear_halt", alerts[0]["detail"])
+
+    def test_halt_without_reason_still_visible(self):
+        """原因缺失时如实标注「未标注原因」（不编造、不静默）。"""
+        store.set_halt(self.conn, True)
+        self._plan()
+        self._run()
+        self.assertIn("未标注原因", self._alerts()[0]["detail"])
+
     # —— 守卫 5：计划存在性/来源/状态 ——
     def test_no_plan_skips(self):
         out = self._run()

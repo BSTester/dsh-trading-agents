@@ -246,6 +246,41 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(statuses["DONE-A"], "done")   # 非 frozen 不动
         self.assertEqual(store.cancel_stale_auto_plans(self.conn, "2026-09-15"), [])  # 幂等
 
+    def test_cancel_stale_auto_plans_cancels_pending_orders(self):
+        """I2 反证：过期计划不得留下孤儿订单——draft/frozen 一并作废，在途订单不动。"""
+        store.insert_plan(self.conn, "OLD-A", "2026-09-14", "sim", "rsi", {}, "h1")
+        self._mark_auto("OLD-A", "SH")
+        store.insert_order(self.conn, "cid-draft", "OLD-A", "SH.600519", "SH",
+                           "BUY", 100, 10.0, "sim", status="draft")
+        store.insert_order(self.conn, "cid-frozen", "OLD-A", "SH.601899", "SH",
+                           "BUY", 100, 10.0, "sim", status="frozen")
+        store.insert_order(self.conn, "cid-submitted", "OLD-A", "SH.600036", "SH",
+                           "BUY", 100, 10.0, "sim", status="submitted")
+        self.assertEqual(store.cancel_stale_auto_plans(self.conn, "2026-09-15"), ["OLD-A"])
+        statuses = {r["client_order_id"]: r["status"] for r in
+                    self.conn.execute("SELECT client_order_id,status FROM orders")}
+        # 未提交订单随计划一起作废（err 标注来源，便于审计分辨）
+        self.assertEqual(statuses["cid-draft"], "cancelled")
+        self.assertEqual(statuses["cid-frozen"], "cancelled")
+        errs = {r["client_order_id"]: r["err"] for r in
+                self.conn.execute("SELECT client_order_id,err FROM orders")}
+        self.assertEqual(errs["cid-draft"], "plan_expired")
+        # 在途订单不动：撤销在途单是券商侧动作，留给对账兜底（先查询不重放）
+        self.assertEqual(statuses["cid-submitted"], "submitted")
+
+    def test_cancel_stale_auto_plans_manual_orders_untouched(self):
+        """手工计划（origin=manual）即使 as_of 更早也不动其计划与订单。"""
+        store.insert_plan(self.conn, "MANUAL", "2026-09-10", "sim", "rsi", {}, "h1")
+        store.insert_order(self.conn, "cid-manual", "MANUAL", "SH.600519", "SH",
+                           "BUY", 100, 10.0, "sim", status="draft")
+        self.assertEqual(store.cancel_stale_auto_plans(self.conn, "2026-09-15"), [])
+        statuses = {r["client_order_id"]: r["status"] for r in
+                    self.conn.execute("SELECT client_order_id,status FROM orders")}
+        self.assertEqual(statuses["cid-manual"], "draft")
+        plan = self.conn.execute(
+            "SELECT status FROM plans WHERE plan_id='MANUAL'").fetchone()
+        self.assertEqual(plan["status"], "frozen")
+
 
 if __name__ == "__main__":
     unittest.main()

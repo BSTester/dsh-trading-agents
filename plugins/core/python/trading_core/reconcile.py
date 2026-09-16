@@ -490,10 +490,13 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     # 状态推进摘要：``count`` 推进条数、``skipped`` 非法迁移跳过数（不掩盖——
     # 跳过的会被订单级判定暴露为差异，见 _advance_order_states docstring）
     advance_digest = {"count": advance["count"], "skipped": advance["skipped"]}
+    # 熔断可见性（2026-09-16 修订 I3）：digest 记录**实际熔断状态与原因**（可能来自
+    # 更早的一次对账差异），否则自动执行守卫只会 info 级跳过、页面看不出停摆原因。
+    # 本函数不自动清除已生效的 halt——恢复永远由人工 clear_halt 决定（先查明原因）。
     digest = {"as_of": today, "mode": mode, "orders": order_status_counts(conn, today),
               "diffs": len(diffs), "untracked": len(untracked), "tca": tca_summary,
               "fills_backfilled": backfill_digest, "orders_advanced": advance_digest,
-              "at": stamp}
+              **store.halt_summary(conn), "at": stamp}
     # snapshot-reconcile 的既有取数口径（diffs/at）+ 本任务新增 untracked/mode
     store.kv_set(conn, "reconcile:latest",
                  {"diffs": diffs, "untracked": untracked, "mode": mode, "at": stamp})

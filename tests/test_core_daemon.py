@@ -241,6 +241,25 @@ class AutoPipelineConfigTest(unittest.TestCase):
             str(self._home({"auto_pipeline": {"exec_at": {"SH": "09:40"}}})))
         self.assertEqual(cfg["exec_at"], {"SH": "09:40", "HK": "09:45", "US": "22:35"})
 
+    def test_strategy_watchlist_defaults_to_watchlist_pool(self):
+        """I1：``watchlist`` 是池键名、可省略（缺省池 watchlist）——省略即补全，
+        下游无需各自处理 None；显式给出的池键原样保留。"""
+        home = self._home({"auto_pipeline": {"enabled": True, "strategies": [
+            {"market": "SH", "strategy": "watchlist_rsi"}]}})
+        cfg = daemon.auto_pipeline_config(str(home))
+        self.assertEqual(cfg["strategies"],
+                         [{"market": "SH", "strategy": "watchlist_rsi",
+                           "watchlist": "watchlist"}])
+        home = self._home({"auto_pipeline": {"enabled": True, "strategies": [
+            {"market": "US", "strategy": "watchlist_rsi", "watchlist": "us_pool"}]}})
+        self.assertEqual(daemon.auto_pipeline_config(str(home))["strategies"][0]["watchlist"],
+                         "us_pool")
+        # 空串仍是非法值（显式给错的池键名要被拦下，而不是静默当缺省）
+        with self.assertRaises(ValueError):
+            daemon.auto_pipeline_config(str(self._home({"auto_pipeline": {
+                "enabled": True, "strategies": [
+                    {"market": "SH", "strategy": "watchlist_rsi", "watchlist": " "}]}})))
+
     def test_invalid_configs_raise(self):
         """非法配置一律 ValueError（fail-closed），不做静默降级。"""
         cases = {

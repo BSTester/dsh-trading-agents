@@ -236,7 +236,7 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
   "watchlist": ["SH.600519", "SH.000001"],
   "auto_pipeline": {
     "enabled": true,
-    "strategies": [{"market": "SH", "strategy": "watchlist_rsi", "watchlist": "SH"}],
+    "strategies": [{"market": "SH", "strategy": "watchlist_rsi", "watchlist": "watchlist"}],
     "exec_at": {"SH": "09:35", "HK": "09:45", "US": "22:35"},
     "reconcile_at": "19:00",
     "exec_window_minutes": 30
@@ -248,6 +248,10 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 2. 关注池填要跑的市场标的（`watchlist_rsi` 扫关注池，BUY 等权、其余现金）；
 3. 重启或等待下一轮调度 tick（约 60 秒）——配置每轮现读，改完即生效。
 
+策略项两个键的分工：**`market` 决定市场范围**（`SH` 链含 SZ/BJ；三市场可各配一条，
+各自独立计算权重与 `max_positions` 截断）；**`watchlist` 只选池子**（池键名，缺省
+`watchlist` = 配置顶层列表，可省略；指定的池键不存在则当日跳过该策略并告警）。
+
 打开后每个交易日自动完成的链路：
 
 | 时机 | 自动动作 |
@@ -258,6 +262,10 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 
 **实盘永远等人工**：live 模式也会自动生成计划，但 `auto_execute` 只对 sim 生效——
 实盘仍是在工作台点「执行」+ 口令「确认执行」。**关掉开关即回到全人工**。
+
+**熔断（halt）不会自动恢复**：对账差异或日内熔断触发后，自动执行以 warn 级跳过并在
+`daily:digest` 记录原因；恢复必须人工查明原因后清 halt（工作台调度页/`clear_halt`）。
+零差异的一次对账**不会**清除已有 halt。
 
 **手工与自动共用同一风控自洽定量口径**：`plan-build`（手工内联权重）与 `build_plan`
 （自动策略权重）走同一个 `planner.build_and_freeze`——数量取 `min(权重定量, 风险预算

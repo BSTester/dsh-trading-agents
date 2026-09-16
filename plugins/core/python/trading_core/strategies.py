@@ -96,6 +96,19 @@ class WatchlistRsiStrategy(SingleTicker):
     向下取整的理由：向上取整会让目标名义略超 ``max_position_pct``，在规则 5 的
     严格大于判定下沦为「必被拒的目标」（差额虽小，但结构性拒绝不该由策略制造）。
 
+    **市场维度（2026-09-16 修订 K1）**：``market`` 给定时 universe 只取该市场链
+    （``SH`` 链含 SZ/BJ，口径见 ``planner.CALENDAR_MARKET``），且**分母与
+    ``max_positions`` 截断都发生在过滤之后**——跨市场合并计数会让先排序的市场
+    吃掉全部名额（实测：三市场各 2 只全 BUY、``max_positions=5`` 时美股恒为 0），
+    同时用全市场 BUY 数作分母会让各市场资金长期闲置。生产路径
+    （``planner.plan_auto``）必传 market；``market=None`` 保留「全池」语义供直接
+    调用与测试使用。
+
+    **命名池（2026-09-16 修订 I1）**：``watchlist`` 指定**配置里的池键名**
+    （缺省 ``watchlist``，即 ``trading-platform.json`` 既有扁平列表）。指定的键
+    不存在 → ``ValueError``（fail-closed：作业入口软跳过并告警，不静默换池）；
+    缺省池不存在则视为合法空池（历史配置里可能根本没有该键）。
+
     配置读取需要 home，而注册表里的策略实例是单例、无可变状态，因此 home 作为
     显式参数传入（缺省按 $DSH_HOME → ~/.dsh 推导）；这样同一实例可在测试里
     指向任意临时 home，不需要为每个 home 重新注册实例。
@@ -103,7 +116,8 @@ class WatchlistRsiStrategy(SingleTicker):
     未知键报错）——本类不另写配置读取；配置非法时异常如实上抛，由作业入口
     按 fail-closed 处理（静默回退默认值会掩盖配置错误）。
     关注池元素按富途 symbol（如 SH.600519）原样使用：不猜市场前缀，写错的标的
-    读不到 bar → HOLD → 不入权重（宁缺毋假）。
+    读不到 bar → HOLD → 不入权重（宁缺毋假）。读取/分片经 ``watchlist`` 模块的
+    唯一实现（I4）——本类不重写池子解析。
     """
 
     id = "watchlist_rsi"
@@ -112,20 +126,21 @@ class WatchlistRsiStrategy(SingleTicker):
         ma_cross_signal, rsi_signal = _signals()
         return rsi_signal(df, 25, 75)
 
-    def universe(self, conn, as_of, home=None):
-        from .daemon import platform_config
-        watchlist = platform_config(_home(home)).get("watchlist") or []
-        if isinstance(watchlist, str):
-            # 兼容逗号分隔写法：字符串按字符迭代会静默产出垃圾标的，这里显式切开
-            watchlist = watchlist.split(",")
-        return [str(s).strip() for s in watchlist if str(s).strip()]
+    def universe(self, conn, as_of, home=None, market=None, watchlist=None):
+        from . import watchlist as watchlist_mod
+        key = watchlist or watchlist_mod.DEFAULT_POOL_KEY
+        return watchlist_mod.watchlist_symbols(
+            _home(home), key=key, market=market,
+            strict=key != watchlist_mod.DEFAULT_POOL_KEY)
 
-    def target_weights(self, conn, as_of, home=None):
+    def target_weights(self, conn, as_of, home=None, market=None, watchlist=None):
         from .daemon import risk_config
         cfg = risk_config(_home(home))
         cap = float(cfg["max_position_pct"])
         limit = int(cfg["max_positions"])
-        buys = sorted(s for s in self.universe(conn, as_of, home=home)
+        # 市场过滤先行（K1）：分母与截断都只看本市场链的 BUY，跨市场不互相挤占名额
+        buys = sorted(s for s in self.universe(conn, as_of, home=home, market=market,
+                                               watchlist=watchlist)
                       if self.signal(conn, s, as_of) == "BUY")
         if not buys:
             return {}

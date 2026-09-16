@@ -60,3 +60,29 @@ def transition(conn, client_order_id, to_state, broker_order_id=None, err=None):
                  " err=COALESCE(?,err), updated_at=? WHERE client_order_id=?",
                  (to_state, broker_order_id, err, _now(), client_order_id))
     conn.commit()
+
+
+def cancel_pending(conn, plan_id, err="cancel_plan"):
+    """撤销计划的**未提交**订单（draft/frozen）；在途订单一律不动，留给对账。
+
+    唯一实现（2026-09-16 修订 I2）：撤销计划的入口有两个——工作台 ``cancel_plan``
+    指令（daemon）与跨日计划过期（``store.cancel_stale_auto_plans``）。原先只有前者
+    处理订单，后者只改计划状态，于是过期计划留下一批 ``draft`` 孤儿单：计划已
+    cancelled 而订单仍在途，OMS 台账自相矛盾（流程页/计划页显示幽灵在途单）。
+    两处各写一遍正是该缺口的成因，故收敛到本函数。
+
+    返回 ``(cancelled_ids, untouched)``；``untouched`` 为 ``[{id, status}]``——
+    在途订单如实列出（不猜测、不撤销：铁律「先查询不重放」）。
+    """
+    rows = conn.execute(
+        f"SELECT client_order_id, status FROM orders WHERE plan_id=?"
+        f" AND status IN ({','.join('?' * len(OPEN_STATES))}) ORDER BY rowid",
+        (plan_id, *OPEN_STATES)).fetchall()
+    cancelled, untouched = [], []
+    for row in rows:
+        if row["status"] in ("draft", "frozen"):
+            transition(conn, row["client_order_id"], "cancelled", err=err)
+            cancelled.append(row["client_order_id"])
+        else:
+            untouched.append({"id": row["client_order_id"], "status": row["status"]})
+    return cancelled, untouched

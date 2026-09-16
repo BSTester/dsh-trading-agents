@@ -81,8 +81,11 @@ AUTO_PIPELINE_DEFAULTS = {
 }
 #: 合法市场（与 store 交易日历的市场键同一集合）
 AUTO_PIPELINE_MARKETS = ("SH", "HK", "US")
-#: 策略项字段：未知键报错——拼错的键被静默忽略等于策略没生效，比报错更危险
+#: 策略项字段：未知键报错——拼错的键被静默忽略等于策略没生效，比报错更危险。
+#: ``watchlist`` 为**池键名**（2026-09-16 修订 I1）：选择 ``trading-platform.json``
+#: 里的命名池，缺省 ``watchlist``；它不决定市场范围（市场由 ``market`` 决定）。
 _AUTO_STRATEGY_KEYS = ("market", "strategy", "watchlist")
+_AUTO_STRATEGY_REQUIRED = ("market", "strategy")
 _HHMM_RE = re.compile(r"^\d{2}:\d{2}$")
 
 
@@ -107,7 +110,14 @@ def _positive_int(value, field):
 
 
 def _auto_strategies(items):
-    """策略项校验：结构/字段/市场/非空串；返回只含白名单键的新列表。"""
+    """策略项校验：结构/字段/市场/非空串；返回只含白名单键的新列表。
+
+    ``watchlist`` 可省略（缺省池 ``watchlist``）——它选池子，不选市场；显式给出的
+    池键若在配置里不存在，由策略层按 fail-closed 抛错并由作业入口软跳过告警
+    （见 ``strategies.WatchlistRsiStrategy`` 与 ``watchlist.watchlist_symbols``）。
+    省略时该键仍会以缺省值补全：下游（planner/策略）无需各自处理 None。
+    """
+    from . import watchlist as watchlist_mod
     if not isinstance(items, list):
         raise ValueError("auto_pipeline.strategies 需为列表")
     out = []
@@ -117,15 +127,16 @@ def _auto_strategies(items):
         unknown = set(item) - set(_AUTO_STRATEGY_KEYS)
         if unknown:
             raise ValueError(f"未知策略字段：{', '.join(sorted(unknown))}")
-        missing = [key for key in _AUTO_STRATEGY_KEYS if key not in item]
+        missing = [key for key in _AUTO_STRATEGY_REQUIRED if key not in item]
         if missing:
             raise ValueError(f"策略项缺少字段：{', '.join(missing)}")
         if item["market"] not in AUTO_PIPELINE_MARKETS:
             raise ValueError(f"策略项 market 非法：{item['market']!r}")
         for key in ("strategy", "watchlist"):
-            if not isinstance(item[key], str) or not item[key].strip():
+            if key in item and (not isinstance(item[key], str) or not item[key].strip()):
                 raise ValueError(f"策略项 {key} 需为非空字符串")
-        out.append({key: item[key] for key in _AUTO_STRATEGY_KEYS})
+        out.append({"market": item["market"], "strategy": item["strategy"],
+                    "watchlist": item.get("watchlist") or watchlist_mod.DEFAULT_POOL_KEY})
     return out
 
 
@@ -265,13 +276,18 @@ def build_jobs(home, conn=None):
 
 
 def resolve_command(cmd, home):
-    """替换 @watchlist 占位为配置关注池；关注池为空返回 None（调用方跳过该作业）。"""
+    """替换 @watchlist 占位为配置关注池；关注池为空返回 None（调用方跳过该作业）。
+
+    读取经 ``watchlist`` 模块的唯一实现（WP9 修订 I4）：同步作业要吃全量关注池，
+    故此处不做市场分片——分片由 planner/strategies 按市场各取所需。
+    """
+    from . import watchlist as watchlist_mod
     cmd = list(cmd)
     if "@watchlist" in cmd:
-        watchlist = ",".join(platform_config(home).get("watchlist") or [])
-        if not watchlist:
+        symbols = watchlist_mod.watchlist_symbols(home)
+        if not symbols:
             return None
-        cmd[cmd.index("@watchlist")] = watchlist
+        cmd[cmd.index("@watchlist")] = ",".join(symbols)
     return cmd
 
 
@@ -623,9 +639,16 @@ def auto_execute(conn, home, market, today=None, now=None):
     if kill_path(home).exists():
         return skip("kill switch 生效：拒绝自动执行", "info", "kill switch 生效")
 
-    # 守卫 4：日内熔断
-    if store.is_halted(conn):
-        return skip("熔断生效：先查明原因并 clear_halt 后再执行", "info", "熔断生效")
+    # 守卫 4：日内熔断。
+    # 分级与可见性（2026-09-16 修订 I3）：halt 生效是**需要人介入**的状态，用 warn 并
+    # 带上原因与设置时间——info 级会让自动链路静默停摆（实测：差异熔断后每天只是
+    # info 跳过，页面上看不到任何异常）。每市场每日至多一条，不构成刷屏。
+    # **不自动恢复**：清除 halt 永远由人工 clear_halt 决定（先查明原因）。
+    halt = store.halt_state(conn)
+    if halt and halt.get("active"):
+        reason = halt.get("reason") or "未标注原因"
+        return skip(f"熔断生效（{reason}，{halt.get('set_at') or '时间未知'}）："
+                    f"先查明原因并人工 clear_halt 后再执行", "warn", "熔断生效")
 
     # 守卫 5+6：计划存在（auto+frozen，最近窗口内）且计划自身 mode=sim、market 一致
     # 窗口 2 的依据见 planner.recent_trading_days（跨市场日期空间容差）
@@ -679,26 +702,21 @@ def auto_execute(conn, home, market, today=None, now=None):
 
 
 def _cancel_plan(conn, cmd):
-    """撤余单：只本地撤销 draft/frozen（未提交）；在途订单不动，留给对账兜底。"""
+    """撤余单：只本地撤销 draft/frozen（未提交）；在途订单不动，留给对账兜底。
+
+    实现经 ``oms.cancel_pending``（唯一实现，2026-09-16 修订 I2）：与跨日计划过期
+    （``store.cancel_stale_auto_plans``）共用同一口径——两处各写一遍曾让「过期计划
+    留下孤儿 draft 单」的缺口出现过。
+    """
+    from . import oms
     plan_hash = cmd.get("plan_hash")
     row = conn.execute(
         "SELECT plan_id FROM plans WHERE content_hash=? ORDER BY created_at DESC LIMIT 1",
         (plan_hash,)).fetchone() if plan_hash else None
     if row is None:
         return {"ok": False, "error": f"计划不存在 hash={plan_hash}"}
-    cancelled, untouched = [], []
-    for o in store.get_open_orders(conn, row["plan_id"]):
-        if o["status"] in ("draft", "frozen"):
-            oms_cancel(conn, o["client_order_id"])
-            cancelled.append(o["client_order_id"])
-        else:
-            untouched.append({"id": o["client_order_id"], "status": o["status"]})
+    cancelled, untouched = oms.cancel_pending(conn, row["plan_id"], err="cancel_plan")
     return {"ok": True, "cancelled": cancelled, "untouched": untouched}
-
-
-def oms_cancel(conn, client_order_id):
-    from . import oms
-    oms.transition(conn, client_order_id, "cancelled", err="cancel_plan")
 
 
 def _real_now():

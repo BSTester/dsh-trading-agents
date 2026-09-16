@@ -128,7 +128,7 @@
 ```json
 "auto_pipeline": {
   "enabled": false,
-  "strategies": [{"market": "SH", "strategy": "watchlist_rsi", "watchlist": "SH"}],
+  "strategies": [{"market": "SH", "strategy": "watchlist_rsi", "watchlist": "watchlist"}],
   "exec_at": {"SH": "09:35", "HK": "09:45", "US": "22:35"},
   "exec_window_minutes": 30,
   "reconcile_at": "19:00"
@@ -142,7 +142,12 @@
   （不做自动 DST 换算——诚实简单）；
 - `exec_window_minutes`（默认 30）：**执行窗口**——见 §4.3 守卫 9（补齐 tick-first
   补跑语义的必然要求）；
-- `strategies[].watchlist` 引用 `watchlist` 配置的市场键，关注池为空则跳过并告警。
+- `strategies[].market` 决定**市场范围**（SH 链含 SZ/BJ），策略的分母与
+  `max_positions` 截断都在市场过滤之后——跨市场合并计数会让先排序的市场吃光名额
+  （2026-09-16 修订 K1）；
+- `strategies[].watchlist` 是**池键名**（可省略，缺省 `watchlist` = 配置顶层既有的
+  扁平列表）：它**不决定市场范围**，只选择关注池；显式指定的池键不存在 → 该策略当日
+  软跳过 + warn 告警（fail-closed，不静默换池子）（2026-09-16 修订 I1）。
 
 ### 4.2 build_plan 作业（各市场链尾追加，factors_snapshot 之后）
 
@@ -170,7 +175,11 @@
    口径）；不新鲜 → 跳过当日 build_plan + warn 告警（宁缺毋假，延续 §4.3 原则）；
 2. **过期语义落地**：生成新计划前，将 `origin='auto'` 且 `status='frozen'` 且
    `as_of < 今日` 的旧计划置 `cancelled`（补齐原规格 §6.1「跨日计划 expired」从未实现
-   的语义；**只动 auto 计划，手工计划不碰**）；
+   的语义；**只动 auto 计划，手工计划不碰**）。**订单同步作废（实现期修订 I2，
+   2026-09-16）**：计划冻结时订单已登记为 `draft`，只改计划状态会留下孤儿单（计划
+   cancelled 而订单在途，OMS 台账自相矛盾、页面显示幽灵单）；故经 `oms.cancel_pending`
+   把未提交订单一并置 cancelled（在途订单不动，留给对账）。该口径与工作台
+   `cancel_plan`、熔断撤余单共用**同一实现**——三处各写一遍正是该缺口的成因；
 3. **策略产出权重**：`strategy.target_weights(conn, as_of)`，as_of = 最近已收盘交易日；
 4. **计划生成**：`planner.build_and_freeze(conn, mode, strategy_id, target,
    broker_positions, prices, as_of)`——价格用本地库 PIT 最近收盘（不盘中取数），持仓经
@@ -228,7 +237,11 @@
 1. `auto_pipeline.enabled == true`；
 2. 模式文件 == sim（live 跳过并告警「计划等待人工执行」——自动生成≠自动执行）；
 3. 无 kill 文件（`~/.dsh/trading-kill` 不存在）；
-4. 无 halt（OMS 熔断状态为清）；
+4. 无 halt（OMS 熔断状态为清）。**可见性与恢复口径（实现期修订 I3，2026-09-16）**：
+   halt 生效时守卫**以 warn 级跳过并带原因与设置时间**（原先 info 级会让自动链路
+   静默停摆、页面上看不到任何异常），且 `daily:digest` 记录 `halted`/`halt_reason`；
+   **不自动恢复**——清除 halt 永远由人工 `clear_halt` 决定（先查明原因；对账零差异
+   也不清除既有 halt）；
 5. 存在 `origin='auto'` 且 `status='frozen'` 且 `as_of == 最近已收盘交易日` 的计划；
 6. 该计划的市场 == 当前作业市场（per-market 计划，见 4.6）；
 7. 该计划今日未被执行过（kv ran 标记幂等，同 daemon 既有口径）；

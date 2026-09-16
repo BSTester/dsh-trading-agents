@@ -102,12 +102,14 @@ class AutoPipelineE2E(unittest.TestCase):
     # ---- 种子 ----
 
     def _config(self, enabled=True, strategy="watchlist_rsi"):
+        # watchlist 是**池键名**（I1）：缺省池就是顶层 "watchlist" 列表，故显式写
+        # "watchlist"（值 "SH" 会被当成一个不存在的池键 → 该策略当日 fail-closed 跳过）
         (self.home / "trading-platform.json").write_text(json.dumps({
             "watchlist": [SYMBOL],
             "auto_pipeline": {
                 "enabled": enabled,
                 "strategies": [{"market": "SH", "strategy": strategy,
-                                "watchlist": "SH"}],
+                                "watchlist": "watchlist"}],
                 "exec_at": {"SH": "09:35", "HK": "09:45", "US": "22:35"},
                 "reconcile_at": "19:00"}}, ensure_ascii=False), encoding="utf-8")
 
