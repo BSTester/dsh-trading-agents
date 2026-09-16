@@ -246,3 +246,20 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   `already-running`，都是正常行为不是错误；`--skip-venv/--skip-deps/--skip-web/--skip-all`
   分层跳过，任一步 `ok=false` 退出码 1；`--dry-run` 零副作用可预览。`install_plugins.py link`
   在每次合并 WP 分支后要重跑一次，否则 venv 里的 core/datasource 是旧副本。
+- **服务优先仓库数据层（WP8）**：服务进程经 `server/run.py` 的 sys.path 处理**优先加载
+  仓库内** `plugins/datasource`/`plugins/core` 的 Python 模块，已修复「venv 副本滞后导致
+  服务缺新模块/AttributeError」一类问题；但 **Harness 内 fin-data/engine 插件仍用 venv 副本**，
+  datasource/core 新增模块后仍要跑 `scripts/install_plugins.py install/update`（见 RUNBOOK）。
+- **OpenAPI 凭据与通道（WP8）**：凭据在 `~/.dsh/futu-openapi.json`（appkey 模式或 OAuth，
+  权限 0600；授权跑 `scripts/futu_auth.py --openapi`）；`trading-platform.json` 顶层
+  `futu_channel: openapi|mcp` 切通道（默认 mcp=WP7 行为零变化）；openapi 无凭据 →
+  `trading/openapi-unavailable`（如实拒绝，不回落）。连通性自检
+  `python3 scripts/futu_openapi_check.py --app-key <ID>`。
+- **`trade_*` 新字段与确认卡片（WP8 任务 6）**：`trade_place/trade_modify` 暴露官方全字段
+  （8 种 order_type/GTC/时段/触发价/港股手数/多腿），字段校验在风控与确认**之前**；
+  live 下单服务端确认 TTL 120s，确认卡片披露「风控基准价」（市价类订单取本地日线最近收盘，
+  取不到 fail-closed 拒绝）；`side` 暂限 BUY/SELL。sim 仍只支持限价当日单（扩展字段如实拒绝）。
+- **WS 推送语义（WP8）**：推送仅作**加速**，不是唯一事实源——断线期间事件不补发、
+  不保证顺序，重连（自动重鉴权+按订阅意图重订阅+refresh 5/10 分钟保活）后靠
+  60s 对账兜底轮询收敛；状态看 `/healthz` 的 `push` 字段（reconnects/last_error）。
+  排障详见 RUNBOOK「OpenAPI 凭据与通道（WP8）」。

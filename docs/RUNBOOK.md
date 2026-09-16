@@ -158,11 +158,44 @@ curl -s -X POST http://127.0.0.1:8397/api/wb/factors-history \
 3. **业务确认 TTL 120s**：live 写在 Web 确认卡片等待用户作答，TTL 到期由服务按**拒绝**收尾
    （fail-closed，订单迁 `cancelled`）；preset 行 `toolCallTimeoutMs: 180000` = TTL 120s +
    作答与子进程取数余量——模型侧超时不代表服务端放弃，最终以闸门信封为准。
-4. **live 写未接入（当前设计内行为，不是故障）**：live 下 `trade_*` 提交即拒——
-   `error.code=trading/broker-unavailable`，文案「live 写通道尚未接入券商执行协议；
-   当前仅 sim 可交易」。接 broker 前只允许 sim 下单；准入评估见 `docs/P4-live-trading.md`。
+4. **live 写 = OpenAPI 执行协议（WP8）**：live 下 `trade_*` 经 OpenAPI place/modify/cancel/
+   order-confirm（协议已接入，**未经真实 live 下单验证**——sim→live 冒烟属 P4 人工准入，
+   见 `docs/P4-live-trading.md` 第 11 项）；未配置 OpenAPI 凭据时确认前即拒，
+   `error.code=trading/openapi-unavailable`（见下节「OpenAPI 凭据与通道（WP8）」）。
 5. **订单 `unknown`（提交超时）**：铁律只查询不重放，走场景 2 对账兜底。
 
+### OpenAPI 凭据与通道（WP8）
+
+- **凭据配置**：`~/.dsh/futu-openapi.json`（appkey 模式样例）：
+  ```json
+  { "mode": "appkey", "app_key_id": "<AppKeyID>", "private_key_pem": "<Ed25519/RSA PEM 原文>" }
+  ```
+  OAuth 模式先跑授权流程（浏览器 OAuth，落盘时私钥/凭据文件权限 0600）：
+  ```bash
+  ~/.dsh/trading-venv/bin/python scripts/futu_auth.py --openapi
+  ```
+  凭据文件权限必须 0600；文件缺失/不可读时 openapi 通道如实降级（见下）。
+- **通道选择**：`~/.dsh/trading-platform.json` 顶层 `futu_channel: "openapi"|"mcp"`
+  （默认 `mcp`，行为与 WP7 完全一致；改后重启服务生效）。`openapi` 通道在凭据
+  缺失/无效时相关工具返回 `trading/openapi-unavailable`（如实拒绝，不静默回落 mcp）。
+- **连通性自检**：
+  ```bash
+  ~/.dsh/trading-venv/bin/python scripts/futu_openapi_check.py --app-key <AppKeyID>
+  ```
+  实调 GET/POST 各一次，期望 200 / `ret_code 0`。
+- **推送排障（WS）**：`curl -s http://127.0.0.1:8397/healthz` 的 `push` 字段
+  （`{enabled, started, reason, last_error, quote, trade}`；quote/trade 各含
+  `connected/authenticated/最后消息时间/reconnects`）。`reconnects` 持续增长 →
+  查网络与服务端断连原因；`last_error` 为鉴权失败 → 重跑 `futu_auth.py --openapi`；
+  客户端按 5/10 分钟周期发 refresh 帧保活（超 10 分钟服务端主动断开）。
+  **断线期间事件不补发**——推送仅作加速，重连后靠对账兜底轮询（60s）收敛，
+  事实来源始终是 REST 查询/对账。
+- **数据层副本**：`plugins/datasource`、`plugins/core` 新增 Python 模块后，Harness 内
+  fin-data/engine 插件仍用 venv 里的副本，须重跑
+  ```bash
+  ~/.dsh/trading-venv/bin/python scripts/install_plugins.py install   # 或 update/link
+  ```
+  平台服务进程已优先仓库路径（WP8 起服务侧不再受副本滞后影响），但 Harness 侧插件不会自动感知新模块。
 
 ### systemd unit 样例
 

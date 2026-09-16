@@ -41,10 +41,10 @@ sim 时相反。完整安装的引擎才提供这层工具守卫；仅克隆 pre
     证据留档于 `docs/superpowers/plans/2026-09-15-wp6-standalone-service.md` 末节。
     **WP7 起确认通道在服务进程内闭环**：live 写待确认走**独立 Web 确认卡片**
     （`trade_*` 工具触发，服务进程内）；原 legacy 面板路径已随面板于 WP7 退役删除；
-11. **live broker 协议实现 + sim→live 冒烟通过（WP7 追加，未完成）**：live 写协议接入前，
-    live 下 `trade_*` 提交即拒（`trading/broker-unavailable`「live 写通道尚未接入券商执行
-    协议」）是**设计内行为**；接入需实现 live 适配器（声明 `supports_live_write`）、
-    复跑闸门回归并完成 sim→live 切换冒烟，逐项核对后再评估本清单其余各项。
+11. **live broker 协议实现 + sim→live 冒烟通过（WP7 追加，未完成）**：**WP8 起 live broker
+    协议已接入**（OpenAPI place/modify/cancel/order-confirm，`supports_live_write` 已实现），
+    但**未经真实 live 下单验证**——待 sim→live 冒烟与真实小额定单验证（未勾选）；完成
+    复跑闸门回归并逐项核对后再评估本清单其余各项。
 
 其中实时成交推送尚未实现；自动对账、调度熔断与告警由 WP3–WP4 交付，
 以 WP4 合并后实测验收为准——不能用“框架已就绪，只差用户确认”代替这些条件。

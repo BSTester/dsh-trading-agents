@@ -217,6 +217,12 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
   `push_unsubscribe`（只改本地连接订阅意图，非交易；未启用如实返回
   `trading/push-unavailable`）。工具面 56 → **59**，端点 52 → **55**，锁定表同步。
   受限字段与通道边界见 [docs/TOOL-LIMITS.md](docs/TOOL-LIMITS.md) 第八节。
+- **OpenAPI 统一接入全链路（WP8 收尾）**：8 种订单类型/交易时段/GTC/多腿/二次确认合一、
+  WS 推送（行情+交易事件→OMS，对账兜底保留）、深度数据/资金流/衍生品/筛选/IPO/自选股/F10
+  全部走同一 OpenAPI 客户端；一键安装（`install/HARNESS_SETUP.md`）后 quantwb 工具面
+  33 → **59**（54 端点工具 + 5 维护）。
+- **富途通道决策**：工作台 OpenAPI 是唯一权威通道（REST+WS）；Harness 直连富途只读研究；
+  托管 MCP 降级为可选只读研究通道（preset 默认 disabled），写通道唯一在工作台。
 
 
 ## 工作台与指令示例

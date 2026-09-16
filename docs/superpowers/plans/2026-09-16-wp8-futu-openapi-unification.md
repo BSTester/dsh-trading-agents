@@ -70,3 +70,67 @@
 - **关键约束**：① 断线期间事件**不补发** → 重连后必须经 REST 对账补齐；② 事件**不保证严格顺序** → 不得把推送顺序当作状态机唯一驱动（REST 查询/对账仍为事实来源）；③ 长连接需重连+重新鉴权；④ 需定时 refresh 维持连接。
 
 **任务 4 实现要求（据上述事实）**：`platform/server/futu_push.py` 实现 QuotePushClient（鉴权/刷新/订阅幂等/重连/本地订阅意图表）与 TradePushClient（鉴权/自动接收事件/重连）；交易事件 → OMS 状态迁移 + 告警，但**对账兜底轮询保留**（推送丢失时仍能收敛）；事件仅作加速，不作为唯一事实源。DSH_WP8_SLOW 下提供真实连接冒烟（有凭据时）。
+
+---
+
+## WP8 验收记录（2026-09-16，任务 5）
+
+### 提交链
+
+| 提交 | 内容 |
+|---|---|
+| `e0f01fe` | 任务 1：OpenAPI 客户端（OAuth2.1+PKCE / AppKey 签名） |
+| `3ca9f96` | 任务 2：行情接入 + 通道路由（工具面 → 50） |
+| `e61d1f6` | 任务 1 审查修复：空 body 签名 / 传输异常收敛 / OrderConfirmRequired / Retry-After / 授权拒绝回调 |
+| `9e279af` | 任务 3：交易链路统一（place/modify/cancel/order-confirm，工具面 → 56） |
+| `44c23e3` | 附录 A：WS 协议事实登记 |
+| `bacef14` | 任务 2/3 审查修复：capital_flow 枚举 / 多值查询串 / 非信封落 unknown |
+| `8ef0302` | 任务 4：WS 推送（行情订阅 / 交易事件→OMS，含重连与对账兜底） |
+| `72bb86e` | 服务优先加载仓库数据层（消除已安装副本滞后） |
+| `850cd71` | 任务 6：交易能力完整暴露（8 订单类型/时段/GTC/多腿/触发价）+ 推送订阅面（工具面 → **59**） |
+| （本提交） | 任务 5：通道收尾与文档验收记录 |
+
+### 全量测试证据（先跑后抄，2026-09-16 本机）
+
+- Python：`Ran 1090 tests … OK (skipped=5)`（`~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests`）
+- Node：`# pass 66 / # fail 0`（`node --test tests/*.test.mjs`）
+- Web：`# pass 199 / # fail 0`（`npm --prefix platform/web test`）
+- Web 构建：`npm --prefix platform/web run build` ✓（vite build 成功产出 dist）
+- 前端残留检查：`grep -rn "设计稿\|示例数据\|宁可\|窄门\|规格" platform/web/src` 零命中
+- 工具面 **59**（54 端点工具 + 5 维护）、服务端点 **55**（锁定测试同步）
+
+### 真实验证记录（有凭据实调）
+
+- AppKey + Ed25519 实调 GET/POST 均 `200 / ret_code 0`（`scripts/futu_openapi_check.py`）；
+- 服务端 `rt_quote` / `capital_flow` / `option_expiration` 走 openapi 通道返回真实数据；
+- `DSH_WP8_SLOW=1` 两通道（openapi/mcp）对拍通过；
+- WS 行情/交易鉴权 + refresh 真实冒烟通过；
+- `orders_open` 在 sim 下如实说明「OpenAPI 交易接口不含模拟账户」。
+
+### 规格 §五 验收对照
+
+| # | 验收标准 | 状态 |
+|---|---|---|
+| 1 | 配置 OAuth 后既有工具不变；新增行情工具可取真实快照 | **已实现**（`3ca9f96`/`bacef14`；实调 US 标的真实数据通过） |
+| 2 | `trade_place` 走 OpenAPI 下单返回 order_id；`need_order_confirm` 两层确认合一；拒绝不调 order-confirm | **已实现**（`9e279af`/`850cd71`；sim 路径实测；live 下单待人工，见已知限制 1） |
+| 3 | WS 交易推送实时可见 + OMS 迁移正确；断线自动重连 | **已实现**（`8ef0302`；真实鉴权/刷新冒烟通过；事件体字段未经真实事件验证，见已知限制 4） |
+| 4 | `mcp__futu__*` disabled 时全量功能不回退（除 91 工具自由研究） | **已实现**（futu 写通道 WP7 起本就被 policy 拒绝；托管 MCP 行降级可选只读研究） |
+| 5 | 全量测试绿 + 工具面锁定测试绿 | **已实现**（本节测试证据） |
+
+### 已知限制（如实登记）
+
+1. **live 券商执行协议已接入但未经真实 live 下单验证**（P4 准入第 11 项：sim→live 冒烟待人工）；
+2. 市价类订单（无 price）的风控基准价取**本地日线最近收盘**，取不到即 fail-closed 拒绝（确认卡片披露「风控基准价」）；
+3. `side` 暂限 `BUY/SELL`（`SELL_SHORT/BUY_BACK` 未暴露）；`price` 未做 4 位小数校验；AUCTION 的 price 互斥为语义推断；
+4. 推送事件体字段名未经真实事件验证（对账兜底轮询保留，事件仅加速）；
+5. `futu-mcp` 行（托管 MCP 91 工具）降级为**可选只读研究通道**（preset 默认 disabled——用户可自行启用做自由研究）；写通道唯一在工作台；
+6. SkillHub 仅作能力对照，不作为集成通道（其 OpenD 形态与单进程服务冲突）；
+7. `toolCallTimeoutMs: 180000`（trade_* 确认 TTL 120s + 取数余量）；
+8. 锁定表计数硬编码 ≥7 处（技术债，见规格 §6.2 第 5 项）。
+
+### 人工验收留位（P4 准入前补）
+
+- [ ] sim→live 切换冒烟（`docs/P4-live-trading.md` 第 11 项）：
+- [ ] 真实小额定单验证（live place/modify/cancel/confirm 全链）：
+- [ ] 真实交易事件到达后的推送事件体字段核对：
+- [ ] 长稳观察（reconnects 不异常增长、refresh 保活 ≥1 小时）：

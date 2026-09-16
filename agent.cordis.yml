@@ -169,6 +169,7 @@
 #    docs/superpowers/specs/2026-09-15-wp6-standalone-service.md） ─────────────
 # 需先启动服务：cd platform && ~/.dsh/trading-venv/bin/python -m server.run（或 python platform/server/run.py；须在 trading-venv 内启动）（未启动时本行安静降级）。
 # 通道分级：quantwb 的 switch_mode 只接受切到 sim（live→sim 回模拟盘）；sim→live 一律拒绝；实盘切换只能在独立 Web 由用户输入口令。
+# trade_* 写工具的确认 TTL 120s（服务端）；本 preset 行 toolCallTimeoutMs 180s = TTL + 取数余量（详见下方行内注释）。
 
 - id: quant-platform-mcp
   name: '@deepseek-ai/dsh-mcp-client'
