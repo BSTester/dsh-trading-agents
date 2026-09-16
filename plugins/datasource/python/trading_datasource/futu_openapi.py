@@ -14,21 +14,27 @@
   [A-Za-z0-9_-]）/ ``Authorization: base64(签名)``（无 Bearer 前缀）；
   签名原文五段以 ``\\n`` 连接（空字段保留位置）：
   ``timestamp_ms\\nMETHOD(大写)\\nrequest_path(不含域名与query)\\nquery_string(原始串)
-  \\nsha256(body)小写hex``；Ed25519 直接签原文，RSA-SHA256 先 sha256 再 PKCS#1 v1.5；
+  \\nsha256(body)小写hex``；**没有请求体时第 5 段传空字符串**（官方文档逐字规定，
+  官方 GET 示例第 5 段为空——不是 ``sha256(b"")`` 的 e3b0c44…，空 body 的原文以
+  ``\\n`` 结尾）；Ed25519 直接签原文，RSA-SHA256 先 sha256 再 PKCS#1 v1.5；
 - Token 安全：不进环境变量，只落 ``~/.dsh/futu-openapi.json``（0600 原子写）。
 
 限频/5xx：本层**不做自动重试**，如实抛 OpenApiError——重试/退避策略留给上层调用方
-（交易链路重试需与 OMS 状态机协同，客户端层盲重试会重复下单）。
+（交易链路重试需与 OMS 状态机协同，客户端层盲重试会重复下单）；429 时响应头
+``Retry-After`` 并入 ``OpenApiError.retry_after`` 供上层退避。
 
 HTTP 传输可注入（``OpenApiClient(..., http=request_fn)``）：
-``request_fn(method, url, headers, body_bytes|None) -> (status:int, body:bytes)``；
-默认实现 ``_default_http`` 用标准库 urllib（与 futu_mcp 同为标准库通道）。
+``request_fn(method, url, headers, body_bytes|None)
+-> (status:int, body:bytes, headers:dict)``；
+默认实现 ``_default_http`` 用标准库 urllib（与 futu_mcp 同为标准库通道），并把
+URLError/超时/连接重置等传输异常包装为 ``TransportError``（OpenApiError 子类）。
 
 仅授权流程（scripts/futu_auth.py --openapi）负责注册/浏览器授权/落盘；本模块负责
 凭据读写与带认证的请求。测试见 tests/test_wp8_openapi_client.py（离线注入）。
 """
 import base64
 import hashlib
+import http.client
 import json
 import os
 import re
@@ -47,8 +53,6 @@ from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 DEFAULT_HOST = "https://webapi.futunn.com"
 TOKEN_PATH = "/oauth2/token"
-# 空 body 的 sha256（官方签名原文第 5 段在无请求体时的取值）
-EMPTY_BODY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
 NONCE_ALPHABET = string.ascii_letters + string.digits + "_-"
 NONCE_PATTERN = r"[A-Za-z0-9_-]{1,64}"
 
@@ -56,19 +60,38 @@ NONCE_PATTERN = r"[A-Za-z0-9_-]{1,64}"
 class OpenApiError(Exception):
     """富途 OpenAPI 错误（信封 s==error / token 刷新失败 / 非预期传输响应）。
 
-    need_order_confirm/confirm_id：下单二次确认信封字段——上层（交易闸门/Web 卡片）
-    批准后自动调 order-confirm；jump_url：部分错误附带的跳转地址。
-    限频/5xx 也在本错误如实抛出（本层不自动重试）。
+    need_order_confirm=true 的信封抛专用子类 ``OrderConfirmRequired``；
+    jump_url：部分错误附带的跳转地址；retry_after：429 时从响应头并入
+    （原值不解析，供上层退避）；限频/5xx 也在本错误如实抛出（本层不自动重试）。
     """
 
     def __init__(self, errmsg, errcode=None, need_order_confirm=None,
-                 confirm_id=None, jump_url=None):
+                 confirm_id=None, jump_url=None, retry_after=None):
         super().__init__(errmsg)
         self.errcode = errcode
         self.errmsg = errmsg
         self.need_order_confirm = need_order_confirm
         self.confirm_id = confirm_id
         self.jump_url = jump_url
+        self.retry_after = retry_after
+
+
+class TransportError(OpenApiError):
+    """传输层异常（DNS 解析失败 / 连接拒绝 / 超时 / 连接重置 / 响应中断）。
+
+    由默认传输 ``_default_http`` 抛出：urllib 的 URLError/OSError 等不再裸穿，
+    使 ``request()`` 的「传输异常 → OpenApiError」契约成立（errcode 为 None，
+    与业务 errcode 语义区分）。
+    """
+
+
+class OrderConfirmRequired(OpenApiError):
+    """下单二次确认信封（``need_order_confirm=true``）：订单**已挂起待确认**。
+
+    该信封代表订单已挂起而不是失败——上层（交易闸门/Web 卡片）必须显式
+    ``except OrderConfirmRequired`` 分流：向用户展示 confirm_id/jump_url，批准后
+    调 order-confirm；**禁止对原请求盲重试**（会重复下单）。
+    """
 
 
 class Pkce:
@@ -124,8 +147,13 @@ class AppKeySigner:
         """签名原文五段，以 \\n 连接，空字段保留位置：
 
         timestamp_ms \\n METHOD(大写) \\n request_path \\n query_string \\n sha256(body)hex
+
+        官方规则（逐字）：**没有请求体时第 5 段传空字符串**（官方 GET 示例第 5 段
+        为空），不是 ``sha256(b"")`` 的 e3b0c44…——因此空 body 的原文以 ``\\n`` 结尾，
+        如 ``1700000000000\\nGET\\n/v4/x\\n\\n``（按官方原文验签通过；用 e3b0c44…
+        验签 InvalidSignature，已实证）。
         """
-        body_part = hashlib.sha256(body_bytes or b"").hexdigest()
+        body_part = "" if not body_bytes else hashlib.sha256(body_bytes).hexdigest()
         return "\n".join([str(timestamp_ms), str(method).upper(), path,
                           query or "", body_part]).encode("utf-8")
 
@@ -245,13 +273,16 @@ def parse_envelope_meta(status, body):
     if isinstance(data, dict) and data.get("s") == "ok":
         return data.get("d"), None
     if isinstance(data, dict) and data.get("s") == "error":
-        raise OpenApiError(
-            data.get("errmsg") or "未知错误",
+        fields = dict(
+            errmsg=data.get("errmsg") or "未知错误",
             errcode=data.get("errcode"),
             need_order_confirm=data.get("need_order_confirm"),
             confirm_id=data.get("confirm_id"),
-            jump_url=data.get("jump_url"),
-        )
+            jump_url=data.get("jump_url"))
+        # need_order_confirm=true：订单已挂起待确认——抛专用子类，供交易闸门
+        # 显式 except 分流（该信封禁止盲重试，会重复下单）
+        cls = OrderConfirmRequired if fields["need_order_confirm"] else OpenApiError
+        raise cls(**fields)
     if isinstance(data, dict) and "ret_code" in data:
         # 行情类网关信封：ret_code!=0 → 业务错误；==0 → data + 顶层 pagination
         if data.get("ret_code") != 0:
@@ -265,19 +296,36 @@ def parse_envelope_meta(status, body):
 
 
 def _default_http(method, url, headers, body):
-    """urllib 传输：非 2xx 不抛（HTTPError 转 (status, body)），由上层解释信封。"""
+    """urllib 传输：返回 ``(status, body, headers)`` 三元组（headers 供上层取
+    ``Retry-After`` 等响应头）。
+
+    - 非 2xx 不抛（HTTPError 转 (status, body, headers)），由上层解释信封；
+    - 其余传输异常（URLError/连接拒绝/超时/连接重置/响应中断）一律包装为
+      ``TransportError``（OpenApiError 子类）——``request()`` 契约
+      「传输异常 → OpenApiError」成立，不再裸穿给调用方。
+    """
     req = urllib.request.Request(url, data=body, method=str(method).upper())
     for name, value in (headers or {}).items():
         req.add_header(name, value)
     try:
         with urllib.request.urlopen(req, timeout=30) as resp:
-            return resp.status, resp.read()
+            return resp.status, resp.read(), dict(resp.headers)
     except urllib.error.HTTPError as e:
         try:
             payload = e.read()
+            resp_headers = dict(e.headers or {})
+        except (OSError, http.client.HTTPException) as inner:
+            # 读错误响应体时连接中断，同样收敛为传输异常
+            raise TransportError(
+                f"网络传输失败（读取错误响应体：{type(inner).__name__}）：{inner}"
+            ) from inner
         finally:
             e.close()
-        return e.code, payload
+        return e.code, payload, resp_headers
+    except (urllib.error.URLError, http.client.HTTPException, OSError) as e:
+        # URLError（含 DNS/拒绝连接）是 OSError 子类；socket.timeout/TimeoutError、
+        # ConnectionResetError 也是 OSError 子类；IncompleteRead 走 HTTPException
+        raise TransportError(f"网络传输失败（{type(e).__name__}）：{e}") from e
 
 
 class OpenApiClient:
@@ -286,7 +334,8 @@ class OpenApiClient:
     OAuth：Bearer 调用；expires_at 前 60s 或遇 401 时用 refresh_token 刷新**一次**
     并重试**一次**（刷新失败 → OpenApiError）；刷新成功立即持久化新 token。
     AppKey：每次请求现算签名头（nonce 自动生成）。
-    限频/5xx：不自动重试，如实抛出——留给上层。
+    限频/5xx：不自动重试，如实抛出——留给上层；429 时响应头 ``Retry-After``
+    并入 ``OpenApiError.retry_after``。传输异常收敛为 ``TransportError``。
     """
 
     REFRESH_LEEWAY_MS = 60_000  # expires_at 前 60s 视为临期，主动刷新
@@ -300,7 +349,11 @@ class OpenApiClient:
     # ------------------------------------------------------------ 公共入口
 
     def request(self, method, path, query=None, json_body=None):
-        """发起请求，返回信封 d 部分；s==error / ret_code!=0 / 传输异常 → OpenApiError。"""
+        """发起请求，返回信封 d 部分。
+
+        s==error / ret_code!=0 / 传输异常 → OpenApiError（传输异常为
+        TransportError 子类；429 附 retry_after）。
+        """
         d, _pagination = self.request_meta(method, path, query, json_body)
         return d
 
@@ -329,6 +382,19 @@ class OpenApiClient:
         qs = query_string(query)
         return self.host + path + (("?" + qs) if qs else "")
 
+    @staticmethod
+    def _with_retry_after(err, status, headers):
+        """429 时把响应头 ``Retry-After`` 原值并入错误（供上层退避；不解析格式）。
+
+        headers 键名大小写不敏感扫描（dict 化后的键保留服务端原始大小写）。
+        """
+        if status == 429 and err.retry_after is None:
+            for key, value in (headers or {}).items():
+                if str(key).lower() == "retry-after" and value:
+                    err.retry_after = str(value).strip()
+                    break
+        return err
+
     def _request_oauth(self, method, path, query, json_body):
         cred = self.store.load()
         if not cred.get("access_token") and not cred.get("refresh_token"):
@@ -342,11 +408,15 @@ class OpenApiClient:
                 self._now_ms() >= int(expires_at) - self.REFRESH_LEEWAY_MS:
             cred = self._refresh(cred)  # 临期主动刷新一次；失败抛 OpenApiError
             refreshed = True
-        status, body = self._send_oauth(cred, method, path, query, json_body)
+        status, body, headers = self._send_oauth(cred, method, path, query, json_body)
         if status == 401 and not refreshed:
             cred = self._refresh(cred)  # 401 触发刷新一次
-            status, body = self._send_oauth(cred, method, path, query, json_body)
-        return parse_envelope_meta(status, body)
+            status, body, headers = self._send_oauth(cred, method, path, query,
+                                                     json_body)
+        try:
+            return parse_envelope_meta(status, body)
+        except OpenApiError as e:
+            raise self._with_retry_after(e, status, headers) from None
 
     def _send_oauth(self, cred, method, path, query, json_body):
         headers = {}
@@ -371,7 +441,7 @@ class OpenApiClient:
             "refresh_token": refresh_token,
             "client_id": cred.get("client_id", ""),
         }).encode("ascii")
-        status, body = self._http(
+        status, body, headers = self._http(
             "POST", self.host + TOKEN_PATH,
             {"Content-Type": "application/x-www-form-urlencoded"}, form)
         data = _safe_json_dict(body)
@@ -381,10 +451,12 @@ class OpenApiClient:
                 detail = data.get("errmsg") or data.get("error_description") \
                     or data.get("error")
             errcode = data.get("errcode") if isinstance(data, dict) else None
-            raise OpenApiError(
-                errcode=errcode if errcode is not None else status,
-                errmsg="refresh_token 刷新失败："
-                       f"{detail or (body[:200] if body else status)}")
+            raise self._with_retry_after(
+                OpenApiError(
+                    errcode=errcode if errcode is not None else status,
+                    errmsg="refresh_token 刷新失败："
+                           f"{detail or (body[:200] if body else status)}"),
+                status, headers)
         updated = dict(cred)
         updated["mode"] = "oauth"
         updated["access_token"] = data["access_token"]
@@ -419,9 +491,13 @@ class OpenApiClient:
         }
         if body is not None:
             headers["Content-Type"] = "application/json"
-        status, resp_body = self._http(str(method).upper(), self._url(path, query),
-                                       headers, body)
-        return parse_envelope_meta(status, resp_body)
+        status, resp_body, headers = self._http(str(method).upper(),
+                                                self._url(path, query),
+                                                headers, body)
+        try:
+            return parse_envelope_meta(status, resp_body)
+        except OpenApiError as e:
+            raise self._with_retry_after(e, status, headers) from None
 
 
 # ---------------------------------------------------------------------------

@@ -2,13 +2,19 @@
 
 * PKCE S256：RFC 7636 附录 B 官方向量；
 * AppKey 签名：签名原文五段逐字断言 + cryptography 生成密钥并公钥验签（Ed25519/RSA-SHA256）；
+  **没有请求体时第 5 段是空字符串**（官方文档逐字规定，官方 GET 示例第 5 段为空；
+  sha256(b"") 的 e3b0c44… 已实证按官方原文验签 InvalidSignature）；
 * OAuth 全流程（mock）：Bearer 头、expires_at 前 60s 主动刷新一次并持久化、
   401 触发刷新重试一次、刷新失败抛 OpenApiError、无 refresh_token 如实报错；
-* 信封：s==ok 透传 d；s==error 抛 OpenApiError（保留 need_order_confirm/confirm_id/jump_url）；
-  限频/5xx 不自动重试、如实抛出（调用次数锁定为 1）；
+* 信封：s==ok 透传 d；s==error 抛 OpenApiError（need_order_confirm=true 抛专用子类
+  OrderConfirmRequired，保留 need_order_confirm/confirm_id/jump_url）；
+  限频/5xx 不自动重试、如实抛出（调用次数锁定为 1）；429 把响应头 Retry-After
+  并入 OpenApiError.retry_after；
+* 传输异常收敛：默认传输 _default_http 把 URLError/超时/连接重置包装为
+  TransportError（OpenApiError 子类），request() 契约「传输异常 → OpenApiError」；
 * 凭据：0600 原子读写、坏 JSON 抛错、路径可覆盖（测试隔离）；
 * scripts/futu_auth.py --openapi 纯函数：PKCE/state 生成、授权 URL、token 交换、
-  凭据合并、state 校验。
+  凭据合并、state 校验、回调分类（code vs error=access_denied 等）。
 
 真实网络流程（/oauth2/register、浏览器授权页、60355 回调、token 端点实连）
 **不自动化测试**，属人工流程：python scripts/futu_auth.py --openapi。
@@ -40,8 +46,6 @@ _spec = importlib.util.spec_from_file_location(
 futu_auth = importlib.util.module_from_spec(_spec)
 _spec.loader.exec_module(futu_auth)
 
-EMPTY_SHA256 = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855"
-
 
 def _pem(key):
     """cryptography 私钥 → PKCS8 PEM（Ed25519/RSA 通用）。"""
@@ -59,7 +63,11 @@ def _oauth_cred(now_ms, **over):
 
 
 class RecordingHttp:
-    """注入用假传输：记录每次调用，按序回放 (status, body) 响应。"""
+    """注入用假传输（契约对齐 ``_default_http``）：记录每次调用，按序回放响应。
+
+    响应项可写 ``(status, body)``（等价 headers={}）或 ``(status, body, headers)``；
+    回放统一为 ``(status, body, headers)`` 三元组。
+    """
 
     def __init__(self, *responses):
         self.responses = list(responses)
@@ -73,10 +81,14 @@ class RecordingHttp:
         item = self.responses.pop(0)
         if isinstance(item, Exception):
             raise item
-        status, payload = item
+        if len(item) == 3:
+            status, payload, resp_headers = item
+        else:
+            status, payload = item
+            resp_headers = {}
         if isinstance(payload, bytes):
-            return status, payload
-        return status, json.dumps(payload).encode("utf-8")
+            return status, payload, resp_headers
+        return status, json.dumps(payload).encode("utf-8"), resp_headers
 
 
 class TempHomeTestBase(unittest.TestCase):
@@ -119,18 +131,24 @@ class AppKeySignerTest(TempHomeTestBase):
                          ["1690000000123", "POST", "/v4/trade/place", "a=1",
                           hashlib.sha256(body).hexdigest()])
 
-    def test_empty_body_uses_sha256_of_empty_bytes(self):
+    def test_empty_body_fifth_segment_is_empty_string(self):
+        """官方规则（逐字）：没有请求体时第 5 段传空字符串（官方 GET 示例第 5 段为空）。
+
+        错误做法是 sha256(b"")（e3b0c44…）——已实证：无 body GET 按官方原文
+        （第 5 段空串）验签通过，按 e3b0c44… 验签 InvalidSignature。
+        """
         msg = fo.AppKeySigner.signing_message(1, "GET", "/v4/x", "", None)
-        self.assertEqual(msg.decode("utf-8").split("\n")[4], EMPTY_SHA256)
-        self.assertEqual(fo.EMPTY_BODY_SHA256, EMPTY_SHA256)
+        self.assertEqual(msg, b"1\nGET\n/v4/x\n\n", "空 body：签名原文以 \\n 结尾")
+        self.assertEqual(msg.decode("utf-8").split("\n")[4], "")
 
     def test_empty_fields_keep_position(self):
-        """空 query/空 body 段保留位置（连续 \\n 不收缩）。"""
+        """空 query/空 body 段保留位置（连续 \\n 不收缩，原文以换行结尾）。"""
         msg = fo.AppKeySigner.signing_message(7, "GET", "/v4/x", None, b"").decode("utf-8")
         parts = msg.split("\n")
         self.assertEqual(len(parts), 5)
         self.assertEqual(parts[3], "")
-        self.assertEqual(parts[4], EMPTY_SHA256)
+        self.assertEqual(parts[4], "")
+        self.assertTrue(msg.endswith("\n"), "空 body 段保留位置：原文以 \\n 结尾")
 
     def test_ed25519_signature_verifies_with_public_key(self):
         key = Ed25519PrivateKey.generate()
@@ -228,7 +246,8 @@ class OAuthClientTest(TempHomeTestBase):
         self.assertEqual(call["url"], "https://webapi.futunn.com/v4/market-snapshot")
         self.assertEqual(len(http.calls), 1, "token 新鲜时不得触发刷新")
 
-    def test_error_envelope_raises_openapi_error_with_confirm_fields(self):
+    def test_need_order_confirm_raises_order_confirm_required(self):
+        """need_order_confirm=true：抛专用子类 OrderConfirmRequired（闸门显式分流）。"""
         resp = {"s": "error", "errcode": 123, "errmsg": "需要二次确认",
                 "need_order_confirm": True, "confirm_id": "cf-1",
                 "jump_url": "https://www.futunn.com/confirm"}
@@ -236,11 +255,21 @@ class OAuthClientTest(TempHomeTestBase):
         with self.assertRaises(fo.OpenApiError) as cm:
             client.request("POST", "/v4/trade/place", json_body={"qty": 1})
         err = cm.exception
+        self.assertIs(type(err), fo.OrderConfirmRequired,
+                      "need_order_confirm 信封必须抛专用子类（订单已挂起，禁止盲重试）")
         self.assertEqual(err.errcode, 123)
         self.assertEqual(err.errmsg, "需要二次确认")
         self.assertIs(err.need_order_confirm, True)
         self.assertEqual(err.confirm_id, "cf-1")
         self.assertEqual(err.jump_url, "https://www.futunn.com/confirm")
+
+    def test_plain_error_envelope_is_exactly_openapi_error(self):
+        """无 need_order_confirm 的普通错误信封：恰为 OpenApiError 本身。"""
+        client, _, _ = self._client(
+            {}, [(200, {"s": "error", "errcode": 7, "errmsg": "boom"})])
+        with self.assertRaises(fo.OpenApiError) as cm:
+            client.request("GET", "/v4/x")
+        self.assertIs(type(cm.exception), fo.OpenApiError)
 
     def test_pre_expiry_refreshes_once_persists_then_calls(self):
         """expires_at 前 60s：先刷新一次（持久化），再带新 token 调业务接口。"""
@@ -300,7 +329,19 @@ class OAuthClientTest(TempHomeTestBase):
         with self.assertRaises(fo.OpenApiError) as cm:
             client.request("GET", "/v4/market-snapshot")
         self.assertEqual(cm.exception.errcode, 500)
+        self.assertIsNone(cm.exception.retry_after, "非 429 不得携带 retry_after")
         self.assertEqual(len(http.calls), 1)
+
+    def test_429_attaches_retry_after_header(self):
+        """429：响应头 Retry-After 原值并入 OpenApiError.retry_after（供上层退避）。"""
+        client, http, _ = self._client(
+            {}, [(429, b"rate limited", {"Retry-After": "3"})])
+        with self.assertRaises(fo.OpenApiError) as cm:
+            client.request("GET", "/v4/market-snapshot")
+        err = cm.exception
+        self.assertEqual(err.errcode, 429)
+        self.assertEqual(err.retry_after, "3")
+        self.assertEqual(len(http.calls), 1, "429 也不自动重试（含 Retry-After 透传）")
 
     def test_missing_mode_raises_openapi_error(self):
         store = fo.CredentialStore(self.tmp / "empty.json")
@@ -377,7 +418,7 @@ class AppKeyClientTest(TempHomeTestBase):
             "", None)
         self.assertEqual(message.decode("utf-8").split("\n"),
                          ["1700000000000", "GET", "/v4/market-snapshot", "",
-                          EMPTY_SHA256])
+                          ""])
         self._verify(key.public_key(), call["headers"]["Authorization"],
                      message, "Ed25519")
 

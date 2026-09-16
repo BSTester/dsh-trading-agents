@@ -94,6 +94,7 @@ def register_client():
 
 class CallbackHandler(http.server.BaseHTTPRequestHandler):
     code = ""
+    state = ""
     seen = False
 
     def do_GET(self):
@@ -103,6 +104,7 @@ class CallbackHandler(http.server.BaseHTTPRequestHandler):
             return  # 无关探针：忽略并继续监听
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         CallbackHandler.code = query.get("code", [""])[0]
+        CallbackHandler.state = query.get("state", [""])[0]
         CallbackHandler.seen = True
         self.send_response(200)
         self.end_headers()
@@ -176,7 +178,6 @@ def refresh_tokens():
     moment = record_expiry(resp)
     if resp.get("refresh_token"):
         REFRESH_FILE.write_text(resp["refresh_token"])
-    moment = record_expiry(resp)
     say("续期成功，token 已更新。" + (f"（有效期至 {moment:%H:%M}）" if moment else ""))
     touch_preset()
     return 0
@@ -215,7 +216,11 @@ def openapi_generate_state():
 
 
 def openapi_build_authorize_url(client_id, redirect_uri, state, code_challenge, scope):
-    """GET /oauth2/authorize/confirm 的授权 URL（S256；%20/%2A 精确编码）。"""
+    """GET /oauth2/authorize/confirm 的授权 URL（S256；%20/%2A 精确编码）。
+
+    注意：官方 Query 参数表未列 ``scope``——实测服务端容忍该参数并按其下发权限
+    （2026-09-16 实抓），故保留传递；若未来服务端开始严格校验，去掉即可。
+    """
     return AUTHORIZE_URL + "?" + urllib.parse.urlencode({
         "response_type": "code",
         "client_id": client_id,
@@ -266,11 +271,31 @@ def openapi_validate_state(expected, received):
     return True
 
 
+def openapi_classify_callback(query):
+    """回调 query（``parse_qs`` 产物，dict-of-lists）分类：成功 vs 被拒。
+
+    返回 ``(kind, value, extra)``：
+    - ``("code", code, state)``：授权成功，继续换 token（state 另行逐字校验）；
+    - ``("error", error, error_description)``：用户拒绝/授权失败（如
+      ``access_denied``）或回调缺 code——必须如实报「授权被拒绝」，不能误报
+      「超时未收到授权回调」。
+    """
+    error = query.get("error", [""])[0]
+    if error:
+        return ("error", error, query.get("error_description", [""])[0])
+    code = query.get("code", [""])[0]
+    if code:
+        return ("code", code, query.get("state", [""])[0])
+    return ("error", "invalid_callback", "回调缺少 code 参数")
+
+
 class OpenApiCallbackHandler(http.server.BaseHTTPRequestHandler):
-    """60355 回调：捕获 code + state（与 MCP 通道的 CallbackHandler 互不干扰）。"""
+    """60355 回调：捕获 code + state；授权被拒时捕获 error（与 MCP 通道互不干扰）。"""
 
     code = ""
     state = ""
+    error = ""
+    error_description = ""
     seen = False
 
     def do_GET(self):
@@ -281,14 +306,21 @@ class OpenApiCallbackHandler(http.server.BaseHTTPRequestHandler):
         query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
         OpenApiCallbackHandler.code = query.get("code", [""])[0]
         OpenApiCallbackHandler.state = query.get("state", [""])[0]
+        OpenApiCallbackHandler.error = query.get("error", [""])[0]
+        OpenApiCallbackHandler.error_description = \
+            query.get("error_description", [""])[0]
         OpenApiCallbackHandler.seen = True
         self.send_response(200)
         self.end_headers()
+        if OpenApiCallbackHandler.error:
+            body = ("<h3>❌ 授权被拒绝/失败</h3>"
+                    "<p>可关闭本页，回到终端查看原因后重试。</p>")
+        else:
+            body = ("<h3>✅ OpenAPI 授权成功</h3>"
+                    "<p>凭据已保存，本页面将自动关闭。若未关闭可手动关闭。</p>")
         html = ("<!DOCTYPE html><html><head><meta charset='utf-8'>"
                 "<script>window.close();</script></head>"
-                "<body style='font-family:sans-serif'><h3>✅ OpenAPI 授权成功</h3>"
-                "<p>凭据已保存，本页面将自动关闭。若未关闭可手动关闭。</p>"
-                "</body></html>")
+                f"<body style='font-family:sans-serif'>{body}</body></html>")
         self.wfile.write(html.encode("utf-8"))
 
     def log_message(self, *a):
@@ -352,6 +384,8 @@ def cmd_openapi(scope=OPENAPI_DEFAULT_SCOPE):
     OpenApiCallbackHandler.seen = False
     OpenApiCallbackHandler.code = ""
     OpenApiCallbackHandler.state = ""
+    OpenApiCallbackHandler.error = ""
+    OpenApiCallbackHandler.error_description = ""
     server = http.server.HTTPServer(("127.0.0.1", OPENAPI_CALLBACK_PORT),
                                     OpenApiCallbackHandler)
     server.timeout = 2  # 循环接收：每次处理一个请求，直到拿到授权码
@@ -371,8 +405,19 @@ def cmd_openapi(scope=OPENAPI_DEFAULT_SCOPE):
     while time.time() < deadline and not OpenApiCallbackHandler.seen:
         server.handle_request()
     server.server_close()
-    if not OpenApiCallbackHandler.seen or not OpenApiCallbackHandler.code:
+    if not OpenApiCallbackHandler.seen:
         warn("超时未收到授权回调，请重试。")
+        return 1
+    # 授权被拒（?error=access_denied 等）/畸形回调：如实报拒绝原因，不再误报超时
+    kind, value, extra = openapi_classify_callback({
+        "code": [OpenApiCallbackHandler.code],
+        "state": [OpenApiCallbackHandler.state],
+        "error": [OpenApiCallbackHandler.error],
+        "error_description": [OpenApiCallbackHandler.error_description],
+    })
+    if kind == "error":
+        warn(f"授权被拒绝/失败：{value}" + (f"（{extra}）" if extra else "")
+             + "——未换取 token，请重新运行并在浏览器中完成授权。")
         return 1
     try:
         openapi_validate_state(state, OpenApiCallbackHandler.state)
@@ -432,6 +477,7 @@ def main():
     verifier = secrets.token_urlsafe(48)
     challenge = base64.urlsafe_b64encode(
         hashlib.sha256(verifier.encode()).digest()).rstrip(b"=").decode()
+    state = secrets.token_urlsafe(16)  # 防 CSRF：回调时逐字校验（与 --openapi 通道对齐）
 
     server = http.server.HTTPServer(("127.0.0.1", CALLBACK_PORT), CallbackHandler)
     server.timeout = 2  # 循环接收：每个请求都处理，直到拿到有效授权码
@@ -450,7 +496,7 @@ def main():
         "client_id": client_id,
         "redirect_uri": REDIRECT_URI,
         "scope": scopes,
-        "state": secrets.token_urlsafe(16),
+        "state": state,
         "code_challenge": challenge,
         "code_challenge_method": "S256",
     }, safe=":", quote_via=urllib.parse.quote)  # 用 %20/%2A 精确编码，避免 + 和 * 在浏览器跳转中损坏
@@ -468,6 +514,11 @@ def main():
     server.server_close()
     if not CallbackHandler.seen or not CallbackHandler.code:
         warn("超时未收到授权回调，请重试。")
+        return 1
+    try:
+        openapi_validate_state(state, CallbackHandler.state)
+    except ValueError as e:
+        warn(str(e))
         return 1
     code = CallbackHandler.code
     say("收到授权码，换取 token…")
