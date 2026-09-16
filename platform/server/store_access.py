@@ -394,22 +394,36 @@ WP10_ENDPOINTS = ("pipeline", "auto_pipeline")
 # 进 CACHE_TTL_MS（5m）与 ENDPOINT_SHAPE，且进 MCP 工具面（只读类，模型可查采集进度）。
 WP11_ENDPOINTS = ("sentiment-history",)
 
+# WP12 任务 4：富途数据面端点（16 个；取数与通道路由在 server/futu_data.py，只在
+# openapi 通道有实现——mcp 通道无登记上游，如实拒绝）。构成为：
+#   直通 14 = 经济日历 2 + 所属板块 + 复权因子 + 板块 2 + 筛选 2 + IPO + 做空 2 + 自选 3；
+#   聚合 2 = f10_detail（26 section）+ derivative_detail（4 section）。
+# 其中 3 个是**有意的 HTTP-only**（不进 MCP 工具面，见 mcp_tools.MCP_EXCLUDED_ENDPOINTS）：
+# warrant_screen / modify_user_security / info_rehab。缓存口径：除写类
+# modify_user_security 外均进 CACHE_TTL_MS（6h/30m/5m/1h 四档，依据见 caches.py）；
+# 形状表只登记 4 项官方文档明示包装键（见 caches.ENDPOINT_SHAPE 的 WP12 注释）。
+WP12_ENDPOINTS = ("economic_calendar_hot", "economic_calendar_search", "info_owner_plate",
+                  "info_rehab", "plate_list", "plate_stock", "stock_screen",
+                  "warrant_screen", "ipo_list", "short_daily_volume", "short_interest",
+                  "watchlist_list", "watchlist_groups", "modify_user_security",
+                  "f10_detail", "derivative_detail")
+
 
 def endpoints():
-    """服务端点清单（61 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
+    """服务端点清单（77 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
     + 9 项 WP8 OpenAPI 行情 + 6 项 WP8 OpenAPI 交易只读 + 3 项 WP8 推送订阅管理
     + 3 项 WP8 设置页（openapi_config/openapi_test/openapi_oauth）+ 2 项 WP10
     （流程页 pipeline + 自动流水线设置 auto_pipeline）+ 1 项 WP11
-    （情绪快照 sentiment-history）。
+    （情绪快照 sentiment-history）+ 16 项 WP12 数据面。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
-    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8/WP10/WP11
-    增量按交付顺序登记在各自常量里；锁定测试把 61 项整体钉死。
+    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8/WP10/WP11/WP12
+    增量按交付顺序登记在各自常量里；锁定测试把 77 项整体钉死。
     """
     return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS) \
         + list(WP8_MARKET_ENDPOINTS) + list(WP8_TRADE_ENDPOINTS) \
         + list(WP8_PUSH_ENDPOINTS) + list(WP8_SETTINGS_ENDPOINTS) + list(WP10_ENDPOINTS) \
-        + list(WP11_ENDPOINTS)
+        + list(WP11_ENDPOINTS) + list(WP12_ENDPOINTS)
 
 
 def read_mode(home):

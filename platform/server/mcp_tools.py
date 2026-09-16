@@ -85,7 +85,7 @@ SERVER_VERSION = "0.1.0"
 # confirm-decide 与设置页 3 端点 openapi_config/openapi_test/openapi_oauth）
 # + 5 维护工具（§3.4）+ WP10 任务 1 pipeline + WP11 任务 3 sentiment_history。
 # 锁定测试断言 61 恒成立。
-TOOL_COUNT = 61
+TOOL_COUNT = 74
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订；
 # WP8 任务 7 增补；WP8 OAuth 集成再增 openapi_oauth）。
@@ -98,7 +98,12 @@ TOOL_COUNT = 61
 # 执行链——**模型不得自拨**，开关只在 Web 设置页。R5/S1 按本常量断言
 # 「工具名集 ≡ 端点数 − 排除集」。
 MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide", "openapi_config", "openapi_test",
-                                    "openapi_oauth", "auto_pipeline"})
+                                    "openapi_oauth", "auto_pipeline",
+                                    # WP12 任务 4：数据面三端点有意 HTTP-only——
+                                    # warrant_screen（窝轮数据保持 API 面完整，平台不策略化）、
+                                    # modify_user_security（**写用户富途侧自选**，仅 Web 用户
+                                    # 操作可达）、info_rehab（复权因子，同步作业内部取数用）。
+                                    "warrant_screen", "modify_user_security", "info_rehab"})
 
 # 规格 §3.6 禁用名黑名单（与 Node 原实现（已退役）同表）。匹配语义是**整名或分段精确**：工具名按
 # 非字母数字切段，任一段命中才算，所以 ``plan_execute`` 不因子串 "exec" 被误伤，而
@@ -892,6 +897,185 @@ TOOLS = (
             opt("order_book", "str_list", "要取消的摆盘标的"),
             opt("ticker", "str_list", "要取消的逐笔标的"),
             opt("kline", "object_list", "要取消的 K 线订阅项：[{symbol, period, adjust}]"),
+        ),
+    ),
+    # ---- WP12 任务 4：富途数据面（直通 11 + 聚合 2）----
+    # 三档之外的两类：窝轮筛选/修改自选/复权因子是 HTTP-only（不进本清单，见
+    # MCP_EXCLUDED_ENDPOINTS）；F10 26 项与衍生品 4 项走**聚合工具**（section 枚举），
+    # 不逐端点铺开——工具面预算 TOOL_COUNT ≤ 80 是硬约束（本组 +13 → 74）。
+    ToolDefinition(
+        "stock_screen",
+        "条件选股（全市场筛选，服务端经富途获取）：screen_queries 必填，每元素是"
+        "「11 选 1」的查询对象（市场/板块/行情估值/累计行情/财务/技术指标/技术形态/"
+        "特色因子/经纪商持股/K线形态/期权指标）；retrieve_queries 是「9 选 1」的取值"
+        "因子（返回顺序与它对齐）；支持 sort/sorts 排序、next_key 翻页、limit≤300。"
+        "支持 HK/US/A 股/SG/CA/AU/JP/MY；broker_holdings 与 kline_shape 仅 HK。",
+        "stock_screen",
+        (
+            req("screen_queries", "object_list", "筛选条件数组（每元素 11 选 1 的 query 对象）"),
+            opt("retrieve_queries", "object_list", "取值因子数组（每元素 9 选 1）"),
+            opt("sort", "object", "单字段排序 {direction, simple_property:{name}}"),
+            opt("sorts", "object_list", "多字段排序（优先于 sort）"),
+            opt("next_key", "str", "翻页游标（首页留空）"),
+            opt("limit", "int", "单页条数，默认 200，最大 300", minimum=1, maximum=300),
+            opt("watchlist_stock_ids", "int_list", "自选股 stock_id 列表（配合 mode=1）"),
+            opt("holding_stock_ids", "int_list", "持仓 stock_id 列表（配合 mode=2）"),
+            opt("user_stock_list_mode", "int", "0=不限/1=仅自选/2=仅持仓，默认 0",
+                minimum=0, maximum=2),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "plate_list",
+        "板块列表（服务端经富途获取）：给定市场与板块分类，返回该分类下全部板块"
+        "（代码/简繁英文名）。plate_class 取值 ALL/INDUSTRY/REGION/CONCEPT/OTHER；"
+        "REGION 仅 A 股（SH/SZ）支持。",
+        "plate_list",
+        (
+            req("market", "str", "市场前缀，如 HK/SH/SZ/US"),
+            req("plate_class", "str", "板块分类：ALL/INDUSTRY/REGION/CONCEPT/OTHER"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "plate_stock",
+        "板块成分股（服务端经富途获取）：给定板块代码返回成分股列表（代码/名称/每手/"
+        "上市时间）与分页；板块不存在或下线时上游报错，如实返回。",
+        "plate_stock",
+        (
+            req("plate_code", "str", "板块代码，如 HK.LIST23618"),
+            opt("sort_field", "str", "排序字段"),
+            opt("ascend", "bool", "是否升序"),
+            opt("price_type", "str", "价格类型"),
+            opt("leverage_direction", "str", "杠杆方向（窝轮相关）"),
+            opt("leverage_multiple", "str", "杠杆倍数（窝轮相关）"),
+            opt("next_key", "str", "翻页游标"),
+            opt("limit", "int", "单页条数"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "short_daily_volume",
+        "每日卖空成交（服务端经富途获取，仅 HK/US 可卖空证券）：港股为成交维度"
+        "（卖空股数/金额、累计空头持仓与占比），美股为持仓维度（各交易所卖空股数、"
+        "卖空占比）。无卖空数据时如实返回「无数据」而不是零值。",
+        "short_daily_volume",
+        (
+            req("code", "str", "标的代码，如 HK.00700 / US.AAPL"),
+            opt("count", "int", "返回条数，默认 30，最大 90", minimum=1, maximum=90),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "short_interest",
+        "空头持仓（服务端经富途获取，仅 HK/US）：空头股数/占比、回补天数、"
+        "日均卖空量等。无数据时如实返回「无数据」。",
+        "short_interest",
+        (
+            req("code", "str", "标的代码，如 US.AAPL"),
+            opt("count", "int", "返回条数", minimum=1),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "ipo_list",
+        "新股列表（服务端经富途获取）：按市场返回即将上市/可申购/待上市的新股"
+        "（代码/名称/上市时间/发行价区间/每手/认购起止）。market 取值 hk/us/cn/sg/my"
+        "（官方按市场独立端点）；request_type 省略时不代填（各市场默认值不同）。",
+        "ipo_list",
+        (
+            req("market", "str", "市场：hk/us/cn/sg/my（小写）"),
+            opt("request_type", "int", "类别（HK/US/SG/MY 默认 11；A 股默认 4）",
+                minimum=1, maximum=11),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "economic_calendar_hot",
+        "热门经济事件（服务端经富途获取）：按日返回重磅经济数据日历（前值/预测/"
+        "公布值/重要性/国家/币种），limit 1..20。",
+        "economic_calendar_hot",
+        (
+            opt("limit", "int", "返回条数，1..20", minimum=1, maximum=20),
+            opt("next_key", "str", "翻页游标"),
+            opt("date", "str", "日期 yyyy-MM-dd（缺省今天）"),
+            opt("timezone", "str", "时区"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "economic_calendar_search",
+        "经济事件搜索（服务端经富途获取）：keyword 与 search_type 必填，返回匹配的"
+        "经济事件列表（字段同热门经济事件）。",
+        "economic_calendar_search",
+        (
+            req("keyword", "str", "搜索关键词"),
+            req("search_type", "int", "搜索类型 1..4", minimum=1, maximum=4),
+            opt("limit", "int", "返回条数", minimum=1),
+            opt("next_key", "str", "翻页游标"),
+            opt("time_order_type", "int", "时间排序方式"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "info_owner_plate",
+        "所属板块（服务端经富途获取）：标的的板块归属列表（板块代码/名称/类型）；"
+        "行业中性化与研究分类的基础数据。",
+        "info_owner_plate",
+        (req("code", "str", "标的代码，如 SH.600519"), REFRESH),
+    ),
+    ToolDefinition(
+        "watchlist_list",
+        "自选股列表（服务端经富途获取，读取用户自选分组内的标的）：group_name 必填；"
+        "用户身份缺失或无效时上游如实报错（该端点属用户态数据）。",
+        "watchlist_list",
+        (
+            req("group_name", "str", "自选分组名（先用 watchlist_groups 查）"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "watchlist_groups",
+        "自选股分组（服务端经富途获取）：返回用户的自选分组清单"
+        "（group_name/group_type）；group_type 取值 ALL/CUSTOM/SYSTEM（大小写敏感）。",
+        "watchlist_groups",
+        (
+            opt("group_type", "str", "ALL/CUSTOM/SYSTEM（缺省 ALL）"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "f10_detail",
+        "个股深度数据（服务端经富途获取，聚合 26 个 section）：财务数据"
+        "（earnings_price_move/earnings_price_history/statements/revenue_breakdown）、"
+        "研究（analyst_consensus/rating_summary/morningstar）、估值（valuation_detail/"
+        "valuation_plate_stocks/valuation_index_stocks/valuation_index_stock_plates）、"
+        "公司行为（dividends/buybacks/splits）、股东持股（shareholders_overview/"
+        "holding_changes/holder_detail/institutional/insider_holders/insider_trades）、"
+        "公司信息（company_profile/company_executives/company_executive_background/"
+        "company_operational_efficiency）、十大经纪商（top_brokers/top_brokers_history）。"
+        "section 参数经 params 对象下传（如 statements 的 statement_type）。",
+        "f10_detail",
+        (
+            req("code", "str", "标的代码，如 HK.00700 / US.AAPL"),
+            req("section", "str", "26 个 section 之一（见工具描述）"),
+            opt("params", "object", "section 参数对象（键随 section 而定）"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "derivative_detail",
+        "衍生品数据（服务端经富途获取，聚合 4 个 section）：future_info（期货合约信息，"
+        "需 params.code_list）、reference_future（标的关联期货）、option_volatility"
+        "（期权隐含/历史波动率）、option_exercise_probability（期权行权概率）。"
+        "后两者需传**期权合约**代码。",
+        "derivative_detail",
+        (
+            req("code", "str", "标的或期权合约代码"),
+            req("section", "str", "future_info/reference_future/option_volatility/"
+                                "option_exercise_probability"),
+            opt("params", "object", "section 参数对象（如 future_info 的 code_list）"),
+            REFRESH,
         ),
     ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----

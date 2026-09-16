@@ -114,6 +114,14 @@ FUTU_TOOLS = {
 CACHED_FUTU_ENDPOINTS = frozenset({
     "info_basicinfo", "info_trading_days", "info_search", "info_market_state",
     "quote_history_kline_v2",
+    # WP12 任务 4：数据面低频端点的 value 层缓存（TTL 值在 caches.CACHE_TTL_MS：
+    # 板块列表/复权/所属板块 6h，经济日历/F10/衍生品/板块成分/IPO 30m，筛选/自选 5m，
+    # 做空 1h）。**modify_user_security 不进**：它是写（非交易写），缓存住写结果没有意义
+    # 且会掩盖后续读。所有被缓存的端点都走同一份「错误不进缓存」语义（_cached）。
+    "economic_calendar_hot", "economic_calendar_search", "info_owner_plate", "info_rehab",
+    "plate_list", "plate_stock", "stock_screen", "warrant_screen", "ipo_list",
+    "short_daily_volume", "short_interest", "watchlist_list", "watchlist_groups",
+    "f10_detail", "derivative_detail",
 })
 
 # 端点 → OpenApiMarket 方法登记（openapi 后端；与 FUTU_TOOLS 键集一致，锁定测试比对）。
@@ -177,6 +185,75 @@ OPENAPI_ADAPTERS = {
 # option_screen 的 filter 对象内键白名单（与上游 tools/list 的入参面逐项对应）。
 _SCREEN_KEYS = ("strategy", "field_filter", "limit", "next_key", "request_exact_data",
                 "sort_obj", "strategy_param")
+
+# ---------------------------------------------------------------------------
+# WP12 任务 4：富途数据面端点（锁定表 docs/superpowers/plans/wp12-endpoint-lock.md §C）
+# ---------------------------------------------------------------------------
+# 16 个端点 = 直通 14 + 聚合 2（``f10_detail`` 26 section / ``derivative_detail`` 4 section）。
+# 其中 3 个是**有意的 HTTP-only**（进服务端点面、不进 MCP 工具面，见
+# ``mcp_tools.MCP_EXCLUDED_ENDPOINTS``）：
+#   * ``warrant_screen``——窝轮数据保持 API 面完整，但平台策略/风控/执行不引入该品类；
+#   * ``modify_user_security``——**写用户富途侧自选**（非交易写），仅 Web 用户操作可达；
+#   * ``info_rehab``——复权因子，同步作业内部取数用，不需要模型工具面。
+#
+# mcp 通道**不登记**本组端点：托管 MCP 的上游工具名与参数形状未逐项核对（锁定表只核对
+# REST 面），按仓库纪律禁止猜名——``_fetch_mcp`` 对本组如实拒绝并指引切 openapi 通道。
+DATAPLANE_ENDPOINTS = (
+    "economic_calendar_hot", "economic_calendar_search", "info_owner_plate", "info_rehab",
+    "plate_list", "plate_stock", "stock_screen", "warrant_screen", "ipo_list",
+    "short_daily_volume", "short_interest", "watchlist_list", "watchlist_groups",
+    "modify_user_security", "f10_detail", "derivative_detail",
+)
+
+# ``derivative_detail`` 的 section 白名单（锁定表 §C.7 四项）→ OpenApiDerivatives 方法名。
+DERIVATIVE_SECTIONS = {
+    "future_info": "future_info",
+    "reference_future": "reference_future",
+    "option_volatility": "option_volatility",
+    "option_exercise_probability": "option_exercise_probability",
+}
+
+# ``f10_detail`` 的 section 白名单以传输层 ``OpenApiF10.SECTIONS`` 为**单一事实源**
+# （锁定表 §C.5 的 26 项），此处不复制名单——复制一份迟早漂移（与 _market_class 同口径）。
+
+
+def _f10_class():
+    """``trading_datasource.futu_openapi.OpenApiF10``（惰性导入，section 名单单一源）。"""
+    from trading_datasource.futu_openapi import OpenApiF10 as cls  # noqa: PLC0415
+    return cls
+
+
+def _oa_derivative_detail(groups, arguments):
+    """``derivative_detail``：section 白名单 → OpenApiDerivatives 专用方法。"""
+    section = arguments["section"]
+    method = DERIVATIVE_SECTIONS.get(section)
+    if method is None:
+        raise _param_error(f"section 取值非法：{section!r}"
+                           f"（允许：{sorted(DERIVATIVE_SECTIONS)}）")
+    params = arguments.get("params") or {}
+    return getattr(groups.derivatives, method)(arguments["symbol"], **params)
+
+
+# 端点 → 适配器：canonical arguments（服务载荷归一后的形状）→ 方法组调用。
+# 与 OPENAPI_ADAPTERS 同构，区别只在注入的是**数据面八方法组**（共享同一 OpenApiClient）。
+DATAPLANE_ADAPTERS = {
+    "economic_calendar_hot": lambda g, a: g.basic.economic_calendar_hot(**a),
+    "economic_calendar_search": lambda g, a: g.basic.economic_calendar_search(**a),
+    "info_owner_plate": lambda g, a: g.basic.owner_plate(**a),
+    "info_rehab": lambda g, a: g.basic.rehab(**a),
+    "plate_list": lambda g, a: g.plate.plate_list(**a),
+    "plate_stock": lambda g, a: g.plate.plate_stock(**a),
+    "stock_screen": lambda g, a: g.screen.stock_screen(**a),
+    "warrant_screen": lambda g, a: g.screen.warrant_screen(**a),
+    "ipo_list": lambda g, a: g.ipo.ipo_list(**a),
+    "short_daily_volume": lambda g, a: g.short.short_daily_volume(**a),
+    "short_interest": lambda g, a: g.short.short_interest(**a),
+    "watchlist_list": lambda g, a: g.watchlist.watchlist_list(**a),
+    "watchlist_groups": lambda g, a: g.watchlist.watchlist_groups(**a),
+    "modify_user_security": lambda g, a: g.watchlist.modify_user_security(**a),
+    "f10_detail": lambda g, a: g.f10.f10(a["symbol"], a["section"], **(a.get("params") or {})),
+    "derivative_detail": _oa_derivative_detail,
+}
 
 # call_tool 把业务错误抛成 "……: ret=<code> <ret_msg>" / "……: s=<status> <detail>"，
 # 两条特征各一份正则（futu_mcp._unwrap 的输出格式，锁定测试按此钉）。
@@ -364,6 +441,110 @@ def _optional_date(payload, field, required=False):
     return value
 
 
+def _optional_str(payload, field):
+    """可选非空字符串（分页游标/分组名等）：非字符串或空白一律拒绝。"""
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str) or not value.strip():
+        raise _param_error(f"{field} 必须是非空字符串")
+    return value
+
+
+def _optional_int(payload, field, minimum=1):
+    """可选整数下界校验（**不做上界发明**：上界由传输层方法按其常量判，单一事实源）。"""
+    value = payload.get(field)
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
+        raise _param_error(f"{field} 必须是不小于 {minimum} 的整数")
+    return value
+
+
+def _optional_scalar(payload, field):
+    """可选标量直通（官方未给区间/枚举的参数，不发明规则）。"""
+    value = payload.get(field)
+    if value is None:
+        return None
+    if isinstance(value, (dict, list)):
+        raise _param_error(f"{field} 必须是标量（字符串或数字）")
+    return value
+
+
+def _optional_list(payload, field):
+    """可选非空数组（code_list/screen_queries 等）：元素形状由传输层方法校验。"""
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not value:
+        raise _param_error(f"{field} 必须是非空数组")
+    return value
+
+
+def _optional_dict(payload, field):
+    """可选非空对象（section 参数等）：键集合由传输层方法校验。"""
+    value = payload.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, dict):
+        raise _param_error(f"{field} 必须是对象")
+    return value
+
+
+def _required_str(payload, field):
+    value = payload.get(field)
+    if value is None:
+        raise _param_error(f"缺少必填字段 {field}")
+    if not isinstance(value, str) or not value.strip():
+        raise _param_error(f"{field} 必须是非空字符串")
+    return value.strip()
+
+
+def _required_scalar(payload, field):
+    """必填标量（官方必填但未给区间/枚举的参数，如 search_type）。"""
+    value = payload.get(field)
+    if value is None:
+        raise _param_error(f"缺少必填字段 {field}")
+    if isinstance(value, (dict, list)):
+        raise _param_error(f"{field} 必须是标量（字符串或数字）")
+    return value
+
+
+def _required_list(payload, field):
+    """必填非空数组（官方必填的 code_list/screen_queries 等）。"""
+    value = payload.get(field)
+    if value is None:
+        raise _param_error(f"缺少必填字段 {field}")
+    if not isinstance(value, list) or not value:
+        raise _param_error(f"{field} 必须是非空数组")
+    return value
+
+
+class DataPlaneGroups:
+    """WP12 数据面八方法组的实例集合（**共享同一个 OpenApiClient**）。
+
+    方法与 WP8 的 ``OpenApiMarket`` 同源：每个方法组只是一个 REST 面（筛选用 screen、
+    板块用 plate……），凭据/续期/限频/错误码映射都在共用的 client 上，因此这里必须
+    复用 ``FutuData._client()`` 建出的**同一个** client 实例，不能各建一个。
+    """
+
+    __slots__ = ("screen", "plate", "short", "basic", "ipo", "watchlist",
+                 "derivatives", "f10")
+
+    def __init__(self, client):
+        from trading_datasource.futu_openapi import (  # noqa: PLC0415 —— 避免导入期拉起 cryptography
+            OpenApiBasicData, OpenApiDerivatives, OpenApiF10, OpenApiIpo, OpenApiPlate,
+            OpenApiScreen, OpenApiShort, OpenApiWatchlist)
+        self.screen = OpenApiScreen(client)
+        self.plate = OpenApiPlate(client)
+        self.short = OpenApiShort(client)
+        self.basic = OpenApiBasicData(client)
+        self.ipo = OpenApiIpo(client)
+        self.watchlist = OpenApiWatchlist(client)
+        self.derivatives = OpenApiDerivatives(client)
+        self.f10 = OpenApiF10(client)
+
+
 class FutuData:
     """富途实时直通：17 个数据方法 + ``handle(endpoint, payload)`` 信封分发 + 通道路由。
 
@@ -377,19 +558,23 @@ class FutuData:
     """
 
     def __init__(self, call=None, timeout=DEFAULT_TIMEOUT_SECONDS, home=None,
-                 channel=None, market=None, credential_path=None, push=None):
+                 channel=None, market=None, credential_path=None, push=None,
+                 dataplane=None):
         self._call = call
         self.timeout = timeout
         self.home = home
         self._credential_path = credential_path
         self._market_override = market
+        # WP12 任务 4：数据面八方法组替身注入口（与 market 同口径——注入即钉住 openapi）
+        self._dataplane_override = dataplane
+        self._client_built = None
         # WP8 任务 4：WS 行情推送的进程内快照缓存（None = 未接线，rt_quote 走通道）
         self._push = push
         if channel is not None:
             self._channel = channel
         elif call is not None:
             self._channel = CHANNEL_MCP  # 注入 MCP 替身即钉住 MCP 通道（测试确定性）
-        elif market is not None:
+        elif market is not None or dataplane is not None:
             self._channel = CHANNEL_OPENAPI
         else:
             self._channel = None  # 惰性读 futu_channel 配置
@@ -401,17 +586,32 @@ class FutuData:
             self._channel = load_channel(self.home)
         return self._channel
 
+    def _client(self):
+        """OpenAPI 客户端单例：行情组与 WP12 数据面八组**共用**（凭据/续期/限频只有一份）。"""
+        if self._client_built is None:
+            from trading_datasource.futu_openapi import (  # noqa: PLC0415
+                CredentialStore, OpenApiClient)
+            self._client_built = OpenApiClient(CredentialStore(self._credential_path))
+        return self._client_built
+
     @property
     def market(self):
-        """OpenAPI 后端（注入替身优先；缺省 OpenApiMarket + 默认凭据路径）。"""
+        """OpenAPI 行情后端（注入替身优先；缺省 OpenApiMarket + 默认凭据路径）。"""
         if self._market_override is not None:
             return self._market_override
         if getattr(self, "_market_built", None) is None:
-            from trading_datasource.futu_openapi import (  # noqa: PLC0415
-                CredentialStore, OpenApiClient, OpenApiMarket)
-            self._market_built = OpenApiMarket(
-                OpenApiClient(CredentialStore(self._credential_path)))
+            from trading_datasource.futu_openapi import OpenApiMarket  # noqa: PLC0415
+            self._market_built = OpenApiMarket(self._client())
         return self._market_built
+
+    @property
+    def dataplane(self):
+        """WP12 数据面八方法组（注入替身优先；缺省与 ``market`` 共用同一 client）。"""
+        if self._dataplane_override is not None:
+            return self._dataplane_override
+        if getattr(self, "_dataplane_built", None) is None:
+            self._dataplane_built = DataPlaneGroups(self._client())
+        return self._dataplane_built
 
     def _openapi_ready(self):
         """channel=openapi 时凭据是否可用（注入 market 替身视为可用）。
@@ -462,6 +662,15 @@ class FutuData:
 
     def _fetch_mcp(self, endpoint, arguments):
         """MCP 直通（既有行为，零变化）：call_tool → 分类 → data 透传。"""
+        if endpoint in DATAPLANE_ENDPOINTS:
+            # WP12 数据面端点在 mcp 通道**无登记上游**：托管 MCP 的工具名与参数形状
+            # 未逐项核对（锁定表只核对 REST 面），不猜名、不静默降级——如实拒绝并给出
+            # 可行路径（fail-closed，与「通道不可用如实报错」同一纪律）。
+            raise FutuDataError(
+                f"{endpoint} 仅支持 openapi 通道：mcp 通道未登记该端点的上游工具"
+                f"（上游工具名与参数形状未核对，禁止猜名）。请配置 openapi 凭据"
+                f"（~/.dsh/futu-openapi.json）并把 futu_channel 设为 openapi。",
+                kind="unavailable")
         # None = 未提供（与 OpenApiMarket._body 同规）：可选参数缺省不显式传 null
         arguments = {key: value for key, value in arguments.items() if value is not None}
         try:
@@ -492,7 +701,11 @@ class FutuData:
         from trading_datasource.futu_openapi import (  # noqa: PLC0415
             OpenApiError, UnexpectedResponse)
         try:
-            value = OPENAPI_ADAPTERS[endpoint](self.market, arguments)
+            if endpoint in DATAPLANE_ADAPTERS:
+                # WP12 任务 4：数据面八方法组（与 market 共用 client，注入替身走同一入口）
+                value = DATAPLANE_ADAPTERS[endpoint](self.dataplane, arguments)
+            else:
+                value = OPENAPI_ADAPTERS[endpoint](self.market, arguments)
         except FutuDataError:
             raise
         except ValueError as error:  # noqa: B901 —— OpenApiMarket 参数白名单（本地校验）
@@ -723,6 +936,155 @@ class FutuData:
                                    market.EXTENDED_TIME_VALUES, 0),
         })
 
+    # ---- WP12 任务 4：富途数据面端点（锁定表 §C）----
+    # 校验分层：本层只做**必填/类型/形状**（坏参数零通道调用）；取值上界与枚举由传输层
+    # 方法组按锁定表常量判（同样是本地校验，零网络往返）——区间/枚举只有一份事实源。
+    def economic_calendar_hot(self, payload):
+        """热门经济事件：limit 1..20；next_key/date/timezone 选填。"""
+        return self._fetch("economic_calendar_hot", {
+            "limit": _int_range(payload, "limit", 1, 20),
+            "next_key": _optional_str(payload, "next_key"),
+            "date": _optional_date(payload, "date"),
+            "timezone": _optional_scalar(payload, "timezone"),
+        })
+
+    def economic_calendar_search(self, payload):
+        """经济事件搜索：keyword 与 search_type 必填（官方必填）；limit/time_order_type
+        官方未给区间 → 标量直通（不发明）。"""
+        return self._fetch("economic_calendar_search", {
+            "keyword": _required_str(payload, "keyword"),
+            "search_type": _required_scalar(payload, "search_type"),
+            "limit": _optional_scalar(payload, "limit"),
+            "next_key": _optional_str(payload, "next_key"),
+            "time_order_type": _optional_scalar(payload, "time_order_type"),
+        })
+
+    def info_owner_plate(self, payload):
+        """所属板块：code 必填（板块归属，行业中性化的前提数据）。"""
+        return self._fetch("info_owner_plate", {"symbol": _required_code(payload)})
+
+    def info_rehab(self, payload):
+        """复权因子：code 必填；divi_mode 选填（枚举由传输层判）。"""
+        return self._fetch("info_rehab", {
+            "symbol": _required_code(payload),
+            "divi_mode": _optional_scalar(payload, "divi_mode"),
+        })
+
+    def plate_list(self, payload):
+        """板块列表：market 与 plate_class 必填（枚举与 REGION 市场限制由传输层判）。"""
+        return self._fetch("plate_list", {
+            "market": _required_str(payload, "market"),
+            "plate_class": _required_str(payload, "plate_class"),
+        })
+
+    def plate_stock(self, payload):
+        """板块成分股：plate_code 必填；排序/分页参数选填。"""
+        return self._fetch("plate_stock", {
+            "plate_code": _required_str(payload, "plate_code"),
+            "sort_field": _optional_scalar(payload, "sort_field"),
+            "ascend": _optional_bool(payload, "ascend"),
+            "price_type": _optional_scalar(payload, "price_type"),
+            "leverage_direction": _optional_scalar(payload, "leverage_direction"),
+            "leverage_multiple": _optional_scalar(payload, "leverage_multiple"),
+            "next_key": _optional_str(payload, "next_key"),
+            "limit": _optional_int(payload, "limit"),
+        })
+
+    def stock_screen(self, payload):
+        """股票筛选：screen_queries 必填（11 选 1 查询类型，形状由传输层判）；
+        retrieve_queries/sort/sorts/分页/自选持仓范围选填。"""
+        user_mode = payload.get("user_stock_list_mode")
+        if user_mode is not None and (isinstance(user_mode, bool)
+                                      or user_mode not in (0, 1, 2)):
+            raise _param_error("user_stock_list_mode 取值必须是 0/1/2")
+        return self._fetch("stock_screen", {
+            "screen_queries": _required_list(payload, "screen_queries"),
+            "retrieve_queries": _optional_list(payload, "retrieve_queries"),
+            "sort": _optional_dict(payload, "sort"),
+            "sorts": _optional_list(payload, "sorts"),
+            "next_key": _optional_str(payload, "next_key"),
+            "limit": _optional_int(payload, "limit"),
+            "watchlist_stock_ids": _optional_list(payload, "watchlist_stock_ids"),
+            "holding_stock_ids": _optional_list(payload, "holding_stock_ids"),
+            "user_stock_list_mode": user_mode,
+        })
+
+    def warrant_screen(self, payload):
+        """窝轮筛选（HTTP-only：数据面完整，平台不策略化窝轮）：全参数选填。"""
+        return self._fetch("warrant_screen", {
+            "market_type": _optional_scalar(payload, "market_type"),
+            "is_delay": _optional_bool(payload, "is_delay"),
+            "only_count": _optional_bool(payload, "only_count"),
+            "stock_owner": _optional_str(payload, "stock_owner"),
+            "screen_groups": _optional_list(payload, "screen_groups"),
+            "sorts": _optional_list(payload, "sorts"),
+            "next_key": _optional_str(payload, "next_key"),
+            "limit": _optional_int(payload, "limit"),
+        })
+
+    def ipo_list(self, payload):
+        """新股列表：market 必填（官方按市场独立端点，小写枚举）；request_type 选填。"""
+        return self._fetch("ipo_list", {
+            "market": _required_str(payload, "market"),
+            "request_type": _optional_int(payload, "request_type"),
+        })
+
+    def short_daily_volume(self, payload):
+        """每日卖空成交：code 必填；count 选填（上界由传输层判）。"""
+        return self._fetch("short_daily_volume", {
+            "symbol": _required_code(payload),
+            "count": _optional_int(payload, "count"),
+        })
+
+    def short_interest(self, payload):
+        """空头持仓：code 必填；count 选填（上界由传输层判）。"""
+        return self._fetch("short_interest", {
+            "symbol": _required_code(payload),
+            "count": _optional_int(payload, "count"),
+        })
+
+    def watchlist_list(self, payload):
+        """自选股列表：group_name 必填（用户身份缺失时上游 -9，按权限语义如实呈现）。"""
+        return self._fetch("watchlist_list", {"group_name": _required_str(payload, "group_name")})
+
+    def watchlist_groups(self, payload):
+        """自选股分组：group_type 选填（ALL/CUSTOM/SYSTEM，大小写敏感由传输层判）。"""
+        return self._fetch("watchlist_groups",
+                           {"group_type": _optional_str(payload, "group_type")})
+
+    def modify_user_security(self, payload):
+        """修改自选（HTTP-only，仅 Web 用户操作，不进 MCP 工具面）：op 与 code_list 必填。"""
+        return self._fetch("modify_user_security", {
+            "op": _required_str(payload, "op"),
+            "code_list": _required_list(payload, "code_list"),
+            "group_name": _optional_str(payload, "group_name"),
+        })
+
+    def f10_detail(self, payload):
+        """个股深度数据聚合：code + section 必填（section 白名单 = 传输层 SECTIONS 26 项，
+        单一事实源）；section 参数经 params 对象下传（键集合由传输层方法判）。"""
+        section = _required_str(payload, "section")
+        if section not in _f10_class().SECTIONS:
+            raise _param_error(f"section 取值非法：{section!r}"
+                               f"（允许：{sorted(_f10_class().SECTIONS)}）")
+        return self._fetch("f10_detail", {
+            "symbol": _required_code(payload),
+            "section": section,
+            "params": _optional_dict(payload, "params"),
+        })
+
+    def derivative_detail(self, payload):
+        """衍生品聚合：code + section 必填（section 白名单 = 锁定表 §C.7 四项）。"""
+        section = _required_str(payload, "section")
+        if section not in DERIVATIVE_SECTIONS:
+            raise _param_error(f"section 取值非法：{section!r}"
+                               f"（允许：{sorted(DERIVATIVE_SECTIONS)}）")
+        return self._fetch("derivative_detail", {
+            "symbol": _required_code(payload),
+            "section": section,
+            "params": _optional_dict(payload, "params"),
+        })
+
     # ---- 信封分发 ----
     _METHODS = {
         "rt_quote": "rt_quote",
@@ -742,10 +1104,27 @@ class FutuData:
         "info_search": "info_search",
         "info_market_state": "info_market_state",
         "quote_history_kline_v2": "quote_history_kline_v2",
+        # WP12 任务 4：数据面端点（方法名与端点名同形）
+        "economic_calendar_hot": "economic_calendar_hot",
+        "economic_calendar_search": "economic_calendar_search",
+        "info_owner_plate": "info_owner_plate",
+        "info_rehab": "info_rehab",
+        "plate_list": "plate_list",
+        "plate_stock": "plate_stock",
+        "stock_screen": "stock_screen",
+        "warrant_screen": "warrant_screen",
+        "ipo_list": "ipo_list",
+        "short_daily_volume": "short_daily_volume",
+        "short_interest": "short_interest",
+        "watchlist_list": "watchlist_list",
+        "watchlist_groups": "watchlist_groups",
+        "modify_user_security": "modify_user_security",
+        "f10_detail": "f10_detail",
+        "derivative_detail": "derivative_detail",
     }
 
     def dispatch(self, endpoint, payload):
-        if endpoint not in FUTU_TOOLS:
+        if endpoint not in FUTU_TOOLS and endpoint not in DATAPLANE_ENDPOINTS:
             raise _param_error(f"未知富途直通端点：{endpoint}")
         payload = payload if isinstance(payload, dict) else {}
         return getattr(self, self._METHODS[endpoint])(payload)

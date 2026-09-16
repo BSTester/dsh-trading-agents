@@ -47,9 +47,12 @@ class Wp6ServiceLocks(unittest.TestCase):
         self.assertIn("trading/live-switch-web-only", manifest)
         # 不变式 1（规格 §5.1 A7）：confirm-decide 绝不进 MCP 工具面——常量名与端点名都在源码里
         self.assertIn("MCP_EXCLUDED_ENDPOINTS", manifest)
+        # WP12 任务 4：数据面三端点并入排除集（窝轮数据/写用户自选/同步内部复权）
         self.assertIn('frozenset({"confirm-decide", "openapi_config", "openapi_test",\n'
-                      '                                    "openapi_oauth", "auto_pipeline"})',
+                      '                                    "openapi_oauth", "auto_pipeline",',
                       manifest)
+        for name in ("warrant_screen", "modify_user_security", "info_rehab"):
+            self.assertIn(f'"{name}"', manifest)
         # WP8 任务 7：设置页端点与 confirm-decide 同属有意排除集（凭据读写是人工动作）；
         # OAuth 集成增补 openapi_oauth（授权流程 start/status/cancel 同为人工动作）
         # WP10 任务 2：auto_pipeline（自动流水线是否自动下单的总开关）同理——模型若能拨

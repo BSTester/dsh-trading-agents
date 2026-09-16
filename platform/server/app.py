@@ -200,6 +200,31 @@ FUTU_FIELDS = {
     "info_market_state": ("codes", "is_contain_ba", "is_contain_overnight"),
     "quote_history_kline_v2": ("code", "start", "end", "ktype", "autype",
                                "num", "extended_time"),
+    # WP12 任务 4：数据面端点载荷白名单（深校验在 server/futu_data.py：必填/类型/
+    # 形状；取值范围与枚举由传输层方法组按锁定表常量判）。三个 HTTP-only 端点
+    # （warrant_screen/modify_user_security/info_rehab）同样在这里过白名单——
+    # 「不进 MCP 工具面」不影响它们在服务端点面的载荷约束。
+    "economic_calendar_hot": ("limit", "next_key", "date", "timezone"),
+    "economic_calendar_search": ("keyword", "search_type", "limit", "next_key",
+                                 "time_order_type"),
+    "info_owner_plate": ("code",),
+    "info_rehab": ("code", "divi_mode"),
+    "plate_list": ("market", "plate_class"),
+    "plate_stock": ("plate_code", "sort_field", "ascend", "price_type",
+                    "leverage_direction", "leverage_multiple", "next_key", "limit"),
+    "stock_screen": ("screen_queries", "retrieve_queries", "sort", "sorts", "next_key",
+                     "limit", "watchlist_stock_ids", "holding_stock_ids",
+                     "user_stock_list_mode"),
+    "warrant_screen": ("market_type", "is_delay", "only_count", "stock_owner",
+                       "screen_groups", "sorts", "next_key", "limit"),
+    "ipo_list": ("market", "request_type"),
+    "short_daily_volume": ("code", "count"),
+    "short_interest": ("code", "count"),
+    "watchlist_list": ("group_name",),
+    "watchlist_groups": ("group_type",),
+    "modify_user_security": ("op", "code_list", "group_name"),
+    "f10_detail": ("code", "section", "params"),
+    "derivative_detail": ("code", "section", "params"),
 }
 
 
@@ -477,8 +502,10 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                     return {"ok": True,
                             "value": settings_api.save_auto_pipeline(home, payload)}
                 return {"ok": True, "value": settings_api.get_auto_pipeline(home)}
-            if endpoint in futu_data.FUTU_TOOLS:
+            if endpoint in futu_data.FUTU_TOOLS or endpoint in futu_data.DATAPLANE_ENDPOINTS:
                 # WP8 富途实时直通：skills 需要而本地无缓存的数据由服务端实时经富途获取。
+                # WP12 任务 4 起路由门同时覆盖**数据面端点**（DATAPLANE_ENDPOINTS）：
+                # 它们只在 openapi 通道有实现（mcp 通道如实拒绝，见 futu_data._fetch_mcp）。
                 # 浅白名单在这里拒（与其他端点同形），深校验（code 归一/必填/内键/上游
                 # 陷阱如 option_screen 的 field_filter）在 futu_data 数据方法里。
                 # 通道（mcp|openapi）与 TTL 缓存（基本五类的 value 层缓存）都在

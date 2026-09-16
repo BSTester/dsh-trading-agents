@@ -1,4 +1,4 @@
-"""WP11 任务 3：``sentiment-history`` 查询（HTTP 端点 + MCP 工具；工具面 60 → 61）。
+"""WP11 任务 3：``sentiment-history`` 查询（HTTP 端点 + MCP 工具；工具面 61 → 74）。
 
 全部离线注入。覆盖计划任务 3 的测试清单与边界：
 
@@ -8,7 +8,7 @@
   * compute：命令拼装、缺省 30、越界/非整数**起子进程前**拒绝、CLI 失败信封 → ComputeError；
   * 路由：envelope 契约、白名单、limit 越界 → core-unavailable、形状不符不缓存、
     TTL 命中与 ``_refresh`` 旁路；
-  * MCP：工具在面内（61）、字段/区间/描述、端点工具集 ≡ 端点清单 − 排除集、派发透传；
+  * MCP：工具在面内（74）、字段/区间/描述、端点工具集 ≡ 端点清单 − 排除集、派发透传；
   * 流程页：情绪阶段摘要追加积累事实（累计天数/连续交易日/最近日期），空库不产生噪声；
   * 只读性：端点调用后库与 kv 零变化。
 """
@@ -292,9 +292,9 @@ class SentimentRouteTest(SentimentHistoryBase):
 
 
 class SentimentMcpToolTest(SentimentHistoryBase):
-    def test_tool_surface_is_61_and_includes_sentiment_history(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 61)
-        self.assertEqual(len(mcp_tools.TOOLS), 61)
+    def test_tool_surface_is_74_and_includes_sentiment_history(self):
+        self.assertEqual(mcp_tools.TOOL_COUNT, 74)
+        self.assertEqual(len(mcp_tools.TOOLS), 74)
         self.assertIn("sentiment_history", mcp_tools.TOOL_NAMES)
         self.assertEqual(mcp_tools.ENDPOINT_TOOL_ENDPOINTS["sentiment_history"],
                          "sentiment-history")

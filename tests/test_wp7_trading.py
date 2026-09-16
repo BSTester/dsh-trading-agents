@@ -726,10 +726,10 @@ class RoutingTest(unittest.TestCase):
 class SurfaceLockTest(unittest.TestCase):
     """工具面 61（WP11 任务 3 起）：新工具进面、confirm-decide 仍排除、字段集与 HTTP 白名单同形。"""
 
-    def test_tool_surface_is_61(self):
+    def test_tool_surface_is_74(self):
         from server import mcp_tools
-        self.assertEqual(mcp_tools.TOOL_COUNT, 61)
-        self.assertEqual(len(mcp_tools.TOOLS), 61)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 74)
+        self.assertEqual(len(mcp_tools.TOOLS), 74)
         names = {t.name for t in mcp_tools.TOOLS}
         self.assertLessEqual({"trade_place", "trade_modify", "trade_cancel",
                               "account_positions", "account_orders", "account_funds"}, names)

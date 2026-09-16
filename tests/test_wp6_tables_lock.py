@@ -6,11 +6,11 @@ WP7 面板退役（用户决策 2026-09-16）后 JS 面板源已整体删除，P
 因此改写为纯 Python 断言——把当前事实冻结成内嵌期望值，任何一侧被无意改动立刻红。
 
 覆盖：
-  * ``store_access.endpoints()`` ≡ 61 项内嵌清单（22 项基础清单按已删 endpoints.js
+  * ``store_access.endpoints()`` ≡ 77 项内嵌清单（22 项基础清单按已删 endpoints.js
     原序冻结 + 7 项 WP7 服务自有端点 + 8 项 WP8 富途实时直通端点 + 9 项 WP8 OpenAPI
     行情端点 + 6 项 WP8 OpenAPI 交易只读端点 + 3 项 WP8 推送订阅管理端点 + 3 项 WP8
-    设置页端点 + 2 项 WP10（流程页/自动流水线设置）+ 1 项 WP11（情绪快照历史），
-    逐项与顺序都钉死）；
+    设置页端点 + 2 项 WP10（流程页/自动流水线设置）+ 1 项 WP11（情绪快照历史）
+    + 16 项 WP12（富途数据面），逐项与顺序都钉死）；
   * ``caches.CACHE_TTL_MS``：17 项 legacy TTL 逐项钉死 + WP7 增量
     ``factors-history: 5 分钟`` + WP8 任务 2 增量（基本类 5 分钟 ×4 +
     ``quote_history_kline_v2: 10 分钟``；实时类不进表，TTL 恒 0）+ WP10 增量
@@ -116,18 +116,54 @@ WP11_ENDPOINTS = ["sentiment-history"]
 WP11_TTL = {"sentiment-history": 5 * 60_000}
 WP11_SHAPE = {"sentiment-history": ["records", "summary"]}
 
+# WP12 任务 4：富途数据面端点（与 store_access.WP12_ENDPOINTS 逐项同序）。
+#   * 16 项 = 直通 14 + 聚合 2（f10_detail 26 section / derivative_detail 4 section）；
+#   * 3 项 HTTP-only（warrant_screen/modify_user_security/info_rehab）进端点清单、
+#     不进 MCP 工具面（mcp_tools.MCP_EXCLUDED_ENDPOINTS）；
+#   * TTL：写类不进表，其余 15 项按数据变化速度分四档（与 caches.py 注释同源）；
+#   * 形状：只登记官方文档明示包装键的 4 项——其余不登记是有意的（`-10 no_data`
+#     返回 {"no_data": True}、权限注记另有包裹键，固定形状会误杀合法响应）。
+WP12_ENDPOINTS = ["economic_calendar_hot", "economic_calendar_search", "info_owner_plate",
+                  "info_rehab", "plate_list", "plate_stock", "stock_screen",
+                  "warrant_screen", "ipo_list", "short_daily_volume", "short_interest",
+                  "watchlist_list", "watchlist_groups", "modify_user_security",
+                  "f10_detail", "derivative_detail"]
+WP12_TTL = {
+    "economic_calendar_hot": 30 * 60_000,
+    "economic_calendar_search": 30 * 60_000,
+    "info_owner_plate": 6 * 60 * 60_000,
+    "info_rehab": 6 * 60 * 60_000,
+    "plate_list": 6 * 60 * 60_000,
+    "plate_stock": 30 * 60_000,
+    "stock_screen": 5 * 60_000,
+    "warrant_screen": 5 * 60_000,
+    "ipo_list": 30 * 60_000,
+    "short_daily_volume": 60 * 60_000,
+    "short_interest": 60 * 60_000,
+    "watchlist_list": 5 * 60_000,
+    "watchlist_groups": 5 * 60_000,
+    "f10_detail": 30 * 60_000,
+    "derivative_detail": 30 * 60_000,
+}
+WP12_SHAPE = {
+    "plate_list": ["plate_list"],
+    "plate_stock": ["stock_list"],
+    "info_rehab": ["rehabs"],
+    "watchlist_groups": ["group_list"],
+}
+
 
 class EndpointListLockTests(unittest.TestCase):
-    def test_endpoints_is_frozen_61_item_list(self):
+    def test_endpoints_is_frozen_77_item_list(self):
         """``store_access.endpoints()`` ≡ 22 基础 + 7 WP7 + 8 WP8 直通 + 9 WP8 行情
         + 6 WP8 交易 + 3 WP8 推送 + 3 WP8 设置 + 2 WP10（流程页 + 自动流水线设置）
-        + 1 WP11（情绪快照）= 61 项，同序。"""
+        + 1 WP11（情绪快照）+ 16 WP12（富途数据面）= 77 项，同序。"""
         self.assertEqual(store_access.endpoints(),
                          BASE_ENDPOINTS + WP7_ENDPOINTS + FUTU_ENDPOINTS
                          + WP8_MARKET_ENDPOINTS + WP8_TRADE_ENDPOINTS
                          + WP8_PUSH_ENDPOINTS + WP8_SETTINGS_ENDPOINTS + WP10_ENDPOINTS
-                         + WP11_ENDPOINTS)
-        self.assertEqual(len(store_access.endpoints()), 61)
+                         + WP11_ENDPOINTS + WP12_ENDPOINTS)
+        self.assertEqual(len(store_access.endpoints()), 77)
         self.assertEqual(len(store_access._BASE_ENDPOINTS), 22)
         self.assertEqual(list(store_access.WP7_ENDPOINTS), WP7_ENDPOINTS)
         self.assertEqual(list(store_access.FUTU_ENDPOINTS), FUTU_ENDPOINTS)
@@ -137,23 +173,23 @@ class EndpointListLockTests(unittest.TestCase):
         self.assertEqual(list(store_access.WP8_SETTINGS_ENDPOINTS), WP8_SETTINGS_ENDPOINTS)
         self.assertEqual(list(store_access.WP10_ENDPOINTS), WP10_ENDPOINTS)
         self.assertEqual(list(store_access.WP11_ENDPOINTS), WP11_ENDPOINTS)
-        # 尾部锚点：业务确认两端点收尾基础清单；WP7/WP8/WP10/WP11 增量按任务顺序追加
-        self.assertEqual(store_access.endpoints()[-41:-39],
-                         ["confirmation", "confirm-decide"])
-        self.assertEqual(store_access.endpoints()[-39:-32], WP7_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-32:-24], FUTU_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-24:-15], WP8_MARKET_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-15:-9], WP8_TRADE_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-9:-6], WP8_PUSH_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-6:-3], WP8_SETTINGS_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-3:-1], WP10_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-1:], WP11_ENDPOINTS)
+        self.assertEqual(list(store_access.WP12_ENDPOINTS), WP12_ENDPOINTS)
+        # 尾部锚点：从尾部按期望增量**逐段倒推**（不再写死负索引——增量段一变，
+        # 写死的切片就要重算，是脆的；倒推与期望清单同源，改清单即自动对齐）。
+        tail = (WP12_ENDPOINTS, WP11_ENDPOINTS, WP10_ENDPOINTS, WP8_SETTINGS_ENDPOINTS,
+                WP8_PUSH_ENDPOINTS, WP8_TRADE_ENDPOINTS, WP8_MARKET_ENDPOINTS,
+                FUTU_ENDPOINTS, WP7_ENDPOINTS, ["confirmation", "confirm-decide"])
+        pos = len(store_access.endpoints())
+        for segment in tail:
+            pos -= len(segment)
+            self.assertEqual(store_access.endpoints()[pos:pos + len(segment)], segment)
+        self.assertEqual(pos, len(BASE_ENDPOINTS) - 2)  # 尾部两段收尾（confirmation/confirm-decide 已扣）
         self.assertEqual(store_access.endpoints()[0], "snapshot")
         # 无重复；重复调用返回等值副本（调用方改动不污染后续结果）
-        self.assertEqual(len(set(store_access.endpoints())), 61)
+        self.assertEqual(len(set(store_access.endpoints())), 77)
         sample = store_access.endpoints()
         sample.append("bogus")
-        self.assertEqual(len(store_access.endpoints()), 61)
+        self.assertEqual(len(store_access.endpoints()), 77)
 
     def test_analytics_endpoints_are_declared(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))
@@ -196,7 +232,8 @@ class CacheTtlLockTests(unittest.TestCase):
                           if name not in WP7_ENDPOINTS
                           and name not in WP8_MARKET_ENDPOINTS
                           and name not in WP10_ENDPOINTS
-                          and name not in WP11_ENDPOINTS}, self.LEGACY_TTL_MS)
+                          and name not in WP11_ENDPOINTS
+                          and name not in WP12_ENDPOINTS}, self.LEGACY_TTL_MS)
         self.assertEqual(self.LEGACY_TTL_MS["instrument"], 10 * 60_000)
 
     def test_wp7_ttl_delta_is_pinned(self):
@@ -204,13 +241,32 @@ class CacheTtlLockTests(unittest.TestCase):
         self.assertEqual(caches.CACHE_TTL_MS.get("factors-history"), 5 * 60_000)
         self.assertEqual(len(caches.CACHE_TTL_MS),
                          len(self.LEGACY_TTL_MS) + 1 + len(WP8_MARKET_TTL_MS)
-                         + len(WP10_TTL) + len(WP11_TTL))
+                         + len(WP10_TTL) + len(WP11_TTL) + len(WP12_TTL))
 
     def test_wp11_ttl_delta_is_pinned(self):
         """WP11 增量：情绪快照历史/摘要 5 分钟（按日采集，与 factors-history 同量级）。"""
         self.assertEqual({name: caches.CACHE_TTL_MS[name]
                           for name in WP11_ENDPOINTS
                           if name in caches.CACHE_TTL_MS}, WP11_TTL)
+
+    def test_wp12_ttl_delta_is_pinned(self):
+        """WP12 增量：数据面 15 项按数据变化速度分四档（6h 板块/归属/复权、30m 日历/
+        F10/衍生品/板块成分/IPO、5m 筛选/自选、1h 做空）；写类 modify_user_security
+        不进表（TTL 0）。"""
+        self.assertEqual({name: caches.CACHE_TTL_MS[name]
+                          for name in WP12_ENDPOINTS
+                          if name in caches.CACHE_TTL_MS}, WP12_TTL)
+        self.assertNotIn("modify_user_security", caches.CACHE_TTL_MS)
+
+    def test_wp12_shape_registration_is_deliberate(self):
+        """WP12 只登记 4 项官方明示包装键；其余数据面端点不进形状表（有意：
+        no_data/权限注记路径的响应形状不固定，固定形状会误杀合法响应）。"""
+        self.assertEqual({name: caches.ENDPOINT_SHAPE[name]
+                          for name in WP12_ENDPOINTS
+                          if name in caches.ENDPOINT_SHAPE}, WP12_SHAPE)
+        for name in ("f10_detail", "derivative_detail", "short_daily_volume",
+                     "economic_calendar_hot", "stock_screen"):
+            self.assertNotIn(name, caches.ENDPOINT_SHAPE, name)
 
     def test_wp10_ttl_delta_is_pinned(self):
         """WP10 增量：流程快照 30 秒（与 schedule 同量级，页面要看到刚跑完的作业）；
@@ -263,7 +319,8 @@ class EndpointShapeLockTests(unittest.TestCase):
                           if name not in WP7_ENDPOINTS
                           and name not in WP8_MARKET_ENDPOINTS
                           and name not in WP10_ENDPOINTS
-                          and name not in WP11_ENDPOINTS}, self.LEGACY_SHAPE)
+                          and name not in WP11_ENDPOINTS
+                          and name not in WP12_ENDPOINTS}, self.LEGACY_SHAPE)
         self.assertEqual(caches.ENDPOINT_SHAPE["confirmation"], ["pending"])
 
     def test_wp7_shape_delta_is_pinned(self):
@@ -271,7 +328,7 @@ class EndpointShapeLockTests(unittest.TestCase):
         self.assertEqual(caches.ENDPOINT_SHAPE["factors-history"], ["snapshots"])
         self.assertEqual(len(caches.ENDPOINT_SHAPE),
                          len(self.LEGACY_SHAPE) + 1 + len(WP8_MARKET_SHAPE)
-                         + len(WP10_SHAPE) + len(WP11_SHAPE))
+                         + len(WP10_SHAPE) + len(WP11_SHAPE) + len(WP12_SHAPE))
 
     def test_wp11_shape_delta_is_pinned(self):
         """WP11 增量：情绪快照两形态共用同一出口，records/summary 两键恒在。"""

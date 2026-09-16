@@ -56,6 +56,8 @@ ENDPOINTS = [
     *store_access.WP10_ENDPOINTS,
     # WP11 任务 3：情绪快照历史/摘要，与 store_access.WP11_ENDPOINTS 同步
     *store_access.WP11_ENDPOINTS,
+    # WP12 任务 4：富途数据面 16 端点，与 store_access.WP12_ENDPOINTS 同步
+    *store_access.WP12_ENDPOINTS,
 ]
 
 
@@ -177,7 +179,8 @@ class ContractTests(Base):
                         + len(store_access.WP8_PUSH_ENDPOINTS)
                         + len(store_access.WP8_SETTINGS_ENDPOINTS)
                         + len(store_access.WP10_ENDPOINTS)
-                        + len(store_access.WP11_ENDPOINTS))
+                        + len(store_access.WP11_ENDPOINTS)
+                        + len(store_access.WP12_ENDPOINTS))
         self.assertEqual(body["value"]["mode"], "sim")
         self.assertIn("generated_at", body["value"])
 
@@ -739,7 +742,8 @@ class ConfirmationRoutesTests(Base):
                         + len(store_access.WP8_PUSH_ENDPOINTS)
                         + len(store_access.WP8_SETTINGS_ENDPOINTS)
                         + len(store_access.WP10_ENDPOINTS)
-                        + len(store_access.WP11_ENDPOINTS))
+                        + len(store_access.WP11_ENDPOINTS)
+                        + len(store_access.WP12_ENDPOINTS))
         self.assertIn("confirmation", store_access.endpoints())
         self.assertIn("confirm-decide", store_access.endpoints())
         declared = self.post(self.client, "snapshot").json()["value"]["endpoints"]
@@ -892,7 +896,7 @@ class StaticTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": f"http://127.0.0.1:{port}",
                                 "mcp": f"http://127.0.0.1:{port}/mcp",
-                                "tools": 61, "auth": "loopback-only"})
+                                "tools": 74, "auth": "loopback-only"})
 
     def test_bad_encoding_is_400(self):
         dist = self.make_dist()
@@ -1131,7 +1135,8 @@ class ComputeBridgeTests(Base):
         # WP8 任务 2：+基本类 5m ×4 + quote_history_kline_v2 10m（实时类不进表）
         # WP10 任务 1：+pipeline 30s（流程页阶段状态，与 schedule 同量级）
         # WP11 任务 3：+sentiment-history 5m（按日采集，与 factors-history 同量级）
-        self.assertEqual(len(caches.CACHE_TTL_MS), 25)
+        # WP12 任务 4：+数据面 15 项（6h/30m/5m/1h 四档；写类 modify_user_security 不进表）
+        self.assertEqual(len(caches.CACHE_TTL_MS), 40)
         self.assertEqual(caches.CACHE_TTL_MS["pipeline"], 30_000)
         self.assertEqual(caches.CACHE_TTL_MS["quality"], 60 * 60_000)
 
@@ -1457,7 +1462,7 @@ class RunEntryTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": "http://127.0.0.1:41234",
                                 "mcp": "http://127.0.0.1:41234/mcp",
-                                "tools": 61, "auth": "loopback-only"})
+                                "tools": 74, "auth": "loopback-only"})
         line = run_module.ready_line(("127.0.0.1", 8397),
                                      {"port": 8397, "host": "127.0.0.1", "token": "t"})
         self.assertEqual(line["auth"], "token")

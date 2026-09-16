@@ -339,9 +339,9 @@ class RoutingContractTest(unittest.TestCase):
 class ToolSurfaceTest(unittest.TestCase):
     """MCP 工具面 61（WP11 任务 3 起）：8 工具进面、字段同形、描述注明实时直通与 A 股受限。"""
 
-    def test_tool_surface_is_61(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 61)
-        self.assertEqual(len(mcp_tools.TOOLS), 61)
+    def test_tool_surface_is_74(self):
+        self.assertEqual(mcp_tools.TOOL_COUNT, 74)
+        self.assertEqual(len(mcp_tools.TOOLS), 74)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(FUTU_ENDPOINTS), names)
         self.assertNotIn("confirm_decide", names)
@@ -390,7 +390,9 @@ class ToolSurfaceTest(unittest.TestCase):
         # HTTP 白名单不含 refresh（载荷层 refresh 映射为 _refresh 旁路）
         http_fields = {name: tuple(f for f in fields if f != "refresh")
                        for name, fields in expected_fields.items()}
-        self.assertEqual(list(app_module.FUTU_FIELDS), list(http_fields))
+        # WP12 任务 4 起 FUTU_FIELDS 还含数据面端点（其键集与字段由 test_wp12_surface.py 钉）；
+        # 本用例钉的是「本组端点在白名单内且逐项同形」
+        self.assertTrue(set(http_fields) <= set(app_module.FUTU_FIELDS))
         for name, fields in http_fields.items():
             self.assertEqual(tuple(app_module.FUTU_FIELDS[name]), fields, name)
 

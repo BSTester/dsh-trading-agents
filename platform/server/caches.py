@@ -64,6 +64,30 @@ CACHE_TTL_MS = {
     # WP10 任务 1：流程快照（每市场阶段状态推导，读当日 ran 标记与表事实）——30 秒，
     # 与「调度」页同量级：页面轮询要能看到作业刚跑完的状态变化。
     "pipeline": 30_000,
+    # WP12 任务 4：数据面端点 TTL（按**数据变化速度**分档，规格 §7.2 给的是
+    # 「静态/低频 30m–6h、做空 1h」区间）：
+    #   * 6h：板块分类集合、行业归属、复权因子——按公司行动/指数调整变化，日内几乎不动；
+    #   * 30m：经济日历（按日更新、盘中可能有新增）、F10 聚合面与衍生品聚合面（混合低频
+    #     财报/公司资料与含行情的业绩价格/期权波动率，取区间下界）、板块成分股（调整低频
+    #     但含市值/价格字段）、IPO 列表；
+    #   * 5m：全市场筛选（结果随行情变动）、自选列表/分组（用户侧可能随时改）；
+    #   * 1h：做空数据（按日更新）。
+    # modify_user_security（写）与其余 HTTP-only 写类一律不进本表（TTL 0）。
+    "economic_calendar_hot": 30 * 60_000,
+    "economic_calendar_search": 30 * 60_000,
+    "info_owner_plate": 6 * 60 * 60_000,
+    "info_rehab": 6 * 60 * 60_000,
+    "plate_list": 6 * 60 * 60_000,
+    "plate_stock": 30 * 60_000,
+    "stock_screen": 5 * 60_000,
+    "warrant_screen": 5 * 60_000,
+    "ipo_list": 30 * 60_000,
+    "short_daily_volume": 60 * 60_000,
+    "short_interest": 60 * 60_000,
+    "watchlist_list": 5 * 60_000,
+    "watchlist_groups": 5 * 60_000,
+    "f10_detail": 30 * 60_000,
+    "derivative_detail": 30 * 60_000,
 }
 
 # endpoints.js:46-65 的端点最小字段（plan-execute 是动作端点，不进缓存形状表）
@@ -87,6 +111,14 @@ ENDPOINT_SHAPE = {
     "confirmation": ["pending"],
     "schedule": ["heartbeat", "jobs"],
     "reconcile": ["diffs", "tca"],
+    # WP12 任务 4：只登记**官方文档明示包装键**的 4 项（锁定表 §C.2/§C.1/§C.8）。
+    # 其余数据面端点**有意不登记形状**：``-10 no_data`` 路径返回 ``{"no_data": True}``
+    # （传输层 _tolerate_no_data），权限注记路径另有包裹键，固定形状会把**合法响应判成
+    # 「载荷不完整」**——宁可不校验形状，也不误杀合法结果（延续「宁可空不造假」）。
+    "plate_list": ["plate_list"],
+    "plate_stock": ["stock_list"],
+    "info_rehab": ["rehabs"],
+    "watchlist_groups": ["group_list"],
     # WP10 任务 1：流程快照最小字段（每市场阶段表 + 全局阶段 + 配置摘要）
     "pipeline": ["date", "markets", "global", "auto_pipeline"],
     # WP7：因子快照历史（服务定时收集），最小字段只有一个快照数组

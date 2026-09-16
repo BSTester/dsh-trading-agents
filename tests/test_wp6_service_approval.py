@@ -77,6 +77,26 @@ SPEC_FIELDS = {
     # WP11 任务 3：情绪快照历史/摘要（按日采集，只读），字段与 HTTP 面白名单
     # ["symbol", "limit"] 同步
     "sentiment_history": ((), ("symbol", "limit", "refresh")),
+    # WP12 任务 4：富途数据面（直通 11 + 聚合 2；HTTP-only 三端点不在工具面）
+    "stock_screen": (("screen_queries",),
+                     ("retrieve_queries", "sort", "sorts", "next_key", "limit",
+                      "watchlist_stock_ids", "holding_stock_ids", "user_stock_list_mode",
+                      "refresh")),
+    "plate_list": (("market", "plate_class"), ("refresh",)),
+    "plate_stock": (("plate_code",),
+                    ("sort_field", "ascend", "price_type", "leverage_direction",
+                     "leverage_multiple", "next_key", "limit", "refresh")),
+    "short_daily_volume": (("code",), ("count", "refresh")),
+    "short_interest": (("code",), ("count", "refresh")),
+    "ipo_list": (("market",), ("request_type", "refresh")),
+    "economic_calendar_hot": ((), ("limit", "next_key", "date", "timezone", "refresh")),
+    "economic_calendar_search": (("keyword", "search_type"),
+                                 ("limit", "next_key", "time_order_type", "refresh")),
+    "info_owner_plate": (("code",), ("refresh",)),
+    "watchlist_list": (("group_name",), ("refresh",)),
+    "watchlist_groups": ((), ("group_type", "refresh")),
+    "f10_detail": (("code", "section"), ("params", "refresh")),
+    "derivative_detail": (("code", "section"), ("params", "refresh")),
     # WP7 任务 3：受约束交易工具（写三个过闸门链 + Web 确认；读三个 mode 直通 broker），
     # 字段与 app.py 的 TRADE_*/ACCOUNT_QUERY 白名单逐键同形；trade_* 不带 mode（模式只认
     # 模式文件）也不带口令（live 授权=Web 确认卡片）。
@@ -379,7 +399,7 @@ class R2ConfirmationTests(Base):
 
     def test_confirmation_read_tool_is_present_and_confirm_decide_is_absent(self):
         names = [tool.name for tool in self.app.state.mcp_tools]
-        self.assertEqual(len(names), 61)
+        self.assertEqual(len(names), 74)
         self.assertIn("confirmation", names)
         self.assertNotIn("confirm_decide", names)
         self.assertNotIn("confirm-decide", names)
@@ -571,7 +591,7 @@ class R4PlanExecuteTests(Base):
 
 
 class R5ToolSurfaceTests(Base):
-    """R5：工具面封闭（恰 61 / 端点对等 − 排除集 / 输入字段 / 黑名单 / 未知名不触达 handle）。"""
+    """R5：工具面封闭（恰 74 / 端点对等 − 排除集 / 输入字段 / 黑名单 / 未知名不触达 handle）。"""
 
     def setUp(self):
         super().setUp()
@@ -580,9 +600,9 @@ class R5ToolSurfaceTests(Base):
     def registered(self):
         return asyncio.run(self.app.state.mcp.list_tools())
 
-    def test_exactly_61_tools_with_the_declared_names(self):
+    def test_exactly_74_tools_with_the_declared_names(self):
         tools = self.registered()
-        self.assertEqual(len(tools), 61)
+        self.assertEqual(len(tools), 74)
         self.assertEqual(len(tools), mcp_tools.TOOL_COUNT)
         self.assertEqual([tool.name for tool in tools],
                          [definition.name for definition in mcp_tools.TOOLS])
@@ -600,9 +620,11 @@ class R5ToolSurfaceTests(Base):
         self.assertNotIn("confirm-decide", set(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()))
         # WP8 任务 7：设置页三端点（凭据读/写/授权）与 confirm-decide 同类——有意排除集；
         # WP10 任务 2 的 auto_pipeline（自动执行总开关）同理：模型不得自拨
+        # WP12 任务 4：数据面三端点有意 HTTP-only（窝轮数据/写用户自选/同步内部复权）
         self.assertEqual(mcp_tools.MCP_EXCLUDED_ENDPOINTS,
                          frozenset({"confirm-decide", "openapi_config", "openapi_test",
-                                    "openapi_oauth", "auto_pipeline"}))
+                                    "openapi_oauth", "auto_pipeline", "warrant_screen",
+                                    "modify_user_security", "info_rehab"}))
         # 只读的 confirmation 工具**在**工具面里（读待确认不是批准）
         self.assertIn("confirmation", names)
         with self.assertRaises(Exception) as caught:
@@ -614,10 +636,10 @@ class R5ToolSurfaceTests(Base):
         + WP8 交易 6 + WP8 推送 3 + WP8 设置 3 + WP10 流程 2 + WP11 情绪 1）
         − 有意排除集（§3.2 对等性）。"""
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 61)
+        self.assertEqual(len(endpoints), 77)
         forwarded = [definition.endpoint for definition in mcp_tools.TOOLS
                      if definition.endpoint]
-        self.assertEqual(len(forwarded), 56)
+        self.assertEqual(len(forwarded), 69)
         self.assertEqual(sorted(forwarded),
                          sorted(set(endpoints) - mcp_tools.MCP_EXCLUDED_ENDPOINTS))
         self.assertEqual(sorted(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()),
@@ -672,16 +694,16 @@ class R5ToolSurfaceTests(Base):
         self.assertIsNot(before.get("additionalProperties"), False)
         mcp_tools.register(server, recording_handle()[0], mcp_tools.StoreApi(self.home))
         schemas = {tool.name: tool.input_schema for tool in asyncio.run(server.list_tools())}
-        self.assertEqual(len(schemas), 62)  # 61 本模块工具 + 1 外来工具
+        self.assertEqual(len(schemas), 75)  # 74 本模块工具 + 1 外来工具
         self.assertEqual(schemas["foreign_tool"], before,
-                         "本模块只应封闭自己注册的 60 个工具")
+                         "本模块只应封闭自己注册的 74 个工具")
         self.assertIs(schemas["series"]["additionalProperties"], False)
 
     def test_unknown_tool_never_reaches_the_handle(self):
         handle, calls = recording_handle()
         server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
         mcp_tools.register(server, handle, mcp_tools.StoreApi(self.home))
-        self.assertEqual(len(asyncio.run(server.list_tools())), 61)
+        self.assertEqual(len(asyncio.run(server.list_tools())), 74)
         with self.assertRaises(Exception) as caught:
             asyncio.run(server.call_tool("not_a_tool", {}))
         self.assertIn("not_a_tool", str(caught.exception))
@@ -810,7 +832,7 @@ class R6SameSourceTests(Base):
         self.client = self.client(self.app)
 
     def test_every_tool_shares_the_app_handle(self):
-        self.assertEqual(len(self.app.state.mcp_tools), 61)
+        self.assertEqual(len(self.app.state.mcp_tools), 74)
         for tool in self.app.state.mcp_tools:
             self.assertIs(tool.handle, self.app.state.handle, tool.name)
 

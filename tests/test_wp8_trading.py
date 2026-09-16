@@ -1173,27 +1173,28 @@ class HttpRoutingTest(unittest.TestCase):
 # 五、工具面/端点清单/字段集锁定（60 工具 / 59 端点，WP10 任务 1 起；OAuth 集成 57→58）
 # ---------------------------------------------------------------------------
 class SurfaceLockTest(unittest.TestCase):
-    def test_tool_surface_is_59(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 61)
-        self.assertEqual(len(mcp_tools.TOOLS), 61)
+    def test_tool_surface_is_74(self):
+        self.assertEqual(mcp_tools.TOOL_COUNT, 74)
+        self.assertEqual(len(mcp_tools.TOOLS), 74)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(trading.OPENAPI_TRADE_ENDPOINTS), names)
         self.assertNotIn("trade_confirm", names, "券商二次确认不得成为模型可调用工具")
         self.assertNotIn("confirm_decide", names)
 
-    def test_endpoint_registry_is_61_with_new_tail(self):
+    def test_endpoint_registry_is_77_with_new_tail(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 61)
-        self.assertEqual(len(set(endpoints)), 61)
+        self.assertEqual(len(endpoints), 77)
+        self.assertEqual(len(set(endpoints)), 77)
         self.assertEqual(list(store_access.WP8_TRADE_ENDPOINTS),
                          list(trading.OPENAPI_TRADE_ENDPOINTS))
-        self.assertEqual(endpoints[-15:-9], list(trading.OPENAPI_TRADE_ENDPOINTS))
-        self.assertEqual(endpoints[-9:-6], list(store_access.WP8_PUSH_ENDPOINTS))
+        self.assertEqual(endpoints[-31:-25], list(trading.OPENAPI_TRADE_ENDPOINTS))
+        self.assertEqual(endpoints[-25:-22], list(store_access.WP8_PUSH_ENDPOINTS))
         # WP8 任务 7 起设置页端点收尾（凭据读写/授权有意不进工具面，见 mcp_tools；
         # WP8 OAuth 集成增补 openapi_oauth）；WP10 任务 1 起流程页端点收尾
-        self.assertEqual(endpoints[-6:-3], list(store_access.WP8_SETTINGS_ENDPOINTS))
-        self.assertEqual(endpoints[-3:-1], list(store_access.WP10_ENDPOINTS))
-        self.assertEqual(endpoints[-1:], list(store_access.WP11_ENDPOINTS))
+        self.assertEqual(endpoints[-22:-19], list(store_access.WP8_SETTINGS_ENDPOINTS))
+        self.assertEqual(endpoints[-19:-17], list(store_access.WP10_ENDPOINTS))
+        self.assertEqual(endpoints[-17:-16], list(store_access.WP11_ENDPOINTS))
+        self.assertEqual(endpoints[-16:], list(store_access.WP12_ENDPOINTS))
 
     def test_tool_fields_match_http_whitelist(self):
         definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
@@ -1735,7 +1736,7 @@ class Wp8Task6SurfaceLockTest(unittest.TestCase):
                          ["push_status", "push_subscribe", "push_unsubscribe"])
         # 清单尾部依次是设置页端点、WP10 端点（流程页/自动流水线设置）与 WP11 情绪端点，
         # 推送 3 项在其之前
-        self.assertEqual(store_access.endpoints()[-9:-6],
+        self.assertEqual(store_access.endpoints()[-25:-22],
                          list(store_access.WP8_PUSH_ENDPOINTS))
         names = {tool.name for tool in mcp_tools.TOOLS}
         for endpoint in store_access.WP8_PUSH_ENDPOINTS:

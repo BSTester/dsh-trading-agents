@@ -1022,8 +1022,8 @@ class ToolSurfaceTest(unittest.TestCase):
     """工具面 50 锁定（WP8 任务 3 起 56）+ 9 新工具契约。"""
 
     def test_tool_surface_is_56(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 61)
-        self.assertEqual(len(mcp_tools.TOOLS), 61)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 74)
+        self.assertEqual(len(mcp_tools.TOOLS), 74)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(WP8_MARKET_ENDPOINTS), names)
         self.assertNotIn("confirm-decide", names)
@@ -1058,8 +1058,11 @@ class ToolSurfaceTest(unittest.TestCase):
             self.assertEqual([p.name for p in definitions[name].params if p.required][0],
                              fields[0], f"{name} 首字段必填")
             self.assertEqual(tuple(app_module.FUTU_FIELDS[name]), fields, name)
+        # WP12 任务 4：HTTP 白名单 = mcp 可直通的 FUTU_TOOLS ∪ 只在 openapi 有实现的
+        # DATAPLANE_ENDPOINTS（后者在 mcp 通道如实拒绝，见 futu_data._fetch_mcp）
         self.assertEqual(set(app_module.FUTU_FIELDS),
-                         set(futu_data.FUTU_TOOLS), "HTTP 白名单与通道表同键集")
+                         set(futu_data.FUTU_TOOLS) | set(futu_data.DATAPLANE_ENDPOINTS),
+                         "HTTP 白名单与通道表并集同键集")
 
     def test_required_fields_follow_official_docs(self):
         definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
@@ -1079,15 +1082,15 @@ class ToolSurfaceTest(unittest.TestCase):
             tool = next(t for t in mcp_tools.TOOLS if t.name == name)
             self.assertIn("实时", tool.description, name)
 
-    def test_endpoint_registry_is_61(self):
+    def test_endpoint_registry_is_77(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 61)
+        self.assertEqual(len(endpoints), 77)
         self.assertEqual(tuple(store_access.WP8_MARKET_ENDPOINTS), WP8_MARKET_ENDPOINTS)
         # WP8 任务 3 起尾部再追加 6 个 OpenAPI 交易只读端点、任务 6 追加 3 个推送端点、
         # 任务 7 追加设置页端点（openapi_config/openapi_test；OAuth 集成再增 openapi_oauth，
         # 行情 9 项落在它们之前）
-        self.assertEqual(endpoints[-24:-15], list(WP8_MARKET_ENDPOINTS))
-        self.assertEqual(len(set(endpoints)), 61)
+        self.assertEqual(endpoints[-40:-31], list(WP8_MARKET_ENDPOINTS))
+        self.assertEqual(len(set(endpoints)), 77)
 
 
 class RealChannelComparisonTest(unittest.TestCase):
