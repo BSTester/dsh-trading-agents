@@ -23,15 +23,22 @@ JOBS_DEFAULT = {
     # WP7：每个有作业的市场收盘链末尾追加 factors_snapshot（先让数据作业落库，
     # 快照再吃当日数据）；cmd 形式走既有 runner——@watchlist 替换 / 900s 超时 /
     # 失败告警语义与协议零改动。
+    # WP11：链尾再追加 sentiment_snapshot（factors_snapshot + 10 分钟）。它是**基础链**
+    # 作业而非 auto_pipeline 派生作业：情绪/资讯采集是攒 PIT 历史（250 交易日演进条款
+    # 的地基），与交易开关无关——auto_pipeline 关闭时也应持续积累；缺席源如实标
+    # absent 并退出 0，不阻塞链。
     "SH": [{"name": "sync_bars", "at": "16:00", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "sync_fundamentals", "at": "16:00", "cmd": ["fundamentals", "--tickers", "@watchlist"]},
             {"name": "merge_announcements", "at": "16:05", "cmd": ["merge-announcements", "--period", "@latest-quarter"]},
             {"name": "quality", "at": "16:10", "cmd": ["quality", "--market", "SH"]},
-            {"name": "factors_snapshot", "at": "16:15", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]}],
+            {"name": "factors_snapshot", "at": "16:15", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
+            {"name": "sentiment_snapshot", "at": "16:25", "cmd": ["sentiment-snapshot", "--market", "SH"]}],
     "HK": [{"name": "sync_bars", "at": "16:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
-            {"name": "factors_snapshot", "at": "16:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]}],
+            {"name": "factors_snapshot", "at": "16:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
+            {"name": "sentiment_snapshot", "at": "16:45", "cmd": ["sentiment-snapshot", "--market", "HK"]}],
     "US": [{"name": "sync_bars", "at": "05:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
-            {"name": "factors_snapshot", "at": "05:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]}],
+            {"name": "factors_snapshot", "at": "05:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
+            {"name": "sentiment_snapshot", "at": "05:45", "cmd": ["sentiment-snapshot", "--market", "US"]}],
 }
 
 # 风控参数默认值：镜像 engine/python/risk_config.py 的 DEFAULTS（venv 只链接

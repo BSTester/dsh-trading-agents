@@ -105,6 +105,16 @@ def build_parser():
                    help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用；执行窗口按它判定）")
     _add_db(s)
 
+    s = sub.add_parser("sentiment-snapshot",
+                       help="情绪/资讯快照（fin_sentiment/fin_news/last30days；落 sentiment_snapshots）")
+    s.add_argument("--market", required=True, help="市场链：SH/HK/US（SH 链含 SZ/BJ）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    s.add_argument("--today", default=None,
+                   help="观测日覆盖 YYYY-MM-DD 或完整时刻（测试/补跑用）")
+    s.add_argument("--now", default=None,
+                   help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用）")
+    _add_db(s)
+
     s = sub.add_parser("reconcile-diff", help="离线比对本地与券商持仓 JSON")
     s.add_argument("--local", required=True)
     s.add_argument("--broker", required=True)
@@ -293,6 +303,18 @@ def main(argv=None):
                 print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
                 return 1
             result = daemon.auto_execute(conn, home, args.market, today=args.today, now=now)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
+                return 1
+        elif args.cmd == "sentiment-snapshot":
+            # 情绪/资讯 PIT 采集作业体（WP11）。软跳过（会话未收盘/池空/通道缺席）=
+            # 退出 0：采集是攒历史，不是当日依赖，缺源不阻塞调度链；市场链/时钟非法
+            # =fail-closed 非零退出（与 plan-auto 同一分级）。
+            import os
+            from . import sentiment
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = sentiment.run(home, args.market, conn=conn, today=args.today,
+                                   now=args.now)
             if not result.get("ok"):
                 print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
                 return 1

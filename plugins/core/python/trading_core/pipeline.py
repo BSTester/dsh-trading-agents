@@ -95,6 +95,10 @@ _ALERT_STATUS = {
     "对账通道不可用": ("reconcile", "failed"),
     "对账差异": ("reconcile", "failed"),
     "对账无差异": ("reconcile", "ok"),
+    # sentiment.run（sentiment_snapshot 作业，WP11）
+    "情绪快照跳过": ("sentiment_snapshot", "skipped"),
+    "情绪源不可用": ("sentiment_snapshot", "failed"),
+    "情绪快照全部失败": ("sentiment_snapshot", "failed"),
 }
 #: 市场链层告警（daemon.tick 在整条链层面发出）→ 作用于该市场所有数据作业
 _CHAIN_ALERT_STATUS = {"日历未同步": "skipped"}

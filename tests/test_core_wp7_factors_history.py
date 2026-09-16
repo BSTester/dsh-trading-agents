@@ -153,19 +153,23 @@ class FactorsHistoryCliTest(CliTestBase):
 
 
 class FactorsSnapshotJobWiringTest(unittest.TestCase):
-    """调度接线：每个有作业的市场收盘链末尾追加 factors_snapshot（daemon 协议零改动）。"""
+    """调度接线：每个有作业的市场收盘链追加 factors_snapshot（daemon 协议零改动）。
 
-    def test_every_market_chain_ends_with_factors_snapshot_cmd_job(self):
+    WP11 修订：factors_snapshot **不再逐字面意义地位于链尾**——WP11 在其后追加了
+    sentiment_snapshot（情绪/资讯 PIT 快照）。WP7 的不变式（cmd 作业、单一、
+    排在数据同步之后）全部保留，只把「字面链尾」换成「位置关系」断言。
+    """
+
+    def test_every_market_chain_has_factors_snapshot_after_bars_sync(self):
         self.assertTrue(daemon.JOBS_DEFAULT)
         for market, chain in daemon.JOBS_DEFAULT.items():
             self.assertGreaterEqual(len(chain), 2, market)
-            last = chain[-1]
-            self.assertEqual(last["name"], "factors_snapshot", market)
-            self.assertEqual(last["cmd"], ["factors-snapshot", "--tickers", "@watchlist"], market)
-            # 收盘链末尾：触发时刻晚于链内前一个作业（前序数据作业先落库，快照吃到当日数据）
-            self.assertGreater(last["at"], chain[-2]["at"], market)
-            for job in chain[:-1]:
-                self.assertNotEqual(job["name"], "factors_snapshot", market)
+            names = [job["name"] for job in chain]
+            self.assertEqual(names.count("factors_snapshot"), 1, market)
+            job = chain[names.index("factors_snapshot")]
+            self.assertEqual(job["cmd"], ["factors-snapshot", "--tickers", "@watchlist"], market)
+            # 先让数据作业落库，快照再吃当日数据：触发时刻晚于行情同步
+            self.assertGreater(job["at"], chain[names.index("sync_bars")]["at"], market)
 
     def test_factors_snapshot_job_resolves_watchlist_via_existing_runner_protocol(self):
         """cmd 形式走既有协议：@watchlist 由 resolve_command 替换（关注池空返回 None 跳过）。"""
@@ -178,7 +182,9 @@ class FactorsSnapshotJobWiringTest(unittest.TestCase):
             old = os.environ.get("DSH_HOME")
             os.environ["DSH_HOME"] = home
             try:
-                job = daemon.JOBS_DEFAULT["SH"][-1]
+                # 按名字取作业（WP11 起链尾是 sentiment_snapshot，位置取值会取错作业）
+                job = next(job for job in daemon.JOBS_DEFAULT["SH"]
+                           if job["name"] == "factors_snapshot")
                 self.assertEqual(daemon.resolve_command(job["cmd"], home),
                                  ["factors-snapshot", "--tickers", "SH.600519,HK.00700"])
                 config.write_text("{}", encoding="utf-8")
