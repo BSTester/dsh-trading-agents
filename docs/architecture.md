@@ -174,6 +174,23 @@ Host 校验会话归属、标的、模式、五档评级及来源。报告不会
 渠道不可用时一律明确报「不可用」：`load_bars` 抛错、情绪返回 `available: false`、
 `locate` 返回 `None`。工作台因此宁可为空，也不显示占位数据。
 
+### 情绪/资讯 PIT 积累与演进条款（WP11）
+
+情绪与资讯数据自 WP11 起**每日按关注池落 `sentiment_snapshots` 表**
+（`date,symbol,source,payload,fetched_at`，主键三元组；**只存渠道原文事实，不打分**——
+打分算法会漂移，原始数据不会）。采集作业 `sentiment_snapshot` 在**基础链**上常驻
+（不受 `auto_pipeline.enabled` 交易开关控制，理由见规格 §4.1 作业分层）：数据积累
+不应因为没开自动交易而停摆。
+
+三源现状：`fin_sentiment`（X + 千股千评）、`fin_news`（fin-data 的新闻路由：
+futu → AKShare → Yahoo）、`last30days`（可选组件，未安装即缺席）。**上游
+`quote_news_search` 实测恒空**（TOOL-LIMITS/HANDOVER 记录），故不接该通道——不造一个
+永远为空的源；单源失败对该源计缺席并告警，不阻塞其余源与作业链。
+
+**演进条款（规格 §6.3）**：某资讯类因子候选**累计 ≥250 交易日**后，可由研究院提出
+检验申请，走 WP14 验证门（IC t 检验显著 + 分层单调 + walk-forward OOS）；**转正前不得
+出现在任何启用规则的 factors 列表**（规则解释器机械拒绝未注册/未通过检验的因子引用）。
+
 ## 交易动态与实时性
 
 账户工具的 `tools/result` 事件记录为 `broker_response`，包含模式、时间、
