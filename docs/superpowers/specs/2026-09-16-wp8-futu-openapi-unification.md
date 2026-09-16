@@ -50,6 +50,8 @@ REST 端点 → quantwb 工具（**分组平铺**，命名 `<域>_<对象>`；�
 | 基本数据 | basicinfo/trading-days/rehab/owner-plate/history-kline/market-state/search/economic-calendar | `info_basicinfo`、`info_trading_days`、`quote_history_kline_v2`… |
 | 资金/板块/衍生品/筛选/IPO/自选股 | capital-flow(-history/-distribution)/plate-*/option-chain/stock-screen/ipo-list/user-security* | 对应 `flow_*`、`plate_*`、`deriv_*`、`screen_*`、`ipo_list`、`watchlist_*` |
 | 深度数据 | statements/analyst-consensus/morningstar/valuation/dividends/holders/top-brokers/short | `fund_*`、`research_*`、`valuation_*`、`corp_*`、`holders_*`、`short_*` |
+> **现状注记（2026-09-16）**：`rt_quote/rt_order_book/capital_flow/capital_flow_history/capital_distribution/option_expiration/option_chain/option_screen` 8 个端点已先行交付（托管 MCP 通道直通，commit `f668204`，服务 skills 已对接）。任务 2/3 实施 OpenAPI 后仅切换这 8 个端点的**后端**（MCP call_tool → REST），工具契约与前端零变化；切换时以通道探针对比两者输出差异后灰度替换。
+>
 | 交易 | place/modify/cancel/order-confirm/get-max-qty/open-orders/history-orders/order-details/today-deals/history-deals/get-accounts/get-funds/get-positions | WP7 的 `trade_*`/`account_*` 改接 OpenAPI；新增 `trade_confirm`、`trade_max_qty`、`orders_open/orders_history/orders_detail/deals_today/deals_history` |
 | 推送 | WS quote/trade | 无独立工具：事件落 OMS/告警/推送缓存，经 `snapshot`/Web 实时可见 |
 | 模拟交易/加密货币 | sim-trade 全链 / crypto | sim 走既有 WP7 路径；crypto 预留不实现 |
