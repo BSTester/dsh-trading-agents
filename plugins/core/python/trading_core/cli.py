@@ -142,16 +142,18 @@ def build_parser():
 
 
 def _daemon_round(conn, home):
-    """常驻循环的一轮：调度 + 指令轮询；处理失败的指令告警（文件仍移入 processed/）。"""
-    from . import alerts, commands
+    """常驻循环的一轮：调度 + 指令轮询；失败指令进本轮摘要。
+
+    轮询、告警与失败判定全部走 ``daemon`` 的单一实现（poll_commands/command_failure）——
+    原先这里自带一份轮询与告警，与新增的服务内调度器重复且漏判 ok:False 形态。
+    """
     from . import daemon as daemon_mod
     daemon_mod.tick(conn, home)
     issues = []
-    for item in commands.poll(home, handler=lambda cmd: daemon_mod.handle_command(conn, home, cmd)):
-        if item.get("error"):
-            issues.append({"file": item.get("file"), "error": item["error"]})
-            alerts.emit(conn, home=str(home), level="warn",
-                        title="指令处理失败", detail=item["error"])
+    for item in daemon_mod.poll_commands(conn, home):
+        failure = daemon_mod.command_failure(item)
+        if failure:
+            issues.append({"file": failure[0], "error": failure[1]})
     return issues
 
 

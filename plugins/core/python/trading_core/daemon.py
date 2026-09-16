@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import alerts, execute, store
+from . import alerts, commands, execute, store
 
 JOBS_DEFAULT = {
     # WP7：每个有作业的市场收盘链末尾追加 factors_snapshot（先让数据作业落库，
@@ -364,6 +364,61 @@ def handle_command(conn, home, cmd, executor=None, runner=None):
 
 def _default_executor(conn, home, cmd):
     return _execute_plan(conn, home, cmd)
+
+
+def poll_commands(conn, home):
+    """轮询指令目录并分派（服务内调度器与 daemon CLI 共用同一实现）。
+
+    断点背景（WP9 任务 7）：commands.poll 原先只在 daemon CLI 常驻模式里跑，服务内
+    调度器只跑作业链——独立 daemon 未启动时，plan-execute/auto_execute 写下的指令
+    永远无人处理。本函数把轮询并入调度 tick，使单进程也能闭环。
+
+    返回 commands.poll 的结果列表（每条含 ``result`` 或 ``error``）。**永不抛出**：
+    poll 自身逐条 try/except，这里再兜一层目录/IO 级故障——轮询是调度循环的附加段，
+    任何故障都不该拖垮作业链。失败逐条落 warn 告警（含文件名与错误摘要）；文件仍被
+    移入 processed/，毒丸指令不每轮重试（与 handle_command 的收敛口径一致）。
+    """
+    home = str(home)
+    try:
+        results = commands.poll(home, lambda cmd: handle_command(conn, home, cmd))
+    except Exception as error:  # noqa: BLE001 —— 目录/IO 级故障：告警后放行
+        _alert_command_failure(conn, home, "poll", str(error))
+        return []
+    for item in results:
+        failure = command_failure(item)
+        if failure:
+            _alert_command_failure(conn, home, failure[0], failure[1])
+    return results
+
+
+def command_failure(item):
+    """从 poll 结果项提取失败事实：返回 ``(where, detail)``，成功项返回 None。
+
+    两类失败形态（handle_command 永不抛，故失败都从这里收敛）：
+      * poll 自身捕获的异常项 —— ``{"file": …, "error": …}``（如非法 JSON）；
+      * 分派器返回的失败结果 —— ``{"type": …, "result": {"ok": False, "error": …}}``
+        （如白名单外指令、执行被拒）。
+    轮询告警（本模块）与 CLI ``--once`` 摘要（cli._daemon_round）共用本判定，
+    避免两处各写一份而漏掉 ok:False 形态。
+    """
+    detail = item.get("error")
+    if detail is None:
+        result = item.get("result")
+        if not (isinstance(result, dict) and result.get("ok") is False):
+            return None
+        detail = result.get("error") or "指令失败"
+    return item.get("file") or item.get("type") or "?", detail
+
+
+def _alert_command_failure(conn, home, where, detail):
+    """指令失败的 warn 告警；告警自身失败不得反噬轮询（conn 为 None 时静默跳过）。"""
+    if conn is None:
+        return
+    try:
+        alerts.emit(conn, home=home, level="warn", title="指令处理失败",
+                    detail=f"{where}: {detail}"[:300])
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def risk_config(home):

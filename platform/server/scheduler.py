@@ -6,6 +6,7 @@
 #   1. tick-first：启动即先跑一轮再等间隔（_loop 先 tick 后 wait），不空等第一个周期；
 #   2. 启动即补跑当日到期作业；与 daemon CLI 共享 kv `daemon:state` 的 ran 标记，
 #      同日作业不重复执行（服务与手动 daemon 先后跑同一天也只执行一次）。
+import sqlite3
 import sys
 import threading
 import traceback
@@ -64,28 +65,69 @@ class Scheduler:
         return bool(self._thread and self._thread.is_alive())
 
 
+def _record_last_error(conn, now, error):
+    """段级异常落 kv ``daemon:last_error``（保留最近一次，成功不清除）。
+
+    与 healthz 的 ``scheduler:{alive,last_error}`` 同一证据口径（300 字符截断）：
+    healthz 读的是 Scheduler 线程属性，这里落库的是调度器可查询的同一事实。
+    记账失败不得影响调度主流程。
+    """
+    try:
+        stamp = (now or daemon._real_now)()
+        store.kv_set(conn, "daemon:last_error",
+                     {"at": stamp, "error": str(error)[:300]})
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def build_tick(home, jobs=None, now=None, conn=None):
-    """组装 daemon.tick 的无参 callable（daemon 协议零改动，这里只管连接的生灭）。
+    """组装 daemon 的作业链 + 指令轮询的无参 callable（这里只管连接的生灭与分段）。
 
     conn 三种形态：
       * callable —— 每轮调用新建连接，用完即关（服务默认 ``store.connect(store.db_path(home))``，
         库路径跟随应用 home 而不是环境变量，测试可注入任意工厂）；
       * 既有连接对象 —— 每轮复用、不关闭（测试注入）；
       * None —— 每轮按上一条默认口径新建并关闭。
+
+    两段（WP9 任务 7）：**先作业链、后指令轮询**，共用同一连接。顺序有意义——
+    auto_execute 作业在 tick 内写下的 execute_plan 指令，同轮即被取走执行。
+    两段各自 try/except：一段失败不阻断另一段；失败落 kv ``daemon:last_error`` 后
+    **继续向上抛**，让 Scheduler.last_error 与 /healthz 保持原有的故障可见性
+    （吞掉异常会让 healthz 谎报无错）。
+
+    注：``sqlite3.Connection`` 自身可调用（``conn()`` 是游标的旧别名），因此**先按
+    isinstance 认连接对象、再判可调用**——否则注入真实连接会被误当工厂调用而崩。
     """
     def tick():
-        if callable(conn):
-            connection = conn()
-            close_after = True
-        elif conn is not None:
-            connection = conn
-            close_after = False
-        else:
+        if conn is None:
             connection = store.connect(store.db_path(str(home)))
             close_after = True
+        elif isinstance(conn, sqlite3.Connection):
+            connection = conn
+            close_after = False
+        elif callable(conn):
+            connection = conn()
+            close_after = True
+        else:
+            connection = conn
+            close_after = False
+        state = None
+        failures = []
         try:
-            return daemon.tick(connection, home=str(home), jobs=jobs, now=now)
+            try:
+                state = daemon.tick(connection, home=str(home), jobs=jobs, now=now)
+            except Exception as error:  # noqa: BLE001 —— 一段失败不阻断另一段
+                failures.append(("tick", error))
+                _record_last_error(connection, now, error)
+            try:
+                daemon.poll_commands(connection, home=str(home))
+            except Exception as error:  # noqa: BLE001
+                failures.append(("poll", error))
+                _record_last_error(connection, now, error)
         finally:
             if close_after:
                 connection.close()
+        if failures:
+            raise RuntimeError("; ".join(f"{phase}: {error}" for phase, error in failures))
+        return state
     return tick
