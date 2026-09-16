@@ -335,6 +335,8 @@ Client 用 `ctx.connection.rpc.call` 调用并继承 Connection 信任——该 
 | `account_positions` / `account_orders` / `account_funds`（WP7） | `{mode?}` | 券商账户查询直通（模式文件约束；不进任何缓存；失败账户列入 `errors` 不掩盖） |
 | `push_status`（WP8 任务 6） | `{}`（空载荷，TTL 0） | 富途 WS 推送状态：`{enabled, started, reason, last_error, quote, trade}`——与 `/healthz` 的 `push` **同一实现、同一事实**（quote/trade 各含 connected/authenticated/最后消息时间/重连次数/订阅意图） |
 | `push_subscribe` / `push_unsubscribe`（WP8 任务 6） | `{quote?, order_book?, ticker?, kline?: [{symbol, period, adjust}]}`（**非交易**载荷） | 追加/精确移除本地连接订阅意图（不改模式、不过风控、不产生订单）；成功回意图快照；推送未启用 → `trading/push-unavailable`（如实拒绝），载荷非法 → `trading/invalid-operation`；幂等（重复订阅不重发订阅帧） |
+| `pipeline`（WP10） | `{}`（空载荷，TTL 30s） | 流程页数据源：每市场当日各阶段（真实作业名 + `plan`/`execute`/`digest`）`{label, status: pending\|ok\|skipped\|failed, at, scheduled, summary}` + `auto_pipeline` 生效配置摘要；**只读既有事实**（kv ran 标记、plans/orders、当日告警归因），不造状态、不写库、不调券商 |
+| `auto_pipeline`（WP10） | GET 空载荷读；POST `{enabled, strategies, exec_at, exec_window_minutes, reconcile_at}`（白名单） | 自动流水线开关读写：写入经 core `autopipeline.apply_overlay` **同一校验实现**，原子写 `trading-platform.json` 的 `auto_pipeline` 键（保留其他键），校验失败文件零改动；**两端点不进 MCP 工具面**（模型不得自拨开关，同 `openapi_config`/`confirm-decide` 先例） |
 
 除 `plan-execute`（执行已冻结计划，白名单指令落盘）、`confirm-decide`（人工批准）与
 WP7 的 `trade_*` 写端点（必须通过交易闸门链：模式→风控 8 规则→kill→业务确认）外，
