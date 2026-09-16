@@ -263,3 +263,18 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   不保证顺序，重连（自动重鉴权+按订阅意图重订阅+refresh 5/10 分钟保活）后靠
   60s 对账兜底轮询收敛；状态看 `/healthz` 的 `push` 字段（reconnects/last_error）。
   排障详见 RUNBOOK「OpenAPI 凭据与通道（WP8）」。
+- **自动流水线开关与窗口（WP9）**：`trading-platform.json` 顶层 `auto_pipeline`
+  （`enabled` 默认 false）。`exec_at` 为**北京时间**；美股默认 22:35 按夏令时写死，
+  冬令时需人工调早一小时（不做自动 DST 换算）。`exec_window_minutes`（默认 30）是执行
+  窗口：**超出窗口的计划不自动执行、留待人工**——调度器 tick-first（启动即补跑当日到期
+  作业）时，靠它防止收盘后才去执行早盘计划；窗口外会在告警里看到「已超执行窗口」。
+  对账差异会置 halt，此时 `auto_execute` 由守卫 4（熔断）拦下并要求人工核对
+  （差异只暂停、不自动平仓）；恢复走 RUNBOOK 场景 3。
+- **假时钟 `DSH_FAKE_NOW`（WP9 演练/测试专用）**：格式 `YYYY-MM-DD HH:MM:SS`，
+  设置后 daemon 调度与 `plan-auto`/`auto-execute`/`reconcile-daily` 全部按它取时刻
+  （子进程作业靠它对齐时间线）。生效时工作台告警列表会出现一条 warn「假时钟生效」——
+  **看到这条告警说明环境变量还挂着，演练结束务必 `unset DSH_FAKE_NOW`**；格式写错会
+  fail-closed 报错（不静默回落真实时间）。演练示例见 RUNBOOK「自动流水线（WP9）」。
+- **常驻入口二选一（WP9）**：服务内调度器（`platform/`）已包含指令轮询；独立
+  `python -m trading_core daemon` 仍可用但**建议只留一个常驻**——两者靠 processed/nonce
+  与 kv ran 标记互斥，同跑不会重复执行，但会产生重复的告警噪音。

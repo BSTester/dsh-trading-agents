@@ -315,6 +315,42 @@ WantedBy=default.target
 - 行为异常先自检：`~/.dsh/trading-venv/bin/python ~/.dsh/last30days-skill/skills/last30days/scripts/last30days.py --preflight`（不读 Cookie 不写文件）；报「目录/引擎不存在」先跑 `python3 scripts/install_last30days.py`，装完新建会话才会挂载。
 - 密钥缺失时的降级面：免密钥来源（Reddit/HN/Polymarket/GitHub/StockTwits）照常可用；X、YouTube、TikTok/Instagram/Threads/Pinterest/LinkedIn、小红书、Perplexity、Brave 未按上游 README 配置密钥/会话时这些来源缺席（简报如实标注），属预期行为而非故障。
 
+## 自动流水线（WP9）
+
+> 前提：`trading-platform.json` 已开 `auto_pipeline.enabled=true`（配置样例见 README
+> 「WP9：自动流水线」）。关掉开关即回到全人工，任何演练都不需要改代码。
+
+### 假时钟演练（`DSH_FAKE_NOW`，测试/演练专用）
+
+```bash
+export DSH_HOME=~/.dsh
+export DSH_FAKE_NOW="2026-09-16 16:20:00"      # 必填格式 YYYY-MM-DD HH:MM:SS
+~/.dsh/trading-venv/bin/python -m trading_core plan-auto --market SH
+~/.dsh/trading-venv/bin/python -m trading_core snapshot-schedule   # 看 ran 标记与告警
+export DSH_FAKE_NOW="2026-09-17 09:35:00"      # 次日执行窗口内
+~/.dsh/trading-venv/bin/python -m trading_core auto-execute --market SH
+~/.dsh/trading-venv/bin/python -m trading_core snapshot-plan       # 看计划→订单状态
+unset DSH_FAKE_NOW                              # 演练结束必须清理
+```
+
+- **预期**：`plan-auto` 产出 `origin=auto/market=SH` 的 frozen 计划；`auto-execute` 在
+  窗口内写出 `execute_plan` 指令（`~/.dsh/trading-commands/pending/`）并返回 nonce；
+  `snapshot-plan` 可见订单状态推进。
+- **必查**：`snapshot-schedule` 的告警列表里有且仅有一条 warn「假时钟生效」——
+  它同时是「环境变量还挂着」的提醒；`unset` 后重启服务或等下一轮 tick，告警不再新增。
+- **格式写错**（如 `2026/09/16 16:20`）：命令**直接报错退出**，不会静默按真实时间跑。
+
+### 窗口超时 / kill / 熔断：三条「应该不执行」的排查
+
+| 现象（告警标题） | 含义 | 处置 |
+|---|---|---|
+| `已超执行窗口` | 当前时刻超出 `exec_at + exec_window_minutes`（如服务在收盘后才启动补跑） | 属预期：计划留待人工在工作台执行；要当日自动执行就调整 `exec_at`/窗口或重启服务在窗口内 |
+| `kill switch 生效` | `~/.dsh/trading-kill` 存在 | 确认是否人为放的总闸；恢复即删除该文件（工作台一键清除） |
+| `熔断生效` | 对账差异或日内亏损触发 halt（**差异只暂停不平仓**） | 先按「场景 3」人工核对券商事实，再 `clear_halt` 恢复 |
+
+排查入口：`snapshot-schedule`（ran 标记/心跳/告警）、`snapshot-reconcile`（差异/TCA/
+链路）、`snapshot-plan`（计划→订单→风控预检）。
+
 ## 演练记录（待 WP4 daemon 合并后执行）
 
 > 以下四场景须在 WP4 daemon 合并、`install_plugins.py link` 同步后按上文步骤实际执行，输出原文（JSON/命令回显）粘贴到对应条目，并回填至 `docs/superpowers/plans/2026-09-14-wp5-ops-acceptance.md` 的 WP5 验收记录。

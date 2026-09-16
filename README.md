@@ -225,6 +225,43 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
   托管 MCP 降级为可选只读研究通道（preset 默认 disabled），写通道唯一在工作台。
 
 
+## WP9：自动流水线（模拟盘全自动）
+
+**默认关闭**：不配置 `auto_pipeline` 时，调度行为与 WP8 完全一致（零变化）。
+
+打开方式（三步，全部在 `trading-platform.json` 里）：
+
+```json
+{
+  "watchlist": ["SH.600519", "SH.000001"],
+  "auto_pipeline": {
+    "enabled": true,
+    "strategies": [{"market": "SH", "strategy": "watchlist_rsi", "watchlist": "SH"}],
+    "exec_at": {"SH": "09:35", "HK": "09:45", "US": "22:35"},
+    "reconcile_at": "19:00",
+    "exec_window_minutes": 30
+  }
+}
+```
+
+1. 写入上表配置（`enabled=false`/缺省即关闭）；
+2. 关注池填要跑的市场标的（`watchlist_rsi` 扫关注池，BUY 等权、其余现金）；
+3. 重启或等待下一轮调度 tick（约 60 秒）——配置每轮现读，改完即生效。
+
+打开后每个交易日自动完成的链路：
+
+| 时机 | 自动动作 |
+|---|---|
+| 收盘后（各市场 `factors_snapshot` + 5 分钟） | `build_plan`：数据就绪门 → 策略算权重 → 冻结 auto 计划 |
+| 晚间 `reconcile_at` | `reconcile` → TCA → digest（对账差异 → critical 告警 + 自动暂停执行） |
+| 次一交易日 `exec_at`（窗口 `exec_window_minutes` 内） | `auto_execute`：九守卫 → 写 `execute_plan` 指令 → 同轮轮询消费 → 走风控 8 规则执行 |
+
+**实盘永远等人工**：live 模式也会自动生成计划，但 `auto_execute` 只对 sim 生效——
+实盘仍是在工作台点「执行」+ 口令「确认执行」。**关掉开关即回到全人工**。
+
+排障与演练（假时钟、窗口超时、熔断拦截）见 [docs/RUNBOOK.md](docs/RUNBOOK.md)「自动流水线（WP9）」。
+
+
 ## 工作台与指令示例
 
 按上节启动独立 Web 后在浏览器打开 `http://127.0.0.1:8397`（Harness 内没有工作台面板，
