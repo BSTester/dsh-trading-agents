@@ -52,7 +52,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
-from server import audit_chain, caches, compute, futu_data, mcp_tools, store_access, trading
+from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_tools,
+                    store_access, trading)
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -402,18 +403,27 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
 
 
 def create_app(home=None, dist=None, config=None, analytics=None, series=None, core=None,
-               scheduler=None):
+               scheduler=None, futu=None, push=None):
     """组装 FastAPI 应用（沿用 Node 原实现已退役的组装顺序：一份 handle 共享）。
 
     ``scheduler``（WP7 任务 1）：传入即用（测试注入替身/禁用）；None 才建真调度器
     （``Scheduler(build_tick(home), interval=60.0)``），lifespan 启停、/healthz 上报。
+
+    ``push``（WP8 任务 4）：富途 WS 推送运行时（``futu_push.PushRuntime``，测试注入替身
+    即可离线）。缺省按 home 建一个——**只有** ``futu_channel=openapi`` 且 OpenAPI 凭据
+    可用时才真正建连接，否则 lifespan 零副作用、``/healthz`` 如实报 ``enabled:false``。
+    ``futu`` 注入口用于把同一个行情快照缓存接进直通层（``rt_quote`` 可命中推送数据）；
+    缺省按 home 建 ``FutuData`` 并挂上 ``push.quote_cache``。
     """
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
     home = str(home)
     root = Path(dist if dist is not None else DEFAULT_DIST)
     config = load_config(home) if config is None else config
-    handle = create_handler(home, analytics=analytics, series=series, core=core)
+    push = push if push is not None else futu_push.PushRuntime(home=home)
+    if futu is None:
+        futu = futu_data.FutuData(home=home, push=push.quote_cache)
+    handle = create_handler(home, analytics=analytics, series=series, core=core, futu=futu)
     endpoints = store_access.endpoints()
     if scheduler is None:
         # 延迟导入：注入替身的调用（绝大多数测试）不必承担 trading_core 的导入
@@ -442,12 +452,18 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
         WP7 任务 1：同处启停服务内调度器——start 在 MCP lifespan 之前，stop 放
         finally（MCP 启动失败也要停线程）；stop 自带 join，优雅退出不悬挂。
+
+        WP8 任务 4：同处启停富途 WS 推送（行情 + 交易）——``push.start()`` 只在
+        ``futu_channel=openapi`` 且凭据可用时建连接，否则立即返回 False（零副作用）；
+        stop 放 finally（MCP 启动失败也要断开推送连接）。
         """
         _app.state.scheduler.start()
         try:
+            await _app.state.push.start()
             async with mcp_app.router.lifespan_context(mcp_app):
                 yield
         finally:
+            await _app.state.push.stop()
             _app.state.scheduler.stop()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
@@ -456,6 +472,8 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     app.state.config = config
     app.state.handle = handle
     app.state.scheduler = scheduler
+    app.state.push = push
+    app.state.futu = futu
     app.state.mcp = mcp_server
     app.state.mcp_app = mcp_app
     app.state.mcp_tools = bound_tools
@@ -498,11 +516,16 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         WP7 任务 1：附带调度器存活态——``alive`` 线程是否在跑，``last_error`` 最近一次
         tick 异常记录（成功不清除，None 即从未出错）。截断 ≤300 字符对齐既有
         ``str(error)[:300]`` 惯例；全量 traceback 属于日志语义，这里只留故障存在性的证据。
+
+        WP8 任务 4：附带 ``push``（行情/交易两条 WS 的 connected/已鉴权/最后消息时间/
+        重连次数/最后错误）。推送是旁路加速，``status()`` 的任何异常都被
+        ``futu_push.safe_status`` 收敛成同形状的失败态——**绝不影响 healthz 主字段**。
         """
         last_error = scheduler.last_error
         return {"ok": True, "mode": read_mode(home),
                 "scheduler": {"alive": bool(scheduler.alive),
-                              "last_error": None if last_error is None else str(last_error)[:300]}}
+                              "last_error": None if last_error is None else str(last_error)[:300]},
+                "push": futu_push.safe_status(push)}
 
     @app.post("/api/wb/{endpoint}")
     async def workbench(endpoint: str, request: Request):

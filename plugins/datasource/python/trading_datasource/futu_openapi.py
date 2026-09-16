@@ -23,6 +23,9 @@
   \\nsha256(body)小写hex``；**没有请求体时第 5 段传空字符串**（官方文档逐字规定，
   官方 GET 示例第 5 段为空——不是 ``sha256(b"")`` 的 e3b0c44…，空 body 的原文以
   ``\\n`` 结尾）；Ed25519 直接签原文，RSA-SHA256 先 sha256 再 PKCS#1 v1.5；
+- **WebSocket 签名原文与 REST 不同**（WP8 任务 4，附录 A 实抓）：行情 WS 与交易 WS
+  同构，原文 ``{timestamp_ms}\\n{nonce}\\nWEBSOCKET\\nws/auth``（``sign_ws`` /
+  ``ws_signing_message``）；鉴权/刷新的 JSON 帧构造在 ``server/futu_push.py``；
 - Token 安全：不进环境变量，只落 ``~/.dsh/futu-openapi.json``（0600 原子写）。
 
 限频/5xx：本层**不做自动重试**，如实抛 ``UnexpectedResponse``（非信封响应，见上）——
@@ -183,6 +186,30 @@ class AppKeySigner:
     def sign(self, timestamp_ms, method, path, query, body_bytes):
         """返回 base64(signature)（即 Authorization 头的取值，无 Bearer 前缀）。"""
         message = self.signing_message(timestamp_ms, method, path, query, body_bytes)
+        return self._sign_message(message)
+
+    @staticmethod
+    def ws_signing_message(timestamp_ms, nonce):
+        """WebSocket 鉴权/刷新的签名原文（**与 REST 五段原文不同**，附录 A 实抓）：
+
+        ``{timestamp_ms}\\n{nonce}\\nWEBSOCKET\\nws/auth``
+
+        行情 WS 与交易 WS 完全同构（``trade_event_push/auth.md`` 已核对），因此两种
+        action（auth/refresh）共用这一份原文——刷新帧换的是 ``timestamp_ms``/``nonce``，
+        原文形状不变。
+        """
+        return "\n".join([str(timestamp_ms), str(nonce), "WEBSOCKET",
+                          "ws/auth"]).encode("utf-8")
+
+    def sign_ws(self, timestamp_ms, nonce):
+        """WS 鉴权/刷新帧的 ``authorization``：base64(signature)，无 Bearer 前缀。
+
+        签名算法与 REST 一致（Ed25519 直签原文；RSA-SHA256 先 sha256 再 PKCS#1 v1.5），
+        只有原文不同——**不得复用 REST 的 ``sign``**（五段原文会验签失败）。
+        """
+        return self._sign_message(self.ws_signing_message(timestamp_ms, nonce))
+
+    def _sign_message(self, message):
         if self.algorithm == "Ed25519":
             signature = self._key.sign(message)
         else:

@@ -56,6 +56,14 @@
 #   trading/invalid-operation  参数白名单/必填/类型（与 handle 层载荷校验同码）
 import re
 import time
+from datetime import datetime, timezone
+
+
+def _iso_from_ms(at_ms):
+    """毫秒时间戳 → UTC ISO 串（与 caches.iso_from_ms 同格式；本模块不跨模块依赖私有助手）。"""
+    moment = datetime.fromtimestamp(at_ms / 1000, tz=timezone.utc)
+    return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
+
 
 # 错误码（直通层信封 + 参数拒绝沿用 invalid-operation）。
 UNAVAILABLE_CODE = "trading/futu-unavailable"
@@ -369,12 +377,14 @@ class FutuData:
     """
 
     def __init__(self, call=None, timeout=DEFAULT_TIMEOUT_SECONDS, home=None,
-                 channel=None, market=None, credential_path=None):
+                 channel=None, market=None, credential_path=None, push=None):
         self._call = call
         self.timeout = timeout
         self.home = home
         self._credential_path = credential_path
         self._market_override = market
+        # WP8 任务 4：WS 行情推送的进程内快照缓存（None = 未接线，rt_quote 走通道）
+        self._push = push
         if channel is not None:
             self._channel = channel
         elif call is not None:
@@ -515,12 +525,38 @@ class FutuData:
 
     # ---- 数据方法（参数白名单 + 必填/类型校验，坏参数零通道调用）----
     def rt_quote(self, payload):
-        """实时报价快照：codes 1..10 个 → 上游 code_list。"""
+        """实时报价快照：codes 1..10 个 → 上游 code_list。
+
+        WP8 任务 4：``futu_channel=openapi`` 且行情 WS 在跑时，先看进程内推送快照
+        （TTL 语义由 ``QuoteSnapshotCache`` 承担）；命中即返回推送数据并标注
+        ``source: "push"``（与 REST 取的形状不同——推送帧的字段面由上游决定，
+        调用方可据 ``source`` 判别）。未命中一律走通道取数，行为与既有逐字一致。
+        """
         codes = payload.get("codes")
         if not isinstance(codes, list) or not 1 <= len(codes) <= 10:
             raise _param_error("rt_quote 的 codes 必须是 1..10 个标的代码的列表")
         normalized = [_normalize_code(code, "codes") for code in codes]
+        hit = self._push_lookup(normalized)
+        if hit is not None:
+            return hit
         return self._fetch("rt_quote", {"code_list": normalized})
+
+    def _push_lookup(self, codes):
+        """推送快照命中 → value（``source: "push"``）；未接线/未命中/过期 → None。"""
+        if self._push is None:
+            return None
+        lookup = getattr(self._push, "lookup", None)
+        if lookup is None:
+            return None
+        try:
+            hit = lookup(codes)
+        except Exception:  # noqa: BLE001 —— 推送缓存只是加速，坏缓存不许打断取数
+            return None
+        if not hit:
+            return None
+        return {"source": "push", "code_list": hit["entries"],
+                "pushed_at": _iso_from_ms(hit["at_ms"]),
+                "ttl_ms": getattr(self._push, "ttl_ms", None)}
 
     def rt_order_book(self, payload):
         """实时盘口：档数随行情权限（HK 10 / US 60 / A 股不可用），不假定固定档数。"""

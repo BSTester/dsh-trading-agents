@@ -38,12 +38,14 @@
 # 所有失败一律 {ok:false, error:{code, message≤300, details:{}}}，绝不抛到 500。
 import re
 import sys
+import threading
 import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 try:
     # venv 里 trading_core 已 pip install -e（与 server/scheduler.py 同口径）。
+    from trading_core import alerts as core_alerts
     from trading_core import broker as core_broker
     from trading_core import daemon as core_daemon
     from trading_core import oms as core_oms
@@ -54,6 +56,7 @@ except ImportError:
     _CORE_PYTHON = str(Path(__file__).resolve().parents[2] / "plugins" / "core" / "python")
     if _CORE_PYTHON not in sys.path:
         sys.path.insert(0, _CORE_PYTHON)
+    from trading_core import alerts as core_alerts
     from trading_core import broker as core_broker
     from trading_core import daemon as core_daemon
     from trading_core import oms as core_oms
@@ -1382,3 +1385,466 @@ class TradeGate:
             else:  # pragma: no cover —— 适配器契约外的状态立即暴露
                 raise ValueError(f"broker 适配返回未知状态：{status!r}")
         return _envelope_ok({**result, "client_order_id": cid})
+
+
+# ---------------------------------------------------------------------------
+# WP8 任务 4：WS 交易事件 → OMS / 告警（推送只作加速，REST/对账仍是事实来源）
+# ---------------------------------------------------------------------------
+# 事件 → OMS 目标状态（附录 A 的 10 类）。``None`` = 该事件不改变订单状态：
+#   * EVENT_REPLACED：改单成功，订单仍在途（状态由数量事实决定，推送不改）；
+#   * EVENT_FILL：目标由累计成交量决定（partial/filled，见 _fill_target）；
+#   * *_REJECTED / EVENT_FILL_CORRECT / EVENT_FILL_CANCEL：**保守处理**——只告警不猜
+#     状态（撤单被拒时订单仍有效；成交修正/撤成交需要 REST 事实才能判定，绝不凭推送
+#     把已成交的订单降级）。
+EVENT_TARGET_STATE = {
+    "EVENT_NEW": "submitted",
+    "EVENT_REPLACED": None,
+    "EVENT_CANCELED": "cancelled",
+    "EVENT_EXPIRED": "cancelled",
+    "EVENT_FILL": None,
+    "EVENT_NEW_REJECTED": "rejected",
+    "EVENT_REPLACE_REJECTED": None,
+    "EVENT_CANCEL_REJECTED": None,
+    "EVENT_FILL_CORRECT": None,
+    "EVENT_FILL_CANCEL": None,
+}
+# 告警级别：拒单类/事实修正类必须引人注意（warn）；正常生命周期留 info 痕迹。
+EVENT_ALERT_LEVEL = {
+    "EVENT_NEW": "info",
+    "EVENT_REPLACED": "info",
+    "EVENT_CANCELED": "info",
+    "EVENT_EXPIRED": "info",
+    "EVENT_FILL": "info",
+    "EVENT_NEW_REJECTED": "warn",
+    "EVENT_REPLACE_REJECTED": "warn",
+    "EVENT_CANCEL_REJECTED": "warn",
+    "EVENT_FILL_CORRECT": "warn",
+    "EVENT_FILL_CANCEL": "warn",
+}
+# 事件里承载订单号/数量/价格的候选字段（官方未在附录 A 给出事件体字段名，这里按
+# 「读叶子字段、大小写变体、缺失即跳过」的防御口径取值，绝不猜不存在的语义）。
+_EVENT_TYPE_KEYS = ("event_type", "event", "type", "action", "push_type", "msg_type")
+_ORDER_ID_KEYS = ("order_id", "orderId", "order_id_ex", "broker_order_id")
+_CLIENT_ORDER_ID_KEYS = ("client_order_id", "clientOrderId")
+_DEALT_KEYS = ("dealt_qty", "dealtQty", "filled_qty", "filledQty", "traded_qty")
+_TOTAL_QTY_KEYS = ("qty", "quantity", "order_qty", "total_qty")
+_FILL_ID_KEYS = ("fill_id", "deal_id", "fillId", "dealId")
+_PRICE_KEYS = ("price", "dealt_avg_price", "avg_price", "fill_price")
+_FILL_QTY_KEYS = ("fill_qty", "deal_qty", "last_qty", "qty")
+_TRADED_AT_KEYS = ("traded_at", "deal_time", "fill_time", "update_time", "create_time")
+_REASON_KEYS = ("reason", "err_msg", "message", "remark", "status")
+
+
+def _leaf(frame, keys):
+    """从帧或其 ``data`` 子对象里取第一个非空叶子字段（不递归、不序列化活对象）。"""
+    sources = [frame]
+    data = frame.get("data")
+    if isinstance(data, dict):
+        sources.append(data)
+    for source in sources:
+        for key in keys:
+            value = source.get(key)
+            if value is None or value == "":
+                continue
+            if isinstance(value, (str, int, float, bool)):
+                return value
+    return None
+
+
+def _number(value):
+    """数量/价格叶子 → float（非数值返回 None；bool 不算数值）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        try:
+            return float(value.strip())
+        except ValueError:
+            return None
+    return None
+
+
+def event_type_of(frame):
+    """事件类型（10 类白名单内的大写名）；未知/缺失返回 None（不崩）。"""
+    if not isinstance(frame, dict):
+        return None
+    value = _leaf(frame, _EVENT_TYPE_KEYS)
+    if isinstance(value, str) and value.upper() in EVENT_TARGET_STATE:
+        return value.upper()
+    return None
+
+
+class TradeEventBridge:
+    """交易推送事件 → OMS 白名单迁移 + 告警。**永不抛出**（推送不得拖垮会话）。
+
+    硬约束落地（附录 A③）：
+      * 用 ``order_id`` 定位订单（``broker_order_id`` 或调用方给的 ``client_order_id``）；
+      * 状态迁移只走 ``trading_core.oms.TRANSITIONS`` 白名单——乱序（撤单先于成交回报）、
+        重复、未知类型都不崩：非法迁移落 ``warn`` 告警并保留原状态；
+      * 目标状态 == 当前状态 → ``state-unchanged``（正常重复回报，不产生告警噪音）；
+      * 事件**不是**唯一事实源：这里只做「能确定的迁移」，其余交给对账兜底。
+    """
+
+    def __init__(self, home, conn_factory=None, alert_fn=None):
+        self.home = str(home)
+        self._conn_factory = conn_factory
+        self._alert_fn = alert_fn
+        self._lock = threading.Lock()
+        self._counts = {"received": 0, "applied": 0, "alerts": 0, "unknown_events": 0,
+                        "unmatched": 0, "errors": 0, "fills": 0}
+
+    def _conn(self):
+        if self._conn_factory is not None:
+            return self._conn_factory()
+        return core_store.connect(core_store.db_path(self.home))
+
+    def _bump(self, key, amount=1):
+        with self._lock:
+            self._counts[key] = self._counts.get(key, 0) + amount
+
+    def status(self):
+        with self._lock:
+            return dict(self._counts)
+
+    def _alert(self, conn, level, title, detail):
+        self._bump("alerts")
+        try:
+            if self._alert_fn is not None:
+                self._alert_fn(conn, self.home, level, title, detail)
+            else:
+                core_alerts.emit(conn, self.home, level, title, detail)
+        except Exception:  # noqa: BLE001 —— 告警失败不能影响状态迁移结论
+            self._bump("errors")
+
+    def handle(self, frame):
+        """处理一帧推送 → ``{"event", "applied", "reason", ...}``（永不抛出）。"""
+        self._bump("received")
+        if not isinstance(frame, dict):
+            return self._result(None, False, "not-an-object")
+        event = event_type_of(frame)
+        if event is None:
+            self._bump("unknown_events")
+            return self._result(None, False, "unknown-event")
+        try:
+            return self._apply(event, frame)
+        except Exception as error:  # noqa: BLE001 —— 任何异常都收敛为「未应用」
+            self._bump("errors")
+            return self._result(event, False, "error", detail=str(error)[:200])
+
+    # ---- 内部 ----
+    def _result(self, event, applied, reason, **extra):
+        return {"event": event, "applied": applied, "reason": reason, **extra}
+
+    def _apply(self, event, frame):
+        conn = self._conn()
+        try:
+            row = self._locate(conn, frame)
+            if row is None:
+                self._bump("unmatched")
+                self._alert(conn, "warn", f"推送事件无法定位订单：{event}",
+                            self._detail(frame))
+                return self._result(event, False, "order-not-found")
+            current = row["status"]
+            target = self._target(event, frame, row)
+            if target is None:
+                level = EVENT_ALERT_LEVEL.get(event, "warn")
+                if event == "EVENT_REPLACED":
+                    self._record_fill(conn, frame, row)
+                    return self._result(event, False, "state-unchanged")
+                self._alert(conn, level, f"推送事件需人工关注：{event}",
+                            self._detail(frame, row))
+                return self._result(event, False, "no-state-change")
+            if target == current:
+                self._record_fill(conn, frame, row)
+                return self._result(event, False, "state-unchanged")
+            try:
+                core_oms.transition(conn, row["client_order_id"], target,
+                                    broker_order_id=_text_of(frame, _ORDER_ID_KEYS))
+            except ValueError as error:
+                # 乱序/重复/非法迁移：记录告警，状态保持原样（对账兜底会收敛）
+                self._alert(conn, "warn", f"推送事件迁移被拒：{event}",
+                            f"{self._detail(frame, row)} / {str(error)[:120]}")
+                return self._result(event, False, "illegal-transition", to=target)
+            self._bump("applied")
+            self._record_fill(conn, frame, row)
+            self._alert(conn, EVENT_ALERT_LEVEL.get(event, "info"),
+                        f"推送事件 {event}：{row['symbol']} {current} → {target}",
+                        self._detail(frame, row))
+            return self._result(event, True, "applied", to=target)
+        finally:
+            conn.close()
+
+    def _locate(self, conn, frame):
+        broker_id = _text_of(frame, _ORDER_ID_KEYS)
+        client_id = _text_of(frame, _CLIENT_ORDER_ID_KEYS)
+        if client_id:
+            row = conn.execute("SELECT client_order_id, symbol, status, qty, side"
+                               " FROM orders WHERE client_order_id=?",
+                               (client_id,)).fetchone()
+            if row is not None:
+                return row
+        if broker_id:
+            rows = conn.execute("SELECT client_order_id, symbol, status, qty, side"
+                                " FROM orders WHERE broker_order_id=?",
+                                (broker_id,)).fetchall()
+            if len(rows) == 1:
+                return rows[0]
+            if len(rows) > 1:
+                # 同一券商单号对应多行：取最近更新的在途行（推送只作加速，不猜）
+                return rows[-1]
+        return None
+
+    def _target(self, event, frame, row):
+        if event == "EVENT_FILL":
+            return self._fill_target(frame, row)
+        return EVENT_TARGET_STATE.get(event)
+
+    @staticmethod
+    def _fill_target(frame, row):
+        """成交事件的目标状态：成交量够 → filled；有部分成交 → partial；无数量 → partial。
+
+        推送不携带累计量时按 partial 保守处理（若当前是 submitted，这是一次合法迁移；
+        后续事件/对账会收敛到 filled）。
+        """
+        dealt = _number(_leaf(frame, _DEALT_KEYS))
+        total = _number(_leaf(frame, _TOTAL_QTY_KEYS))
+        if total is None:
+            total = _number(row["qty"])
+        if dealt is None:
+            return "partial"
+        if total is not None and dealt >= total:
+            return "filled"
+        return "partial" if dealt > 0 else None
+
+    def _record_fill(self, conn, frame, row):
+        """显式携带成交编号/数量/价格的 EVENT_FILL 落 ``fills``（按 fill_id 去重）。
+
+        官方事件体字段未在附录 A 给出：只有「编号 + 数量 + 价格」都拿得到才落库，
+        否则跳过（绝不凭猜测合成成交记录）。
+        """
+        if event_type_of(frame) != "EVENT_FILL":
+            return
+        fill_id = _text_of(frame, _FILL_ID_KEYS)
+        qty = _number(_leaf(frame, _FILL_QTY_KEYS))
+        price = _number(_leaf(frame, _PRICE_KEYS))
+        if not fill_id or not qty or price is None:
+            return
+        existing = conn.execute("SELECT 1 FROM fills WHERE fill_id=?",
+                                (str(fill_id),)).fetchone()
+        if existing is not None:
+            return  # 重复推送（含乱序重发）不重复落成交
+        try:
+            core_store.insert_fill(conn, str(fill_id), row["client_order_id"], price,
+                                   int(qty), traded_at=_text_of(frame, _TRADED_AT_KEYS))
+        except Exception:  # noqa: BLE001 —— 落成交失败如实计数，不影响状态迁移结论
+            self._bump("errors")
+            return
+        self._bump("fills")
+
+    @staticmethod
+    def _detail(frame, row=None):
+        """告警明细：只取叶子字段，长度受限（不序列化推送原始帧）。"""
+        parts = []
+        event = _leaf(frame, _EVENT_TYPE_KEYS)
+        if event is not None:
+            parts.append(f"event={event}")
+        order_id = _leaf(frame, _ORDER_ID_KEYS)
+        if order_id is not None:
+            parts.append(f"order_id={order_id}")
+        if row is not None:
+            parts.append(f"client_order_id={row['client_order_id']}")
+            parts.append(f"status={row['status']}")
+        reason = _leaf(frame, _REASON_KEYS)
+        if reason is not None:
+            parts.append(f"detail={str(reason)[:120]}")
+        return " ".join(parts)[:300]
+
+
+def _text_of(frame, keys):
+    value = _leaf(frame, keys)
+    if value is None:
+        return None
+    return str(value)
+
+
+# ---------------------------------------------------------------------------
+# WP8 任务 4：重连后 REST 对账（事件不补发 → 用查询补齐）
+# ---------------------------------------------------------------------------
+#: 对账默认覆盖的市场（OpenApiTrade.TRD_MARKETS 的子集；A 股不在官方 OpenAPI 交易面）
+PUSH_RECONCILE_MARKETS = ("HK", "US")
+#: 状态文本的粗判子串（**不解读未公开的状态枚举**）：先看数量口径，再看这些子串
+_STATUS_CANCEL = ("CANCEL", "EXPIRE")
+_STATUS_REJECT = ("REJECT",)
+_STATUS_FILLED = ("FILLED", "FILL_ALL")
+
+
+class PushReconciler:
+    """重连后的 REST 对账兜底：拉券商未结订单，与本地 OMS 在途订单比对。
+
+    事实来源优先级（不变式 1）：REST 查询 > 推送事件。本类只做三件事：
+      1. 用数量口径（``dealt_qty`` vs ``qty``）判定 filled/partial；
+      2. 数量不足以判定时，用状态文本的粗粒度子串（CANCEL/EXPIRE/REJECT/FILLED）判定；
+      3. 其余一律记差异（``local_only``/``broker_only``/``illegal-transition``），
+         **绝不猜终态**——迁移仍走 ``oms.TRANSITIONS`` 白名单。
+
+    记录落 kv ``reconcile:push``（``snapshot-reconcile`` 的 ``push`` 字段即它），并落一条
+    告警；REST 失败如实记录，**永不抛出**（推送重连的回调里抛异常会打断客户端会话）。
+    """
+
+    def __init__(self, home, gate=None, conn_factory=None, alert_fn=None,
+                 markets=PUSH_RECONCILE_MARKETS, now=None):
+        self.home = str(home)
+        self._gate = gate
+        self._conn_factory = conn_factory
+        self._alert_fn = alert_fn
+        self._markets = tuple(markets)
+        self._now = now
+        self._lock = threading.Lock()
+        self.last_error = None
+
+    def _conn(self):
+        if self._conn_factory is not None:
+            return self._conn_factory()
+        return core_store.connect(core_store.db_path(self.home))
+
+    def _gateway(self):
+        if self._gate is None:
+            self._gate = TradeGate(self.home)
+        return self._gate
+
+    @staticmethod
+    def _stamp():
+        return _iso_now()
+
+    def run(self, reason="ws-reconnect"):
+        """执行一次对账 → 记录（``{"at","reason","checked","updated","diffs","errors"}``）。"""
+        record = {"at": self._stamp(), "reason": reason, "markets": list(self._markets),
+                  "checked": 0, "updated": [], "diffs": [], "errors": []}
+        rows = {}
+        try:
+            rows = self._broker_rows(record)
+        except Exception as error:  # noqa: BLE001 —— 对账失败不影响推送会话
+            self._record(record, f"{type(error).__name__}: {error}"[:200])
+        try:
+            self._reconcile(record, rows)
+        except Exception as error:  # noqa: BLE001
+            self._record(record, f"{type(error).__name__}: {error}"[:200])
+        self._persist(record)
+        return record
+
+    def _record(self, record, message):
+        record["errors"].append(message)
+        with self._lock:
+            self.last_error = message
+
+    def _broker_rows(self, record):
+        """逐市场拉未结订单（REST）；单市场失败不掩盖其余市场。"""
+        rows = {}
+        gate = self._gateway()
+        for market in self._markets:
+            try:
+                envelope = gate.orders_open({"mode": "live", "market": market})
+            except Exception as error:  # noqa: BLE001 —— 单市场通道失败继续下一个
+                self._record(record, f"{market}: {type(error).__name__}: {error}"[:160])
+                continue
+            if not isinstance(envelope, dict) or not envelope.get("ok"):
+                error = (envelope or {}).get("error") or {}
+                self._record(record,
+                             f"{market}: {str(error.get('message') or envelope)[:160]}")
+                continue
+            value = envelope.get("value") or {}
+            for group in value.get("groups") or []:
+                group_market = group.get("market") or market
+                for row in group.get("rows") or []:
+                    if not isinstance(row, dict):
+                        continue
+                    order_id = _text_of(row, _ORDER_ID_KEYS)
+                    if order_id:
+                        rows[order_id] = {"market": group_market, "row": row}
+        return rows
+
+    def _reconcile(self, record, broker_rows):
+        conn = self._conn()
+        try:
+            local = conn.execute(
+                "SELECT client_order_id, broker_order_id, symbol, status, qty, side"
+                f" FROM orders WHERE broker_order_id IS NOT NULL AND status IN"
+                f" ({','.join('?' * len(core_oms.OPEN_STATES))})",
+                tuple(core_oms.OPEN_STATES)).fetchall()
+            seen = set()
+            for order in local:
+                record["checked"] += 1
+                broker_id = str(order["broker_order_id"])
+                seen.add(broker_id)
+                entry = broker_rows.get(broker_id)
+                if entry is None:
+                    record["diffs"].append({"kind": "local_only", "order_id": broker_id,
+                                            "client_order_id": order["client_order_id"],
+                                            "status": order["status"]})
+                    continue
+                target = self._target_state(entry["row"], order)
+                if target is None or target == order["status"]:
+                    continue
+                try:
+                    core_oms.transition(conn, order["client_order_id"], target,
+                                        broker_order_id=broker_id)
+                except ValueError as error:
+                    record["diffs"].append({"kind": "illegal-transition",
+                                            "order_id": broker_id,
+                                            "client_order_id": order["client_order_id"],
+                                            "from": order["status"], "to": target,
+                                            "detail": str(error)[:120]})
+                    continue
+                record["updated"].append({"order_id": broker_id,
+                                          "client_order_id": order["client_order_id"],
+                                          "from": order["status"], "to": target,
+                                          "source": "rest:orders"})
+            for broker_id in sorted(set(broker_rows) - seen):
+                record["diffs"].append({"kind": "broker_only", "order_id": broker_id,
+                                        "market": broker_rows[broker_id]["market"]})
+        finally:
+            conn.close()
+
+    @staticmethod
+    def _target_state(row, order):
+        """由 REST 行推导 OMS 目标状态：数量口径优先，其次状态文本子串，最后 None。"""
+        dealt = _number(_leaf(row, _DEALT_KEYS))
+        total = _number(_leaf(row, _TOTAL_QTY_KEYS)) or _number(order["qty"])
+        if dealt is not None:
+            if total is not None and dealt >= total:
+                return "filled"
+            if dealt > 0:
+                return "partial"
+        status_text = str(_leaf(row, ("status", "order_status", "status_name")) or "").upper()
+        if any(mark in status_text for mark in _STATUS_REJECT):
+            return "rejected"
+        if any(mark in status_text for mark in _STATUS_CANCEL):
+            return "cancelled"
+        if "PART" in status_text:
+            return "partial"
+        if any(mark in status_text for mark in _STATUS_FILLED):
+            return "filled"
+        return None
+
+    def _persist(self, record):
+        try:
+            conn = self._conn()
+        except Exception as error:  # noqa: BLE001
+            self._record(record, f"对账记录落库失败：{error}")
+            return
+        try:
+            core_store.kv_set(conn, "reconcile:push", record)
+            level = "warn" if (record["diffs"] or record["errors"]) else "info"
+            title = "推送重连对账"
+            detail = (f"市场={','.join(record['markets'])} 核对={record['checked']} "
+                      f"迁移={len(record['updated'])} 差异={len(record['diffs'])} "
+                      f"错误={len(record['errors'])}")
+            if self._alert_fn is not None:
+                self._alert_fn(conn, self.home, level, title, detail)
+            else:
+                core_alerts.emit(conn, self.home, level, title, detail)
+        except Exception as error:  # noqa: BLE001
+            self._record(record, f"对账告警落库失败：{error}")
+        finally:
+            conn.close()

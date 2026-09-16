@@ -296,8 +296,14 @@ class ContractTests(Base):
         response = client.get("/healthz")
         self.assertEqual(response.status_code, 200)
         # WP7：healthz 附带调度器存活态（替身未启动 → alive=False、last_error=None）。
-        self.assertEqual(response.json(), {"ok": True, "mode": "sim",
-                                           "scheduler": {"alive": False, "last_error": None}})
+        body = response.json()
+        # WP8 任务 4：healthz 增 push 字段（此处只锁定主字段与 push 的存在性/形状；
+        # push 自身形状由 tests/test_wp8_push.py 的 PushServiceWiringTest 逐键锁定）。
+        push = body.pop("push")
+        self.assertEqual(body, {"ok": True, "mode": "sim",
+                                "scheduler": {"alive": False, "last_error": None}})
+        self.assertIsInstance(push.get("quote"), dict)
+        self.assertIsInstance(push.get("trade"), dict)
 
     def test_token_required_for_api_and_static_exempt(self):
         dist = self.make_dist()

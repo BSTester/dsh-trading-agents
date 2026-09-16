@@ -80,6 +80,11 @@ def reconcile_snapshot(conn, chain_limit=5, alert_limit=20):
     from . import tca
     latest = store.kv_get(conn, "reconcile:latest", default={"diffs": [], "at": None}) or {}
     diffs = latest.get("diffs") or []
+    # WP8 任务 4：推送重连触发的一次对账（WS 事件不补发 → on_reconnect 走 REST 补齐）。
+    # 键缺失/坏数据按 None 处理（老库无此键时行为与之前逐字一致）。
+    push = store.kv_get(conn, "reconcile:push", default=None)
+    if not isinstance(push, dict):
+        push = None
     try:
         rows = conn.execute(
             "SELECT client_order_id, symbol, day, arrival, filled, side, bps"
@@ -98,4 +103,5 @@ def reconcile_snapshot(conn, chain_limit=5, alert_limit=20):
     # 规格 §8.3：reconcile 端点输出包含告警列表（调度页展示）
     return {"diffs": diffs, "diffs_at": latest.get("at"),
             "tca": {"rows": tca_rows, "avg_bps": avg_bps},
-            "alerts": alerts.list_recent(conn, limit=alert_limit), "chain": chain}
+            "alerts": alerts.list_recent(conn, limit=alert_limit), "chain": chain,
+            "push": push}

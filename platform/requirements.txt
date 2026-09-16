@@ -5,3 +5,5 @@ mcp==2.2.0
 httpx==0.28.1
 # WP8 富途 OpenAPI AppKey 签名（Ed25519/RSA-SHA256）——trading_datasource.futu_openapi 依赖
 cryptography==50.0.1
+# WP8 任务 4 富途 WS 推送（server/futu_push.py 的默认传输；协议层 ping/pong 保活）
+websockets==17.1
