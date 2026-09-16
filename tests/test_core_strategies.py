@@ -83,8 +83,10 @@ class StrategiesTest(unittest.TestCase):
         with mock.patch.object(type(strat), "signal",
                                lambda self, conn, symbol, as_of: signals[symbol]):
             weights = strat.target_weights(self.conn, "2026-09-13", home=self.tmp.name)
-        # BUY 两个 → 等权 1/2；HOLD 不入表（减仓由 planner 持仓 diff 处理）
-        self.assertEqual(weights, {"SH.600519": 0.5, "SH.601899": 0.5})
+        # BUY 两个 → 等权基数 1/2 = 0.5，但受单票上限 max_position_pct(默认 0.25) 约束
+        # → 每只 0.25（规格 §4.2 第 5 点：策略不生成规则 5 注定拒绝的目标）；
+        # HOLD 不入表（减仓由 planner 持仓 diff 处理）
+        self.assertEqual(weights, {"SH.600519": 0.25, "SH.601899": 0.25})
         self.assertLessEqual(sum(weights.values()), 1.0 + 1e-9)
 
     def test_watchlist_rsi_all_hold_returns_empty(self):

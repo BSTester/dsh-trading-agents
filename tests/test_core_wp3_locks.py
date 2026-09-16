@@ -9,6 +9,7 @@ import json
 import sys
 import tempfile
 import unittest
+import datetime as dt
 from contextlib import redirect_stdout
 from pathlib import Path
 
@@ -120,7 +121,25 @@ class Wp3CliCommands(unittest.TestCase):
         self.assertEqual(code, 0)
         return json.loads(buf.getvalue())
 
+    def _seed_bars(self, symbol, close, count=20):
+        """铺确定性日线（h=c+0.5 / l=c−0.5 → TR=1.0 → ATR=1.0 → 止损距离=2.0）。
+
+        计划按风险预算定量（规格 §4.2 第 5 点，WP9 缺口修复）：加仓标的必须有可算的
+        ATR，否则跳过（宁缺毋假）。本测试验证的是 plan-build 的**冻结 JSON 契约**，
+        因此补最小 bar 集让权重臂成为约束臂（期望数量与修复前一致）。
+        """
+        conn = store.connect(self.db)
+        try:
+            days = [(dt.date(2026, 8, 31) - dt.timedelta(days=count - 1 - i)).isoformat()
+                    for i in range(count)]
+            store.upsert_bars(conn, symbol, "1d", [
+                {"t": d, "o": close, "h": close + 0.5, "l": close - 0.5, "c": close,
+                 "v": 1000.0} for d in days], source="test")
+        finally:
+            conn.close()
+
     def test_plan_build_freezes_plan_json(self):
+        self._seed_bars("SH.600519", 1580.0)
         out = self._run(["plan-build", "--mode", "SIM", "--strategy", "momentum_value_top5",
                          "--target", '{"SH.600519": 0.5}',
                          "--prices", '{"SH.600519": 1580.0}',

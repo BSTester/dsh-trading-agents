@@ -12,7 +12,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import alerts, commands, execute, store
+from . import alerts, commands, execute, indicators, store
 
 JOBS_DEFAULT = {
     # WP7：每个有作业的市场收盘链末尾追加 factors_snapshot（先让数据作业落库，
@@ -489,14 +489,20 @@ def _execute_plan(conn, home, cmd, broker_call=None, equity=None, today=None,
             calendar_ok = store.is_trading_day(conn, (market_row or {"market": "SH"})["market"], day)
         except RuntimeError:
             calendar_ok = False  # 日历缺失：不放行（宁可不执行）
+    cfg = risk_config(home)
     if price_of is None:
         price_of = lambda s: _last_close(conn, s, stamp)  # noqa: E731
     if stop_dist_of is None:
-        stop_dist_of = lambda s: None  # noqa: E731 —— 保守口径：风险额按全额名义计
+        # 与计划定量**同源**（indicators.stop_distance 唯一实现，规格 §4.2 第 5 点）：
+        # planner 按该距离定量、规则 4 按该距离校验，两侧自洽——计划不再生成必被拦下
+        # 的徒劳订单，规则 4 也不会被 0 止损静默废除。ATR 取不到 → None → 规则 4 退回
+        # 「全额名义」保守口径（如实反映数据缺口，宁可拒绝）。
+        stop_dist_of = lambda s: indicators.stop_distance(  # noqa: E731
+            conn, s, stamp, cfg["stop_atr_mult"])
     ctx = {"mode": row["mode"], "kill_path": str(kill_path(home)),
            "equity": equity if equity is not None else 1_000_000.0,
            "positions_value": {}, "positions_count": 0, "day_pnl_pct": 0.0,
-           "is_trading_day": bool(calendar_ok), "config": risk_config(home)}
+           "is_trading_day": bool(calendar_ok), "config": cfg}
     result = execute.run(conn, row["plan_id"], plan_hash, ctx, broker_call,
                          price_of=price_of, stop_dist_of=stop_dist_of)
     return {"ok": True, "plan_id": row["plan_id"], **result}

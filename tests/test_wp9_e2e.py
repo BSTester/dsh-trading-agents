@@ -13,14 +13,16 @@
 
 五个场景把链路讲完整（每条都是平台真实行为，不是为测试方便而设计的假路径）：
 
-  ① 满仓单：链路跑通，**窄门如期拦截**——规则 4（单笔风险 ≤ 权益×1%）拒掉按权重定量
-     的满仓单；订单 cancelled + 风控留痕 + 券商零调用；
-  ② 小权重单：策略给出 0.8% 目标权重（100 股 / 8,000 元）→ 规则 4 放行 →
-     **券商真实收到下单**、订单 submitted；
+  ① 满仓单（**定量自洽后正常成交**）：策略上限把 1/N 压到 max_position_pct，计划再按
+     风险预算定量 → 规则 4/5 放行 → **券商真实收到下单**、订单 submitted；
+  ② 小权重单：策略给出 0.8% 目标权重（100 股 / 8,000 元）→ 权重臂成为约束臂 →
+     同样提交（与 ① 互补：① 由预算臂定量，② 由权重臂定量）；
   ③ 对账差异：券商持仓与本地台账不一致 → critical 差异 → 自动暂停 → 次日自动执行被
      守卫 4（熔断）拦下（**差异只暂停不平仓**，这是规格 §6.3 的既定语义）；
   ④ 关闭态回归：``enabled=false`` 时同一时间线零自动产物；
-  ⑤ 假时钟告警：``DSH_FAKE_NOW`` 生效时工作台可见一条 warn（生产防误用）。
+  ⑤ 假时钟告警：``DSH_FAKE_NOW`` 生效时工作台可见一条 warn（生产防误用）；
+  ⑥ **硬规则反证**：人为放大 qty 的超限订单仍被规则 4 拦下、券商零调用
+     ——定量口径的修复**没有削弱**任何一条硬拦截。
 """
 import contextlib
 import io
@@ -38,7 +40,7 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 
 from server import scheduler  # noqa: E402
-from trading_core import cli, daemon, store, strategies  # noqa: E402
+from trading_core import cli, daemon, oms, store, strategies  # noqa: E402
 
 PREV = "2026-09-15"
 D1 = "2026-09-16"
@@ -48,10 +50,12 @@ AUTO_COMMANDS = ("plan-auto", "auto-execute", "reconcile-daily")
 
 
 class _SmallWeightStrategy:
-    """小额目标权重的测试替身：证明「风险预算内的单可被自动提交」。
+    """小额目标权重的测试替身：验证**权重臂**成为约束臂时的提交路径。
 
-    真实 ``watchlist_rsi`` 是等权满仓（1/N），在当前定量口径下必然被规则 4 拦截
-    （见场景 ①）——本替身不掩盖该事实，只把**提交路径**单独验证出来。
+    ``watchlist_rsi`` 的单票上限是 max_position_pct(25%)，在单标的关注池下算出 25% ——
+    该权重再由计划侧的风险预算定量压到预算内（场景 ①）。本替身给出更小的权重
+    （0.8%），使 min(权重定量, 预算定量) 由**权重臂**决定，把「小单照常提交」这一支
+    单独钉住。
     """
 
     id = "wp9_small_weight"
@@ -210,9 +214,18 @@ class AutoPipelineE2E(unittest.TestCase):
         return [(name, args) for name, args in broker_calls
                 if name == "sim_trade_input_order"]
 
-    # ---- ① 满仓单：链路跑通、窄门如期拦截 ----
+    # ---- ① 满仓单：定量自洽 → 正常成交 ----
 
-    def test_full_chain_blocks_oversized_order(self):
+    def test_full_chain_fills_end_to_end(self):
+        """权重 1.0 → 策略上限 0.25 → 风险预算定量 → 规则 4/5 放行 → 券商收到下单。
+
+        定量算术（种子 bars 为 h=l=o=c，TR 由相邻收盘差决定）：
+          最近 14 个 TR = 12×0.5（缓涨段）+ 18.5（95←113.5）+ 15.0（80←95）= 39.5
+          ATR = 39.5 ÷ 14 ≈ 2.8214 → 止损距离 = 2 × ATR ≈ 5.6429
+          权重定量 = 1e6 × 0.25 ÷ 80 = 3125 → 整手 3100
+          预算定量 = floor(1e6 × 1% ÷ 5.6429 ÷ 100) × 100 = 1700
+          下单量 = min(3100, 1700) = 1700（预算臂约束；名义 13.6% ≤ 规则 5 的 25%）
+        """
         self._config(enabled=True)
         self._mode()
         self._calendar()
@@ -228,6 +241,7 @@ class AutoPipelineE2E(unittest.TestCase):
                              ("auto", "SH", "frozen", D1))
             orders = self._orders()
             self.assertEqual(len(orders), 1, orders)
+            self.assertEqual((orders[0]["side"], orders[0]["qty"]), ("BUY", 1700), orders)
 
             self._tick(f"{D1} 19:00:00")
             self.assertIsNotNone(store.kv_get(self.conn, "reconcile:latest"))
@@ -240,11 +254,15 @@ class AutoPipelineE2E(unittest.TestCase):
             self.assertTrue(store.kv_get(self.conn, f"auto_exec:SH:{D2}"))
 
         orders = self._orders()
-        self.assertEqual(orders[0]["status"], "cancelled", orders)
-        self.assertIn("risk:", orders[0]["err"] or "")
+        self.assertEqual(orders[0]["status"], "submitted", orders)
+        self.assertIsNone(orders[0]["err"], orders)
+        # 风控留痕：全部放行（Verdict 只在拒绝时带规则号，放行为 rule=0）
         verdicts = self._risk_checks()
-        self.assertTrue(any(v["rule"] == 4 and not v["allowed"] for v in verdicts), verdicts)
-        self.assertEqual(self._places(broker_calls), [])   # 拦截在触达券商之前
+        self.assertTrue(any(v["allowed"] for v in verdicts), verdicts)
+        self.assertFalse(any(not v["allowed"] for v in verdicts), verdicts)
+        places = self._places(broker_calls)
+        self.assertEqual(len(places), 1, broker_calls)     # 券商真实收到下单
+        self.assertEqual(places[0][1]["qty"], 1700)
         self.assertEqual(sorted(set(dispatched)),
                          ["auto-execute", "plan-auto", "reconcile-daily"])
 
@@ -331,6 +349,44 @@ class AutoPipelineE2E(unittest.TestCase):
         self.assertEqual(len(rows), 1, rows)        # 每进程一次
         self.assertEqual(rows[0]["level"], "warn")
         self.assertIn(daemon.FAKE_NOW_ENV, rows[0]["detail"])
+
+    # ---- ⑥ 硬规则反证：人为放大 qty 仍被规则 4 拦下 ----
+
+    def test_oversized_order_still_blocked_by_risk_rules(self):
+        """定量修复**不削弱**硬规则：人为放大的超限订单仍被拦、券商零调用。
+
+        构造方式刻意绕过计划侧定量（直接登记 100,000 股 @80 的订单）——模拟
+        「定量逻辑被绕过 / 被喂了宽松风险配置」的最坏情形，验证规则 4 是最后防线：
+          单笔风险 = 100,000 × 止损距离(≈5.6429) ≈ 564,290 > 权益 × 1% = 10,000
+          （且 100,000 × 80 = 8,000,000 也远超规则 5 的权益 × 25%）
+        取不到 ATR 时口径更严（全额名义），本反证在两种情形下都成立。
+        """
+        self._config(enabled=False)   # 不经自动链，直接构造超限订单
+        self._mode()
+        self._calendar()
+        self._bars()
+        self.conn.execute(
+            "INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,content_hash,status,"
+            "created_at,origin,market) VALUES('PLN-BIG',?,'sim','s','{}','hash-big',"
+            "'frozen','2026-09-16 16:20:00','manual',NULL)", (D1,))
+        self.conn.commit()
+        order = oms.register_order(self.conn, "PLN-BIG", SYMBOL, "SH", "BUY",
+                                   100000, 80.0, "sim", "hash-big")
+        call, broker_calls = self._broker()
+
+        out = daemon._execute_plan(self.conn, str(self.home), {"plan_hash": "hash-big"},
+                                   broker_call=call, equity=1_000_000.0, today=D2,
+                                   calendar_ok=True)
+
+        self.assertTrue(out["ok"], out)
+        self.assertEqual((out["submitted"], out["blocked"]), (0, 1), out)
+        row = self.conn.execute("SELECT status, err FROM orders WHERE client_order_id=?",
+                                (order["client_order_id"],)).fetchone()
+        self.assertEqual(row["status"], "cancelled")
+        self.assertIn("risk:", row["err"] or "")
+        self.assertEqual(self._places(broker_calls), [])   # 拦截在触达券商之前
+        verdicts = self._risk_checks()
+        self.assertTrue(any(v["rule"] == 4 and not v["allowed"] for v in verdicts), verdicts)
 
 
 if __name__ == "__main__":  # pragma: no cover

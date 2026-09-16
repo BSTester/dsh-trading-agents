@@ -14,6 +14,7 @@ import json
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -72,10 +73,20 @@ class PlanAutoTest(unittest.TestCase):
         store.upsert_calendar(self.conn, market, [
             {"day": d, "trade_date_type": "WHOLE", "trade_second": 14400} for d in days])
 
-    def _bars(self, symbol, days=(PREV, TODAY), close=100.0):
+    def _bars(self, symbol, days=None, close=100.0):
+        """铺日线：默认最后 20 个自然日（末日 = TODAY，过数据就绪门）。
+
+        每根 h=c+0.5 / l=c−0.5 / o=c → 每根 TR=1.0 → ATR(14)=1.0 → 止损距离=2.0 →
+        风险预算 = floor(1e6 × 1% ÷ 2.0 ÷ 100) × 100 = 5000 股：本文件期望的
+        5000/1500 由**权重臂**约束（与定量修复前的期望一致，见规格 §4.2 第 5 点）。
+        显式传 days 时按传入日期铺（落后日期用于数据门用例）。
+        """
+        if days is None:
+            end = date.fromisoformat(TODAY)
+            days = [(end - timedelta(days=19 - i)).isoformat() for i in range(20)]
         store.upsert_bars(self.conn, symbol, "1d", [
-            {"t": d, "o": close, "h": close, "l": close, "c": close, "v": 1000.0}
-            for d in days], source="test")
+            {"t": d, "o": close, "h": close + 0.5, "l": close - 0.5, "c": close,
+             "v": 1000.0} for d in days], source="test")
 
     def _mode(self, value):
         (self.home / "trading-account-mode").write_text(value, encoding="utf-8")

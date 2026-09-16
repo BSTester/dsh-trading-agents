@@ -1,7 +1,14 @@
-"""planner：目标权重 vs 券商实际 → 订单 diff → 冻结（hash）+ 订单登记进 OMS。"""
+"""planner：目标权重 vs 券商实际 → 订单 diff → 冻结（hash）+ 订单登记进 OMS。
+
+定量自洽（规格 §4.2 第 5 点）：计划按风险预算定量，因此**加仓标的必须有可算的 ATR**
+（``indicators.stop_distance``）。本文件的用例验证 hash/diff/登记链路，统一用
+``seed_bars`` 铺 20 根确定性 bar → ATR=1.0 → 止损距离=2.0 → 风险预算 5000 股，
+使**权重臂**成为约束臂（期望数量与修复前一致）。
+"""
 import sys
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
@@ -15,6 +22,18 @@ RISK_CTX = {"mode": "sim", "kill_path": "/nonexistent", "equity": 1_000_000.0,
                        "max_position_pct": 0.25, "daily_loss_limit_pct": 0.03}}
 
 
+def seed_bars(conn, symbol, close, count=20, last="2026-08-31"):
+    """铺确定性日线：h=c+0.5 / l=c−0.5 / o=c → 每根 TR=1.0 → ATR(14)=1.0。
+
+    最后一天固定在 2026-08-31（早于本文件所有 as_of），使 PIT 过滤后仍留足 15 根。
+    """
+    end = date.fromisoformat(last)
+    days = [(end - timedelta(days=count - 1 - i)).isoformat() for i in range(count)]
+    store.upsert_bars(conn, symbol, "1d", [
+        {"t": d, "o": close, "h": close + 0.5, "l": close - 0.5, "c": close, "v": 1000.0}
+        for d in days], source="test")
+
+
 class PlannerTest(unittest.TestCase):
     def setUp(self):
         self.tmp = tempfile.TemporaryDirectory()
@@ -25,6 +44,9 @@ class PlannerTest(unittest.TestCase):
         self.tmp.cleanup()
 
     def test_freeze_plan_hash_stable_and_diff(self):
+        seed_bars(self.conn, "SH.600519", 1580.0)
+        seed_bars(self.conn, "SZ.300750", 201.8)
+
         def broker_positions(mode):
             return {"SH.600519": {"qty": 400, "price": 1580.0}}, 1_000_000.0
 
@@ -44,6 +66,7 @@ class PlannerTest(unittest.TestCase):
 
     def test_missing_price_is_skipped(self):
         """无价（停牌/无行情）跳过不猜价；订单方向与整手取整口径。"""
+        seed_bars(self.conn, "SH.600519", 1580.0)
 
         def broker_positions(mode):
             return {}, 1_000_000.0
@@ -63,6 +86,8 @@ class PlannerTest(unittest.TestCase):
 
     def test_freeze_registers_orders_in_oms(self):
         """冻结后 orders 表行与返回 orders 逐条一致（symbol/market/side/qty/price/mode/status）。"""
+        seed_bars(self.conn, "SH.600519", 100.0)
+        seed_bars(self.conn, "SZ.300750", 200.0)
 
         def broker_positions(mode):
             return {}, 1_000_000.0
@@ -88,6 +113,7 @@ class PlannerTest(unittest.TestCase):
 
     def test_frozen_plan_executes_through_oms(self):
         """冻结即登记的链路打通：execute.run 能取到单并提交（人工执行与 WP9 自动执行同路）。"""
+        seed_bars(self.conn, "SH.600519", 100.0)
 
         def broker_positions(mode):
             return {}, 1_000_000.0
@@ -112,6 +138,7 @@ class PlannerTest(unittest.TestCase):
 
     def test_plan_without_orders_registers_nothing(self):
         """目标与持仓一致 → 零订单计划照常冻结，orders 表零行。"""
+        seed_bars(self.conn, "SH.600519", 100.0)
 
         def broker_positions(mode):
             return {"SH.600519": {"qty": 5000, "price": 100.0}}, 1_000_000.0

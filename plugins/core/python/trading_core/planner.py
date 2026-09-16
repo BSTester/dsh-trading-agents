@@ -10,7 +10,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from . import oms, store
+from . import indicators, oms, store
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -28,8 +28,14 @@ def _now():
     return datetime.now(_TZ8).strftime("%Y-%m-%d %H:%M:%S")
 
 
+def _risk_defaults():
+    """风控默认值（镜像唯一源 ``daemon.RISK_DEFAULTS``；惰性导入避免模块级环依赖）。"""
+    from . import daemon
+    return dict(daemon.RISK_DEFAULTS)
+
+
 def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
-                     as_of, lot=100, origin="manual", market=None):
+                     as_of, lot=100, origin="manual", market=None, risk_config=None):
     """冻结一份计划。``origin``/``market`` 是**来源与归属元数据**（规格 §4.6）：
 
     * ``origin="auto"`` 的计划供自动执行链识别（``store.get_latest_auto_plan`` /
@@ -42,9 +48,36 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
     永远执行不到任何单（人工 plan-execute 与 WP9 auto_execute 都走这条链路）。
     幂等由 ``oms.register_order`` 的在途单查重把守：同一 plan_id 重复登记会抛
     ``DuplicateOpenOrder``，**如实传播**，不静默吞。
+
+    **定量口径（规格 §4.2 第 5 点，2026-09-16 修订）**：权重是**上限**，实际下单量
+    受单笔风险预算约束，两者自洽于同一止损距离（``indicators.stop_distance`` 唯一实现，
+    与执行侧规则 4 同源）::
+
+        权重定量  = 权益 × 权重 ÷ 价（整手向下取整）
+        风险预算  = floor(权益 × risk_per_trade ÷ 止损距离 ÷ lot) × lot
+        加仓量    = min(增量, 风险预算)          # 增量 = 权重定量 − 当前持仓
+
+    「上限只约束**增量**」是刻意的读法（``qty = min(权重定量, 风险预算)`` 的直译只在
+    空仓时等价）：若把上限套在**目标持仓**上，已持仓 5000 股、目标 5000 股的标的会被
+    压成 1700 股目标 → 凭空产生 3300 股**非预期卖出**；同理减仓（delta<0）不受风险预算
+    限制——减少敞口不是新增风险。因此：加仓量取 min 且不为负；减仓量照常全额执行。
+
+    ``跳过``（返回 ``skipped`` 列表，**不静默**）：
+      * ``"SYM(无ATR)"``：bar 不足或 ATR 为 0 → 算不出止损距离 → 跳过。**不退回
+        「无止损全额定量」**：那必然被规则 4 拦下（徒劳计划），也绝不用 0 止损把
+        规则 4 静默废除；
+      * ``"SYM(风险预算不足一手)"``：预算连一手都买不起 → 跳过（如实列出，不生成 0 单）。
+
+    ``risk_config`` 缺省用 ``daemon.RISK_DEFAULTS``；``plan_auto`` 传
+    ``daemon.risk_config(home)``（含 ``~/.dsh/trading-risk.json`` 覆盖）。部分字段的
+    覆盖字典按「缺省补默认」合并——**不重写配置读取实现**。
     """
     positions, equity = broker_positions(mode)
-    orders, plan_id = [], f"PLN-{as_of.replace('-', '')}-{mode}-{uuid.uuid4().hex[:4].upper()}"
+    cfg = _risk_defaults()
+    if risk_config:
+        cfg.update(risk_config)
+    orders, skipped = [], []
+    plan_id = f"PLN-{as_of.replace('-', '')}-{mode}-{uuid.uuid4().hex[:4].upper()}"
     for symbol, weight in target.items():
         px = prices.get(symbol)
         if not px:
@@ -54,6 +87,16 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
         delta = want_qty - have_qty
         if delta == 0:
             continue
+        if delta > 0:  # 加仓：受单笔风险预算约束（减仓不受限，见 docstring）
+            stop_dist = indicators.stop_distance(conn, symbol, as_of, cfg["stop_atr_mult"])
+            if stop_dist is None:
+                skipped.append(f"{symbol}(无ATR)")
+                continue
+            budget_qty = int(equity * cfg["risk_per_trade"] / stop_dist // lot * lot)
+            delta = min(delta, budget_qty)
+            if delta <= 0:
+                skipped.append(f"{symbol}(风险预算不足一手)")
+                continue
         orders.append({"symbol": symbol, "market": symbol.split(".")[0],
                        "side": "BUY" if delta > 0 else "SELL", "qty": abs(delta),
                        "price": px})
@@ -72,7 +115,7 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
         oms.register_order(conn, plan_id, order["symbol"], order["market"],
                            order["side"], order["qty"], order["price"], mode, content_hash)
     return {"plan_id": plan_id, "as_of": as_of, "mode": mode, "status": "frozen",
-            "orders": orders, "content_hash": content_hash}
+            "orders": orders, "content_hash": content_hash, "skipped": skipped}
 
 
 def read_mode(home):
@@ -128,7 +171,10 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
       {"ok": True,  "skipped": <原因>}                    软跳过，不产生计划
       {"ok": False, "error": <原因>}                      配置/模式非法（fail-closed）
       {"ok": True,  "plan": {...}, "expired": [...],
-       "no_price": [...], "equity": <float>}              成功冻结
+       "no_price": [...], "no_atr": [...], "equity": <float>}   成功冻结
+
+    ``no_atr`` = 因算不出 ATR（止损距离）而未定量的标的（planner 的 ``skipped`` 原样
+    透出）——它们既不产单也不静默：运维据此判断是数据缺口还是标的本身不可用。
 
     软跳过的告警分级：关闭功能=静默（默认态不是异常）；其余原因=info/warn
     （warn 用于「本可运行但条件不满足」：数据未就绪/日历缺失/券商不可用）。
@@ -207,7 +253,13 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
 
     # 组合策略需要 home 读配置，单标的策略没有该参数——按签名显式分派，不靠猜
     params = inspect.signature(strategy.target_weights).parameters
-    weights = strategy.target_weights(conn, today, **({"home": home} if "home" in params else {}))
+    try:
+        weights = strategy.target_weights(conn, today, **({"home": home} if "home" in params else {}))
+    except ValueError as error:
+        # 组合策略要读风控配置（权重上限）；trading-risk.json 非法时 risk_config 抛
+        # ValueError——作业契约是「永不抛」，这里按 fail-closed 软跳过并告警
+        # （静默回退默认值会掩盖配置错误：配置非法时宁可当日不生成计划）
+        return skip(f"策略权重计算失败：{str(error)[:120]}", "warn", "策略权重失败")
     target = {s: w for s, w in (weights or {}).items()
               if CALENDAR_MARKET.get(str(s).split(".", 1)[0]) == market}
 
@@ -241,6 +293,8 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
 
     plan = build_and_freeze(conn, mode=mode, strategy_id=entry["strategy"], target=target,
                             broker_positions=lambda _mode: (positions, equity),
-                            prices=prices, as_of=today, origin="auto", market=market)
+                            prices=prices, as_of=today, origin="auto", market=market,
+                            risk_config=daemon.risk_config(home))
     return {"ok": True, "plan": plan, "expired": expired, "no_price": no_price,
-            "equity": equity, "watchlist": len(symbols)}
+            "no_atr": list(plan.get("skipped") or []), "equity": equity,
+            "watchlist": len(symbols)}
