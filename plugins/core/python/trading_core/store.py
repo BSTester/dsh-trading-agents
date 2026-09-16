@@ -66,6 +66,17 @@ CREATE TABLE IF NOT EXISTS sentiment_snapshots(
   date TEXT NOT NULL, symbol TEXT NOT NULL, source TEXT NOT NULL,
   payload TEXT NOT NULL, fetched_at TEXT NOT NULL,
   PRIMARY KEY(date, symbol, source)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS f10_snapshots(
+  symbol TEXT NOT NULL, section TEXT NOT NULL, period_end TEXT NOT NULL,
+  announced_at TEXT, payload TEXT NOT NULL, fetched_at TEXT NOT NULL,
+  PRIMARY KEY(symbol, section, period_end, fetched_at)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS short_snapshots(
+  symbol TEXT NOT NULL, date TEXT NOT NULL, payload TEXT NOT NULL,
+  fetched_at TEXT NOT NULL, PRIMARY KEY(symbol, date)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS plate_snapshots(
+  date TEXT NOT NULL, market TEXT NOT NULL, plate_class TEXT NOT NULL,
+  payload TEXT NOT NULL, fetched_at TEXT NOT NULL,
+  PRIMARY KEY(date, market, plate_class)) WITHOUT ROWID;
 """
 
 # ---------------------------------------------------------------------------
@@ -686,3 +697,164 @@ def sentiment_streak(conn, market=None, today=None):
         count += 1
         cursor -= timedelta(days=1)
     return count
+
+
+# ---------------------------------------------------------------------------
+# WP12 任务 5：富途数据面研究快照三表（规格 §7.3）——F10 深度数据 / 做空 / 板块目录。
+# 表与 WP7 factor_snapshots、WP11 sentiment_snapshots 同一先例（CREATE TABLE IF NOT
+# EXISTS 幂等追加，SCHEMA_VERSION 不动）；同样是**观测记录**而非 bar 序列：一行 = 一次
+# 抓取，payload 是上游原文 JSON，不打分、不重算（原始数据不会漂移，口径会）。
+#
+# PIT 语义（规格 §7.3「钥匙按 section 语义取值，不得统一硬套」）：
+#   * ``announced_at`` 非空（财报/公告类）→ 可查询性由**披露时点**决定（antichain：
+#     只有 announced_at <= as_of 的行可读，防「报告期早但尚未公告」的前视）；
+#   * ``announced_at`` 为空（持仓/评级/共识等快照类，或上游未给披露时点）→ 退化为
+#     **观测时点**口径：只有观测日 <= as_of 的行可读；采集侧在此情形写入
+#     ``_observed_note`` 标注，读侧不做二次判定（标注只解释口径，不参与过滤）。
+#
+# 主键取 ``(symbol, section, period_end, fetched_at)`` 的理由（规格 §7.3 二选一）：
+#   * 只按 period_end 做键会让**同一报告期内的后续观测覆盖先前观测**——早期 as_of 的
+#     研究将读不到当时的观测，或读到更晚的值（前视），违反 PIT 的第一性要求；
+#   * 纳入 fetched_at 后，每次观测各自留痕（观测不可被后来的观测抹掉），而同一观测时点
+#     重跑仍覆盖自身（幂等）——作业侧以一次运行的观测时刻入参，重跑即同键。
+#   * ``period_end`` 非空（无自然期的 section 回落观测日）：保证键可比较且同日幂等，
+#     否则 NULL 在键里彼此互不相等，重跑会不断堆积。
+# ---------------------------------------------------------------------------
+
+#: 观测口径标注键（规格 §7.3）：可查询性依据是观测时点而非数据披露时点。
+OBSERVED_NOTE_KEY = "_observed_note"
+
+
+def _json_payload(payload, table):
+    """渠道原文 → 存储字符串（dict/list 序列化；str 必须已是 JSON）。非法即 ValueError。
+
+    宁缺毋假：写不进去的坏数据在这里就拒绝，**不写占位行**（与 insert_sentiment 同口径）。
+    """
+    if isinstance(payload, (dict, list)):
+        payload = json.dumps(payload, ensure_ascii=False)
+    elif not isinstance(payload, str):
+        raise ValueError(f"{table} payload 必须是 JSON 字符串或对象，"
+                         f"收到 {type(payload).__name__}")
+    try:
+        json.loads(payload)
+    except ValueError as error:
+        raise ValueError(f"{table} payload 不是合法 JSON：{error}") from None
+    return payload
+
+
+def insert_f10(conn, symbol, section, payload, period_end, announced_at=None,
+               fetched_at=None):
+    """按 (symbol,section,period_end,fetched_at) upsert F10 观测（同一观测时点幂等）。
+
+    ``period_end`` 必须给（调用方约定：数据自身期，取不到则给观测日——见模块注释）；
+    ``announced_at`` 只在**拿到披露时点**时给，否则留 None 走观测口径。
+    """
+    conn.execute(
+        "INSERT INTO f10_snapshots(symbol,section,period_end,announced_at,payload,"
+        "fetched_at) VALUES(?,?,?,?,?,?)"
+        " ON CONFLICT(symbol,section,period_end,fetched_at) DO UPDATE SET"
+        " announced_at=excluded.announced_at, payload=excluded.payload",
+        (symbol, section, period_end, announced_at,
+         _json_payload(payload, "f10_snapshots"), fetched_at or _now()))
+    conn.commit()
+
+
+def read_f10(conn, symbol, section, as_of):
+    """该标的该 section 在 ``as_of`` 时点**可见**的 F10 观测（倒序，最新在前）。
+
+    PIT 上界（规格 §7.3，两条互斥路径）：
+      * ``announced_at`` 非空 → 只返 ``announced_at <= as_of``（含当日）；
+      * ``announced_at`` 为空 → 只返 ``substr(fetched_at,1,10) <= as_of``（观测日上界）。
+    """
+    rows = conn.execute(
+        "SELECT symbol,section,period_end,announced_at,payload,fetched_at"
+        " FROM f10_snapshots WHERE symbol=? AND section=? AND ("
+        "  (announced_at IS NOT NULL AND announced_at <= ?)"
+        "  OR (announced_at IS NULL AND substr(fetched_at,1,10) <= ?))"
+        " ORDER BY fetched_at DESC, period_end DESC",
+        (symbol, section, as_of, as_of)).fetchall()
+    return [{"symbol": r["symbol"], "section": r["section"], "period_end": r["period_end"],
+             "announced_at": r["announced_at"], "payload": json.loads(r["payload"]),
+             "fetched_at": r["fetched_at"]} for r in rows]
+
+
+def insert_short(conn, symbol, date, payload, fetched_at=None):
+    """按 (symbol,date) upsert 做空观测（同日重跑幂等覆盖）。"""
+    conn.execute(
+        "INSERT INTO short_snapshots(symbol,date,payload,fetched_at) VALUES(?,?,?,?)"
+        " ON CONFLICT(symbol,date) DO UPDATE SET payload=excluded.payload,"
+        " fetched_at=excluded.fetched_at",
+        (symbol, date, _json_payload(payload, "short_snapshots"), fetched_at or _now()))
+    conn.commit()
+
+
+def read_shorts(conn, symbol, before=None):
+    """该标的做空观测（日期倒序）；``before`` 给定时只返 ``date <= before``。"""
+    sql = "SELECT symbol,date,payload,fetched_at FROM short_snapshots WHERE symbol=?"
+    params = [symbol]
+    if before:
+        sql += " AND date<=?"
+        params.append(before)
+    sql += " ORDER BY date DESC"
+    rows = conn.execute(sql, params).fetchall()
+    return [{"symbol": r["symbol"], "date": r["date"], "fetched_at": r["fetched_at"],
+             "payload": json.loads(r["payload"])} for r in rows]
+
+
+def insert_plate(conn, date, market, plate_class, payload, fetched_at=None):
+    """按 (date,market,plate_class) upsert 板块目录观测（同日重跑幂等覆盖）。"""
+    conn.execute(
+        "INSERT INTO plate_snapshots(date,market,plate_class,payload,fetched_at)"
+        " VALUES(?,?,?,?,?) ON CONFLICT(date,market,plate_class) DO UPDATE SET"
+        " payload=excluded.payload, fetched_at=excluded.fetched_at",
+        (date, market, plate_class, _json_payload(payload, "plate_snapshots"),
+         fetched_at or _now()))
+    conn.commit()
+
+
+def read_plates(conn, date=None, market=None, plate_class=None):
+    """板块目录观测；``date`` 缺省取最近有观测的日期（无任何观测返回 []）。"""
+    if date is None:
+        row = conn.execute("SELECT MAX(date) AS d FROM plate_snapshots").fetchone()
+        date = row["d"]
+        if date is None:
+            return []
+    sql = ("SELECT date,market,plate_class,payload,fetched_at FROM plate_snapshots"
+           " WHERE date=?")
+    params = [date]
+    for column, value in (("market", market), ("plate_class", plate_class)):
+        if value:
+            sql += f" AND {column}=?"
+            params.append(value)
+    sql += " ORDER BY market, plate_class"
+    rows = conn.execute(sql, params).fetchall()
+    return [{"date": r["date"], "market": r["market"], "plate_class": r["plate_class"],
+             "fetched_at": r["fetched_at"], "payload": json.loads(r["payload"])}
+            for r in rows]
+
+
+def research_stats(conn):
+    """研究数据覆盖统计（CLI ``research-snapshot --stats`` 的取数口径）。
+
+    ``announced_ratio`` 是 F10 行里**拿到披露时点**的比例——它就是「有多少行是按公告日
+    对齐的」的可观测下界；其余行走观测口径（规格 §7.3），值低不是错误，是如实状态。
+    """
+    f10 = conn.execute(
+        "SELECT COUNT(*) AS rows, COUNT(DISTINCT symbol) AS symbols,"
+        " COUNT(DISTINCT section) AS sections,"
+        " SUM(CASE WHEN announced_at IS NOT NULL THEN 1 ELSE 0 END) AS announced,"
+        " MAX(substr(fetched_at,1,10)) AS latest FROM f10_snapshots").fetchone()
+    total = int(f10["rows"] or 0)
+    announced = int(f10["announced"] or 0)
+    short = conn.execute(
+        "SELECT COUNT(*) AS rows, COUNT(DISTINCT symbol) AS symbols, MAX(date) AS latest"
+        " FROM short_snapshots").fetchone()
+    plate = conn.execute(
+        "SELECT COUNT(*) AS rows, MAX(date) AS latest FROM plate_snapshots").fetchone()
+    return {"f10": {"rows": total, "symbols": int(f10["symbols"] or 0),
+                    "sections": int(f10["sections"] or 0), "announced": announced,
+                    "announced_ratio": (announced / total) if total else None,
+                    "latest": f10["latest"]},
+            "short": {"rows": int(short["rows"] or 0),
+                      "symbols": int(short["symbols"] or 0), "latest": short["latest"]},
+            "plate": {"rows": int(plate["rows"] or 0), "latest": plate["latest"]}}

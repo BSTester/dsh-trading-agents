@@ -106,7 +106,7 @@ class StageDerivationTests(PipelineBase):
         stages = self.stages(out)
         self.assertEqual(list(stages), ["sync_bars", "sync_fundamentals", "merge_announcements",
                                         "quality", "factors_snapshot", "sentiment_snapshot",
-                                        "plan", "execute"])
+                                        "research_snapshot", "plan", "execute"])
         self.assertEqual({s["status"] for s in stages.values()}, {"pending"})
         self.assertFalse(out["auto_pipeline"]["enabled"])
         self.assertEqual(out["date"], DATE)
@@ -120,7 +120,8 @@ class StageDerivationTests(PipelineBase):
         # 阶段顺序：真实作业链 + plan 紧跟 build_plan、execute 紧跟 auto_execute
         self.assertEqual(list(stages), ["sync_bars", "sync_fundamentals", "merge_announcements",
                                         "quality", "factors_snapshot", "sentiment_snapshot",
-                                        "build_plan", "plan", "auto_execute", "execute"])
+                                        "research_snapshot", "build_plan", "plan",
+                                        "auto_execute", "execute"])
         sync = stages["sync_bars"]
         self.assertEqual(sync["status"], "ok")
         self.assertEqual(sync["at"], "2026-09-16 16:00:05")

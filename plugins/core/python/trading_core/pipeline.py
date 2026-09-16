@@ -106,6 +106,13 @@ _ALERT_STATUS = {
     "情绪快照跳过": ("sentiment_snapshot", "skipped"),
     "情绪源不可用": ("sentiment_snapshot", "failed"),
     "情绪快照全部失败": ("sentiment_snapshot", "failed"),
+    # research_sync.run（research_snapshot 作业，WP12 任务 5）——仅作业**没跑完**时的状态
+    # 归因；作业跑完（有 ran 标记）时软失败不改状态，结局在结算 failed/absent 与告警明细里
+    # 可查（与情绪阶段同一分工：状态说「跑没跑」，内容说「采到什么」）。
+    "研究快照跳过": ("research_snapshot", "skipped"),
+    "研究数据面未配置": ("research_snapshot", "skipped"),
+    "研究快照源不可用": ("research_snapshot", "failed"),
+    "研究快照全部失败": ("research_snapshot", "failed"),
 }
 
 #: 情绪采集的**内容结局**（作业跑完后的软失败）→ 摘要片段。软失败（池空/全源失败/会话

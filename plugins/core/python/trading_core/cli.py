@@ -115,6 +115,20 @@ def build_parser():
                    help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用）")
     _add_db(s)
 
+    s = sub.add_parser("research-snapshot",
+                       help="研究数据 PIT 快照（F10 关键 section/做空/板块目录；"
+                            "落 f10_snapshots/short_snapshots/plate_snapshots）")
+    s.add_argument("--market", default=None,
+                   help="市场链：SH/HK/US（SH 链含 SZ/BJ；--stats 时可省）")
+    s.add_argument("--stats", action="store_true",
+                   help="只读输出研究数据覆盖统计（不采集、不写库）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    s.add_argument("--today", default=None,
+                   help="观测日覆盖 YYYY-MM-DD 或完整时刻（测试/补跑用）")
+    s.add_argument("--now", default=None,
+                   help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用）")
+    _add_db(s)
+
     s = sub.add_parser("reconcile-diff", help="离线比对本地与券商持仓 JSON")
     s.add_argument("--local", required=True)
     s.add_argument("--broker", required=True)
@@ -323,6 +337,28 @@ def main(argv=None):
             if not result.get("ok"):
                 print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
                 return 1
+        elif args.cmd == "research-snapshot":
+            # 研究数据 PIT 采集作业体（WP12 任务 5）。与 sentiment-snapshot 同一分级：
+            # 软跳过（会话未收盘/池空/数据面未配置）=退出 0——研究数据是攒 PIT 历史
+            # （250 交易日演进条款的地基），是**基础链**作业，与交易开关无关，未配置
+            # 凭据也不阻塞调度链；市场链/时钟非法=fail-closed 非零退出。
+            # --stats 只读覆盖统计（不采集、不写库）。
+            import os
+            from . import research_sync
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            if args.stats:
+                result = {"ok": True, **store.research_stats(conn)}
+            elif not args.market:
+                print(json.dumps(
+                    {"ok": False, "error": "research-snapshot 需要 --market（或用 --stats）"},
+                    ensure_ascii=False))
+                return 1
+            else:
+                result = research_sync.run(home, args.market, conn=conn,
+                                           today=args.today, now=args.now)
+                if not result.get("ok"):
+                    print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
+                    return 1
         elif args.cmd == "reconcile-diff":
             from . import reconcile
             diffs = reconcile.compare(

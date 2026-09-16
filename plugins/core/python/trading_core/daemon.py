@@ -27,18 +27,25 @@ JOBS_DEFAULT = {
     # 作业而非 auto_pipeline 派生作业：情绪/资讯采集是攒 PIT 历史（250 交易日演进条款
     # 的地基），与交易开关无关——auto_pipeline 关闭时也应持续积累；缺席源如实标
     # absent 并退出 0，不阻塞链。
+    # WP12 任务 5：链尾再追加 research_snapshot（sentiment_snapshot + 5 分钟）。同样是
+    # **基础链**作业（研究数据积累不受交易开关控制）：F10 关键 section/做空/板块目录每日
+    # 落 PIT 表，是 250 交易日演进条款的数据地基；数据面未配置凭据时软跳过退出 0。
+    # 错峰 5 分钟：与情绪采集的浏览器/网络负载分开，避免同刻争用同一通道。
     "SH": [{"name": "sync_bars", "at": "16:00", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "sync_fundamentals", "at": "16:00", "cmd": ["fundamentals", "--tickers", "@watchlist"]},
             {"name": "merge_announcements", "at": "16:05", "cmd": ["merge-announcements", "--period", "@latest-quarter"]},
             {"name": "quality", "at": "16:10", "cmd": ["quality", "--market", "SH"]},
             {"name": "factors_snapshot", "at": "16:15", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
-            {"name": "sentiment_snapshot", "at": "16:25", "cmd": ["sentiment-snapshot", "--market", "SH"]}],
+            {"name": "sentiment_snapshot", "at": "16:25", "cmd": ["sentiment-snapshot", "--market", "SH"]},
+            {"name": "research_snapshot", "at": "16:30", "cmd": ["research-snapshot", "--market", "SH"]}],
     "HK": [{"name": "sync_bars", "at": "16:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "factors_snapshot", "at": "16:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
-            {"name": "sentiment_snapshot", "at": "16:45", "cmd": ["sentiment-snapshot", "--market", "HK"]}],
+            {"name": "sentiment_snapshot", "at": "16:45", "cmd": ["sentiment-snapshot", "--market", "HK"]},
+            {"name": "research_snapshot", "at": "16:50", "cmd": ["research-snapshot", "--market", "HK"]}],
     "US": [{"name": "sync_bars", "at": "05:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "factors_snapshot", "at": "05:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
-            {"name": "sentiment_snapshot", "at": "05:45", "cmd": ["sentiment-snapshot", "--market", "US"]}],
+            {"name": "sentiment_snapshot", "at": "05:45", "cmd": ["sentiment-snapshot", "--market", "US"]},
+            {"name": "research_snapshot", "at": "05:50", "cmd": ["research-snapshot", "--market", "US"]}],
 }
 
 # 风控参数默认值：镜像 engine/python/risk_config.py 的 DEFAULTS（venv 只链接
