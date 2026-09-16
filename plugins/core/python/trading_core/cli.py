@@ -84,6 +84,12 @@ def build_parser():
     s.add_argument("--as-of", required=True)
     _add_db(s)
 
+    s = sub.add_parser("plan-auto", help="自动计划生成（auto_pipeline：策略权重→冻结；按市场链）")
+    s.add_argument("--market", required=True, help="市场链：SH/HK/US（SH 链含 SZ/BJ）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    s.add_argument("--today", default=None, help="as_of 覆盖 YYYY-MM-DD（测试/补跑用）")
+    _add_db(s)
+
     s = sub.add_parser("reconcile-diff", help="离线比对本地与券商持仓 JSON")
     s.add_argument("--local", required=True)
     s.add_argument("--broker", required=True)
@@ -230,6 +236,16 @@ def main(argv=None):
             result = planner.build_and_freeze(conn, mode=args.mode, strategy_id=args.strategy,
                                               target=target, broker_positions=broker_positions,
                                               prices=prices, as_of=args.as_of)
+        elif args.cmd == "plan-auto":
+            # auto_pipeline 的 build_plan 作业体（WP9）。软跳过=退出 0（当日不生成计划
+            # 是正常结论）；配置/模式非法=fail-closed 非零退出，让调度链与运维看得到。
+            import os
+            from . import planner
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = planner.plan_auto(conn, home, args.market, today=args.today)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False, indent=1))
+                return 1
         elif args.cmd == "reconcile-diff":
             from . import reconcile
             diffs = reconcile.compare(
