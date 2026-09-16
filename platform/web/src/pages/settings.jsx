@@ -18,11 +18,14 @@
 // 本页也绝不把粘贴框内容写进 localStorage，刷新即丢、以服务端落盘为准。
 import React from "react";
 import {
-  Alert, App, Button, Card, Descriptions, Form, Input, Radio, Select, Space, Tabs,
-  Tag, Typography,
+  Alert, App, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Select, Space,
+  Switch, Tabs, Tag, Typography,
 } from "antd";
 import { callApi, clearCache, getToken, setToken } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
+import {
+  MARKETS, autoPipelineDraft, autoPipelinePayload, newStrategyRow,
+} from "../services/pipeline.js";
 
 const { TextArea } = Input;
 
@@ -176,6 +179,133 @@ function ServiceTokenSection() {
   );
 }
 
+/** 自动流水线：总开关 + 策略行 + 各市场执行时刻 + 执行窗口 + 晚间对账时刻。
+ *  端点：auto_pipeline —— 空载荷=读有效配置（与 GET /api/wb/auto_pipeline 同一实现）；
+ *  带载荷=校验（复用 trading_core.autopipeline.apply_overlay，与调度侧同一实现）后原子写，
+ *  失败文件零改动。草稿与载荷的键集恒等于服务端白名单（services/pipeline.js 的
+ *  AUTO_PIPELINE_KEYS）——只读字段（error/date）不会经本页回写。
+ *  语义：开关作用于流水线的**自动执行**环节；实盘（live）的计划照常生成但永不自动执行，
+ *  仍走计划页人工确认。 */
+function AutoPipelineSection() {
+  const { message } = App.useApp();
+  const config = useEndpoint("auto_pipeline", {}, []);
+  const [draft, setDraft] = React.useState(null);
+  const [busy, setBusy] = React.useState(false);
+
+  // 读回后初始化一次草稿：用户编辑期间不被后续读回覆盖（刷新只更新卡片右上角标签）。
+  React.useEffect(() => {
+    if (config.value && draft === null) setDraft(autoPipelineDraft(config.value));
+  }, [config.value, draft]);
+
+  const base = () => draft ?? autoPipelineDraft(config.value);
+  const patch = (fields) => setDraft({ ...base(), ...fields });
+  const patchExecAt = (market, value) => setDraft({
+    ...base(), exec_at: { ...base().exec_at, [market]: value } });
+  const patchStrategy = (index, fields) => {
+    const rows = base().strategies.map((row, i) => (i === index ? { ...row, ...fields } : row));
+    setDraft({ ...base(), strategies: rows });
+  };
+  const addStrategy = () => setDraft({ ...base(), strategies: [...base().strategies, newStrategyRow()] });
+  const removeStrategy = (index) => setDraft({
+    ...base(), strategies: base().strategies.filter((_row, i) => i !== index) });
+
+  const save = async () => {
+    setBusy(true);
+    try {
+      const value = await callApi("auto_pipeline", autoPipelinePayload(base()));
+      setDraft(autoPipelineDraft(value));
+      message.success("自动流水线配置已保存");
+      config.refresh();
+    } catch (error) {
+      message.error(`保存失败：${error.message || error}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const loading = config.loading && !config.value;
+  const enabled = base().enabled === true;
+  return (
+    <Card size="small" title="自动流水线"
+      extra={enabled ? <Tag color="green">自动执行已开启</Tag> : <Tag>自动执行关闭</Tag>}>
+      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+        {config.error && (
+          <Alert type="warning" showIcon message={`配置读取失败：${config.error}`} />)}
+        {config.value?.error && (
+          <Alert type="error" showIcon message={`当前配置非法：${config.value.error}`}
+            description="配置文件里的 auto_pipeline 无法被调度侧解析；保存一次合法配置即可覆盖。" />)}
+
+        <Space size="small" wrap>
+          <Switch checked={enabled} disabled={loading || busy} aria-label="启用自动流水线"
+            onChange={(checked) => patch({ enabled: checked })} />
+          <Typography.Text>启用自动流水线</Typography.Text>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            仅模拟盘自动执行；实盘计划照常生成，但仍需在计划页人工确认
+          </Typography.Text>
+        </Space>
+
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          策略（市场 + 策略名 + 关注池键名）：每个市场每天按策略生成目标权重并冻结计划
+        </Typography.Text>
+        {base().strategies.length === 0 && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            未配置策略：开启后流水线只跑数据与对账，不会生成计划
+          </Typography.Text>)}
+        {base().strategies.map((row, index) => (
+          <Space key={`strategy-${index}`} size="small" wrap>
+            <Select value={row.market || undefined} style={{ width: 90 }}
+              disabled={busy} aria-label={`策略 ${index + 1} 市场`}
+              placeholder="市场"
+              onChange={(value) => patchStrategy(index, { market: value })}
+              options={MARKETS.map((market) => ({ value: market, label: market }))} />
+            <Input value={row.strategy} style={{ width: 200 }} disabled={busy}
+              aria-label={`策略 ${index + 1} 名称`} placeholder="策略名，如 watchlist_rsi"
+              onChange={(event) => patchStrategy(index, { strategy: event.target.value })} />
+            <Input value={row.watchlist} style={{ width: 160 }} disabled={busy}
+              aria-label={`策略 ${index + 1} 关注池键`} placeholder="池键，如 watchlist"
+              onChange={(event) => patchStrategy(index, { watchlist: event.target.value })} />
+            <Button size="small" disabled={busy} onClick={() => removeStrategy(index)}>删除</Button>
+          </Space>))}
+        <Button size="small" disabled={busy} onClick={addStrategy}>添加策略</Button>
+
+        <Space size="small" wrap>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>执行时刻（北京时间）</Typography.Text>
+          {MARKETS.map((market) => (
+            <Space key={market} size={4}>
+              <Typography.Text>{market}</Typography.Text>
+              <Input value={base().exec_at[market] ?? ""} style={{ width: 80 }} disabled={busy}
+                aria-label={`${market} 执行时刻`} placeholder="HH:MM"
+                onChange={(event) => patchExecAt(market, event.target.value)} />
+            </Space>))}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            窗口
+          </Typography.Text>
+          <InputNumber value={base().exec_window_minutes} min={1} max={240} disabled={busy}
+            aria-label="执行窗口分钟数"
+            onChange={(value) => patch({ exec_window_minutes: value })} />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>分钟</Typography.Text>
+        </Space>
+
+        <Space size="small" wrap>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>晚间对账时刻</Typography.Text>
+          <Input value={base().reconcile_at} style={{ width: 80 }} disabled={busy}
+            aria-label="晚间对账时刻" placeholder="HH:MM"
+            onChange={(event) => patch({ reconcile_at: event.target.value })} />
+        </Space>
+
+        <Space size="small" wrap>
+          <Button type="primary" loading={busy} disabled={loading || draft === null}
+            onClick={save}>保存自动流水线</Button>
+          {loading && <Typography.Text type="secondary">配置读取中…</Typography.Text>}
+        </Space>
+        <Typography.Text type="secondary" style={{ display: "block", fontSize: 12 }}>
+          关闭时流水线不自动运行（数据同步与因子快照等既有作业不受本开关影响）；
+          执行时刻按各市场交易日历触发，美股为夏令时口径，冬令时需人工调整。
+        </Typography.Text>
+      </Space>
+    </Card>);
+}
+
 export default function SettingsPage() {
   const status = useEndpoint("openapi_config", {}, []);
   const [form] = Form.useForm();
@@ -293,6 +423,7 @@ export default function SettingsPage() {
           description={<Typography.Text copyable={testResult.ok} style={{ fontSize: 12 }}>{testResult.text}</Typography.Text>} />
       )}
       <ServiceTokenSection />
+      <AutoPipelineSection />
       <StatusCard status={status} />
     </Space>
   );

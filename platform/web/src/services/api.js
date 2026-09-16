@@ -10,6 +10,9 @@ const TTL_MS = {
   events: 3_600_000, factors: 1_800_000, ic: 1_800_000, audit: 120_000,
   sources: 300_000, instrument: 600_000, quality: 3_600_000,
   plan: 60_000, schedule: 30_000, reconcile: 300_000,
+  // WP10 任务 3：流程页对齐服务端 30 秒缓存（caches.py CACHE_TTL_MS["pipeline"]）；
+  // auto_pipeline 是设置页读/写端点，与服务端同口径实时直通（不缓存）。
+  pipeline: 30_000, auto_pipeline: 0,
   // WP7：因子快照历史对齐服务端 5 分钟缓存（caches.CACHE_TTL_MS["factors-history"]）
   "factors-history": 300_000,
   // WP8 富途实时直通 + OpenAPI 交易只读 + 推送状态：服务端一律 TTL 0（实时直通，

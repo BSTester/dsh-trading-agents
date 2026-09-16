@@ -18,6 +18,7 @@ import ExecutionPage from "./pages/execution.jsx";
 import ResearchPage from "./pages/research.jsx";
 import EventsPage from "./pages/events.jsx";
 import PlanPage from "./pages/plan.jsx";
+import PipelinePage from "./pages/pipeline.jsx";
 import SchedulePage from "./pages/schedule.jsx";
 import AuditPage from "./pages/audit.jsx";
 import SettingsPage from "./pages/settings.jsx";
@@ -35,6 +36,9 @@ const PAGES = [
   { key: "research", name: "研究", element: <ResearchPage /> },
   { key: "events", name: "事件", element: <EventsPage /> },
   { key: "plan", name: "计划", element: <PlanPage /> },
+  // WP10 任务 3：流程页（当日闭环阶段链）；放在「调度」之前——先看闭环跑到哪一步，
+  // 再看调度作业明细。
+  { key: "pipeline", name: "流程", element: <PipelinePage /> },
   { key: "schedule", name: "调度", element: <SchedulePage /> },
   { key: "audit", name: "审计", element: <AuditPage /> },
   // WP8 任务 7：设置页收尾（富途 OpenAPI 凭据配置：保存/测试/状态）
