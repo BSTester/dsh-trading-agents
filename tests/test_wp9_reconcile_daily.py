@@ -11,7 +11,10 @@
   * ⑦ **对账前从券商订单历史回填 fills**（修复 sim 系统性假差异与自锁熔断）：
     回填后本地台账等于券商事实 → 一致即零 diff；真差异不放过；幂等（连跑两次不重复落库）；
     均价不可得 → 不回填、不编造价格（缺口以 qty_diff 如实暴露）；cum_qty=0 不产生 fills；
-    历史存量持仓仍是 untracked。
+    历史存量持仓仍是 untracked；
+  * ⑧ **按累计成交量推进 OMS 状态**（修复订单级自锁熔断路径）：足额 → filled、
+    部分 → partial、cum=0 不动、终态不回退、非法迁移跳过并计数且仍暴露为差异；
+    推进后真差异照旧 critical + halt。
 """
 import contextlib
 import io
@@ -118,6 +121,10 @@ class ReconcileDailyTest(unittest.TestCase):
     def _fill_count(self):
         return self.conn.execute("SELECT COUNT(*) AS n FROM fills").fetchone()["n"]
 
+    def _order_status(self, cid):
+        return self.conn.execute("SELECT status FROM orders WHERE client_order_id=?",
+                                 (cid,)).fetchone()["status"]
+
     def _levels(self):
         return [r["level"] for r in self.conn.execute(
             "SELECT level FROM alerts ORDER BY id").fetchall()]
@@ -167,18 +174,133 @@ class ReconcileDailyTest(unittest.TestCase):
         result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
         self.assertEqual(result["diffs"], [])
 
-    def test_broker_filled_but_oms_not_recorded_is_diff(self):
-        """数量可推导的一类状态不一致：券商累计成交已足额，OMS 却仍记在途。"""
+    def test_broker_filled_advances_oms_status_not_a_diff(self):
+        """⑧ 语义变更（WP9 订单级自锁熔断修复）：券商累计成交已足额 → 对账**先学习
+        券商事实**（推进 OMS 到 ``filled``），再判差异——因此本场景是「同步」而非「差异」。
+
+        变更前的期望（保留在此供对照，勿回退）：判 ``status_or_qty_diff``
+        （reason「券商累计成交已足额但 OMS 未记成交」）+ critical + ``set_halt``。
+        但 sim 通道的成交不经 WS 交易事件通道，OMS 状态必然停在 ``submitted``——
+        纯比对会把「本地尚未学习」系统性误报为差异，每日 halt 把自动执行**永久熔断**
+        （模拟盘全自动的前提因此不成立，实现期实测证实）。对账的职责是先同步券商事实、
+        再判差异：只有同步后仍存在的差异才是真差异。
+        """
         self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="submitted")
         broker = _FakeBroker(
             orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
                                                          cum_qty="100")]},
             positions_by_market={3: [{"symbol": "600519", "qty": 100}]})
         result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        # 同步消解了该场景：零差异、零 critical、不 halt
+        self.assertEqual(result["diffs"], [], result["diffs"])
+        self.assertFalse(result["halted"])
+        self.assertFalse(store.is_halted(self.conn))
+        self.assertNotIn("critical", self._levels())
+        # 状态确实被券商事实推进（数量口径：cum 100 >= 委托 100）
+        self.assertEqual(result["orders_advanced"]["count"], 1)
+        self.assertEqual(result["orders_advanced"]["skipped"], 0)
+        step = result["orders_advanced"]["orders"][0]
+        self.assertEqual((step["from"], step["to"]), ("submitted", "filled"))
+        self.assertEqual((step["broker_cum_qty"], step["oms_qty"]), (100, 100))
+        self.assertEqual(self._order_status("o-1"), "filled")
+        # 摘要进 digest（流程页/运维可见），且全程零写类券商调用
+        self.assertEqual(store.kv_get(self.conn, "daily:digest")["orders_advanced"],
+                         {"count": 1, "skipped": 0})
+        self.assertTrue(set(broker.tools()) <= READ_TOOLS, broker.tools())
+
+    def test_partial_fill_advances_to_partial_without_diff(self):
+        """⑧ 部分成交 → OMS ``partial``；数量与 fills 一致 → 零差异。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="submitted")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="30")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 30}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(self._order_status("o-1"), "partial")
+        self.assertEqual(result["orders_advanced"]["count"], 1)
+        self.assertEqual(result["orders_advanced"]["orders"][0]["to"], "partial")
+        # 回填 30 股 → 本地净持仓 == 券商持仓 → 零差异
+        self.assertEqual(reconcile.local_net_positions(self.conn), {"SH.600519": 30})
+        self.assertEqual(result["diffs"], [], result["diffs"])
+        self.assertFalse(store.is_halted(self.conn))
+
+    def test_zero_cum_qty_does_not_touch_status(self):
+        """⑧ 券商累计成交 0（在途未成）→ OMS 状态不动、零差异。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="submitted")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="0")]},
+            positions_by_market={3: []})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["orders_advanced"]["count"], 0)
+        self.assertEqual(self._order_status("o-1"), "submitted")
+        self.assertEqual(result["diffs"], [], result["diffs"])
+        self.assertFalse(store.is_halted(self.conn))
+
+    def test_terminal_filled_order_is_not_retransitioned(self):
+        """⑧ 只前进不回退：已 ``filled`` 的订单不再迁移（且不算作跳过噪音）。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="filled")
+        self._fill("F1", "o-1", 100)
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 100}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["orders_advanced"]["count"], 0)
+        self.assertEqual(result["orders_advanced"]["skipped"], 0)
+        self.assertEqual(result["orders_advanced"]["orders"], [])
+        self.assertEqual(self._order_status("o-1"), "filled")
+        self.assertEqual(result["diffs"], [], result["diffs"])
+
+    def test_illegal_transition_is_skipped_counted_and_still_a_diff(self):
+        """⑧ 非法迁移不崩、不掩盖、**不绕开状态机**：``submitting → filled`` 不在
+        ``oms.TRANSITIONS`` 白名单（须先经 ``submitted``）→ 捕获跳过并计数；该订单随后
+        仍被数量矛盾判据暴露为真差异（critical + halt，保守方向：宁可停下来给人看，
+        也不用「多步走」替状态机猜路径）。
+        """
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="submitting")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: []})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["orders_advanced"]["count"], 0)
+        self.assertEqual(result["orders_advanced"]["skipped"], 1)
+        skipped = result["orders_advanced"]["skipped_orders"][0]
+        self.assertEqual((skipped["from"], skipped["to"]), ("submitting", "filled"))
+        self.assertIn("非法迁移", skipped["reason"])
+        self.assertEqual(self._order_status("o-1"), "submitting")   # 状态未被硬改
+        # 同步消解不了 → 差异照旧（不掩盖）
         kinds = self._kinds(result["diffs"])
         self.assertEqual(kinds.get("status_or_qty_diff"), 1, result["diffs"])
-        self.assertIn("券商累计成交已足额", result["diffs"][0]["reason"])
-        self.assertEqual(result["diffs"][0]["broker_cum_qty"], 100)
+        self.assertTrue(store.is_halted(self.conn))
+
+    def test_real_position_diff_still_halts_after_advance(self):
+        """⑧ 同步不掩盖真差异：券商 cum 100 但持仓 200 ≠ 本地 100 → critical + halt。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="submitted")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 200}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(self._order_status("o-1"), "filled")       # 订单级同步成功
+        pos_diffs = [d for d in result["diffs"] if d["kind"] == "qty"]
+        self.assertEqual(len(pos_diffs), 1, result["diffs"])
+        self.assertEqual((pos_diffs[0]["local"], pos_diffs[0]["broker"]), (100, 200))
+        self.assertTrue(result["halted"])
+        self.assertTrue(store.is_halted(self.conn))
+
+    def test_missing_in_oms_survives_advance(self):
+        """⑧ 券商有单、OMS 完全无对应行 → 同步无从推进（无本地行可改）→ 仍 missing_in_oms。"""
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-9", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: []})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["orders_advanced"]["count"], 0)
+        kinds = self._kinds(result["diffs"])
+        self.assertEqual(kinds.get("missing_in_oms"), 1, result["diffs"])
+        self.assertTrue(store.is_halted(self.conn))
 
     # ---- ② 持仓级 ----
 

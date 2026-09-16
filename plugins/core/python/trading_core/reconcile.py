@@ -16,18 +16,27 @@ critical 告警 + halt（**只暂停后续执行，绝不自动平仓**）→ TC
 * **持仓口径**：本地台账 = OMS ``fills`` 派生的**累计**净持仓（买 + 卖 −）；
   只有 OMS 有足迹（任何订单或成交）的标的参与差异判定——券商有持仓而 OMS 无任何
   记录的标的记入 ``untracked``，**不计差异**（多半是平台外建的仓，报差异是噪音）；
-* **对账前回填成交**（修复 sim 系统性假差异）：sim 通道的成交**不经** WS 交易事件通道
-  （``platform/server/trading.py::_record_fill`` 只在推送路径写 ``fills``），因此 sim
-  常态下 ``fills`` 基本为空 → 本地净持仓恒为 0 → 有 OMS 足迹的持仓全部报 ``qty_diff``
-  → critical + ``set_halt`` → 自动执行被自己的对账噪声永久熔断。修复：持仓级比对之前
-  按券商订单历史的**累计成交**回填 ``fills``（``_backfill_fills``），让本地台账真的等于
-  券商事实——回填只认券商订单历史，历史存量持仓仍是 ``untracked``；
+* **先同步券商事实，再判差异**（修复 sim 系统性假差异与两条自锁熔断路径）：sim 通道的
+  成交**不经** WS 交易事件通道（``platform/server/trading.py::_record_fill`` 只在推送
+  路径写 ``fills``），因此本地台账在 sim 常态下既没有成交、订单状态也停在 ``submitted``。
+  若对账只做纯比对，会把「本地尚未学习」系统性误报为差异 → 每日 critical + ``set_halt``
+  → **自动执行被自己的对账噪声永久熔断**（模拟盘全自动的前提因此不成立）。同步分两步，
+  都在比对之前完成，且**只读券商、只写本地**：
+
+  1. **成交回填**（``_backfill_fills``，消除持仓级假差异）：按券商订单历史的累计成交量与
+     均价补记 ``fills`` 差额，让本地净持仓真的等于券商事实——回填只认券商订单历史，
+     历史存量持仓仍是 ``untracked``；
+  2. **状态推进**（``_advance_order_states``，消除订单级假差异）：按券商累计成交量推进
+     OMS 订单状态（足额→``filled``、部分→``partial``），让订单级判定看到同步后的状态
+     ——否则「券商累计成交已足额但 OMS 未记成交」在 sim 下必然触发。
+
+  同步后仍存在的差异才是真差异（critical + halt）。两步都不向券商写、都不重放。
 * **零写操作**：本模块只调用券商只读工具，任何写类（下单/撤单/改单）都不出现。
 """
 import datetime as _dt
 import hashlib
 
-from . import store
+from . import oms, store
 
 _TZ8 = _dt.timezone(_dt.timedelta(hours=8))
 
@@ -302,6 +311,60 @@ def _backfill_fills(conn, pairs):
             "orders": inserted, "skipped_orders": skipped}
 
 
+def _advance_order_states(conn, pairs):
+    """对账「先同步券商事实」的第二步：按券商累计成交量推进 OMS 订单状态。
+
+    为什么必须推进：sim 通道的成交不经 WS 交易事件通道，OMS 状态会停在 ``submitted``
+    （或 ``unknown``）；而 ``_pair_diffs`` 的「券商累计成交已足额但 OMS 未记成交」判据
+    在 sim 下必然成立 → 每日 critical + ``set_halt`` → 自动执行被自己的对账噪声永久
+    熔断。把券商事实先学进本地，判定才是在比「两侧真实状态」，而不是比「本地学没学会」。
+
+    口径与边界（诚实清单）：
+
+    * **数量口径优先于状态文本**（延续 WP8 P1 遗留项）：券商 ``cum_qty`` 是原文数量事实，
+      券商 ``status`` 是未公开整数码——因此只按 ``cum_qty`` 与委托量的关系推进，
+      **绝不解释状态码**；
+    * **只前进不回退**：目标状态由数量关系决定（足额→``filled``、部分→``partial``），
+      无出边的终态（``filled``/``cancelled``/``rejected``，即 ``TRANSITIONS`` 里没有该键
+      或为空）直接跳过——券商修正使累计量回落时不会把 ``filled`` 拉回 ``partial``；
+    * **非法迁移不崩、不掩盖**：``submitting → filled`` 不在状态机白名单（须先经
+      ``submitted``），此类订单抛 ``ValueError`` 被捕获并计入 ``skipped``——**不绕开
+      状态机**；它们随后仍会被 ``_pair_diffs`` 的数量矛盾判据暴露为差异（保守方向）；
+    * **就地刷新共享匹配结构**：``pairs`` 是回填与订单级判定共用的唯一匹配结果，
+      推进成功后把新状态写回 ``order["status"]``——紧随其后的判定必须看到**同步后**的
+      状态（规格：同步后仍存在的差异才是真差异），否则刚推进到 ``filled`` 的单会被用
+      旧状态再判一次，自锁熔断原样复现；
+    * **零券商写操作**：本函数只读 ``pairs``（券商数据由调用方传入）、只写本地 OMS。
+    """
+    advanced, skipped = [], []
+    for order, broker_row, _match in pairs:
+        cum = broker_row["cum_qty"]
+        if not cum or cum <= 0:
+            continue                                  # 未成交：状态不动
+        oms_qty = _int_of(order["qty"])
+        if oms_qty is None or oms_qty <= 0:
+            continue                                  # 委托量不可解：不猜目标状态
+        if not oms.TRANSITIONS.get(order["status"]):
+            continue                                  # 终态（无出边）：只前进不回退
+        target = "filled" if int(cum) >= oms_qty else "partial"
+        if order["status"] == target:
+            continue                                  # 已是目标态：无需迁移
+        cid = order["client_order_id"]
+        before = order["status"]
+        try:
+            oms.transition(conn, cid, target)
+        except ValueError as error:                   # 非法迁移：跳过并计数，不崩
+            skipped.append({"client_order_id": cid, "from": before, "to": target,
+                            "broker_cum_qty": int(cum), "oms_qty": oms_qty,
+                            "reason": str(error)[:120]})
+            continue
+        order["status"] = target                      # 共享结构就地刷新（见 docstring）
+        advanced.append({"client_order_id": cid, "from": before, "to": target,
+                         "broker_cum_qty": int(cum), "oms_qty": oms_qty})
+    return {"count": len(advanced), "skipped": len(skipped),
+            "orders": advanced, "skipped_orders": skipped}
+
+
 def _sim_broker_state(call, today):
     """一次券商只读扫描：各市场账户 → 订单（当日窗口）+ 当前持仓。
 
@@ -344,10 +407,12 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
       {"ok": False, "error": <原因>}                         通道/模式失败（fail-closed）
       {"ok": True,  "diffs": [...], "untracked": [...],
        "orders": {...}, "tca": {...}, "digest": {...},
-       "fills_backfilled": {...}, "halted": <bool>}           对账完成
+       "fills_backfilled": {...}, "orders_advanced": {...}, "halted": <bool>}  对账完成
 
-    ``fills_backfilled`` 是本次「券商订单历史 → fills」的回填摘要（``count`` 落库条数、
-    ``skipped`` 无均价跳过数、``note`` 标注聚合成交非逐笔）——持仓级比对之前完成。
+    ``fills_backfilled`` 是「券商订单历史 → fills」的回填摘要（``count`` 落库条数、
+    ``skipped`` 无均价跳过数、``note`` 标注聚合成交非逐笔）；``orders_advanced`` 是
+    「按券商累计成交量推进 OMS 状态」的摘要（``count`` 推进条数、``skipped`` 非法迁移
+    跳过数）。两步都在判定之前完成（先同步券商事实，再判差异）。
 
     通道故障一律 fail-closed：**不写任何 kv**（既不写差异也不伪造「无差异」）。
     """
@@ -390,12 +455,14 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
 
     broker_rows = _broker_order_rows(orders_raw, core_broker.normalize_symbol)
 
-    # 成交回填**必须先于持仓级比对**（规格要求的顺序：拉券商订单 → 回填 fills →
-    # 订单级判定 → 持仓级比对）：本地台账由 fills 派生，而 sim 通道的成交不经 WS 事件
-    # 通道，不回填则本地净持仓恒为 0、持仓级全部报假差异并把自动执行熔断。
-    # 匹配结果与订单级判定共用（一次匹配，避免两处错位）。
+    # 「先同步券商事实，再判差异」——顺序是正确性要求（规格 §4.4）：
+    #   ① 回填成交（fills）→ ② 推进订单状态 → ③ 订单级判定 → ④ 持仓级比对。
+    # ①② 都只读券商、只写本地：sim 通道的成交与状态都不经 WS 事件通道，不先把券商
+    # 事实学进本地，③④ 就会把「本地尚未学习」判成差异 → critical + halt → 自锁熔断。
+    # 匹配结果三处共用（一次匹配，避免两处错位把钱/状态记到别的订单上）。
     matched = _match_orders(conn, today, broker_rows)
     backfill = _backfill_fills(conn, matched[0])
+    advance = _advance_order_states(conn, matched[0])
     diffs = _order_diffs(conn, today, broker_rows, matched=matched)
 
     # 持仓级：本地 = fills 派生净持仓（含本次回填）；只核对 OMS 有足迹的标的
@@ -418,13 +485,17 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     tca_summary = tca.aggregate(conn)
     backfill_digest = {"count": backfill["count"], "skipped": backfill["skipped"],
                        "aggregate": True, "note": backfill["note"]}
+    # 状态推进摘要：``count`` 推进条数、``skipped`` 非法迁移跳过数（不掩盖——
+    # 跳过的会被订单级判定暴露为差异，见 _advance_order_states docstring）
+    advance_digest = {"count": advance["count"], "skipped": advance["skipped"]}
     digest = {"as_of": today, "mode": mode, "orders": order_status_counts(conn, today),
               "diffs": len(diffs), "untracked": len(untracked), "tca": tca_summary,
-              "fills_backfilled": backfill_digest, "at": stamp}
+              "fills_backfilled": backfill_digest, "orders_advanced": advance_digest,
+              "at": stamp}
     # snapshot-reconcile 的既有取数口径（diffs/at）+ 本任务新增 untracked/mode
     store.kv_set(conn, "reconcile:latest",
                  {"diffs": diffs, "untracked": untracked, "mode": mode, "at": stamp})
     store.kv_set(conn, "daily:digest", digest)
     return {"ok": True, "diffs": diffs, "untracked": untracked,
             "orders": digest["orders"], "tca": tca_summary, "digest": digest,
-            "fills_backfilled": backfill, "halted": halted}
+            "fills_backfilled": backfill, "orders_advanced": advance, "halted": halted}
