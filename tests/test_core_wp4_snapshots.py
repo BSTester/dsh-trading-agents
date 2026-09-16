@@ -22,7 +22,8 @@ class SnapshotTestBase(unittest.TestCase):
 
     def _seed_plan_with_order(self, plan_id="P1", plan_hash="h1", status="frozen"):
         self.conn.execute(
-            "INSERT INTO plans VALUES(?,?,?,?,?,?,?,?,NULL,NULL)",
+            "INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,content_hash,"
+            "status,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (plan_id, "2026-09-13", "SIM", "s", '{"SH.600519": 0.5}', plan_hash,
              status, "2026-09-13 10:00:00"))
         self.conn.commit()

@@ -30,8 +30,9 @@ class StoreTestBase(unittest.TestCase):
 
 class StoreFactorSnapshotTest(StoreTestBase):
     def test_schema_appends_table_without_version_bump(self):
-        """WP4 alerts 先例：CREATE TABLE IF NOT EXISTS 幂等追加，SCHEMA_VERSION 保持 3。"""
-        self.assertEqual(store.SCHEMA_VERSION, 3)
+        """WP4 alerts 先例：CREATE TABLE IF NOT EXISTS 幂等追加。WP7 当时保持 3；
+        WP9 起 SCHEMA_VERSION=4（plans 补 origin/market，与本表的追加方式无关）。"""
+        self.assertEqual(store.SCHEMA_VERSION, 4)
         names = {row["name"] for row in
                  self.conn.execute("SELECT name FROM sqlite_master WHERE type='table'")}
         self.assertIn("factor_snapshots", names)

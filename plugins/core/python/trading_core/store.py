@@ -12,7 +12,8 @@ import json
 import sqlite3
 from pathlib import Path
 
-SCHEMA_VERSION = 3  # WP2 预留 2（并行分支）；WP3 落 3：plans/orders/fills/risk_checks 四表
+SCHEMA_VERSION = 4  # WP2 预留 2；WP3 落 3（plans/orders/fills/risk_checks 四表）；
+# WP9 落 4：plans 幂等追加 origin/market（ALTER 补列，_SCHEMA 的 CREATE 不改）
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS bars(
@@ -62,6 +63,24 @@ CREATE TABLE IF NOT EXISTS factor_snapshots(
   date TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL);
 """
 
+# ---------------------------------------------------------------------------
+# v4（WP9）：plans 幂等追加 origin/market 两列——ALTER 补列而非改上面的 CREATE。
+# 新建库先 CREATE（无此两列）再由 migrate 的 _add_columns 补齐，与旧库升级路径
+# 终态一致；_add_columns 是全局唯一的幂等补列实现，后续 WP 追加列一律复用。
+#   origin TEXT NOT NULL DEFAULT 'manual' —— auto 计划与手工计划来源隔离
+#     （build_plan 作业写 'auto'；既有 planner/手工路径不传 → 默认 manual，行为不变）；
+#   market TEXT —— auto 计划一计划一市场（匹配 per-market 作业链与 exec_at）；
+#     手工计划 NULL，兼容现状。
+# ---------------------------------------------------------------------------
+
+
+def _add_columns(conn, table, cols):
+    """幂等补列：PRAGMA 检查缺失才 ALTER，已有列零触碰。cols=[(name, decl), ...]。"""
+    have = {r[1] for r in conn.execute(f"PRAGMA table_info({table})")}
+    for name, decl in cols:
+        if name not in have:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {name} {decl}")
+
 
 def db_path(dsh_home=None):
     import os
@@ -82,6 +101,8 @@ def connect(path=None):
 
 def migrate(conn):
     conn.executescript(_SCHEMA)
+    _add_columns(conn, "plans", [("origin", "TEXT NOT NULL DEFAULT 'manual'"),
+                                 ("market", "TEXT")])
     row = conn.execute("PRAGMA user_version").fetchone()[0]
     if row < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -322,6 +343,46 @@ def list_plans(conn):
         plan["target"] = json.loads(plan["target"])
         out.append(plan)
     return out
+
+
+# ---------------------------------------------------------------------------
+# WP9：auto 计划（origin='auto'）的查询与过期语义（规格 §4.2/§4.3）。
+# ---------------------------------------------------------------------------
+
+
+def get_latest_auto_plan(conn, market, as_of, status="frozen"):
+    """auto_execute 守卫查询：origin=auto 且 market/as_of/status 匹配的最新一条。
+
+    返回 dict（target 已反序列化，口径同 get_plan）；无匹配返回 None。
+    排序 created_at DESC + rowid DESC：同秒多条时取最后插入的一条（确定性）。
+    """
+    row = conn.execute(
+        "SELECT * FROM plans WHERE origin='auto' AND market=? AND as_of=? AND status=?"
+        " ORDER BY created_at DESC, rowid DESC LIMIT 1",
+        (market, as_of, status)).fetchone()
+    if row is None:
+        return None
+    plan = dict(row)
+    plan["target"] = json.loads(plan["target"])
+    return plan
+
+
+def cancel_stale_auto_plans(conn, today):
+    """过期语义（规格 §4.2）：as_of < today 的 frozen auto 计划置 cancelled。
+
+    只动 origin='auto' 且 status='frozen'——手工计划与其他状态一律不碰
+    （跨日计划不可执行，但执行中/已完结的历史保持原状）。沿用写函数即写即提交。
+    返回被置 cancelled 的 plan_id 列表（created_at 升序）；幂等（再跑返回 []）。
+    """
+    rows = conn.execute(
+        "SELECT plan_id FROM plans WHERE origin='auto' AND status='frozen' AND as_of<?"
+        " ORDER BY created_at, rowid", (today,)).fetchall()
+    ids = [r["plan_id"] for r in rows]
+    if ids:
+        conn.executemany("UPDATE plans SET status='cancelled' WHERE plan_id=?",
+                         [(pid,) for pid in ids])
+        conn.commit()
+    return ids
 
 
 def insert_order(conn, client_order_id, plan_id, symbol, market, side, qty, price,

@@ -34,7 +34,8 @@ class PlanOrderTest(unittest.TestCase):
 
     def _seed(self, plan_id, created_at, plan_hash, status):
         self.conn.execute(
-            "INSERT INTO plans VALUES(?,?,?,?,?,?,?,?,NULL,NULL)",
+            "INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,content_hash,"
+            "status,created_at) VALUES(?,?,?,?,?,?,?,?)",
             (plan_id, "2026-09-13", "SIM", "s", '{"SH.600519": 0.5}', plan_hash,
              status, created_at))
         self.conn.commit()

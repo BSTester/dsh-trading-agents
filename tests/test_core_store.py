@@ -1,4 +1,5 @@
 """store 层单测：六张表、PIT 纪律强制、幂等 upsert、kv 游标。全部离线。"""
+import sqlite3
 import sys
 import tempfile
 import unittest
@@ -143,6 +144,107 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(rows["pe"], 22.5)
         with self.assertRaises(ValueError):
             store.read_valuations(self.conn, "SH.600519", as_of=None)
+
+    # ------------------------------------------------------------------
+    # v4（WP9）：plans origin/market 补列 + auto 计划查询/过期 helpers
+    # ------------------------------------------------------------------
+
+    def _mark_auto(self, plan_id, market):
+        self.conn.execute("UPDATE plans SET origin='auto', market=? WHERE plan_id=?",
+                          (market, plan_id))
+        self.conn.commit()
+
+    def test_plans_origin_market_columns(self):
+        # connect() 已跑一次 migrate；再跑两次验证补列幂等（v3 起源库无这两列）
+        store.migrate(self.conn)
+        store.migrate(self.conn)
+        cols = {r[1] for r in self.conn.execute("PRAGMA table_info(plans)")}
+        self.assertIn("origin", cols)
+        self.assertIn("market", cols)
+        # 既有手工路径（insert_plan 不传 origin/market）→ 默认 manual/NULL
+        store.insert_plan(self.conn, "PLN-1", "2026-09-15", "sim", "rsi",
+                          {"SH.600519": 0.5}, "hash1")
+        row = self.conn.execute(
+            "SELECT origin, market FROM plans WHERE plan_id='PLN-1'").fetchone()
+        self.assertEqual(row["origin"], "manual")
+        self.assertIsNone(row["market"])
+
+    def test_migrate_upgrades_v3_plans_without_columns(self):
+        # 模拟 v3 旧库：plans 表无 origin/market；migrate 补列且存量行回填默认值
+        conn = sqlite3.connect(":memory:")
+        conn.row_factory = sqlite3.Row
+        conn.execute(
+            "CREATE TABLE plans(plan_id TEXT PRIMARY KEY, as_of TEXT NOT NULL,"
+            " mode TEXT NOT NULL, strategy_id TEXT NOT NULL, target TEXT NOT NULL,"
+            " content_hash TEXT NOT NULL, status TEXT NOT NULL, created_at TEXT NOT NULL,"
+            " approved_at TEXT, approved_by TEXT)")
+        conn.execute(
+            "INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,content_hash,"
+            "status,created_at) VALUES('OLD-1','2026-09-10','sim','rsi','{}','h',"
+            "'frozen','2026-09-10 16:40:00')")
+        try:
+            store.migrate(conn)
+            store.migrate(conn)  # 幂等
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(plans)")}
+            self.assertIn("origin", cols)
+            self.assertIn("market", cols)
+            row = conn.execute(
+                "SELECT origin, market FROM plans WHERE plan_id='OLD-1'").fetchone()
+            self.assertEqual(row["origin"], "manual")  # 存量行回填默认
+            self.assertIsNone(row["market"])
+        finally:
+            conn.close()
+
+    def test_get_latest_auto_plan(self):
+        store.insert_plan(self.conn, "A1", "2026-09-15", "sim", "rsi", {"x": 1}, "h1")
+        store.insert_plan(self.conn, "A2", "2026-09-15", "sim", "rsi", {"x": 2}, "h2")
+        store.insert_plan(self.conn, "A3", "2026-09-15", "sim", "rsi", {"x": 3}, "h3")
+        self._mark_auto("A1", "SH")
+        self._mark_auto("A2", "SH")
+        self._mark_auto("A3", "HK")
+        plan = store.get_latest_auto_plan(self.conn, "SH", "2026-09-15")
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["plan_id"], "A2")  # 同 market/as_of 取最新（同秒按 rowid 兜底）
+        self.assertEqual(plan["origin"], "auto")
+        self.assertEqual(plan["market"], "SH")
+        self.assertEqual(plan["target"], {"x": 2})  # target 反序列化（get_plan 口径）
+        self.assertIsNone(store.get_latest_auto_plan(self.conn, "SH", "2026-09-16"))
+        self.assertIsNone(store.get_latest_auto_plan(self.conn, "US", "2026-09-15"))
+
+    def test_get_latest_auto_plan_filters_origin_and_status(self):
+        # 手工计划（origin=manual）即使 market/as_of 匹配也永不命中
+        store.insert_plan(self.conn, "M1", "2026-09-15", "sim", "rsi", {}, "h1")
+        self.conn.execute("UPDATE plans SET market='SH' WHERE plan_id='M1'")
+        self.conn.commit()
+        self.assertIsNone(store.get_latest_auto_plan(self.conn, "SH", "2026-09-15"))
+        # 非 frozen 状态默认不命中；status 可显式指定
+        store.insert_plan(self.conn, "A1", "2026-09-15", "sim", "rsi", {}, "h2")
+        self._mark_auto("A1", "SH")
+        self.conn.execute("UPDATE plans SET status='executing' WHERE plan_id='A1'")
+        self.conn.commit()
+        self.assertIsNone(store.get_latest_auto_plan(self.conn, "SH", "2026-09-15"))
+        got = store.get_latest_auto_plan(self.conn, "SH", "2026-09-15", status="executing")
+        self.assertEqual(got["plan_id"], "A1")
+
+    def test_cancel_stale_auto_plans(self):
+        store.insert_plan(self.conn, "OLD-A", "2026-09-14", "sim", "rsi", {}, "h1")
+        store.insert_plan(self.conn, "OLD-M", "2026-09-14", "sim", "rsi", {}, "h2")
+        store.insert_plan(self.conn, "NEW-A", "2026-09-15", "sim", "rsi", {}, "h3")
+        store.insert_plan(self.conn, "DONE-A", "2026-09-14", "sim", "rsi", {}, "h4")
+        self._mark_auto("OLD-A", "SH")
+        self._mark_auto("NEW-A", "SH")
+        self._mark_auto("DONE-A", "SH")
+        self.conn.execute("UPDATE plans SET status='done' WHERE plan_id='DONE-A'")
+        self.conn.commit()
+        cancelled = store.cancel_stale_auto_plans(self.conn, "2026-09-15")
+        self.assertEqual(cancelled, ["OLD-A"])  # 仅 frozen 且 as_of<today 的 auto
+        statuses = {r["plan_id"]: r["status"] for r in
+                    self.conn.execute("SELECT plan_id,status FROM plans")}
+        self.assertEqual(statuses["OLD-A"], "cancelled")
+        self.assertEqual(statuses["OLD-M"], "frozen")  # 手工计划不动
+        self.assertEqual(statuses["NEW-A"], "frozen")  # 当日计划不动（严格 <）
+        self.assertEqual(statuses["DONE-A"], "done")   # 非 frozen 不动
+        self.assertEqual(store.cancel_stale_auto_plans(self.conn, "2026-09-15"), [])  # 幂等
 
 
 if __name__ == "__main__":

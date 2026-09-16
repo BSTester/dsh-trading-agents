@@ -41,9 +41,10 @@ class StoreV3Test(unittest.TestCase):
         self.conn.close()
         self.tmp.cleanup()
 
-    def test_schema_version_is_3_with_four_new_tables(self):
-        self.assertEqual(store.SCHEMA_VERSION, 3)
-        self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], 3)
+    def test_schema_version_is_4_with_four_new_tables(self):
+        # WP3 落 3（四表）；WP9 起为 4（plans 幂等补 origin/market 列，见 test_core_store）
+        self.assertEqual(store.SCHEMA_VERSION, 4)
+        self.assertEqual(self.conn.execute("PRAGMA user_version").fetchone()[0], 4)
         names = {r["name"] for r in self.conn.execute(
             "SELECT name FROM sqlite_master WHERE type='table'").fetchall()}
         self.assertTrue({"plans", "orders", "fills", "risk_checks"} <= names)

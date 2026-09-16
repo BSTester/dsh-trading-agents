@@ -22,8 +22,9 @@ class Wp4E2eTest(unittest.TestCase):
         self.addCleanup(self.conn.close)
         # 冻结计划 + 一笔冻结订单（执行后应推进到 submitted）
         self.conn.execute(
-            "INSERT INTO plans VALUES('P1','2026-09-13','SIM','s','{\"SH.600519\": 0.5}',"
-            "'h1','frozen','2026-09-13 10:00:00',NULL,NULL)")
+            "INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,content_hash,"
+            "status,created_at) VALUES('P1','2026-09-13','SIM','s',"
+            "'{\"SH.600519\": 0.5}','h1','frozen','2026-09-13 10:00:00')")
         self.conn.commit()
         o = oms.register_order(self.conn, "P1", "SH.600519", "SH", "BUY", 100, 100.0, "SIM", "h1")
         oms.transition(self.conn, o["client_order_id"], "frozen")

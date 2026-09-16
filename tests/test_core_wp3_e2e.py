@@ -13,8 +13,9 @@ class E2eTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         conn = store.connect(str(Path(tmp.name) / "t.sqlite"))
-        conn.execute("INSERT INTO plans VALUES('P1','2026-09-13','SIM','s','{}','h1',"
-                     "'frozen','t',NULL,NULL)")
+        conn.execute("INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,"
+                     "content_hash,status,created_at) VALUES('P1','2026-09-13','SIM',"
+                     "'s','{}','h1','frozen','t')")
         conn.commit()
         for i, sym in enumerate(("SH.600519", "SZ.300750", "SH.601899")):
             o = oms.register_order(conn, "P1", sym, sym.split(".")[0], "BUY",
@@ -59,8 +60,9 @@ class E2eTest(unittest.TestCase):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         conn = store.connect(str(Path(tmp.name) / "t.sqlite"))
-        conn.execute("INSERT INTO plans VALUES('P1','2026-09-13','SIM','s','{}','h1',"
-                     "'frozen','t',NULL,NULL)")
+        conn.execute("INSERT INTO plans(plan_id,as_of,mode,strategy_id,target,"
+                     "content_hash,status,created_at) VALUES('P1','2026-09-13','SIM',"
+                     "'s','{}','h1','frozen','t')")
         conn.commit()
         for sym in ("SH.600519", "SZ.300750"):
             o = oms.register_order(conn, "P1", sym, sym.split(".")[0], "BUY",
