@@ -68,11 +68,12 @@ def accounts(call, timeout=30):
     return call(TOOLS["accounts"], {}, timeout=timeout) or {}
 
 
-def _normalize_symbol(value):
-    """券商持仓行的标的 → 仓库统一写法（SH.600519）。
+def normalize_symbol(value):
+    """券商持仓/订单行的标的 → 仓库统一写法（SH.600519）。
 
     模拟盘行可能给裸代码（600519）或已带前缀；裸代码的 SH/SZ/BJ 判定交给
     ``trading_datasource.market.to_futu_symbol``（唯一实现，不在这里重写规则）。
+    对账（``reconcile``）复用同一实现——标的口径只有一份。
     """
     text = str(value or "").strip().upper()
     if not text:
@@ -140,7 +141,7 @@ def _sim_positions_and_equity(call, market, timeout):
         # sim 持仓列表实测键为 positions（workbench/positions.py 与 platform 交易测试
         # 一致）；position_list 是 core 早期口径，保留兼容读取，两者取到即用。
         for row in (data.get("positions") or data.get("position_list") or []):
-            symbol = _normalize_symbol(row.get("symbol") or row.get("code"))
+            symbol = normalize_symbol(row.get("symbol") or row.get("code"))
             qty = row.get("qty")
             if not symbol or qty is None:
                 continue
@@ -187,7 +188,7 @@ def _live_positions_and_equity(call, market, timeout):
         rows = call(LIVE_TOOLS["positions"], {"acc_id": acc_id}, timeout=timeout)
         rows = rows if isinstance(rows, list) else ((rows or {}).get("positions") or [])
         for row in rows:
-            symbol = _normalize_symbol(row.get("code") or row.get("symbol"))
+            symbol = normalize_symbol(row.get("code") or row.get("symbol"))
             qty = row.get("qty")
             if not symbol or qty is None:
                 continue

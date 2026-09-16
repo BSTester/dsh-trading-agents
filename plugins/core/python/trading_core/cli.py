@@ -103,6 +103,13 @@ def build_parser():
     s.add_argument("--broker", required=True)
     _add_db(s)
 
+    s = sub.add_parser("reconcile-daily",
+                       help="每日对账（订单/持仓 vs 券商 → 差异告警+暂停 → TCA → digest）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    s.add_argument("--mode", default=None, help="账户模式覆盖 sim|live（默认读模式文件）")
+    s.add_argument("--today", default=None, help="日期覆盖 YYYY-MM-DD（测试/补跑用）")
+    _add_db(s)
+
     s = sub.add_parser("daemon", help="调度守护进程（--once 跑一轮；默认常驻轮询）")
     s.add_argument("--once", action="store_true", help="只跑一轮调度 + 指令轮询后退出")
     s.add_argument("--interval", type=int, default=60, help="常驻轮询秒数（默认 60）")
@@ -286,6 +293,17 @@ def main(argv=None):
             store.kv_set(conn, "reconcile:latest",
                          {"diffs": diffs, "at": _dt.datetime.now().isoformat(timespec="seconds")})
             result = {"diffs": diffs}
+        elif args.cmd == "reconcile-daily":
+            # WP9 任务 6b：reconcile 作业体（规格 §4.4）。软跳过（live/无账户）=退出 0
+            # （跳过是正常结论）；通道/模式失败=fail-closed 非零退出，让调度链与运维
+            # 看得到——对账失败绝不静默成「无差异」。
+            import os
+            from . import reconcile
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = reconcile.daily(conn, home, mode=args.mode, today=args.today)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
+                return 1
         elif args.cmd == "snapshot-plan":
             from . import snapshots
             result = snapshots.plan_snapshot(conn, alert_limit=args.limit)
