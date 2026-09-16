@@ -185,5 +185,88 @@ class CliDaemonTest(unittest.TestCase):
         self.assertIn("once", buffer.getvalue())                    # JSON 摘要
 
 
+class AutoPipelineConfigTest(unittest.TestCase):
+    """auto_pipeline 配置（WP9 任务 3，规格 §4.1）：键缺省补默认；非法 fail-closed 报错。
+
+    缺失与非法是两回事：缺失=用默认值（功能关闭是默认态），非法=ValueError
+    （静默降级成默认会让「配置写错了」伪装成「功能没开」，比报错更危险）。
+    """
+
+    def _home(self, config=None):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        if config is not None:
+            (home / "trading-platform.json").write_text(
+                json.dumps(config, ensure_ascii=False), encoding="utf-8")
+        return home
+
+    def test_defaults_when_missing(self):
+        """无文件、无 auto_pipeline 键 → 功能关闭 + 默认时刻表。"""
+        for home in (self._home(), self._home({"watchlist": ["SH.600519"]})):
+            cfg = daemon.auto_pipeline_config(str(home))
+            self.assertFalse(cfg["enabled"])
+            self.assertEqual(cfg["strategies"], [])
+            self.assertEqual(cfg["exec_at"], {"SH": "09:35", "HK": "09:45", "US": "22:35"})
+            self.assertEqual(cfg["reconcile_at"], "19:00")
+
+    def test_full_valid_config_roundtrip(self):
+        home = self._home({"auto_pipeline": {
+            "enabled": True,
+            "strategies": [{"market": "SH", "strategy": "watchlist_rsi", "watchlist": "SH"}],
+            "exec_at": {"SH": "09:40", "HK": "09:50", "US": "22:40"},
+            "reconcile_at": "19:30"}})
+        cfg = daemon.auto_pipeline_config(str(home))
+        self.assertEqual(cfg, {"enabled": True,
+                               "strategies": [{"market": "SH", "strategy": "watchlist_rsi",
+                                               "watchlist": "SH"}],
+                               "exec_at": {"SH": "09:40", "HK": "09:50", "US": "22:40"},
+                               "reconcile_at": "19:30"})
+
+    def test_partial_keys_fill_defaults(self):
+        """单键缺省补默认：只给 enabled 或只给 exec_at 的一个市场。"""
+        cfg = daemon.auto_pipeline_config(str(self._home({"auto_pipeline": {"enabled": True}})))
+        self.assertTrue(cfg["enabled"])
+        self.assertEqual(cfg["exec_at"], {"SH": "09:35", "HK": "09:45", "US": "22:35"})
+        cfg = daemon.auto_pipeline_config(
+            str(self._home({"auto_pipeline": {"exec_at": {"SH": "09:40"}}})))
+        self.assertEqual(cfg["exec_at"], {"SH": "09:40", "HK": "09:45", "US": "22:35"})
+
+    def test_invalid_configs_raise(self):
+        """非法配置一律 ValueError（fail-closed），不做静默降级。"""
+        cases = {
+            "auto_pipeline 非对象": {"auto_pipeline": []},
+            "enabled 非布尔": {"auto_pipeline": {"enabled": "yes"}},
+            "strategies 非列表": {"auto_pipeline": {"strategies": {}}},
+            "策略项非对象": {"auto_pipeline": {"strategies": ["rsi"]}},
+            "策略项缺字段": {"auto_pipeline": {"strategies": [{"market": "SH"}]}},
+            "策略项字段类型错": {"auto_pipeline": {"strategies": [
+                {"market": "SH", "strategy": 1, "watchlist": "SH"}]}},
+            "策略项未知键": {"auto_pipeline": {"strategies": [
+                {"market": "SH", "strategy": "watchlist_rsi", "watchlist": "SH",
+                 "extra": 1}]}},
+            "exec_at 非对象": {"auto_pipeline": {"exec_at": "09:35"}},
+            "exec_at 格式错": {"auto_pipeline": {"exec_at": {"SH": "9:35"}}},
+            "exec_at 越界": {"auto_pipeline": {"exec_at": {"SH": "25:00"}}},
+            "exec_at 未知市场": {"auto_pipeline": {"exec_at": {"SZ": "09:35"}}},
+            "reconcile_at 格式错": {"auto_pipeline": {"reconcile_at": "19:00:00"}},
+            "顶层未知键": {"auto_pipeline": {"enabled": True, "strategy": "rsi"}},
+        }
+        for label, config in cases.items():
+            with self.subTest(label):
+                with self.assertRaises(ValueError):
+                    daemon.auto_pipeline_config(str(self._home(config)))
+
+    def test_returns_fresh_copy(self):
+        """返回值不得与模块级默认共享可变对象（调用方改 exec_at 不能污染下次读取）。"""
+        home = self._home()
+        first = daemon.auto_pipeline_config(str(home))
+        first["exec_at"]["SH"] = "23:59"
+        first["strategies"].append({"market": "SH", "strategy": "x", "watchlist": "SH"})
+        second = daemon.auto_pipeline_config(str(home))
+        self.assertEqual(second["exec_at"]["SH"], "09:35")
+        self.assertEqual(second["strategies"], [])
+
+
 if __name__ == "__main__":
     unittest.main()

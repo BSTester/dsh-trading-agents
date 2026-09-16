@@ -4,8 +4,10 @@
 边界（规格 §8.4 恢复原则）：cancel_plan 只本地撤销未提交（draft/frozen）订单，
 在途订单留给对账兜底，绝不自动清除 unknown 状态。
 kill 文件约定 ~/.dsh/trading-kill（WP3 risk.py ctx["kill_path"] 同一事实）。"""
+import copy
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -62,6 +64,96 @@ def platform_config(home):
         return json.loads(p.read_text(encoding="utf-8")) if p.exists() else {}
     except (OSError, ValueError):
         return {}
+
+
+#: auto_pipeline 默认值（规格 §4.1）：默认关闭是硬约束——enabled=False 时调用方
+#: （plan-auto / auto-execute 作业）必须与「功能未实现」逐字节等价。exec_at 为北京
+#: 时间，美股按夏令时写（冬令时需人工调配置，不做自动 DST 换算）。
+AUTO_PIPELINE_DEFAULTS = {
+    "enabled": False,
+    "strategies": [],
+    "exec_at": {"SH": "09:35", "HK": "09:45", "US": "22:35"},
+    "reconcile_at": "19:00",
+}
+#: 合法市场（与 store 交易日历的市场键同一集合）
+AUTO_PIPELINE_MARKETS = ("SH", "HK", "US")
+#: 策略项字段：未知键报错——拼错的键被静默忽略等于策略没生效，比报错更危险
+_AUTO_STRATEGY_KEYS = ("market", "strategy", "watchlist")
+_HHMM_RE = re.compile(r"^\d{2}:\d{2}$")
+
+
+def _hhmm(value, field):
+    """HH:MM 校验：格式 + 00-23/00-59 范围（非法抛 ValueError，fail-closed）。"""
+    if not isinstance(value, str) or not _HHMM_RE.match(value):
+        raise ValueError(f"{field} 需为 HH:MM 格式，收到 {value!r}")
+    hour, minute = (int(part) for part in value.split(":"))
+    if hour > 23 or minute > 59:
+        raise ValueError(f"{field} 时刻越界：{value!r}")
+    return value
+
+
+def _auto_strategies(items):
+    """策略项校验：结构/字段/市场/非空串；返回只含白名单键的新列表。"""
+    if not isinstance(items, list):
+        raise ValueError("auto_pipeline.strategies 需为列表")
+    out = []
+    for item in items:
+        if not isinstance(item, dict):
+            raise ValueError(f"auto_pipeline.strategies 每项需为对象，收到 {item!r}")
+        unknown = set(item) - set(_AUTO_STRATEGY_KEYS)
+        if unknown:
+            raise ValueError(f"未知策略字段：{', '.join(sorted(unknown))}")
+        missing = [key for key in _AUTO_STRATEGY_KEYS if key not in item]
+        if missing:
+            raise ValueError(f"策略项缺少字段：{', '.join(missing)}")
+        if item["market"] not in AUTO_PIPELINE_MARKETS:
+            raise ValueError(f"策略项 market 非法：{item['market']!r}")
+        for key in ("strategy", "watchlist"):
+            if not isinstance(item[key], str) or not item[key].strip():
+                raise ValueError(f"策略项 {key} 需为非空字符串")
+        out.append({key: item[key] for key in _AUTO_STRATEGY_KEYS})
+    return out
+
+
+def _auto_exec_at(overlay, defaults):
+    """执行时刻表：给到的市场覆盖、未给到的市场补默认；未知市场报错。"""
+    if not isinstance(overlay, dict):
+        raise ValueError("auto_pipeline.exec_at 需为对象")
+    unknown = set(overlay) - set(AUTO_PIPELINE_MARKETS)
+    if unknown:
+        raise ValueError(f"exec_at 未知市场：{', '.join(sorted(unknown))}")
+    merged = dict(defaults)
+    for market, at in overlay.items():
+        merged[market] = _hhmm(at, f"auto_pipeline.exec_at.{market}")
+    return merged
+
+
+def auto_pipeline_config(home):
+    """auto_pipeline 配置（规格 §4.1）：键缺省补默认；非法报错（不静默降级）。
+
+    缺失与非法是两回事：缺失=用默认值（功能关闭是默认态），非法=ValueError——
+    把非法静默降级成默认会让「配置写错了」伪装成「功能没开」。返回值是全新对象，
+    调用方修改不会污染后续读取。"""
+    cfg = copy.deepcopy(AUTO_PIPELINE_DEFAULTS)
+    overlay = platform_config(home).get("auto_pipeline")
+    if overlay is None:
+        return cfg
+    if not isinstance(overlay, dict):
+        raise ValueError("auto_pipeline 需为对象")
+    unknown = set(overlay) - set(AUTO_PIPELINE_DEFAULTS)
+    if unknown:
+        raise ValueError(f"未知 auto_pipeline 字段：{', '.join(sorted(unknown))}")
+    if "enabled" in overlay:
+        if not isinstance(overlay["enabled"], bool):
+            raise ValueError("auto_pipeline.enabled 需为布尔值")
+        cfg["enabled"] = overlay["enabled"]
+    if "strategies" in overlay:
+        cfg["strategies"] = _auto_strategies(overlay["strategies"])
+    if "exec_at" in overlay:
+        cfg["exec_at"] = _auto_exec_at(overlay["exec_at"], cfg["exec_at"])
+    if "reconcile_at" in overlay:
+        cfg["reconcile_at"] = _hhmm(overlay["reconcile_at"], "auto_pipeline.reconcile_at")
+    return cfg
 
 
 def resolve_command(cmd, home):
