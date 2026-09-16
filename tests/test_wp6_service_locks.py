@@ -47,7 +47,9 @@ class Wp6ServiceLocks(unittest.TestCase):
         self.assertIn("trading/live-switch-web-only", manifest)
         # 不变式 1（规格 §5.1 A7）：confirm-decide 绝不进 MCP 工具面——常量名与端点名都在源码里
         self.assertIn("MCP_EXCLUDED_ENDPOINTS", manifest)
-        self.assertIn('frozenset({"confirm-decide"})', manifest)
+        self.assertIn('frozenset({"confirm-decide", "openapi_config", "openapi_test"})',
+                      manifest)
+        # WP8 任务 7：设置页两端点与 confirm-decide 同属有意排除集（凭据读写是人工动作）
 
 
 if __name__ == "__main__":

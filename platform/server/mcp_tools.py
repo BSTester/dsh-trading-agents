@@ -81,15 +81,18 @@ SERVER_VERSION = "0.1.0"
 
 # 工具面总数：54 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
 # 工具 + WP8 富途实时直通 8 个 + WP8 任务 2 的 9 个行情工具 + WP8 任务 3 的 6 个
-# OpenAPI 交易只读工具 + WP8 任务 6 的 3 个推送订阅管理工具；55 端点扣除有意排除的
-# confirm-decide）+ 5 维护工具（§3.4）。
+# OpenAPI 交易只读工具 + WP8 任务 6 的 3 个推送订阅管理工具；57 端点扣除有意排除的
+# confirm-decide 与 WP8 任务 7 的 2 个设置页端点）+ 5 维护工具（§3.4）。
 # 锁定测试断言 59 恒成立。
 TOOL_COUNT = 59
 
-# 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
+# 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订；
+# WP8 任务 7 增补）。
 # ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
-# 让模型自己批自己的实盘单。R5/S1 按本常量断言「工具名集 ≡ 端点数 − 排除集」。
-MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide"})
+# 让模型自己批自己的实盘单。``openapi_config``/``openapi_test``（WP8 任务 7 设置页）同理：
+# 凭据的写入与连通性测试是**人工 Web 动作**——读写 AppKey/私钥落盘的工具面等于把凭据
+# 管理交给模型，绝不做。R5/S1 按本常量断言「工具名集 ≡ 端点数 − 排除集」。
+MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide", "openapi_config", "openapi_test"})
 
 # 规格 §3.6 禁用名黑名单（与 Node 原实现（已退役）同表）。匹配语义是**整名或分段精确**：工具名按
 # 非字母数字切段，任一段命中才算，所以 ``plan_execute`` 不因子串 "exec" 被误伤，而
@@ -252,7 +255,8 @@ class ToolDefinition:
 # 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
 # 字段顺序也保持原实现顺序（inputSchema 的 properties 顺序因此稳定可比）。
 # 唯一新增/排除（2026-09-15 业务确认修订）：新增 ``confirmation`` 读工具（规格 §3.2 表 20b），
-# 排除 ``confirm-decide``（见文件头与 MCP_EXCLUDED_ENDPOINTS）。
+# 排除 ``confirm-decide``（见文件头与 MCP_EXCLUDED_ENDPOINTS）；WP8 任务 7 起排除集再加
+# 设置页两端点 openapi_config/openapi_test（凭据读写是人工 Web 动作，同一常量）。
 TOOLS = (
     ToolDefinition(
         "snapshot",

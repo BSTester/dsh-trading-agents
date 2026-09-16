@@ -593,7 +593,9 @@ class R5ToolSurfaceTests(Base):
         self.assertNotIn("confirm-decide", names)
         self.assertNotIn("confirm_decide", [tool.name for tool in self.registered()])
         self.assertNotIn("confirm-decide", set(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()))
-        self.assertEqual(mcp_tools.MCP_EXCLUDED_ENDPOINTS, frozenset({"confirm-decide"}))
+        # WP8 任务 7：设置页两端点（凭据读/写）与 confirm-decide 同类——有意排除集
+        self.assertEqual(mcp_tools.MCP_EXCLUDED_ENDPOINTS,
+                         frozenset({"confirm-decide", "openapi_config", "openapi_test"}))
         # 只读的 confirmation 工具**在**工具面里（读待确认不是批准）
         self.assertIn("confirmation", names)
         with self.assertRaises(Exception) as caught:
@@ -602,9 +604,9 @@ class R5ToolSurfaceTests(Base):
 
     def test_endpoint_tool_set_equals_store_endpoints_minus_excluded(self):
         """端点工具集 ≡ 端点清单（22 legacy + WP7 7 + WP8 直通 8 + WP8 行情 9
-        + WP8 交易 6 + WP8 推送 3）− 有意排除集（§3.2 对等性）。"""
+        + WP8 交易 6 + WP8 推送 3 + WP8 设置 2）− 有意排除集（§3.2 对等性）。"""
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 55)
+        self.assertEqual(len(endpoints), 57)
         forwarded = [definition.endpoint for definition in mcp_tools.TOOLS
                      if definition.endpoint]
         self.assertEqual(len(forwarded), 54)

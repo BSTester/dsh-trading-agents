@@ -53,7 +53,7 @@ from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
 from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_tools,
-                    store_access, trading)
+                    settings_api, store_access, trading)
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -139,6 +139,13 @@ ACCOUNT_QUERY_FIELDS = ("mode",)
 # （坏参数 → trading/invalid-operation），推送未启用 → trading/push-unavailable。
 PUSH_STATUS_FIELDS = ()
 PUSH_SUBSCRIBE_FIELDS = ("quote", "order_book", "ticker", "kline")
+# WP8 任务 7：设置页（读写在 server/settings_api.py）。openapi_config 空载荷=读状态、
+# 带载荷=保存（校验 → 写私钥 0600 → 写凭据 JSON → 联动 futu_channel，全部先校验后落盘）；
+# openapi_test 无载荷（用已保存凭据发一次真实 trading-days GET 并计时）。响应**绝不**
+# 含私钥 PEM 原文与完整 app_key（settings_api 保证，测试全文 grep 钉死）；两个端点
+# 有意不在 MCP 工具面（mcp_tools.MCP_EXCLUDED_ENDPOINTS）。实时直通：不进 caches.cached。
+OPENAPI_CONFIG_FIELDS = settings_api.CONFIG_FIELDS
+OPENAPI_TEST_FIELDS = ()
 # WP8 任务 3：OpenAPI 交易只读端点的载荷白名单（逐端点定义；与 mcp_tools 的工具字段
 # 逐键同形，锁定测试比对）。这些端点是**读类**：只受模式约束（mode 缺省读模式文件），
 # 业务参数（code/market/exchange/page_flag/...）整体下传 trading.TradeGate._read；
@@ -411,6 +418,19 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                                                    "details": {}}}
                 return {"ok": True, "value": {"enabled": True, "action": action,
                                               "intent": intent}}
+            if endpoint == "openapi_config":
+                # WP8 任务 7：设置页凭据读/写。空载荷=读状态（与 GET 专用路由同一实现）；
+                # 带载荷=保存——校验失败抛 WorkbenchError 落 trading/invalid-operation
+                # （与其他端点同形的业务失败信封），成功返回保存后的状态快照。
+                _check_fields(endpoint, payload, OPENAPI_CONFIG_FIELDS)
+                if payload:
+                    return {"ok": True, "value": settings_api.save_config(home, payload)}
+                return {"ok": True, "value": settings_api.get_config_status(home)}
+            if endpoint == "openapi_test":
+                # WP8 任务 7：连通性测试——用**已保存**凭据发一次真实 trading-days GET；
+                # 失败信封（trading/openapi-unavailable）由 settings_api 给出，原样透传。
+                _check_fields(endpoint, payload, OPENAPI_TEST_FIELDS)
+                return settings_api.test_connectivity(home)
             if endpoint in futu_data.FUTU_TOOLS:
                 # WP8 富途实时直通：skills 需要而本地无缓存的数据由服务端实时经富途获取。
                 # 浅白名单在这里拒（与其他端点同形），深校验（code 归一/必填/内键/上游
@@ -566,6 +586,18 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
                 "scheduler": {"alive": bool(scheduler.alive),
                               "last_error": None if last_error is None else str(last_error)[:300]},
                 "push": futu_push.safe_status(push)}
+
+    @app.get("/api/wb/openapi_config")
+    async def openapi_config_read():
+        """WP8 任务 7：GET 读凭据配置状态（POST 空载荷同实现）。
+
+        认证由 /api/* 中间件统一判定（token 已配置时必须 Bearer）。阻塞文件读经
+        asyncio.to_thread 让出事件循环（有意差异 4）。注册在 ``/api/wb/{endpoint}``
+        之前：单段 GET 不再落到「仅 POST」的 405 兜底；响应由 settings_api 保证
+        不含私钥 PEM 原文与完整 app_key。
+        """
+        return JSONResponse(content={"ok": True, "value": await asyncio.to_thread(
+            settings_api.get_config_status, home)})
 
     @app.post("/api/wb/{endpoint}")
     async def workbench(endpoint: str, request: Request):

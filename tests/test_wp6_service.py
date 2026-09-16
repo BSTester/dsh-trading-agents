@@ -50,6 +50,8 @@ ENDPOINTS = [
     *store_access.WP8_TRADE_ENDPOINTS,
     # WP8 任务 6：推送订阅管理面（非交易），与 store_access.WP8_PUSH_ENDPOINTS 同步
     *store_access.WP8_PUSH_ENDPOINTS,
+    # WP8 任务 7：设置页（凭据读/写与连通性测试），与 store_access.WP8_SETTINGS_ENDPOINTS 同步
+    *store_access.WP8_SETTINGS_ENDPOINTS,
 ]
 
 
@@ -168,7 +170,8 @@ class ContractTests(Base):
                         22 + len(store_access.WP7_ENDPOINTS) + len(store_access.FUTU_ENDPOINTS)
                         + len(store_access.WP8_MARKET_ENDPOINTS)
                         + len(store_access.WP8_TRADE_ENDPOINTS)
-                        + len(store_access.WP8_PUSH_ENDPOINTS))
+                        + len(store_access.WP8_PUSH_ENDPOINTS)
+                        + len(store_access.WP8_SETTINGS_ENDPOINTS))
         self.assertEqual(body["value"]["mode"], "sim")
         self.assertIn("generated_at", body["value"])
 
@@ -727,7 +730,8 @@ class ConfirmationRoutesTests(Base):
                         + len(store_access.FUTU_ENDPOINTS)
                         + len(store_access.WP8_MARKET_ENDPOINTS)
                         + len(store_access.WP8_TRADE_ENDPOINTS)
-                        + len(store_access.WP8_PUSH_ENDPOINTS))
+                        + len(store_access.WP8_PUSH_ENDPOINTS)
+                        + len(store_access.WP8_SETTINGS_ENDPOINTS))
         self.assertIn("confirmation", store_access.endpoints())
         self.assertIn("confirm-decide", store_access.endpoints())
         declared = self.post(self.client, "snapshot").json()["value"]["endpoints"]

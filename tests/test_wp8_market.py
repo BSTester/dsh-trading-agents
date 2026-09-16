@@ -1079,14 +1079,14 @@ class ToolSurfaceTest(unittest.TestCase):
             tool = next(t for t in mcp_tools.TOOLS if t.name == name)
             self.assertIn("实时", tool.description, name)
 
-    def test_endpoint_registry_is_55(self):
+    def test_endpoint_registry_is_57(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 55)
+        self.assertEqual(len(endpoints), 57)
         self.assertEqual(tuple(store_access.WP8_MARKET_ENDPOINTS), WP8_MARKET_ENDPOINTS)
-        # WP8 任务 3 起尾部再追加 6 个 OpenAPI 交易只读端点、任务 6 追加 3 个推送端点
-        # （行情 9 项落在它们之前）
-        self.assertEqual(endpoints[-18:-9], list(WP8_MARKET_ENDPOINTS))
-        self.assertEqual(len(set(endpoints)), 55)
+        # WP8 任务 3 起尾部再追加 6 个 OpenAPI 交易只读端点、任务 6 追加 3 个推送端点、
+        # 任务 7 追加 2 个设置页端点（行情 9 项落在它们之前）
+        self.assertEqual(endpoints[-20:-11], list(WP8_MARKET_ENDPOINTS))
+        self.assertEqual(len(set(endpoints)), 57)
 
 
 class RealChannelComparisonTest(unittest.TestCase):

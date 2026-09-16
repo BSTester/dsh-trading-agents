@@ -7,9 +7,13 @@
 """
 import json
 import os
+import tempfile
 from pathlib import Path
 
 DEFAULTS = {"port": 8397, "host": "127.0.0.1", "token": None}
+
+# 富途通道（WP8 任务 7：设置页保存凭据时联动更新；读取方是 futu_data.load_channel）
+FUTU_CHANNELS = ("openapi", "mcp")
 
 
 def config_path(home=None):
@@ -51,3 +55,45 @@ def load_config(home=None):
         if _valid_port(env_port):
             merged["port"] = env_port
     return merged
+
+
+def save_futu_channel(home=None, channel=None):
+    """写 trading-platform.json 顶层 ``futu_channel``（WP8 任务 7：设置页联动）。
+
+    channel 必须是 ``openapi|mcp``（否则 ``ValueError``，调用方先校验后落盘——绝不写
+    半截配置）；文件缺失则新建（0600：里面有 service.token 时不能宽权限）；已有文件
+    原子更新且**只改这一个键**（service 等既有键原样保留），文件本身的权限保持不变。
+    """
+    if channel not in FUTU_CHANNELS:
+        raise ValueError(f"futu_channel 取值非法：{channel!r}（允许：{' / '.join(FUTU_CHANNELS)}）")
+    path = config_path(home)
+    data = {}
+    if path.exists():
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as error:
+            raise ValueError(f"trading-platform.json 解析失败：{error}") from error
+        if not isinstance(data, dict):
+            raise ValueError("trading-platform.json 顶层必须是 JSON 对象")
+    data = {**data, "futu_channel": channel}
+    payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".trading-platform.",
+                               suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(payload)
+            f.flush()
+            os.fsync(f.fileno())
+        if path.exists():
+            os.chmod(tmp, path.stat().st_mode & 0o777)  # 已有文件：权限原样保留
+        else:
+            os.chmod(tmp, 0o600)  # 新建：可能含 service.token，不放宽
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return channel

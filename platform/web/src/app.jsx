@@ -20,6 +20,7 @@ import EventsPage from "./pages/events.jsx";
 import PlanPage from "./pages/plan.jsx";
 import SchedulePage from "./pages/schedule.jsx";
 import AuditPage from "./pages/audit.jsx";
+import SettingsPage from "./pages/settings.jsx";
 
 const PAGES = [
   { key: "overview", name: "概览", element: <OverviewPage /> },
@@ -36,6 +37,8 @@ const PAGES = [
   { key: "plan", name: "计划", element: <PlanPage /> },
   { key: "schedule", name: "调度", element: <SchedulePage /> },
   { key: "audit", name: "审计", element: <AuditPage /> },
+  // WP8 任务 7：设置页收尾（富途 OpenAPI 凭据配置：保存/测试/状态）
+  { key: "settings", name: "设置", element: <SettingsPage /> },
 ];
 
 function currentKey() {
