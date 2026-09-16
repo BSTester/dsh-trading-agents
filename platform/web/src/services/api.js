@@ -15,6 +15,9 @@ const TTL_MS = {
   pipeline: 30_000, auto_pipeline: 0,
   // WP7：因子快照历史对齐服务端 5 分钟缓存（caches.CACHE_TTL_MS["factors-history"]）
   "factors-history": 300_000,
+  // WP11 任务 3：情绪快照历史/摘要同为按日采集，对齐服务端 5 分钟缓存
+  // （caches.CACHE_TTL_MS["sentiment-history"]）。
+  "sentiment-history": 300_000,
   // WP8 富途实时直通 + OpenAPI 交易只读 + 推送状态：服务端一律 TTL 0（实时直通，
   // futu_data.py 文件头与 store_access.WP8_*_ENDPOINTS 同口径），客户端同样不缓存。
   rt_quote: 0, rt_order_book: 0,

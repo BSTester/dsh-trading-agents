@@ -595,6 +595,25 @@ def sentiment_latest(conn):
     return row["d"]
 
 
+def sentiment_summary(conn, date=None):
+    """该日（缺省最近有记录日）的采集摘要：标的数/记录数/各源条数。
+
+    WP11 任务 3：``sentiment-history`` 不带 symbol 时的载荷来源。聚合在 SQL 侧完成
+    （不把全表拉进 Python 再数）；无任何记录 → 空结构（空是事实，不是错误）。
+    """
+    day = date or sentiment_latest(conn)
+    if day is None:
+        return {"date": None, "symbols": 0, "records": 0, "sources": {}}
+    row = conn.execute(
+        "SELECT COUNT(*) AS records, COUNT(DISTINCT symbol) AS symbols"
+        " FROM sentiment_snapshots WHERE date=?", (day,)).fetchone()
+    sources = {r["source"]: int(r["n"]) for r in conn.execute(
+        "SELECT source, COUNT(*) AS n FROM sentiment_snapshots WHERE date=?"
+        " GROUP BY source ORDER BY source", (day,))}
+    return {"date": day, "symbols": int(row["symbols"]), "records": int(row["records"]),
+            "sources": sources}
+
+
 def sentiment_streak(conn, market=None, today=None):
     """连续积累**交易日**数：从最近有记录的交易日往前数，遇无记录交易日即停。
 

@@ -120,6 +120,9 @@ PLAN_EXECUTE_FIELDS = ("plan_hash", "expected_mode", "confirmation", "action")
 SERIES_FIELDS = ("ticker", "period", "limit")
 # WP7：因子快照历史的载荷只有 limit（1..120 校验在 compute.factors_history）
 FACTORS_HISTORY_FIELDS = ("limit",)
+# WP11 任务 3：情绪快照历史/摘要的载荷只有 symbol 与 limit（limit 1..120 校验在
+# compute.sentiment_history）；symbol 缺省返回最近一日采集摘要。
+SENTIMENT_HISTORY_FIELDS = ("symbol", "limit")
 # WP7 任务 3：受约束交易工具的载荷白名单（逐工具定义；与 mcp_tools 的 params 同形）。
 # 交易工具的载荷刻意**不含 mode**（模式只认模式文件，杜绝声明模式旁路）也不含口令
 # （live 授权=Web 业务确认卡片，不是对话口令）；client_order_id 是幂等编号（可省）。
@@ -264,6 +267,9 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 for name in compute.SNAPSHOT_COMMANDS}
         # WP7：因子快照历史走同一 core 桥（limit 由路由透传，compute 侧校验）
         core["factors-history"] = lambda limit=30: compute.factors_history(limit)
+        # WP11 任务 3：情绪快照历史/摘要同走 core 桥（symbol/limit 透传，compute 侧校验）
+        core["sentiment-history"] = lambda symbol=None, limit=30: compute.sentiment_history(
+            symbol, limit)
     if trade is None:
         trade = trading.TradeGate(home)
     if futu is None:
@@ -345,6 +351,18 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                     raise WorkbenchError("Core bridge unavailable")
                 return caches.cached(endpoint, payload, force,
                                      lambda: provider(payload.get("limit")),
+                                     "trading/core-unavailable")
+            if endpoint == "sentiment-history":
+                # WP11 任务 3：情绪快照历史/摘要（服务定时采集的只读面板数据），与
+                # factors-history 同构：字段白名单 → core 桥 → TTL 缓存；limit 区间校验在
+                # compute.sentiment_history（ComputeError 交 cached() 落 trading/core-unavailable）。
+                _check_fields(endpoint, payload, SENTIMENT_HISTORY_FIELDS)
+                provider = core.get("sentiment-history")
+                if provider is None:
+                    raise WorkbenchError("Core bridge unavailable")
+                return caches.cached(endpoint, payload, force,
+                                     lambda: provider(payload.get("symbol"),
+                                                      payload.get("limit")),
                                      "trading/core-unavailable")
             if endpoint == "plan-execute":
                 # rpc.js:183-210：唯一受约束执行入口；校验通过后原子写指令文件即返回

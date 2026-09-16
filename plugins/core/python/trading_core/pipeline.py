@@ -251,6 +251,25 @@ def _digest_stage(conn, date):
             "scheduled": None, "summary": summary}
 
 
+def _sentiment_stage(conn, market, date, stage):
+    """情绪快照阶段的积累事实（WP11 任务 3）：累计天数 + 连续交易日 + 最近日期。
+
+    只读事实、不改状态：作业没跑（pending/skipped/failed）时也照样展示「攒了多少」——
+    采集是长期积累，与当日是否成功是两件事。无任何记录时原样返回（空库不产生噪声）。
+    摘要拼在告警标题之后（用「；」分隔），既有归因文案不丢。
+    """
+    days = store.sentiment_days(conn)
+    if days == 0:
+        return stage
+    latest = store.sentiment_latest(conn)
+    streak = store.sentiment_streak(conn, market=market, today=date)
+    note = f"已积累 {days} 天（连续 {streak} 个交易日，最近 {latest}）"
+    summary = str(stage.get("summary") or "")
+    enriched = dict(stage)
+    enriched["summary"] = f"{summary}；{note}" if summary else note
+    return enriched
+
+
 def _market_stages(conn, market, jobs, state, alerts, date):
     """该市场阶段表：真实作业链顺序 + 在 build_plan/auto_execute 之后插入派生阶段。"""
     stages = {}
@@ -260,6 +279,8 @@ def _market_stages(conn, market, jobs, state, alerts, date):
         name = job["name"]
         stage = _stage(market, name, state, alerts, date)
         stage["scheduled"] = job.get("at")
+        if name == "sentiment_snapshot":
+            stage = _sentiment_stage(conn, market, date, stage)
         stages[name] = stage
         if name == "build_plan":
             stages["plan"] = _plan_stage(conn, market)

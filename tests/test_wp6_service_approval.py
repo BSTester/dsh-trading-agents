@@ -74,6 +74,9 @@ SPEC_FIELDS = {
     "pipeline": ((), ("refresh",)),
     # WP7 任务 2：因子快照历史（服务定时收集），字段与 HTTP 面白名单 ["limit"] 同步
     "factors_history": ((), ("limit", "refresh")),
+    # WP11 任务 3：情绪快照历史/摘要（按日采集，只读），字段与 HTTP 面白名单
+    # ["symbol", "limit"] 同步
+    "sentiment_history": ((), ("symbol", "limit", "refresh")),
     # WP7 任务 3：受约束交易工具（写三个过闸门链 + Web 确认；读三个 mode 直通 broker），
     # 字段与 app.py 的 TRADE_*/ACCOUNT_QUERY 白名单逐键同形；trade_* 不带 mode（模式只认
     # 模式文件）也不带口令（live 授权=Web 确认卡片）。
@@ -376,7 +379,7 @@ class R2ConfirmationTests(Base):
 
     def test_confirmation_read_tool_is_present_and_confirm_decide_is_absent(self):
         names = [tool.name for tool in self.app.state.mcp_tools]
-        self.assertEqual(len(names), 60)
+        self.assertEqual(len(names), 61)
         self.assertIn("confirmation", names)
         self.assertNotIn("confirm_decide", names)
         self.assertNotIn("confirm-decide", names)
@@ -568,7 +571,7 @@ class R4PlanExecuteTests(Base):
 
 
 class R5ToolSurfaceTests(Base):
-    """R5：工具面封闭（恰 59 / 端点对等 − confirm-decide / 输入字段 / 黑名单 / 未知名不触达 handle）。"""
+    """R5：工具面封闭（恰 61 / 端点对等 − 排除集 / 输入字段 / 黑名单 / 未知名不触达 handle）。"""
 
     def setUp(self):
         super().setUp()
@@ -577,9 +580,9 @@ class R5ToolSurfaceTests(Base):
     def registered(self):
         return asyncio.run(self.app.state.mcp.list_tools())
 
-    def test_exactly_27_tools_with_the_declared_names(self):
+    def test_exactly_61_tools_with_the_declared_names(self):
         tools = self.registered()
-        self.assertEqual(len(tools), 60)
+        self.assertEqual(len(tools), 61)
         self.assertEqual(len(tools), mcp_tools.TOOL_COUNT)
         self.assertEqual([tool.name for tool in tools],
                          [definition.name for definition in mcp_tools.TOOLS])
@@ -608,12 +611,13 @@ class R5ToolSurfaceTests(Base):
 
     def test_endpoint_tool_set_equals_store_endpoints_minus_excluded(self):
         """端点工具集 ≡ 端点清单（22 legacy + WP7 7 + WP8 直通 8 + WP8 行情 9
-        + WP8 交易 6 + WP8 推送 3 + WP8 设置 3 + WP10 流程 1）− 有意排除集（§3.2 对等性）。"""
+        + WP8 交易 6 + WP8 推送 3 + WP8 设置 3 + WP10 流程 2 + WP11 情绪 1）
+        − 有意排除集（§3.2 对等性）。"""
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 60)
+        self.assertEqual(len(endpoints), 61)
         forwarded = [definition.endpoint for definition in mcp_tools.TOOLS
                      if definition.endpoint]
-        self.assertEqual(len(forwarded), 55)
+        self.assertEqual(len(forwarded), 56)
         self.assertEqual(sorted(forwarded),
                          sorted(set(endpoints) - mcp_tools.MCP_EXCLUDED_ENDPOINTS))
         self.assertEqual(sorted(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()),
@@ -668,7 +672,7 @@ class R5ToolSurfaceTests(Base):
         self.assertIsNot(before.get("additionalProperties"), False)
         mcp_tools.register(server, recording_handle()[0], mcp_tools.StoreApi(self.home))
         schemas = {tool.name: tool.input_schema for tool in asyncio.run(server.list_tools())}
-        self.assertEqual(len(schemas), 61)  # 60 本模块工具 + 1 外来工具
+        self.assertEqual(len(schemas), 62)  # 61 本模块工具 + 1 外来工具
         self.assertEqual(schemas["foreign_tool"], before,
                          "本模块只应封闭自己注册的 60 个工具")
         self.assertIs(schemas["series"]["additionalProperties"], False)
@@ -677,7 +681,7 @@ class R5ToolSurfaceTests(Base):
         handle, calls = recording_handle()
         server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
         mcp_tools.register(server, handle, mcp_tools.StoreApi(self.home))
-        self.assertEqual(len(asyncio.run(server.list_tools())), 60)
+        self.assertEqual(len(asyncio.run(server.list_tools())), 61)
         with self.assertRaises(Exception) as caught:
             asyncio.run(server.call_tool("not_a_tool", {}))
         self.assertIn("not_a_tool", str(caught.exception))
@@ -806,7 +810,7 @@ class R6SameSourceTests(Base):
         self.client = self.client(self.app)
 
     def test_every_tool_shares_the_app_handle(self):
-        self.assertEqual(len(self.app.state.mcp_tools), 60)
+        self.assertEqual(len(self.app.state.mcp_tools), 61)
         for tool in self.app.state.mcp_tools:
             self.assertIs(tool.handle, self.app.state.handle, tool.name)
 

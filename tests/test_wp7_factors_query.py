@@ -170,9 +170,9 @@ class FactorsHistoryAppWiringTest(FactorsHistoryTestBase):
 
 class FactorsHistoryMcpToolTest(FactorsHistoryTestBase):
     def test_tool_surface_is_27_and_includes_factors_history(self):
-        # WP8 任务 6 起工具面扩到 59、WP10 任务 1 起 60；本用例改钉「 factors_history 在面内」这一增量事实
-        self.assertEqual(mcp_tools.TOOL_COUNT, 60)
-        self.assertEqual(len(mcp_tools.TOOLS), 60)
+        # WP8 任务 6 起 59、WP10 起 60、WP11 任务 3 起 61；本用例钉「factors_history 在面内」
+        self.assertEqual(mcp_tools.TOOL_COUNT, 61)
+        self.assertEqual(len(mcp_tools.TOOLS), 61)
         self.assertIn("factors_history", mcp_tools.TOOL_NAMES)
         self.assertEqual(mcp_tools.ENDPOINT_TOOL_ENDPOINTS["factors_history"],
                          "factors-history")

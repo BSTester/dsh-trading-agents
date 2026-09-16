@@ -6,16 +6,19 @@ WP7 面板退役（用户决策 2026-09-16）后 JS 面板源已整体删除，P
 因此改写为纯 Python 断言——把当前事实冻结成内嵌期望值，任何一侧被无意改动立刻红。
 
 覆盖：
-  * ``store_access.endpoints()`` ≡ 58 项内嵌清单（22 项基础清单按已删 endpoints.js
+  * ``store_access.endpoints()`` ≡ 61 项内嵌清单（22 项基础清单按已删 endpoints.js
     原序冻结 + 7 项 WP7 服务自有端点 + 8 项 WP8 富途实时直通端点 + 9 项 WP8 OpenAPI
-    行情端点 + 6 项 WP8 OpenAPI 交易只读端点 + 3 项 WP8 推送订阅管理端点 + 2 项 WP8
-    设置页端点，逐项与顺序都钉死）；
+    行情端点 + 6 项 WP8 OpenAPI 交易只读端点 + 3 项 WP8 推送订阅管理端点 + 3 项 WP8
+    设置页端点 + 2 项 WP10（流程页/自动流水线设置）+ 1 项 WP11（情绪快照历史），
+    逐项与顺序都钉死）；
   * ``caches.CACHE_TTL_MS``：17 项 legacy TTL 逐项钉死 + WP7 增量
     ``factors-history: 5 分钟`` + WP8 任务 2 增量（基本类 5 分钟 ×4 +
-    ``quote_history_kline_v2: 10 分钟``；实时类不进表，TTL 恒 0）；
-    业务确认两端点不在表里（TTL 恒 0，不得缓存「待确认」）；
+    ``quote_history_kline_v2: 10 分钟``；实时类不进表，TTL 恒 0）+ WP10 增量
+    ``pipeline: 30 秒`` + WP11 增量 ``sentiment-history: 5 分钟``；
+    业务确认两端点与 auto_pipeline 不在表里（TTL 恒 0，不得缓存「待确认」与设置读）；
   * ``caches.ENDPOINT_SHAPE``：16 项 legacy 形状逐项钉死 + WP7 增量
-    ``factors-history: ["snapshots"]`` + WP8 任务 2 增量 5 项；``confirmation:
+    ``factors-history: ["snapshots"]`` + WP8 任务 2 增量 5 项 + WP10 ``pipeline``
+    + WP11 ``sentiment-history: ["records", "summary"]``；``confirmation:
     ["pending"]`` 保留；
   * ``app.ANALYTICS_ENDPOINTS`` 逐端点字段白名单与各动作端点字段表；
   * ``compute`` 的内层缓存 TTL / 逐端点 timeout / 端点→脚本映射（脚本真实存在，
@@ -106,17 +109,25 @@ WP10_ENDPOINTS = ["pipeline", "auto_pipeline"]
 WP10_TTL = {"pipeline": 30_000}
 WP10_SHAPE = {"pipeline": ["date", "markets", "global", "auto_pipeline"]}
 
+# WP11 任务 3：情绪快照历史/摘要（与 store_access.WP11_ENDPOINTS 逐项同序）。
+# 只读查询，按日采集：进 TTL（5 分钟，与 factors-history 同量级）与形状表
+# （records/summary 两键恒在——给 symbol 时 summary 为 None，不给时 records 为空数组）。
+WP11_ENDPOINTS = ["sentiment-history"]
+WP11_TTL = {"sentiment-history": 5 * 60_000}
+WP11_SHAPE = {"sentiment-history": ["records", "summary"]}
+
 
 class EndpointListLockTests(unittest.TestCase):
-    def test_endpoints_is_frozen_60_item_list(self):
+    def test_endpoints_is_frozen_61_item_list(self):
         """``store_access.endpoints()`` ≡ 22 基础 + 7 WP7 + 8 WP8 直通 + 9 WP8 行情
         + 6 WP8 交易 + 3 WP8 推送 + 3 WP8 设置 + 2 WP10（流程页 + 自动流水线设置）
-        = 60 项，同序。"""
+        + 1 WP11（情绪快照）= 61 项，同序。"""
         self.assertEqual(store_access.endpoints(),
                          BASE_ENDPOINTS + WP7_ENDPOINTS + FUTU_ENDPOINTS
                          + WP8_MARKET_ENDPOINTS + WP8_TRADE_ENDPOINTS
-                         + WP8_PUSH_ENDPOINTS + WP8_SETTINGS_ENDPOINTS + WP10_ENDPOINTS)
-        self.assertEqual(len(store_access.endpoints()), 60)
+                         + WP8_PUSH_ENDPOINTS + WP8_SETTINGS_ENDPOINTS + WP10_ENDPOINTS
+                         + WP11_ENDPOINTS)
+        self.assertEqual(len(store_access.endpoints()), 61)
         self.assertEqual(len(store_access._BASE_ENDPOINTS), 22)
         self.assertEqual(list(store_access.WP7_ENDPOINTS), WP7_ENDPOINTS)
         self.assertEqual(list(store_access.FUTU_ENDPOINTS), FUTU_ENDPOINTS)
@@ -125,22 +136,24 @@ class EndpointListLockTests(unittest.TestCase):
         self.assertEqual(list(store_access.WP8_PUSH_ENDPOINTS), WP8_PUSH_ENDPOINTS)
         self.assertEqual(list(store_access.WP8_SETTINGS_ENDPOINTS), WP8_SETTINGS_ENDPOINTS)
         self.assertEqual(list(store_access.WP10_ENDPOINTS), WP10_ENDPOINTS)
-        # 尾部锚点：业务确认两端点收尾基础清单；WP7/WP8/WP10 增量按任务顺序追加
-        self.assertEqual(store_access.endpoints()[-40:-38],
+        self.assertEqual(list(store_access.WP11_ENDPOINTS), WP11_ENDPOINTS)
+        # 尾部锚点：业务确认两端点收尾基础清单；WP7/WP8/WP10/WP11 增量按任务顺序追加
+        self.assertEqual(store_access.endpoints()[-41:-39],
                          ["confirmation", "confirm-decide"])
-        self.assertEqual(store_access.endpoints()[-38:-31], WP7_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-31:-23], FUTU_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-23:-14], WP8_MARKET_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-14:-8], WP8_TRADE_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-8:-5], WP8_PUSH_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-5:-2], WP8_SETTINGS_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-2:], WP10_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-39:-32], WP7_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-32:-24], FUTU_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-24:-15], WP8_MARKET_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-15:-9], WP8_TRADE_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-9:-6], WP8_PUSH_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-6:-3], WP8_SETTINGS_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-3:-1], WP10_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-1:], WP11_ENDPOINTS)
         self.assertEqual(store_access.endpoints()[0], "snapshot")
         # 无重复；重复调用返回等值副本（调用方改动不污染后续结果）
-        self.assertEqual(len(set(store_access.endpoints())), 60)
+        self.assertEqual(len(set(store_access.endpoints())), 61)
         sample = store_access.endpoints()
         sample.append("bogus")
-        self.assertEqual(len(store_access.endpoints()), 60)
+        self.assertEqual(len(store_access.endpoints()), 61)
 
     def test_analytics_endpoints_are_declared(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))
@@ -182,7 +195,8 @@ class CacheTtlLockTests(unittest.TestCase):
         self.assertEqual({name: ttl for name, ttl in caches.CACHE_TTL_MS.items()
                           if name not in WP7_ENDPOINTS
                           and name not in WP8_MARKET_ENDPOINTS
-                          and name not in WP10_ENDPOINTS}, self.LEGACY_TTL_MS)
+                          and name not in WP10_ENDPOINTS
+                          and name not in WP11_ENDPOINTS}, self.LEGACY_TTL_MS)
         self.assertEqual(self.LEGACY_TTL_MS["instrument"], 10 * 60_000)
 
     def test_wp7_ttl_delta_is_pinned(self):
@@ -190,7 +204,13 @@ class CacheTtlLockTests(unittest.TestCase):
         self.assertEqual(caches.CACHE_TTL_MS.get("factors-history"), 5 * 60_000)
         self.assertEqual(len(caches.CACHE_TTL_MS),
                          len(self.LEGACY_TTL_MS) + 1 + len(WP8_MARKET_TTL_MS)
-                         + len(WP10_TTL))
+                         + len(WP10_TTL) + len(WP11_TTL))
+
+    def test_wp11_ttl_delta_is_pinned(self):
+        """WP11 增量：情绪快照历史/摘要 5 分钟（按日采集，与 factors-history 同量级）。"""
+        self.assertEqual({name: caches.CACHE_TTL_MS[name]
+                          for name in WP11_ENDPOINTS
+                          if name in caches.CACHE_TTL_MS}, WP11_TTL)
 
     def test_wp10_ttl_delta_is_pinned(self):
         """WP10 增量：流程快照 30 秒（与 schedule 同量级，页面要看到刚跑完的作业）；
@@ -242,7 +262,8 @@ class EndpointShapeLockTests(unittest.TestCase):
         self.assertEqual({name: fields for name, fields in caches.ENDPOINT_SHAPE.items()
                           if name not in WP7_ENDPOINTS
                           and name not in WP8_MARKET_ENDPOINTS
-                          and name not in WP10_ENDPOINTS}, self.LEGACY_SHAPE)
+                          and name not in WP10_ENDPOINTS
+                          and name not in WP11_ENDPOINTS}, self.LEGACY_SHAPE)
         self.assertEqual(caches.ENDPOINT_SHAPE["confirmation"], ["pending"])
 
     def test_wp7_shape_delta_is_pinned(self):
@@ -250,7 +271,13 @@ class EndpointShapeLockTests(unittest.TestCase):
         self.assertEqual(caches.ENDPOINT_SHAPE["factors-history"], ["snapshots"])
         self.assertEqual(len(caches.ENDPOINT_SHAPE),
                          len(self.LEGACY_SHAPE) + 1 + len(WP8_MARKET_SHAPE)
-                         + len(WP10_SHAPE))
+                         + len(WP10_SHAPE) + len(WP11_SHAPE))
+
+    def test_wp11_shape_delta_is_pinned(self):
+        """WP11 增量：情绪快照两形态共用同一出口，records/summary 两键恒在。"""
+        self.assertEqual({name: caches.ENDPOINT_SHAPE[name]
+                          for name in WP11_ENDPOINTS
+                          if name in caches.ENDPOINT_SHAPE}, WP11_SHAPE)
 
     def test_wp10_shape_delta_is_pinned(self):
         """WP10 增量：流程快照最小字段（每市场阶段表 + 全局阶段 + 配置摘要）；

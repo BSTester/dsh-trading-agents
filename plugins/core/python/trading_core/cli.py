@@ -162,6 +162,11 @@ def build_parser():
     s = sub.add_parser("factors-history", help="因子快照历史（按日期倒序，只读）")
     s.add_argument("--limit", type=int, default=30, help="最多返回条数（默认 30）")
     _add_db(s)
+
+    s = sub.add_parser("sentiment-history", help="情绪快照历史/当日采集摘要（只读）")
+    s.add_argument("--symbol", default=None, help="标的代码；缺省返回最近一日采集摘要")
+    s.add_argument("--limit", type=int, default=30, help="记录条数 1..120（默认 30）")
+    _add_db(s)
     return p
 
 
@@ -368,6 +373,16 @@ def main(argv=None):
         elif args.cmd == "factors-history":
             result = {"ok": True, "snapshots": store.list_factor_snapshots(conn,
                                                                           limit=args.limit)}
+        elif args.cmd == "sentiment-history":
+            # 两种形态共用同一出口（records/summary 两键恒在，服务端形状校验单一）：
+            #   给 --symbol → 该标的倒序记录；不给 → 最近一日的采集摘要。
+            if args.symbol:
+                result = {"ok": True, "symbol": args.symbol, "summary": None,
+                          "records": store.read_sentiments(conn, args.symbol,
+                                                           limit=args.limit)}
+            else:
+                result = {"ok": True, "symbol": None, "records": [],
+                          "summary": store.sentiment_summary(conn)}
         elif args.cmd == "daemon":
             import os
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")

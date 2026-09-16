@@ -83,8 +83,9 @@ SERVER_VERSION = "0.1.0"
 # 工具 + WP8 富途实时直通 8 个 + WP8 任务 2 的 9 个行情工具 + WP8 任务 3 的 6 个
 # OpenAPI 交易只读工具 + WP8 任务 6 的 3 个推送订阅管理工具；58 端点扣除有意排除的
 # confirm-decide 与设置页 3 端点 openapi_config/openapi_test/openapi_oauth）
-# + 5 维护工具（§3.4）。锁定测试断言 59 恒成立。
-TOOL_COUNT = 60
+# + 5 维护工具（§3.4）+ WP10 任务 1 pipeline + WP11 任务 3 sentiment_history。
+# 锁定测试断言 61 恒成立。
+TOOL_COUNT = 61
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订；
 # WP8 任务 7 增补；WP8 OAuth 集成再增 openapi_oauth）。
@@ -445,6 +446,19 @@ TOOLS = (
         "factors-history",
         (
             opt("limit", "int", "最多返回快照条数（1..120，默认 30）", minimum=1, maximum=120),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "sentiment_history",
+        "情绪/舆情快照（WP11）：给 symbol 返回该标的按日期倒序的渠道原文记录"
+        "（source 如 fin_sentiment/futu_news/last30days，payload 为渠道原始 JSON）；"
+        "不给 symbol 返回最近一日的采集摘要（date/symbols/records/sources）。"
+        "数据来自服务每交易日定时采集落库，只作研究与并列参考，不参与信号计算。",
+        "sentiment-history",
+        (
+            opt("symbol", "str", "标的代码，如 SH.600519；缺省返回最近一日采集摘要"),
+            opt("limit", "int", "记录条数（1..120，默认 30）", minimum=1, maximum=120),
             REFRESH,
         ),
     ),

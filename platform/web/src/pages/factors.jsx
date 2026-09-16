@@ -24,6 +24,7 @@ import { Alert, Card, Col, Descriptions, Input, Row, Select, Space, Statistic, T
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
 import { LineChart } from "../charts/line.jsx";
+import { sentimentHeadline, sentimentRows } from "../services/sentiment.js";
 
 // IC 检验当前只覆盖价量因子（同旧客户端 IC_FACTORS，client.js L1385）。
 const FACTORS = ["mom_20", "mom_60", "vol_20", "trend", "rsi_14", "liq_ratio", "mdd_60"];
@@ -136,6 +137,9 @@ export default function FactorsPage() {
   const ic = useEndpoint("ic", tickers.length >= 3 ? { tickers, factor, forward: 5, window: 250 } : null,
     [tickers.join(","), factor]);
   const quality = useEndpoint("quality", tickers.length === 1 ? { ticker: tickers[0] } : null, [tickers.join(",")]);
+  // WP11 任务 3：情绪快照采集摘要（不带 symbol 的形态——采集是流水线事实，与关注池无关）
+  const sentiment = useEndpoint("sentiment-history", {}, []);
+  const sentimentSummary = sentiment.value?.summary ?? null;
   const icPoints = (ic.value?.points ?? []).map((point) => ({ t: point.t, v: point.ic }));
   const failures = Object.entries(snap.value?.failures ?? {});
   return (
@@ -149,6 +153,24 @@ export default function FactorsPage() {
           options={FACTORS.map((key) => ({ value: key, label: FACTOR_LABELS[key] ?? key }))} />
       </Space>)}>
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+        <Card type="inner" title="情绪快照采集"
+          extra={(<Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {sentimentHeadline(sentimentSummary)}
+          </Typography.Text>)}>
+          {sentiment.error && (
+            <Alert type="error" showIcon message={`情绪快照读取失败：${sentiment.error}`} />)}
+          <Table size="small" rowKey="source" pagination={false}
+            dataSource={sentimentRows(sentimentSummary)}
+            columns={[
+              { title: "来源", dataIndex: "source" },
+              { title: "条数", dataIndex: "count", width: 90 },
+              { title: "状态", key: "present", width: 90,
+                render: (_value, row) => (row.present ? "在场" : "缺席") },
+            ]} />
+          <Typography.Text type="secondary">
+            每交易日收盘作业链自动采集落库（原始渠道文本，不打分）；情绪只作研究参考，不参与信号计算。
+          </Typography.Text>
+        </Card>
         {tickers.length === 0 && (
           <Typography.Text type="secondary">
             输入关注池后回车加载：≥2 个标的做横截面打分，≥3 个加做 IC 检验，恰好 1 个只看财报质量。

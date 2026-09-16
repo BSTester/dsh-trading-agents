@@ -51,6 +51,8 @@ CACHE_TTL_MS = {
     "reconcile": 5 * 60_000,
     # WP7：因子快照按日收集，5 分钟 TTL 足够面板新鲜度（legacy rpc.js 不回写）
     "factors-history": 5 * 60_000,
+    # WP11 任务 3：情绪快照同为按日采集，5 分钟 TTL 与因子快照同量级
+    "sentiment-history": 5 * 60_000,
     # WP8 任务 2：OpenAPI 行情接入的基本类端点（基本类 5m；历史 K 线 v2 10m）。
     # 实时四类（market_snapshot/cur_kline/rt_data/rt_ticker）与其余富途实时端点
     # 一律 TTL 0，**不进**本表（与 WP8 富途实时直通 8 端点同口径）。
@@ -89,6 +91,9 @@ ENDPOINT_SHAPE = {
     "pipeline": ["date", "markets", "global", "auto_pipeline"],
     # WP7：因子快照历史（服务定时收集），最小字段只有一个快照数组
     "factors-history": ["snapshots"],
+    # WP11 任务 3：情绪快照历史/摘要——两种形态共用同一出口，records 与 summary 两键恒在
+    # （给 symbol 时 summary 为 None，不给时 records 为空数组），形状校验因此单一。
+    "sentiment-history": ["records", "summary"],
     # WP8 任务 2：OpenAPI 行情接入进缓存端点的最小字段（官方文档 data 顶层键，与
     # MCP 通道 data 同形）。注意 info_search：MCP 侧 quote_news_search 恒空，归一化为
     # {"news_list": []}（futu_data._fetch_mcp），两通道/形状校验因此同规。
