@@ -13,6 +13,11 @@
   info_trading_days/info_search/info_market_state/quote_history_kline_v2）：参数
   白名单 → 双后端；TTL 0（实时四类）/ 5m（基本四类）/ 10m（历史 K 线 v2）；
 * 归一化 fixture：两通道产出同形状（rt_quote/order_book/capital_flow 三例对拍）；
+* 出站 URL 字符串断言（2026-09-16 审查补齐）：rt-ticker 的 period 同名多值展开与顺序、
+  capital-flow/history 与 history-kline 的 None 省略与键序、option-expiration 的
+  filter_expiration_cycles 逗号串 %2C 编码；capital-flow.section 是独立 4 值枚举
+  （非 rt-data 的 6 值）；客户端契约（注入传输异常 → TransportError；5xx/429/非 JSON
+  → UnexpectedResponse 且读路径落 trading/futu-unavailable，429 的 Retry-After 进 details）；
 * 工具面 50 锁定（WP8 任务 3 起 56）+ 端点清单 46 锁定（任务 3 起 52）。
 
 官方文档记录（2026-09-16 web_fetch 实抓，路径前缀 ``/api/v1.0/quote``）：
@@ -20,20 +25,24 @@
   stock-quote      POST /quote/stock-quote         body {code_list}
   order-book       POST /quote/order-book          body {code, num? 1..60}
   cur-kline        GET  /quote/{symbol}/cur-kline  query {num! 1..370, ktype?=2, autype?=1, extended_time?=0}
-  rt-data          GET  /quote/{symbol}/rt-data    query {request_section?=NORMAL}
+  rt-data          GET  /quote/{symbol}/rt-data    query {request_section?=NORMAL}（6 值）
   rt-ticker        GET  /quote/{symbol}/rt-ticker  query {num? 1..750=500, period?[]}
+                   （period 是**同名多值**：?period=BEFORE&period=AFTER，不是 Python repr）
   history-kline    GET  /quote/{symbol}/history-kline query {end!, start?, ktype?=2, autype?=1, num?<=370, extended_time?=0}
   stock-basicinfo  POST /quote/stock-basicinfo     body {code_list 1..400}
   trading-days     GET  /quote/trading-days        query {market!, start!, end!}
   market-state     POST /quote/market-state        body {code_list, is_contain_ba?, is_contain_overnight?}
   search           GET  /quote/find-news | /quote/find-community  query {symbol!, size? 1..50, ...}
   capital-flow     GET  /quote/{symbol}/capital-flow            query {section?=NORMAL}
+                   （section 只有 4 值 NORMAL/FULL/PREMARKET/AFTERHOURS，**不是** rt-data 的 6 值）
   capital-flow-hist GET /quote/{symbol}/capital-flow/history    query {period_type?=DAY, start?, end?, count? 1..1000}
   capital-distrib  GET  /quote/{symbol}/capital-distribution
   option-expiration GET /quote/{symbol}/option-expiration       query {index_option_type?, filter_standard?, filter_expiration_cycles?}
+                   （filter_expiration_cycles 官方是**逗号分隔字符串**，非数组）
   option-chain     GET  /quote/{symbol}/option-chain            query {start?, end?, index_option_type?, filter_standard?}
   option-screen    POST /quote/option-screen          body {strategy!, field_filter?, sort_obj?, next_key?, limit?, request_exact_data?, strategy_param?}
 """
+import json
 import os
 import sys
 import tempfile
@@ -47,8 +56,11 @@ sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 
 from server import app as app_module  # noqa: E402
 from server import caches, futu_data, mcp_tools, store_access  # noqa: E402
+from trading_datasource import futu_openapi as fo  # noqa: E402
 from trading_datasource.futu_mcp import FutuUnavailable  # noqa: E402
-from trading_datasource.futu_openapi import OpenApiError, OpenApiMarket  # noqa: E402
+from trading_datasource.futu_openapi import (  # noqa: E402
+    CredentialStore, OpenApiClient, OpenApiError, OpenApiMarket, TransportError,
+    UnexpectedResponse)
 
 # 9 个新端点/工具（任务 C 清单原序）：8 个按官方文档命名 + history-kline 新端点。
 WP8_MARKET_ENDPOINTS = ("market_snapshot", "cur_kline", "rt_data", "rt_ticker",
@@ -251,6 +263,29 @@ class OpenApiMarketDocTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             make_market().capital_flow_history("HK.00700", period_type="YEAR")
 
+    def test_capital_flow_section_is_four_values_not_rt_sections(self):
+        """capital-flow.section 是独立枚举（4 值）；rt-data 的 6 值不得复用（live -3 已复现）。"""
+        self.assertEqual(OpenApiMarket.CAPITAL_FLOW_SECTIONS,
+                         frozenset({"NORMAL", "FULL", "PREMARKET", "AFTERHOURS"}))
+        # rt-data 仍保留 6 值（HK_DARK/OVERNIGHT 只属于 request_section）
+        self.assertEqual(OpenApiMarket.RT_SECTIONS - OpenApiMarket.CAPITAL_FLOW_SECTIONS,
+                         frozenset({"HK_DARK", "OVERNIGHT"}))
+        market = make_market()
+        for section in ("NORMAL", "FULL", "PREMARKET", "AFTERHOURS"):
+            market.capital_flow("HK.00700", section=section)
+            self.assertEqual(market.client.calls[-1][3], {"section": section})
+        # 默认 NORMAL 只发一次请求；越界值与 rt-data 专有值一律本地拒绝（零网络往返）
+        market.capital_flow("HK.00700")
+        self.assertEqual(market.client.calls[-1][3], {"section": "NORMAL"})
+        for bad in ("OVERNIGHT", "HK_DARK", "NONE", "normal", ""):
+            with self.subTest(section=bad):
+                client = RecordingClient()
+                with self.assertRaises(ValueError) as cm:
+                    OpenApiMarket(client).capital_flow("HK.00700", section=bad)
+                self.assertEqual(client.calls, [], "坏 section 不得触达通道")
+                for allowed in ("NORMAL", "FULL", "PREMARKET", "AFTERHOURS"):
+                    self.assertIn(allowed, str(cm.exception), "错误消息须列出 4 值")
+
     def test_option_family_hits_official_paths(self):
         market = make_market()
         market.option_expiration("HK.00700")
@@ -264,6 +299,32 @@ class OpenApiMarketDocTest(unittest.TestCase):
                           "filter_standard": "ALL"})
         with self.assertRaises(ValueError):
             make_market().option_expiration("HK.00700", filter_standard="FREE")
+
+    def test_option_expiration_cycles_is_csv_string_not_list(self):
+        """filter_expiration_cycles 官方是逗号分隔字符串：list 本地拒绝，str 归一后透传。"""
+        self.assertIn("WEEK", OpenApiMarket.EXPIRATION_CYCLES)
+        market = make_market()
+        market.option_expiration("HK.00700")
+        self.assertEqual(market.client.calls[-1][3], {"filter_standard": "ALL"},
+                         "未提供 cycles 时不得出现该 query 键")
+        market.option_expiration("HK.00700", filter_expiration_cycles="WEEK,MONTH")
+        self.assertEqual(market.client.calls[-1][3],
+                         {"filter_standard": "ALL",
+                          "filter_expiration_cycles": "WEEK,MONTH"})
+        market.option_expiration("HK.00700", filter_expiration_cycles=" WEEK , WEEKMON ")
+        self.assertEqual(market.client.calls[-1][3]["filter_expiration_cycles"],
+                         "WEEK,WEEKMON", "元素两端空白归一，仍按官方 pattern 拼接")
+        market.option_expiration("HK.00700", filter_expiration_cycles="")
+        self.assertEqual(market.client.calls[-1][3], {"filter_standard": "ALL"},
+                         "空串视为未提供")
+        for bad in (["WEEK", "MONTH"], ["WEEK"], ("WEEK",), 7, "WEEK,NOPE", "NOPE",
+                    "WEEK,,MONTH"):
+            with self.subTest(cycles=bad):
+                client = RecordingClient()
+                with self.assertRaises(ValueError):
+                    OpenApiMarket(client).option_expiration(
+                        "HK.00700", filter_expiration_cycles=bad)
+                self.assertEqual(client.calls, [], "坏 cycles 不得触达通道")
 
     def test_option_screen_posts_strategy_body_and_merges_pagination(self):
         market = make_market(d={"option_list": [1]}, pagination={"has_more": False})
@@ -283,6 +344,181 @@ class OpenApiMarketDocTest(unittest.TestCase):
         market = make_market(error=OpenApiError("权限不足", errcode=-9))
         with self.assertRaises(OpenApiError):
             market.capital_flow("HK.00700")
+
+
+# ---------------------------------------------------------------------------
+# 出站 URL 字符串 + 客户端传输/信封契约（2026-09-16 审查项）
+# ---------------------------------------------------------------------------
+def _ed25519_pem():
+    """一组 PKCS8 Ed25519 私钥（只用于签名器构造/凭据判定，本文件不验签）。"""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    return Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption())
+
+
+class UrlRecordingHttp:
+    """真传输替身：记录出站 ``(method, url, headers, body)``，默认回 OK 行情信封。
+
+    把断言钉在**出站 URL 字符串**上——此前缺口：只记录/断言序列化前的 query dict，
+    而「list 被序列化成 Python repr」这类缺陷在 dict 层完全看不见。
+    """
+
+    def __init__(self, responses=None):
+        self.calls = []
+        self.responses = list(responses or [])
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append({"method": method, "url": url, "headers": headers,
+                           "body": body})
+        if self.responses:
+            item = self.responses.pop(0)
+            if isinstance(item, Exception):
+                raise item
+            return item
+        return 200, json.dumps({"ret_code": 0, "data": {"ok": 1}}).encode("utf-8"), {}
+
+
+class OpenApiOutboundUrlTest(unittest.TestCase):
+    """出站 URL 逐字节断言：多值展开/顺序/编码/None 省略（审查必修 2）。"""
+
+    HOST = "https://webapi.futunn.com"
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.http = UrlRecordingHttp()
+        self.market = OpenApiMarket(self._client(self.tmp.name, self.http))
+
+    def _client(self, tmp, http, cred=None):
+        path = Path(tmp) / "cred.json"
+        path.write_text(json.dumps(cred or {"mode": "oauth", "access_token": "tok"}),
+                        encoding="utf-8")
+        return OpenApiClient(CredentialStore(path), http=http, host=self.HOST)
+
+    def test_rt_ticker_period_is_same_name_multi_value(self):
+        """period 同名多值：?num=2&period=BEFORE&period=AFTER（不是 Python repr）。"""
+        self.market.rt_ticker("HK.00700", num=2, period=["BEFORE", "AFTER"])
+        url = self.http.calls[-1]["url"]
+        self.assertEqual(url, self.HOST +
+                         "/api/v1.0/quote/HK.00700/rt-ticker"
+                         "?num=2&period=BEFORE&period=AFTER")
+        self.assertNotIn("%5B", url, "不得出现 list 的 repr（%5B = '['）")
+        self.assertNotIn("%27", url, "不得出现引号转义（%27 = \"'\")")
+        self.assertEqual(url.count("period="), 2, "同名键按值各出现一次")
+        self.market.rt_ticker("HK.00700", num=3, period=["AFTER", "BEFORE", "OVERNIGHT"])
+        self.assertTrue(self.http.calls[-1]["url"].endswith(
+            "?num=3&period=AFTER&period=BEFORE&period=OVERNIGHT"),
+            "多值顺序 = 传入顺序（不排序）")
+
+    def test_history_queries_omit_none_and_keep_exact_order(self):
+        """None = 未提供 → 整条省略（曾出站 start=None，网关 -3，已 live 复现）。"""
+        self.market.capital_flow_history("HK.00700", count=5)
+        self.assertEqual(self.http.calls[-1]["url"], self.HOST +
+                         "/api/v1.0/quote/HK.00700/capital-flow/history"
+                         "?period_type=DAY&count=5")
+        self.market.capital_flow_history("HK.00700", start="2026-08-01",
+                                         end="2026-09-01", count=7)
+        self.assertEqual(self.http.calls[-1]["url"], self.HOST +
+                         "/api/v1.0/quote/HK.00700/capital-flow/history"
+                         "?period_type=DAY&start=2026-08-01&end=2026-09-01&count=7")
+        self.market.history_kline("HK.00700", end="2026-09-10", num=2)
+        self.assertEqual(self.http.calls[-1]["url"], self.HOST +
+                         "/api/v1.0/quote/HK.00700/history-kline"
+                         "?end=2026-09-10&ktype=2&autype=1&num=2&extended_time=0")
+
+    def test_option_expiration_cycles_csv_is_percent_encoded(self):
+        self.market.option_expiration("HK.00700", filter_expiration_cycles="WEEK,MONTH")
+        self.assertEqual(self.http.calls[-1]["url"], self.HOST +
+                         "/api/v1.0/quote/HK.00700/option-expiration"
+                         "?filter_standard=ALL&filter_expiration_cycles=WEEK%2CMONTH")
+        self.market.option_expiration("HK.00700")
+        self.assertEqual(self.http.calls[-1]["url"], self.HOST +
+                         "/api/v1.0/quote/HK.00700/option-expiration?filter_standard=ALL")
+
+    def test_query_string_contract(self):
+        self.assertEqual(fo.query_string(None), "")
+        self.assertEqual(fo.query_string("a=1&b=2"), "a=1&b=2", "str 原样（签名口径）")
+        self.assertEqual(fo.query_string({"period": ["BEFORE", "AFTER"], "num": 2}),
+                         "period=BEFORE&period=AFTER&num=2")
+        self.assertEqual(fo.query_string({"period": ["BEFORE"]}), "period=BEFORE",
+                         "单元素列表同样展开（不是 ['BEFORE']）")
+        self.assertEqual(fo.query_string({"start": None, "end": "2026-09-10"}),
+                         "end=2026-09-10")
+        self.assertEqual(fo.query_string({"q": "a b/c&d=e"}), "q=a%20b%2Fc%26d%3De",
+                         "safe=\"\"：空格/斜杠/&/=\\u0020全部转义")
+
+
+class OpenApiClientContractTest(unittest.TestCase):
+    """客户端契约（审查 D）：注入传输异常 → TransportError；非信封 → UnexpectedResponse。
+
+    与 ``test_wp8_openapi_client.py`` 的既有用例互补（那里锁的是刷新/签名等既有行为），
+    这里只锁本次审查的「出站传输收敛」与「业务结论 vs 非业务结论」分类。
+    """
+
+    HOST = "https://webapi.futunn.com"
+
+    def _client(self, tmp, http, cred=None):
+        path = Path(tmp) / "cred.json"
+        path.write_text(json.dumps(cred or {"mode": "oauth", "access_token": "tok"}),
+                        encoding="utf-8")
+        return OpenApiClient(CredentialStore(path), http=http, host=self.HOST)
+
+    def test_injected_transport_exception_is_transport_error(self):
+        """注入传输抛裸异常（oauth 与 appkey 两条路径）→ 契约要求的 TransportError。"""
+        for mode_name, cred in (("oauth", None), ("appkey", None)):
+            with self.subTest(mode=mode_name), tempfile.TemporaryDirectory() as tmp:
+                if mode_name == "appkey":
+                    pem = Path(tmp) / "key.pem"
+                    pem.write_bytes(_ed25519_pem())
+                    cred = {"mode": "appkey", "app_key": "ak",
+                            "private_key_path": str(pem), "algorithm": "Ed25519"}
+                http = UrlRecordingHttp([ConnectionResetError("peer reset")])
+                client = self._client(tmp, http, cred)
+                with self.assertRaises(TransportError) as cm:
+                    client.request("GET", "/v4/x")
+                self.assertIsInstance(cm.exception, OpenApiError, "仍是 OpenApiError 子类")
+                self.assertIsNone(cm.exception.errcode, "传输异常没有业务 errcode")
+                self.assertIn("ConnectionResetError", str(cm.exception))
+                self.assertEqual(len(http.calls), 1, "传输失败不自动重试")
+
+    def test_non_envelope_5xx_and_non_json_are_unexpected_response(self):
+        for label, response in (("500", (500, b"<html>bad gateway</html>", {})),
+                                ("非 JSON", (200, b"<html>not json</html>", {})),
+                                ("非信封 JSON", (200, b'{"foo":1}', {}))):
+            with self.subTest(label=label), tempfile.TemporaryDirectory() as tmp:
+                http = UrlRecordingHttp([response])
+                client = self._client(tmp, http)
+                with self.assertRaises(UnexpectedResponse) as cm:
+                    client.request("GET", "/v4/x")
+                self.assertIsInstance(cm.exception, OpenApiError)
+                self.assertEqual(cm.exception.errcode, response[0],
+                                 "errcode = HTTP status（非业务 errcode）")
+                self.assertEqual(len(http.calls), 1, "非信封不自动重试")
+
+    def test_429_retry_after_rides_on_unexpected_response(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            http = UrlRecordingHttp([(429, b"rate limited", {"Retry-After": "3"})])
+            client = self._client(tmp, http)
+            with self.assertRaises(UnexpectedResponse) as cm:
+                client.request("GET", "/v4/x")
+            self.assertEqual(cm.exception.errcode, 429)
+            self.assertEqual(cm.exception.retry_after, "3")
+            self.assertEqual(len(http.calls), 1)
+
+    def test_business_envelopes_are_not_unexpected_response(self):
+        """真业务信封（交易 s==error / 行情 ret_code!=0）保持业务语义（写路径 → rejected）。"""
+        cases = ((b'{"s":"error","errcode":-2000,"errmsg":"no funds"}', -2000),
+                 (b'{"ret_code":-3,"ret_msg":"bad param"}', -3))
+        for body, errcode in cases:
+            with self.subTest(errcode=errcode), tempfile.TemporaryDirectory() as tmp:
+                http = UrlRecordingHttp([(200, body, {})])
+                client = self._client(tmp, http)
+                with self.assertRaises(OpenApiError) as cm:
+                    client.request("POST", "/v4/orders")
+                self.assertNotIsInstance(cm.exception, UnexpectedResponse)
+                self.assertEqual(cm.exception.errcode, errcode)
 
 
 # ---------------------------------------------------------------------------
@@ -461,6 +697,43 @@ class RouteSwitchTest(CacheIsolatedTest):
         out = futu.handle("capital_flow", {"code": "HK.00700"})
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"]["code"], "trading/futu-unavailable")
+
+    def test_openapi_non_envelope_maps_to_unavailable_not_business(self):
+        """5xx/429/非 JSON（UnexpectedResponse）是「没有业务结论」→ unavailable，不是 futu-error。"""
+        for status, body in ((500, b"<html>bad gateway</html>"),
+                             (429, b"rate limited"), (200, b"<html>not json</html>")):
+            with self.subTest(status=status):
+                try:
+                    fo.parse_envelope_meta(status, body)
+                except UnexpectedResponse as exc:  # except-as 出块即解绑 → 先转存
+                    failure = exc
+                else:  # pragma: no cover —— 分类前提不成立就该失败
+                    self.fail(f"HTTP {status} 应为 UnexpectedResponse")
+                futu = make_futu(channel="openapi",
+                                 market=RecordingMarket(error=failure))
+                out = futu.handle("capital_flow", {"code": "HK.00700"})
+                self.assertFalse(out["ok"], out)
+                self.assertEqual(out["error"]["code"], "trading/futu-unavailable")
+                self.assertIn("OpenAPI 通道不可用", out["error"]["message"])
+
+    def test_openapi_429_retry_after_in_error_details(self):
+        error = UnexpectedResponse("rate limited", errcode=429, retry_after="3")
+        futu = make_futu(channel="openapi", market=RecordingMarket(error=error))
+        out = futu.handle("capital_flow", {"code": "HK.00700"})
+        self.assertFalse(out["ok"])
+        self.assertEqual(out["error"]["code"], "trading/futu-unavailable")
+        self.assertEqual(out["error"]["details"], {"retry_after": "3"})
+
+    def test_openapi_info_search_empty_payload_normalized_to_shape(self):
+        """OpenAPI 侧合法空结果（{}）归一化为 {"news_list": []}，与 MCP 侧同规。"""
+        futu = make_futu(channel="openapi", market=RecordingMarket(result={}))
+        out = futu.handle("info_search", {"keyword": "腾讯"})
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["value"], {"news_list": []})
+        self.assertTrue(caches.matches_shape("info_search", out["value"]),
+                        "归一化后必须通过形状表校验（否则被 ENDPOINT_SHAPE 判载荷不完整）")
+        # 反证：未归一化的空对象会被形状校验判失败
+        self.assertFalse(caches.matches_shape("info_search", {}))
 
 
 MIN_PAYLOAD_EXISTING = {

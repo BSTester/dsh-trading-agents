@@ -9,7 +9,13 @@
     坏参数零网络往返；
   * 两层确认合一：``need_order_confirm`` → 人工批准（业务确认）之后由 broker 自动
     ``order_confirm``，**下单只发一次**；confirm 失败 / 信封缺 confirm_id / 传输异常
-    → ``unknown`` 且**绝不重发下单**；业务错误信封 → ``rejected`` 且**不发 confirm**；
+    / 任何意外异常 → ``unknown`` 且**绝不重发下单**；业务错误信封 → ``rejected``
+    且**不发 confirm**；
+  * 非信封响应（5xx/429/非 JSON）在写路径落 **unknown**（不是 rejected，OMS 不留终态）：
+    ``UnexpectedResponse`` 与业务错误信封严格二分；429 的 Retry-After 从响应头一路
+    进闸门信封（真客户端 → 真 OpenApiTrade → 闸门整链）；
+  * 凭据就绪判定含**私钥可加载**：appkey 私钥缺失 → ``supports_live_write`` False、
+    人工确认零消耗、OMS/风控零落行、零 HTTP 调用、``trading/broker-unavailable``；
   * 改单策略：非 A 股走官方原生 ``PUT`` 改单（不再撤旧重下）；A 股如实拒绝（官方
     modify-order 页明示不支持）；撤单的 exchange 映射（SH→SSE / HK→SEHK / US→US）；
     北交所（官方交换枚举无 BJ）如实拒绝；
@@ -67,10 +73,12 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 
 from server import app as app_module  # noqa: E402
-from server import caches, mcp_tools, store_access, trading  # noqa: E402
+from server import caches, futu_data, mcp_tools, store_access, trading  # noqa: E402
 from trading_core import store as core_store  # noqa: E402
+from trading_datasource import futu_openapi as fo  # noqa: E402
 from trading_datasource.futu_openapi import (  # noqa: E402
-    OpenApiError, OpenApiTrade, OrderConfirmRequired, TransportError)
+    OpenApiError, OpenApiTrade, OrderConfirmRequired, TransportError,
+    UnexpectedResponse)
 
 ORDER = {"symbol": "US.AAPL", "side": "BUY", "qty": 100, "price": 150.5}
 A_SHARE_ORDER = {"symbol": "SH.600519", "side": "BUY", "qty": 100, "price": 123.5}
@@ -253,6 +261,44 @@ class FakeConfirm:
 
     def decide(self, home, confirmation_id, decision):  # pragma: no cover
         raise AssertionError("FakeConfirm 不提供 decide")
+
+
+def unexpected_response(status, body):
+    """用**真实** ``parse_envelope_meta`` 造 UnexpectedResponse（不手搓错误类型）。"""
+    try:
+        fo.parse_envelope_meta(status, body)
+    except UnexpectedResponse as error:
+        return error
+    raise AssertionError(f"HTTP {status} / {body!r} 应为 UnexpectedResponse")
+
+
+def _ed25519_pem():
+    """一组 PKCS8 Ed25519 私钥（只验证凭据就绪判定，不在此验签）。"""
+    from cryptography.hazmat.primitives import serialization
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    return Ed25519PrivateKey.generate().private_bytes(
+        serialization.Encoding.PEM, serialization.PrivateFormat.PKCS8,
+        serialization.NoEncryption())
+
+
+class FifoHttp:
+    """真传输替身：按序回放 ``(status, body, headers)``（body 为 dict 时按 JSON 编码）。
+
+    用于让「真客户端 → 真 OpenApiTrade → 闸门」整链跑一次 429（断言 Retry-After 从
+    响应头一路进 OMS/信封），而不是手搓错误对象。
+    """
+
+    def __init__(self, responses):
+        self.calls = []
+        self.responses = list(responses)
+
+    def __call__(self, method, url, headers, body):
+        self.calls.append({"method": method, "url": url, "headers": headers,
+                           "body": body})
+        status, payload, response_headers = self.responses.pop(0)
+        if isinstance(payload, (dict, list)):
+            payload = json.dumps(payload).encode("utf-8")
+        return status, payload, response_headers
 
 
 # ---------------------------------------------------------------------------
@@ -531,6 +577,17 @@ class OpenApiBrokerWriteTest(unittest.TestCase):
                 self.assertIn("勿重发下单", out["err"])
                 self.assertEqual(backend.count("place_order"), 1)
                 self.assertEqual(backend.count("order_confirm"), 1)
+
+    def test_confirm_unexpected_exception_is_unknown_too(self):
+        """confirm 的任何异常（含非 OpenApiError 的意外异常）一律 unknown（对 confirm 更诚实）。"""
+        backend = FakeTradeBackend(place_order=self.need,
+                                   order_confirm=RuntimeError("驱动层炸了"))
+        out = trading.OpenApiBroker(trade=backend).place(dict(ORDER), "live")
+        self.assertEqual(out["status"], "unknown")
+        self.assertIn("驱动层炸了", out["err"])
+        self.assertIn("勿重发下单", out["err"])
+        self.assertEqual(backend.count("place_order"), 1, "绝不重发下单")
+        self.assertEqual(backend.count("order_confirm"), 1)
 
     def test_confirm_id_missing_is_unknown_without_confirm_call(self):
         backend = FakeTradeBackend(place_order=OrderConfirmRequired(
@@ -860,6 +917,97 @@ class GateOpenApiTest(unittest.TestCase):
         self.assertEqual(out["value"]["status"], "unknown")
         self.assertEqual(self.order_row("CID-3")["status"], "unknown")
         self.assertEqual(self.backend.count("place_order"), 1, "绝不重发下单")
+
+    def test_non_envelope_response_leaves_oms_unknown_not_rejected(self):
+        """5xx/非 JSON（非信封）→ unknown：没有业务结论，可能已到达券商（不可重放）。"""
+        for label, status, body, symbol in (
+                ("500", 500, b"<html>bad gateway</html>", "US.AAPL"),
+                ("非 JSON", 200, b"<html>not json</html>", "US.MSFT")):
+            cid = f"CID-NONENV-{status}"
+            with self.subTest(label=label):
+                error = unexpected_response(status, body)
+                self.assertIsInstance(error, UnexpectedResponse)
+                self.assertIsInstance(error, OpenApiError, "仍是 OpenApiError 子类")
+                backend = FakeTradeBackend(place_order=error)
+                out = self.gate(broker=trading.OpenApiBroker(trade=backend)).place(
+                    dict(ORDER, symbol=symbol, client_order_id=cid))
+                self.assertTrue(out["ok"], out)
+                self.assertEqual(out["value"]["status"], "unknown")
+                self.assertIn("未知状态：先查询订单，勿重放", out["value"]["err"])
+                self.assertEqual(self.order_row(cid)["status"], "unknown",
+                                 "OMS 必须落 unknown（rejected 是终态、无出边）")
+                self.assertEqual(backend.count("place_order"), 1, "绝不重放")
+
+    def test_429_retry_after_reaches_envelope_and_oms_unknown(self):
+        """429 整链：响应头 Retry-After → UnexpectedResponse → unknown + 信封可见。"""
+        (self.home / "futu-openapi.json").write_text(json.dumps(
+            {"mode": "oauth", "access_token": "t"}), encoding="utf-8")
+        http = FifoHttp([(200, {"s": "ok", "d": DEFAULT_ACCOUNTS}, {}),
+                         (429, b"rate limited", {"Retry-After": "7"})])
+        client = fo.OpenApiClient(fo.CredentialStore(self.home / "futu-openapi.json"),
+                                  http=http)
+        broker = trading.OpenApiBroker(trade=OpenApiTrade(client))
+        out = self.gate(broker=broker).place(dict(ORDER, client_order_id="CID-429"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["value"]["status"], "unknown")
+        self.assertEqual(out["value"]["retry_after"], "7", "Retry-After 原值进信封")
+        self.assertIn("Retry-After=7", out["value"]["err"])
+        self.assertIn("未知状态：先查询订单，勿重放", out["value"]["err"])
+        self.assertEqual(self.order_row("CID-429")["status"], "unknown")
+        self.assertEqual(len(self.confirm.requests), 1, "业务确认已耗尽（批准后才触达券商）")
+        self.assertEqual(len(http.calls), 2, "1 次账户解析 + 1 次下单；429 不自动重试")
+        self.assertTrue(http.calls[-1]["url"].endswith("/accounts/LIVE-1/orders"))
+
+    def test_business_error_still_rejected_and_oms_rejected(self):
+        """真业务错误信封（-2000）→ rejected——不因非信封改判而回归。"""
+        backend = FakeTradeBackend(place_order=OpenApiError("资金不足", errcode=-2000))
+        out = self.gate(broker=trading.OpenApiBroker(trade=backend)).place(
+            dict(ORDER, client_order_id="CID-BIZ"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["value"]["status"], "rejected")
+        self.assertIn("资金不足", out["value"]["err"])
+        self.assertIn("errcode=-2000", out["value"]["err"])
+        self.assertEqual(self.order_row("CID-BIZ")["status"], "rejected")
+        self.assertEqual(backend.count("place_order"), 1)
+
+    def test_missing_private_key_blocks_live_write_before_confirm(self):
+        """appkey 凭据但私钥不可加载 → 凭据不就绪：无能力、确认零消耗、零 HTTP 调用。"""
+        self.write_channel("openapi")
+        cred = self.home / "futu-openapi.json"
+        cred.write_text(json.dumps({
+            "mode": "appkey", "app_key": "ak",
+            "private_key_path": str(self.home / "missing.pem"),
+            "algorithm": "Ed25519"}), encoding="utf-8")
+        http_calls = []
+
+        def no_http(*args, **kwargs):  # pragma: no cover —— 一旦被调用即失败
+            http_calls.append(args)
+            raise AssertionError("凭据不就绪时不得发起任何 HTTP 调用")
+
+        with mock.patch.object(fo, "_default_http", no_http), \
+                mock.patch.dict(os.environ, {"DSH_HOME": str(self.home)}):
+            self.assertFalse(futu_data.openapi_ready(str(cred)),
+                             "私钥文件缺失 → 凭据不可用")
+            broker = trading.default_broker(str(self.home))
+            self.assertFalse(broker.supports_live_write)
+            out = self.gate(broker=broker).place(dict(ORDER, client_order_id="CID-NOKEY"))
+        self.assertFalse(out["ok"], out)
+        self.assertEqual(out["error"]["code"], "trading/broker-unavailable")
+        self.assertEqual(self.confirm.requests, [], "人工确认不得被消耗")
+        self.assertEqual(self.counts(), (0, 0), "不落 OMS/风控行")
+        self.assertEqual(http_calls, [], "零 HTTP 调用")
+
+    def test_loadable_private_key_is_part_of_credentials_ready(self):
+        """反证：私钥可加载时凭据就绪；私钥消失后能力立即收回。"""
+        pem = self.home / "key.pem"
+        pem.write_bytes(_ed25519_pem())
+        cred = self.home / "futu-openapi.json"
+        cred.write_text(json.dumps({
+            "mode": "appkey", "app_key": "ak", "private_key_path": str(pem),
+            "algorithm": "Ed25519"}), encoding="utf-8")
+        self.assertTrue(futu_data.openapi_ready(str(cred)))
+        pem.unlink()
+        self.assertFalse(futu_data.openapi_ready(str(cred)), "私钥消失 → 不可用")
 
     def test_modify_and_cancel_go_through_gate_on_openapi(self):
         self.backend.plan["modify_order"] = {}

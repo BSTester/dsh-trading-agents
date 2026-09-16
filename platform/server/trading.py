@@ -633,15 +633,30 @@ def _classify_openapi_error(error, label):
       * ``OrderConfirmRequired``（need_order_confirm=true）→ ``{"need_confirm": exc}``：
         订单在券商侧**已挂起**，必须走 order_confirm，**绝不重发下单**；
       * ``TransportError`` → ``unknown``：请求可能已到达券商（铁律：先查询，不重放）；
-      * ``OpenApiError`` → ``rejected``：业务错误信封，券商未接受本单。
+      * ``UnexpectedResponse``（5xx/429/非 JSON/非信封）→ **``unknown``**：服务端没给出
+        业务结论，请求同样可能已到达券商——若当 ``rejected``（终态、无出边）会把可能已
+        成交的单直接丢掉，与「先查询不重放」冲突；429 的 ``Retry-After`` 原值同时进
+        消息与返回（信封 value.retry_after），供上层退避；
+      * 其余 ``OpenApiError``（``s==error`` / ``ret_code!=0`` 的业务信封）→ ``rejected``：
+        券商明确未接受本单——这是唯一可以落终态的情形。
     """
     from trading_datasource.futu_openapi import (  # noqa: PLC0415
-        OpenApiError, OrderConfirmRequired, TransportError)
+        OpenApiError, OrderConfirmRequired, TransportError, UnexpectedResponse)
     if isinstance(error, OrderConfirmRequired):
         return {"need_confirm": error}
     if isinstance(error, TransportError):
         return {"status": "unknown",
                 "err": f"{label}传输异常：{_err_text(error)}（先查询，不重放）"}
+    if isinstance(error, UnexpectedResponse):
+        retry_after = getattr(error, "retry_after", None)
+        status = getattr(error, "errcode", None)
+        detail = _err_text(error)
+        if retry_after:
+            detail = f"{detail}；Retry-After={retry_after}"
+        return {"status": "unknown",
+                "err": f"{label}响应状态未知（HTTP {status if status is not None else 'n/a'}）："
+                       f"未知状态：先查询订单，勿重放（{detail}）",
+                **({"retry_after": str(retry_after)} if retry_after else {})}
     if isinstance(error, OpenApiError):
         return {"status": "rejected", "err": f"{label}被拒：{_err_text(error)}"}
     return None
@@ -857,6 +872,10 @@ class OpenApiBroker:
         trade = self.trade
         acc_id = self._account_for(symbol)
         try:
+            # 缺口登记（2026-09-16 审查）：官方 PUT 改单可带 ``aux_price``（触发价），但闸门/
+            # 工具面没有该字段 → 对在富途客户端建的非限价单（STOP/STOP_LIMIT/MARKET_IF_TOUCHED/
+            # LIMIT_IF_TOUCHED）无法正确改单（这里只改 qty/price，触发价沿用旧值）。本期如实
+            # 保留，后续任务补工具字段（见规格「执行偏差与覆盖缺口」）。
             data = trade.modify_order(acc_id=acc_id, order_id=order["order_id"],
                                       exchange=exchange, qty=order["qty"],
                                       price=order["price"])
@@ -891,8 +910,9 @@ class OpenApiBroker:
             if outcome is None:
                 raise
             if "need_confirm" in outcome:
-                # 官方撤单页未列 need_order_confirm；若券商如此返回，仍按「用户已在卡片批准
-                # 本操作」自动确认（同一批准覆盖同一操作，不额外打扰用户）。
+                # 官方撤单页未列 need_order_confirm（**未实测的防御分支**）；若券商如此返回，
+                # 仍按「用户已在卡片批准本操作」自动确认（同一批准覆盖同一操作，不额外打扰
+                # 用户）。真实通道若出现该分支，先以查单复核再定策略。
                 return self._confirm(trade, acc_id, outcome["need_confirm"], None, "cancel",
                                      fallback_order_id=order["order_id"])
             return {"order_id": order["order_id"], **outcome}
@@ -902,9 +922,11 @@ class OpenApiBroker:
     def _confirm(self, trade, acc_id, need, placed, operation, fallback_order_id=None):
         """券商侧二次确认（两层确认合一的第二层）——**只调 order_confirm，绝不重发下单**。
 
-        用户已在 Web 卡片批准本单参数（业务确认），因此这里自动完成券商确认。失败一律
-        落 ``unknown``：订单在券商侧**已挂起**（place/modify）且 confirm 结果不确定，
-        铁律「先查询不重放」；confirm_id 缺失同样 unknown（不猜、不重发）。
+        用户已在 Web 卡片批准本单参数（业务确认），因此这里自动完成券商确认。**任何**异常
+        （业务信封/传输/非信封/意外异常）一律落 ``unknown``：订单在券商侧**已挂起**
+        （place/modify）且 confirm 结果不确定，铁律「先查询不重放」；对 confirm 而言
+        ``unknown`` 永远比 ``rejected`` 诚实（后者会让 OMS 丢掉一张可能已生效的单）。
+        confirm_id 缺失同样 unknown（不猜、不重发）。
         """
         confirm_id = getattr(need, "confirm_id", None)
         base = {"acc_id": acc_id, "broker_order_id": _order_id(placed)
@@ -915,11 +937,8 @@ class OpenApiBroker:
                            "订单在券商侧挂起待确认（先查单，勿重发下单）"}
         try:
             confirmed = trade.order_confirm(acc_id=acc_id, confirm_id=confirm_id)
-        except Exception as error:  # noqa: BLE001
-            from trading_datasource.futu_openapi import (  # noqa: PLC0415
-                OpenApiError, TransportError)
-            if not isinstance(error, (OpenApiError, TransportError)):
-                raise
+        except Exception as error:  # noqa: BLE001 —— confirm 任何异常一律 unknown（更诚实）
+            from trading_datasource.futu_openapi import TransportError  # noqa: PLC0415
             kind = "传输异常" if isinstance(error, TransportError) else "失败"
             return {**base, "status": "unknown",
                     "err": f"券商二次确认{kind}：{_err_text(error)}"

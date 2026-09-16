@@ -22,8 +22,11 @@
 #   * 归一化规则：(a) 信封 ``d`` 透传；(b) 信封顶层 ``pagination`` 并入 d（三个分页
 #     端点 capital_flow_history/option_screen/quote_history_kline_v2，与
 #     ``futu_mcp._unwrap`` 同规则）；(c) ``info_search`` 的 MCP 侧 ``quote_news_search``
-#     实测恒空（官方通道已知问题，见 docs/TOOL-LIMITS.md），归一化为形状表要求的
-#     ``{"news_list": []}``；
+#     实测恒空（官方通道已知问题，见 docs/TOOL-LIMITS.md），**OpenAPI 侧同端点也可能回
+#     空对象**（合法空结果）——两侧同规归一化为形状表要求的 ``{"news_list": []}``；
+#   * 错误分类（2026-09-16 审查修正）：OpenAPI 侧 ``UnexpectedResponse``（5xx/429/非
+#     JSON/非信封）按**通道不可用**（trading/futu-unavailable）而不是业务错误——它没有
+#     业务结论；只有 ``s==error`` / ``ret_code!=0`` 才是 trading/futu-error；
 #   * 已知残余差异如实登记（不强求对齐）：``capital_flow_history`` 的 ``next_time`` 键
 #     MCP data 有而 REST d 无；``rt_order_book`` 元素级字段 REST 更全；A 股 -9 的替代
 #     路径提示只在 MCP 通道追加（OpenAPI 通道 errcode 语义未实测，不冒充）。
@@ -45,9 +48,11 @@
 # caches.cached——由 app.py 分支直连本模块保证）。
 #
 # 错误码族（与既有 trading/* 一致，全部 {ok:false, error:{code, message≤300, details}}）：
-#   trading/futu-unavailable   MCP 通道不可用（未授权/网络/响应形状）→ 指向安装/授权
+#   trading/futu-unavailable   MCP 通道不可用（未授权/网络/响应形状）；OpenAPI 非信封
+#                              （5xx/429/非 JSON）同码——都没拿到业务结论
 #   trading/openapi-unavailable OpenAPI 通道不可用（channel=openapi 但无凭据）→ 指向授权
-#   trading/futu-error         富途业务错误（MCP ret_code!=0 / s=error；OpenAPI errcode）
+#   trading/futu-error         富途业务错误（MCP ret_code!=0 / s=error；OpenAPI errcode/
+#                              ret_code!=0 信封）
 #   trading/invalid-operation  参数白名单/必填/类型（与 handle 层载荷校验同码）
 import re
 import time
@@ -218,7 +223,13 @@ def openapi_ready(credential_path=None):
     """OpenAPI 凭据是否可用（**行情与交易两条链共用的唯一判定**）。
 
     oauth → access_token/refresh_token 至少有一个（可刷新）；
-    appkey → app_key 与 private_key_path 齐备；其余（文件缺失/坏 JSON/mode 未配置）→ False。
+    appkey → app_key 与 private_key_path 齐备**且私钥文件可加载**
+    （``AppKeySigner.from_path``：文件缺失/坏 PEM/算法不支持/私钥类型不符 → 不可用）；
+    其余（文件缺失/坏 JSON/mode 未配置）→ False。
+
+    「私钥可加载」是凭据就绪的一部分：只看路径存在会让 live 写穿过闸门（**人工确认被消耗**）
+    后才在签名时失败；判在这里则确认零消耗、零 HTTP 调用、错误码 ``trading/broker-unavailable``
+    （见 tests/test_wp8_trading.py 的私钥缺失用例）。
     """
     from trading_datasource.futu_openapi import CredentialStore  # noqa: PLC0415
     try:
@@ -229,7 +240,15 @@ def openapi_ready(credential_path=None):
     if mode == "oauth":
         return bool(cred.get("access_token") or cred.get("refresh_token"))
     if mode == "appkey":
-        return bool(cred.get("app_key") and cred.get("private_key_path"))
+        if not (cred.get("app_key") and cred.get("private_key_path")):
+            return False
+        from trading_datasource.futu_openapi import AppKeySigner  # noqa: PLC0415
+        try:
+            AppKeySigner.from_path(cred["private_key_path"],
+                                   cred.get("algorithm", "Ed25519"))
+        except Exception:  # noqa: BLE001 —— 私钥缺失/坏 PEM/算法不支持 → 凭据不可用
+            return False
+        return True
     return False
 
 
@@ -452,14 +471,28 @@ class FutuData:
         return data
 
     def _fetch_openapi(self, endpoint, arguments):
-        """OpenAPI 后端：参数适配 → OpenApiMarket → 归一化（d 已由方法层并好 pagination）。"""
-        from trading_datasource.futu_openapi import OpenApiError  # noqa: PLC0415
+        """OpenAPI 后端：参数适配 → OpenApiMarket → 归一化（d 已由方法层并好 pagination）。
+
+        错误分流（与交易写路径同一份错误分类，措辞按读路径）：
+          * ``UnexpectedResponse``（5xx/429/非 JSON/非信封）→ ``trading/futu-unavailable``
+            （「通道没给出业务结论」不是业务错误；429 的 Retry-After 进 details）；
+          * 其余 ``OpenApiError``（``s==error`` / ``ret_code!=0``）→ ``trading/futu-error``；
+          * 传输异常 → ``trading/futu-unavailable``。
+        """
+        from trading_datasource.futu_openapi import (  # noqa: PLC0415
+            OpenApiError, UnexpectedResponse)
         try:
             value = OPENAPI_ADAPTERS[endpoint](self.market, arguments)
         except FutuDataError:
             raise
         except ValueError as error:  # noqa: B901 —— OpenApiMarket 参数白名单（本地校验）
             raise _param_error(str(error)) from error
+        except UnexpectedResponse as error:  # noqa: B901 —— 非信封/5xx/429：无业务结论
+            status = error.errcode if error.errcode is not None else "n/a"
+            details = {"retry_after": str(error.retry_after)} if error.retry_after else {}
+            raise FutuDataError(
+                f"OpenAPI 通道不可用（HTTP {status}）：{str(error.errmsg)[:200]}",
+                kind="unavailable", details=details) from error
         except OpenApiError as error:  # noqa: B901 —— 信封 s==error / ret_code!=0
             errcode = error.errcode if error.errcode is not None else "n/a"
             raise FutuDataError(
@@ -473,6 +506,11 @@ class FutuData:
         if not isinstance(value, (dict, list)):
             raise FutuDataError(f"{endpoint}: OpenAPI 返回不是对象或数组",
                                 kind="unavailable")
+        if endpoint == "info_search" and value == {}:
+            # 通道事实：MCP 侧 quote_news_search 实测恒空；OpenAPI 侧同端点也可能回空对象
+            # （合法空结果）。两侧同规归一化为形状表要求的 {"news_list": []}，避免
+            # ENDPOINT_SHAPE 把合法空结果判成「载荷不完整」。
+            return {"news_list": []}
         return value
 
     # ---- 数据方法（参数白名单 + 必填/类型校验，坏参数零通道调用）----

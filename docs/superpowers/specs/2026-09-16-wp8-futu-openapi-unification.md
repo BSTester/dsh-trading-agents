@@ -65,3 +65,30 @@ REST 端点 → quantwb 工具（**分组平铺**，命名 `<域>_<对象>`；�
 3. WS 交易推送：下单/成交事件在 Web 实时可见且 OMS 状态迁移正确；心跳断线自动重连；
 4. `mcp__futu__*` 行 disabled 时全量功能不回退（除 91 工具自由研究）；
 5. 全量测试绿 + 新增工具面锁定测试绿。
+
+## 六、执行偏差与覆盖缺口（2026-09-16 审查）
+
+本节登记任务 2/3 落地后的**已知偏差、覆盖缺口与技术债**——都经源码/live 复核，不是猜测；后续任务按此收敛，不在本期暗中补做。
+
+### 6.1 必修项（本批已修，2026-09-16）
+
+| 项 | 事实 | 处置 |
+|---|---|---|
+| `capital_flow.section` 枚举族用错 | `futu_openapi.capital_flow` 复用 `RT_SECTIONS`（6 值，含 rt-data 专有的 `HK_DARK`/`OVERNIGHT`）；官方 `capital_flow_section` 只有 4 值 `NORMAL/FULL/PREMARKET/AFTERHOURS`。**live 复现**：`section=OVERNIGHT` → `-3 … allowed: [NORMAL, FULL, PREMARKET, AFTERHOURS]` | 新增独立常量 `OpenApiMarket.CAPITAL_FLOW_SECTIONS` 并在本地拒绝；错误消息列出 4 值；`RT_SECTIONS` 保持 6 值只给 `rt_data`。live 复跑：4 值全通、`OVERNIGHT`/`HK_DARK` 本地拒绝 |
+| 列表参数被序列化成 Python repr | `query_string()` 缺 `doseq=True`：`rt_ticker(period=["BEFORE","AFTER"])` 出站为 `period=%5B%27BEFORE%27…%5D`。**live 复现**：`-3 … invalid value '['BEFORE', 'AFTER']'` | `doseq=True` 展开同名多值；`rt_ticker.period` 收紧为非空列表。live 复跑：`?num=2&period=BEFORE&period=AFTER` 通过。出站 URL 字符串断言见 `tests/test_wp8_market.py::OpenApiOutboundUrlTest` |
+| `filter_expiration_cycles` 类型错 | 官方是**逗号分隔字符串**（网关 pattern `^(MONTH\|WEEK\|…)(,(…))*$`），原先按 list 透传。**live 复现**：list → `-3`；`"WEEK,MONTH"` → 通过 | 收紧为字符串：新增 `_csv_enum`/`EXPIRATION_CYCLES`，**list 一律本地拒绝**（不按文档拼接——拼接会掩盖调用方类型错），`""` 视为未提供，元素空白归一 |
+| 5xx/429/非信封在下单路径被误标 `rejected` | `parse_envelope_meta` 对非信封抛 `OpenApiError(errcode=status)`，`_classify_openapi_error` 一律当业务拒绝 → OMS 落 `rejected`（**终态、无出边**），而这类响应「可能已到达券商」 | 新增 `UnexpectedResponse(OpenApiError)`；分类顺序 `OrderConfirmRequired` → `TransportError` → `UnexpectedResponse` → 业务 `OpenApiError`。前两者落 `unknown`（消息含「未知状态：先查询订单，勿重放」），只有真业务信封落 `rejected`；429 的 `Retry-After` 原值进消息与信封 `value.retry_after`。读路径同修：非信封 → `trading/futu-unavailable`（`trading/futu-error` 只留给真业务错误） |
+
+### 6.2 覆盖缺口与登记项（未修，后续任务）
+
+1. **工具面覆盖缺口（本期降级）**：`trade_place` 的工具字段只有 `symbol/side/qty/price/client_order_id`，且 `validate_order` 把 `side` 限为 `BUY/SELL`、`OpenApiBroker.place` 硬编码 `order_type=LIMIT + time_in_force=DAY`。客户端 `OpenApiTrade.place_order` 已支持 **8 种 order_type、4 种 side、美股 session、GTC、多腿 `order_class=MLEG`/`multi_leg_info`、`lot_type`、`remark`、`aux_price`** ——这些在工具面不可达。**明确为「本期降级」**：后续任务补工具字段（含 `validate_order` 与 `OPENAPI_TRADE_FIELDS` 同步扩面）。
+2. **改单丢 `aux_price`**：官方 `PUT /orders/{id}` 接受 `aux_price`（触发价），但闸门 `_write_gated`→`validate_order`→`OpenApiBroker.modify` 全链没有该字段（只传 `exchange/qty/price`）。对**在富途客户端建的非限价单**（STOP/STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED）无法正确改单（触发价沿用旧值）。闸门/工具层缺口，登记待补（源码注释见 `platform/server/trading.py::OpenApiBroker.modify`）。
+3. **撤单 `need_order_confirm` 分支属未实测的防御分支**：官方撤单页**没有** `need_order_confirm` 字段；`OpenApiBroker.cancel` 的自动 `order_confirm` 分支是防御性实现，从未在真实通道触发过。真实通道若出现该分支，先以查单复核再定策略。
+4. **`9e279af` 的 preset 行为变更（提交信息未说明）**：该提交把 `agent.cordis.yml` 的 `futu-keepalive` 行由 `disabled: true` 改为 `disabled: false`。事实：sim 模式在 `futu_channel=openapi` 下仍依赖 MCP 凭据（sim 路径走富途 MCP），因此保活行需要默认启用——**作为行为变更登记**（影响：默认部署多一条 10 分钟定时检查 + 会热重载组合；见 `docs/HANDOVER.md`）。
+5. **锁定表计数硬编码（维护噪声/技术债）**：工具面 56 / 端点 52 这两个数硬编码在 `platform/server/mcp_tools.py`（`TOOL_COUNT = 56` + 文件头与注释里 5 处字符串）、`platform/server/app.py`（注释），以及 **7 个测试文件**各自断言 `56/52`（`test_wp6_mcp`、`test_wp6_service_approval`、`test_wp7_factors_query`、`test_wp7_futu_data`、`test_wp7_trading`、`test_wp8_market`、`test_wp8_trading`）。每次扩面都要逐处改；后续应改为从 `TOOLS`/`endpoints()` 派生。
+6. **顺带修正（必修 2 核对出站 URL 时发现，live 已复现）**：`query_string` 曾把 `None` 序列化为字面 `None`（`capital_flow_history` 默认出站 `?start=None&end=None` → `-3 parameter 'start' does not match pattern '^\d{4}-\d{2}-\d{2}$'`）。现按「None = 调用方未提供」整条省略（与请求体 `_body` 同规），live 复跑默认路径通过。登记为**查询串序列化的行为修正**。
+
+### 6.3 信封表述更正（仅注释，代码未变）
+
+原模块头与交易段注释写「交易侧与行情侧同一信封」——**不准确**：交易是 `{"s":"ok","d":…}` / `{"s":"error",errcode,errmsg,…}`，行情是 `{"ret_code":0,"data":{…},"pagination":{…}}`（分页在信封顶层），`parse_envelope_meta` 一直同时兼容两者。现已改正注释并显式登记第三种情形 `UnexpectedResponse`（非信封/5xx/429）。
+

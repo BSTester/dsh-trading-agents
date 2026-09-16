@@ -1,9 +1,15 @@
 """富途 OpenAPI（REST）客户端 —— OAuth 2.1+PKCE 与 AppKey 双认证（全仓库唯一实现）。
 
 对齐官方文档（2026-09-16 实抓，规格 §三 认证与凭据）：
-- REST Host ``https://webapi.futunn.com``；响应信封
-  ``{"s":"ok","d":...}`` / ``{"s":"error","errcode":int,"errmsg":str,
-  "jump_url"?,"need_order_confirm"?,"confirm_id"?}``；
+- REST Host ``https://webapi.futunn.com``；**两种信封并存，不是「同一信封」**：
+  * 交易侧：``{"s":"ok","d":...}`` / ``{"s":"error","errcode":int,"errmsg":str,
+    "jump_url"?,"need_order_confirm"?,"confirm_id"?}``（``s==error`` → OpenApiError，
+    ``need_order_confirm=true`` → OrderConfirmRequired）；
+  * 行情侧：``{"ret_code":0,"data":{...},"pagination":{...}}``（``ret_code!=0`` →
+    OpenApiError，errcode=ret_code）；分页在**信封顶层**而非 data 内；
+  * 两者都不是（5xx/429/网关页/非 JSON/非信封）→ ``UnexpectedResponse``：这是
+    **非业务错误**（响应体不是券商结论，请求可能已到达服务端），写路径必须落
+    ``unknown``「先查询、勿重放」，只有真业务错误信封才算拒绝；
 - OAuth 2.1+PKCE（推荐）：``POST /oauth2/register``（public client，PKCE required）
   → ``GET /oauth2/authorize/confirm``（S256 challenge）→ 本地 callback 收 code/state
   → ``POST /oauth2/token``（authorization_code + code_verifier）→
@@ -19,9 +25,9 @@
   ``\\n`` 结尾）；Ed25519 直接签原文，RSA-SHA256 先 sha256 再 PKCS#1 v1.5；
 - Token 安全：不进环境变量，只落 ``~/.dsh/futu-openapi.json``（0600 原子写）。
 
-限频/5xx：本层**不做自动重试**，如实抛 OpenApiError——重试/退避策略留给上层调用方
-（交易链路重试需与 OMS 状态机协同，客户端层盲重试会重复下单）；429 时响应头
-``Retry-After`` 并入 ``OpenApiError.retry_after`` 供上层退避。
+限频/5xx：本层**不做自动重试**，如实抛 ``UnexpectedResponse``（非信封响应，见上）——
+重试/退避策略留给上层调用方（交易链路重试需与 OMS 状态机协同，客户端层盲重试会重复
+下单）；429 时响应头 ``Retry-After`` 并入 ``OpenApiError.retry_after`` 供上层退避。
 
 HTTP 传输可注入（``OpenApiClient(..., http=request_fn)``）：
 ``request_fn(method, url, headers, body_bytes|None)
@@ -84,7 +90,21 @@ class TransportError(OpenApiError):
 
     由默认传输 ``_default_http`` 抛出：urllib 的 URLError/OSError 等不再裸穿，
     使 ``request()`` 的「传输异常 → OpenApiError」契约成立（errcode 为 None，
-    与业务 errcode 语义区分）。
+    与业务 errcode 语义区分）。注入式传输抛出的任意异常同样由 ``_transport_call``
+    收敛为本类，契约对注入传输一样成立。
+    """
+
+
+class UnexpectedResponse(OpenApiError):
+    """非信封响应（5xx / 429 / 非 JSON / 网关页）：**不是业务结论**。
+
+    ``parse_envelope_meta`` 对既非 ``{"s":...}`` 也非 ``{"ret_code":...}`` 的响应抛本类
+    （``errcode`` = HTTP status，``retry_after`` = 429 的响应头原值）。
+
+    与业务错误信封（有 errcode/errmsg）严格区分：本类代表「服务端**没有**给出可判定的
+    业务结论」，请求**可能已到达券商**——交易写路径必须落 ``unknown``（铁律：先查询订单，
+    勿重放），绝不能当 ``rejected``（终态、无出边，会把可能已成交的单丢掉）。
+    读路径同样按「通道不可用」而不是「业务错误」处置（见 server/futu_data.py）。
     """
 
 
@@ -238,12 +258,23 @@ def json_body_bytes(json_body):
 
 
 def query_string(query):
-    """原始 query 串：dict 按插入序完全转义（safe=""，避免 + / 空格歧义）；str 原样。"""
+    """原始 query 串：dict 按插入序完全转义（safe=""，避免 + / 空格歧义）；str 原样。
+
+    * **同名多值**必须展开：``period=["BEFORE","AFTER"]`` → ``period=BEFORE&period=AFTER``
+      （官方 rt-ticker 多值语义）→ ``doseq=True``。缺了它，list 会被序列化成 Python repr
+      （``period=%5B%27BEFORE%27...%5D``），网关按非法枚举拒绝（实测 -3 invalid_parameter）；
+    * ``None`` = 调用方未提供 → **整条省略**（与请求体 ``_body`` 去 None 同规）。不省略会
+      出站 ``start=None``，网关按日期 pattern 拒绝（capital-flow/history 实测 -3）；
+    * ``str`` 值不受 doseq 影响（仍是单值）；URL 与 AppKey 签名原文共用本函数，
+      保证逐字节一致。
+    """
     if query is None:
         return ""
     if isinstance(query, str):
         return query
-    return urllib.parse.urlencode(query, quote_via=urllib.parse.quote, safe="")
+    pairs = [(key, value) for key, value in query.items() if value is not None]
+    return urllib.parse.urlencode(pairs, doseq=True,
+                                  quote_via=urllib.parse.quote, safe="")
 
 
 def _safe_json_dict(body):
@@ -257,9 +288,10 @@ def _safe_json_dict(body):
 
 
 def parse_envelope(status, body):
-    """官方响应信封：{"s":"ok","d":...} → d；{"s":"error",...} → OpenApiError。
+    """官方响应信封 → d；业务错误信封 → OpenApiError（见 ``parse_envelope_meta``）。
 
-    非 JSON / 非信封（含 5xx、限频页）：如实抛 OpenApiError——本层不自动重试。
+    非 JSON / 非信封（含 5xx、限频页）：抛 ``UnexpectedResponse``（OpenApiError 子类）
+    ——「没有业务结论」与「业务拒绝」是两回事，本层不自动重试。
     """
     return parse_envelope_meta(status, body)[0]
 
@@ -267,10 +299,15 @@ def parse_envelope(status, body):
 def parse_envelope_meta(status, body):
     """``parse_envelope`` 的 (d, 分页) 版本。
 
-    行情分页端点（capital-flow/history、option-screen、history-kline）的信封是
-    ``{"ret_code":0, "data":{...}, "pagination":{...}}``——分页在**信封顶层**而不在
-    data 内。OpenApiMarket 把它并入返回值以对齐 MCP 通道 ``futu_mcp._unwrap`` 的形状
-    （那里 pagination 同样被并入 data）；无分页时第二个元素为 ``None``。
+    三种形态（**不是同一信封**）：
+      * 交易侧 ``{"s":"ok","d":...}`` → (d, None)；``{"s":"error",...}`` →
+        OpenApiError / OrderConfirmRequired；
+      * 行情侧网关 ``{"ret_code":0,"data":{...},"pagination":{...}}`` —— 分页在**信封
+        顶层**而不在 data 内，OpenApiMarket 把它并入返回值以对齐 MCP 通道
+        ``futu_mcp._unwrap`` 的形状（那里 pagination 同样被并入 data）；``ret_code!=0``
+        → OpenApiError（errcode=ret_code）；无分页时第二个元素为 ``None``；
+      * 其余（非 JSON/非信封/5xx/429 网关页）→ ``UnexpectedResponse``：**非业务错误**，
+        写路径据此落 unknown「先查询、勿重放」，不得当业务拒绝。
     """
     data = _safe_json_dict(body)
     if isinstance(data, dict) and data.get("s") == "ok":
@@ -293,7 +330,7 @@ def parse_envelope_meta(status, body):
                                errcode=data.get("ret_code"))
         pagination = data.get("pagination")
         return data.get("data"), pagination if isinstance(pagination, dict) else None
-    raise OpenApiError(
+    raise UnexpectedResponse(
         errcode=status if isinstance(status, int) and status else -1,
         errmsg=f"非预期响应（HTTP {status}）：{(body or b'')[:200]!r}")
 
@@ -337,8 +374,9 @@ class OpenApiClient:
     OAuth：Bearer 调用；expires_at 前 60s 或遇 401 时用 refresh_token 刷新**一次**
     并重试**一次**（刷新失败 → OpenApiError）；刷新成功立即持久化新 token。
     AppKey：每次请求现算签名头（nonce 自动生成）。
-    限频/5xx：不自动重试，如实抛出——留给上层；429 时响应头 ``Retry-After``
-    并入 ``OpenApiError.retry_after``。传输异常收敛为 ``TransportError``。
+    限频/5xx：不自动重试，如实抛出——留给上层；非信封响应统一为
+    ``UnexpectedResponse``，429 时响应头 ``Retry-After`` 并入 ``OpenApiError.retry_after``。
+    传输异常（含注入式传输抛出的任意异常）收敛为 ``TransportError``。
     """
 
     REFRESH_LEEWAY_MS = 60_000  # expires_at 前 60s 视为临期，主动刷新
@@ -354,8 +392,9 @@ class OpenApiClient:
     def request(self, method, path, query=None, json_body=None):
         """发起请求，返回信封 d 部分。
 
-        s==error / ret_code!=0 / 传输异常 → OpenApiError（传输异常为
-        TransportError 子类；429 附 retry_after）。
+        s==error / ret_code!=0 → OpenApiError（业务结论）；非信封/5xx/429 →
+        UnexpectedResponse（**非业务结论**，调用方不得当业务拒绝）；传输异常为
+        TransportError 子类；429 附 retry_after。
         """
         d, _pagination = self.request_meta(method, path, query, json_body)
         return d
@@ -384,6 +423,23 @@ class OpenApiClient:
     def _url(self, path, query):
         qs = query_string(query)
         return self.host + path + (("?" + qs) if qs else "")
+
+    @staticmethod
+    def _transport_call(http, method, url, headers, body):
+        """调传输并兑现 ``request()`` 的契约：传输层异常一律收敛为 ``TransportError``。
+
+        默认传输 ``_default_http`` 自己已包装；**注入式传输**（测试/自研通道）可能抛任意
+        异常（connection reset / 自定义 HTTP 库异常）——在三个调用点统一收敛，避免裸穿
+        给调用方被误当业务错误（交易写路径会把裸异常上抛成 broker-unavailable 而不是
+        unknown）。已经是 OpenApiError 系（含 TransportError）的原样上抛。
+        """
+        try:
+            return http(str(method).upper(), url, headers, body)
+        except OpenApiError:
+            raise
+        except Exception as error:  # noqa: BLE001 —— 注入传输的任意异常都是传输失败
+            raise TransportError(
+                f"网络传输失败（{type(error).__name__}）：{error}") from error
 
     @staticmethod
     def _with_retry_after(err, status, headers):
@@ -428,7 +484,8 @@ class OpenApiClient:
             body = json_body_bytes(json_body)
             headers["Content-Type"] = "application/json"
         headers["Authorization"] = "Bearer " + str(cred.get("access_token", ""))
-        return self._http(str(method).upper(), self._url(path, query), headers, body)
+        return self._transport_call(self._http, method, self._url(path, query),
+                                    headers, body)
 
     def _refresh(self, cred):
         """refresh_token 换新 access_token（官方不轮换 refresh_token）。
@@ -444,8 +501,8 @@ class OpenApiClient:
             "refresh_token": refresh_token,
             "client_id": cred.get("client_id", ""),
         }).encode("ascii")
-        status, body, headers = self._http(
-            "POST", self.host + TOKEN_PATH,
+        status, body, headers = self._transport_call(
+            self._http, "POST", self.host + TOKEN_PATH,
             {"Content-Type": "application/x-www-form-urlencoded"}, form)
         data = _safe_json_dict(body)
         if status >= 400 or not isinstance(data, dict) or not data.get("access_token"):
@@ -494,9 +551,8 @@ class OpenApiClient:
         }
         if body is not None:
             headers["Content-Type"] = "application/json"
-        status, resp_body, headers = self._http(str(method).upper(),
-                                                self._url(path, query),
-                                                headers, body)
+        status, resp_body, headers = self._transport_call(
+            self._http, method, self._url(path, query), headers, body)
         try:
             return parse_envelope_meta(status, resp_body)
         except OpenApiError as e:
@@ -546,6 +602,26 @@ class _RestValidators:
         if value not in allowed:
             raise ValueError(f"{name} 取值非法：{value!r}（允许：{sorted(allowed)}）")
         return value
+
+    def _csv_enum(self, value, allowed, name, default=None):
+        """逗号分隔字符串枚举（官方 ``filter_expiration_cycles`` 的形态）。
+
+        官方类型是**字符串**（网关 pattern 逐字：``^(A|B)(,(A|B))*$``，2026-09-16 实测），
+        **不是数组**——传 list 会被出站序列化成 Python repr 并被网关 -3 拒绝，因此这里只
+        接受字符串（list 等非字符串本地拒绝，坏参数零网络往返）；``""`` 视为未提供。
+        元素两端空白容忍并归一（去掉后按原文逗号拼接，保证与网关 pattern 一致）。
+        """
+        if value is None or value == "":
+            return default
+        if not isinstance(value, str):
+            raise ValueError(
+                f"{name} 必须是逗号分隔的字符串（官方类型 string，如 'WEEK,MONTH'），"
+                f"不接受 {type(value).__name__}：{value!r}；允许：{sorted(allowed)}")
+        parts = [part.strip() for part in value.split(",")]
+        if any(part not in allowed for part in parts):
+            raise ValueError(f"{name} 取值非法：{value!r}"
+                             f"（允许：{sorted(allowed)}，逗号分隔）")
+        return ",".join(parts)
 
     def _date(self, value, name, required=False):
         """yyyy-MM-dd 日期校验（含日历有效性）。"""
@@ -604,9 +680,14 @@ class OpenApiMarket(_RestValidators):
     AUTYPE_VALUES = frozenset({0, 1, 2, 3, 4})
     #: extended_time 枚举：0=默认 1=含盘前盘后（美股 1 分 K） 2=含夜盘
     EXTENDED_TIME_VALUES = frozenset({0, 1, 2})
-    #: rt-data 的交易时段枚举（官方文档 rt-data 页）
+    #: rt-data 的交易时段枚举（官方文档 rt-data 页，6 值；**仅 rt_data 用**）
     RT_SECTIONS = frozenset({"NORMAL", "FULL", "PREMARKET", "AFTERHOURS",
                              "HK_DARK", "OVERNIGHT"})
+    #: capital-flow 的 section 枚举（官方 naming-dictionary#capital-flow-section，4 值）。
+    #: **不是 RT_SECTIONS**：网关逐字返回 allowed:[NORMAL, FULL, PREMARKET, AFTERHOURS]
+    #: （2026-09-16 实测 OVERNIGHT/HK_DARK → -3 invalid_parameter）；两者复用同一常量
+    #: 会把 rt-data 的夜盘枚举漏进 capital-flow，是已复现的 live 缺陷。
+    CAPITAL_FLOW_SECTIONS = frozenset({"NORMAL", "FULL", "PREMARKET", "AFTERHOURS"})
     #: rt-ticker 的时段过滤枚举
     TICKER_PERIODS = frozenset({"NORMAL", "BEFORE", "AFTER", "OVERNIGHT"})
     #: trading-days 的市场枚举（官方文档 trading-days 页）
@@ -614,6 +695,11 @@ class OpenApiMarket(_RestValidators):
                                  "AU", "JP_FUTURE", "SG_FUTURE"})
     #: option-expiration / option-chain 的 filter_standard 枚举
     FILTER_STANDARDS = frozenset({"ALL", "STANDARD", "NON_STANDARD"})
+    #: option-expiration 的 filter_expiration_cycles 取值（官方网关 pattern 逐字，
+    #: 2026-09-16 实测；请求形态是**逗号分隔字符串**而非数组，见 _csv_enum）
+    EXPIRATION_CYCLES = frozenset({"MONTH", "WEEK", "END_OF_MONTH", "QUARTERLY",
+                                   "WEEKMON", "WEEKTUE", "WEEKWED", "WEEKTHU",
+                                   "WEEKFRI"})
     #: capital-flow-history 的聚合周期
     FLOW_PERIOD_TYPES = frozenset({"DAY", "WEEK", "MONTH"})
     #: find-news 的资讯类型：1=资讯 2=公告 3=研报
@@ -679,12 +765,17 @@ class OpenApiMarket(_RestValidators):
                                    query=query)
 
     def rt_ticker(self, symbol, num=500, period=None):
-        """GET /api/v1.0/quote/{symbol}/rt-ticker —— 逐笔成交（num 1..750；period 列表）。"""
+        """GET /api/v1.0/quote/{symbol}/rt-ticker —— 逐笔成交（num 1..750；period 列表）。
+
+        ``period`` 是**同名多值**参数：``["BEFORE","AFTER"]`` 出站为
+        ``?num=…&period=BEFORE&period=AFTER``（由 ``query_string`` 的 doseq 展开），
+        绝不是 ``period=['BEFORE', 'AFTER']`` 的 Python repr（后者实测 -3）。
+        """
         query = {"num": self._int_in(num, 1, self.MAX_TICKER_NUM, "num", default=500)}
         if period is not None:
-            if not isinstance(period, list) or \
+            if not isinstance(period, list) or not period or \
                     any(item not in self.TICKER_PERIODS for item in period):
-                raise ValueError(f"period 必须是 {sorted(self.TICKER_PERIODS)} 的列表")
+                raise ValueError(f"period 必须是 {sorted(self.TICKER_PERIODS)} 的非空列表")
             query["period"] = list(period)
         return self.client.request("GET", f"/api/v1.0/quote/{symbol}/rt-ticker",
                                    query=query)
@@ -777,8 +868,12 @@ class OpenApiMarket(_RestValidators):
     # ------------------------------------------------------------ 资金（capital-flow）
 
     def capital_flow(self, symbol, section="NORMAL"):
-        """GET /api/v1.0/quote/{symbol}/capital-flow —— 日内分钟级资金流。"""
-        query = {"section": self._enum_in(section, self.RT_SECTIONS, "section",
+        """GET /api/v1.0/quote/{symbol}/capital-flow —— 日内分钟级资金流。
+
+        ``section`` 用 ``CAPITAL_FLOW_SECTIONS``（4 值），**不是** ``RT_SECTIONS``（6 值，
+        含 rt-data 专有的 HK_DARK/OVERNIGHT，网关对 capital-flow 拒绝这两个值）。
+        """
+        query = {"section": self._enum_in(section, self.CAPITAL_FLOW_SECTIONS, "section",
                                           default="NORMAL")}
         return self.client.request("GET", f"/api/v1.0/quote/{symbol}/capital-flow",
                                    query=query)
@@ -809,12 +904,19 @@ class OpenApiMarket(_RestValidators):
 
     def option_expiration(self, symbol, index_option_type=None,
                           filter_standard="ALL", filter_expiration_cycles=None):
-        """GET /api/v1.0/quote/{symbol}/option-expiration —— 期权到期日列表。"""
+        """GET /api/v1.0/quote/{symbol}/option-expiration —— 期权到期日列表。
+
+        ``filter_expiration_cycles`` 官方类型是**逗号分隔字符串**（如 ``"WEEK,MONTH"``），
+        传 list 本地拒绝（见 ``_csv_enum``）；若不拒，list 会出站成 Python repr 并被
+        网关 -3 拒绝（已实测）。
+        """
         query = self._body({
             "index_option_type": index_option_type,
             "filter_standard": self._enum_in(filter_standard, self.FILTER_STANDARDS,
                                              "filter_standard", default="ALL"),
-            "filter_expiration_cycles": filter_expiration_cycles,
+            "filter_expiration_cycles": self._csv_enum(
+                filter_expiration_cycles, self.EXPIRATION_CYCLES,
+                "filter_expiration_cycles"),
         })
         return self.client.request("GET", f"/api/v1.0/quote/{symbol}/option-expiration",
                                    query=query)
@@ -884,10 +986,13 @@ class OpenApiMarket(_RestValidators):
 #   账户资金    GET    /accounts/{acc_id}/funds              query {currency?}
 #   持仓        GET    /accounts/{acc_id}/positions          query {code? pl_ratio_min? pl_ratio_max?}
 #
-# 信封：交易侧与行情侧同一信封（``{"s":"ok","d":...}`` / ``{"s":"error","errcode",
-# "errmsg","jump_url"?,"need_order_confirm"?,"confirm_id"?}``），由 client.request 统一
-# 解析——need_order_confirm=true 抛 ``OrderConfirmRequired``（订单在券商侧**已挂起**，
-# 调 order_confirm 放行；**禁止对原请求重发**）。
+# 信封：交易侧是 ``{"s":"ok","d":...}`` / ``{"s":"error","errcode","errmsg","jump_url"?,
+# "need_order_confirm"?,"confirm_id"?}``（**行情侧是另一套**：``{"ret_code":0,"data":...,
+# "pagination":...}``，见模块头与 parse_envelope_meta——两者不是同一信封），由 client.request
+# 统一解析——need_order_confirm=true 抛 ``OrderConfirmRequired``（订单在券商侧**已挂起**，
+# 调 order_confirm 放行；**禁止对原请求重发**）。既非 s 信封也非 ret_code 信封（5xx/429/
+# 网关页/非 JSON）→ ``UnexpectedResponse``：**没有业务结论**，写路径落 unknown 先查询，
+# 不得当业务拒绝。
 #
 # 文档与实现的差异登记（不猜，逐条给出源码依据）：
 #   * funds 的 ``currency`` 在官方参数表标 Required=Yes，但同页 curl 示例未传该参数
