@@ -85,3 +85,7 @@ WP1（§13.2 六项）、WP2（估值字段路径复用 `workbench/python/factor
 合并 WP6 后重构为**完整独立版本**：工作台（FastAPI 单进程）自带调度与因子快照定时收集（吸收 daemon）、自带富途通道（账户/交易/行情的权威通道，写路径唯一：mode→风控→kill→业务确认）；Harness 只做大脑（研究/决策/分析），富途直连降级为只读研究通道（写类被 policy 拒绝并指引工作台）；提供一键安装提示词（`install/HARNESS_SETUP.md`）。
 规格：`docs/superpowers/specs/2026-09-16-wp7-standalone-platform.md`；计划：`docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md`。
 验收记录：**`docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md` 末节「WP7 验收记录」**（任务 1-6 提交清单、全量测试证据、规格 §四 验收对照表、已知限制、人工验收留位）。
+
+## WP8 富途 OpenAPI 统一接入（已立项，2026-09-16 用户决策）
+
+富途三种开放能力（OpenAPI REST+WS / 托管 MCP / SkillHub）中，**OpenAPI 是唯一全能力层**（行情与交易 WebSocket 推送、二次确认、8 种订单类型、多腿、加密货币、深度数据）。WP8 把 OpenAPI 统一接入工作台服务端（OAuth 2.1+PKCE / AppKey 双认证），quantwb 工具面完整覆盖官方交易链路；托管 MCP 降级为可选只读研究通道；SkillHub 仅作能力对照。规格：`docs/superpowers/specs/2026-09-16-wp8-futu-openapi-unification.md`；计划：`docs/superpowers/plans/2026-09-16-wp8-futu-openapi-unification.md`。
