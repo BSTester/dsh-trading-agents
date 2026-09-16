@@ -19,21 +19,21 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "platform"))
 sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 
-from trading_core import cli, daemon  # noqa: E402
+from trading_core import cli, clock, daemon  # noqa: E402
 
 
 class FakeNowTest(unittest.TestCase):
     def setUp(self):
         self._saved = os.environ.get(daemon.FAKE_NOW_ENV)
         os.environ.pop(daemon.FAKE_NOW_ENV, None)
-        daemon._fake_now_alerted = False  # 去重位是模块级：逐用例复位
+        clock._fake_now_alerted = False  # 去重位是模块级：逐用例复位（WP9 拆分后归 clock）
 
     def tearDown(self):
         if self._saved is None:
             os.environ.pop(daemon.FAKE_NOW_ENV, None)
         else:
             os.environ[daemon.FAKE_NOW_ENV] = self._saved
-        daemon._fake_now_alerted = False
+        clock._fake_now_alerted = False
 
     # ---- ① 优先级 ----
 

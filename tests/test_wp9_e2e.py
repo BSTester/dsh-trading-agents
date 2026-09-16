@@ -42,7 +42,7 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 
 from server import scheduler  # noqa: E402
-from trading_core import cli, daemon, oms, store, strategies  # noqa: E402
+from trading_core import cli, clock, daemon, oms, store, strategies  # noqa: E402
 
 PREV = "2026-09-15"
 D1 = "2026-09-16"
@@ -81,8 +81,8 @@ class AutoPipelineE2E(unittest.TestCase):
         os.environ["DSH_HOME"] = str(self.home)
         os.environ.pop(daemon.FAKE_NOW_ENV, None)
         self.addCleanup(self._restore_env)
-        daemon._fake_now_alerted = False
-        self.addCleanup(setattr, daemon, "_fake_now_alerted", False)
+        clock._fake_now_alerted = False
+        self.addCleanup(setattr, clock, "_fake_now_alerted", False)
 
         # 父进程与 CLI 子进程必须落同一个库：CLI 按 DSH_HOME 推 db_path()
         self.conn = store.connect(store.db_path(str(self.home)))
