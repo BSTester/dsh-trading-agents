@@ -52,6 +52,8 @@ ENDPOINTS = [
     *store_access.WP8_PUSH_ENDPOINTS,
     # WP8 任务 7：设置页（凭据读/写与连通性测试），与 store_access.WP8_SETTINGS_ENDPOINTS 同步
     *store_access.WP8_SETTINGS_ENDPOINTS,
+    # WP10 任务 1：流程页只读聚合，与 store_access.WP10_ENDPOINTS 同步
+    *store_access.WP10_ENDPOINTS,
 ]
 
 
@@ -171,7 +173,8 @@ class ContractTests(Base):
                         + len(store_access.WP8_MARKET_ENDPOINTS)
                         + len(store_access.WP8_TRADE_ENDPOINTS)
                         + len(store_access.WP8_PUSH_ENDPOINTS)
-                        + len(store_access.WP8_SETTINGS_ENDPOINTS))
+                        + len(store_access.WP8_SETTINGS_ENDPOINTS)
+                        + len(store_access.WP10_ENDPOINTS))
         self.assertEqual(body["value"]["mode"], "sim")
         self.assertIn("generated_at", body["value"])
 
@@ -731,7 +734,8 @@ class ConfirmationRoutesTests(Base):
                         + len(store_access.WP8_MARKET_ENDPOINTS)
                         + len(store_access.WP8_TRADE_ENDPOINTS)
                         + len(store_access.WP8_PUSH_ENDPOINTS)
-                        + len(store_access.WP8_SETTINGS_ENDPOINTS))
+                        + len(store_access.WP8_SETTINGS_ENDPOINTS)
+                        + len(store_access.WP10_ENDPOINTS))
         self.assertIn("confirmation", store_access.endpoints())
         self.assertIn("confirm-decide", store_access.endpoints())
         declared = self.post(self.client, "snapshot").json()["value"]["endpoints"]
@@ -884,7 +888,7 @@ class StaticTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": f"http://127.0.0.1:{port}",
                                 "mcp": f"http://127.0.0.1:{port}/mcp",
-                                "tools": 59, "auth": "loopback-only"})
+                                "tools": 60, "auth": "loopback-only"})
 
     def test_bad_encoding_is_400(self):
         dist = self.make_dist()
@@ -1106,7 +1110,8 @@ class ComputeBridgeTests(Base):
         with self.assertRaises(compute.ComputeError):
             compute.snapshot_cli("snapshot-something")
         self.assertEqual(compute.SNAPSHOT_COMMANDS,
-                         ("snapshot-plan", "snapshot-schedule", "snapshot-reconcile"))
+                         ("snapshot-plan", "snapshot-schedule", "snapshot-reconcile",
+                          "snapshot-pipeline"))
         self.assertEqual(compute.PYTHON, sys.executable)
 
     def test_stable_key_is_order_independent(self):
@@ -1120,7 +1125,9 @@ class ComputeBridgeTests(Base):
         # WP7 任务 2：+factors-history（5m，服务自有端点，不在 legacy rpc.js 表里）
         self.assertEqual(caches.CACHE_TTL_MS["factors-history"], 5 * 60_000)
         # WP8 任务 2：+基本类 5m ×4 + quote_history_kline_v2 10m（实时类不进表）
-        self.assertEqual(len(caches.CACHE_TTL_MS), 23)
+        # WP10 任务 1：+pipeline 30s（流程页阶段状态，与 schedule 同量级）
+        self.assertEqual(len(caches.CACHE_TTL_MS), 24)
+        self.assertEqual(caches.CACHE_TTL_MS["pipeline"], 30_000)
         self.assertEqual(caches.CACHE_TTL_MS["quality"], 60 * 60_000)
 
     def test_shape_table_and_matcher(self):
@@ -1445,7 +1452,7 @@ class RunEntryTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": "http://127.0.0.1:41234",
                                 "mcp": "http://127.0.0.1:41234/mcp",
-                                "tools": 59, "auth": "loopback-only"})
+                                "tools": 60, "auth": "loopback-only"})
         line = run_module.ready_line(("127.0.0.1", 8397),
                                      {"port": 8397, "host": "127.0.0.1", "token": "t"})
         self.assertEqual(line["auth"], "token")

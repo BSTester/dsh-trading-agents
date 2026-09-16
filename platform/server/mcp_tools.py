@@ -84,7 +84,7 @@ SERVER_VERSION = "0.1.0"
 # OpenAPI 交易只读工具 + WP8 任务 6 的 3 个推送订阅管理工具；58 端点扣除有意排除的
 # confirm-decide 与设置页 3 端点 openapi_config/openapi_test/openapi_oauth）
 # + 5 维护工具（§3.4）。锁定测试断言 59 恒成立。
-TOOL_COUNT = 59
+TOOL_COUNT = 60
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订；
 # WP8 任务 7 增补；WP8 OAuth 集成再增 openapi_oauth）。
@@ -427,6 +427,14 @@ TOOLS = (
     ),
     ToolDefinition(
         "reconcile", "对账快照：最近差异、TCA 摘要、告警列表。", "reconcile", (REFRESH,),
+    ),
+    ToolDefinition(
+        "pipeline",
+        "流程快照：每市场今日闭环阶段状态（同步/质量/因子/计划生成/自动执行等）、"
+        "全局阶段（对账/摘要）、auto_pipeline 配置摘要与当日告警。阶段状态只反映事实"
+        "（已跑=ok、未跑且无告警=pending），不推断。",
+        "pipeline",
+        (REFRESH,),
     ),
     ToolDefinition(
         "factors_history",

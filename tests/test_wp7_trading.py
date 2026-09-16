@@ -728,8 +728,8 @@ class SurfaceLockTest(unittest.TestCase):
 
     def test_tool_surface_is_56(self):
         from server import mcp_tools
-        self.assertEqual(mcp_tools.TOOL_COUNT, 59)
-        self.assertEqual(len(mcp_tools.TOOLS), 59)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 60)
+        self.assertEqual(len(mcp_tools.TOOLS), 60)
         names = {t.name for t in mcp_tools.TOOLS}
         self.assertLessEqual({"trade_place", "trade_modify", "trade_cancel",
                               "account_positions", "account_orders", "account_funds"}, names)

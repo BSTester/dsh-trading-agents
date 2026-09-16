@@ -95,16 +95,20 @@ WP8_PUSH_ENDPOINTS = ["push_status", "push_subscribe", "push_unsubscribe"]
 # WP8 OAuth 集成增补 openapi_oauth（授权流程 start/status/cancel，server/oauth_flow.py）。
 WP8_SETTINGS_ENDPOINTS = ["openapi_config", "openapi_test", "openapi_oauth"]
 
+# WP10 任务 1：流程页端点（与 store_access.WP10_ENDPOINTS 逐项同序）：只读聚合，
+# 取数在 trading_core pipeline.py（snapshot-pipeline 子命令），进 TTL/形状表。
+WP10_ENDPOINTS = ["pipeline"]
+
 
 class EndpointListLockTests(unittest.TestCase):
-    def test_endpoints_is_frozen_58_item_list(self):
+    def test_endpoints_is_frozen_59_item_list(self):
         """``store_access.endpoints()`` ≡ 22 基础 + 7 WP7 + 8 WP8 直通 + 9 WP8 行情
-        + 6 WP8 交易 + 3 WP8 推送 + 3 WP8 设置 = 58 项，同序。"""
+        + 6 WP8 交易 + 3 WP8 推送 + 3 WP8 设置 + 1 WP10 流程 = 59 项，同序。"""
         self.assertEqual(store_access.endpoints(),
                          BASE_ENDPOINTS + WP7_ENDPOINTS + FUTU_ENDPOINTS
                          + WP8_MARKET_ENDPOINTS + WP8_TRADE_ENDPOINTS
-                         + WP8_PUSH_ENDPOINTS + WP8_SETTINGS_ENDPOINTS)
-        self.assertEqual(len(store_access.endpoints()), 58)
+                         + WP8_PUSH_ENDPOINTS + WP8_SETTINGS_ENDPOINTS + WP10_ENDPOINTS)
+        self.assertEqual(len(store_access.endpoints()), 59)
         self.assertEqual(len(store_access._BASE_ENDPOINTS), 22)
         self.assertEqual(list(store_access.WP7_ENDPOINTS), WP7_ENDPOINTS)
         self.assertEqual(list(store_access.FUTU_ENDPOINTS), FUTU_ENDPOINTS)
@@ -112,21 +116,23 @@ class EndpointListLockTests(unittest.TestCase):
         self.assertEqual(list(store_access.WP8_TRADE_ENDPOINTS), WP8_TRADE_ENDPOINTS)
         self.assertEqual(list(store_access.WP8_PUSH_ENDPOINTS), WP8_PUSH_ENDPOINTS)
         self.assertEqual(list(store_access.WP8_SETTINGS_ENDPOINTS), WP8_SETTINGS_ENDPOINTS)
-        # 尾部锚点：业务确认两端点收尾基础清单；WP7/WP8 增量按任务顺序追加
-        self.assertEqual(store_access.endpoints()[-38:-36],
+        self.assertEqual(list(store_access.WP10_ENDPOINTS), WP10_ENDPOINTS)
+        # 尾部锚点：业务确认两端点收尾基础清单；WP7/WP8/WP10 增量按任务顺序追加
+        self.assertEqual(store_access.endpoints()[-39:-37],
                          ["confirmation", "confirm-decide"])
-        self.assertEqual(store_access.endpoints()[-36:-29], WP7_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-29:-21], FUTU_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-21:-12], WP8_MARKET_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-12:-6], WP8_TRADE_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-6:-3], WP8_PUSH_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-3:], WP8_SETTINGS_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-37:-30], WP7_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-30:-22], FUTU_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-22:-13], WP8_MARKET_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-13:-7], WP8_TRADE_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-7:-4], WP8_PUSH_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-4:-1], WP8_SETTINGS_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-1:], WP10_ENDPOINTS)
         self.assertEqual(store_access.endpoints()[0], "snapshot")
         # 无重复；重复调用返回等值副本（调用方改动不污染后续结果）
-        self.assertEqual(len(set(store_access.endpoints())), 58)
+        self.assertEqual(len(set(store_access.endpoints())), 59)
         sample = store_access.endpoints()
         sample.append("bogus")
-        self.assertEqual(len(store_access.endpoints()), 58)
+        self.assertEqual(len(store_access.endpoints()), 59)
 
     def test_analytics_endpoints_are_declared(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))
@@ -167,14 +173,22 @@ class CacheTtlLockTests(unittest.TestCase):
     def test_legacy_ttl_table_is_frozen(self):
         self.assertEqual({name: ttl for name, ttl in caches.CACHE_TTL_MS.items()
                           if name not in WP7_ENDPOINTS
-                          and name not in WP8_MARKET_ENDPOINTS}, self.LEGACY_TTL_MS)
+                          and name not in WP8_MARKET_ENDPOINTS
+                          and name not in WP10_ENDPOINTS}, self.LEGACY_TTL_MS)
         self.assertEqual(self.LEGACY_TTL_MS["instrument"], 10 * 60_000)
 
     def test_wp7_ttl_delta_is_pinned(self):
         """WP7 增量钉死：factors-history 5 分钟（面板退役前的服务自有值）。"""
         self.assertEqual(caches.CACHE_TTL_MS.get("factors-history"), 5 * 60_000)
         self.assertEqual(len(caches.CACHE_TTL_MS),
-                         len(self.LEGACY_TTL_MS) + 1 + len(WP8_MARKET_TTL_MS))
+                         len(self.LEGACY_TTL_MS) + 1 + len(WP8_MARKET_TTL_MS)
+                         + len(WP10_ENDPOINTS))
+
+    def test_wp10_ttl_delta_is_pinned(self):
+        """WP10 任务 1 增量：流程快照 30 秒（与 schedule 同量级，页面要看到刚跑完的作业）。"""
+        self.assertEqual({name: caches.CACHE_TTL_MS[name]
+                          for name in WP10_ENDPOINTS
+                          if name in caches.CACHE_TTL_MS}, {"pipeline": 30_000})
 
     def test_wp8_market_ttl_delta_is_pinned(self):
         """WP8 任务 2 增量：基本类 5 分钟 ×4 + 历史 K 线 v2 10 分钟；实时四类不进表。"""
@@ -217,14 +231,23 @@ class EndpointShapeLockTests(unittest.TestCase):
     def test_legacy_shape_table_is_frozen(self):
         self.assertEqual({name: fields for name, fields in caches.ENDPOINT_SHAPE.items()
                           if name not in WP7_ENDPOINTS
-                          and name not in WP8_MARKET_ENDPOINTS}, self.LEGACY_SHAPE)
+                          and name not in WP8_MARKET_ENDPOINTS
+                          and name not in WP10_ENDPOINTS}, self.LEGACY_SHAPE)
         self.assertEqual(caches.ENDPOINT_SHAPE["confirmation"], ["pending"])
 
     def test_wp7_shape_delta_is_pinned(self):
         """WP7 增量钉死：factors-history 最小字段只有一个快照数组。"""
         self.assertEqual(caches.ENDPOINT_SHAPE["factors-history"], ["snapshots"])
         self.assertEqual(len(caches.ENDPOINT_SHAPE),
-                         len(self.LEGACY_SHAPE) + 1 + len(WP8_MARKET_SHAPE))
+                         len(self.LEGACY_SHAPE) + 1 + len(WP8_MARKET_SHAPE)
+                         + len(WP10_ENDPOINTS))
+
+    def test_wp10_shape_delta_is_pinned(self):
+        """WP10 任务 1 增量：流程快照最小字段（每市场阶段表 + 全局阶段 + 配置摘要）。"""
+        self.assertEqual({name: caches.ENDPOINT_SHAPE[name]
+                          for name in WP10_ENDPOINTS
+                          if name in caches.ENDPOINT_SHAPE},
+                         {"pipeline": ["date", "markets", "global", "auto_pipeline"]})
 
     def test_wp8_market_shape_delta_is_pinned(self):
         """WP8 任务 2 增量：5 个进缓存端点的最小字段（与上游 data 键逐项对应）。"""
@@ -274,7 +297,8 @@ class WhitelistLockTests(unittest.TestCase):
                          ["plan_hash", "expected_mode", "confirmation", "action"])
         self.assertEqual(list(app_module.SERIES_FIELDS), ["ticker", "period", "limit"])
         self.assertEqual(set(app_module.EMPTY_PAYLOAD_ENDPOINTS),
-                         {"snapshot", "audit", "confirmation", "plan", "schedule", "reconcile"})
+                         {"snapshot", "audit", "confirmation", "plan", "schedule",
+                          "reconcile", "pipeline"})
 
 
 class ComputeTableLockTests(unittest.TestCase):

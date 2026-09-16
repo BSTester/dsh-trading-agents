@@ -59,6 +59,9 @@ CACHE_TTL_MS = {
     "info_search": 5 * 60_000,
     "info_market_state": 5 * 60_000,
     "quote_history_kline_v2": 10 * 60_000,
+    # WP10 任务 1：流程快照（每市场阶段状态推导，读当日 ran 标记与表事实）——30 秒，
+    # 与「调度」页同量级：页面轮询要能看到作业刚跑完的状态变化。
+    "pipeline": 30_000,
 }
 
 # endpoints.js:46-65 的端点最小字段（plan-execute 是动作端点，不进缓存形状表）
@@ -82,6 +85,8 @@ ENDPOINT_SHAPE = {
     "confirmation": ["pending"],
     "schedule": ["heartbeat", "jobs"],
     "reconcile": ["diffs", "tca"],
+    # WP10 任务 1：流程快照最小字段（每市场阶段表 + 全局阶段 + 配置摘要）
+    "pipeline": ["date", "markets", "global", "auto_pipeline"],
     # WP7：因子快照历史（服务定时收集），最小字段只有一个快照数组
     "factors-history": ["snapshots"],
     # WP8 任务 2：OpenAPI 行情接入进缓存端点的最小字段（官方文档 data 顶层键，与

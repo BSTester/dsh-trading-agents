@@ -377,19 +377,25 @@ WP8_PUSH_ENDPOINTS = ("push_status", "push_subscribe", "push_unsubscribe")
 # 实时直通：不进 CACHE_TTL_MS/ENDPOINT_SHAPE。
 WP8_SETTINGS_ENDPOINTS = ("openapi_config", "openapi_test", "openapi_oauth")
 
+# WP10 任务 1：流程页端点（1 个）。只读聚合：每市场「今日闭环跑到哪一步」的阶段状态
+# + 全局阶段 + auto_pipeline 配置摘要，取数在 trading_core pipeline.py
+# （`snapshot-pipeline` 子命令，经 app.py 的 plan/schedule/reconcile 同一 core 桥）。
+# 空载荷；进 CACHE_TTL_MS（30s）与 ENDPOINT_SHAPE（与 plan/schedule/reconcile 同类）。
+WP10_ENDPOINTS = ("pipeline",)
+
 
 def endpoints():
-    """服务端点清单（58 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
+    """服务端点清单（59 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
     + 9 项 WP8 OpenAPI 行情 + 6 项 WP8 OpenAPI 交易只读 + 3 项 WP8 推送订阅管理
-    + 3 项 WP8 设置页（openapi_config/openapi_test/openapi_oauth）。
+    + 3 项 WP8 设置页（openapi_config/openapi_test/openapi_oauth）+ 1 项 WP10 流程页。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
-    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8 增量按交付
-    顺序登记在各自常量里；锁定测试把 58 项整体钉死。
+    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8/WP10 增量按
+    交付顺序登记在各自常量里；锁定测试把 59 项整体钉死。
     """
     return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS) \
         + list(WP8_MARKET_ENDPOINTS) + list(WP8_TRADE_ENDPOINTS) \
-        + list(WP8_PUSH_ENDPOINTS) + list(WP8_SETTINGS_ENDPOINTS)
+        + list(WP8_PUSH_ENDPOINTS) + list(WP8_SETTINGS_ENDPOINTS) + list(WP10_ENDPOINTS)
 
 
 def read_mode(home):

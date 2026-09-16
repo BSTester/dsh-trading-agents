@@ -136,6 +136,13 @@ def build_parser():
     s.add_argument("--limit", type=int, default=5, help="链路包含的计划数（默认 5）")
     _add_db(s)
 
+    # WP10 任务 1：流程快照（每市场「今日闭环跑到哪一步」，只读；流程页数据源）
+    s = sub.add_parser("snapshot-pipeline", help="流程快照（每市场阶段状态+全局阶段，只读）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    s.add_argument("--date", default=None, help="日期 YYYY-MM-DD（默认时钟口径今天）")
+    s.add_argument("--limit", type=int, default=10, help="告警条数（默认 10）")
+    _add_db(s)
+
     # ── WP7：因子快照（收盘作业链定时收集 + 历史查询；只动本地库）──
     s = sub.add_parser("factors-snapshot", help="横截面因子快照（factors.REGISTRY 全量，落 factor_snapshots）")
     s.add_argument("--tickers", required=True, help="逗号分隔")
@@ -320,6 +327,12 @@ def main(argv=None):
         elif args.cmd == "snapshot-reconcile":
             from . import snapshots
             result = snapshots.reconcile_snapshot(conn, chain_limit=args.limit)
+        elif args.cmd == "snapshot-pipeline":
+            import os
+            from . import pipeline
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = pipeline.pipeline_snapshot(conn, home, date=args.date,
+                                                alert_limit=args.limit)
         elif args.cmd == "factors-snapshot":
             # 无数据/计算失败：{ok:false, error} + 非零退出（daemon runner 只看退出码，
             # 干净 JSON 让调用方拿得到原因，而不是一屏 traceback）。

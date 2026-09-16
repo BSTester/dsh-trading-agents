@@ -99,8 +99,9 @@ ANALYTICS_ENDPOINTS = {
     "quality": ("ticker",),
 }
 
-# 空载荷端点（rpc.js:104/115/146/188）
-EMPTY_PAYLOAD_ENDPOINTS = ("snapshot", "audit", "confirmation", "plan", "schedule", "reconcile")
+# 空载荷端点（rpc.js:104/115/146/188）；WP10 任务 1 起含流程页 pipeline（只读聚合）
+EMPTY_PAYLOAD_ENDPOINTS = ("snapshot", "audit", "confirmation", "plan", "schedule", "reconcile",
+                           "pipeline")
 
 # rpc.js:121-123 的 confirm-decide 字段白名单：载荷只有编号与结论，**没有下单参数**——
 # 确认通道不能变成下单通道。这也是唯一能批准实盘操作的入口（模型侧不进 MCP 工具面）。
@@ -314,7 +315,7 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                         trades = {"trades": []}
                 return {"ok": True, "value": audit_chain.build_audit_chain(
                     store_access.snapshot(home), trades)}
-            if endpoint in ("plan", "schedule", "reconcile"):
+            if endpoint in ("plan", "schedule", "reconcile", "pipeline"):
                 # rpc.js:172-181：只读端点经 trading_core 子命令取数，plan 并入当前 mode
                 _takes_no_payload(endpoint, payload)
                 name = f"snapshot-{endpoint}"

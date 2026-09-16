@@ -37,6 +37,27 @@ SCRIPTS = ROOT / "plugins" / "workbench" / "python"
 # python 可执行：有意差异 1（sys.executable，不硬编码 venv）。
 PYTHON = sys.executable
 
+# 子进程的数据层版本（WP10 任务 1 补全 run.py 的同一条策略）：venv 的
+# ``dsh-trading-python.pth`` 把 ``$DSH_HOME/trading-python/{datasource,core}`` 加进
+# sys.path——那是安装器解出的**副本**，新增子命令/模块不会自动同步。服务进程自己已由
+# run.py 把仓库路径插到最前，但 ``subprocess`` 起的是**新解释器**，不继承父进程 sys.path，
+# 因此仓库内运行时会解析到旧副本（实测：新子命令报 ``invalid choice``）。
+# 这里把仓库数据层路径经 PYTHONPATH 传给子进程，让「代码版本 = 数据层版本」在子进程
+# 边界同样成立；无仓库（打包安装）时保持原样，回落 $DSH_HOME 副本。
+_DATA_LAYER_DIRS = tuple(str(ROOT / "plugins" / name / "python")
+                         for name in ("datasource", "core"))
+
+
+def _subprocess_env():
+    """子进程环境：仓库数据层优先（存在才前置，绝不覆盖既有 PYTHONPATH 的其它项）。"""
+    existing = [part for part in os.environ.get("PYTHONPATH", "").split(os.pathsep) if part]
+    prefix = [path for path in _DATA_LAYER_DIRS if Path(path).is_dir()]
+    if not prefix:
+        return None
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join(prefix + [p for p in existing if p not in prefix])
+    return env
+
 TIMEOUT = 180_000  # analytics.js:67 execFile 默认 timeout 180s
 SNAPSHOT_TIMEOUT = 60_000  # pycore.js:18 默认 timeout 60s
 # analytics.js 里逐个写死的 timeout：只有 instrument 不用默认值（analytics.js:170 = 120s）
@@ -107,10 +128,15 @@ def timeout_for(endpoint, default=TIMEOUT):
 
 
 def _spawn(command, timeout):
-    """真实子进程调用（``analytics.js:66-67 execFile`` 的等价物）；返回 ``CompletedProcess``。"""
+    """真实子进程调用（``analytics.js:66-67 execFile`` 的等价物）；返回 ``CompletedProcess``。
+
+    ``env`` 由 ``_subprocess_env`` 提供（仓库数据层优先），保证子进程与父进程解析到
+    同一份 ``trading_core``/``trading_datasource``。
+    """
     try:
         return subprocess.run(command, capture_output=True, text=True,
-                              timeout=timeout / 1000.0, check=False)
+                              timeout=timeout / 1000.0, check=False,
+                              env=_subprocess_env())
     except subprocess.TimeoutExpired as error:
         raise ComputeError(f"{command[1]} 超时（{int(timeout / 1000)}s）") from error
     except OSError as error:
@@ -370,7 +396,8 @@ def series(ticker, period="5m", limit=300, runner=None):
                       timeout=120_000, runner=runner)  # series.js:37 timeout 120s
 
 
-SNAPSHOT_COMMANDS = ("snapshot-plan", "snapshot-schedule", "snapshot-reconcile")
+SNAPSHOT_COMMANDS = ("snapshot-plan", "snapshot-schedule", "snapshot-reconcile",
+                     "snapshot-pipeline")
 
 
 def snapshot_cli(name, timeout=SNAPSHOT_TIMEOUT, runner=None):

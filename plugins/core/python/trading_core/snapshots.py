@@ -37,8 +37,11 @@ def _orders_of(conn, plan_id, with_fills=False):
 def _plans_newest_first(conn):
     """端点取数口径 = 最新在前（store.list_plans 仍按 created_at, plan_id 升序——
     通用访问器语义不变，两处口径差异只在快照端点边界归一）。plan 与 reconcile 的 chain、
-    以及 Web「当前计划」= plans[0] 都依赖这一口径：否则多计划并存时会取到最旧计划。"""
-    return list(reversed(store.list_plans(conn)))
+    以及 Web「当前计划」= plans[0] 都依赖这一口径：否则多计划并存时会取到最旧计划。
+
+    实现委托 ``store.list_plans_newest_first``（WP10 起流程快照也要同一口径——
+    单一实现，不在两个快照模块里各写一遍）。"""
+    return store.list_plans_newest_first(conn)
 
 
 def plan_snapshot(conn, alert_limit=10):
