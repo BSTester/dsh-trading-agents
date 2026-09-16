@@ -90,10 +90,12 @@ def build_parser():
     s.add_argument("--today", default=None, help="as_of 覆盖 YYYY-MM-DD（测试/补跑用）")
     _add_db(s)
 
-    s = sub.add_parser("auto-execute", help="自动执行（auto_pipeline：八守卫→执行已冻结计划指令）")
+    s = sub.add_parser("auto-execute", help="自动执行（auto_pipeline：九守卫→执行已冻结计划指令）")
     s.add_argument("--market", required=True, help="市场链：SH/HK/US（SH 链含 SZ/BJ）")
     s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
     s.add_argument("--today", default=None, help="日期覆盖 YYYY-MM-DD（测试/补跑用）")
+    s.add_argument("--now", default=None,
+                   help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用；执行窗口按它判定）")
     _add_db(s)
 
     s = sub.add_parser("reconcile-diff", help="离线比对本地与券商持仓 JSON")
@@ -254,12 +256,24 @@ def main(argv=None):
                 return 1
         elif args.cmd == "auto-execute":
             # auto_pipeline 的 auto_execute 作业体（WP9）。软跳过=退出 0（当日不执行是
-            # 正常结论——守卫拦截/已执行/无计划）；配置/模式非法=fail-closed 非零退出，
-            # 让调度链与运维看得到（计划与规格 §4.3 守卫 1/2 的分级一致）。
+            # 正常结论——守卫拦截/已执行/无计划/超出执行窗口）；配置/模式非法=fail-closed
+            # 非零退出，让调度链与运维看得到（计划与规格 §4.3 守卫 1/2 的分级一致）。
+            # --now 是假时钟入口（守卫 9 执行窗口按它判定）：格式非法直接 fail-closed，
+            # 不让一个写错的时间戳静默变成一个总是超窗/总是命中的判定。
             import os
             from . import daemon
+            now = None
+            if args.now is not None:
+                try:
+                    _dt.datetime.strptime(args.now, "%Y-%m-%d %H:%M:%S")
+                except ValueError:
+                    print(json.dumps({"ok": False, "error":
+                                      f"--now 需为 YYYY-MM-DD HH:MM:SS，收到 {args.now!r}"},
+                                     ensure_ascii=False))
+                    return 1
+                now = (lambda stamp: (lambda: stamp))(args.now)
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
-            result = daemon.auto_execute(conn, home, args.market, today=args.today)
+            result = daemon.auto_execute(conn, home, args.market, today=args.today, now=now)
             if not result.get("ok"):
                 print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
                 return 1

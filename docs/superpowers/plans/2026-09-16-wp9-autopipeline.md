@@ -97,17 +97,17 @@ def test_auto_pipeline_config(self):
 - [ ] **步骤 4：通过**；三套绿。
 - [ ] **步骤 5：Commit**：`git commit -m "feat(core): plan-auto 作业——策略驱动计划生成+数据就绪门+过期语义"`
 
-### 任务 5：auto_execute 作业（CLI `auto-execute`，八守卫）
+### 任务 5：auto_execute 作业（CLI `auto-execute`，九守卫）
 
 **文件**：`cli.py`、`daemon.py`；测试 `tests/test_wp9_auto_execute.py`。
 
 - [ ] **步骤 1：失败测试**（假时钟 + 假库 + 临时 home）：
-  ① 八守卫逐项跳过：enabled=False / mode=live（告警文案含「等待人工执行」）/ kill 文件存在 / halt 置位 / 无 auto frozen 计划 / 计划 market≠作业 market / 当日已执行（kv `auto_exec:<market>:<date>` 已存在）/ expected_mode 不匹配——各产 info 告警、**零指令文件**；
+  ① 九守卫逐项跳过：enabled=False / mode=live（告警文案含「等待人工执行」）/ kill 文件存在 / halt 置位 / 无 auto frozen 计划 / 计划 market≠作业 market / 当日已执行（kv `auto_exec:<market>:<date>` 已存在）/ expected_mode 不匹配 / **超出执行窗口**（`exec_window_minutes` 默认 30，规格 §4.3 守卫 9——tick-first 补跑不得在错误时点执行）——各产 info 告警、**零指令文件**；
   ② 全部通过 → `~/.dsh/trading-commands/pending/` 出现 `execute_plan` 指令，payload 含 plan_hash 与 expected_mode=sim；kv ran 标记写入；
   ③ 与人工路径同构：指令文件被 `handle_command` 消费后计划 executing（复用 test_core_commands 假件）。
 - [ ] **步骤 2：验证失败** → **步骤 3：实现** `cli auto-execute --market SH`：守卫顺序按规格 §4.3 编号，任一失败 `alerts.emit(info)` 后 exit 0（**不是错误**，是当日不执行）；通过后 `commands.write_command(home, "execute_plan", {...})`。
 - [ ] **步骤 4：通过**；三套绿。
-- [ ] **步骤 5：Commit**：`git commit -m "feat(core): auto-execute 作业——八守卫+指令文件复用人工窄门"`
+- [ ] **步骤 5：Commit**：`git commit -m "feat(core): auto-execute 作业——九守卫（含执行窗口）+指令文件复用人工窄门"`
 
 ### 任务 6：reconcile/tca/digest 入链 + build_jobs 装配
 
@@ -148,6 +148,6 @@ def test_auto_pipeline_config(self):
 
 ### WP9 验收（对照规格 §4.7）
 
-- [ ] 八守卫/数据门/过期/plans 列/轮询并入全部有测试；
+- [ ] 九守卫（含执行窗口半开区间边界）/数据门/过期/plans 列/轮询并入全部有测试；
 - [ ] `enabled=false` 全平台行为回归一致；
 - [ ] 三套测试全绿；边界检查：auto 链路零 LLM、零绕过风控（订单全部经 `execute.run` 的 pre_trade_checks）。

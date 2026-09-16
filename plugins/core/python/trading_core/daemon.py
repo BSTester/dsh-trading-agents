@@ -69,10 +69,14 @@ def platform_config(home):
 #: auto_pipeline 默认值（规格 §4.1）：默认关闭是硬约束——enabled=False 时调用方
 #: （plan-auto / auto-execute 作业）必须与「功能未实现」逐字节等价。exec_at 为北京
 #: 时间，美股按夏令时写（冬令时需人工调配置，不做自动 DST 换算）。
+#: exec_window_minutes = 执行窗口分钟数（规格 §4.3 守卫 9）：调度器 tick-first——服务
+#: 启动即补跑当日到期作业，没有窗口就会在收盘后补执行 09:35 的计划（被风控规则 3
+#: 逐单拒单并消耗当日计划）。超窗一律不执行、留待人工。
 AUTO_PIPELINE_DEFAULTS = {
     "enabled": False,
     "strategies": [],
     "exec_at": {"SH": "09:35", "HK": "09:45", "US": "22:35"},
+    "exec_window_minutes": 30,
     "reconcile_at": "19:00",
 }
 #: 合法市场（与 store 交易日历的市场键同一集合）
@@ -89,6 +93,16 @@ def _hhmm(value, field):
     hour, minute = (int(part) for part in value.split(":"))
     if hour > 23 or minute > 59:
         raise ValueError(f"{field} 时刻越界：{value!r}")
+    return value
+
+
+def _positive_int(value, field):
+    """正整数校验（fail-closed）。
+
+    bool 必须显式排除：Python 里 ``isinstance(True, int)`` 为真，而 ``exec_window_minutes:
+    true`` 是写错的配置——当 1 分钟用会把窗口缩到几乎不可用，静默接受比报错更危险。"""
+    if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+        raise ValueError(f"{field} 需为正整数，收到 {value!r}")
     return value
 
 
@@ -151,6 +165,9 @@ def auto_pipeline_config(home):
         cfg["strategies"] = _auto_strategies(overlay["strategies"])
     if "exec_at" in overlay:
         cfg["exec_at"] = _auto_exec_at(overlay["exec_at"], cfg["exec_at"])
+    if "exec_window_minutes" in overlay:
+        cfg["exec_window_minutes"] = _positive_int(
+            overlay["exec_window_minutes"], "auto_pipeline.exec_window_minutes")
     if "reconcile_at" in overlay:
         cfg["reconcile_at"] = _hhmm(overlay["reconcile_at"], "auto_pipeline.reconcile_at")
     return cfg
@@ -168,6 +185,29 @@ def _plus_minutes(hhmm, minutes):
     hour, minute = (int(part) for part in hhmm.split(":"))
     total = (hour * 60 + minute + minutes) % (24 * 60)
     return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _minutes_of_day(hhmm):
+    """HH:MM → 当日分钟数（0..1439）。格式非法抛 ValueError（调用方 fail-closed）。"""
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    return hour * 60 + minute
+
+
+def _within_exec_window(stamp_hhmm, exec_at, window_minutes):
+    """守卫 9 判定（规格 §4.3 第 9 条）：当前时刻是否落在执行窗口内。
+
+    窗口是**半开区间** ``[exec_at, exec_at + window_minutes)``：配置值是「从 exec_at 起算
+    的分钟数」——30 分钟窗口（09:35 起）覆盖 09:35..10:04，10:05 已在窗外。用半开而非
+    闭区间，是为了让「窗口长度」与配置值逐分钟对齐（闭区间会得到 window_minutes+1 个
+    分钟位）。
+
+    **跨日**：``exec_at + window`` 越过当日 23:59 时按当日末分钟截断，不跨到次日——
+    判定只在同一交易日内成立（tick 按当日 ran 标记去重，次日是另一条标记），截断方向
+    保守（宁可少执行）。默认时刻表（SH 09:35 / HK 09:45 / US 22:35）都不会触发截断。
+    """
+    start = _minutes_of_day(exec_at)
+    end = min(start + window_minutes, 24 * 60)
+    return start <= _minutes_of_day(stamp_hhmm) < end
 
 
 def _factors_at(chain):
@@ -391,11 +431,15 @@ def _execute_plan(conn, home, cmd, broker_call=None, equity=None, today=None,
 
 
 def auto_execute(conn, home, market, today=None, now=None):
-    """auto_execute 作业体（规格 §4.3）：八守卫 → 写 execute_plan 指令。
+    """auto_execute 作业体（规格 §4.3）：九守卫 → 写 execute_plan 指令。
 
     **与人工点击落完全相同的指令文件**（commands.write_command 同一实现），由指令轮询
     消费后走 handle_command → execute.run 的既有窄门（逐单风控 8 规则）；本函数不做任何
     旁路，也不直接触达券商。
+
+    守卫 9 = **执行窗口**（规格 §4.3 第 9 条）：调度器 tick-first——启动即补跑当日已到期
+    作业，没有窗口就会在收盘后补执行 09:35 的计划（风控规则 3 逐单拒单 + 当日计划被消耗）。
+    窗口外一律不执行、留待人工（info 告警）。
 
     返回契约（**永不抛**——作业失败不拖垮调度链）::
 
@@ -405,13 +449,16 @@ def auto_execute(conn, home, market, today=None, now=None):
 
     守卫分级：总开关关闭=静默（默认态不是故障）；其余跳过=info（当日不执行是正常结论）；
     配置/模式非法=warn + ok=False（无人值守时必须让运维看得见）。
+
+    时刻口径：``now()`` 只采样一次（today 与窗口判定共用同一样本），避免跨分钟抖动。
     """
     from . import commands, planner
 
     home = str(home)
     market = str(market).upper()
     now = now or _real_now
-    today = today or now()[:10]
+    stamp = now()
+    today = today or stamp[:10]
 
     def skip(reason, level="info", title=None):
         alerts.emit(conn, home=home, level=level, title=(title or reason)[:40],
@@ -474,12 +521,28 @@ def auto_execute(conn, home, market, today=None, now=None):
     if store.kv_get(conn, mark_key):
         return skip(f"当日已执行：{market} {today}", "info", "当日已执行")
 
+    # 守卫 9：执行窗口（规格 §4.3 第 9 条）——写指令前的最后一道判定。
+    # 位置说明：规格把「写指令（携带 expected_mode）」记为守卫 8，本函数把窗口判定放在
+    # 写动作之前，编号沿用规格（8 = 写指令，9 = 执行窗口）。
+    exec_at = cfg["exec_at"].get(market)
+    if exec_at is None:
+        # exec_at 表只覆盖 AUTO_PIPELINE_MARKETS（SH/HK/US）；作业市场传入表外键时
+        # fail-closed 跳过，不 KeyError（永不抛契约）
+        return skip(f"exec_at 未配置市场 {market}：拒绝自动执行", "warn", "exec_at 缺市场")
+    try:
+        in_window = _within_exec_window(stamp[11:16], exec_at, cfg["exec_window_minutes"])
+    except ValueError as error:
+        return skip(f"当前时刻非法：{error}", "warn", "时刻非法")
+    if not in_window:
+        return skip(f"已超执行窗口（{exec_at} 起 {cfg['exec_window_minutes']} 分钟，"
+                    f"当前 {stamp[11:16]}）：计划等待人工执行", "info", "已超执行窗口")
+
     # 守卫 8：写指令（携带 expected_mode；指令处理侧既有复核兜底）
     nonce = commands.write_command(home, "execute_plan",
                                   {"plan_hash": plan["content_hash"],
                                    "expected_mode": "sim"})
     store.kv_set(conn, mark_key, {"plan_id": plan["plan_id"], "nonce": nonce,
-                                  "as_of": plan["as_of"], "at": now()})
+                                  "as_of": plan["as_of"], "at": stamp})
     return {"ok": True, "nonce": nonce, "as_of": plan["as_of"], "plan": plan}
 
 

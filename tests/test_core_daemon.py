@@ -221,7 +221,16 @@ class AutoPipelineConfigTest(unittest.TestCase):
                                "strategies": [{"market": "SH", "strategy": "watchlist_rsi",
                                                "watchlist": "SH"}],
                                "exec_at": {"SH": "09:40", "HK": "09:50", "US": "22:40"},
+                               # 未给 exec_window_minutes → 补默认 30（规格 §4.1）
+                               "exec_window_minutes": 30,
                                "reconcile_at": "19:30"})
+
+    def test_exec_window_minutes_roundtrip(self):
+        """执行窗口：显式给值覆盖默认；默认值随缺省补全。"""
+        home = self._home({"auto_pipeline": {"enabled": True, "exec_window_minutes": 5}})
+        self.assertEqual(daemon.auto_pipeline_config(str(home))["exec_window_minutes"], 5)
+        self.assertEqual(
+            daemon.auto_pipeline_config(str(self._home()))["exec_window_minutes"], 30)
 
     def test_partial_keys_fill_defaults(self):
         """单键缺省补默认：只给 enabled 或只给 exec_at 的一个市场。"""
@@ -249,6 +258,10 @@ class AutoPipelineConfigTest(unittest.TestCase):
             "exec_at 格式错": {"auto_pipeline": {"exec_at": {"SH": "9:35"}}},
             "exec_at 越界": {"auto_pipeline": {"exec_at": {"SH": "25:00"}}},
             "exec_at 未知市场": {"auto_pipeline": {"exec_at": {"SZ": "09:35"}}},
+            "exec_window 零": {"auto_pipeline": {"exec_window_minutes": 0}},
+            "exec_window 负数": {"auto_pipeline": {"exec_window_minutes": -1}},
+            "exec_window 字符串": {"auto_pipeline": {"exec_window_minutes": "30"}},
+            "exec_window 布尔": {"auto_pipeline": {"exec_window_minutes": True}},
             "reconcile_at 格式错": {"auto_pipeline": {"reconcile_at": "19:00:00"}},
             "顶层未知键": {"auto_pipeline": {"enabled": True, "strategy": "rsi"}},
         }
