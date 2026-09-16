@@ -10,7 +10,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from . import store
+from . import oms, store
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -36,6 +36,12 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
       ``cancel_stale_auto_plans``）；``"manual"`` 保持既有语义（``market`` 为 NULL）；
     * 二者**不参与 content_hash**——hash 是计划内容的指纹，来源不是内容；既有 hash
       口径不变，历史计划不需重算，也让「同一内容同一 hash」的校验继续成立。
+
+    **冻结即登记**（WP9 任务 4 修订）：订单 diff 同时写入 OMS ``orders`` 表（状态
+    ``draft``）——``execute.run`` 只认 ``store.get_orders_by_plan``，不登记就等于计划
+    永远执行不到任何单（人工 plan-execute 与 WP9 auto_execute 都走这条链路）。
+    幂等由 ``oms.register_order`` 的在途单查重把守：同一 plan_id 重复登记会抛
+    ``DuplicateOpenOrder``，**如实传播**，不静默吞。
     """
     positions, equity = broker_positions(mode)
     orders, plan_id = [], f"PLN-{as_of.replace('-', '')}-{mode}-{uuid.uuid4().hex[:4].upper()}"
@@ -60,6 +66,11 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
                  (plan_id, as_of, mode, strategy_id, json.dumps(target, ensure_ascii=False),
                   content_hash, _now(), origin, market))
     conn.commit()
+    # 冻结即登记：订单进 OMS（draft），execute.run 据此取单。plan_hash 参数传 content_hash
+    # ——与 execute.run 校验用的计划指纹同源，登记与执行两侧口径一致。
+    for order in orders:
+        oms.register_order(conn, plan_id, order["symbol"], order["market"],
+                           order["side"], order["qty"], order["price"], mode, content_hash)
     return {"plan_id": plan_id, "as_of": as_of, "mode": mode, "status": "frozen",
             "orders": orders, "content_hash": content_hash}
 
