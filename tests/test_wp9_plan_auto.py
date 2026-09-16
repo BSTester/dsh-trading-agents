@@ -6,7 +6,7 @@
   * ② 就绪 → 策略权重按市场切片 → build_and_freeze(origin=auto, market=SH) 落库；
   * ③ 过期语义：昨日 frozen auto → cancelled；手工 frozen 计划不动；
   * ④ planner 既有调用（不传 origin/market）→ 默认 manual/NULL 回归；
-  * 边界：配置关闭静默 / 无匹配策略 / 日历缺失 / 券商通道失败 / live 待权益口径。
+  * 边界：配置关闭静默 / 无匹配策略 / 日历缺失 / 券商通道失败 / live 权益不可用。
 """
 import contextlib
 import io
@@ -96,6 +96,28 @@ class PlanAutoTest(unittest.TestCase):
 
         return call, calls
 
+    def _live_broker(self, positions=None, equity="1000000.00", missing_equity=False,
+                     fail=None):
+        """live 假通道：账户（enable_market[4]=A股）/ 持仓（code 前缀）/ 资金（total_assets）。"""
+        calls = []
+
+        def call(name, args=None, timeout=30, **kwargs):
+            calls.append((name, args))
+            if fail and name == fail:
+                raise RuntimeError(f"{name} 通道断线")
+            if name == "account_authorized_trd_accs":
+                return {"accounts": [{"account_id": "LIVE-1", "enable_market": [4],
+                                      "acc_type": "margin"}]}
+            if name == "account_positions":
+                return {"positions": positions if positions is not None else [
+                    {"code": "SH.600519", "qty": 400},
+                    {"code": "US.AAPL", "qty": 10}]}  # 非本市场持仓须被过滤
+            if name == "account_funds":
+                return {} if missing_equity else {"total_assets": equity}
+            raise AssertionError(f"意外工具 {name}")
+
+        return call, calls
+
     def _alerts(self, level=None):
         rows = self.conn.execute(
             "SELECT level, title, detail FROM alerts ORDER BY id").fetchall()
@@ -160,6 +182,11 @@ class PlanAutoTest(unittest.TestCase):
         self.assertEqual(
             [args["market"] for name, args in calls if name == "sim_trade_position_list"], [3])
         self.assertNotIn("warn", [a["level"] for a in self._alerts()])
+        # 冻结即登记：订单进 OMS（execute.run 的唯一取单来源）
+        order_rows = store.get_orders_by_plan(self.conn, plan["plan_id"])
+        self.assertEqual(len(order_rows), len(plan["orders"]))
+        self.assertEqual({r["symbol"] for r in order_rows}, {"SH.600519", "SZ.300750"})
+        self.assertEqual({r["status"] for r in order_rows}, {"draft"})
 
     # ---- ③ 过期语义 ----
 
@@ -267,20 +294,67 @@ class PlanAutoTest(unittest.TestCase):
         self.assertEqual(self._plan_rows(), [])
         self.assertTrue(self._alerts("warn"), "券商失败必须告警")
 
-    def test_live_mode_skips_pending_equity_channel(self):
-        """live 权益口径未接入 → 显式跳过 + warn（不编造权益生成真实计划）。"""
+    def test_live_mode_generates_plan_for_human_execution(self):
+        """live 也自动生成计划（规格 §4.2 双模式都生成）；执行仍全人工——本路径零写操作。"""
         self._config()
         self._calendar()
-        self._bars("SH.600519")
+        self._bars("SH.600519", close=100.0)
+        self._bars("SZ.300750", close=200.0)
         self._mode("live")
-        call, calls = self._broker()
+        call, calls = self._live_broker()
 
         result = planner.plan_auto(self.conn, str(self.home), "SH",
                                    today=TODAY, broker_call=call)
+
+        self.assertTrue(result["ok"], result)
+        plan = result["plan"]
+        self.assertEqual(plan["mode"], "live")
+        self.assertEqual([o["symbol"] for o in plan["orders"]], ["SH.600519", "SZ.300750"])
+        rows = self._plan_rows()
+        self.assertEqual([(r["origin"], r["market"], r["mode"], r["status"]) for r in rows],
+                         [("auto", "SH", "live", "frozen")])
+        # 订单已登记进 OMS；live 的执行仍由工作台口令 + Web 确认卡片把守（本作业只读+冻结）
+        order_rows = store.get_orders_by_plan(self.conn, plan["plan_id"])
+        self.assertEqual(len(order_rows), len(plan["orders"]))
+        self.assertEqual({r["mode"] for r in order_rows}, {"live"})
+        names = [name for name, _ in calls]
+        self.assertEqual(names.count("account_authorized_trd_accs"), 1)
+        self.assertIn("account_positions", names)
+        self.assertIn("account_funds", names)
+        self.assertNotIn("warn", [a["level"] for a in self._alerts()])
+
+    def test_live_equity_missing_skips_with_warn(self):
+        """官方权益字段缺失 → 跳过 + warn + 零计划（绝不编造权益）。"""
+        self._config()
+        self._calendar()
+        self._bars("SH.600519")
+        self._bars("SZ.300750")
+        self._mode("live")
+        call, _ = self._live_broker(missing_equity=True)
+
+        result = planner.plan_auto(self.conn, str(self.home), "SH",
+                                   today=TODAY, broker_call=call)
+
         self.assertTrue(result["ok"])
-        self.assertIn("live", result["skipped"])
+        self.assertIn("权益不可用", result["skipped"])
         self.assertEqual(self._plan_rows(), [])
-        self.assertEqual(calls, [])
+        self.assertTrue(self._alerts("warn"), "权益缺失必须告警")
+
+    def test_live_account_query_failure_skips_with_warn(self):
+        """live 账户查询失败 → 跳过 + warn（不用本地台账兜底）。"""
+        self._config()
+        self._calendar()
+        self._bars("SH.600519")
+        self._bars("SZ.300750")
+        self._mode("live")
+        call, _ = self._live_broker(fail="account_positions")
+
+        result = planner.plan_auto(self.conn, str(self.home), "SH",
+                                   today=TODAY, broker_call=call)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("券商通道不可用", result["skipped"])
+        self.assertEqual(self._plan_rows(), [])
         self.assertTrue(self._alerts("warn"))
 
     def test_invalid_config_fails_closed(self):
@@ -300,6 +374,15 @@ class PlanAutoTest(unittest.TestCase):
     def test_market_ids_mapping_matches_platform(self):
         """模拟账户 market_id 口径同为镜像：港股 1 / A股 3 / 美股 100。"""
         self.assertEqual(broker.MARKET_IDS, server_trading.PREFIX_MARKET_ID)
+
+    def test_openapi_enable_market_matches_platform(self):
+        """live 账户挑选用 enable_market（另一套数字口径）——镜像漂移必须在此处炸掉。"""
+        self.assertEqual(broker.OPENAPI_ENABLE_MARKET, server_trading.OPENAPI_ENABLE_MARKET)
+
+    def test_chain_prefixes_cover_calendar_markets(self):
+        """持仓过滤前缀集合与日历市场映射同源（SH 链含 SZ/BJ）。"""
+        self.assertEqual({p for prefixes in broker.CHAIN_PREFIXES.values() for p in prefixes},
+                         set(planner.CALENDAR_MARKET))
 
     # ---- CLI 接线 ----
 

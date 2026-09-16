@@ -155,12 +155,6 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     except ValueError as error:
         return {"ok": False, "error": str(error)}
 
-    if mode == "live":
-        # 诚实边界：live 的权益口径（账户资金查询）尚未验证，用未验证的权益算真实
-        # 订单数量是拿真钱试错——显式跳过并告警，接入属 P4 人工准入项。
-        return skip("live 模式自动计划待权益口径接入（P4 准入项）", "warn",
-                    "live 自动计划未接入")
-
     try:
         is_trading_day = store.is_trading_day(conn, market, today)
     except RuntimeError as error:
@@ -212,6 +206,9 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     try:
         positions, equity = core_broker.positions_and_equity(broker_call, mode=mode,
                                                              market=market)
+    except core_broker.EquityUnavailable as error:
+        # 权益口径问题（官方字段缺失/非正）与通道故障分列：告警文案不得互相冒名
+        return skip(f"券商权益不可用（缺失或非正）：{str(error)[:120]}", "warn", "权益不可用")
     except Exception as error:  # noqa: BLE001 —— 通道失败即跳过（不用本地台账）
         return skip(f"券商通道不可用：{str(error)[:120]}", "warn", "券商通道不可用")
 

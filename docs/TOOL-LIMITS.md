@@ -204,3 +204,27 @@ Node 侧 store 三方法与 `confirmation`/`confirm-decide` 端点**保留**（l
   意图（不改模式、不过风控、不产生订单），推送未启用时返回 `trading/push-unavailable`
   （不假装成功），载荷非法返回 `trading/invalid-operation`。幂等：重复提交同一意图不重发
   订阅帧，反订阅从未订阅的标的无副作用。
+
+## 九、live 账户读取口径（WP9 任务 4，2026-09-16 官方文档核对）
+
+live 计划生成（`planner.plan_auto`）与任何需要「券商真实持仓 + 权益」的读路径共用
+`trading_core.broker.positions_and_equity`，口径如下（**禁止猜字段**）：
+
+| 环节 | 工具/端点 | 官方字段（核实来源） |
+|---|---|---|
+| 挑账户 | `account_authorized_trd_accs` / `GET /api/v1.0/accounts/authorized_trd_accs` | `accounts[].account_id`；`accounts[].enable_market: list[int]`（naming-dictionary#enable-market：**1=HK 2=US 4=ChinaStock** 5=Futures 6=SG 12=CA 15=JP 18=KR） |
+| 持仓 | `account_positions` / `GET /accounts/{acc_id}/positions` | 行字段 `code`/`qty`（实测口径见 `plugins/workbench/python/positions.py` live 分支）；**该接口不接受 market 参数**，返回账户全部持仓 → 按 `code` 前缀过滤到目标市场链 |
+| 权益 | `account_funds` / `GET /api/v1.0/accounts/{acc_id}/funds` | **`total_assets`=总净资产**（官方 get-funds.md 响应表；同页 `securities_assets`/`cash`/`market_val` 是分类口径，**不作权益用**）。官方参数表把 `currency` 标为必填，但同页 curl 示例未传——沿用仓库既有调用（不带 currency），只用 `total_assets` |
+
+**两条硬纪律**（`EquityUnavailable` 与通道故障分列，告警文案不互相冒名）：
+
+1. **权益缺失或非正 → 抛 `EquityUnavailable`**，调用方跳过当日计划并告警「权益不可用」。
+   绝不把缺失当 0：权益为 0 会让目标数量全变 0，等于凭空生成清仓单；
+2. **`enable_market` 与 sim 的 `market_id` 是两套数字口径**（sim：HK 1/A 股 3/US 100；
+   live enable_market：HK 1/US 2/A 股 4），**不互相换算**，各自有镜像常量与锁定测试。
+
+**权益分母口径（已知近似，非保守保证）**：官方资金接口只给账户整体的 `total_assets`，
+没有按市场切分的权益。多市场同时生成计划（SH/HK/US 各一份）时，每份计划的分母都是同一笔
+账户整体权益——各市场权重之和若都接近 1，**跨市场总敞口可能超过账户权益**。当前依赖风控
+8 规则逐单拦截 + live 人工确认把守，不得据此认为跨市场敞口已被自动约束；精确口径需引入
+按市场权益拆分或组合级联合约束（后续工作）。
