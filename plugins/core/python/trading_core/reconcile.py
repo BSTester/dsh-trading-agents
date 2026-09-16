@@ -16,9 +16,16 @@ critical 告警 + halt（**只暂停后续执行，绝不自动平仓**）→ TC
 * **持仓口径**：本地台账 = OMS ``fills`` 派生的**累计**净持仓（买 + 卖 −）；
   只有 OMS 有足迹（任何订单或成交）的标的参与差异判定——券商有持仓而 OMS 无任何
   记录的标的记入 ``untracked``，**不计差异**（多半是平台外建的仓，报差异是噪音）；
+* **对账前回填成交**（修复 sim 系统性假差异）：sim 通道的成交**不经** WS 交易事件通道
+  （``platform/server/trading.py::_record_fill`` 只在推送路径写 ``fills``），因此 sim
+  常态下 ``fills`` 基本为空 → 本地净持仓恒为 0 → 有 OMS 足迹的持仓全部报 ``qty_diff``
+  → critical + ``set_halt`` → 自动执行被自己的对账噪声永久熔断。修复：持仓级比对之前
+  按券商订单历史的**累计成交**回填 ``fills``（``_backfill_fills``），让本地台账真的等于
+  券商事实——回填只认券商订单历史，历史存量持仓仍是 ``untracked``；
 * **零写操作**：本模块只调用券商只读工具，任何写类（下单/撤单/改单）都不出现。
 """
 import datetime as _dt
+import hashlib
 
 from . import store
 
@@ -46,6 +53,16 @@ def _int_of(value):
         return None
     try:
         return int(float(value))
+    except (TypeError, ValueError):
+        return None
+
+
+def _float_of(value):
+    """券商价格字段同样的字符串口径（TOOL-LIMITS 实测 "10.0"）；非法/缺失 → None。"""
+    if value is None or value == "":
+        return None
+    try:
+        return float(value)
     except (TypeError, ValueError):
         return None
 
@@ -107,7 +124,7 @@ def order_status_counts(conn, today):
 
 
 def _broker_order_rows(rows, normalize):
-    """券商订单行 → 归一结构（数量转 int；标的走 core 唯一实现）。"""
+    """券商订单行 → 归一结构（数量转 int、价格转 float；标的走 core 唯一实现）。"""
     out = []
     for row in rows or []:
         if not isinstance(row, dict):
@@ -119,6 +136,8 @@ def _broker_order_rows(rows, normalize):
             "side": SIDE_BY_CODE.get(side_code, ""),
             "qty": _int_of(row.get("qty")),
             "cum_qty": _int_of(row.get("cum_qty")),
+            "price": _float_of(row.get("price")),
+            "avg_fill_price": _float_of(row.get("avg_fill_price")),
             "status_raw": row.get("status"),
         })
     return out
@@ -148,13 +167,18 @@ def _pair_diffs(oms, broker_row, match):
     return diffs
 
 
-def _order_diffs(conn, today, broker_rows):
-    """订单级对账：missing_at_broker / missing_in_oms / status_or_qty_diff 三类。
+def _match_orders(conn, today, broker_rows):
+    """本地当日订单 ↔ 券商订单行匹配，返回 ``(pairs, unmatched_oms, unmatched_broker)``。
+
+    ``pairs`` 元素为 ``(oms_row, broker_row, match)``；``match`` ∈ {"strong", "weak"}。
 
     匹配分三遍（顺序是正确性要求，不是风格）：**先按券商编号强匹配**，再对剩下的本地单
     按 (标的, 方向, 委托数量) 弱匹配，最后把未认领的券商行记为 missing_in_oms。
     若弱匹配先跑，一张编号未知的本地单会「抢走」另一张本地单编号对应的券商行，
     造成一侧漏报、另一侧误报。
+
+    成交回填（``_backfill_fills``）与订单级差异（``_order_diffs``）**必须共用这里的匹配
+    结果**：两处各写一份匹配迟早会错位，回填就会把钱记到别的订单上。
     """
     oms_rows = [dict(row) for row in conn.execute(
         "SELECT * FROM orders WHERE created_at LIKE ? ORDER BY rowid",
@@ -163,41 +187,119 @@ def _order_diffs(conn, today, broker_rows):
     for idx, row in enumerate(broker_rows):
         if row["broker_order_id"]:
             by_id.setdefault(row["broker_order_id"], idx)
-    used, diffs, pending = set(), [], []
+    used, pairs, pending = set(), [], []
 
     for oms in oms_rows:
         bid = str(oms.get("broker_order_id") or "").strip()
         idx = by_id.get(bid) if bid else None
         if idx is not None and idx not in used:
             used.add(idx)
-            diffs.extend(_pair_diffs(oms, broker_rows[idx], "strong"))
+            pairs.append((oms, broker_rows[idx], "strong"))
         else:
             pending.append(oms)
 
+    unmatched_oms = []
     for oms in pending:
         if oms.get("status") not in BROKER_EXPECTED_STATES:
             continue      # 未提交/已作废的本地单无需券商佐证
-        bid = str(oms.get("broker_order_id") or "").strip()
         oms_qty = _int_of(oms.get("qty"))
         cand = next((i for i, r in enumerate(broker_rows) if i not in used
                      and r["symbol"] == oms["symbol"] and r["side"] == oms["side"]
                      and r["qty"] is not None and r["qty"] == oms_qty), None)
         if cand is None:
-            diffs.append({"symbol": oms["symbol"], "client_order_id": oms["client_order_id"],
-                          "broker_order_id": bid or None, "kind": "missing_at_broker",
-                          "match": "id" if bid else "weak", "oms_status": oms["status"],
-                          "oms_qty": oms_qty})
+            unmatched_oms.append(oms)
             continue
         used.add(cand)
-        diffs.extend(_pair_diffs(oms, broker_rows[cand], "weak"))
+        pairs.append((oms, broker_rows[cand], "weak"))
 
-    for idx, row in enumerate(broker_rows):
-        if idx in used:
-            continue
+    unmatched_broker = [r for i, r in enumerate(broker_rows) if i not in used]
+    return pairs, unmatched_oms, unmatched_broker
+
+
+def _order_diffs(conn, today, broker_rows, matched=None):
+    """订单级对账：missing_at_broker / missing_in_oms / status_or_qty_diff 三类。
+
+    ``matched`` 由调用方传入时复用（``daily`` 与成交回填共用一次匹配）。
+    """
+    pairs, unmatched_oms, unmatched_broker = (
+        matched if matched is not None else _match_orders(conn, today, broker_rows))
+
+    diffs = []
+    for oms, broker_row, match in pairs:
+        diffs.extend(_pair_diffs(oms, broker_row, match))
+
+    for oms in unmatched_oms:
+        bid = str(oms.get("broker_order_id") or "").strip()
+        diffs.append({"symbol": oms["symbol"], "client_order_id": oms["client_order_id"],
+                      "broker_order_id": bid or None, "kind": "missing_at_broker",
+                      "match": "id" if bid else "weak", "oms_status": oms["status"],
+                      "oms_qty": _int_of(oms.get("qty"))})
+
+    for row in unmatched_broker:
         diffs.append({"symbol": row["symbol"], "broker_order_id": row["broker_order_id"],
                       "side": row["side"], "qty": row["qty"],
                       "broker_status_raw": row["status_raw"], "kind": "missing_in_oms"})
     return diffs
+
+
+def _fill_fingerprint(broker_order_id, cum_qty, price):
+    """回填成交的确定性指纹：同一累计成交状态重复运行不会重复落库。
+
+    前缀 ``bf-`` 让回填来源在 ``fills.fill_id`` 上可辨认（审计时一眼分得清
+    「WS 逐笔成交」与「对账聚合成交」）。
+    """
+    raw = f"{broker_order_id}|{cum_qty}|{price}"
+    return "bf-" + hashlib.sha1(raw.encode("utf-8")).hexdigest()[:24]
+
+
+def _backfill_fills(conn, pairs):
+    """对账前按券商订单历史回填 ``fills``（让本地台账等于券商事实）。
+
+    为什么必须回填：sim 通道成交不经 WS 交易事件通道，``fills`` 基本为空 → 本地净持仓
+    恒为 0 → 有 OMS 足迹的持仓全部报 ``qty_diff`` → critical + halt → 自动执行被自己的
+    对账噪声永久熔断（模拟盘全自动的前提因此不成立）。
+
+    口径与边界（诚实清单）：
+
+    * **只补差额**：回填量 = ``cum_qty − 本地既有 fills 合计``。既有 WS 逐笔成交不被
+      重复计数；重复运行差额为 0 即跳过（幂等）；累计成交增长时按增量补记；
+    * **聚合成交，非逐笔**：券商订单历史没有逐笔明细，因此一条 fill 聚合该单的增量成交
+      （qty=差额，price=成交均价）。**数量维度准确**（累计成交数量是券商原文），故本模块
+      的数量判据成立；成本/TCA 口径应按「聚合」理解，结果里如实标注；
+    * **价格缺失不回填**：均价不可得 → 跳过并计数（``skipped``），绝不拿委托价或
+      任何编造值充当成交价——缺口以 ``qty_diff`` 如实暴露（宁缺毋假）；
+    * **不处理成交修正**：``cum_qty`` 回落（券商修正）时不回删既有 fills，只跳过——
+      绝不猜券商的修正意图；
+    * **零券商写操作**：只读订单历史（本函数不调用券商通道，数据由调用方传入）。
+    """
+    inserted, skipped = [], []
+    for oms, broker_row, _match in pairs:
+        cum = broker_row["cum_qty"]
+        if not cum or cum <= 0:
+            continue      # 未成交部分不回填
+        cid = oms["client_order_id"]
+        existing = sum(int(r["qty"]) for r in store.fills_by_order(conn, cid))
+        delta = int(cum) - existing
+        if delta <= 0:
+            continue      # 已记满（或券商修正回落）：不重复计数、不回删
+        price = broker_row["avg_fill_price"]
+        if price is None or price <= 0:
+            skipped.append({"client_order_id": cid,
+                            "broker_order_id": broker_row["broker_order_id"],
+                            "cum_qty": int(cum), "reason": "券商未给成交均价"})
+            continue
+        fill_id = _fill_fingerprint(
+            broker_row["broker_order_id"] or cid, int(cum), price)
+        if conn.execute("SELECT 1 FROM fills WHERE fill_id=?",
+                        (fill_id,)).fetchone() is not None:
+            continue      # 同一累计状态的指纹已落库（兜底幂等）
+        store.insert_fill(conn, fill_id, cid, float(price), delta)
+        inserted.append({"client_order_id": cid,
+                         "broker_order_id": broker_row["broker_order_id"],
+                         "qty": delta, "price": float(price), "fill_id": fill_id})
+    return {"count": len(inserted), "skipped": len(skipped), "aggregate": True,
+            "note": "聚合成交（非逐笔）：券商订单历史无逐笔成交明细",
+            "orders": inserted, "skipped_orders": skipped}
 
 
 def _sim_broker_state(call, today):
@@ -241,7 +343,11 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
       {"ok": True,  "skipped": <原因>}                       软跳过（live/无账户）
       {"ok": False, "error": <原因>}                         通道/模式失败（fail-closed）
       {"ok": True,  "diffs": [...], "untracked": [...],
-       "orders": {...}, "tca": {...}, "digest": {...}, "halted": <bool>}   对账完成
+       "orders": {...}, "tca": {...}, "digest": {...},
+       "fills_backfilled": {...}, "halted": <bool>}           对账完成
+
+    ``fills_backfilled`` 是本次「券商订单历史 → fills」的回填摘要（``count`` 落库条数、
+    ``skipped`` 无均价跳过数、``note`` 标注聚合成交非逐笔）——持仓级比对之前完成。
 
     通道故障一律 fail-closed：**不写任何 kv**（既不写差异也不伪造「无差异」）。
     """
@@ -283,9 +389,16 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
         return {"ok": False, "error": reason}
 
     broker_rows = _broker_order_rows(orders_raw, core_broker.normalize_symbol)
-    diffs = _order_diffs(conn, today, broker_rows)
 
-    # 持仓级：本地 = fills 派生净持仓；只核对 OMS 有足迹的标的
+    # 成交回填**必须先于持仓级比对**（规格要求的顺序：拉券商订单 → 回填 fills →
+    # 订单级判定 → 持仓级比对）：本地台账由 fills 派生，而 sim 通道的成交不经 WS 事件
+    # 通道，不回填则本地净持仓恒为 0、持仓级全部报假差异并把自动执行熔断。
+    # 匹配结果与订单级判定共用（一次匹配，避免两处错位）。
+    matched = _match_orders(conn, today, broker_rows)
+    backfill = _backfill_fills(conn, matched[0])
+    diffs = _order_diffs(conn, today, broker_rows, matched=matched)
+
+    # 持仓级：本地 = fills 派生净持仓（含本次回填）；只核对 OMS 有足迹的标的
     footprint = footprint_symbols(conn)
     local = {s: {"qty": q} for s, q in local_net_positions(conn).items() if s in footprint}
     broker_subset = {s: v for s, v in broker_positions.items() if s in footprint}
@@ -303,13 +416,15 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
                     detail=f"{today} 订单/持仓与券商一致")
 
     tca_summary = tca.aggregate(conn)
+    backfill_digest = {"count": backfill["count"], "skipped": backfill["skipped"],
+                       "aggregate": True, "note": backfill["note"]}
     digest = {"as_of": today, "mode": mode, "orders": order_status_counts(conn, today),
               "diffs": len(diffs), "untracked": len(untracked), "tca": tca_summary,
-              "at": stamp}
+              "fills_backfilled": backfill_digest, "at": stamp}
     # snapshot-reconcile 的既有取数口径（diffs/at）+ 本任务新增 untracked/mode
     store.kv_set(conn, "reconcile:latest",
                  {"diffs": diffs, "untracked": untracked, "mode": mode, "at": stamp})
     store.kv_set(conn, "daily:digest", digest)
     return {"ok": True, "diffs": diffs, "untracked": untracked,
             "orders": digest["orders"], "tca": tca_summary, "digest": digest,
-            "halted": halted}
+            "fills_backfilled": backfill, "halted": halted}

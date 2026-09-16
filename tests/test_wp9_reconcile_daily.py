@@ -7,7 +7,11 @@
   * ③ 有 diff → critical 告警 + halt 置位，且**全程零写类券商调用**（只暂停不平仓）；
   * ④ digest 落 kv 且字段齐全（orders 计数 / diffs / untracked / tca）；
   * ⑤ live 模式 → info 告警 + 跳过 + 零券商调用；
-  * ⑥ 券商通道抛错 → ok=False（CLI 退出 1）且**不写** reconcile:latest（不伪造「无差异」）。
+  * ⑥ 券商通道抛错 → ok=False（CLI 退出 1）且**不写** reconcile:latest（不伪造「无差异」）；
+  * ⑦ **对账前从券商订单历史回填 fills**（修复 sim 系统性假差异与自锁熔断）：
+    回填后本地台账等于券商事实 → 一致即零 diff；真差异不放过；幂等（连跑两次不重复落库）；
+    均价不可得 → 不回填、不编造价格（缺口以 qty_diff 如实暴露）；cum_qty=0 不产生 fills；
+    历史存量持仓仍是 untracked。
 """
 import contextlib
 import io
@@ -16,6 +20,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "platform"))
@@ -99,11 +104,23 @@ class ReconcileDailyTest(unittest.TestCase):
             (fill_id, cid, price, qty, None, created_at or f"{TODAY} 09:36:00"))
         self.conn.commit()
 
-    def _sim_order(self, order_id, symbol, side=1, qty="100", cum_qty="100", status=4):
-        """券商订单行形状（TOOL-LIMITS 实测口径：裸代码 + 字符串数量 + 整数状态码）。"""
+    def _sim_order(self, order_id, symbol, side=1, qty="100", cum_qty="100", status=4,
+                   price="10.0", avg_fill_price="10.0"):
+        """券商订单行形状（TOOL-LIMITS 实测口径：裸代码 + 字符串数量 + 整数状态码）。
+
+        ``price``（委托价）/``avg_fill_price``（成交均价）可传 None：用于构造
+        「成交明细不可得」的退化场景（回填必须如实跳过而非编造价）。
+        """
         return {"order_id": order_id, "symbol": symbol, "side": side, "qty": qty,
-                "cum_qty": cum_qty, "price": "10.0", "avg_fill_price": "10.0",
+                "cum_qty": cum_qty, "price": price, "avg_fill_price": avg_fill_price,
                 "status": status, "create_time": "1768550082000000"}
+
+    def _fill_count(self):
+        return self.conn.execute("SELECT COUNT(*) AS n FROM fills").fetchone()["n"]
+
+    def _levels(self):
+        return [r["level"] for r in self.conn.execute(
+            "SELECT level FROM alerts ORDER BY id").fetchall()]
 
     def _kinds(self, diffs):
         counts = {}
@@ -256,6 +273,157 @@ class ReconcileDailyTest(unittest.TestCase):
         # 不伪造「无差异」：既有 kv 原样保留
         self.assertEqual(store.kv_get(self.conn, "reconcile:latest"), sentinel)
         self.assertIsNone(store.kv_get(self.conn, "daily:digest"))
+
+    # ---- ⑦ 对账前从券商订单历史回填 fills（修复 sim 系统性假差异 + 自锁熔断）----
+
+    def test_backfill_makes_local_ledger_match_broker(self):
+        """① 关键修复证据：OMS 有足迹但无任何 fills（sim 常态——成交不经 WS 事件通道）
+        + 券商订单历史有已成交单（cum_qty/均价）+ 券商持仓与之一致。
+
+        修复前：本地净持仓恒为 0 → qty_diff → critical → halt（自动执行被对账噪声永久熔断）；
+        修复后：回填聚合成交 → 本地 == 券商 → 零 diff、零 critical、不 halt。
+        """
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="filled")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 100}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["diffs"], [], result["diffs"])
+        self.assertFalse(result["halted"])
+        self.assertFalse(store.is_halted(self.conn))
+        self.assertNotIn("critical", self._levels())
+        # 回填真实发生：一条聚合成交（数量=差额、价格=券商成交均价），并如实标注非逐笔
+        self.assertEqual(result["fills_backfilled"]["count"], 1)
+        self.assertTrue(result["fills_backfilled"]["aggregate"])
+        self.assertIn("聚合成交", result["fills_backfilled"]["note"])
+        fills = store.fills_by_order(self.conn, "o-1")
+        self.assertEqual([(int(f["qty"]), float(f["price"])) for f in fills], [(100, 10.0)])
+        # 本地台账 == 券商事实
+        self.assertEqual(reconcile.local_net_positions(self.conn), {"SH.600519": 100})
+
+    def test_backfill_without_avg_price_skips_and_keeps_gap_visible(self):
+        """均价/委托价都不可得 → **不回填、不编造价格**：缺口以 qty_diff 如实暴露（宁缺毋假）。
+
+        这条同时是「回填才是消除假差异的原因」的反证：拿掉价格，同场景立刻恢复差异。
+        """
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="filled")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100", price=None,
+                                                         avg_fill_price=None)]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 100}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["fills_backfilled"]["count"], 0)
+        self.assertEqual(result["fills_backfilled"]["skipped"], 1)
+        self.assertEqual(self._fill_count(), 0)
+        # 本地净持仓为空 → 该标的一侧缺失，差异以 missing_side 如实暴露（本地 None vs 券商 100）
+        pos_diffs = [d for d in result["diffs"]
+                     if d["kind"] in ("qty", "missing_side")]
+        self.assertEqual(len(pos_diffs), 1, result["diffs"])
+        self.assertIsNone(pos_diffs[0]["local"])
+        self.assertEqual(pos_diffs[0]["broker"], {"qty": 100})
+        self.assertTrue(store.is_halted(self.conn))
+
+    def test_backfill_does_not_mask_real_position_diff(self):
+        """② 回填后持仓仍不一致 → qty_diff 且 halt（真差异不放过）。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="filled")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 200}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        pos_diffs = [d for d in result["diffs"] if d["kind"] == "qty"]
+        self.assertEqual(len(pos_diffs), 1, result["diffs"])
+        self.assertEqual((pos_diffs[0]["local"], pos_diffs[0]["broker"]), (100, 200))
+        self.assertTrue(store.is_halted(self.conn))
+        self.assertTrue(result["halted"])
+
+    def test_backfill_is_idempotent(self):
+        """③ 同一份券商数据连跑两次 → fills 行数不变、净持仓不变、第二次仍零 diff。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="filled")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 100}]})
+        first = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        rows_after_first = self._fill_count()
+        net_after_first = reconcile.local_net_positions(self.conn)
+        second = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(first["fills_backfilled"]["count"], 1)
+        self.assertEqual(second["fills_backfilled"]["count"], 0)   # 差额为 0 → 不重复落库
+        self.assertEqual(self._fill_count(), rows_after_first)
+        self.assertEqual(reconcile.local_net_positions(self.conn), net_after_first)
+        self.assertEqual(second["diffs"], [])
+
+    def test_backfill_counts_only_delta_against_existing_fills(self):
+        """既有逐笔成交（WS 路径）不被重复计数：只补 cum_qty 与本地合计的差额。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=300, status="partial")
+        self._fill("F-partial", "o-1", 100)          # WS 逐笔已记 100
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="300",
+                                                         cum_qty="300")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 300}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["fills_backfilled"]["count"], 1)
+        self.assertEqual(reconcile.local_net_positions(self.conn), {"SH.600519": 300})
+        fills = store.fills_by_order(self.conn, "o-1")
+        self.assertEqual(sum(int(f["qty"]) for f in fills), 300)
+        self.assertEqual(result["diffs"], [])
+
+    def test_zero_cum_qty_orders_produce_no_fills(self):
+        """⑤ 未成交（cum_qty=0）的订单不产生 fills。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="submitted")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="0")]},
+            positions_by_market={3: []})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["fills_backfilled"]["count"], 0)
+        self.assertEqual(self._fill_count(), 0)
+        self.assertFalse(store.is_halted(self.conn))
+
+    def test_backfill_leaves_legacy_holdings_untracked(self):
+        """④ 历史存量持仓（券商有、订单历史与 fills 皆无）→ untracked、不计差异、不 halt。
+
+        回填只认「有订单历史」的成交，因此不会把平台外建的仓误判成差异。
+        """
+        broker = _FakeBroker(orders_by_market={"SIM-SH": []},
+                             positions_by_market={3: [{"symbol": "002594", "qty": 500}]})
+        result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertEqual(result["diffs"], [])
+        self.assertEqual(result["untracked"], ["SZ.002594"])
+        self.assertEqual(result["fills_backfilled"]["count"], 0)
+        self.assertFalse(store.is_halted(self.conn))
+
+    def test_backfill_is_read_only_on_broker_side(self):
+        """回填只读券商订单历史：全程零写类券商调用（对账铁律不变）。"""
+        self._order("o-1", "SH.600519", broker_id="B-1", qty=100, status="filled")
+        broker = _FakeBroker(
+            orders_by_market={"SIM-SH": [self._sim_order("B-1", "600519", qty="100",
+                                                         cum_qty="100")]},
+            positions_by_market={3: [{"symbol": "600519", "qty": 100}]})
+        reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
+        self.assertTrue(set(broker.tools()) <= READ_TOOLS, broker.tools())
+
+    def test_cli_channel_failure_exits_one_and_writes_nothing(self):
+        """⑥ 通道失败 → CLI 退出 1 且不写 reconcile:latest（回归：fail-closed）。
+
+        经真实 CLI 路径验证退出码映射：打桩券商通道令其抛错（daily 惰性导入该函数）。
+        """
+        db = self.home / "cli.sqlite"
+        out = io.StringIO()
+        with mock.patch("trading_datasource.futu_mcp.call_tool",
+                        side_effect=RuntimeError("通道故障（假件）")):
+            with contextlib.redirect_stdout(out):
+                code = cli.main(["reconcile-daily", "--db", str(db),
+                                 "--home", str(self.home), "--today", TODAY])
+        self.assertEqual(code, 1, out.getvalue())
+        self.assertIn("通道", out.getvalue())
+        conn2 = store.connect(str(db))
+        self.addCleanup(conn2.close)
+        self.assertIsNone(store.kv_get(conn2, "reconcile:latest"))
+        self.assertIsNone(store.kv_get(conn2, "daily:digest"))
 
     # ---- CLI 层 ----
 
