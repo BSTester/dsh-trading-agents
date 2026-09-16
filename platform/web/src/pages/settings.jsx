@@ -24,7 +24,7 @@ import {
 import { callApi, clearCache, getToken, setToken } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
 import {
-  MARKETS, autoPipelineDraft, autoPipelinePayload, newStrategyRow,
+  EXEC_WINDOW_MAX_MINUTES, MARKETS, autoPipelineDraft, autoPipelinePayload, newStrategyRow,
 } from "../services/pipeline.js";
 
 const { TextArea } = Input;
@@ -280,7 +280,8 @@ function AutoPipelineSection() {
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             窗口
           </Typography.Text>
-          <InputNumber value={base().exec_window_minutes} min={1} max={240} disabled={busy}
+          <InputNumber value={base().exec_window_minutes} min={1}
+            max={EXEC_WINDOW_MAX_MINUTES} disabled={busy}
             aria-label="执行窗口分钟数"
             onChange={(value) => patch({ exec_window_minutes: value })} />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>分钟</Typography.Text>

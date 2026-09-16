@@ -60,9 +60,13 @@ export function stageEntries(stages) {
   return Object.entries(stages).map(([key, stage]) => ({ key, ...(stage ?? {}) }));
 }
 
-/** auto_pipeline 摘要 → 徽章文案与颜色；非法配置如实报「配置非法」，不显示为关闭。 */
+/** auto_pipeline 摘要 → 徽章文案与颜色；非法配置如实报「配置非法」，不显示为关闭。
+ *
+ * ``error`` = 语义非法（``apply_overlay`` 拒绝）；``config_error`` = 文件级不可解析
+ * （JSON 坏，core 按空配置容错但摘要如实标注，见 pipeline.py ``_config_unparsable``）。
+ * 两者都必须是红色「配置非法」——否则坏文件在页面上与「功能没开」长得一样。 */
 export function autoPipelineBadge(config) {
-  if (config?.error) return { text: "配置非法", color: "red" };
+  if (config?.error || config?.config_error) return { text: "配置非法", color: "red" };
   if (config?.enabled === true) return { text: "自动执行已开启", color: "green" };
   if (config?.enabled === false) return { text: "自动执行关闭", color: "default" };
   return { text: "—", color: "default" };
@@ -91,6 +95,13 @@ export const AUTO_PIPELINE_DEFAULTS = {
   exec_window_minutes: 30,
   reconcile_at: "19:00",
 };
+
+/** 执行窗口上界，镜像 trading_core.autopipeline.EXEC_WINDOW_MAX_MINUTES。
+ *
+ * 这里是**镜像**而非独立常量：设置页 InputNumber 的 max 用它，core 用同一语义值拒绝
+ * 越界配置。两侧漂移会让「页面允许填的值被服务端拒绝」——由 tests/test_wp10_locks.py
+ * 解析比对（N1/N2），不靠「记得同步」。 */
+export const EXEC_WINDOW_MAX_MINUTES = 240;
 
 /** 服务端有效配置 → 可编辑草稿：只保留白名单键，缺失补默认（error 等只读字段不带）。 */
 export function autoPipelineDraft(config) {

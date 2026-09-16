@@ -232,6 +232,17 @@ class AutoPipelineConfigTest(unittest.TestCase):
         self.assertEqual(
             daemon.auto_pipeline_config(str(self._home()))["exec_window_minutes"], 30)
 
+    def test_exec_window_minutes_upper_bound(self):
+        """上界闭区间：设到上界放行、超过即拒绝（N2——窗口越长守卫越接近失效）。"""
+        home = self._home({"auto_pipeline": {
+            "exec_window_minutes": daemon.EXEC_WINDOW_MAX_MINUTES}})
+        self.assertEqual(daemon.auto_pipeline_config(str(home))["exec_window_minutes"],
+                         daemon.EXEC_WINDOW_MAX_MINUTES)
+        with self.assertRaises(ValueError) as caught:
+            daemon.auto_pipeline_config(str(self._home({"auto_pipeline": {
+                "exec_window_minutes": daemon.EXEC_WINDOW_MAX_MINUTES + 1}})))
+        self.assertIn(str(daemon.EXEC_WINDOW_MAX_MINUTES), str(caught.exception))
+
     def test_partial_keys_fill_defaults(self):
         """单键缺省补默认：只给 enabled 或只给 exec_at 的一个市场。"""
         cfg = daemon.auto_pipeline_config(str(self._home({"auto_pipeline": {"enabled": True}})))
@@ -281,6 +292,8 @@ class AutoPipelineConfigTest(unittest.TestCase):
             "exec_window 负数": {"auto_pipeline": {"exec_window_minutes": -1}},
             "exec_window 字符串": {"auto_pipeline": {"exec_window_minutes": "30"}},
             "exec_window 布尔": {"auto_pipeline": {"exec_window_minutes": True}},
+            "exec_window 超上界": {"auto_pipeline": {"exec_window_minutes":
+                                                     daemon.EXEC_WINDOW_MAX_MINUTES + 1}},
             "reconcile_at 格式错": {"auto_pipeline": {"reconcile_at": "19:00:00"}},
             "顶层未知键": {"auto_pipeline": {"enabled": True, "strategy": "rsi"}},
         }

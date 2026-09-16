@@ -87,6 +87,9 @@ test("autoPipelineBadge：非法配置显示「配置非法」而非「关闭」
   assert.deepEqual(autoPipelineBadge({ enabled: false }), { text: "自动执行关闭", color: "default" });
   assert.deepEqual(autoPipelineBadge({ enabled: false, error: "exec_at 需为 HH:MM 格式" }),
     { text: "配置非法", color: "red" });
+  // 文件级不可解析（JSON 坏）与语义非法同样可见：core 按空配置容错，但摘要带 config_error
+  assert.deepEqual(autoPipelineBadge({ enabled: false, config_error: "配置文件无法解析" }),
+    { text: "配置非法", color: "red" });
   assert.deepEqual(autoPipelineBadge(undefined), { text: "—", color: "default" });
 });
 

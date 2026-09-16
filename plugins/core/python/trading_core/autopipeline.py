@@ -30,6 +30,11 @@ AUTO_PIPELINE_DEFAULTS = {
 }
 #: 合法市场（与 store 交易日历的市场键同一集合）
 AUTO_PIPELINE_MARKETS = ("SH", "HK", "US")
+#: 执行窗口分钟数上界（2026-09-16 审查 N2）：窗口是「距 exec_at 多久内还可以自动执行」
+#: 的守卫（规格 §4.3 守卫 9），越长越接近失效——240 分钟已跨过 A 股整个连续竞价时段，
+#: 再大就不是窗口而是「当天任意时刻可执行」。设置页 InputNumber 的 max 镜像本常量
+#: （前端镜像由 tests/test_wp10_locks.py 锁定，两侧漂移即测试失败）。
+EXEC_WINDOW_MAX_MINUTES = 240
 #: 策略项字段：未知键报错——拼错的键被静默忽略等于策略没生效，比报错更危险。
 #: ``watchlist`` 为**池键名**（2026-09-16 修订 I1）：选择 ``trading-platform.json``
 #: 里的命名池，缺省 ``watchlist``；它不决定市场范围（市场由 ``market`` 决定）。
@@ -48,13 +53,16 @@ def _hhmm(value, field):
     return value
 
 
-def _positive_int(value, field):
-    """正整数校验（fail-closed）。
+def _positive_int(value, field, maximum=None):
+    """正整数校验（fail-closed）；给了 ``maximum`` 就一并查上界。
 
     bool 必须显式排除：Python 里 ``isinstance(True, int)`` 为真，而 ``exec_window_minutes:
-    true`` 是写错的配置——当 1 分钟用会把窗口缩到几乎不可用，静默接受比报错更危险。"""
+    true`` 是写错的配置——当 1 分钟用会把窗口缩到几乎不可用，静默接受比报错更危险。
+    上界同理：超出 ``EXEC_WINDOW_MAX_MINUTES`` 的窗口让守卫名存实亡，宁可拒绝。"""
     if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
         raise ValueError(f"{field} 需为正整数，收到 {value!r}")
+    if maximum is not None and value > maximum:
+        raise ValueError(f"{field} 不得超过 {maximum}，收到 {value!r}")
     return value
 
 
@@ -128,7 +136,8 @@ def apply_overlay(cfg, overlay):
         merged["exec_at"] = _auto_exec_at(overlay["exec_at"], merged["exec_at"])
     if "exec_window_minutes" in overlay:
         merged["exec_window_minutes"] = _positive_int(
-            overlay["exec_window_minutes"], "auto_pipeline.exec_window_minutes")
+            overlay["exec_window_minutes"], "auto_pipeline.exec_window_minutes",
+            maximum=EXEC_WINDOW_MAX_MINUTES)
     if "reconcile_at" in overlay:
         merged["reconcile_at"] = _hhmm(overlay["reconcile_at"], "auto_pipeline.reconcile_at")
     return merged

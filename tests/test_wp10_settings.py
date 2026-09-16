@@ -139,6 +139,8 @@ class AutoPipelineSettingsTests(SettingsBase):
              "未知策略字段"),
             ({"exec_window_minutes": True}, "正整数"),
             ({"exec_window_minutes": 0}, "正整数"),
+            ({"exec_window_minutes": autopipeline.EXEC_WINDOW_MAX_MINUTES + 1},
+             "不得超过"),
             ({"reconcile_at": "25:00"}, "越界"),
         )
         for payload, fragment in cases:

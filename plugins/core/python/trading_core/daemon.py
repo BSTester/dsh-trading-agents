@@ -14,8 +14,8 @@ from . import alerts, commands, execute, indicators, store
 # WP9 拆分（规格 §3.1）：配置/作业装配 → autopipeline；自动执行作业体 → autopilot；
 # 统一时钟 → clock。以下为**向后兼容再导出**——既有调用方（cli/planner/reconcile/
 # server.scheduler/各测试）继续以 ``daemon.X`` 取用，无需改动。
-from .autopipeline import (AUTO_PIPELINE_DEFAULTS, GLOBAL_CHAIN,  # noqa: F401
-                           auto_pipeline_config, build_jobs)
+from .autopipeline import (AUTO_PIPELINE_DEFAULTS, EXEC_WINDOW_MAX_MINUTES,  # noqa: F401
+                           GLOBAL_CHAIN, auto_pipeline_config, build_jobs)
 from .autopilot import auto_execute
 from .clock import FAKE_NOW_ENV, _real_now, now_fn, now_stamp, warn_fake_now  # noqa: F401
 

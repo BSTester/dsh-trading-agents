@@ -26,11 +26,21 @@
 显式市场标记（``market=SH`` 或 ``SH.600519`` 形态）消歧，detail 无市场标记的（如
 日历未同步）才作用于该市场链上的全部数据作业。
 
+**链域（2026-09-16 修复 K1/I1）**：GLOBAL 链的作业不绑市场日历，因此归因时**不做市场
+消歧**，也不消费市场链层告警（``_CHAIN_ALERT_STATUS``）。两条都是实测错态的直接后果：
+对账差异的 detail 里是**差异标的**（``SH.600519``），拿它当归属市场会把告警甩给 SH，
+GLOBAL 的 reconcile 于是永远停在 pending（critical 差异在页面上不可见）；而「日历未同步」
+作用于市场链数据作业，对账不依赖交易日历，把它当成 GLOBAL 阶段的原因是拿别处故障冒充
+本阶段结论。
+
 时钟口径：``date`` 缺省取 ``clock.now_stamp()[:10]``（``DSH_FAKE_NOW`` 生效），与调度链
 同一时间线。已知限制：``alerts.emit`` 的 ``created_at`` 取真实时间，演练（假时钟）下
 当日告警可能落在真实日期上——因此归因只看最近 N 条并按日期比对，取不到就退化为
 ``pending``（宁可少说，不编）。
 """
+import json
+from pathlib import Path
+
 from . import clock, store
 
 #: 与作业链一致的市场集合（GLOBAL 链单列，不绑市场日历）
@@ -134,8 +144,17 @@ def _applies(alert, market):
     return owner is None or owner == market
 
 
-def _stage(market, job_name, state, alerts, date):
-    """作业阶段：ran 标记 → ok；否则按当日告警归因 → skipped/failed；否则 pending。"""
+def _stage(market, job_name, state, alerts, date, chain="market"):
+    """作业阶段：ran 标记 → ok；否则按当日告警归因 → skipped/failed；否则 pending。
+
+    ``chain`` 区分链域，两条差异都只在 ``"global"`` 下生效（K1/I1，见文件头「链域」）：
+
+      * **不做市场消歧**——GLOBAL 链作业不绑市场，detail 里的证券代码是差异内容而非归属；
+      * **不消费市场链层告警**（``_CHAIN_ALERT_STATUS``）——那是市场链作业的失败原因。
+
+    市场链（``chain="market"``）保持既有口径：告警按 detail 消歧归属，链层告警作用于
+    该市场全部数据作业，配置类告警只影响 build_plan/auto_execute。
+    """
     ran = _ran_at(state, market, job_name, date)
     if ran:
         return {"label": _labels(job_name), "status": "ok",
@@ -143,19 +162,21 @@ def _stage(market, job_name, state, alerts, date):
     for alert in alerts:
         title = str(alert.get("title") or "")
         owner = _ALERT_STATUS.get(title)
-        if owner is not None and owner[0] == job_name and _applies(alert, market):
-            status = "failed" if _is_failure(alert, owner[1]) else owner[1]
-            return {"label": _labels(job_name), "status": status,
-                    "at": None, "scheduled": None, "summary": title}
-    for title, status in _CHAIN_ALERT_STATUS.items():
-        if any(str(a.get("title") or "") == title and _applies(a, market) for a in alerts):
-            return {"label": _labels(job_name), "status": status,
-                    "at": None, "scheduled": None, "summary": title}
-    if any(str(a.get("title") or "") in _CONFIG_ALERT_STATUS and _applies(a, market)
-           for a in alerts) and job_name in ("build_plan", "auto_execute"):
-        return {"label": _labels(job_name),
-                "status": _CONFIG_ALERT_STATUS["auto_pipeline 配置非法"],
-                "at": None, "scheduled": None, "summary": "auto_pipeline 配置非法"}
+        if owner is not None and owner[0] == job_name:
+            if chain == "global" or _applies(alert, market):
+                status = "failed" if _is_failure(alert, owner[1]) else owner[1]
+                return {"label": _labels(job_name), "status": status,
+                        "at": None, "scheduled": None, "summary": title}
+    if chain == "market":
+        for title, status in _CHAIN_ALERT_STATUS.items():
+            if any(str(a.get("title") or "") == title and _applies(a, market) for a in alerts):
+                return {"label": _labels(job_name), "status": status,
+                        "at": None, "scheduled": None, "summary": title}
+        if any(str(a.get("title") or "") in _CONFIG_ALERT_STATUS and _applies(a, market)
+               for a in alerts) and job_name in ("build_plan", "auto_execute"):
+            return {"label": _labels(job_name),
+                    "status": _CONFIG_ALERT_STATUS["auto_pipeline 配置非法"],
+                    "at": None, "scheduled": None, "summary": "auto_pipeline 配置非法"}
     return {"label": _labels(job_name), "status": "pending",
             "at": None, "scheduled": None, "summary": ""}
 
@@ -190,19 +211,28 @@ def _plan_stage(conn, market):
             "scheduled": None, "summary": summary}
 
 
+#: 「执行发生过」的状态集（I2）：只有这些代表订单真的到达了券商（``unknown`` = 可能已
+#: 触达、先查不重放，故算到达）。其余（``cancelled``/``rejected``）意味着一单未成——
+#: 自动链下风控拒整批是可达路径，把它显示成绿色「已完成」与「闭环是否正常」相悖。
+_EXECUTED_STATES = frozenset({"submitted", "partial", "filled", "unknown"})
+
+
 def _execute_stage(conn, market):
+    """执行阶段：有订单则按**结局**派生状态（摘要始终是事实口径，不粉饰）。"""
     plan = _latest_auto_plan(conn, market)
     if plan is None:
         return {"label": _labels("execute"), "status": "pending", "at": None,
                 "scheduled": None, "summary": "无计划"}
+    orders = store.get_orders_by_plan(conn, plan["plan_id"])
     counts = {}
-    for order in store.get_orders_by_plan(conn, plan["plan_id"]):
+    for order in orders:
         counts[order["status"]] = counts.get(order["status"], 0) + 1
     if not counts:
         return {"label": _labels("execute"), "status": "pending", "at": None,
                 "scheduled": None, "summary": "无订单"}
     summary = ", ".join(f"{key} {counts[key]}" for key in sorted(counts))
-    return {"label": _labels("execute"), "status": "ok", "at": None,
+    status = "ok" if any(o["status"] in _EXECUTED_STATES for o in orders) else "failed"
+    return {"label": _labels("execute"), "status": status, "at": None,
             "scheduled": None, "summary": summary}
 
 
@@ -241,22 +271,47 @@ def _market_stages(conn, market, jobs, state, alerts, date):
 
 
 def _global_stages(conn, jobs, state, alerts, date):
+    """GLOBAL 链阶段（不绑市场日历）：归因不做市场消歧、不消费市场链层告警。"""
     stages = {}
     for job in jobs.get(GLOBAL_CHAIN) or []:
-        stage = _stage(GLOBAL_CHAIN, job["name"], state, alerts, date)
+        stage = _stage(GLOBAL_CHAIN, job["name"], state, alerts, date, chain="global")
         stage["scheduled"] = job.get("at")
         stages[job["name"]] = stage
     stages["digest"] = _digest_stage(conn, date)
     return stages
 
 
+def _config_unparsable(home):
+    """``trading-platform.json`` 存在但 JSON 不可解析（I3）。
+
+    ``platform_config`` 对损坏文件按空配置容错（不阻塞调度，这是有意的）；但那样一来
+    「配置坏了」与「功能没开」在摘要里长得一模一样。此处只**判可解析性**，不改变容错语义。
+    """
+    path = Path(home) / "trading-platform.json"
+    if not path.exists():
+        return False
+    try:
+        json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return True
+    return False
+
+
 def _auto_pipeline_summary(home):
-    """auto_pipeline 配置摘要：非法配置如实报错（端点本身不失败）。"""
+    """auto_pipeline 配置摘要：非法配置如实报错（端点本身不失败）。
+
+    两种「非法」分开报：**语义非法**（``apply_overlay`` 的 ValueError）走 ``error``；
+    **文件级不可解析**（JSON 坏）补 ``config_error`` 并保留默认值字段（I3）——两条路径
+    互斥，语义错优先（文件已能解析时才可能语义错）。
+    """
     from . import autopipeline
     try:
-        return autopipeline.auto_pipeline_config(home)
+        summary = autopipeline.auto_pipeline_config(home)
     except ValueError as error:
         return {"enabled": False, "error": str(error)[:160]}
+    if _config_unparsable(home):
+        summary["config_error"] = "配置文件无法解析"
+    return summary
 
 
 def pipeline_snapshot(conn, home, date=None, alert_limit=10):

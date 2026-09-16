@@ -79,15 +79,24 @@ class PipelineBase(unittest.TestCase):
         return plan_id
 
     def seed_order(self, plan_id, status="submitted", symbol="SH.600519"):
+        """按结局构造订单。``cancelled`` 走**风控拒单的真实路径**（frozen → cancelled，
+        见 ``execute.run`` 的被拒分支）；``submitting → cancelled`` 不是合法迁移，
+        不要把「从未提交」写成「提交后被撤」。"""
         order = oms.register_order(self.conn, plan_id, symbol, symbol.split(".")[0],
                                    "BUY", 100, 100.0, "sim", "h" + plan_id[-4:])
-        oms.transition(self.conn, order["client_order_id"], "frozen")
-        oms.transition(self.conn, order["client_order_id"], "submitting")
+        cid = order["client_order_id"]
+        oms.transition(self.conn, cid, "frozen")
+        if status == "cancelled":
+            oms.transition(self.conn, cid, "cancelled", err="risk")
+            return cid
+        oms.transition(self.conn, cid, "submitting")
         if status == "submitted":
-            oms.transition(self.conn, order["client_order_id"], "submitted", broker_order_id="9")
-        elif status == "cancelled":
-            oms.transition(self.conn, order["client_order_id"], "cancelled", err="risk")
-        return order["client_order_id"]
+            oms.transition(self.conn, cid, "submitted", broker_order_id="9")
+        elif status == "rejected":
+            oms.transition(self.conn, cid, "rejected", err="broker")
+        elif status == "unknown":
+            oms.transition(self.conn, cid, "unknown", err="timeout")
+        return cid
 
 
 class StageDerivationTests(PipelineBase):
@@ -295,6 +304,108 @@ class ConfigAndSafetyTests(PipelineBase):
         self.assertEqual(len(out["alerts"]), 2)
         # 告警按 id 倒序：最近一条在前
         self.assertEqual(out["alerts"][0]["detail"], "缺 2 日")
+
+
+class ReviewFixTests(PipelineBase):
+    """WP10 代码质量审查（基线 b62e1b7）的修复回归：K1 / I1 / I2 / I3。
+
+    每条用例先复现审查者实证的错态，再由修复转绿——不是对实现的同义改写。
+    """
+
+    # ---- K1：GLOBAL 链不做市场消歧（critical 对账差异必须可见） ----
+    def test_global_reconcile_critical_diff_is_failed(self):
+        """对账差异 detail 里是差异标的（SH.600519/HK.00700），不是归属市场。
+
+        修复前：``_applies(alert, "GLOBAL")`` 因 detail 含 ``SH.`` 判为「不属于 GLOBAL」
+        → reconcile 停在 pending，页面上对账差异完全不可见（与 ``_is_failure`` 的
+        「critical 一律 failed」注释直接矛盾）。
+        """
+        self.enable_auto()
+        self.emit_alert("对账差异", "2 条差异（2026-09-16）：SH.600519,HK.00700",
+                        level="critical")
+        stages = self.snapshot()["global"]["stages"]
+        self.assertEqual(stages["reconcile"]["status"], "failed")
+        self.assertEqual(stages["reconcile"]["summary"], "对账差异")
+
+    def test_global_reconcile_no_diff_still_ok(self):
+        """反向钉子：无差异的 info 告警仍按表口径判 ok（GLOBAL 分支不把一切告警当失败）。"""
+        self.enable_auto()
+        self.emit_alert("对账无差异", "2026-09-16 订单/持仓与券商一致", level="info")
+        self.assertEqual(self.snapshot()["global"]["stages"]["reconcile"]["status"], "ok")
+
+    # ---- I1：市场链层告警不误伤 GLOBAL 链 ----
+    def test_chain_alert_does_not_touch_global_stage(self):
+        """「日历未同步」作用于市场链数据作业，但对账不依赖交易日历。
+
+        修复前该告警（detail 无市场标记 → owner None）作用于**所有**市场**以及** GLOBAL
+        链，于是 GLOBAL reconcile 显示 ``skipped | 日历未同步``——把别处故障当本阶段原因。
+        """
+        self.enable_auto()
+        self.emit_alert("日历未同步", "日历未同步：SH（交易日历未同步）", level="warn")
+        out = self.snapshot()
+        reconcile = out["global"]["stages"]["reconcile"]
+        self.assertEqual(reconcile["status"], "pending")
+        self.assertEqual(reconcile["summary"], "")
+        # 既有市场链行为不变：同一告警仍让该市场数据作业显示跳过
+        self.assertEqual(self.stages(out)["sync_bars"]["status"], "skipped")
+        self.assertEqual(self.stages(out)["sync_bars"]["summary"], "日历未同步")
+
+    # ---- I2：执行阶段按结局派生状态（整批被拒不是绿色「已完成」） ----
+    def test_execute_stage_all_rejected_is_failed(self):
+        """自动链下风控/券商拒整批是可达路径——此时显示绿色与「闭环是否正常」相悖。"""
+        self.enable_auto()
+        plan_id = self.seed_auto_plan()
+        self.seed_order(plan_id, status="rejected")
+        stages = self.stages(self.snapshot())
+        self.assertEqual(stages["execute"]["status"], "failed")
+        self.assertEqual(stages["execute"]["summary"], "rejected 1")  # 摘要保持事实口径
+
+    def test_execute_stage_all_cancelled_is_failed(self):
+        self.enable_auto()
+        plan_id = self.seed_auto_plan()
+        self.seed_order(plan_id, status="cancelled")
+        stages = self.stages(self.snapshot())
+        self.assertEqual(stages["execute"]["status"], "failed")
+        self.assertEqual(stages["execute"]["summary"], "cancelled 1")
+
+    def test_execute_stage_one_reached_keeps_ok(self):
+        """部分到达即算执行发生（unknown 代表可能已触达券商，不判失败）。"""
+        self.enable_auto()
+        plan_id = self.seed_auto_plan()
+        self.seed_order(plan_id, status="cancelled")
+        self.seed_order(plan_id, status="submitted", symbol="SH.000001")
+        stages = self.stages(self.snapshot())
+        self.assertEqual(stages["execute"]["status"], "ok")
+        self.assertEqual(stages["execute"]["summary"], "cancelled 1, submitted 1")
+
+    def test_execute_stage_unknown_only_is_ok(self):
+        self.enable_auto()
+        plan_id = self.seed_auto_plan()
+        self.seed_order(plan_id, status="unknown")
+        self.assertEqual(self.stages(self.snapshot())["execute"]["status"], "ok")
+
+    # ---- I3：坏配置文件不得伪装成「功能关闭」 ----
+    def test_unparsable_config_is_reported(self):
+        """JSON 解析失败走 ``platform_config`` 容错（按空配置跑，不阻塞调度）——但摘要
+        必须能区分「配置坏了」与「功能没开」：补 ``config_error``，并保留默认值字段。"""
+        (self.home / "trading-platform.json").write_text("{ not json", encoding="utf-8")
+        out = self.snapshot()["auto_pipeline"]
+        self.assertEqual(out["config_error"], "配置文件无法解析")
+        self.assertFalse(out["enabled"])          # 默认值字段保留（摘要仍完整可渲染）
+        self.assertIn("exec_at", out)
+        self.assertIn("exec_window_minutes", out)
+        self.assertNotIn("error", out)            # 与语义非法（error）分开报
+
+    def test_unparsable_config_keeps_semantic_error_priority(self):
+        """文件能解析但语义非法 → 仍走 ``error``（两条路径不互相覆盖）。"""
+        self.write_platform({"auto_pipeline": {"enabled": "yes"}})
+        out = self.snapshot()["auto_pipeline"]
+        self.assertIn("error", out)
+        self.assertNotIn("config_error", out)
+
+    def test_missing_config_has_no_config_error(self):
+        """文件不存在 = 功能未启用（默认态），不是配置错误。"""
+        self.assertNotIn("config_error", self.snapshot()["auto_pipeline"])
 
 
 class PipelineEndpointTests(PipelineBase):
