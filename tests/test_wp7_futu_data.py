@@ -15,8 +15,9 @@ capital_distribution/option_expiration/option_chain/option_screen）。
 * 路由契约：8 端点进 ``store_access.endpoints()`` 白名单、字段白名单在 handle 层拒绝、
   实时零缓存（不进 CACHE_TTL_MS/ENDPOINT_SHAPE、响应不带 cached 字段、连调两次
   全部触达通道）、错误 envelope 原样透传；
-* 工具面 41：新 8 工具 ∈ TOOLS、映射端点同名、字段集与 HTTP 白名单同形、
-  ``confirm_decide`` 仍禁入、描述注明「服务端经富途实时获取；A 股实时受限见错误消息」。
+* 工具面（WP8 任务 2 起 50）：8 工具 ∈ TOOLS、映射端点同名、字段集与 HTTP 白名单
+  同形、``confirm_decide`` 仍禁入、描述注明「服务端经富途实时获取；A 股实时受限见
+  错误消息」。
 * ``option_expiration`` 的上游实名是 ``quote_option_expiration_date``（2026-09-16 实测
   tools/list：``quote_option_expiration`` 返回 "tool has been deactivated or does not
   exist"，``quote_option_expiration_date`` ret_code=0）——按通道实测事实锁定。
@@ -324,7 +325,9 @@ class RoutingContractTest(unittest.TestCase):
         for endpoint in FUTU_ENDPOINTS:
             self.assertIn(endpoint, endpoints, endpoint)
         self.assertEqual(tuple(store_access.FUTU_ENDPOINTS), FUTU_ENDPOINTS)
-        self.assertEqual(tuple(futu_data.FUTU_TOOLS), FUTU_ENDPOINTS)
+        # WP8 任务 2 起 FUTU_TOOLS 覆盖全部 17 个富途直通端点（8 直通 + 9 行情）
+        self.assertEqual(tuple(futu_data.FUTU_TOOLS),
+                         FUTU_ENDPOINTS + tuple(store_access.WP8_MARKET_ENDPOINTS))
 
     def test_realtime_endpoints_absent_from_ttl_and_shape_tables(self):
         for endpoint in FUTU_ENDPOINTS:
@@ -334,11 +337,11 @@ class RoutingContractTest(unittest.TestCase):
 
 
 class ToolSurfaceTest(unittest.TestCase):
-    """MCP 工具面 41：8 新工具进面、字段同形、描述注明实时直通与 A 股受限。"""
+    """MCP 工具面 50（WP8 任务 2 起）：8 工具进面、字段同形、描述注明实时直通与 A 股受限。"""
 
-    def test_tool_surface_is_41(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 41)
-        self.assertEqual(len(mcp_tools.TOOLS), 41)
+    def test_tool_surface_is_50(self):
+        self.assertEqual(mcp_tools.TOOL_COUNT, 50)
+        self.assertEqual(len(mcp_tools.TOOLS), 50)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(FUTU_ENDPOINTS), names)
         self.assertNotIn("confirm_decide", names)
@@ -362,14 +365,33 @@ class ToolSurfaceTest(unittest.TestCase):
             "option_expiration": ("code",),
             "option_chain": ("code", "field_filter"),
             "option_screen": ("filter",),
+            # WP8 任务 2：OpenAPI 行情接入的 9 个增量端点（与 tests/test_wp8_market.py
+            # 同表；这里只钉这 8 个既有端点的字段不受任务 2 影响，另断言表键集一致）
+            "market_snapshot": ("codes",),
+            "cur_kline": ("code", "num", "ktype", "autype", "extended_time"),
+            "rt_data": ("code", "request_section"),
+            "rt_ticker": ("code", "num", "period"),
+            # 进 TTL 缓存的 5 个工具带 refresh 旁路参数（同其他缓存工具的房规）
+            "info_basicinfo": ("codes", "refresh"),
+            "info_trading_days": ("market", "start", "end", "refresh"),
+            "info_search": ("keyword", "size", "news_type", "sort_type", "lang", "refresh"),
+            "info_market_state": ("codes", "is_contain_ba", "is_contain_overnight", "refresh"),
+            "quote_history_kline_v2": ("code", "start", "end", "ktype", "autype",
+                                       "num", "extended_time", "refresh"),
         }
         definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
         for name, fields in expected_fields.items():
             self.assertEqual(definitions[name].fields, fields, name)
-            self.assertEqual([param.name for param in definitions[name].params if param.required],
-                             [fields[0]], f"{name} 的首字段必填")
-        self.assertEqual(list(app_module.FUTU_FIELDS), list(expected_fields))
-        for name, fields in expected_fields.items():
+            # 首字段必填（cur_kline 的 num、quote_history_kline_v2 的 end 等官方必填
+            # 字段由 tests/test_wp8_market.py 的 test_required_fields_follow_official_docs 钉）
+            self.assertEqual(
+                [param.name for param in definitions[name].params if param.required][0],
+                fields[0], f"{name} 的首字段必填")
+        # HTTP 白名单不含 refresh（载荷层 refresh 映射为 _refresh 旁路）
+        http_fields = {name: tuple(f for f in fields if f != "refresh")
+                       for name, fields in expected_fields.items()}
+        self.assertEqual(list(app_module.FUTU_FIELDS), list(http_fields))
+        for name, fields in http_fields.items():
             self.assertEqual(tuple(app_module.FUTU_FIELDS[name]), fields, name)
 
     def test_descriptions_state_realtime_passthrough_and_a_share_limit(self):
@@ -382,6 +404,8 @@ class ToolSurfaceTest(unittest.TestCase):
             self.assertIn("A 股", tool.description, name)
 
     def test_upstream_tool_mapping_is_locked(self):
+        """endpoint → 富途 MCP 工具名全表（WP8 任务 2 增至 17 键；新 9 键的
+        2026-09-16 实测依据见 tests/test_wp8_market.py::test_nine_new_endpoints_route_to_mcp_tools）。"""
         self.assertEqual(futu_data.FUTU_TOOLS, {
             "rt_quote": "quote_stock_quote",
             "rt_order_book": "quote_order_book",
@@ -391,6 +415,15 @@ class ToolSurfaceTest(unittest.TestCase):
             "option_expiration": "quote_option_expiration_date",
             "option_chain": "quote_option_chain",
             "option_screen": "quote_option_screen",
+            "market_snapshot": "quote_market_snapshot",
+            "cur_kline": "quote_cur_kline",
+            "rt_data": "quote_rt_data",
+            "rt_ticker": "quote_rt_ticker",
+            "info_basicinfo": "quote_stock_basicinfo",
+            "info_trading_days": "quote_trading_days",
+            "info_search": "quote_news_search",
+            "info_market_state": "quote_market_state",
+            "quote_history_kline_v2": "quote_history_kline",
         })
 
     def test_sdk_signature_accepts_object_and_list_payloads(self):

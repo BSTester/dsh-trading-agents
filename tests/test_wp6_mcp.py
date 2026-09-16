@@ -156,7 +156,7 @@ class McpProtocolSmoke(unittest.TestCase):
     # ---- S1 ----
 
     def test_s1_initialize_and_tool_surface(self):
-        """initialize → tools/list 恰 41；名单与输入字段集逐个对齐规格清单（WP7/WP8 增量）。"""
+        """initialize → tools/list 恰 50；名单与输入字段集逐个对齐规格清单（WP7/WP8 增量）。"""
         async def runner():
             async with streamable_http_client(self.url) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -167,7 +167,7 @@ class McpProtocolSmoke(unittest.TestCase):
         init, listing = asyncio.run(runner())
         self.assertEqual(init.server_info.name, mcp_tools.SERVER_NAME)
         names = [tool.name for tool in listing.tools]
-        self.assertEqual(len(names), 41)
+        self.assertEqual(len(names), 50)
         self.assertEqual(len(names), mcp_tools.TOOL_COUNT)
         self.assertEqual(names, [definition.name for definition in mcp_tools.TOOLS])
         # 不变式 1：唯一能批准实盘操作的通道绝不进工具面（两种写法都不允许出现）

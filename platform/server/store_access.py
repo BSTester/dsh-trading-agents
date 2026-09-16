@@ -337,16 +337,25 @@ WP7_ENDPOINTS = ("factors-history", "trade_place", "trade_modify", "trade_cancel
 FUTU_ENDPOINTS = ("rt_quote", "rt_order_book", "capital_flow", "capital_flow_history",
                   "capital_distribution", "option_expiration", "option_chain", "option_screen")
 
+# WP8 任务 2：OpenAPI 行情接入新增端点（9 个；取数与通道路由同在 server/futu_data.py，
+# futu_channel=openapi 时走 REST 后端）。实时四类（market_snapshot/cur_kline/rt_data/
+# rt_ticker）不进缓存；基本四类 + quote_history_kline_v2 进 CACHE_TTL_MS/ENDPOINT_SHAPE
+# 并在 value 层缓存（futu_data.CACHED_FUTU_ENDPOINTS）。
+WP8_MARKET_ENDPOINTS = ("market_snapshot", "cur_kline", "rt_data", "rt_ticker",
+                        "info_basicinfo", "info_trading_days", "info_search",
+                        "info_market_state", "quote_history_kline_v2")
+
 
 def endpoints():
-    """服务端点清单（37 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通。
+    """服务端点清单（46 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
+    + 9 项 WP8 OpenAPI 行情。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
-    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7 端点登记在
-    ``WP7_ENDPOINTS``，WP8 富途直通端点登记在 ``FUTU_ENDPOINTS``，按交付顺序追加；
-    锁定测试把 37 项整体钉死。
+    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8 增量按交付
+    顺序登记在各自常量里；锁定测试把 46 项整体钉死。
     """
-    return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS)
+    return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS) \
+        + list(WP8_MARKET_ENDPOINTS)
 
 
 def read_mode(home):

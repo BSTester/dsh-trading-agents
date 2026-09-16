@@ -230,9 +230,20 @@ def parse_envelope(status, body):
 
     非 JSON / 非信封（含 5xx、限频页）：如实抛 OpenApiError——本层不自动重试。
     """
+    return parse_envelope_meta(status, body)[0]
+
+
+def parse_envelope_meta(status, body):
+    """``parse_envelope`` 的 (d, 分页) 版本。
+
+    行情分页端点（capital-flow/history、option-screen、history-kline）的信封是
+    ``{"ret_code":0, "data":{...}, "pagination":{...}}``——分页在**信封顶层**而不在
+    data 内。OpenApiMarket 把它并入返回值以对齐 MCP 通道 ``futu_mcp._unwrap`` 的形状
+    （那里 pagination 同样被并入 data）；无分页时第二个元素为 ``None``。
+    """
     data = _safe_json_dict(body)
     if isinstance(data, dict) and data.get("s") == "ok":
-        return data.get("d")
+        return data.get("d"), None
     if isinstance(data, dict) and data.get("s") == "error":
         raise OpenApiError(
             data.get("errmsg") or "未知错误",
@@ -241,6 +252,13 @@ def parse_envelope(status, body):
             confirm_id=data.get("confirm_id"),
             jump_url=data.get("jump_url"),
         )
+    if isinstance(data, dict) and "ret_code" in data:
+        # 行情类网关信封：ret_code!=0 → 业务错误；==0 → data + 顶层 pagination
+        if data.get("ret_code") != 0:
+            raise OpenApiError(data.get("ret_msg") or data.get("errmsg") or "未知错误",
+                               errcode=data.get("ret_code"))
+        pagination = data.get("pagination")
+        return data.get("data"), pagination if isinstance(pagination, dict) else None
     raise OpenApiError(
         errcode=status if isinstance(status, int) and status else -1,
         errmsg=f"非预期响应（HTTP {status}）：{(body or b'')[:200]!r}")
@@ -282,7 +300,17 @@ class OpenApiClient:
     # ------------------------------------------------------------ 公共入口
 
     def request(self, method, path, query=None, json_body=None):
-        """发起请求，返回信封 d 部分；s==error / 传输异常 → OpenApiError。"""
+        """发起请求，返回信封 d 部分；s==error / ret_code!=0 / 传输异常 → OpenApiError。"""
+        d, _pagination = self.request_meta(method, path, query, json_body)
+        return d
+
+    def request_meta(self, method, path, query=None, json_body=None):
+        """``request`` 的 (d, 信封顶层 pagination) 版本。
+
+        分页由 OpenApiMarket 的分页端点（capital_flow_history/option_screen/
+        history_kline）消费：并入返回值后与 MCP 通道 data 形状一致（见
+        parse_envelope_meta）。无分页时 pagination 为 None。
+        """
         mode = self.store.load().get("mode")
         if mode == "oauth":
             return self._request_oauth(method, path, query, json_body)
@@ -318,7 +346,7 @@ class OpenApiClient:
         if status == 401 and not refreshed:
             cred = self._refresh(cred)  # 401 触发刷新一次
             status, body = self._send_oauth(cred, method, path, query, json_body)
-        return parse_envelope(status, body)
+        return parse_envelope_meta(status, body)
 
     def _send_oauth(self, cred, method, path, query, json_body):
         headers = {}
@@ -393,4 +421,348 @@ class OpenApiClient:
             headers["Content-Type"] = "application/json"
         status, resp_body = self._http(str(method).upper(), self._url(path, query),
                                        headers, body)
-        return parse_envelope(status, resp_body)
+        return parse_envelope_meta(status, resp_body)
+
+
+# ---------------------------------------------------------------------------
+# OpenApiMarket：行情 REST 方法组（WP8 任务 2）
+# ---------------------------------------------------------------------------
+# 路径与参数逐项对照官方文档（2026-09-16 web_fetch 实抓，前缀 /api/v1.0/quote）：
+#   realtime/market-snapshot … basic-data/search、capital-flow/*、derivatives/*、
+#   screening/option-screen（各方法 docstring 里带精确路径与参数）。
+# 约定：每个方法做参数白名单/类型/区间校验（本地 ValueError，消息面向调用方）→
+# client.request(request_meta) → 返回信封 d。符号归一**不在这里**做（futu_data 层统一
+# 走 market.to_futu_symbol，全仓库一份归一），这里只做形状校验。
+# 三个分页端点（capital_flow_history/option_screen/history_kline）用 request_meta 把
+# 信封顶层 pagination 并入返回值——与 MCP 通道 futu_mcp._unwrap 的形状一致，使
+# futu_data 的双通道路由可以产出同形状响应（归一化 fixture 见 tests/test_wp8_market.py）。
+class OpenApiMarket:
+    """富途行情 OpenAPI（REST）方法组：WP8 任务 2 的 OpenAPI 后端唯一入口。
+
+    每个方法对应一个官方 REST 端点（方法名 = futu_data.OPENAPI_METHODS 的登记值）；
+    参数名与官方文档一致（code_list/code/symbol/num/ktype/autype/...）。调用方必须
+    先配好凭据（~/.dsh/futu-openapi.json，OAuth 或 AppKey），否则 client.request 抛
+    OpenApiError。
+    """
+
+    #: 行情快照/报价/基本信息/市场状态批量上限（官方：单次最多 400 个 code）
+    MAX_CODE_LIST = 400
+    #: K 线单次条数上限（官方：num 默认 370、最大 370）
+    MAX_KLINE_NUM = 370
+    #: 买卖盘档数上限（官方：num 1..60）
+    MAX_ORDER_BOOK_NUM = 60
+    #: 逐笔成交条数上限（官方：num 默认 500、最大 750）
+    MAX_TICKER_NUM = 750
+
+    #: ktype 枚举（官方文档 cur-kline 页）：1=1分 2=日 3=周 4=月 5=年 6=5分 7=15分
+    #: 8=30分 9=60分 10=3分 11=季 14=120分 15=240分 26=10分 29=180分
+    KTYPE_VALUES = frozenset({1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 14, 15, 26, 29})
+    #: autype 枚举：0=不复权 1=前复权 2=后复权 3=前复权含股息 4=后复权含股息
+    AUTYPE_VALUES = frozenset({0, 1, 2, 3, 4})
+    #: extended_time 枚举：0=默认 1=含盘前盘后（美股 1 分 K） 2=含夜盘
+    EXTENDED_TIME_VALUES = frozenset({0, 1, 2})
+    #: rt-data 的交易时段枚举（官方文档 rt-data 页）
+    RT_SECTIONS = frozenset({"NORMAL", "FULL", "PREMARKET", "AFTERHOURS",
+                             "HK_DARK", "OVERNIGHT"})
+    #: rt-ticker 的时段过滤枚举
+    TICKER_PERIODS = frozenset({"NORMAL", "BEFORE", "AFTER", "OVERNIGHT"})
+    #: trading-days 的市场枚举（官方文档 trading-days 页）
+    TRADING_MARKETS = frozenset({"HK", "US", "SH", "SZ", "BJ", "SG", "JP", "CA",
+                                 "AU", "JP_FUTURE", "SG_FUTURE"})
+    #: option-expiration / option-chain 的 filter_standard 枚举
+    FILTER_STANDARDS = frozenset({"ALL", "STANDARD", "NON_STANDARD"})
+    #: capital-flow-history 的聚合周期
+    FLOW_PERIOD_TYPES = frozenset({"DAY", "WEEK", "MONTH"})
+    #: find-news 的资讯类型：1=资讯 2=公告 3=研报
+    NEWS_TYPES = frozenset({1, 2, 3})
+    #: find-news / find-community 排序：1=热度/阅读量 2=时间
+    SEARCH_SORT_TYPES = frozenset({1, 2})
+    #: find-news / find-community 语言过滤
+    SEARCH_LANGS = frozenset({"zh-CN", "zh-HK", "en", "ja"})
+    #: find-community 社区类型：1=讨论 2=话题 3=直播
+    COMMUNITY_TYPES = frozenset({1, 2, 3})
+
+    def __init__(self, client):
+        self.client = client
+
+    # ------------------------------------------------------------ 校验助手
+
+    def _codes(self, codes, count_max):
+        """批量 code_list 校验：1..count_max 个非空字符串（官方 invalid_parameter 面）。"""
+        if not isinstance(codes, list) or not 1 <= len(codes) <= count_max:
+            raise ValueError(
+                f"code_list 必须是 1..{count_max} 个标的代码的列表（如 HK.00700）")
+        for code in codes:
+            if not isinstance(code, str) or not code.strip():
+                raise ValueError(f"code_list 元素必须是非空字符串，得到：{code!r}")
+        return list(codes)
+
+    def _int_in(self, value, low, high, name, default=None):
+        """整数区间校验：None 走 default；越界/类型错拒绝（bool 是 int 的子类，排除）。"""
+        if value is None:
+            if default is None:
+                raise ValueError(f"{name} 必填（{low}..{high} 的整数）")
+            return default
+        if isinstance(value, bool) or not isinstance(value, int) \
+                or not low <= value <= high:
+            raise ValueError(f"{name} 必须是 {low}..{high} 的整数")
+        return value
+
+    _REQUIRED = object()  # 「必填枚举」哨兵：default=None 表示可省略（请求体去 None）
+
+    def _enum_in(self, value, allowed, name, default=_REQUIRED):
+        """枚举校验：None 走 default；default 为哨兵时视为必填。"""
+        if value is None:
+            if default is self._REQUIRED:
+                raise ValueError(f"{name} 必填，取值之一：{sorted(allowed)}")
+            return default
+        if value not in allowed:
+            raise ValueError(f"{name} 取值非法：{value!r}（允许：{sorted(allowed)}）")
+        return value
+
+    def _date(self, value, name, required=False):
+        """yyyy-MM-dd 日期校验（含日历有效性）。"""
+        if value is None or value == "":
+            if required:
+                raise ValueError(f"{name} 必填（yyyy-MM-dd）")
+            return None
+        if not isinstance(value, str):
+            raise ValueError(f"{name} 必须是 yyyy-MM-dd 字符串")
+        try:
+            import datetime as _dt
+            _dt.date.fromisoformat(value)
+        except ValueError:
+            raise ValueError(f"{name} 不是合法日期：{value!r}（yyyy-MM-dd）") from None
+        return value
+
+    def _body(self, mapping):
+        """去掉 None 值的请求体（官方接口按缺省处理省略字段）。"""
+        return {key: value for key, value in mapping.items() if value is not None}
+
+    def _merge_pagination(self, d, pagination):
+        """信封顶层 pagination 并入 d（对齐 futu_mcp._unwrap；无分页原样返回）。"""
+        if pagination:
+            return {**d, "pagination": pagination}
+        return d
+
+    # ------------------------------------------------------------ 实时行情（realtime）
+
+    def market_snapshot(self, code_list):
+        """POST /api/v1.0/quote/snapshot —— 行情快照（批量 1..400，按品类分组字段）。"""
+        return self.client.request("POST", "/api/v1.0/quote/snapshot",
+                                   json_body={"code_list": self._codes(code_list,
+                                                                       self.MAX_CODE_LIST)})
+
+    def stock_quote(self, code_list):
+        """POST /api/v1.0/quote/stock-quote —— 实时报价（轻量版快照）。"""
+        return self.client.request("POST", "/api/v1.0/quote/stock-quote",
+                                   json_body={"code_list": self._codes(code_list,
+                                                                       self.MAX_CODE_LIST)})
+
+    def order_book(self, code, num=None):
+        """POST /api/v1.0/quote/order-book —— 买卖盘（num 1..60，缺省=权限档上限）。"""
+        body = {"code": self._codes([code], 1)[0]}
+        if num is not None:
+            body["num"] = self._int_in(num, 1, self.MAX_ORDER_BOOK_NUM, "num")
+        return self.client.request("POST", "/api/v1.0/quote/order-book", json_body=body)
+
+    def cur_kline(self, symbol, num, ktype=2, autype=1, extended_time=0):
+        """GET /api/v1.0/quote/{symbol}/cur-kline —— 当前 K 线（num 必填 1..370）。"""
+        query = {
+            "num": self._int_in(num, 1, self.MAX_KLINE_NUM, "num"),
+            "ktype": self._enum_in(ktype, self.KTYPE_VALUES, "ktype", default=2),
+            "autype": self._enum_in(autype, self.AUTYPE_VALUES, "autype", default=1),
+            "extended_time": self._enum_in(extended_time, self.EXTENDED_TIME_VALUES,
+                                           "extended_time", default=0),
+        }
+        return self.client.request("GET", f"/api/v1.0/quote/{symbol}/cur-kline",
+                                   query=query)
+
+    def rt_data(self, symbol, request_section="NORMAL"):
+        """GET /api/v1.0/quote/{symbol}/rt-data —— 分时数据（时段枚举见 RT_SECTIONS）。"""
+        query = {"request_section": self._enum_in(request_section, self.RT_SECTIONS,
+                                                  "request_section", default="NORMAL")}
+        return self.client.request("GET", f"/api/v1.0/quote/{symbol}/rt-data",
+                                   query=query)
+
+    def rt_ticker(self, symbol, num=500, period=None):
+        """GET /api/v1.0/quote/{symbol}/rt-ticker —— 逐笔成交（num 1..750；period 列表）。"""
+        query = {"num": self._int_in(num, 1, self.MAX_TICKER_NUM, "num", default=500)}
+        if period is not None:
+            if not isinstance(period, list) or \
+                    any(item not in self.TICKER_PERIODS for item in period):
+                raise ValueError(f"period 必须是 {sorted(self.TICKER_PERIODS)} 的列表")
+            query["period"] = list(period)
+        return self.client.request("GET", f"/api/v1.0/quote/{symbol}/rt-ticker",
+                                   query=query)
+
+    # ------------------------------------------------------------ 基本数据（basic-data）
+
+    def stock_basicinfo(self, code_list):
+        """POST /api/v1.0/quote/stock-basicinfo —— 标的基本静态信息（批量 1..400）。"""
+        return self.client.request("POST", "/api/v1.0/quote/stock-basicinfo",
+                                   json_body={"code_list": self._codes(code_list,
+                                                                       self.MAX_CODE_LIST)})
+
+    def trading_days(self, market, start, end):
+        """GET /api/v1.0/quote/trading-days —— 交易日历（market/start/end 全必填）。"""
+        query = {
+            "market": self._enum_in(market, self.TRADING_MARKETS, "market"),
+            "start": self._date(start, "start", required=True),
+            "end": self._date(end, "end", required=True),
+        }
+        if query["start"] > query["end"]:
+            raise ValueError("start 不能晚于 end")
+        return self.client.request("GET", "/api/v1.0/quote/trading-days", query=query)
+
+    def history_kline(self, symbol, end, start=None, ktype=2, autype=1,
+                      num=370, extended_time=0):
+        """GET /api/v1.0/quote/{symbol}/history-kline —— 历史 K 线（end 必填；num≤370）。
+
+        信封顶层 pagination 并入返回值（向更早翻页游标，与 MCP 通道同形状）。
+        """
+        query = {
+            "start": self._date(start, "start"),
+            "end": self._date(end, "end", required=True),
+            "ktype": self._enum_in(ktype, self.KTYPE_VALUES, "ktype", default=2),
+            "autype": self._enum_in(autype, self.AUTYPE_VALUES, "autype", default=1),
+            "num": self._int_in(num, 1, self.MAX_KLINE_NUM, "num", default=370),
+            "extended_time": self._enum_in(extended_time, self.EXTENDED_TIME_VALUES,
+                                           "extended_time", default=0),
+        }
+        d, pagination = self.client.request_meta(
+            "GET", f"/api/v1.0/quote/{symbol}/history-kline", query=query)
+        return self._merge_pagination(d, pagination)
+
+    def market_state(self, code_list, is_contain_ba=None, is_contain_overnight=None):
+        """POST /api/v1.0/quote/market-state —— 市场状态（批量 1..400，带市场前缀）。"""
+        body = self._body({
+            "code_list": self._codes(code_list, self.MAX_CODE_LIST),
+            "is_contain_ba": is_contain_ba,
+            "is_contain_overnight": is_contain_overnight,
+        })
+        for flag in ("is_contain_ba", "is_contain_overnight"):
+            if flag in body and not isinstance(body[flag], bool):
+                raise ValueError(f"{flag} 必须是布尔值")
+        return self.client.request("POST", "/api/v1.0/quote/market-state",
+                                   json_body=body)
+
+    def search_news(self, symbol, size=10, news_type=None, sort_type=None, lang=None):
+        """GET /api/v1.0/quote/find-news —— 资讯搜索（官方 search 页的资讯子接口）。"""
+        query = {
+            "symbol": self._keyword(symbol),
+            "size": self._int_in(size, 1, 50, "size", default=10),
+            "news_type": self._enum_in(news_type, self.NEWS_TYPES, "news_type",
+                                       default=None),
+            "sort_type": self._enum_in(sort_type, self.SEARCH_SORT_TYPES, "sort_type",
+                                       default=None),
+            "lang": self._enum_in(lang, self.SEARCH_LANGS, "lang", default=None),
+        }
+        return self.client.request("GET", "/api/v1.0/quote/find-news",
+                                   query=self._body(query))
+
+    def search_community(self, symbol, size=10, community_type=None, sort_type=None,
+                         lang=None):
+        """GET /api/v1.0/quote/find-community —— 社区搜索（search 页的社区子接口）。"""
+        query = {
+            "symbol": self._keyword(symbol),
+            "size": self._int_in(size, 1, 50, "size", default=10),
+            "community_type": self._enum_in(community_type, self.COMMUNITY_TYPES,
+                                            "community_type", default=None),
+            "sort_type": self._enum_in(sort_type, self.SEARCH_SORT_TYPES, "sort_type",
+                                       default=None),
+            "lang": self._enum_in(lang, self.SEARCH_LANGS, "lang", default=None),
+        }
+        return self.client.request("GET", "/api/v1.0/quote/find-community",
+                                   query=self._body(query))
+
+    def _keyword(self, symbol):
+        if not isinstance(symbol, str) or not symbol.strip():
+            raise ValueError("symbol（搜索关键词）必须是非空字符串")
+        return symbol
+
+    # ------------------------------------------------------------ 资金（capital-flow）
+
+    def capital_flow(self, symbol, section="NORMAL"):
+        """GET /api/v1.0/quote/{symbol}/capital-flow —— 日内分钟级资金流。"""
+        query = {"section": self._enum_in(section, self.RT_SECTIONS, "section",
+                                          default="NORMAL")}
+        return self.client.request("GET", f"/api/v1.0/quote/{symbol}/capital-flow",
+                                   query=query)
+
+    def capital_flow_history(self, symbol, period_type="DAY", start=None, end=None,
+                             count=365):
+        """GET /api/v1.0/quote/{symbol}/capital-flow/history —— 历史资金流（count 1..1000）。
+
+        信封顶层 pagination 并入返回值（has_more，与 MCP 通道同形状）。
+        """
+        query = {
+            "period_type": self._enum_in(period_type, self.FLOW_PERIOD_TYPES,
+                                         "period_type", default="DAY"),
+            "start": self._date(start, "start"),
+            "end": self._date(end, "end"),
+            "count": self._int_in(count, 1, 1000, "count", default=365),
+        }
+        d, pagination = self.client.request_meta(
+            "GET", f"/api/v1.0/quote/{symbol}/capital-flow/history", query=query)
+        return self._merge_pagination(d, pagination)
+
+    def capital_distribution(self, symbol):
+        """GET /api/v1.0/quote/{symbol}/capital-distribution —— 日内资金分布快照。"""
+        return self.client.request("GET",
+                                   f"/api/v1.0/quote/{symbol}/capital-distribution")
+
+    # ------------------------------------------------------------ 衍生品 / 筛选
+
+    def option_expiration(self, symbol, index_option_type=None,
+                          filter_standard="ALL", filter_expiration_cycles=None):
+        """GET /api/v1.0/quote/{symbol}/option-expiration —— 期权到期日列表。"""
+        query = self._body({
+            "index_option_type": index_option_type,
+            "filter_standard": self._enum_in(filter_standard, self.FILTER_STANDARDS,
+                                             "filter_standard", default="ALL"),
+            "filter_expiration_cycles": filter_expiration_cycles,
+        })
+        return self.client.request("GET", f"/api/v1.0/quote/{symbol}/option-expiration",
+                                   query=query)
+
+    def option_chain(self, symbol, start=None, end=None, index_option_type=None,
+                     filter_standard="ALL"):
+        """GET /api/v1.0/quote/{symbol}/option-chain —— 期权链（单次最多 20 个到期日）。"""
+        query = self._body({
+            "start": self._date(start, "start"),
+            "end": self._date(end, "end"),
+            "index_option_type": index_option_type,
+            "filter_standard": self._enum_in(filter_standard, self.FILTER_STANDARDS,
+                                             "filter_standard", default="ALL"),
+        })
+        return self.client.request("GET", f"/api/v1.0/quote/{symbol}/option-chain",
+                                   query=query)
+
+    def option_screen(self, strategy, field_filter=None, sort_obj=None, next_key=None,
+                      limit=None, request_exact_data=None, strategy_param=None):
+        """POST /api/v1.0/quote/option-screen —— 期权筛选器（strategy 必填对象）。
+
+        信封顶层 pagination 并入返回值（has_more/next_key/total，与 MCP 通道同形状）。
+        """
+        if not isinstance(strategy, dict) or not strategy:
+            raise ValueError("strategy 必须是非空对象（如 {market_category_list: [1]}）")
+        body = self._body({
+            "strategy": strategy,
+            "field_filter": field_filter,
+            "sort_obj": sort_obj,
+            "next_key": next_key,
+            "limit": limit,
+            "request_exact_data": request_exact_data,
+            "strategy_param": strategy_param,
+        })
+        if "limit" in body:
+            body["limit"] = self._int_in(body["limit"], 0, 1000, "limit")
+        for name in ("field_filter", "sort_obj", "strategy_param"):
+            if name in body and not isinstance(body[name], dict):
+                raise ValueError(f"{name} 必须是对象")
+        if "next_key" in body and not isinstance(body["next_key"], str):
+            raise ValueError("next_key 必须是字符串（分页游标）")
+        d, pagination = self.client.request_meta(
+            "POST", "/api/v1.0/quote/option-screen", json_body=body)
+        return self._merge_pagination(d, pagination)

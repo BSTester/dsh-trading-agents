@@ -1,13 +1,14 @@
-# WP6 补遗任务 D：MCP 工具面（41 工具，WP8 富途直通起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
+# WP6 补遗任务 D：MCP 工具面（50 工具，WP8 任务 2 起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
 #
-# 唯一事实来源：本文件的 ``TOOLS`` 清单（36 端点工具 + 5 维护工具）。MCP 工具不复制任何
-# 业务逻辑：端点工具一律 ``handle(endpoint, payload)``（app.create_handler 的产物，与 HTTP
-# 面同一个实例），维护工具一律 ``store_api.admin_*``——两条通道对同一 payload 因此必然同源
+# 唯一事实来源：本文件的 ``TOOLS`` 清单（45 端点工具 + 5 维护工具；46 端点扣除有意
+# 排除的 confirm-decide）。MCP 工具不复制任何业务逻辑：端点工具一律
+# ``handle(endpoint, payload)``（app.create_handler 的产物，与 HTTP 面同一个实例），
+# 维护工具一律 ``store_api.admin_*``——两条通道对同一 payload 因此必然同源
 # （规格 §5.1 A3/A4 的结构保证）。
 #
 # **``confirm-decide`` 有意不进工具面**（规格 §5.1 A7，2026-09-15 业务确认修订）：
 # HTTP 面 WP6 时 23 端点里有 22 个各有一个 MCP 工具（WP7 任务 3 起 29 端点 28 工具，
-# WP8 富途直通起 37 端点 36 工具），
+# WP8 富途直通起 37 端点 36 工具，WP8 任务 2 起 46 端点 45 工具），
 # 唯一被排除的始终是 ``confirm-decide``。
 # 理由是通道分级：它是**唯一能批准实盘操作**的通道，必须只由独立 Web 上的用户点击触发。
 # 若把它做成工具，模型就能"自己发起、自己批准"，业务确认会退化成模型自批实盘单——
@@ -32,7 +33,7 @@
 # SDK 适配结论（mcp 2.2.0 实测，非推测）：
 #   * ``from mcp.server.mcpserver import MCPServer``（2.x 由 FastMCP 更名）；
 #   * 注册面是 ``MCPServer.add_tool(fn, name=..., description=..., structured_output=...)``，
-#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 41 个工具共用一个
+#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 50 个工具共用一个
 #     ``**kwargs`` 派发函数 + 每个工具自带的 ``__signature__`` 表达字段集，注解即契约；
 #   * ``MCPServer.list_tools/call_tool`` 是 async；``streamable_http_app()`` 返回的 Starlette
 #     app 自带 ``lifespan=session_manager.run()``，挂载时须并入主 app 的 lifespan；
@@ -77,10 +78,10 @@ from server import store_access
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
 
-# 工具面总数：36 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
-# 工具 + WP8 富途实时直通 8 个；37 端点扣除有意排除的 confirm-decide）+ 5 维护工具
-# （§3.4）。锁定测试断言 41 恒成立。
-TOOL_COUNT = 41
+# 工具面总数：45 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
+# 工具 + WP8 富途实时直通 8 个 + WP8 任务 2 的 9 个行情工具；46 端点扣除有意排除的
+# confirm-decide）+ 5 维护工具（§3.4）。锁定测试断言 50 恒成立。
+TOOL_COUNT = 50
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
 # ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
@@ -224,7 +225,7 @@ class ToolDefinition:
 
 
 # ---------------------------------------------------------------------------
-# 41 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history、6 个
+# 50 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history、6 个
 # 受约束交易工具，逐项对应）
 # ---------------------------------------------------------------------------
 # 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
@@ -551,6 +552,118 @@ TOOLS = (
              "筛选对象：必须含非空 field_filter 与非空 strategy；可选 limit/next_key/"
              "request_exact_data/sort_obj/strategy_param"),),
     ),
+    # ---- WP8 任务 2：OpenAPI 行情接入（9 个；取数与通道路由在 server/futu_data.py，
+    # futu_channel=openapi 时走 OpenAPI REST 后端，默认 mcp 直通）。实时四类 TTL 0；
+    # 基本五类进 TTL 缓存（quote_history_kline_v2 带 refresh 旁路）。A 股实时统一 -9
+    # （仅延时权限），错误消息附替代路径——数据事实，不是故障。
+    ToolDefinition(
+        "market_snapshot",
+        "行情快照（服务端经富途实时获取）：代码/名称/最新价/涨跌幅/量额/估值/市值等"
+        "按品类分组的全字段快照，codes 1..400 个。A 股实时无权限（统一 -9，见错误消息"
+        "里的替代路径提示）；港股/美股实时。",
+        "market_snapshot",
+        (req("codes", "str_list", "标的代码列表，1..400 个，如 [\"HK.00700\", \"US.AAPL\"]"),),
+    ),
+    ToolDefinition(
+        "cur_kline",
+        "当前 K 线（服务端经富途实时获取）：距今最新 num 根（1..370，必填），支持"
+        "分钟/日/周/月/年/季（ktype）与复权（autype，默认前复权）；extended_time 仅对"
+        "美股 1 分 K 生效。A 股实时无权限（统一 -9）。",
+        "cur_kline",
+        (
+            req("code", "str", "标的代码，如 HK.00700 / SH.600519"),
+            req("num", "int", "K 线数量，1..370", minimum=1, maximum=370),
+            opt("ktype", "int", "K 线类型（官方枚举）：2=日(默认) 1=1分 6=5分 7=15分 8=30分 9=60分 3=周 4=月"),
+            opt("autype", "int", "复权：1=前复权(默认) 0=不复权 2=后复权 3/4=含股息前/后复权"),
+            opt("extended_time", "int", "0=默认 1=含美股盘前盘后（仅 1 分 K） 2=含夜盘"),
+        ),
+    ),
+    ToolDefinition(
+        "rt_data",
+        "分时数据（服务端经富途实时获取）：当日分钟级时间序列，按交易时段分节返回。"
+        "request_section 可选时段：NORMAL=默认(港股自动含暗盘) / FULL / PREMARKET / "
+        "AFTERHOURS（美股）/ HK_DARK / OVERNIGHT。A 股实时无权限（统一 -9）。",
+        "rt_data",
+        (
+            req("code", "str", "标的代码，如 HK.00700"),
+            opt("request_section", "str", "交易时段，默认 NORMAL（枚举见描述）"),
+        ),
+    ),
+    ToolDefinition(
+        "rt_ticker",
+        "逐笔成交（服务端经富途实时获取）：最新 N 笔（num 1..750，默认 500），含"
+        "买卖方向/成交类型/时段；不支持时间区间过滤。period 可按时段过滤（NORMAL/"
+        "BEFORE/AFTER/OVERNIGHT）。A 股实时无权限（统一 -9）。",
+        "rt_ticker",
+        (
+            req("code", "str", "标的代码，如 HK.00700"),
+            opt("num", "int", "返回条数，1..750，默认 500", minimum=1, maximum=750),
+            opt("period", "str_list", "按时段过滤：NORMAL/BEFORE/AFTER/OVERNIGHT"),
+        ),
+    ),
+    ToolDefinition(
+        "info_basicinfo",
+        "标的静态信息（服务端经富途获取，基本数据类）：代码/名称/每手股数/标的类型/"
+        "上市日期/内部 stock_id/停牌位/生命周期状态等，codes 1..400 个。",
+        "info_basicinfo",
+        (req("codes", "str_list", "标的代码列表，1..400 个"), REFRESH),
+    ),
+    ToolDefinition(
+        "info_trading_days",
+        "交易日历（服务端经富途获取，基本数据类）：指定市场在 [start,end] 内的交易日"
+        "与当日交易总秒数（识别半日市）。market/start/end 全必填。",
+        "info_trading_days",
+        (
+            req("market", "str", "市场：HK/US/SH/SZ/BJ/SG/JP/CA/AU/JP_FUTURE/SG_FUTURE"),
+            req("start", "str", "起始日期 yyyy-MM-dd（含）"),
+            req("end", "str", "结束日期 yyyy-MM-dd（含）"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "info_search",
+        "资讯搜索（服务端经富途获取）：按关键词搜资讯/公告/研报，返回标题/发布时间/"
+        "链接。注意：MCP 通道上游恒空（官方通道已知问题，见 docs/TOOL-LIMITS.md），"
+        "本工具以 OpenAPI 通道为准；配置 futu_channel=openapi 后才有数据。",
+        "info_search",
+        (
+            req("keyword", "str", "搜索关键词，如 腾讯 / AAPL / 新能源"),
+            opt("size", "int", "返回条数，1..50，默认 10", minimum=1, maximum=50),
+            opt("news_type", "int", "类型过滤：1=资讯 2=公告 3=研报；不传全部"),
+            opt("sort_type", "int", "排序：1=按阅读量 2=按时间"),
+            opt("lang", "str", "语言过滤：zh-CN/zh-HK/en/ja"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "info_market_state",
+        "市场状态（服务端经富途获取，基本数据类）：代码所属市场当前交易状态"
+        "（开盘/休市/盘前/盘后/夜盘等）+ 当日时段表；codes 1..400 个。",
+        "info_market_state",
+        (
+            req("codes", "str_list", "标的代码列表，1..400 个，必须带市场前缀"),
+            opt("is_contain_ba", "bool", "true 时含美股盘前盘后时段切换"),
+            opt("is_contain_overnight", "bool", "true 时含美股夜盘时段切换"),
+            REFRESH,
+        ),
+    ),
+    ToolDefinition(
+        "quote_history_kline_v2",
+        "历史 K 线 v2（服务端经富途获取；REST history-kline 新端点，带复权参数与翻页，"
+        "单次上限 370 根、pagination.has_more 向更早翻页。既有 series 为 WP6 契约，"
+        "不受本工具影响）：end 必填，ktype/autype 语义同 cur_kline。",
+        "quote_history_kline_v2",
+        (
+            req("code", "str", "标的代码，如 HK.00700 / SH.600519"),
+            opt("start", "str", "起始日期 yyyy-MM-dd（含）；不传按 num 从 end 前推"),
+            req("end", "str", "结束日期 yyyy-MM-dd（含）"),
+            opt("ktype", "int", "K 线类型（官方枚举）：2=日(默认) 1=1分 6=5分 7=15分 8=30分 9=60分 3=周 4=月"),
+            opt("autype", "int", "复权：1=前复权(默认) 0=不复权 2=后复权 3/4=含股息前/后复权"),
+            opt("num", "int", "数量，1..370，默认 370", minimum=1, maximum=370),
+            opt("extended_time", "int", "0=默认 1=含美股盘前盘后（日内 K） 2=含夜盘"),
+            REFRESH,
+        ),
+    ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----
     # 不经 RPC handler，直调 store_access 的 admin_*（与全部端点同库同锁；WP6 口径 23
     # 端点、WP7 任务 3 起 29 端点——2026-09 修订：原文「与 22 端点同库同锁」计数未随
@@ -586,7 +699,7 @@ if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时
 # 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
 TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 
-# 36 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
+# 45 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 
@@ -728,7 +841,7 @@ class BoundTool:
 
 
 def build_tools(handle, store_api):
-    """41 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
+    """50 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
 
     ``handle`` 必须是 ``app.create_handler`` 的产物——与 HTTP 面同一个实例（规格 §5.2 R6）。
     """
@@ -754,7 +867,7 @@ def _bind(definition, handle, store_api):
 
 
 def register(server: MCPServer, handle, store_api=None):
-    """把 41 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
+    """把 50 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
 
     ``store_api`` 在生产路径上由 create_app 显式传入；缺省 None 只为单测里手搓 server 的便利
     （此时维护工具调用会抛 AttributeError，并按程序异常包成 tool-failed）。

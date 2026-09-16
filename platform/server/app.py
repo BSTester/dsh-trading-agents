@@ -127,7 +127,9 @@ TRADE_CANCEL_FIELDS = ("order_id", "symbol", "client_order_id")
 # 账户查询只受模式约束直通 broker；mode 缺省读模式文件（实时查询，不进缓存）
 ACCOUNT_QUERY_FIELDS = ("mode",)
 # WP8 富途实时直通端点的载荷白名单（深校验在 server/futu_data.py：code 归一/必填/内键）。
-# 全部实时（TTL 0，不进 CACHE_TTL_MS/ENDPOINT_SHAPE），响应由 futu_data.handle 直接给出。
+# 实时类 TTL 0，不进 CACHE_TTL_MS/ENDPOINT_SHAPE；WP8 任务 2 的基本五类
+# （info_basicinfo/info_trading_days/info_search/info_market_state/quote_history_kline_v2）
+# 进 TTL 表并在 FutuData 内做 value 层缓存。响应由 futu_data.handle 直接给出。
 FUTU_FIELDS = {
     "rt_quote": ("codes",),
     "rt_order_book": ("code",),
@@ -137,6 +139,17 @@ FUTU_FIELDS = {
     "option_expiration": ("code",),
     "option_chain": ("code", "field_filter"),
     "option_screen": ("filter",),
+    # WP8 任务 2：OpenAPI 行情接入的 9 个增量端点（与 mcp_tools 的工具字段同形）
+    "market_snapshot": ("codes",),
+    "cur_kline": ("code", "num", "ktype", "autype", "extended_time"),
+    "rt_data": ("code", "request_section"),
+    "rt_ticker": ("code", "num", "period"),
+    "info_basicinfo": ("codes",),
+    "info_trading_days": ("market", "start", "end"),
+    "info_search": ("keyword", "size", "news_type", "sort_type", "lang"),
+    "info_market_state": ("codes", "is_contain_ba", "is_contain_overnight"),
+    "quote_history_kline_v2": ("code", "start", "end", "ktype", "autype",
+                               "num", "extended_time"),
 }
 
 
@@ -185,8 +198,10 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
     - ``command_home``：指令落盘根，缺省 ``home``（服务侧 DSH_HOME）；
     - ``trade``（WP7 任务 3）：``TradeGate``（缺省按 home 构造默认闸门，broker 经
       ``trading_core.broker`` + ``trading_datasource``；测试注入替身即可离线）；
-    - ``futu``（WP8）：富途实时直通提供方（缺省 ``futu_data.FutuData()``，通道经
-      ``trading_datasource.futu_mcp.call_tool``；测试注入替身即可离线）。
+    - ``futu``（WP8）：富途实时直通提供方（缺省 ``futu_data.FutuData(home=home)``——
+      MCP 通道经 ``trading_datasource.futu_mcp.call_tool``；WP8 任务 2 起
+      ``futu_channel=openapi`` 时切 OpenAPI REST 后端，通道路由在 futu_data；
+      测试注入替身即可离线）。
     """
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
@@ -201,7 +216,7 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
     if trade is None:
         trade = trading.TradeGate(home)
     if futu is None:
-        futu = futu_data.FutuData()
+        futu = futu_data.FutuData(home=home)
     write_home = home if command_home is None else command_home
 
     def handle(endpoint, raw_payload):
@@ -337,10 +352,13 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
             if endpoint in futu_data.FUTU_TOOLS:
                 # WP8 富途实时直通：skills 需要而本地无缓存的数据由服务端实时经富途获取。
                 # 浅白名单在这里拒（与其他端点同形），深校验（code 归一/必填/内键/上游
-                # 陷阱如 option_screen 的 field_filter）在 futu_data 数据方法里；全部实时
-                # 不进缓存——不经 caches.cached，futu.handle 直接给出最终信封
-                # （成功 {ok,value}；失败 trading/futu-unavailable|futu-error|invalid-operation）。
+                # 陷阱如 option_screen 的 field_filter）在 futu_data 数据方法里。
+                # 通道（mcp|openapi）与 TTL 缓存（基本五类的 value 层缓存）都在
+                # futu_data.handle 内解决——本层只透传，不经 caches.cached。
                 _check_fields(endpoint, payload, FUTU_FIELDS[endpoint])
+                if force:
+                    # ``refresh`` 旁路透传：TTL 端点在 FutuData 内识别 _refresh 重取
+                    payload = {**payload, "_refresh": True}
                 return futu.handle(endpoint, payload)
             if endpoint == "series":
                 _check_fields(endpoint, payload, SERIES_FIELDS)
@@ -381,10 +399,10 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         from server import scheduler as scheduler_module
         scheduler = scheduler_module.Scheduler(scheduler_module.build_tick(home), interval=60.0)
 
-    # MCP 工具面（WP6 补遗 D + WP7 + WP8）：41 工具注册进 MCPServer，端点工具与 HTTP 面
+    # MCP 工具面（WP6 补遗 D + WP7 + WP8）：50 工具注册进 MCPServer，端点工具与 HTTP 面
     # 共用同一个 handle 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的
     # home 绑定门面。
-    # 37 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
+    # 46 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
     mcp_server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
     bound_tools = mcp_tools.register(mcp_server, handle, mcp_tools.StoreApi(home))
     # json_response=True 对齐 Node 版 enableJsonResponse：无 SSE 依赖，普通 JSON 响应。

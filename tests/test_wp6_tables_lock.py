@@ -6,12 +6,16 @@ WP7 面板退役（用户决策 2026-09-16）后 JS 面板源已整体删除，P
 因此改写为纯 Python 断言——把当前事实冻结成内嵌期望值，任何一侧被无意改动立刻红。
 
 覆盖：
-  * ``store_access.endpoints()`` ≡ 37 项内嵌清单（22 项基础清单按已删 endpoints.js
-    原序冻结 + 7 项 WP7 服务自有端点 + 8 项 WP8 富途实时直通端点，逐项与顺序都钉死）；
+  * ``store_access.endpoints()`` ≡ 46 项内嵌清单（22 项基础清单按已删 endpoints.js
+    原序冻结 + 7 项 WP7 服务自有端点 + 8 项 WP8 富途实时直通端点 + 9 项 WP8 OpenAPI
+    行情端点，逐项与顺序都钉死）；
   * ``caches.CACHE_TTL_MS``：17 项 legacy TTL 逐项钉死 + WP7 增量
-    ``factors-history: 5 分钟``；业务确认两端点不在表里（TTL 恒 0，不得缓存「待确认」）；
+    ``factors-history: 5 分钟`` + WP8 任务 2 增量（基本类 5 分钟 ×4 +
+    ``quote_history_kline_v2: 10 分钟``；实时类不进表，TTL 恒 0）；
+    业务确认两端点不在表里（TTL 恒 0，不得缓存「待确认」）；
   * ``caches.ENDPOINT_SHAPE``：16 项 legacy 形状逐项钉死 + WP7 增量
-    ``factors-history: ["snapshots"]``；``confirmation: ["pending"]`` 保留；
+    ``factors-history: ["snapshots"]`` + WP8 任务 2 增量 5 项；``confirmation:
+    ["pending"]`` 保留；
   * ``app.ANALYTICS_ENDPOINTS`` 逐端点字段白名单与各动作端点字段表；
   * ``compute`` 的内层缓存 TTL / 逐端点 timeout / 端点→脚本映射（脚本真实存在，
     analytics.py 子命令白名单对齐——这两条原由 tests/analytics-routing.test.mjs
@@ -69,29 +73,50 @@ WP7_ENDPOINTS = ["factors-history", "trade_place", "trade_modify", "trade_cancel
 FUTU_ENDPOINTS = ["rt_quote", "rt_order_book", "capital_flow", "capital_flow_history",
                   "capital_distribution", "option_expiration", "option_chain", "option_screen"]
 
+# WP8 任务 2：OpenAPI 行情接入新增端点（9 个；与 store_access.WP8_MARKET_ENDPOINTS
+# 逐项同序）。实时四类（market_snapshot/cur_kline/rt_data/rt_ticker）TTL 0 不进
+# 缓存表；基本四类 + 历史 K 线 v2 进 TTL/形状表。
+WP8_MARKET_ENDPOINTS = ["market_snapshot", "cur_kline", "rt_data", "rt_ticker",
+                        "info_basicinfo", "info_trading_days", "info_search",
+                        "info_market_state", "quote_history_kline_v2"]
+
 
 class EndpointListLockTests(unittest.TestCase):
-    def test_endpoints_is_frozen_37_item_list(self):
-        """``store_access.endpoints()`` ≡ 22 项基础清单 + 7 项 WP7 增量 + 8 项 WP8 直通 = 37 项，同序。"""
+    def test_endpoints_is_frozen_46_item_list(self):
+        """``store_access.endpoints()`` ≡ 22 基础 + 7 WP7 + 8 WP8 直通 + 9 WP8 行情 = 46 项，同序。"""
         self.assertEqual(store_access.endpoints(),
-                         BASE_ENDPOINTS + WP7_ENDPOINTS + FUTU_ENDPOINTS)
-        self.assertEqual(len(store_access.endpoints()), 37)
+                         BASE_ENDPOINTS + WP7_ENDPOINTS + FUTU_ENDPOINTS
+                         + WP8_MARKET_ENDPOINTS)
+        self.assertEqual(len(store_access.endpoints()), 46)
         self.assertEqual(len(store_access._BASE_ENDPOINTS), 22)
         self.assertEqual(list(store_access.WP7_ENDPOINTS), WP7_ENDPOINTS)
         self.assertEqual(list(store_access.FUTU_ENDPOINTS), FUTU_ENDPOINTS)
+        self.assertEqual(list(store_access.WP8_MARKET_ENDPOINTS), WP8_MARKET_ENDPOINTS)
         # 尾部锚点：业务确认两端点收尾基础清单；WP7/WP8 增量按任务顺序追加
-        self.assertEqual(store_access.endpoints()[-17:-15], ["confirmation", "confirm-decide"])
-        self.assertEqual(store_access.endpoints()[-15:-8], WP7_ENDPOINTS)
-        self.assertEqual(store_access.endpoints()[-8:], FUTU_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-26:-24],
+                         ["confirmation", "confirm-decide"])
+        self.assertEqual(store_access.endpoints()[-24:-17], WP7_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-17:-9], FUTU_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-9:], WP8_MARKET_ENDPOINTS)
         self.assertEqual(store_access.endpoints()[0], "snapshot")
         # 无重复；重复调用返回等值副本（调用方改动不污染后续结果）
-        self.assertEqual(len(set(store_access.endpoints())), 37)
+        self.assertEqual(len(set(store_access.endpoints())), 46)
         sample = store_access.endpoints()
         sample.append("bogus")
-        self.assertEqual(len(store_access.endpoints()), 37)
+        self.assertEqual(len(store_access.endpoints()), 46)
 
     def test_analytics_endpoints_are_declared(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))
+
+
+# WP8 任务 2 的 TTL 增量（任务书：实时类 TTL 0，基本类 5m，history-kline-v2 10m）
+WP8_MARKET_TTL_MS = {
+    "info_basicinfo": 5 * 60_000,
+    "info_trading_days": 5 * 60_000,
+    "info_search": 5 * 60_000,
+    "info_market_state": 5 * 60_000,
+    "quote_history_kline_v2": 10 * 60_000,
+}
 
 
 class CacheTtlLockTests(unittest.TestCase):
@@ -118,13 +143,24 @@ class CacheTtlLockTests(unittest.TestCase):
 
     def test_legacy_ttl_table_is_frozen(self):
         self.assertEqual({name: ttl for name, ttl in caches.CACHE_TTL_MS.items()
-                          if name not in WP7_ENDPOINTS}, self.LEGACY_TTL_MS)
+                          if name not in WP7_ENDPOINTS
+                          and name not in WP8_MARKET_ENDPOINTS}, self.LEGACY_TTL_MS)
         self.assertEqual(self.LEGACY_TTL_MS["instrument"], 10 * 60_000)
 
     def test_wp7_ttl_delta_is_pinned(self):
         """WP7 增量钉死：factors-history 5 分钟（面板退役前的服务自有值）。"""
         self.assertEqual(caches.CACHE_TTL_MS.get("factors-history"), 5 * 60_000)
-        self.assertEqual(len(caches.CACHE_TTL_MS), len(self.LEGACY_TTL_MS) + 1)
+        self.assertEqual(len(caches.CACHE_TTL_MS),
+                         len(self.LEGACY_TTL_MS) + 1 + len(WP8_MARKET_TTL_MS))
+
+    def test_wp8_market_ttl_delta_is_pinned(self):
+        """WP8 任务 2 增量：基本类 5 分钟 ×4 + 历史 K 线 v2 10 分钟；实时四类不进表。"""
+        self.assertEqual({name: caches.CACHE_TTL_MS[name]
+                          for name in WP8_MARKET_ENDPOINTS
+                          if name in caches.CACHE_TTL_MS}, WP8_MARKET_TTL_MS)
+        for endpoint in ("market_snapshot", "cur_kline", "rt_data", "rt_ticker"):
+            self.assertNotIn(endpoint, caches.CACHE_TTL_MS, endpoint)
+            self.assertEqual(caches.CACHE_TTL_MS.get(endpoint, 0), 0, endpoint)
 
     def test_business_confirmation_endpoints_are_not_cached(self):
         """业务确认两端点 TTL 恒为 0：缓存住「待确认」会让界面拿到已处理掉的请求。"""
@@ -157,13 +193,33 @@ class EndpointShapeLockTests(unittest.TestCase):
 
     def test_legacy_shape_table_is_frozen(self):
         self.assertEqual({name: fields for name, fields in caches.ENDPOINT_SHAPE.items()
-                          if name not in WP7_ENDPOINTS}, self.LEGACY_SHAPE)
+                          if name not in WP7_ENDPOINTS
+                          and name not in WP8_MARKET_ENDPOINTS}, self.LEGACY_SHAPE)
         self.assertEqual(caches.ENDPOINT_SHAPE["confirmation"], ["pending"])
 
     def test_wp7_shape_delta_is_pinned(self):
         """WP7 增量钉死：factors-history 最小字段只有一个快照数组。"""
         self.assertEqual(caches.ENDPOINT_SHAPE["factors-history"], ["snapshots"])
-        self.assertEqual(len(caches.ENDPOINT_SHAPE), len(self.LEGACY_SHAPE) + 1)
+        self.assertEqual(len(caches.ENDPOINT_SHAPE),
+                         len(self.LEGACY_SHAPE) + 1 + len(WP8_MARKET_SHAPE))
+
+    def test_wp8_market_shape_delta_is_pinned(self):
+        """WP8 任务 2 增量：5 个进缓存端点的最小字段（与上游 data 键逐项对应）。"""
+        self.assertEqual({name: caches.ENDPOINT_SHAPE[name]
+                          for name in WP8_MARKET_ENDPOINTS
+                          if name in caches.ENDPOINT_SHAPE}, WP8_MARKET_SHAPE)
+        for endpoint in ("market_snapshot", "cur_kline", "rt_data", "rt_ticker"):
+            self.assertNotIn(endpoint, caches.ENDPOINT_SHAPE, endpoint)
+
+
+# WP8 任务 2 的形状增量：最小字段取自官方文档 data 顶层键（与 MCP 通道 data 同形）
+WP8_MARKET_SHAPE = {
+    "info_basicinfo": ["basic_list"],
+    "info_trading_days": ["trading_days"],
+    "info_search": ["news_list"],
+    "info_market_state": ["market_state_list"],
+    "quote_history_kline_v2": ["kline_list"],
+}
 
 
 class WhitelistLockTests(unittest.TestCase):
