@@ -1408,6 +1408,28 @@ class DefaultWiringSmokeTests(Base):
 class RunEntryTests(Base):
     """入口：就绪行形状、uvicorn 配置、启动失败契约与解释器告警。"""
 
+    def test_repo_data_layer_takes_precedence_over_installed_copy(self):
+        """WP8 修正：仓库存在时，入口把仓库数据层插到 sys.path 最前。
+
+        背景：venv 的 dsh-trading-python.pth 指向 $DSH_HOME 的**副本**，
+        新增模块不会自动同步（实测缺 futu_openapi / sign_ws）。从仓库运行服务时
+        必须以仓库代码为准，否则「测试全绿、服务报 AttributeError」。
+        """
+        import sys as _sys
+
+        from server import run as run_module  # noqa: F401
+
+        repo = Path(__file__).resolve().parents[1]
+        dirs = (repo / "plugins" / "datasource" / "python",
+                repo / "plugins" / "core" / "python")
+        for directory in dirs:
+            self.assertIn(str(directory), _sys.path, str(directory))
+        first_site_packages = min(
+            (i for i, entry in enumerate(_sys.path) if "site-packages" in entry),
+            default=len(_sys.path))
+        for directory in dirs:
+            self.assertLess(_sys.path.index(str(directory)), first_site_packages)
+
     def test_ready_line_shape(self):
         from server import run as run_module
         config = {"port": 0, "host": "127.0.0.1", "token": None}

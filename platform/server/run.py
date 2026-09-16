@@ -35,6 +35,19 @@ PLATFORM = str(Path(__file__).resolve().parents[1])
 if PLATFORM not in sys.path:  # 自举：与「sys.path 加 platform/ 后 from server import ...」同源
     sys.path.insert(0, PLATFORM)
 
+# 数据层优先取**仓库内**代码（WP8 修正）：从仓库运行服务时，venv 的
+# ``dsh-trading-python.pth`` 会把 ``$DSH_HOME/trading-python/{datasource,core}``
+# 加进 sys.path——那是安装器解出的**副本**，新增模块/修复不会自动同步
+# （实测踩两次：缺 ``futu_openapi``、缺 ``AppSigner.sign_ws``，表现为服务端
+# 取数/推送报 ModuleNotFound/AttributeError 而仓库测试全绿）。
+# 仓库存在时把仓库路径插到最前，保证「代码版本 = 数据层版本」；打包安装
+# （无仓库）场景仍回落到 ``$DSH_HOME`` 副本。
+REPO_ROOT = Path(PLATFORM).parent
+for _dir in (REPO_ROOT / "plugins" / "datasource" / "python",
+             REPO_ROOT / "plugins" / "core" / "python"):
+    if _dir.is_dir() and str(_dir) not in sys.path:
+        sys.path.insert(0, str(_dir))
+
 import uvicorn  # noqa: E402
 
 from server.app import create_app  # noqa: E402
