@@ -2495,3 +2495,14 @@ A → B → C → D → E 严格串行（同 worktree）；任务 12（页面批
 >   R1/R2）；`python -B -m unittest discover -s tests -p 'test_*.py'` 669 tests OK（skip 1）。
 >   注意：Node 与 Python 两套套件**不可并发跑**——`tests/test_install.py` 在仓库根下建临时目录，
 >   与 Node 侧扫描仓库根的用例会互相干扰（并发跑会出现与本次改动无关的 `test_install` 失败）。
+
+### 9. 面板退役（用户决策 2026-09-16）
+
+> **2026-09-16 面板退役（用户决策）：`2c63cdf`** —— legacy 面板（client.js）、Host Connection RPC
+> 面（rpc/endpoints/audit/series/analytics/corebridge/commandbus/pycore/cache）与 Node 侧业务确认
+> 三方法（store.js `requestConfirmation`/`confirmationView`/`decideConfirmation` 及
+> `CONFIRM_TTL_MS`/`CONFIRM_OPERATIONS`）随独立服务承接全部工作台能力而整体移除；
+> `plugins/workbench` 只保留 `tradingWorkbench` 服务锚（engine 8 工具 + policy 三层 +
+> 观察记录链路，harness 测试改直调服务锚断言）。`store_access.endpoints()` 改为服务自有
+> 常量清单（22 基础 + 7 WP7 = 29，同序零行为变化），`tests/test_wp6_tables_lock.py` 改纯
+> Python 断言整表钉死。§5.4 与 §八-7 的「过渡期保留/双实现并存」条目已在规格中标注退役。
