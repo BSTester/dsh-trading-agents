@@ -53,7 +53,7 @@ from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
 from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_tools,
-                    settings_api, store_access, trading)
+                    oauth_flow, settings_api, store_access, trading)
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -146,6 +146,11 @@ PUSH_SUBSCRIBE_FIELDS = ("quote", "order_book", "ticker", "kline")
 # 有意不在 MCP 工具面（mcp_tools.MCP_EXCLUDED_ENDPOINTS）。实时直通：不进 caches.cached。
 OPENAPI_CONFIG_FIELDS = settings_api.CONFIG_FIELDS
 OPENAPI_TEST_FIELDS = ()
+# WP8：OAuth 2.1+PKCE 授权流程管理面（生命周期在 server/oauth_flow.py）。
+# action 三值（start/status/cancel）；start 可带 client_id（缺省自动注册或复用
+# 凭据文件已存的）。与 openapi_config 同类：进 token 认证与 snapshot 声明，
+# 有意不进 MCP 工具面（mcp_tools.MCP_EXCLUDED_ENDPOINTS）——凭据管理是人工动作。
+OPENAPI_OAUTH_FIELDS = ("action", "client_id")
 # WP8 任务 3：OpenAPI 交易只读端点的载荷白名单（逐端点定义；与 mcp_tools 的工具字段
 # 逐键同形，锁定测试比对）。这些端点是**读类**：只受模式约束（mode 缺省读模式文件），
 # 业务参数（code/market/exchange/page_flag/...）整体下传 trading.TradeGate._read；
@@ -431,6 +436,13 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 # 失败信封（trading/openapi-unavailable）由 settings_api 给出，原样透传。
                 _check_fields(endpoint, payload, OPENAPI_TEST_FIELDS)
                 return settings_api.test_connectivity(home)
+            if endpoint == "openapi_oauth":
+                # WP8：OAuth 2.1+PKCE 授权流程管理（start/status/cancel）。生命周期
+                # （注册 client/PKCE/回调 listener/换 token/落盘）在 oauth_flow，本层
+                # 只路由；业务失败（非法 action/注册被拒/端口占用）由 handle_action
+                # 抛 WorkbenchError → 下方统一落 invalid-operation 信封。
+                _check_fields(endpoint, payload, OPENAPI_OAUTH_FIELDS)
+                return {"ok": True, "value": oauth_flow.handle_action(home, payload)}
             if endpoint in futu_data.FUTU_TOOLS:
                 # WP8 富途实时直通：skills 需要而本地无缓存的数据由服务端实时经富途获取。
                 # 浅白名单在这里拒（与其他端点同形），深校验（code 归一/必填/内键/上游
@@ -525,6 +537,8 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         finally:
             await _app.state.push.stop()
             _app.state.scheduler.stop()
+            # WP8：OAuth 授权流程的在途回调 listener 一并收尾（无流程时零副作用）
+            oauth_flow.shutdown_all()
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.home = home

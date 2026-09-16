@@ -11,7 +11,8 @@
   * R4 —— 服务层 ``plan_execute``：live 无口令拒、带口令 → queued+nonce、指令文件含
     plan_hash/expected_mode 且无口令字段、action 四映射、白名单外 action 拒；
   * R5 —— 工具面封闭：tools/list 恰 59（WP8 任务 6 起）、名单 ≡ mcp_tools 清单、端点工具集 ≡
-    store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS（37 − 1 = 36，唯一排除 confirm-decide）、
+    store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS（58 − 4 = 54，排除 confirm-decide
+    与设置页三端点 openapi_config/openapi_test/openapi_oauth）、
     输入字段与规格 §3.2（含 20b confirmation）/§3.4 逐项一致、无黑名单名、未知名不触达 handle；
     增补 5 个维护工具在真 run 的临时 store 上的全量行为（status/runs/cancel_run/cancel_stale/
     prune_runs）与 ``hours`` 阈值语义（锚 ``scripts/workbench_admin.mjs`` 的 ``hoursArg``）；
@@ -595,7 +596,8 @@ class R5ToolSurfaceTests(Base):
         self.assertNotIn("confirm-decide", set(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()))
         # WP8 任务 7：设置页两端点（凭据读/写）与 confirm-decide 同类——有意排除集
         self.assertEqual(mcp_tools.MCP_EXCLUDED_ENDPOINTS,
-                         frozenset({"confirm-decide", "openapi_config", "openapi_test"}))
+                         frozenset({"confirm-decide", "openapi_config", "openapi_test",
+                                    "openapi_oauth"}))
         # 只读的 confirmation 工具**在**工具面里（读待确认不是批准）
         self.assertIn("confirmation", names)
         with self.assertRaises(Exception) as caught:
@@ -604,9 +606,9 @@ class R5ToolSurfaceTests(Base):
 
     def test_endpoint_tool_set_equals_store_endpoints_minus_excluded(self):
         """端点工具集 ≡ 端点清单（22 legacy + WP7 7 + WP8 直通 8 + WP8 行情 9
-        + WP8 交易 6 + WP8 推送 3 + WP8 设置 2）− 有意排除集（§3.2 对等性）。"""
+        + WP8 交易 6 + WP8 推送 3 + WP8 设置 3）− 有意排除集（§3.2 对等性）。"""
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 57)
+        self.assertEqual(len(endpoints), 58)
         forwarded = [definition.endpoint for definition in mcp_tools.TOOLS
                      if definition.endpoint]
         self.assertEqual(len(forwarded), 54)

@@ -21,7 +21,8 @@ const TTL_MS = {
   deals_today: 0, deals_history: 0, push_status: 0,
   // WP8 任务 7 设置页：凭据读/写与连通性测试一律实时直通（服务端不走 cached()，
   // 这里 TTL 0 不写缓存；openapi_test_post 是同名防御别名，与 POST 语义对齐）。
-  openapi_config: 0, openapi_test: 0, openapi_test_post: 0,
+  // WP8 OAuth：授权流程 start/status/cancel 同为实时直通（status 由设置页 2s 轮询）。
+  openapi_config: 0, openapi_test: 0, openapi_test_post: 0, openapi_oauth: 0,
 };
 const memory = new Map();
 // snapshot 响应声明的端点集合；null = 尚未取到声明（不拦，交给 404 兜底）。

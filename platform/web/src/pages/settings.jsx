@@ -1,4 +1,4 @@
-// 设置页：富途 OpenAPI 凭据配置（保存 / 连通性测试 / 当前状态）。
+// 设置页：富途 OpenAPI 凭据配置（保存 / 连通性测试 / 当前状态 / OAuth 2.1+PKCE 授权）。
 // 端点（取值路径均可指到源码行）：
 //   openapi_config → platform/server/settings_api.py：POST 空载荷=读状态（与
 //     GET /api/wb/openapi_config 专用路由同一实现，app.py）；POST 带载荷=保存
@@ -7,8 +7,14 @@
 //   openapi_test → settings_api.test_connectivity：用**已保存**凭据经真实调用路径
 //     （OpenApiClient + OpenApiMarket.trading-days）发一次 GET 并计时；失败 =
 //     trading/openapi-unavailable 信封（callApi 抛 Error(message)）。
-// 安全约定（tests/test_wp8_settings.py 全文 grep 钉死）：私钥 PEM 原文只进不出——
-// 服务端任何响应都不含 PEM 与完整 app_key，只有「已配置 + 公钥指纹（SHA256 前 16 hex）」；
+//   openapi_oauth → platform/server/oauth_flow.py：OAuth 2.1+PKCE 授权流程的
+//     start（注册 client 如需 → 服务端起 127.0.0.1 回调监听 → 返回授权 URL）/
+//     status（本页 2s 轮询 {pending,done,error,tokens_saved}）/ cancel（停监听清状态）。
+//     授权完成后凭据由服务端落盘（mode=oauth，0600），本页**不**经 openapi_config
+//     保存 OAuth 凭据（服务端也拒绝）——与 AppKey 模式并存，存哪种写哪种 mode。
+// 安全约定（tests/test_wp8_settings.py 与 tests/test_wp8_oauth.py 全文 grep 钉死）：
+// 私钥 PEM 原文只进不出——服务端任何响应都不含 PEM 与完整 app_key，只有「已配置 +
+// 公钥指纹（SHA256 前 16 hex）」；code_verifier 只存服务端内存，不落盘不进日志；
 // 本页也绝不把粘贴框内容写进 localStorage，刷新即丢、以服务端落盘为准。
 import React from "react";
 import {
@@ -71,8 +77,84 @@ function StatusCard({ status }) {
   );
 }
 
-export default function SettingsPage() {
+/** OAuth 2.1+PKCE 授权面板：Client ID（可空=自动注册）→ 开始授权 → 轮询 → 落盘。 */
+function OAuthPanel({ form, mode, status }) {
   const { message } = App.useApp();
+  // phase ∈ idle | starting | waiting | done | error（error 携带服务端文案）
+  const [oauth, setOauth] = React.useState({ phase: "idle" });
+  const waiting = oauth.phase === "waiting";
+
+  // 等待授权期间 2s 轮询 status 端点；done/error 即停（切走 OAuth 模式也停）。
+  React.useEffect(() => {
+    if (!waiting || mode !== "oauth") return undefined;
+    const timer = setInterval(async () => {
+      try {
+        const flow = await callApi("openapi_oauth", { action: "status" });
+        if (flow.done && flow.tokens_saved) {
+          setOauth({ phase: "done" });
+          message.success("OAuth 授权完成，凭据已保存");
+          status.refresh();
+        } else if (flow.error) {
+          setOauth({ phase: "error", error: flow.error });
+        }
+      } catch { /* 单次轮询失败忽略：下个周期重试 */ }
+    }, 2000);
+    return () => clearInterval(timer);
+  }, [waiting, mode]);
+
+  const startOAuth = async () => {
+    const clientId = String(form.getFieldValue("oauth_client_id") ?? "").trim();
+    setOauth({ phase: "starting" });
+    try {
+      const flow = await callApi("openapi_oauth",
+        clientId ? { action: "start", client_id: clientId } : { action: "start" });
+      setOauth({ phase: "waiting", authUrl: flow.auth_url });
+      status.refresh();
+    } catch (error) {
+      setOauth({ phase: "error", error: String(error.message || error) });
+    }
+  };
+
+  const cancelOAuth = async () => {
+    try {
+      await callApi("openapi_oauth", { action: "cancel" });
+    } catch { /* 取消失败不打断 UI：服务端 600s 超时兜底 */ }
+    setOauth({ phase: "idle" });
+  };
+
+  return (
+    <>
+      <Form.Item name="oauth_client_id" label="Client ID（富途 OpenAPI OAuth 客户端）"
+        extra="留空则自动注册 public client（PKCE required）；已注册过可填既有 client_id 复用，注册结果由服务端写入凭据文件。">
+        <Input placeholder="留空自动注册，或粘贴已注册的 client_id" autoComplete="off" allowClear />
+      </Form.Item>
+      <Space wrap>
+        <Button type="primary" loading={oauth.phase === "starting"}
+          disabled={waiting} onClick={startOAuth}>开始授权</Button>
+        {waiting && <Button onClick={cancelOAuth}>取消</Button>}
+      </Space>
+      <Typography.Text type="secondary" style={{ display: "block", fontSize: 12, marginTop: 8 }}>
+        流程：注册 client（如需）→ 服务端在本机启动回调监听（仅 127.0.0.1:60355）→
+        你在浏览器完成富途账号授权 → 服务端校验 state 后自动换取 token 并落盘
+        ~/.dsh/futu-openapi.json（0600，本页不再回显）。授权链接 10 分钟内有效，超时可重新发起。
+      </Typography.Text>
+      {waiting && oauth.authUrl && (
+        <Alert type="info" showIcon style={{ marginTop: 8 }} message="等待授权中…（完成或被拒后本页自动更新）"
+          description={<a href={oauth.authUrl} target="_blank" rel="noreferrer">点击打开富途授权页（若浏览器未自动打开）</a>} />
+      )}
+      {oauth.phase === "done" && (
+        <Alert type="success" showIcon style={{ marginTop: 8 }}
+          message="✓ OAuth 授权完成，凭据已保存（mode=oauth）" />
+      )}
+      {oauth.phase === "error" && (
+        <Alert type="error" showIcon style={{ marginTop: 8 }} message="授权未完成"
+          description={oauth.error} />
+      )}
+    </>
+  );
+}
+
+export default function SettingsPage() {
   const status = useEndpoint("openapi_config", {}, []);
   const [form] = Form.useForm();
   const [keyTab, setKeyTab] = React.useState("pem");
@@ -136,50 +218,51 @@ export default function SettingsPage() {
             <Radio.Group value={mode} onChange={(event) => setMode(event.target.value)}
               options={[
                 { label: "AppKey 签名", value: "appkey" },
-                { label: "OAuth 2.1（经 scripts/futu_auth.py --openapi 授权，本页不改）", value: "oauth", disabled: true },
+                { label: "OAuth 2.1 + PKCE（推荐，本页发起授权）", value: "oauth" },
               ]} />
-            {mode === "oauth" && (
-              <Typography.Text type="secondary" style={{ display: "block", fontSize: 12 }}>
-                OAuth 凭据由授权脚本写入；本页仅保存 AppKey 凭据。
+          </Form.Item>
+          {mode === "oauth" ? (
+            <OAuthPanel form={form} mode={mode} status={status} />
+          ) : (
+            <>
+              <Form.Item name="app_key" label="AppKey ID" rules={[
+                { required: true, message: "AppKey ID 必填（富途开放平台控制台创建）" }]}>
+                <Input placeholder="如 0be2eb1122334455" autoComplete="off" allowClear />
+              </Form.Item>
+              <Form.Item name="algorithm" label="签名算法" rules={[
+                { required: true, message: "请选择签名算法" }]}>
+                <Select options={ALGORITHMS.map((value) => ({ value, label: value }))} />
+              </Form.Item>
+              <Form.Item label="私钥（与控制台创建 AppKey 时登记的公钥成对；二选一）">
+                <Tabs activeKey={keyTab} onChange={setKeyTab} items={[
+                  {
+                    key: "pem", label: "粘贴 PEM", forceRender: true,
+                    children: (
+                      <Form.Item name="private_key_pem" noStyle>
+                        <TextArea rows={7} spellCheck={false}
+                          placeholder={"-----BEGIN PRIVATE KEY-----\n…（PEM 原文，保存后服务端落盘 0600，本页不再回显）\n-----END PRIVATE KEY-----"}
+                          aria-label="私钥 PEM 原文" />
+                      </Form.Item>
+                    ),
+                  },
+                  {
+                    key: "path", label: "文件路径", forceRender: true,
+                    children: (
+                      <Form.Item name="private_key_path" noStyle>
+                        <Input placeholder="已放好的私钥文件路径，如 ~/.dsh/futu-openapi-key.pem"
+                          autoComplete="off" aria-label="私钥文件路径" />
+                      </Form.Item>
+                    ),
+                  },
+                ]} />
+              </Form.Item>
+              <Button type="primary" loading={busy} onClick={saveAndTest}>保存并测试</Button>
+              <Typography.Text type="secondary" style={{ display: "block", fontSize: 12, marginTop: 8 }}>
+                保存流程：校验（AppKey/PEM/算法匹配）→ 私钥写 ~/.dsh/futu-openapi-key.pem（0600）→
+                写 ~/.dsh/futu-openapi.json → 更新通道 → 立即用已保存凭据发一次真实 trading-days 请求。
               </Typography.Text>
-            )}
-          </Form.Item>
-          <Form.Item name="app_key" label="AppKey ID" rules={[
-            { required: true, message: "AppKey ID 必填（富途开放平台控制台创建）" }]}>
-            <Input placeholder="如 0be2eb1122334455" autoComplete="off" allowClear />
-          </Form.Item>
-          <Form.Item name="algorithm" label="签名算法" rules={[
-            { required: true, message: "请选择签名算法" }]}>
-            <Select options={ALGORITHMS.map((value) => ({ value, label: value }))} />
-          </Form.Item>
-          <Form.Item label="私钥（与控制台创建 AppKey 时登记的公钥成对；二选一）">
-            <Tabs activeKey={keyTab} onChange={setKeyTab} items={[
-              {
-                key: "pem", label: "粘贴 PEM", forceRender: true,
-                children: (
-                  <Form.Item name="private_key_pem" noStyle>
-                    <TextArea rows={7} spellCheck={false}
-                      placeholder={"-----BEGIN PRIVATE KEY-----\n…（PEM 原文，保存后服务端落盘 0600，本页不再回显）\n-----END PRIVATE KEY-----"}
-                      aria-label="私钥 PEM 原文" />
-                  </Form.Item>
-                ),
-              },
-              {
-                key: "path", label: "文件路径", forceRender: true,
-                children: (
-                  <Form.Item name="private_key_path" noStyle>
-                    <Input placeholder="已放好的私钥文件路径，如 ~/.dsh/futu-openapi-key.pem"
-                      autoComplete="off" aria-label="私钥文件路径" />
-                  </Form.Item>
-                ),
-              },
-            ]} />
-          </Form.Item>
-          <Button type="primary" loading={busy} onClick={saveAndTest}>保存并测试</Button>
-          <Typography.Text type="secondary" style={{ display: "block", fontSize: 12, marginTop: 8 }}>
-            保存流程：校验（AppKey/PEM/算法匹配）→ 私钥写 ~/.dsh/futu-openapi-key.pem（0600）→
-            写 ~/.dsh/futu-openapi.json → 更新通道 → 立即用已保存凭据发一次真实 trading-days 请求。
-          </Typography.Text>
+            </>
+          )}
         </Form>
       </Card>
       {testResult && (

@@ -367,23 +367,25 @@ WP8_TRADE_ENDPOINTS = ("trade_max_qty", "orders_open", "orders_history",
 # 全部实时直通：不进 CACHE_TTL_MS / ENDPOINT_SHAPE。名单与 mcp_tools 的 3 个工具逐项锁定。
 WP8_PUSH_ENDPOINTS = ("push_status", "push_subscribe", "push_unsubscribe")
 
-# WP8 任务 7：设置页端点（2 个；读写在 server/settings_api.py——openapi_config
+# WP8 任务 7：设置页端点（读写在 server/settings_api.py——openapi_config
 # 空载荷=读状态、带载荷=保存（写私钥 0600 + 写凭据 JSON + 联动 futu_channel），
 # openapi_test 用已保存凭据发一次真实 trading-days GET；GET 读走 app.py 专用路由，
-# POST 走 handle 白名单分支）。**有意排除在 MCP 工具面之外**（mcp_tools.MCP_EXCLUDED_
-# ENDPOINTS）：凭据写入是人工 Web 动作，绝不做成模型工具（与 confirm-decide 同类）。
+# POST 走 handle 白名单分支）。WP8 增补 openapi_oauth：OAuth 2.1+PKCE 授权流程
+# 管理面（start/status/cancel，生命周期在 server/oauth_flow.py，与 AppKey 模式并列）。
+# **有意排除在 MCP 工具面之外**（mcp_tools.MCP_EXCLUDED_ENDPOINTS）：凭据管理与
+# 授权是人工 Web 动作，绝不做成模型工具（与 confirm-decide 同类）。
 # 实时直通：不进 CACHE_TTL_MS/ENDPOINT_SHAPE。
-WP8_SETTINGS_ENDPOINTS = ("openapi_config", "openapi_test")
+WP8_SETTINGS_ENDPOINTS = ("openapi_config", "openapi_test", "openapi_oauth")
 
 
 def endpoints():
-    """服务端点清单（57 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
+    """服务端点清单（58 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
     + 9 项 WP8 OpenAPI 行情 + 6 项 WP8 OpenAPI 交易只读 + 3 项 WP8 推送订阅管理
-    + 2 项 WP8 设置页。
+    + 3 项 WP8 设置页（openapi_config/openapi_test/openapi_oauth）。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
     基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8 增量按交付
-    顺序登记在各自常量里；锁定测试把 57 项整体钉死。
+    顺序登记在各自常量里；锁定测试把 58 项整体钉死。
     """
     return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS) \
         + list(WP8_MARKET_ENDPOINTS) + list(WP8_TRADE_ENDPOINTS) \
