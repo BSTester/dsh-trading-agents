@@ -314,6 +314,99 @@ def _execute_plan(conn, home, cmd, broker_call=None, equity=None, today=None,
     return {"ok": True, "plan_id": row["plan_id"], **result}
 
 
+def auto_execute(conn, home, market, today=None, now=None):
+    """auto_execute 作业体（规格 §4.3）：八守卫 → 写 execute_plan 指令。
+
+    **与人工点击落完全相同的指令文件**（commands.write_command 同一实现），由指令轮询
+    消费后走 handle_command → execute.run 的既有窄门（逐单风控 8 规则）；本函数不做任何
+    旁路，也不直接触达券商。
+
+    返回契约（**永不抛**——作业失败不拖垮调度链）::
+
+      {"ok": True,  "skipped": <原因>}                 守卫未过/当日已执行（软跳过，退出 0）
+      {"ok": False, "error": <原因>}                   配置/模式非法（fail-closed，退出 1）
+      {"ok": True,  "nonce":…, "as_of":…, "plan":…}    指令已落盘
+
+    守卫分级：总开关关闭=静默（默认态不是故障）；其余跳过=info（当日不执行是正常结论）；
+    配置/模式非法=warn + ok=False（无人值守时必须让运维看得见）。
+    """
+    from . import commands, planner
+
+    home = str(home)
+    market = str(market).upper()
+    now = now or _real_now
+    today = today or now()[:10]
+
+    def skip(reason, level="info", title=None):
+        alerts.emit(conn, home=home, level=level, title=(title or reason)[:40],
+                    detail=reason[:160])
+        return {"ok": True, "skipped": reason}
+
+    # 守卫 1：总开关（关闭=默认态，静默；非法=fail-closed）
+    try:
+        cfg = auto_pipeline_config(home)
+    except ValueError as error:
+        reason = f"auto_pipeline 配置非法：{error}"
+        alerts.emit(conn, home=home, level="warn", title="auto_pipeline 配置非法",
+                    detail=reason[:160])
+        return {"ok": False, "error": reason}
+    if not cfg["enabled"]:
+        return {"ok": True, "skipped": "auto_pipeline 未启用"}
+
+    # 守卫 2：只有 sim 自动执行；live 永远等人工（自动生成 ≠ 自动执行）
+    try:
+        mode = planner.read_mode(home)
+    except ValueError as error:
+        reason = f"账户模式非法：{error}"
+        alerts.emit(conn, home=home, level="warn", title="账户模式非法", detail=reason[:160])
+        return {"ok": False, "error": reason}
+    if mode != "sim":
+        return skip(f"{mode} 模式：计划等待人工执行（自动生成≠自动执行）",
+                    "info", "计划等待人工执行")
+
+    # 守卫 3：kill switch
+    if kill_path(home).exists():
+        return skip("kill switch 生效：拒绝自动执行", "info", "kill switch 生效")
+
+    # 守卫 4：日内熔断
+    if store.is_halted(conn):
+        return skip("熔断生效：先查明原因并 clear_halt 后再执行", "info", "熔断生效")
+
+    # 守卫 5+6：计划存在（auto+frozen，最近窗口内）且计划自身 mode=sim、market 一致
+    # 窗口 2 的依据见 planner.recent_trading_days（跨市场日期空间容差）
+    try:
+        candidates = planner.recent_trading_days(conn, market, today, window=2)
+    except RuntimeError as error:
+        return skip(f"日历未同步：{error}", "warn", "日历未同步")
+    plan = None
+    for as_of in candidates:
+        plan = store.get_latest_auto_plan(conn, market, as_of)
+        if plan is not None:
+            break
+    if plan is None:
+        return skip(f"无 auto 冻结计划（{market} 最近交易日 {'/'.join(candidates)}）",
+                    "info", "无待执行计划")
+    if str(plan.get("mode") or "").lower() != "sim":
+        # 加固：live 期生成的计划不会被自动执行（防跨模式挂单）
+        return skip(f"计划 {plan['plan_id']} 为 {plan.get('mode')} 模式：等待人工执行",
+                    "info", "计划等待人工执行")
+    if plan.get("market") != market:
+        return skip(f"计划市场不符：{plan.get('market')} ≠ {market}", "warn", "计划市场不符")
+
+    # 守卫 7：当日幂等（kv 标记；指令文件另有 nonce 幂等兜底）
+    mark_key = f"auto_exec:{market}:{today}"
+    if store.kv_get(conn, mark_key):
+        return skip(f"当日已执行：{market} {today}", "info", "当日已执行")
+
+    # 守卫 8：写指令（携带 expected_mode；指令处理侧既有复核兜底）
+    nonce = commands.write_command(home, "execute_plan",
+                                  {"plan_hash": plan["content_hash"],
+                                   "expected_mode": "sim"})
+    store.kv_set(conn, mark_key, {"plan_id": plan["plan_id"], "nonce": nonce,
+                                  "as_of": plan["as_of"], "at": now()})
+    return {"ok": True, "nonce": nonce, "as_of": plan["as_of"], "plan": plan}
+
+
 def _cancel_plan(conn, cmd):
     """撤余单：只本地撤销 draft/frozen（未提交）；在途订单不动，留给对账兜底。"""
     plan_hash = cmd.get("plan_hash")

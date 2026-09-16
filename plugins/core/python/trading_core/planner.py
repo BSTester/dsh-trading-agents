@@ -105,6 +105,21 @@ def symbols_for_market(home, market):
     return out
 
 
+def recent_trading_days(conn, market, today, window=1):
+    """最近 window 个交易日（≤ today，降序，最近在前）。
+
+    日历按**市场本地日期**落库（quote_trading_days 口径），作业按北京时间触发：
+    同一个「最近已收盘交易日」在两种日期空间解释下可能相差一天，容差由 window 决定——
+    plan_auto（数据就绪门）取 1，auto_execute（自动执行守卫）取 2。
+    日历未同步 → RuntimeError（调用方按「宁可不执行」处理）。
+    """
+    start = (date.fromisoformat(today) - timedelta(days=READINESS_LOOKBACK_DAYS)).isoformat()
+    days = store.trading_days(conn, market, start, today)
+    if not days:
+        raise RuntimeError(f"日历无交易日：{market} {start}..{today}")
+    return list(reversed(days[-window:]))
+
+
 def plan_auto(conn, home, market, today=None, broker_call=None):
     """build_plan 作业体（规格 §4.2）：数据就绪 → 策略权重 → 冻结 auto 计划。
 
@@ -162,9 +177,12 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     if not is_trading_day:
         return skip(f"{today} 非 {market} 交易日")  # 休市不是故障：不告警
 
-    start = (date.fromisoformat(today) - timedelta(days=READINESS_LOOKBACK_DAYS)).isoformat()
-    days = store.trading_days(conn, market, start, today)
-    expected = days[-1]
+    # 数据就绪门期望的「最近已收盘交易日」：与 auto_execute 共用同一 helper
+    # （窗口 1 = 交易日维度最近一天，不含日期空间容差）
+    try:
+        expected = recent_trading_days(conn, market, today, window=1)[0]
+    except RuntimeError as error:
+        return skip(f"日历未同步：{error}", "warn", "日历未同步")
 
     symbols = symbols_for_market(home, market)
     if not symbols:
