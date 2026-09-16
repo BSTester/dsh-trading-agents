@@ -298,8 +298,11 @@ MCP 工具面按研究价值分档，避免工具数无节制膨胀：
 
 - **F10 与做空数据落 PIT 表**（新表，只存原始事实 + 抓取时间 + 来源）：
   `f10_snapshots(symbol, section, period_end, announced_at, payload, fetched_at)`、
-  `short_snapshots(symbol, date, payload, fetched_at)`——**PIT 钥匙是
-  `announced_at`**（沿用 WP1 财报公告日双源合并口径；与 `fundamentals` 表同纪律）；
+  `short_snapshots(symbol, date, payload, fetched_at)`——**PIT 钥匙按 section 语义取值，
+  不得统一硬套**：财报/公告类用 `announced_at`（沿用 WP1 财报公告日双源合并口径，与
+  `fundamentals` 表同纪律）；持仓/评级/共识等快照类用数据自身日期字段（如
+  `period_end`/数据日期），该字段缺失时以 `fetched_at` 为观测时点并**显式标注
+  「观测时点非数据时点」**——研究查询只允许 `as_of` 之前已入库的观测，防前视；
 - 每日作业 `research_snapshot`（与 sentiment_snapshot 同链）：对关注池标的抓取
   F10 关键 section（分析师共识、评级汇总、机构持仓、内部交易、持股变动）与做空数据
   落库，攒 PIT 历史；**先攒数、后因子化**，与 §6.3 同一套 250 交易日演进条款；
