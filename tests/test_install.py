@@ -27,6 +27,9 @@ PRESET = """# keep comments and unrelated disabled rows
 - id: futu-keepalive
   name: '@bstester/dsh-futu-keepalive'
   disabled: true
+- id: platform-autostart
+  name: '@bstester/dsh-platform-autostart'
+  disabled: true
 """
 
 
@@ -37,6 +40,7 @@ PACKAGE_PYTHON = {
     "engine": ["python/engine.py"],
     "workbench": ["python/bars.py"],
     "futu-keepalive": ["src/index.js"],
+    "platform-autostart": ["src/index.js"],
 }
 
 
@@ -77,7 +81,7 @@ class InstallerTests(unittest.TestCase):
         self.repo.mkdir()
         self.home = self.root / "custom dsh home"
         (self.repo / "agent.cordis.yml").write_text(PRESET)
-        for directory in ("workbench", "fin-data", "engine", "futu-keepalive"):
+        for directory in ("workbench", "fin-data", "engine", "futu-keepalive", "platform-autostart"):
             package = self.repo / "plugins" / directory
             package.mkdir(parents=True)
             manifest = {"name": directory, "version": "0.2.0"}
@@ -172,6 +176,34 @@ class InstallerTests(unittest.TestCase):
                 patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
             self.installer.install_plugins(self.repo, self.home)
         self.assertEqual(len(self.added), len(self.installer.PLUGINS))
+
+    def test_platform_autostart_wiring_matches_futu_keepalive_shape(self):
+        """platform-autostart 必须与 futu-keepalive 同构：打进 PLUGINS、注册包名、挂 preset 行。
+
+        只加 PRESET_PACKAGES 不加 PLUGINS 会让 preset 行指向一个永远装不上的包，
+        自动拉起成为死功能——这是本测试存在的原因。
+        """
+        for table in (self.installer.PLUGINS, self.installer.PACKAGE_NAMES,
+                      self.installer.PRESET_PACKAGES):
+            self.assertIn("platform-autostart", table)
+        self.assertEqual(self.installer.PACKAGE_NAMES["platform-autostart"],
+                         self.installer.PRESET_PACKAGES["platform-autostart"])
+
+    def test_install_writes_and_overwrites_repo_marker(self):
+        """install 成功后写仓库标记文件（内容=--repo 值，覆盖写）：
+        platform-autostart 插件据此定位仓库，更新/重装必须刷新它。"""
+        marker = self.home / "trading-platform-repo"
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        self.assertTrue(marker.is_file())
+        self.assertEqual(marker.read_text(encoding="utf-8").strip(), str(self.repo.resolve()))
+        marker.write_text("/stale/checkout\n", encoding="utf-8")
+        with patch.object(self.installer.shutil, "which", side_effect=lambda name: name), \
+                patch.object(self.installer.subprocess, "run", side_effect=self.fake_commands()):
+            self.installer.install_plugins(self.repo, self.home)
+        self.assertEqual(marker.read_text(encoding="utf-8").strip(), str(self.repo.resolve()),
+                         "重装必须覆盖陈旧标记")
 
     def test_reinstall_refreshes_unified_tree(self):
         """重装即刷新，因此统一目录不可能与仓库版本漂移。"""

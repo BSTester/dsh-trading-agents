@@ -1,0 +1,11 @@
+{
+  "name": "@bstester/dsh-platform-autostart",
+  "version": "0.1.0",
+  "description": "会话启动时检测并自动拉起量化平台服务",
+  "type": "module",
+  "main": "src/index.js",
+  "files": [
+    "src"
+  ],
+  "license": "MIT"
+}

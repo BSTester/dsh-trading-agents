@@ -66,7 +66,10 @@
 6b. 技能可用提示：preset 的 customSkillDirs 直读仓库 skills/ 目录，此时
     futu-skills 的 7 个技能已可用（新建会话生效）；每个技能用哪些工具、缺口能力
     如何降级，工具清单见 skills/futu-skills/README.md。
-7. 后台启动服务（若第 4 步已报 already-running 则跳过本步）：
+7. （备用）手动启动服务（若第 4 步已报 already-running 则跳过本步）：
+   会话自动拉起已默认启用（preset 行 platform-autostart）：之后新建的会话会自动
+   /healthz 检测并以分离进程拉起服务，通常无需手动；本步仅用于在当前安装会话里
+   立即验证（供第 8 步 curl）：
    cd "$REPO_ROOT/platform" && "$HOME/.dsh/trading-venv/bin/python" -m server.run
    放在 Harness 的后台终端/pty 里保持进程存活。启动成功会打印单行 JSON
    （形如 {"ok":true,"service":"quant-platform","url":...,"tools":...}）。
@@ -131,9 +134,15 @@
 | 5 数据层链接 | `python3 scripts/install_plugins.py link --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | 把 `trading_core`/`trading_datasource` 写入 venv（.pth） | 每次合并 WP 分支后重新 link 一次 |
 | 6 启用行 | 编辑 `agent.cordis.yml` | `quant-platform-mcp` 行 `disabled: false`；`fin-data`/`trading-engine` 确认 `disabled: false` | 只改 quant-platform-mcp 行的 disabled，`toolCallTimeoutMs: 180000` 保持不动（确认 TTL 120s + 作答余量）；`futu-keepalive` 不动 |
 | 6b 技能可用 | 无命令（提示项） | futu-skills 的 7 个技能已可用（新建会话生效）；工具清单见 `skills/futu-skills/README.md` | 技能由 customSkillDirs 直读仓库目录，随 3b 的仓库副本更新 |
-| 7 启动服务 | `cd platform && "$HOME/.dsh/trading-venv/bin/python" -m server.run`（后台） | 单行 JSON：`{"ok":true,"service":"quant-platform","url":…,"tools":…}` | 已在跑则跳过（第 4 步会报 `already-running`） |
+| 7 （备用）手动启动 | `cd platform && "$HOME/.dsh/trading-venv/bin/python" -m server.run`（后台） | 单行 JSON：`{"ok":true,"service":"quant-platform","url":…,"tools":…}` | 已在跑则跳过（第 4 步会报 `already-running`）；新建会话由 platform-autostart 自动拉起，通常无需手动 |
 | 8 验证 | `curl -fsS http://127.0.0.1:8397/healthz` | `{"ok":true,"mode":"sim","scheduler":{…}}` | 只读探测 |
 | 9 新会话验证 | 用户新建 Harness 会话 | 工具面出现 `mcp__quantwb__*`（如 `trading_status`） | 行加载发生在会话创建时 |
+
+**会话自动拉起**：preset 行 `platform-autostart` 已默认启用——会话启动自动 `/healthz`
+检测，未启动则以分离进程拉起（日志 `~/.dsh/trading-platform-service.log`）；未安装时仅
+日志提示，按本手册安装。安装器（`install_plugins.py` install/update 与
+`install_platform.py` 的 service 步）会写仓库标记文件 `~/.dsh/trading-platform-repo`
+供插件定位仓库；行为、日志与并发会话竞态说明见 `docs/RUNBOOK.md`「会话自动拉起」节。
 
 平台安装器的分层跳过（按需组合）：
 

@@ -57,6 +57,28 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 - 启动成功打印**单行 JSON**：`{"ok": true, "service": "quant-platform", "url": ...,
   "mcp": ".../mcp", "tools": 33, "auth": "loopback-only"}`。
 
+### 会话自动拉起（platform-autostart 插件）
+
+preset 行 `platform-autostart` 已默认启用：**会话启动时自动 `GET /healthz` 检测**本服务。
+已在跑则什么都不做；未启动且仓库/venv 就绪时，以**分离进程**（detached + unref，随会话
+结束仍存活）执行 `cd <repo>/platform && <venv-python> -m server.run`；venv/仓库未安装时
+不强行启动，仅打一行日志给安装指引（按 install/HARNESS_SETUP.md 安装）。
+
+- **日志**：`~/.dsh/trading-platform-service.log` —— 被拉起服务的 stdout/stderr 与插件的
+  运行记录（`{"event":"platform-autostart","action":"ok|started|not-installed|spawn-failed",...}`）
+  都在这里；排障先看本文件，再看 Harness 控制台的同款 JSON 行。
+- **仓库定位**：环境变量 `DSH_TRADING_REPO` > 标记文件 `~/.dsh/trading-platform-repo`
+  （`install_plugins.py` 的 install/update 与 `install_platform.py` 的 service 步写入，
+  内容为仓库根路径）> 未找到 → `not-installed` 提示。
+- **并发会话竞态是安全的**：每个会话启动都以 `/healthz` 为闸门——后启动者探测到服务
+  已在跑即收手（`action:"ok"`）；极端情况下多个会话同时探测失败、各自 spawn，也只有
+  一个进程能绑定端口，其余按 `run.py` 的既定行为打印 `{"ok":false}` 后**绑定失败自退**，
+  不会出现双监听。
+- **端口**：读 `~/.dsh/trading-platform.json` 的 `service.port`（默认 8397，坏 JSON 回落
+  默认）；插件只负责"把进程拉起来"，服务自身的 token 认证、sim/live 闸门、交易确认
+  全部留在服务侧，不受影响。
+- 插件自身失败绝不影响会话：检测/拉起全程捕获，每个会话最多尝试启动一次。
+
 ### 配置
 
 `~/.dsh/trading-platform.json`（文件缺失或字段缺省即取默认；`DSH_HOME` 可换根目录）：

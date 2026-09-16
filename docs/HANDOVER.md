@@ -38,6 +38,7 @@
 | 执行策略 | 账户工具按 sim/live 拒绝不匹配调用；真实写工具经**工作台业务确认**（独立于权限审批，任何档位下都必须确认）；不允许模型走其他通道绕过 |
 | 量化 | 修正风险/成本/成交时序；本地模拟与券商数据分离，失败不能回退为零价格或虚构资产 |
 | 安装 | Bash/PowerShell 共用插件安装流程，包路径、失败退出、幂等启用与更新行为可重复核对 |
+| 会话自动拉起 | preset 行 `platform-autostart`：会话启动自动 GET `/healthz` 检测平台服务，未启动则以分离进程（detached+unref）拉起，日志 `~/.dsh/trading-platform-service.log`；venv/仓库未安装时仅日志提示（指引 `install/HARNESS_SETUP.md`），不强行启动。仓库定位靠安装器写的标记文件 `~/.dsh/trading-platform-repo` |
 
 工作台通过包内 `dsh.bundle.patch` 加载一次根级 Host；安装普通插件包不会自动启用 Host。
 fin-data/engine 只在 preset 中启用。安装器保留内容寻址的 tarball 供 pnpm 后续更新，

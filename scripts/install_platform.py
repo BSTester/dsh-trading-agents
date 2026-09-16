@@ -32,6 +32,8 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_PORT = 8397
+# 仓库标记文件：platform-autostart 插件据此定位仓库；与 install_plugins.py 双保险。
+REPO_MARKER_NAME = "trading-platform-repo"
 
 
 # ── 纯函数（离线可测） ────────────────────────────────────────────────────────
@@ -245,6 +247,9 @@ def main(argv=None, runner=None, probe=None, health=None):
             print(f"配置样例 {home / 'trading-platform.json'}（可选；文件缺失即默认 loopback:8397）：")
             print(f'  {{ "service": {{ "port": {config["port"]}, '
                   f'"host": "{config["host"]}", "token": {token} }} }}')
+            # 仓库标记文件（覆盖写）：会话启动的 platform-autostart 插件据此定位仓库并
+            # 自动拉起 platform/server/run.py；内容解析口径见插件 resolvePaths（首行去空白）。
+            (home / REPO_MARKER_NAME).write_text(str(REPO_ROOT) + "\n", encoding="utf-8")
             if probe(config["port"]):
                 ok_all &= emit(name, True,
                                f"already-running（{config['host']}:{config['port']} 已有服务）")

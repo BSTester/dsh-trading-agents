@@ -788,7 +788,8 @@ class InstallDocTests(unittest.TestCase):
         spec.loader.exec_module(module)
         # 文档用的是展示名，与安装器的目录名不完全一致（engine → trading-engine）
         display = {"workbench": "workbench", "fin-data": "fin-data",
-                   "engine": "trading-engine", "futu-keepalive": "futu-keepalive"}
+                   "engine": "trading-engine", "futu-keepalive": "futu-keepalive",
+                   "platform-autostart": "platform-autostart"}
         self.assertEqual(set(display), set(module.PLUGINS),
                          "新增插件后要同步这里的展示名映射")
         text = self._readme()

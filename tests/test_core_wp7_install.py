@@ -375,6 +375,25 @@ class ExecutionPathTest(unittest.TestCase):
             self.assertTrue(steps["verify"]["ok"])
             self.assertIn("warning", steps["verify"]["detail"])
 
+    def test_service_step_writes_repo_marker_for_autostart(self):
+        """service 步写仓库标记文件（与 install_plugins.py 双保险）：
+        platform-autostart 插件据此定位仓库并拉起 platform/server/run.py。"""
+        with FakeVenv() as fake:
+            home = self._prepared_home(fake)
+            code, out = _run_main(["--home", str(home), "--skip-venv", "--skip-deps",
+                                   "--skip-web"],
+                                  runner=lambda argv: 0, probe=lambda port: False)
+            self.assertEqual(code, 0)
+            marker = home / "trading-platform-repo"
+            self.assertTrue(marker.is_file(), "service 步必须写仓库标记文件")
+            self.assertEqual(marker.read_text(encoding="utf-8").strip(), str(ip.REPO_ROOT))
+        # 既有约定：跳过的步骤零副作用（SkipAllTest 断言 home 为空），service 被跳过时不得补写
+        with FakeVenv() as fake:
+            _run_main(["--home", str(fake.home), "--skip-venv", "--skip-deps",
+                       "--skip-web", "--skip-service"],
+                      runner=lambda argv: 0, probe=lambda port: False)
+            self.assertFalse((fake.home / "trading-platform-repo").exists())
+
 
 class HealthAndPortHelpersTest(unittest.TestCase):
     def test_describe_health_carries_mode_and_tool_surface(self):

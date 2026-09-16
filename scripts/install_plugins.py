@@ -13,7 +13,7 @@ import sys
 import tempfile
 
 
-PLUGINS = ("workbench", "fin-data", "engine", "futu-keepalive")
+PLUGINS = ("workbench", "fin-data", "engine", "futu-keepalive", "platform-autostart")
 # 统一数据层：不是 Harness 插件（没有 cordis 行），只作为 python 库被各插件共用。
 LIBRARIES = ("datasource", "core")
 # 需要出现在"统一 python 目录"里、可被其他插件 import 或调用的包：
@@ -28,6 +28,7 @@ PACKAGE_NAMES = {
     "fin-data": "@bstester/dsh-fin-data",
     "engine": "@bstester/dsh-trading-engine",
     "futu-keepalive": "@bstester/dsh-futu-keepalive",
+    "platform-autostart": "@bstester/dsh-platform-autostart",
     "datasource": "@bstester/dsh-datasource",
     "core": "@bstester/dsh-trading-core",
 }
@@ -58,7 +59,24 @@ PRESET_PACKAGES = {
     "fin-data": "@bstester/dsh-fin-data",
     "trading-engine": "@bstester/dsh-trading-engine",
     "futu-keepalive": "@bstester/dsh-futu-keepalive",
+    # 会话启动自动检测并拉起工作台服务；仓库定位依赖 write_repo_marker 写的标记文件。
+    "platform-autostart": "@bstester/dsh-platform-autostart",
 }
+
+# 仓库标记文件：platform-autostart 插件据此定位 <repo>/platform/server/run.py。
+REPO_MARKER_NAME = "trading-platform-repo"
+
+
+def write_repo_marker(repo, dsh_home):
+    """写仓库标记文件（内容=--repo 值，覆盖写）。
+
+    install/update（本脚本）与 install_platform.py 的 service 步各写一次，双保险；
+    解析口径在 plugins/platform-autostart/src/autostart.js 的 resolvePaths（首行去空白）。
+    """
+    marker = Path(dsh_home) / REPO_MARKER_NAME
+    marker.parent.mkdir(parents=True, exist_ok=True)
+    marker.write_text(str(Path(repo).resolve()) + "\n", encoding="utf-8")
+    return marker
 
 
 def activate_preset(text):
@@ -348,6 +366,7 @@ def install_plugins(repo, dsh_home):
     if write_data_layer_pth(dsh_home) is None:
         print("NOTE: trading venv not found yet; run `install_plugins.py link` after creating it "
               "so plugins can import trading_datasource.")
+    write_repo_marker(repo, dsh_home)
     print("Installed web profile Host and plugins; fin-data/trading-engine enabled. "
           "Restart dsh web (npx @deepseek-ai/dsh web).")
 
@@ -362,6 +381,7 @@ def main():
     try:
         if args.action == "update":
             update_checkout(args.repo)
+            write_repo_marker(args.repo, args.dsh_home)
         elif args.action == "check":
             return check_install(args.repo, args.dsh_home)
         elif args.action == "link":

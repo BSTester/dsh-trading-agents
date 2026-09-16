@@ -48,7 +48,7 @@ git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-pres
 git clone https://github.com/BSTester/dsh-trading-agents "$env:USERPROFILE\.dsh\.agent-presets\dsh-trading-agents"
 ```
 
-**方式 B · 完整安装脚本**（preset + Python 依赖 + 富途授权向导 + 四个插件）
+**方式 B · 完整安装脚本**（preset + Python 依赖 + 富途授权向导 + 五个插件）
 
 ```bash
 # Linux / macOS
@@ -62,10 +62,11 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 
 **方式 C · 让 AI 帮你装**——把下面这段话直接发给你正在使用的 DeepSeek Harness 会话。
 
-> 实测：按下面的步骤走完，会装出 **2 个 skill + 4 个插件 + 统一 Python 层
+> 实测：按下面的步骤走完，会装出 **2 个 skill + 5 个插件 + 统一 Python 层
 > （数据层 datasource + 量化核心 core）+ Python 依赖**，
 > 并以自检「✅ 安装完整」为准。`install.sh` 会自行把 preset 克隆到用户 preset 目录，
-> 因此**不需要你手动克隆**。
+> 因此**不需要你手动克隆**。装完后的对话模式会话会**自动检测并拉起工作台服务**
+> （preset 行 `platform-autostart`；未安装平台时仅日志提示，不影响会话）。
 
 ```text
 请帮我完整安装 dsh-trading-agents。这是"对话模式 + 全部插件"的完整安装，不要只装 skill 基础模式。
@@ -76,8 +77,8 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
      bash /tmp/dsh-trading-agents/install.sh
    Windows 用 powershell -File /tmp/dsh-trading-agents/install.ps1
    它会：把 preset 装到 $HOME/.dsh/.agent-presets/dsh-trading-agents（Windows 为
-   %USERPROFILE%\.dsh\...）、安装 workbench / fin-data / trading-engine / futu-keepalive
-   四个插件、解出统一 Python 层（datasource + core 两个库）并注入交易 venv、
+   %USERPROFILE%\.dsh\...）、安装 workbench / fin-data / trading-engine / futu-keepalive /
+   platform-autostart 五个插件、解出统一 Python 层（datasource + core 两个库）并注入交易 venv、
    创建 venv 并安装 akshare 与 playwright。
    预期最后一行为「重启 dsh web → 新建会话 → 选择「交易智囊模式」…」。
    ⚠️ 过程中会弹出富途授权页（OAuth）等你确认。此刻不想授权就让它跳过，
@@ -86,7 +87,7 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 2) 运行安装自检，必须看到「✅ 安装完整」：
      python "$HOME/.dsh/.agent-presets/dsh-trading-agents/scripts/install_plugins.py" check \
        --repo "$HOME/.dsh/.agent-presets/dsh-trading-agents" --dsh-home "$HOME/.dsh"
-   自检会逐项核对 preset 各行的启用状态、四个插件、统一 Python 层
+   自检会逐项核对 preset 各行的启用状态、五个插件、统一 Python 层
    （datasource/core 两库的标记文件）与 .pth 注入。
    若报出问题，按它给出的修复命令处理后重跑，直到通过为止。
 
