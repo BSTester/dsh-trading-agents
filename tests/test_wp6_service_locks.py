@@ -48,10 +48,12 @@ class Wp6ServiceLocks(unittest.TestCase):
         # 不变式 1（规格 §5.1 A7）：confirm-decide 绝不进 MCP 工具面——常量名与端点名都在源码里
         self.assertIn("MCP_EXCLUDED_ENDPOINTS", manifest)
         self.assertIn('frozenset({"confirm-decide", "openapi_config", "openapi_test",\n'
-                      '                                    "openapi_oauth"})',
+                      '                                    "openapi_oauth", "auto_pipeline"})',
                       manifest)
         # WP8 任务 7：设置页端点与 confirm-decide 同属有意排除集（凭据读写是人工动作）；
         # OAuth 集成增补 openapi_oauth（授权流程 start/status/cancel 同为人工动作）
+        # WP10 任务 2：auto_pipeline（自动流水线是否自动下单的总开关）同理——模型若能拨
+        # 开关就等于能自己启动无人确认的执行链，故与凭据/批准同类，只在 Web 设置页可达
 
 
 if __name__ == "__main__":

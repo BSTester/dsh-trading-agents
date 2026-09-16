@@ -57,15 +57,14 @@ def load_config(home=None):
     return merged
 
 
-def save_futu_channel(home=None, channel=None):
-    """写 trading-platform.json 顶层 ``futu_channel``（WP8 任务 7：设置页联动）。
+def _save_platform_key(home, key, value):
+    """原子写 trading-platform.json 顶层**单键**（其余键原样保留）。
 
-    channel 必须是 ``openapi|mcp``（否则 ``ValueError``，调用方先校验后落盘——绝不写
-    半截配置）；文件缺失则新建（0600：里面有 service.token 时不能宽权限）；已有文件
-    原子更新且**只改这一个键**（service 等既有键原样保留），文件本身的权限保持不变。
+    全仓库写该文件的唯一实现（``save_futu_channel`` 与 ``save_auto_pipeline`` 共用）：
+    先读现有文件 → 合并一个键 → 临时文件 fsync → ``os.replace``；文件缺失则新建
+    （0600：里面有 service.token 时不能宽权限），已有文件权限原样保留。解析失败
+    一律 ``ValueError``（绝不覆盖读不懂的文件——那会静默抹掉用户的其它配置）。
     """
-    if channel not in FUTU_CHANNELS:
-        raise ValueError(f"futu_channel 取值非法：{channel!r}（允许：{' / '.join(FUTU_CHANNELS)}）")
     path = config_path(home)
     data = {}
     if path.exists():
@@ -75,7 +74,7 @@ def save_futu_channel(home=None, channel=None):
             raise ValueError(f"trading-platform.json 解析失败：{error}") from error
         if not isinstance(data, dict):
             raise ValueError("trading-platform.json 顶层必须是 JSON 对象")
-    data = {**data, "futu_channel": channel}
+    data = {**data, key: value}
     payload = json.dumps(data, ensure_ascii=False, indent=2).encode("utf-8") + b"\n"
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix=".trading-platform.",
@@ -96,4 +95,25 @@ def save_futu_channel(home=None, channel=None):
         except OSError:
             pass
         raise
-    return channel
+    return value
+
+
+def save_futu_channel(home=None, channel=None):
+    """写 trading-platform.json 顶层 ``futu_channel``（WP8 任务 7：设置页联动）。
+
+    channel 必须是 ``openapi|mcp``（否则 ``ValueError``，调用方先校验后落盘——绝不写
+    半截配置）；落盘细节见 ``_save_platform_key``。
+    """
+    if channel not in FUTU_CHANNELS:
+        raise ValueError(f"futu_channel 取值非法：{channel!r}（允许：{' / '.join(FUTU_CHANNELS)}）")
+    return _save_platform_key(home, "futu_channel", channel)
+
+
+def save_auto_pipeline(home=None, value=None):
+    """写 trading-platform.json 顶层 ``auto_pipeline``（WP10 任务 2：设置页开关）。
+
+    **本函数只负责落盘，不负责校验**：校验在 ``settings_api.save_auto_pipeline``，
+    复用 ``trading_core.autopipeline.apply_overlay``（与调度侧同一实现）——配置语义
+    归 core，服务层不重复定义什么是合法配置。
+    """
+    return _save_platform_key(home, "auto_pipeline", value)

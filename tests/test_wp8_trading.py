@@ -1181,18 +1181,18 @@ class SurfaceLockTest(unittest.TestCase):
         self.assertNotIn("trade_confirm", names, "券商二次确认不得成为模型可调用工具")
         self.assertNotIn("confirm_decide", names)
 
-    def test_endpoint_registry_is_58_with_new_tail(self):
+    def test_endpoint_registry_is_60_with_new_tail(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 59)
-        self.assertEqual(len(set(endpoints)), 59)
+        self.assertEqual(len(endpoints), 60)
+        self.assertEqual(len(set(endpoints)), 60)
         self.assertEqual(list(store_access.WP8_TRADE_ENDPOINTS),
                          list(trading.OPENAPI_TRADE_ENDPOINTS))
-        self.assertEqual(endpoints[-13:-7], list(trading.OPENAPI_TRADE_ENDPOINTS))
-        self.assertEqual(endpoints[-7:-4], list(store_access.WP8_PUSH_ENDPOINTS))
+        self.assertEqual(endpoints[-14:-8], list(trading.OPENAPI_TRADE_ENDPOINTS))
+        self.assertEqual(endpoints[-8:-5], list(store_access.WP8_PUSH_ENDPOINTS))
         # WP8 任务 7 起设置页端点收尾（凭据读写/授权有意不进工具面，见 mcp_tools；
         # WP8 OAuth 集成增补 openapi_oauth）；WP10 任务 1 起流程页端点收尾
-        self.assertEqual(endpoints[-4:-1], list(store_access.WP8_SETTINGS_ENDPOINTS))
-        self.assertEqual(endpoints[-1:], list(store_access.WP10_ENDPOINTS))
+        self.assertEqual(endpoints[-5:-2], list(store_access.WP8_SETTINGS_ENDPOINTS))
+        self.assertEqual(endpoints[-2:], list(store_access.WP10_ENDPOINTS))
 
     def test_tool_fields_match_http_whitelist(self):
         definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
@@ -1732,8 +1732,8 @@ class Wp8Task6SurfaceLockTest(unittest.TestCase):
         definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
         self.assertEqual(list(store_access.WP8_PUSH_ENDPOINTS),
                          ["push_status", "push_subscribe", "push_unsubscribe"])
-        # WP8 任务 7 起清单尾部是 2 个设置页端点，推送 3 项在其之前
-        self.assertEqual(store_access.endpoints()[-7:-4],
+        # 清单尾部依次是设置页端点与 WP10 端点（流程页/自动流水线设置），推送 3 项在其之前
+        self.assertEqual(store_access.endpoints()[-8:-5],
                          list(store_access.WP8_PUSH_ENDPOINTS))
         names = {tool.name for tool in mcp_tools.TOOLS}
         for endpoint in store_access.WP8_PUSH_ENDPOINTS:

@@ -92,10 +92,12 @@ TOOL_COUNT = 60
 # 让模型自己批自己的实盘单。设置页三端点同理：``openapi_config``/``openapi_test``（凭据
 # 写入与连通性测试）与 ``openapi_oauth``（OAuth 2.1+PKCE 授权流程的 start/status/cancel，
 # 生命周期在 server/oauth_flow.py）都是**人工 Web 动作**——读写 AppKey/私钥落盘、发起
-# 浏览器授权的工具面等于把凭据管理交给模型，绝不做。R5/S1 按本常量断言
+# 浏览器授权的工具面等于把凭据管理交给模型，绝不做。WP10 的 ``auto_pipeline`` 同理：
+# 它是「自动流水线是否自动下单」的总开关，模型若能拨开关就等于能自己启动无人确认的
+# 执行链——**模型不得自拨**，开关只在 Web 设置页。R5/S1 按本常量断言
 # 「工具名集 ≡ 端点数 − 排除集」。
 MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide", "openapi_config", "openapi_test",
-                                    "openapi_oauth"})
+                                    "openapi_oauth", "auto_pipeline"})
 
 # 规格 §3.6 禁用名黑名单（与 Node 原实现（已退役）同表）。匹配语义是**整名或分段精确**：工具名按
 # 非字母数字切段，任一段命中才算，所以 ``plan_execute`` 不因子串 "exec" 被误伤，而

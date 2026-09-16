@@ -30,7 +30,8 @@ import time
 from pathlib import Path
 
 from server import futu_data
-from server.config import FUTU_CHANNELS, save_futu_channel
+from server.config import (FUTU_CHANNELS, save_auto_pipeline as save_platform_auto_pipeline,
+                           save_futu_channel)
 from server.futu_openapi import key_fingerprint, write_private_key
 from server.store_access import WorkbenchError
 
@@ -40,6 +41,12 @@ CREDENTIAL_FILENAME = "futu-openapi.json"
 #: POST openapi_config 的载荷白名单（app.py 同名常量的单一事实源；锁定测试比对）
 CONFIG_FIELDS = ("mode", "app_key", "algorithm", "private_key_pem",
                  "private_key_path", "channel")
+
+#: POST auto_pipeline 的载荷白名单（app.py 同名常量的单一事实源）。键集必须与
+#: ``trading_core.autopipeline.AUTO_PIPELINE_DEFAULTS`` 逐键一致（锁定测试比对）——
+#: 语义定义在 core，这里只是「服务层允许接收哪些键」的声明。
+AUTO_PIPELINE_FIELDS = ("enabled", "strategies", "exec_at", "exec_window_minutes",
+                        "reconcile_at")
 
 #: trading-days 的探测窗口（恒有交易日，信封必为 ret_code 0）
 PROBE_MARKET = "HK"
@@ -190,6 +197,44 @@ def save_config(home, payload):
         except ValueError as error:
             raise WorkbenchError(str(error)) from error
     return get_config_status(home)
+
+
+def get_auto_pipeline(home):
+    """auto_pipeline **有效配置**快照（缺省补全后的完整结构；GET 与 POST 空载荷共用）。
+
+    直接返回 core 的 ``autopipeline.auto_pipeline_config``：页面看到的就是调度侧实际
+    生效的值（未配置的市场显示默认时刻，而不是空——空会让「没配」看起来像「不会跑」）。
+    """
+    from trading_core import autopipeline  # noqa: PLC0415
+    return autopipeline.auto_pipeline_config(str(home))
+
+
+def save_auto_pipeline(home, payload):
+    """校验并原子写 trading-platform.json 的 ``auto_pipeline`` 键，返回有效配置快照。
+
+    纪律与 ``save_config`` 一致（**先校验后落盘**）：
+
+      * 校验复用 ``trading_core.autopipeline.apply_overlay``——与调度侧同一实现，
+        服务层不重新定义「什么算合法配置」；
+      * 非法载荷抛 ``WorkbenchError`` → ``trading/invalid-operation`` 业务失败信封，
+        **文件零改动**（含 JSON 损坏、权限失败：一条都不写半截）；
+      * 落盘的是**提交的 overlay 本身**（不是补全后的完整配置）：该文件是覆盖层，
+        缺省值在读取时补——这样默认值演进对新旧配置一致生效，也不会把默认值冻结进
+        用户文件（与 ``futu_channel`` 只落一个键同构）。
+    """
+    from trading_core import autopipeline  # noqa: PLC0415
+    if not isinstance(payload, dict) or not payload:
+        raise WorkbenchError("auto_pipeline 载荷需为非空对象")
+    try:
+        # 在默认值之上试算一遍：任何非法键/取值在此暴露，落盘不会发生
+        autopipeline.apply_overlay(autopipeline.AUTO_PIPELINE_DEFAULTS, payload)
+    except ValueError as error:
+        raise WorkbenchError(str(error)) from error
+    try:
+        save_platform_auto_pipeline(home, dict(payload))
+    except (OSError, ValueError) as error:
+        raise WorkbenchError(f"auto_pipeline 写入失败：{error}") from error
+    return get_auto_pipeline(home)
 
 
 def test_connectivity(home, http=None):

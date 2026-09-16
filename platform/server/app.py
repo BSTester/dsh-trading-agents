@@ -152,6 +152,12 @@ OPENAPI_TEST_FIELDS = ()
 # 凭据文件已存的）。与 openapi_config 同类：进 token 认证与 snapshot 声明，
 # 有意不进 MCP 工具面（mcp_tools.MCP_EXCLUDED_ENDPOINTS）——凭据管理是人工动作。
 OPENAPI_OAUTH_FIELDS = ("action", "client_id")
+# WP10 任务 2：自动流水线设置面（读写组装在 server/settings_api.py）。空载荷=读有效
+# 配置、带载荷=校验（复用 trading_core.autopipeline.apply_overlay，与调度侧同一实现）
+# 后原子写 trading-platform.json 的 auto_pipeline 键。与设置页三端点同类：进 token
+# 认证与 snapshot 声明，**有意不进 MCP 工具面**——模型不得自拨自动执行开关（同
+# 「模型不能自批实盘单」的边界；MCP_EXCLUDED_ENDPOINTS 是这条规则的唯一落点）。
+AUTO_PIPELINE_FIELDS = settings_api.AUTO_PIPELINE_FIELDS
 # WP8 任务 3：OpenAPI 交易只读端点的载荷白名单（逐端点定义；与 mcp_tools 的工具字段
 # 逐键同形，锁定测试比对）。这些端点是**读类**：只受模式约束（mode 缺省读模式文件），
 # 业务参数（code/market/exchange/page_flag/...）整体下传 trading.TradeGate._read；
@@ -444,6 +450,15 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 # 抛 WorkbenchError → 下方统一落 invalid-operation 信封。
                 _check_fields(endpoint, payload, OPENAPI_OAUTH_FIELDS)
                 return {"ok": True, "value": oauth_flow.handle_action(home, payload)}
+            if endpoint == "auto_pipeline":
+                # WP10 任务 2：自动流水线设置读/写。空载荷=读有效配置（与 GET 专用路由
+                # 同一实现）；带载荷=校验并原子写——校验失败抛 WorkbenchError 落
+                # trading/invalid-operation，**文件零改动**（先校验后落盘）。
+                _check_fields(endpoint, payload, AUTO_PIPELINE_FIELDS)
+                if payload:
+                    return {"ok": True,
+                            "value": settings_api.save_auto_pipeline(home, payload)}
+                return {"ok": True, "value": settings_api.get_auto_pipeline(home)}
             if endpoint in futu_data.FUTU_TOOLS:
                 # WP8 富途实时直通：skills 需要而本地无缓存的数据由服务端实时经富途获取。
                 # 浅白名单在这里拒（与其他端点同形），深校验（code 归一/必填/内键/上游
@@ -613,6 +628,18 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         """
         return JSONResponse(content={"ok": True, "value": await asyncio.to_thread(
             settings_api.get_config_status, home)})
+
+    @app.get("/api/wb/auto_pipeline")
+    async def auto_pipeline_read():
+        """WP10 任务 2：GET 读 auto_pipeline 有效配置（POST 空载荷同实现）。
+
+        认证由 /api/* 中间件统一判定（token 已配置时必须 Bearer）。阻塞文件读经
+        asyncio.to_thread 让出事件循环（与 openapi_config 同口径）。与它一样注册在
+        ``/api/wb/{endpoint}`` 之前：单段 GET 不再落到「仅 POST」的 405 兜底。
+        页面拿到的是**生效值**（缺省补全后），不是文件里的覆盖层原文。
+        """
+        return JSONResponse(content={"ok": True, "value": await asyncio.to_thread(
+            settings_api.get_auto_pipeline, home)})
 
     @app.post("/api/wb/{endpoint}")
     async def workbench(endpoint: str, request: Request):

@@ -3,6 +3,9 @@
 职责单一：把「配置 → 作业表」这一件事做完——读配置、校验（fail-closed）、在既有
 JOBS_DEFAULT 链尾派生自动作业（build_plan/auto_execute/reconcile）。
 
+校验（``apply_overlay``）是**调度侧与设置页写入侧共用的唯一实现**：设置端点若另写
+一套规则，两处迟早漂移（写页面放行的配置在作业侧报错，或反之）。
+
 依赖方向：本模块 import ``alerts``（叶子）；``watchlist`` 与 ``daemon``（JOBS_DEFAULT、
 platform_config）经**函数内延迟导入**——``daemon`` 模块级 import 本模块，反向只能延迟，
 这是仓库对逆向依赖的既有手法（见 watchlist.py / strategies.py 的同款注释）。
@@ -99,6 +102,38 @@ def _auto_exec_at(overlay, defaults):
     return merged
 
 
+def apply_overlay(cfg, overlay):
+    """把 overlay 校验并合并进 cfg，返回**新对象**；非法抛 ``ValueError``。
+
+    校验只有这一份实现：调度侧（``auto_pipeline_config``）与设置页写入校验
+    （platform 的 ``settings_api.save_auto_pipeline``）都调用本函数——两处各写一套
+    必然漂移，届时「写页面放行的配置」会在作业侧报错，反之亦然。
+
+    校验顺序即报错顺序（未知字段 → enabled → strategies → exec_at →
+    exec_window_minutes → reconcile_at）：一个配置有多个错时先报结构错，便于定位。
+    """
+    if not isinstance(overlay, dict):
+        raise ValueError("auto_pipeline 需为对象")
+    unknown = set(overlay) - set(AUTO_PIPELINE_DEFAULTS)
+    if unknown:
+        raise ValueError(f"未知 auto_pipeline 字段：{', '.join(sorted(unknown))}")
+    merged = copy.deepcopy(cfg)
+    if "enabled" in overlay:
+        if not isinstance(overlay["enabled"], bool):
+            raise ValueError("auto_pipeline.enabled 需为布尔值")
+        merged["enabled"] = overlay["enabled"]
+    if "strategies" in overlay:
+        merged["strategies"] = _auto_strategies(overlay["strategies"])
+    if "exec_at" in overlay:
+        merged["exec_at"] = _auto_exec_at(overlay["exec_at"], merged["exec_at"])
+    if "exec_window_minutes" in overlay:
+        merged["exec_window_minutes"] = _positive_int(
+            overlay["exec_window_minutes"], "auto_pipeline.exec_window_minutes")
+    if "reconcile_at" in overlay:
+        merged["reconcile_at"] = _hhmm(overlay["reconcile_at"], "auto_pipeline.reconcile_at")
+    return merged
+
+
 def auto_pipeline_config(home):
     """auto_pipeline 配置（规格 §4.1）：键缺省补默认；非法报错（不静默降级）。
 
@@ -110,25 +145,7 @@ def auto_pipeline_config(home):
     overlay = platform_config(home).get("auto_pipeline")
     if overlay is None:
         return cfg
-    if not isinstance(overlay, dict):
-        raise ValueError("auto_pipeline 需为对象")
-    unknown = set(overlay) - set(AUTO_PIPELINE_DEFAULTS)
-    if unknown:
-        raise ValueError(f"未知 auto_pipeline 字段：{', '.join(sorted(unknown))}")
-    if "enabled" in overlay:
-        if not isinstance(overlay["enabled"], bool):
-            raise ValueError("auto_pipeline.enabled 需为布尔值")
-        cfg["enabled"] = overlay["enabled"]
-    if "strategies" in overlay:
-        cfg["strategies"] = _auto_strategies(overlay["strategies"])
-    if "exec_at" in overlay:
-        cfg["exec_at"] = _auto_exec_at(overlay["exec_at"], cfg["exec_at"])
-    if "exec_window_minutes" in overlay:
-        cfg["exec_window_minutes"] = _positive_int(
-            overlay["exec_window_minutes"], "auto_pipeline.exec_window_minutes")
-    if "reconcile_at" in overlay:
-        cfg["reconcile_at"] = _hhmm(overlay["reconcile_at"], "auto_pipeline.reconcile_at")
-    return cfg
+    return apply_overlay(cfg, overlay)
 
 
 #: 全局作业链的键（规格 §4.4）：承载不绑市场日历的作业（reconcile）。
