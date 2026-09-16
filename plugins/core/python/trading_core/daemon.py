@@ -156,6 +156,74 @@ def auto_pipeline_config(home):
     return cfg
 
 
+#: 全局作业链的键（规格 §4.4）：承载不绑市场日历的作业（reconcile）。
+GLOBAL_CHAIN = "GLOBAL"
+#: build_plan 相对该市场 factors_snapshot 的偏移（分钟，规格 §4.1）——先让数据与
+#: 因子快照落库，自动计划再吃当日数据。
+BUILD_PLAN_OFFSET_MINUTES = 5
+
+
+def _plus_minutes(hhmm, minutes):
+    """HH:MM + 分钟（跨日回绕）；输入已由 _hhmm/常量保证格式合法。"""
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    total = (hour * 60 + minute + minutes) % (24 * 60)
+    return f"{total // 60:02d}:{total % 60:02d}"
+
+
+def _factors_at(chain):
+    """该市场链上 factors_snapshot 的时点；链上没有则 None（不装配 build_plan）。"""
+    for job in chain:
+        if job["name"] == "factors_snapshot":
+            return job["at"]
+    return None
+
+
+def build_jobs(home, conn=None):
+    """作业表装配（规格 §4.1）：JOBS_DEFAULT + auto_pipeline 派生的自动作业。
+
+    关闭态契约（硬约束）：enabled=False（或未配置）时返回值与 JOBS_DEFAULT
+    **逐键逐值相等**——关闭功能不改变任何现有调度行为。
+
+    开启态在既有链**链尾追加**（不改既有作业的时点与顺序）：
+
+      * 各市场：build_plan（= 该市场 factors_snapshot + ``BUILD_PLAN_OFFSET_MINUTES``）、
+        auto_execute（= ``auto_pipeline.exec_at[market]``）；
+      * ``GLOBAL_CHAIN``：reconcile（= ``auto_pipeline.reconcile_at``）——**不查交易日历**
+        （见 tick），只受时点与当日 ran 标记约束。
+
+    作业体自身的软跳过（未启用/无匹配策略/数据未就绪/守卫拦截）由 ``plan-auto`` 与
+    ``auto-execute`` 实现并留痕；这里不重复做关注池或策略门槛——避免两处判定漂移，
+    作业「缺席」与「跳过」的原因都只有一处可见（告警表）。
+
+    配置非法（ValueError）→ warn 告警 + 退化为纯 JOBS_DEFAULT：调度链不能因为一个
+    写错的配置整体停摆（fail-soft 只在装配层；作业体内仍是 fail-closed）。
+    """
+    jobs = copy.deepcopy(JOBS_DEFAULT)
+    try:
+        cfg = auto_pipeline_config(home)
+    except ValueError as error:
+        if conn is not None:
+            alerts.emit(conn, home=str(home), level="warn", title="auto_pipeline 配置非法",
+                        detail=str(error)[:160])
+        return jobs
+    if not cfg["enabled"]:
+        return jobs
+    for market in AUTO_PIPELINE_MARKETS:
+        chain = jobs.get(market)
+        if chain is None:
+            continue
+        factors_at = _factors_at(chain)
+        if factors_at is not None:
+            chain.append({"name": "build_plan",
+                          "at": _plus_minutes(factors_at, BUILD_PLAN_OFFSET_MINUTES),
+                          "cmd": ["plan-auto", "--market", market]})
+        chain.append({"name": "auto_execute", "at": cfg["exec_at"][market],
+                      "cmd": ["auto-execute", "--market", market]})
+    jobs[GLOBAL_CHAIN] = [{"name": "reconcile", "at": cfg["reconcile_at"],
+                           "cmd": ["reconcile-daily"]}]
+    return jobs
+
+
 def resolve_command(cmd, home):
     """替换 @watchlist 占位为配置关注池；关注池为空返回 None（调用方跳过该作业）。"""
     cmd = list(cmd)
@@ -179,20 +247,25 @@ def _subprocess_runner(cmd):
 
 def tick(conn, home, jobs=None, now=None):
     """一轮调度：对每个市场判断「今日为交易日 且 当前时间 ≥ at 且 今日未跑」，
-    满足则执行并记录。now 注入便于假时钟测试。"""
+    满足则执行并记录。now 注入便于假时钟测试。
+
+    作业表缺省走 ``build_jobs(home, conn)``（规格 §4.1：JOBS_DEFAULT + auto_pipeline
+    派生的自动作业）。``GLOBAL_CHAIN`` 链**不查市场日历**（全局作业与单一市场无关，
+    规格 §4.4），只受时点与当日 ran 标记约束。"""
     now = now or _real_now
-    jobs = jobs or JOBS_DEFAULT
+    jobs = jobs or build_jobs(home, conn)
     state = store.kv_get(conn, "daemon:state", default={"ran": {}})
     stamp = now()
     for market, chain in jobs.items():
-        try:
-            trading_day = store.is_trading_day(conn, market, stamp[:10])
-        except RuntimeError as error:  # 日历未同步：跳过该市场并告警，不拖垮循环
-            alerts.emit(conn, home=str(home), level="warn", title="日历未同步",
-                        detail=str(error)[:160])
-            continue
-        if not trading_day:
-            continue
+        if market != GLOBAL_CHAIN:
+            try:
+                trading_day = store.is_trading_day(conn, market, stamp[:10])
+            except RuntimeError as error:  # 日历未同步：跳过该市场并告警，不拖垮循环
+                alerts.emit(conn, home=str(home), level="warn", title="日历未同步",
+                            detail=str(error)[:160])
+                continue
+            if not trading_day:
+                continue
         for job in chain:
             key = f"{market}:{job['name']}:{stamp[:10]}"
             if state["ran"].get(key) or stamp[11:16] < job["at"]:
@@ -231,7 +304,10 @@ def handle_command(conn, home, cmd, executor=None, runner=None):
             return {"ok": True}
         if type_ == "run_job":
             name = cmd.get("job")
-            job = next((j for chain in JOBS_DEFAULT.values() for j in chain
+            # 作业表与 tick 同一装配口径：手工 run_job 也能寻址自动作业
+            # （build_plan/auto_execute/reconcile）——否则「作业已入链但指令说未知」
+            # 会让运维以为作业不存在。
+            job = next((j for chain in build_jobs(home, conn).values() for j in chain
                         if j["name"] == name), None)
             if job is None:
                 return {"ok": False, "error": f"未知作业 {name}"}
