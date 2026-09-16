@@ -248,3 +248,49 @@ sim 常态下既没有成交记录、订单状态也停在 `submitted`。若对�
   暴露为差异（保守方向：宁可停下来给人看，也不替状态机猜路径）；
 - **同步后仍存在的差异才是真差异** → critical + halt（只暂停后续执行，绝不自动平仓）；
 - 两步都**只读券商、只写本地**：零写类券商调用、永不重放（对账铁律不变）。
+
+## 十、富途数据面端点口径（WP12 任务 5/6，2026-09-16 锁定表核对）
+
+**来源**：`docs/superpowers/plans/wp12-endpoint-lock.md`（任务 1 逐端点取官方文档核对，
+核对日期 2026-09-16）。**文档链接漂移已实测**：`llms.txt` 给出的 `/api/quote/f10/*.md`
+**全部 404**——官方已把深度数据重组为 `financials/research/valuation/corporate-actions/
+shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端点）。**禁止按 llms.txt
+的旧路径猜**；新端点一律先查锁定表再实现。
+
+### 10.1 通道边界（最重要的一条）
+
+数据面 16 个端点（直通 14 + 聚合 2）**只在 openapi 通道登记**：托管 MCP 的上游工具名与
+参数形状未逐项核对，`futu_data._fetch_mcp` 对它们**如实拒绝**并给出可执行路径
+（「配置 openapi 凭据并把 futu_channel 设为 openapi」），**不猜名、不静默降级**。
+默认配置（`futu_channel=mcp` 且无凭据）下，研究页/期权页会显示该原因 + 下一步指引——
+这是**如实呈现**，不是功能故障（前端 `services/f10.js::dataplaneHint` 映射该文案）。
+
+### 10.2 逐端点实测口径（错误码语义按官方；"空"与"错"严格二分）
+
+| 端点 | 路径 | 关键口径与坑 |
+|---|---|---|
+| `stock_screen` | `POST /api/v1.0/quote/stock-screen` | `screen_queries` 11 选 1 查询类型 + `retrieve_queries` 9 选 1 取值；`limit`≤300；**合法但无命中返回 `ret_code=0` + `items=[]`**（空结果是成功，不是错误）；`broker_holdings_query`/`kline_shape_query` 仅 HK，`option_query` 需标的有期权 |
+| `warrant_screen` | `POST …/warrant-screen` | 数据面接入以保持 API 面完整；**平台策略/风控/执行不引入窝轮品类**（HTTP-only） |
+| `plate_list` | `GET …/plate-list` | `plate_class ∈ {ALL,INDUSTRY,REGION,CONCEPT,OTHER}`；**`REGION` 仅 SH/SZ**，其它市场官方 `-8 unsupported`（本地前置拒绝，零往返） |
+| `plate_stock` | `GET …/plate-stock` | 需 `market` + `plate_id` |
+| `short_daily_volume` | `GET …/{symbol}/short/daily-volume` | `count`≤90；**仅 HK/US 可卖空证券**（其它市场 `-8`）；港=成交维度/美=持仓维度；无数据 `-10 no_data` **视为空而非错** |
+| `short_interest` | `GET …/{symbol}/short/interest` | 同上市场限定 |
+| `ipo_list` | `GET …/ipo-list` | 支持 HK/US/CN/MY/SG |
+| `economic_calendar_hot` / `_search` | `GET …/economic-calendar/*` | events 页与宏观因子共用 |
+| `info_owner_plate` | `GET …/{symbol}/owner-plate` | 行业中性化的前提；按 `plate_type` 过滤行业类、剔除概念板块 |
+| `info_rehab` | `GET …/{symbol}/rehab` | 复权因子：**上下文炸弹**（单次返回极大、无分页）→ 必须按市场分批增量；HTTP-only（同步作业内部取数） |
+| `watchlist_list` / `watchlist_groups` | `GET …/watchlist/*` | 读用户富途自选，用于关注池导入 |
+| `modify_user_security` | `POST …/watchlist/modify` | **写用户富途侧自选**（非交易写）：仅 Web 端点可达、不进 MCP 工具面、不进 TTL 缓存 |
+| `f10_detail`（聚合 26 section） | 见锁定表 §C.5 | `analyst_consensus`：**无覆盖时 `data={}`**（合法空，前端显示「无分析师覆盖」）；`buy`/`underperform` 仅部分市场返回（缺失档位**不显示为 0**）；`rating_summary`：**仅 US/CA 有数据**，且其 `rating` 是 **3 档**（1=Sell/2=Hold/3=Buy），与 `analyst_consensus` 的 5 档**不是同一枚举**（前端两套标签分开，`tests/f10.test.mjs` 有防合并断言） |
+| `derivative_detail`（聚合 4 section） | 见锁定表 §C.7 | `option_volatility`/`option_exercise_probability` 的 `symbol` **必须是期权合约**（传正股官方 `-3`）；行权概率 **`-9` = 用户无期权数据查询权限**（与标的无关）；`future_info` **所有 code 被静默丢弃时也返回空数组**（空≠错）；`strike_probability` 内部键名未核对 → 前端按上游原样键展示，不编字段名 |
+
+### 10.3 前端缓存与展示纪律
+
+- **TTL 逐项镜像**服务端 `caches.CACHE_TTL_MS`（6h：板块列表/所属板块/复权因子；
+  30m：经济日历/F10 聚合/衍生品聚合/IPO/板块成分股；5m：全市场筛选/自选；1h：做空；
+  写端点 0）——跨语言漂移由 `tests/test_wp12_locks.py::WebTtlMirrorTests` 解析比对，
+  **单边改值即失败**；
+- 缺失字段一律 `—`，**绝不用 0 冒充缺失**（0 是合法值，缺失是缺失）；「上游合法无数据」
+  （空对象/空列表/`-10`）与「失败」分开展示：前者给如实说明，后者给服务端原因 + 下一步；
+- 每张数据卡末尾保留「原始返回（核对用）」折叠块（`src/lib/raw-collapse.jsx`）——
+  界面不编造数据，但必须留一个能看见上游原样的出口。

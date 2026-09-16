@@ -12,6 +12,16 @@
 > quantwb 工具面 41→**59**（54 端点工具 + 5 维护）、服务端点 **55**。规格/验收见
 > `docs/superpowers/specs/2026-09-16-wp8-futu-openapi-unification.md` 与同名 plan
 > 末节「WP8 验收记录」。
+> **WP9–WP12（2026-09-16）：日常闭环自动化 + 数据面补全**——sim 全自动流水线
+> （`auto_pipeline` 开关 + build_plan/auto_execute/reconcile 入链 + 指令轮询并入服务，
+> 规格 WP9）、流程页签（`pipeline` 端点，WP10）、资讯 PIT 地基
+> （`sentiment_snapshots` 三源采集，WP11）、**富途 OpenAPI 数据面补全**（F10 26 section /
+> 筛选 / 板块 / 做空 / IPO / 经济日历 / 自选，16 端点；WP12）。
+> **当前计数：quantwb 工具面 74（69 端点工具 + 5 维护）、服务端点 77**——工具面按
+> **三档**治理（见「富途数据面」节）：直通 11 / 聚合 2 / HTTP-only 3（数据面内）。
+> 规格见 `docs/superpowers/specs/2026-09-16-wp9-15-autopipeline-research-institute-design.md`，
+> 端点锁定表见 `docs/superpowers/plans/wp12-endpoint-lock.md`，逐端点口径见
+> `docs/TOOL-LIMITS.md` §十。
 > WP6 及更早的修订标注保留在后文相应位置。
 
 ## 结论性字段的中文标签
@@ -52,7 +62,7 @@ Harness 内 `plugins/workbench` 保留 `tradingWorkbench` 服务锚
         ├─ 服务内调度器（吸收 daemon 作业链：sync→quality→factors_snapshot；
         │   心跳/告警协议不变，daemon CLI 保留为手动入口）
         ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
-        ├─ /mcp（mcp SDK streamable-http，59 工具）→ Harness 的 mcp__quantwb__*
+        ├─ /mcp（mcp SDK streamable-http，74 工具）→ Harness 的 mcp__quantwb__*
         ├─ 交易闸门：mode → 风控 8 规则（kill=规则 1）→ 业务确认（Web 卡片，进程内）
         │   └ broker 适配（sim；live 经 OpenAPI place/modify/cancel/order-confirm，
         │     未经真实 live 下单验证——sim→live 冒烟属 P4 人工准入）
@@ -124,7 +134,7 @@ openapi 已配置凭据时行情与交易都走 REST，交易事件走 WS 推送
 | `plugins/datasource/python` | **统一数据层**：唯一的富途 MCP 客户端、行情路由与回测核心，被 engine/workbench 共同依赖（不是 Harness 插件） |
 | `plugins/core/python/trading_core` | **量化平台核心库**（非 Harness 插件）：PIT 存储/日历/同步/质量（WP1）、因子/策略/组合回测/walk-forward（WP2）、风控八规则/计划冻结/OMS 状态机/券商适配/对账/TCA（WP3）、daemon 调度/指令目录/告警（WP4） |
 | `trading_core` daemon | 无 LLM 单进程守护进程（`python -m trading_core daemon`）：按交易日历触发作业链（sync→质量→信号→计划、对账→TCA→摘要，WP7 起各市场链末尾追加 `factors_snapshot`）、心跳落 `~/.dsh/trading-daemon.json`（> 5 分钟未刷新工作台标红）、轮询指令目录 `~/.dsh/trading-commands/`、告警分级落 `alerts` 表（WP4）。**WP7 起常驻循环由平台服务内调度器承担（见 `platform/` 行）；daemon CLI 保留为手动/兼容入口，与调度器共享 kv `daemon:state` 的 ran 标记，同日作业不重复执行** |
-| `platform/` 独立服务进程（WP6，WP7 独立量化平台） | FastAPI/uvicorn **单进程**，WP7 起承载四块新增职责：**①服务内调度器**（`server/scheduler.py`：daemon 作业链 sync→quality→factors_snapshot 原样复用，tick-first——启动即先跑一轮并补跑当日到期作业，与手动 daemon 共享 ran 标记不重复执行；心跳/告警协议不变；线程随 lifespan 启停，`/healthz` 附 `scheduler:{alive,last_error}`，`last_error` 保留最近一次异常、成功不清除、300 字符截断）；**②富途交易闸门**（`server/trading.py`：模式文件→风控 8 规则（kill 文件=规则 1）→业务确认（`store_access.request_confirmation` 进程内阻塞，**Web 确认卡片作答**，TTL 120s 超时=拒绝 fail-closed）→broker 适配（sim 下单/改单/撤单=撤旧重下/查询；WP8 起 live 经 OpenAPI 执行协议 place/modify/cancel/order-confirm，**未经真实 live 下单验证**，sim→live 冒烟属 P4 人工准入；无 OpenAPI 凭据 → `trading/openapi-unavailable`）；OMS 落 `orders`/`risk_checks` 表，超时→unknown 只查询不重放）；**③受约束交易工具**（`trade_place/trade_modify/trade_cancel` + `account_positions/account_orders/account_funds`，工具面 27→**33**）；**④`factors-history`**（定时快照按交易日落 `factor_snapshots` 表，HTTP/CLI/`mcp__quantwb__factors_history` 三路同源）。**WP8 起新增：⑤OpenAPI 统一通道**（`trading_datasource.futu_openapi`：OAuth2.1+PKCE/AppKey 双认证、限频/错误码映射、`futu_channel` 通道选择）；**⑥WS 推送**（`server/futu_push.py`：行情订阅+交易事件→OMS 状态迁移+告警，重连/refresh 保活，断线事件不补发→**对账兜底轮询保留**，事件仅加速不作唯一事实源）；**⑦推送订阅面**（`push_status/push_subscribe/push_unsubscribe`，与 `/healthz` 的 `push` 同一实现）；**⑧设置页凭据配置**（WP8 任务 7：`openapi_config`/`openapi_test` 读写在 `server/settings_api.py`；OAuth 集成增补 `openapi_oauth`：OAuth 2.1+PKCE 授权流程 start/status/cancel 在 `server/oauth_flow.py`（注册 client→PKCE→127.0.0.1 回调→换 token→凭据落盘 0600，与 AppKey 模式并存；code_verifier 只存内存，state 逐字校验，600s 超时自动停），Web 表单保存 AppKey 凭据（私钥 PEM 粘贴落盘 0600 或已有路径）、联动 `futu_channel`、连通性自检；**私钥原文绝不回显**，状态只给掩码 app_key 与公钥指纹）。既有职责不变：`POST /api/wb/<endpoint>` + `GET /api/wb/openapi_config`（envelope 契约，**58 端点**）+ `/mcp`（mcp SDK streamable-http，**59 工具**=54 端点工具+5 维护；**`confirm-decide` 与设置页两端点有意不进工具面**，防模型自批实盘单/自改凭据）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/业务确认/维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*`/`factors-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
+| `platform/` 独立服务进程（WP6，WP7 独立量化平台） | FastAPI/uvicorn **单进程**，WP7 起承载四块新增职责：**①服务内调度器**（`server/scheduler.py`：daemon 作业链 sync→quality→factors_snapshot 原样复用，tick-first——启动即先跑一轮并补跑当日到期作业，与手动 daemon 共享 ran 标记不重复执行；心跳/告警协议不变；线程随 lifespan 启停，`/healthz` 附 `scheduler:{alive,last_error}`，`last_error` 保留最近一次异常、成功不清除、300 字符截断）；**②富途交易闸门**（`server/trading.py`：模式文件→风控 8 规则（kill 文件=规则 1）→业务确认（`store_access.request_confirmation` 进程内阻塞，**Web 确认卡片作答**，TTL 120s 超时=拒绝 fail-closed）→broker 适配（sim 下单/改单/撤单=撤旧重下/查询；WP8 起 live 经 OpenAPI 执行协议 place/modify/cancel/order-confirm，**未经真实 live 下单验证**，sim→live 冒烟属 P4 人工准入；无 OpenAPI 凭据 → `trading/openapi-unavailable`）；OMS 落 `orders`/`risk_checks` 表，超时→unknown 只查询不重放）；**③受约束交易工具**（`trade_place/trade_modify/trade_cancel` + `account_positions/account_orders/account_funds`，工具面 27→**33**）；**④`factors-history`**（定时快照按交易日落 `factor_snapshots` 表，HTTP/CLI/`mcp__quantwb__factors_history` 三路同源）。**WP8 起新增：⑤OpenAPI 统一通道**（`trading_datasource.futu_openapi`：OAuth2.1+PKCE/AppKey 双认证、限频/错误码映射、`futu_channel` 通道选择）；**⑥WS 推送**（`server/futu_push.py`：行情订阅+交易事件→OMS 状态迁移+告警，重连/refresh 保活，断线事件不补发→**对账兜底轮询保留**，事件仅加速不作唯一事实源）；**⑦推送订阅面**（`push_status/push_subscribe/push_unsubscribe`，与 `/healthz` 的 `push` 同一实现）；**⑧设置页凭据配置**（WP8 任务 7：`openapi_config`/`openapi_test` 读写在 `server/settings_api.py`；OAuth 集成增补 `openapi_oauth`：OAuth 2.1+PKCE 授权流程 start/status/cancel 在 `server/oauth_flow.py`（注册 client→PKCE→127.0.0.1 回调→换 token→凭据落盘 0600，与 AppKey 模式并存；code_verifier 只存内存，state 逐字校验，600s 超时自动停），Web 表单保存 AppKey 凭据（私钥 PEM 粘贴落盘 0600 或已有路径）、联动 `futu_channel`、连通性自检；**私钥原文绝不回显**，状态只给掩码 app_key 与公钥指纹）。既有职责不变：`POST /api/wb/<endpoint>` + `GET /api/wb/openapi_config`（envelope 契约，**77 端点**）+ `/mcp`（mcp SDK streamable-http，**74 工具**=69 端点工具+5 维护；**`confirm-decide` 与设置页两端点有意不进工具面**，防模型自批实盘单/自改凭据）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/业务确认/维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*`/`factors-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
 
 `plugins/trading-agents` 是旧的未启用脚手架，不是当前执行引擎。
 workbench 包通过 `dsh.bundle.patch` 插入根级 Host 行；fin-data/engine 是普通插件包，
@@ -355,6 +365,27 @@ Client 用 `ctx.connection.rpc.call` 调用并继承 Connection 信任——该 
 | `push_subscribe` / `push_unsubscribe`（WP8 任务 6） | `{quote?, order_book?, ticker?, kline?: [{symbol, period, adjust}]}`（**非交易**载荷） | 追加/精确移除本地连接订阅意图（不改模式、不过风控、不产生订单）；成功回意图快照；推送未启用 → `trading/push-unavailable`（如实拒绝），载荷非法 → `trading/invalid-operation`；幂等（重复订阅不重发订阅帧） |
 | `pipeline`（WP10） | `{}`（空载荷，TTL 30s） | 流程页数据源：每市场当日各阶段（真实作业名 + `plan`/`execute`/`digest`）`{label, status: pending\|ok\|skipped\|failed, at, scheduled, summary}` + `auto_pipeline` 生效配置摘要；**只读既有事实**（kv ran 标记、plans/orders、当日告警归因），不造状态、不写库、不调券商 |
 | `auto_pipeline`（WP10） | GET 空载荷读；POST `{enabled, strategies, exec_at, exec_window_minutes, reconcile_at}`（白名单） | 自动流水线开关读写：写入经 core `autopipeline.apply_overlay` **同一校验实现**，原子写 `trading-platform.json` 的 `auto_pipeline` 键（保留其他键），校验失败文件零改动；**两端点不进 MCP 工具面**（模型不得自拨开关，同 `openapi_config`/`confirm-decide` 先例） |
+| 富途数据面 16 端点（WP12） | 直通 11（`stock_screen`/`plate_list`/`plate_stock`/`short_daily_volume`/`short_interest`/`ipo_list`/`economic_calendar_hot`/`economic_calendar_search`/`info_owner_plate`/`watchlist_list`/`watchlist_groups`）+ 聚合 2（`f10_detail`/`derivative_detail`，载荷 `{code*, section*, params?}`）+ HTTP-only 3（`warrant_screen`/`modify_user_security`/`info_rehab`） | 逐端点路径/参数/错误码见 `docs/superpowers/plans/wp12-endpoint-lock.md`（2026-09-16 官方文档核对），实测口径见 `docs/TOOL-LIMITS.md` §十 |
+
+### 富途数据面：三档治理与通道边界（WP12，2026-09-16）
+
+**为什么分三档**：数据面一次补入 16 个端点，若全部 1:1 进模型工具面会从 59 涨到 75+，
+模型选择成本与误用面同步膨胀。治理规则（**新增端点必须显式登记档位与理由**）：
+
+| 档 | 端点 | 理由 |
+|---|---|---|
+| **直通**（逐端点 1:1 进工具面，11） | 研究高频、语义独立 | 每个都有独立语义与参数形状，聚合反而增加一层映射 |
+| **聚合**（一个工具 + section 白名单枚举，2） | `f10_detail`（26 section）/ `derivative_detail`（4 section） | 结构同质、逐项暴露收益低；section 白名单以传输层 `OpenApiF10.SECTIONS` 为单一事实源 |
+| **HTTP-only**（服务端点面可达、不进工具面，3） | `warrant_screen`（不策略化窝轮）/ `modify_user_security`（写用户富途自选，非交易写）/ `info_rehab`（同步作业内部取数） | 无需模型自由调用；写类限 Web 用户操作 |
+
+**通道边界（fail-closed）**：数据面 16 端点**只在 openapi 通道登记**——托管 MCP 的上游
+工具名与参数形状未逐项核对（禁止猜名），`futu_data._fetch_mcp` 对它们如实拒绝并指引
+「配置凭据 + 切 `futu_channel=openapi`」。因此**默认配置（mcp 且无凭据）下研究页/期权页
+的数据卡会显示「不可用 + 下一步」**——这是如实呈现而非故障。
+
+**前端 TTL 镜像**：客户端 TTL 与服务端 `caches.CACHE_TTL_MS` 逐项一致（6h/30m/5m/1h 四档，
+写端点 0），跨语言漂移由 `tests/test_wp12_locks.py::WebTtlMirrorTests` 解析两侧比对，
+单边改值即失败。
 
 除 `plan-execute`（执行已冻结计划，白名单指令落盘）、`confirm-decide`（人工批准）与
 WP7 的 `trade_*` 写端点（必须通过交易闸门链：模式→风控 8 规则→kill→业务确认）外，

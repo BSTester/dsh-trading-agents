@@ -16,6 +16,7 @@ F10 族重组为 financials/research/valuation/corporate-actions/shareholders/co
 七个命名空间，并**漏列 2 个估值端点**——本测试是"禁止猜路径"的机械保证。
 """
 import re
+import sys
 import unittest
 from pathlib import Path
 
@@ -163,6 +164,53 @@ class LockTableStructureTests(unittest.TestCase):
         self.assertIn("index-stocks", text)
         self.assertIn("index-stock-plates", text)
         self.assertIn("top-brokers-history", text)
+
+
+class WebTtlMirrorTests(unittest.TestCase):
+    """WP12 任务 6：前端客户端 TTL 必须**逐项镜像**服务端 ``caches.CACHE_TTL_MS``。
+
+    为什么需要跨语言比对：数据面的 TTL 在服务端（Python 表）与前端（JS 表）各写一份，
+    两份都可能被后来者单边修改——前端长得对但值不同，页面就会在服务端缓存之外重复
+    取数（烧额度）或展示超出服务端新鲜度的缓存。比对方式沿用仓库既有跨语言锁定惯例
+    （``tests/test_labels.py`` 解析两侧表格）：解析 ``api.js`` 的 TTL_MS 字面量逐项比较，
+    漂移即失败。
+
+    边界：**只比数据面端点**（WP12 任务 4/6 登记的 16 个）。其余端点（snapshot/series/…
+    与 WP8 实时直通族）不在本测试范围，避免把既有其它口径一并锁死。
+    """
+
+    WEB_API = _REPO / "platform" / "web" / "src" / "services" / "api.js"
+    #: JS 数字字面量（允许下划线分隔，如 21_600_000）；键名可含数字（''f10_detail''）——
+    #: 必须以字母开头，否则 '_detail' 这类子串会被误当键名。
+    _ENTRY_RE = re.compile(r"([a-z][a-z_0-9]*):\s*([0-9_]+)\s*,")
+
+    def _web_ttls(self):
+        text = self.WEB_API.read_text(encoding="utf-8")
+        parts = text.split("const TTL_MS = {", 1)
+        self.assertEqual(len(parts), 2, "api.js 必须仍以 const TTL_MS = { 声明表")
+        # 取到表结束（"\n};"）为止——避免把文件后段的其它数字当 TTL
+        body = parts[1].split("\n};", 1)[0]
+        return {key: int(value.replace("_", ""))
+                for key, value in self._ENTRY_RE.findall(body)}
+
+    def test_dataplane_ttls_mirror_server(self):
+        # 服务端包在 platform/ 下（与 tests/test_wp12_surface.py 同一接线口径：
+        # 仓库根/tests 都在 sys.path，platform 需显式插入）。
+        platform_dir = str(_REPO / "platform")
+        if platform_dir not in sys.path:
+            sys.path.insert(0, platform_dir)
+        from server import caches, futu_data  # noqa: PLC0415 —— 与服务端同源导入
+        web = self._web_ttls()
+        for endpoint in futu_data.DATAPLANE_ENDPOINTS:
+            with self.subTest(endpoint=endpoint):
+                self.assertIn(endpoint, web, f"{endpoint} 未在前端 TTL_MS 登记")
+                expected = (0 if endpoint == "modify_user_security"
+                            else caches.CACHE_TTL_MS[endpoint])
+                self.assertEqual(web[endpoint], expected,
+                                 f"{endpoint} 前端 TTL 与服务端不一致")
+
+    def test_write_endpoint_never_cached(self):
+        self.assertEqual(self._web_ttls().get("modify_user_security"), 0)
 
 
 if __name__ == "__main__":

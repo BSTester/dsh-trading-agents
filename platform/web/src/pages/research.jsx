@@ -10,10 +10,21 @@
 //     reference}], published_at}；snapshot() 同样按模式过滤并倒序。
 // 正文渲染用 src/lib/markdown.jsx（自 plugins/workbench/src/client.js 移植，逻辑零改动）。
 // 评级标签：优先 rating_label（产出侧给出）；缺失时回退原始 rating 码展示，不猜枚举。
+//
+// 深度数据（WP12 任务 6）：F10 三个 section 的按需查询卡。载荷契约来自服务端
+// （app.py 的 f10_detail 白名单与 futu_data.FutuData.f10_detail）：**{code, section, params?}**
+// ——字段名是 code（服务端内部再转 symbol，勿传 symbol 会被白名单拒绝）。
+// section 白名单以传输层 OpenApiF10.SECTIONS（26 项）为单一事实源，本页只取研究关注的三项；
+// 字段名与枚举依据、空结果语义、通道不可用的下一步指引全部在 services/f10.js 文件头登记，
+// 映射逻辑是可直测纯函数（tests/f10.test.mjs），本文件只做接线与渲染。
 import React from "react";
-import { Button, Card, Space, Table, Tag, Typography } from "antd";
-import { useSnapshotPoll } from "../services/hooks.js";
+import { Alert, Button, Card, Input, Space, Table, Tag, Typography } from "antd";
+import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { Markdown } from "../lib/markdown.jsx";
+import { RawCollapse } from "../lib/raw-collapse.jsx";
+import {
+  analystConsensusSummary, dataplaneHint, institutionalSummary, ratingSummarySummary,
+} from "../services/f10.js";
 
 // status 枚举值全部来自 store.js 字面量；中文为展示标签（依据 store.js 各自注释语义）。
 const RUN_STATUS = {
@@ -61,8 +72,7 @@ function RunsTable({ snapshot }) {
   );
 }
 
-/** 报告详情：返回按钮 + Markdown 正文 + 来源列表（name/as_of/reference）。 */
-function ReportDetail({ report, onBack }) {
+/** 报告详情：返回按钮 + Markdown 正文 + 来源列表（name/as_of/reference）。 */function ReportDetail({ report, onBack }) {
   return (
     <Space direction="vertical" size="middle" style={{ width: "100%" }}>
       <Space wrap>
@@ -91,6 +101,98 @@ function ReportDetail({ report, onBack }) {
           <Typography.Text type="secondary">未记录来源。</Typography.Text>)}
       </Card>
     </Space>);
+}
+
+// ---------------------------------------------------------------------------
+// 深度数据（F10 聚合面）——三项研究关注的 section，映射纯函数在 services/f10.js
+// ---------------------------------------------------------------------------
+
+/** 键值行（缺值由纯函数给 —，这里不补默认值）。 */
+function KeyValueRows({ rows }) {
+  return (
+    <Space direction="vertical" size={2} style={{ width: "100%" }}>
+      {rows.map((row) => (
+        <Space key={row.label} size={8} align="start">
+          <Typography.Text type="secondary" style={{ minWidth: 180, display: "inline-block" }}>
+            {row.label}
+          </Typography.Text>
+          <Typography.Text>{row.value}</Typography.Text>
+        </Space>))}
+    </Space>);
+}
+
+/** 评级汇总明细表（逐机构/逐分析师一行；字段来自官方 rating-summary 文档）。 */
+function RatingRowsTable({ rows }) {
+  return (
+    <Table size="small"
+      rowKey={(_row, index) => index}
+      dataSource={rows}
+      pagination={false}
+      locale={{ emptyText: "本期无评级明细。" }}
+      columns={[
+        { title: "来源", key: "source", render: (_f, row) => row.source },
+        { title: "名称", key: "name", render: (_f, row) => row.name },
+        { title: "评级", key: "rating", render: (_f, row) => row.rating },
+        { title: "目标价", key: "target", align: "right", render: (_f, row) => row.target },
+        { title: "推荐日", key: "date", render: (_f, row) => row.date },
+      ]} />);
+}
+
+/** 单 section 查询卡：错误给「服务端原因 + 下一步」，空结果给如实说明，不显示为失败。 */
+function DeepDataCard({ title, section, code, summarize, asTable = false }) {
+  const query = useEndpoint("f10_detail", code ? { code, section } : null, [code, section]);
+  const summary = query.value ? summarize(query.value) : null;
+  const hint = query.error ? dataplaneHint(query.error) : "";
+  return (
+    <Card type="inner" title={title}>
+      {query.error && (
+        <Alert type="error" showIcon message={`读取失败：${query.error}`}
+          description={hint || undefined} />)}
+      {summary?.note && <Alert type="info" showIcon message={summary.note} />}
+      {summary && !summary.note && (
+        asTable
+          ? (
+            <>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                机构 {summary.institutionCount} 条 · 分析师 {summary.analystCount} 条 ·
+                上游 total={summary.total}
+              </Typography.Text>
+              <RatingRowsTable rows={summary.rows} />
+            </>)
+          : <KeyValueRows rows={summary.rows} />)}
+      <RawCollapse value={query.value} loading={query.loading} />
+    </Card>);
+}
+
+/** 深度数据区：输入标的后并发取三个 section（每个卡独立失败，互不牵连）。 */
+function DeepData() {
+  const [ticker, setTicker] = React.useState("");
+  const [code, setCode] = React.useState("");
+  return (
+    <Card type="inner" title="深度数据（F10）"
+      extra={(
+        <Space>
+          <Input placeholder="标的代码，如 HK.00700 / US.AAPL" style={{ width: 240 }} value={ticker}
+            onChange={(event) => setTicker(event.target.value)}
+            onPressEnter={() => setCode(ticker.trim().toUpperCase())} />
+          <Button onClick={() => setCode(ticker.trim().toUpperCase())}>查询</Button>
+        </Space>)}>
+      <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          数据经富途 OpenAPI 数据面（futu_channel=openapi 时可用）；接口不可用时如实显示原因。
+        </Typography.Text>
+        {!code && <Typography.Text type="secondary">输入标的代码后查询。</Typography.Text>}
+        {code && (
+          <DeepDataCard title="分析师一致预期" section="analyst_consensus" code={code}
+            summarize={analystConsensusSummary} />)}
+        {code && (
+          <DeepDataCard title="评级汇总（逐机构/逐分析师）" section="rating_summary" code={code}
+            summarize={ratingSummarySummary} asTable />)}
+        {code && (
+          <DeepDataCard title="机构持股" section="institutional" code={code}
+            summarize={institutionalSummary} />)}
+      </Space>
+    </Card>);
 }
 
 export default function ResearchPage() {
@@ -135,6 +237,7 @@ export default function ResearchPage() {
                       <Button size="small" onClick={() => setSelectedId(row.id)}>查看</Button>) },
                 ]} />
             </Card>
+            <DeepData />
           </>
         )}
       </Space>

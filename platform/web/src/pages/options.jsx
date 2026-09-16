@@ -11,10 +11,14 @@
 // 返回 4 个默认字段、其余全 null），strategy 也是上游必填（服务端提示示例
 // {"market_category_list": [1]}）——缺了直接被拒，不浪费注定失败的往返。
 import React from "react";
-import { Alert, Button, Card, Collapse, Input, Select, Space, Table, Typography } from "antd";
+import { Alert, Button, Card, Input, Select, Space, Table, Typography } from "antd";
 import { callApi } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
+import { RawCollapse } from "../lib/raw-collapse.jsx";
+import {
+  dataplaneHint, exerciseProbabilitySummary, optionVolatilitySummary, strikeRows,
+} from "../services/f10.js";
 
 const { TextArea } = Input;
 
@@ -80,19 +84,7 @@ function chainColumns(rows) {
   ];
 }
 
-/** 原始返回折叠块（核对出口）。 */
-function RawCollapse({ value, loading }) {
-  if (loading || value === null || value === undefined) return null;
-  return (
-    <Collapse size="small" items={[{
-      key: "raw",
-      label: "原始返回（核对用）",
-      children: (
-        <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 12, maxHeight: 320, overflow: "auto" }}>
-          {JSON.stringify(value, null, 2)}
-        </pre>),
-    }]} />);
-}
+/** 原始返回折叠块见 src/lib/raw-collapse.jsx（WP12 任务 6 起与研究页共用）。 */
 
 /** 期权链表：本地过滤到期日（服务端 option_chain 不收到期日参数，见文件头）。 */
 function ChainTable({ chain }) {
@@ -214,6 +206,92 @@ function OptionScreen() {
     </>);
 }
 
+// ---------------------------------------------------------------------------
+// 期权波动率与行权概率（derivative_detail，WP12 任务 6）
+// ---------------------------------------------------------------------------
+// 载荷契约（app.py derivative_detail 白名单 + futu_data.FutuData.derivative_detail）：
+//   {code, section, params?}——字段名是 code；section 白名单 4 项，本区用其中两项。
+// **合约要求**（锁定表 §C.7 官方 -3）：这两个 section 的 symbol 必须是**期权合约**，
+// 传正股会被上游直接拒绝——所以本区用独立的「合约代码」输入，不与正股输入共用。
+// 权限语义：行权概率官方 -9 = 用户无期权数据查询权限（与标的无关），由 dataplaneHint 说明。
+
+/** 键值行（缺值由纯函数给 —）。 */
+function DerivativeRows({ rows }) {
+  return (
+    <Space direction="vertical" size={2} style={{ width: "100%" }}>
+      {rows.map((row) => (
+        <Space key={row.label} size={8} align="start">
+          <Typography.Text type="secondary" style={{ minWidth: 180, display: "inline-block" }}>
+            {row.label}
+          </Typography.Text>
+          <Typography.Text>{row.value}</Typography.Text>
+        </Space>))}
+    </Space>);
+}
+
+/** 单 section 查询卡：错误给服务端原因 + 下一步；空对象给如实说明。 */
+function DerivativeCard({ title, section, code, summarize, withStrikes = false }) {
+  const query = useEndpoint("derivative_detail", code ? { code, section } : null, [code, section]);
+  const summary = query.value ? summarize(query.value) : null;
+  const strikes = withStrikes ? strikeRows(summary?.strikes) : [];
+  const hint = query.error ? dataplaneHint(query.error) : "";
+  return (
+    <Card type="inner" title={title}>
+      {query.error && (
+        <Alert type="error" showIcon message={`读取失败：${query.error}`}
+          description={hint || undefined} />)}
+      {summary?.note && <Alert type="info" showIcon message={summary.note} />}
+      {summary && !summary.note && (
+        <>
+          <DerivativeRows rows={summary.rows} />
+          {strikes.length > 0 && (
+            <>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                行权概率 {summary.strikes.length} 条（键名按上游原样展示，完整内容见下方原始返回）：
+              </Typography.Text>
+              {strikes.map((row) => (
+                <Space key={row.index} wrap size={12} style={{ marginTop: 4 }}>
+                  <Typography.Text type="secondary">#{row.index}</Typography.Text>
+                  {row.cells.map((cell) => (
+                    <Typography.Text key={cell.label}>
+                      <Typography.Text type="secondary">{cell.label}=</Typography.Text>{cell.value}
+                    </Typography.Text>))}
+                </Space>))}
+            </>)}
+        </>)}
+      <RawCollapse value={query.value} loading={query.loading} />
+    </Card>);
+}
+
+/** 衍生品区：独立合约输入 + 两张卡（各自独立失败）。 */
+function DerivativeDetail() {
+  const [contract, setContract] = React.useState("");
+  const [code, setCode] = React.useState("");
+  return (
+    <Card type="inner" title="期权波动率与行权概率（derivative_detail）"
+      extra={(
+        <Space>
+          <Input placeholder="期权合约代码，如 US.AAPL260116C00200000" style={{ width: 300 }}
+            value={contract}
+            onChange={(event) => setContract(event.target.value)}
+            onPressEnter={() => setCode(contract.trim().toUpperCase())} />
+          <Button onClick={() => setCode(contract.trim().toUpperCase())}>查询</Button>
+        </Space>)}>
+      <Space direction="vertical" size="middle" style={{ width: "100%" }}>
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          两个接口要求传期权合约代码（传正股会被上游拒绝）；数据经富途 OpenAPI 数据面。
+        </Typography.Text>
+        {!code && <Typography.Text type="secondary">输入期权合约代码后查询。</Typography.Text>}
+        {code && (
+          <DerivativeCard title="期权波动率" section="option_volatility" code={code}
+            summarize={optionVolatilitySummary} />)}
+        {code && (
+          <DerivativeCard title="行权概率" section="option_exercise_probability" code={code}
+            summarize={exerciseProbabilitySummary} withStrikes />)}
+      </Space>
+    </Card>);
+}
+
 export default function OptionsPage() {
   const [ticker, setTicker] = React.useState("");
   const [query, setQuery] = React.useState("");
@@ -253,6 +331,7 @@ export default function OptionsPage() {
         <Card type="inner" title="期权筛选（option_screen）">
           <OptionScreen />
         </Card>
+        <DerivativeDetail />
       </Space>
     </Card>);
 }

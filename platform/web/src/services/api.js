@@ -29,6 +29,20 @@ const TTL_MS = {
   // 这里 TTL 0 不写缓存；openapi_test_post 是同名防御别名，与 POST 语义对齐）。
   // WP8 OAuth：授权流程 start/status/cancel 同为实时直通（status 由设置页 2s 轮询）。
   openapi_config: 0, openapi_test: 0, openapi_test_post: 0, openapi_oauth: 0,
+  // WP12 任务 6：富途数据面端点——TTL **逐项对齐服务端 caches.CACHE_TTL_MS**
+  // （镜像而非自估；服务端是唯一事实源，漂移由 tests/test_wp12_locks.py 的锁定测试比对）。
+  //   6h：板块列表、所属板块、复权因子（低频静态，服务端注释：按日/结构性数据）
+  //   30m：经济日历两项、板块成分股、IPO 列表、F10 聚合面、衍生品聚合面
+  //   5m：全市场筛选、自选列表/分组（随行情或用户操作变动）
+  //   1h：做空数据（按日更新）
+  //   modify_user_security 是写端点（服务端不进 TTL 表）→ 恒 0。
+  economic_calendar_hot: 1_800_000, economic_calendar_search: 1_800_000,
+  info_owner_plate: 21_600_000, info_rehab: 21_600_000, plate_list: 21_600_000,
+  plate_stock: 1_800_000, stock_screen: 300_000, warrant_screen: 300_000,
+  ipo_list: 1_800_000, short_daily_volume: 3_600_000, short_interest: 3_600_000,
+  watchlist_list: 300_000, watchlist_groups: 300_000,
+  f10_detail: 1_800_000, derivative_detail: 1_800_000,
+  modify_user_security: 0,
 };
 const memory = new Map();
 // snapshot 响应声明的端点集合；null = 尚未取到声明（不拦，交给 404 兜底）。
