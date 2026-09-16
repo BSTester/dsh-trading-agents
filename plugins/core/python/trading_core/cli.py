@@ -76,10 +76,17 @@ def build_parser():
     s.add_argument("--step", type=int, default=63)
     _add_db(s)
 
-    s = sub.add_parser("plan-build", help="生成并冻结计划（目标权重 JSON 内联提供）")
+    s = sub.add_parser(
+        "plan-build",
+        help="生成并冻结计划（目标权重 JSON 内联提供）",
+        description="目标权重是**上限**：数量 = min(权重定量, 风险预算定量)，"
+                    "风险预算 = 权益 × risk_per_trade ÷ 2×ATR 止损距离；加仓受单笔风险"
+                    "约束、减仓/清仓不受限；算不出 ATR 的标的进结果 skipped（不生成"
+                    "必被风控规则 4 拦下的无止损全额定量）。与自动 build_plan 共用同一"
+                    "定量口径（planner.build_and_freeze），手工路径无旁路。")
     s.add_argument("--mode", default="SIM")
     s.add_argument("--strategy", default="momentum_value_top5")
-    s.add_argument("--target", required=True, help='JSON，如 {"SH.600519": 0.5}')
+    s.add_argument("--target", required=True, help='JSON，如 {"SH.600519": 0.5}（权重上限）')
     s.add_argument("--prices", required=True, help="JSON，标的→限价")
     s.add_argument("--as-of", required=True)
     _add_db(s)

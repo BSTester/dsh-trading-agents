@@ -40,10 +40,10 @@ class _FakeStrategy:
     id = "wp9_fake"
 
     def universe(self, conn, as_of, home=None):
-        return ["SH.600519", "SZ.300750", "HK.00700"]
+        return ["SH.600519", "SZ.300750", "HK.00700", "US.AAPL"]
 
     def target_weights(self, conn, as_of, home=None):
-        return {"SH.600519": 0.5, "SZ.300750": 0.3, "HK.00700": 0.2}
+        return {"SH.600519": 0.5, "SZ.300750": 0.3, "HK.00700": 0.2, "US.AAPL": 0.4}
 
 
 class PlanAutoTest(unittest.TestCase):
@@ -88,17 +88,23 @@ class PlanAutoTest(unittest.TestCase):
             {"t": d, "o": close, "h": close + 0.5, "l": close - 0.5, "c": close,
              "v": 1000.0} for d in days], source="test")
 
+    def _bars_ending(self, symbol, end, count=20, close=100.0):
+        """铺到指定日期为止的日线（美股链用：最后 bar = 会话本地日）。"""
+        days = [(date.fromisoformat(end) - timedelta(days=count - 1 - i)).isoformat()
+                for i in range(count)]
+        self._bars(symbol, days=days, close=close)
+
     def _mode(self, value):
         (self.home / "trading-account-mode").write_text(value, encoding="utf-8")
 
-    def _broker(self, positions=None, equity=1_000_000.0):
+    def _broker(self, positions=None, equity=1_000_000.0, market_id=3):
         calls = []
 
         def call(name, args=None, timeout=30, **kwargs):
             calls.append((name, args))
             if name == "sim_trade_account_list":
-                return {"accounts": [{"account_id": "A-1", "market_id": 3,
-                                      "account_title": "模拟A股"}]}
+                return {"accounts": [{"account_id": "A-1", "market_id": market_id,
+                                      "account_title": "模拟账户"}]}
             if name == "sim_trade_position_list":
                 return {"positions": positions or []}
             if name == "sim_trade_cash_info":
@@ -394,6 +400,116 @@ class PlanAutoTest(unittest.TestCase):
         """持仓过滤前缀集合与日历市场映射同源（SH 链含 SZ/BJ）。"""
         self.assertEqual({p for prefixes in broker.CHAIN_PREFIXES.values() for p in prefixes},
                          set(planner.CALENDAR_MARKET))
+
+    # ---- ①b 日期空间：美股链（修复 F1：会话收盘落在北京次日） ----
+
+    def test_us_chain_ready_after_session_close(self):
+        """美股链就绪：北京 D 05:40 负责 ET D−1 会话，数据门按**本地日**判定。
+
+        修复前把北京日当本地日用 → expected 超前一天 → 每天静默跳过
+        （数据未就绪）→ **美股自动计划永不生成**。
+        """
+        self._config(strategies_cfg=[{"market": "US", "strategy": "wp9_fake",
+                                      "watchlist": "US"}],
+                     watchlist=["US.AAPL"])
+        self._calendar("US", days=(PREV, TODAY))
+        self._bars_ending("US.AAPL", PREV)          # 最后 bar = ET D−1（真实落库口径）
+        call, _ = self._broker(market_id=100)       # 美股模拟账户 market_id=100
+
+        result = planner.plan_auto(self.conn, str(self.home), "US",
+                                   today=f"{TODAY} 05:40:00", broker_call=call)
+
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("skipped", result)
+        rows = self._plan_rows()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["market"], "US")
+        self.assertEqual(rows[0]["origin"], "auto")
+        self.assertEqual(rows[0]["as_of"], PREV)    # 本地会话日，不是北京日 TODAY
+        self.assertEqual(len(store.get_orders_by_plan(self.conn, rows[0]["plan_id"])), 1)
+
+    def test_us_chain_before_session_close_skips(self):
+        """边界：北京 03:00（负责的会话尚未收盘）→ 保守跳过、零计划。
+
+        不拿上一场的收盘当本场：否则当日 kv ran 被消耗，真到收盘后不再补跑。
+        """
+        self._config(strategies_cfg=[{"market": "US", "strategy": "wp9_fake",
+                                      "watchlist": "US"}],
+                     watchlist=["US.AAPL"])
+        self._calendar("US", days=(PREV, TODAY))
+        self._bars_ending("US.AAPL", PREV)
+        call, _ = self._broker(market_id=100)
+
+        result = planner.plan_auto(self.conn, str(self.home), "US",
+                                   today=f"{TODAY} 03:00:00", broker_call=call)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("尚未收盘", result["skipped"])
+        self.assertEqual(self._plan_rows(), [])
+
+    def test_us_without_calendar_fails_closed(self):
+        """美股日历未同步 → warn 跳过 + 零计划（不猜日期，不照北京日跑）。"""
+        self._config(strategies_cfg=[{"market": "US", "strategy": "wp9_fake",
+                                      "watchlist": "US"}],
+                     watchlist=["US.AAPL"])
+        self._bars_ending("US.AAPL", PREV)
+        call, _ = self._broker(market_id=100)
+
+        result = planner.plan_auto(self.conn, str(self.home), "US",
+                                   today=f"{TODAY} 05:40:00", broker_call=call)
+
+        self.assertTrue(result["ok"])
+        self.assertIn("日历未同步", result["skipped"])
+        self.assertEqual(self._plan_rows(), [])
+        self.assertTrue(any(a["level"] == "warn" for a in self._alerts()))
+
+    def test_sh_hk_gate_unchanged_by_date_space_fix(self):
+        """回归：沪深/港股与北京同日 → 行为逐字不变（as_of 仍为当日）。
+
+        修复只应改变美股链的日期空间：同日市场（收盘落在北京当日）必须原样通过。
+        """
+        self._config()
+        self._calendar()
+        self._bars("SH.600519")
+        self._bars("SZ.300750")
+        call, _ = self._broker()
+
+        result = planner.plan_auto(self.conn, str(self.home), "SH",
+                                   today=TODAY, broker_call=call)
+        self.assertTrue(result["ok"], result)
+        self.assertNotIn("skipped", result)
+
+        self._config(strategies_cfg=[{"market": "HK", "strategy": "wp9_fake",
+                                      "watchlist": "HK"}],
+                     watchlist=["HK.00700"])
+        self._calendar("HK", days=(PREV, TODAY))
+        self._bars("HK.00700")
+        hk_call, _ = self._broker(market_id=1)
+
+        hk = planner.plan_auto(self.conn, str(self.home), "HK",
+                               today=f"{TODAY} 16:40:00", broker_call=hk_call)
+
+        self.assertTrue(hk["ok"], hk)
+        self.assertNotIn("skipped", hk)
+        self.assertEqual([r["as_of"] for r in self._plan_rows()], [TODAY, TODAY])
+
+    def test_invalid_today_injection_fails_closed(self):
+        """非法 ``--today`` 注入（日期合法、时分非法）→ fail-closed，不抛穿契约。
+
+        ``today`` 注入不走 ``daemon.now_stamp`` 的格式校验，因此由 ``data_date_for``
+        兜底：返回 ``ok=False`` 让 CLI 非零退出，而不是把 ValueError 抛给调用方
+        （作业契约「永不抛」）。
+        """
+        self._config()
+        self._calendar()
+        call, _ = self._broker()
+
+        result = planner.plan_auto(self.conn, str(self.home), "SH",
+                                   today=f"{TODAY} 25:00:00", broker_call=call)
+
+        self.assertFalse(result["ok"])
+        self.assertIn("YYYY-MM-DD", result["error"])
+        self.assertEqual(self._plan_rows(), [])
 
     # ---- CLI 接线 ----
 

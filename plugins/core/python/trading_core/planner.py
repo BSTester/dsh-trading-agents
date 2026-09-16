@@ -22,6 +22,12 @@ CALENDAR_MARKET = {"SH": "SH", "SZ": "SH", "BJ": "SH", "HK": "HK", "US": "US"}
 CHAIN_MARKETS = ("SH", "HK", "US")
 #: 关注池新鲜度回看窗口（够覆盖长假即可）
 READINESS_LOOKBACK_DAYS = 40
+#: 市场会话收盘的**北京时刻**（相对会话本地日）：``(天数偏移, "HH:MM")``。
+#: 作业按北京时间触发，bars 与交易日历按**市场本地日期**落库——美股链两者相差一天
+#: （ET 会话收盘落在北京次日）。US 取 EST 最晚界 05:00（EDT 实为 04:00）：两制下
+#: 都已收盘，全年成立且**偏保守**（宁可晚 1 小时判定就绪，不拿未收盘的会话当已收盘）。
+SESSION_CLOSE_BEIJING = {"SH": (0, "15:00"), "SZ": (0, "15:00"), "BJ": (0, "15:00"),
+                         "HK": (0, "16:00"), "US": (1, "05:00")}
 
 
 def _now():
@@ -163,6 +169,64 @@ def symbols_for_market(home, market):
     return out
 
 
+def _stamp_parts(stamp):
+    """解析作业时刻：完整时刻 ``YYYY-MM-DD HH:MM:SS`` 或纯日期 ``YYYY-MM-DD``。
+
+    纯日期按**当日 23:59:59** 解释（「这一天已经过完」）：``plan_auto`` 的 ``today``
+    注入口径与既有测试都传日期，语义是「该日收盘后」；把纯日期当 00:00 会让按日注入的
+    调用一律落在收盘前而被保守跳过——那不是它们的本意。非法格式如实抛 ``ValueError``
+    （不静默回落：写错的时间戳会让演练结论失真，沿用 ``daemon.now_stamp`` 的口径）。
+    """
+    text = str(stamp).strip()
+    for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d"):
+        try:
+            parsed = datetime.strptime(text, fmt)
+        except ValueError:
+            continue
+        if fmt == "%Y-%m-%d":
+            return parsed.replace(hour=23, minute=59, second=59)
+        return parsed
+    raise ValueError(f"作业时刻需为 YYYY-MM-DD[ HH:MM:SS]，收到 {text!r}")
+
+
+def data_date_for(conn, market, stamp):
+    """本次作业负责的**市场本地会话日期**（规格 §4.2 数据就绪门）。
+
+    作业按北京时间触发，bars 与交易日历按市场本地日期落库——美股链两者相差一天
+    （ET 会话收盘 = 北京次日 04:00/05:00）。北京日直接当本地日用会让美股链的
+    「应有最后交易日」永远超前一天，数据就绪门每天静默跳过（实现期发现，2026-09-16）。
+    本函数把北京时刻折算到该市场本次作业负责的会话本地日：
+
+    1. 时刻早于该会话收盘（``SESSION_CLOSE_BEIJING`` 的北京时间）→ 返回 ``None``：
+       本次负责的会话尚未收盘，宁可不生成计划，也不把上一场的收盘当本场；
+    2. 候选本地日 = 北京日 − 天数偏移；
+    3. 取日历中 ≤ 候选日的**最近交易日**（周末/节假日回落到上一场——北京周一早上的
+       补跑因此落到上周五，正是美股链需要的语义）。
+
+    DST 无关：只依赖「收盘落在北京次日」这一事实（US 界 05:00 在 EDT/EST 两制下
+    都已收盘），不做制度换算。日历未同步 → ``RuntimeError``（调用方按「宁可不跑」处理）。
+    """
+    market = str(market).upper()
+    close = SESSION_CLOSE_BEIJING.get(market)
+    if close is None:
+        raise KeyError(f"未知市场链：{market}")
+    offset, hhmm = close
+    when = _stamp_parts(stamp)
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    # close_at 落在 stamp 当日：表的天数偏移已把「会话本地日 → 北京日」折算进去
+    # （US：候选日 + 1 = 北京日），因此这里只替换时刻、不挪日期。
+    if when < when.replace(hour=hour, minute=minute, second=0, microsecond=0):
+        return None
+    candidate = (when.date() - timedelta(days=offset)).isoformat()
+    calendar_market = CALENDAR_MARKET.get(market, market)  # SZ/BJ 用 SH 日历
+    start = (date.fromisoformat(candidate)
+             - timedelta(days=READINESS_LOOKBACK_DAYS)).isoformat()
+    days = store.trading_days(conn, calendar_market, start, candidate)
+    if not days:
+        raise RuntimeError(f"日历无交易日：{calendar_market} {start}..{candidate}")
+    return days[-1]
+
+
 def recent_trading_days(conn, market, today, window=1):
     """最近 window 个交易日（≤ today，降序，最近在前）。
 
@@ -193,6 +257,11 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
 
     软跳过的告警分级：关闭功能=静默（默认态不是异常）；其余原因=info/warn
     （warn 用于「本可运行但条件不满足」：数据未就绪/日历缺失/券商不可用）。
+
+    **日期空间（实现期修订，2026-09-16）**：``today`` 既接受完整时刻也接受纯日期
+    （纯日期 = 当日已过完）。数据就绪门与下游一律用 ``data_date_for`` 折算出的
+    **市场本地会话日**（美股 = 北京日前一天），不使用北京日——北京日只用于
+    「休市不生成」判定与告警文案。
     """
     from . import alerts
     from . import broker as core_broker
@@ -203,9 +272,10 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     try:
         # 时钟口径唯一实现在 daemon（显式 today > DSH_FAKE_NOW > 真实时间）；
         # 非法假时钟 fail-closed，不静默回落——否则演练会按真实日期生成计划。
-        today = today or daemon.now_stamp()[:10]
+        stamp = today or daemon.now_stamp()
     except ValueError as error:
         return {"ok": False, "error": str(error)}
+    beijing_today = str(stamp)[:10]  # 北京日：只用于休市判定与告警文案（见 docstring）
 
     def skip(reason, level=None, title=None):
         if level:
@@ -237,26 +307,33 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
         return {"ok": False, "error": str(error)}
 
     try:
-        is_trading_day = store.is_trading_day(conn, market, today)
+        is_trading_day = store.is_trading_day(conn, market, beijing_today)
     except RuntimeError as error:
         return skip(f"日历未同步：{error}", "warn", "日历未同步")
     if not is_trading_day:
-        return skip(f"{today} 非 {market} 交易日")  # 休市不是故障：不告警
+        return skip(f"{beijing_today} 非 {market} 交易日")  # 休市不是故障：不告警
 
-    # 数据就绪门期望的「最近已收盘交易日」：与 auto_execute 共用同一 helper
-    # （窗口 1 = 交易日维度最近一天，不含日期空间容差）
+    # 数据就绪门按**市场本地会话日**判定（北京日 ≠ 美股会话日，见 data_date_for）。
+    # 本次负责的会话尚未收盘 → info 软跳过（保守：宁可当日不生成计划，也不拿上一场
+    # 的收盘当本场，否则会把当日 kv ran 标记消耗掉、真到收盘后不再补跑）。
     try:
-        expected = recent_trading_days(conn, market, today, window=1)[0]
+        data_date = data_date_for(conn, market, stamp)
     except RuntimeError as error:
         return skip(f"日历未同步：{error}", "warn", "日历未同步")
+    except ValueError as error:
+        # 注入口径非法（CLI --today 是人工输入）：fail-closed 非零退出，与上面
+        # DSH_FAKE_NOW 非法同一分级——作业契约「永不抛」仍然成立。
+        return {"ok": False, "error": str(error)}
+    if data_date is None:
+        return skip(f"{market} 本次负责的会话尚未收盘（北京 {stamp}）", "info", "会话未收盘")
 
     symbols = symbols_for_market(home, market)
     if not symbols:
         return skip(f"关注池为空：market={market}", "warn", "关注池为空")
     stale = [s for s in symbols
-             if quality.freshness(conn, s, "1d", today)["last"] != expected]
+             if quality.freshness(conn, s, "1d", data_date)["last"] != data_date]
     if stale:
-        return skip(f"数据未就绪（应有最后交易日 {expected}）：{','.join(stale)}",
+        return skip(f"数据未就绪（应有最后交易日 {data_date}）：{','.join(stale)}",
                     "warn", "数据未就绪")
 
     strategy = strategies.REGISTRY.get(entry["strategy"])
@@ -264,12 +341,13 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
         return skip(f"策略未注册：{entry['strategy']}", "warn", "策略未注册")
 
     # 过期语义：先作废跨日的 auto 计划，再生成当日计划（只动 auto，手工计划不碰）
-    expired = store.cancel_stale_auto_plans(conn, today)
+    expired = store.cancel_stale_auto_plans(conn, data_date)
 
     # 组合策略需要 home 读配置，单标的策略没有该参数——按签名显式分派，不靠猜
     params = inspect.signature(strategy.target_weights).parameters
     try:
-        weights = strategy.target_weights(conn, today, **({"home": home} if "home" in params else {}))
+        weights = strategy.target_weights(conn, data_date,
+                                         **({"home": home} if "home" in params else {}))
     except ValueError as error:
         # 组合策略要读风控配置（权重上限）；trading-risk.json 非法时 risk_config 抛
         # ValueError——作业契约是「永不抛」，这里按 fail-closed 软跳过并告警
@@ -285,7 +363,7 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     # （后者会让已持仓标的继续逃过 diff，正是本修订要消除的缺口）。
     u_params = inspect.signature(strategy.universe).parameters
     try:
-        universe = strategy.universe(conn, today,
+        universe = strategy.universe(conn, data_date,
                                      **({"home": home} if "home" in u_params else {}))
     except Exception as error:  # noqa: BLE001 —— 作业契约「永不抛」
         return skip(f"策略 universe 读取失败：{str(error)[:120]}", "warn", "策略 universe 失败")
@@ -301,7 +379,7 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
 
     prices, no_price = {}, []
     for symbol in target:
-        px = daemon._last_close(conn, symbol, today)  # PIT 最近收盘，不盘中取数
+        px = daemon._last_close(conn, symbol, data_date)  # PIT 最近收盘，不盘中取数
         if px:
             prices[symbol] = px
         else:
@@ -325,7 +403,7 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     for symbol in (managed or ()):
         if symbol in prices or (positions.get(symbol, {}).get("qty") or 0) == 0:
             continue
-        px = daemon._last_close(conn, symbol, today)
+        px = daemon._last_close(conn, symbol, data_date)
         if px:
             prices[symbol] = px
         else:
@@ -333,7 +411,7 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
 
     plan = build_and_freeze(conn, mode=mode, strategy_id=entry["strategy"], target=target,
                             broker_positions=lambda _mode: (positions, equity),
-                            prices=prices, as_of=today, origin="auto", market=market,
+                            prices=prices, as_of=data_date, origin="auto", market=market,
                             risk_config=daemon.risk_config(home), managed=managed)
     return {"ok": True, "plan": plan, "expired": expired, "no_price": no_price,
             "no_atr": list(plan.get("skipped") or []), "equity": equity,

@@ -153,5 +153,97 @@ class PlannerTest(unittest.TestCase):
         self.assertEqual(store.get_orders_by_plan(self.conn, plan["plan_id"]), [])
 
 
+class DataDateForTest(unittest.TestCase):
+    """``planner.data_date_for``：北京时刻 → 市场本地会话日（规格 §4.2 数据就绪门）。
+
+    修复背景（2026-09-16 实现期发现）：北京日直接当本地日用会让美股链的「应有最后
+    交易日」永远超前一天 → 数据就绪门每天静默跳过，**美股自动计划永不生成**。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = store.connect(str(Path(self.tmp.name) / "t.sqlite"))
+        self.addCleanup(self.conn.close)
+
+    def _calendar(self, market, days):
+        store.upsert_calendar(self.conn, market, [
+            {"day": d, "trade_date_type": "WHOLE", "trade_second": 14400} for d in days])
+
+    def test_sh_hk_same_day_close(self):
+        """沪深/港股：收盘落在北京当日（15:00 / 16:00）——收盘前不给会话日。"""
+        self._calendar("SH", ["2026-09-15", "2026-09-16"])
+        self._calendar("HK", ["2026-09-15", "2026-09-16"])
+
+        self.assertEqual(planner.data_date_for(self.conn, "SH", "2026-09-16 16:20:00"),
+                         "2026-09-16")
+        self.assertEqual(planner.data_date_for(self.conn, "HK", "2026-09-16 16:40:00"),
+                         "2026-09-16")
+        # 收盘前 → 本次会话尚未收盘（保守：不拿上一场当本场）
+        self.assertIsNone(planner.data_date_for(self.conn, "SH", "2026-09-16 10:00:00"))
+        self.assertIsNone(planner.data_date_for(self.conn, "HK", "2026-09-16 15:30:00"))
+
+    def test_sz_bj_use_sh_calendar(self):
+        """SZ/BJ 归 SH 链：日历查 SH，会话时刻同沪深。"""
+        self._calendar("SH", ["2026-09-16"])
+        self.assertEqual(planner.data_date_for(self.conn, "SZ", "2026-09-16 16:20:00"),
+                         "2026-09-16")
+        self.assertEqual(planner.data_date_for(self.conn, "BJ", "2026-09-16 16:20:00"),
+                         "2026-09-16")
+
+    def test_us_close_lands_next_beijing_day(self):
+        """美股：会话收盘 = 北京次日 05:00 —— 北京 D 05:40 负责的是 ET D−1。"""
+        self._calendar("US", ["2026-09-14", "2026-09-15", "2026-09-16"])
+
+        self.assertEqual(planner.data_date_for(self.conn, "US", "2026-09-16 05:40:00"),
+                         "2026-09-15")
+        # 收盘前（北京 03:00 = ET 前一日盘中）→ 本次会话尚未收盘
+        self.assertIsNone(planner.data_date_for(self.conn, "US", "2026-09-16 03:00:00"))
+
+    def test_us_monday_morning_falls_back_to_friday(self):
+        """周末边界：北京周一早上负责的会话本地日 = 上周五（日历回落到最近交易日）。"""
+        self._calendar("US", ["2026-09-17", "2026-09-18"])  # 周四 / 周五
+
+        self.assertEqual(planner.data_date_for(self.conn, "US", "2026-09-21 05:40:00"),
+                         "2026-09-18")
+
+    def test_us_dst_agnostic(self):
+        """DST 无关：夏季（EDT）与冬季（EST）在同一北京时刻口径下结果一致。
+
+        表里 US 界取 EST 最晚界 05:00（EDT 实为 04:00）：两季都在 05:40 判「已收盘」，
+        且两季都在 04:30 判「尚未收盘」（EDT 下这是刻意的 1 小时保守余量）。
+        """
+        self._calendar("US", ["2026-01-14", "2026-07-14"])
+        summer = planner.data_date_for(self.conn, "US", "2026-07-15 05:40:00")
+        winter = planner.data_date_for(self.conn, "US", "2026-01-15 05:40:00")
+
+        self.assertEqual(summer, "2026-07-14")   # 夏令时
+        self.assertEqual(winter, "2026-01-14")   # 冬令时
+        # 不变量：会话本地日 = 北京日 − 1 天，两季相同——证明未做 DST 换算
+        offset = timedelta(days=1)
+        self.assertEqual(date.fromisoformat("2026-07-15") - date.fromisoformat(summer), offset)
+        self.assertEqual(date.fromisoformat("2026-01-15") - date.fromisoformat(winter), offset)
+        self.assertIsNone(planner.data_date_for(self.conn, "US", "2026-07-15 04:30:00"))
+        self.assertIsNone(planner.data_date_for(self.conn, "US", "2026-01-15 04:30:00"))
+
+    def test_date_only_stamp_means_end_of_day(self):
+        """纯日期注入 = 当日已过完（既有测试/补跑口径），不当 00:00 处理。"""
+        self._calendar("SH", ["2026-09-16"])
+        self._calendar("US", ["2026-09-15"])
+        self.assertEqual(planner.data_date_for(self.conn, "SH", "2026-09-16"), "2026-09-16")
+        self.assertEqual(planner.data_date_for(self.conn, "US", "2026-09-16"), "2026-09-15")
+
+    def test_calendar_missing_raises(self):
+        """日历未同步 → RuntimeError（调用方按「宁可不跑」处理，绝不猜日期）。"""
+        with self.assertRaises(RuntimeError):
+            planner.data_date_for(self.conn, "US", "2026-09-16 05:40:00")
+
+    def test_bad_stamp_raises(self):
+        """非法时刻如实抛错，不静默回落（写错的时间戳会让演练结论失真）。"""
+        self._calendar("SH", ["2026-09-16"])
+        with self.assertRaises(ValueError):
+            planner.data_date_for(self.conn, "SH", "2026/09/16 16:20")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
