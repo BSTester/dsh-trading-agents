@@ -134,3 +134,14 @@
 - [ ] 真实小额定单验证（live place/modify/cancel/confirm 全链）：
 - [ ] 真实交易事件到达后的推送事件体字段核对：
 - [ ] 长稳观察（reconnects 不异常增长、refresh 保活 ≥1 小时）：
+
+### WP8 最终整体审查（2026-09-16，独立探针 24+36 项全过）
+
+- 两层确认合一：place 抛 OrderConfirmRequired → 自动 order_confirm 且 POST /orders 恰一次；confirm 业务失败/传输失败/缺 confirm_id → OMS `unknown`；用户拒绝/TTL 超时 → 券商零调用 + `cancelled`。
+- 非信封/5xx/429 → OMS `unknown`（先查不重放），429 Retry-After 进 envelope；真业务错误 → `rejected`（严格二分）。
+- 事件桥：10 类事件映射/乱序/未知类型/无法定位全部收敛不崩；FILL 累计量口径保守。
+- PushRuntime：无凭据/通道=mcp 零副作用；交易 WS 无订阅帧（自动订阅语义）；鉴权连续失败 3 次封顶；healthz 与 push_status 同源。
+- 结论：**可交付**。遗留两条重要项（保守方向，登记为后续任务）：
+  - **P1** 「部分成交后撤单」对账永不收敛到终态（数量口径优先于状态文本）——需人工核对入口（记 diff 提示，不猜 cancelled）；
+  - **P2** A 股 live 订单不在推送对账覆盖（PUSH_RECONCILE_MARKETS=HK,US）——unknown→终态兜底链对 A 股缺口；
+  - 残余风险：交易事件体字段名为防御性猜测（未真实事件验证，命中不了只告警不误迁移）；真实 live 下单行为属 P4 第 11 项人工准入。
