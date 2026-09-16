@@ -48,3 +48,25 @@
 ### 执行顺序
 
 1 → 2 → 3 → 4 → 5 串行；每任务 TDD + 两阶段审查。真实网络验证（真实下单）仍属 P4 人工准入，不在自动化范围。
+
+---
+
+## 附录 A：WS 推送协议事实（2026-09-16 实抓官方文档，任务 4 实现依据）
+
+**行情 WS**（`wss://webapi-quote.futunn.com/ws`）：
+- 首帧鉴权：`{"action":"auth","data":{"auth_type":"appkey","credential_id":<AppKeyID>,"authorization":<sig>,"timestamp_ms":<ms>,"nonce":<n>}}`（OAuth 则 `auth_type:"oauth2"`, `authorization:"Bearer <token>"`）。
+- **WS 签名原文与 REST 不同**：`{timestamp_ms}\n{nonce}\nWEBSOCKET\nws/auth`（单次连接只用一种鉴权方式；不复用 REST 五段原文）。
+- 鉴权成功响应：`{"id","session_id","server_time"}`（`server_time` 微秒）。
+- **定时刷新**：至少每 10 分钟、建议每 5 分钟发送 `{"action":"refresh","data":{...同鉴权字段，timestamp/nonce 必须为新值...}}`；超 10 分钟不刷新服务端主动断开；刷新成功 `session_id` 不变。
+- 订阅/反订阅：`{"id","action":"subscribe|unsubscribe","quote":[...],"order_book":[...],"ticker":[...],"kline":[{"symbol","period","adjust"}]}`；应答 `{"id","code":0,"message":""}`（`code!=0` 为失败）。
+- 推送类型：`QUOTE`/`ORDER_BOOK`/`TICKER`/`KLINE`/`BROKER_QUEUE`（港股衍生，无需订阅字段）/`MARKET_STATE`。
+- K 线周期枚举含 1m/3m/5m/10m/15m/30m/60m/120m/180m/240m/1D/1W/1M/1Q/1Y；复权 `none|forward_exclude_dividend|forward_include_dividend|forward`。
+- **无业务层 JSON 心跳**：用协议层 ping/pong + 库的空闲/超时检测，禁止发 `{"action":"heartbeat"}`。
+- 断线：重连→重新鉴权→按本地订阅意图表重新订阅；首屏与断线补齐用 REST（snapshot/quote/order-book/cur-kline/rt-ticker）。
+
+**交易 WS**（`wss://webapi-trade.futunn.com/ws`）：
+- 鉴权同上（先鉴权后推送）；**已核对 `trade_event_push/auth.md`：帧格式与签名原文与行情 WS 完全同构**——`{timestamp_ms}\n{nonce}\nWEBSOCKET\nws/auth`；刷新要求同为「至少 10 分钟、建议 5 分钟」；鉴权成功响应同为 `{id,session_id,server_time}`。**鉴权成功后自动订阅该用户全部交易事件，无需发送订阅请求**。
+- 事件类型（10）：`EVENT_NEW`/`EVENT_REPLACED`/`EVENT_CANCELED`/`EVENT_EXPIRED`/`EVENT_FILL`/`EVENT_NEW_REJECTED`/`EVENT_REPLACE_REJECTED`/`EVENT_CANCEL_REJECTED`/`EVENT_FILL_CORRECT`/`EVENT_FILL_CANCEL`。
+- **关键约束**：① 断线期间事件**不补发** → 重连后必须经 REST 对账补齐；② 事件**不保证严格顺序** → 不得把推送顺序当作状态机唯一驱动（REST 查询/对账仍为事实来源）；③ 长连接需重连+重新鉴权；④ 需定时 refresh 维持连接。
+
+**任务 4 实现要求（据上述事实）**：`platform/server/futu_push.py` 实现 QuotePushClient（鉴权/刷新/订阅幂等/重连/本地订阅意图表）与 TradePushClient（鉴权/自动接收事件/重连）；交易事件 → OMS 状态迁移 + 告警，但**对账兜底轮询保留**（推送丢失时仍能收敛）；事件仅作加速，不作为唯一事实源。DSH_WP8_SLOW 下提供真实连接冒烟（有凭据时）。
