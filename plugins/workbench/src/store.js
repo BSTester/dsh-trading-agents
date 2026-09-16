@@ -1,3 +1,11 @@
+// tradingWorkbench 服务锚（engine 对话工具与账户策略的进程内依赖）。
+//
+// WP7 面板退役（用户决策 2026-09-16）：legacy 面板（client.js）与 Host Connection RPC
+// 已随独立服务（platform/）承接全部工作台能力而移除；实盘业务确认三方法
+// （requestConfirmation/confirmationView/decideConfirmation）一并退役——
+// 确认现在只存在于服务侧（platform/server/store_access.py，Web 确认卡片作答）。
+// 本文件只保留：runs/reports/previews/activity/observations、模式互斥、调用租约与
+// trade_summary 派生（经 broker_trades.js）。
 import { summarizeBrokerActivity } from "./broker_trades.js";
 import { zh } from "./labels.js";
 import { randomUUID } from "node:crypto";
@@ -14,67 +22,6 @@ const ABANDONED_AFTER_MS = 2 * 60 * 60 * 1000;
 
 export class WorkbenchError extends Error {}
 
-/**
- * 实盘业务确认的存活时长。超时按**拒绝**处理（fail-closed）：
- * 一笔没人看的委托不该因为"等太久"就自动生效。
- */
-export const CONFIRM_TTL_MS = 120_000;
-
-/**
- * 需要业务确认的实盘操作类型（按工具名后缀判定）。
- *
- * 三类都确认，包括撤单：确认回答的是"这笔业务参数对不对"，撤错单同样是业务错误
- * （撤掉保护性止损、撤错 order_id）。放宽只需要改这一张表。
- */
-export const CONFIRM_OPERATIONS = Object.freeze({ input: "下单", modify: "改单", cancel: "撤单" });
-
-/** 从工具名取出操作类型：`mcp__futu__trading_input_order` → `input`。 */
-export function orderOperation(tool) {
-  const match = /(?:^|_)(input|modify|cancel)_order$/.exec(String(tool ?? ""));
-  return match ? match[1] : null;
-}
-
-/** 方向：1=Buy 2=Sell（工具 schema 明文）。 */
-const ORDER_SIDE = { 1: "买入", 2: "卖出", "1": "买入", "2": "卖出" };
-/**
- * 市场代码 → 中文提示。取值来自 `sim_trade_account_list` 的**实测返回**
- * （港股账户 market=1、A股账户 market=3、美股账户 market=100），
- * 不是从文档猜的：P4 文档明确要求"使用实际返回的 market_id"下单。
- * 未列出的代码不猜，原样显示并提示核对。
- */
-const MARKET_HINT = { 1: "港股", 3: "A股", 100: "美股" };
-
-/**
- * 把券商写操作的工具入参渲染成中文订单摘要。
- *
- * 未知字段一律原样列出、未知枚举附上原始代码——摘要的作用是让人核对，
- * 不是替人解释。宁可显示得笨一点，也不能把没认出来的字段藏起来。
- */
-export function describeOrderArgs(tool, args = {}) {
-  const normalized = {};
-  for (const [key, value] of Object.entries(args ?? {})) normalized[key.toLowerCase()] = value;
-  const raw = (key) => normalized[key];
-  const fields = [];
-  const push = (label, value) => {
-    if (value === undefined || value === null || value === "") return;
-    fields.push({ label, value: String(value) });
-  };
-  const market = raw("market");
-  push("账户", raw("acc_id"));
-  push("市场", market === undefined ? undefined
-    : MARKET_HINT[market] ? `${market}（${MARKET_HINT[market]}）` : `${market}（未识别的市场代码，请核对）`);
-  push("标的", raw("symbol"));
-  const side = raw("order_side") ?? raw("trd_side");
-  push("方向", side === undefined ? undefined
-    : ORDER_SIDE[side] ? `${ORDER_SIDE[side]}（order_side=${side}）` : `未识别（order_side=${side}，请核对）`);
-  push("数量", raw("qty") ?? raw("quantity"));
-  push("价格", raw("price"));
-  push("订单类型", raw("order_type"));
-  push("订单号", raw("order_id"));
-  push("有效期", raw("time_in_force") ?? raw("order_trade_time_type"));
-  push("备注", raw("text") ?? raw("remark"));
-  return { tool, fields, raw: args ?? {} };
-}
 class WorkbenchBusyError extends WorkbenchError {}
 
 function text(value, label, max = 200) {
@@ -126,15 +73,6 @@ export function withRunStatus(run, now = Date.now()) {
 export { ABANDONED_AFTER_MS };
 
 export class WorkbenchStore {
-  /**
-   * 待确认的实盘业务动作（内存态，不落盘）。
-   *
-   * 为什么只在内存：确认是"此刻等人回答"的瞬时状态，进程重启后本就无人回答，
-   * 落盘反而会让一个陈旧请求在重启后复活。持久化的是**事件留痕**（activity），
-   * 用于事后追溯谁在何时批了哪一笔。
-   */
-  pendingConfirmation = null;
-
   constructor(home = process.env.DSH_HOME || path.join(os.homedir(), ".dsh")) {
     this.home = home;
     this.file = path.join(home, "trading-workbench.json");
@@ -288,125 +226,10 @@ export class WorkbenchStore {
       trade_summary: summarizeBrokerActivity(activity),
       broker: state.broker[mode] ?? null,
       in_flight: this.inFlight,
-      // 待确认的业务动作：UI 轮询 confirmation 端点读它（snapshot 是 60 秒一次，太慢）
-      confirmation: this.confirmationView(),
       pending_observations: this.pendingObservations().length,
       recording_error: this.recordingError,
       notice: "交易动态来自 Harness 最近的富途工具响应，不是券商成交推送；下单、撤单及对话请在 Harness 中完成。",
     };
-  }
-
-  /**
-   * 发起一次**业务确认**并等待用户在工作台作答。
-   *
-   * 与 DSH 的 approval 系统完全无关：权限确认回答的是"这个动作准不准做"，
-   * 由会话的 approval policy 裁决；而 full-access（policy="never"）下
-   * `approval.decide()` 会直接返回 rejected，连问都不问
-   * （dsh-user-approval 的 decide()）。"这笔业务参数对不对"是交易动作的固有
-   * 环节，不该因为系统被设成免打扰就静默拒绝。
-   *
-   * 因此写操作在这里无条件等人确认，调用方据结果返回 allow/deny，
-   * **永不返回 {kind:"ask"}** —— 权限系统无从介入。
-   *
-   * 回答只能来自工作台 RPC（`decideConfirmation`）；工具参数无法自证已确认，
-   * 模型不能自己批自己。
-   *
-   * @returns {Promise<{decision:"approved"|"rejected", reason:string, id:string}>}
-   *          超时/取消一律 rejected（fail-closed）。
-   */
-  requestConfirmation({ tool, mode, args, session_id, ttlMs = CONFIRM_TTL_MS, signal } = {}) {
-    modeValue(mode);
-    if (mode !== "live") throw new WorkbenchError("只有实盘写操作需要业务确认");
-    if (typeof tool !== "string" || !tool.trim()) throw new WorkbenchError("Invalid tool name");
-    // 一次只允许一笔：两笔并发时"我看到的是哪一笔"会变模糊，宁可让后来的重试
-    if (this.pendingConfirmation) {
-      return Promise.resolve({ decision: "rejected", id: null,
-        reason: "已有一笔待确认的实盘操作，请先在工作台处理它再重试" });
-    }
-
-    const id = randomUUID();
-    const at = new Date();
-    const request = {
-      id, at: at.toISOString(), expires_at: new Date(at.getTime() + ttlMs).toISOString(),
-      mode, tool, session_id: session_id ?? "unknown",
-      operation: CONFIRM_OPERATIONS[orderOperation(tool)] ?? "实盘写操作",
-      summary: describeOrderArgs(tool, args),
-      status: "pending", decided_at: null, decided_by: null,
-    };
-    this.pendingConfirmation = request;
-    this.recordConfirmationEvent("confirmation_requested", request);
-
-    return new Promise((resolve) => {
-      let settled = false;
-      const settle = (decision, reason) => {
-        if (settled) return;
-        settled = true;
-        clearTimeout(timer);
-        signal?.removeEventListener?.("abort", onAbort);
-        resolve({ decision, reason, id });
-      };
-      const onAbort = () => {
-        request.status = "cancelled";
-        this.pendingConfirmation = null;
-        this.recordConfirmationEvent("confirmation_cancelled", request, "会话已中断");
-        settle("rejected", "会话已中断");
-      };
-      // 注意**不能** unref：这个定时器保证"没人回答也会到期拒绝"。
-      // unref 掉之后，进程在没有其他活时可以直接退出，Promise 永不 settle ——
-      // 一个正在等人的工具调用会变成悬空。TTL 只有两分钟，钉住这段时间是应该的。
-      const timer = setTimeout(() => {
-        request.status = "expired";
-        this.pendingConfirmation = null;
-        this.recordConfirmationEvent("confirmation_expired", request, `超过 ${Math.round(ttlMs / 1000)} 秒未确认`);
-        settle("rejected", `超过 ${Math.round(ttlMs / 1000)} 秒未确认，按拒绝处理`);
-      }, ttlMs);
-      // settle 是内部句柄，只在内存里挂着；confirmationView() 不会把它送出去
-      request.settle = settle;
-      if (signal?.aborted) { onAbort(); return; }
-      signal?.addEventListener?.("abort", onAbort, { once: true });
-    });
-  }
-
-  /** 当前待确认项的只读视图（不含 settle，避免把内部句柄送到界面）。 */
-  confirmationView() {
-    const request = this.pendingConfirmation;
-    if (!request) return null;
-    return { id: request.id, at: request.at, expires_at: request.expires_at,
-      mode: request.mode, tool: request.tool, operation: request.operation,
-      session_id: request.session_id, status: request.status, summary: request.summary };
-  }
-
-  /**
-   * 用户在工作台作出决定。**这是唯一能批准实盘操作的入口**。
-   * @param {{id:string, decision:"approved"|"rejected"}} input
-   */
-  decideConfirmation({ id, decision } = {}) {
-    if (decision !== "approved" && decision !== "rejected") {
-      throw new WorkbenchError("Invalid decision; expected approved/rejected");
-    }
-    const request = this.pendingConfirmation;
-    if (!request) throw new WorkbenchError("没有待确认的实盘操作（可能已超时或被处理）");
-    if (request.id !== id) throw new WorkbenchError("确认编号不匹配；可能已被处理或已超时");
-    this.pendingConfirmation = null;
-    request.status = decision;
-    request.decided_at = new Date().toISOString();
-    // 唯一能批准实盘操作的入口就是工作台 RPC，所以主体恒为工作台界面
-    request.decided_by = "workbench-ui";
-    this.recordConfirmationEvent(
-      decision === "approved" ? "confirmation_approved" : "confirmation_rejected", request);
-    request.settle?.(decision, decision === "approved" ? "用户在工作台确认" : "用户在工作台拒绝");
-    return { id, decision, tool: request.tool, operation: request.operation };
-  }
-
-  /** 确认链路的活动留痕；写盘失败不影响确认本身（锁被占用时不能卡住等人回答）。 */
-  recordConfirmationEvent(kind, request, note) {
-    try {
-      this.update((state) => this.event(state, {
-        kind, mode: request.mode, tool: request.tool, operation: request.operation,
-        confirmation_id: request.id, session_id: request.session_id, ...(note ? { note } : {}),
-        summary: request.summary?.fields ?? [],
-      }));
-    } catch { /* 留痕尽力而为，绝不因此改变确认结论 */ }
   }
 
   switchMode({ mode, expected_mode, confirmation }) {

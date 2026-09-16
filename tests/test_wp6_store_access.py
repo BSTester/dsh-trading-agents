@@ -1,13 +1,13 @@
 """WP6 补遗 B1 差分测试：store 访问层 Python 移植（平台侧只读快照/模式切换/管理动作/业务确认）。
 
-对照基准是 plugins/workbench/src/store.js 与 scripts/workbench_admin.mjs 的实际行为；
-用例逐条钉死字段名、过滤/倒序、2h 派生阈值、锁协议、错误消息。全部离线，临时 home 目录
+对照基准是 plugins/workbench/src/store.js（WP7 面板退役后的服务锚版本）与
+scripts/workbench_admin.mjs 的实际行为；用例逐条钉死字段名、过滤/倒序、2h 派生阈值、锁协议、错误消息。全部离线，临时 home 目录
 显式传给每个 API——store_access 自己**不读** DSH_HOME（那是 config.py 的职责，见
 tests/test_wp6_service_locks.py），所以这里不再改环境变量。
 
 业务确认（2026-09-15 main 修订）另有一节：``request_confirmation``/``confirmation_view``/
 ``decide_confirmation`` 的 TTL 超时、signal 取消、重复决定、跨 home 隔离。确认是**进程内
-内存态**（store.js:136 的语义），因此这些用例不需要落盘校验之外的夹具。
+内存态**（Node 侧原实现同语义，该实现已随 legacy 面板退役），因此这些用例不需要落盘校验之外的夹具。
 """
 import json
 import stat
@@ -264,8 +264,9 @@ class SnapshotTest(StoreAccessBase):
 
     def test_endpoints_manifest_is_23_and_cached(self):
         endpoints = sa.endpoints()
-        # 22 legacy（endpoints.js 文本提取）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS；
-        # 任务 3 起含 factors-history + 6 个交易端点，共 29）
+        # 29 项 = 22 项基础清单（WP7 面板退役后冻结在 sa._BASE_ENDPOINTS，原序=已删
+        # endpoints.js 的数组原序）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS；
+        # 任务 3 起含 factors-history + 6 个交易端点，共 29）。整表钉死见 test_wp6_tables_lock。
         expected = 22 + len(sa.WP7_ENDPOINTS)
         self.assertEqual(len(endpoints), expected)
         self.assertEqual(expected, 29)
@@ -568,7 +569,9 @@ class AdminPruneRunsTest(StoreAccessBase):
 
 
 class ConfirmationTest(StoreAccessBase):
-    """store.js:299-410 业务确认三方法的移植（TTL 超时 / signal 取消 / 重复决定 / 隔离）。
+    """业务确认三方法（服务自有实现；TTL 超时 / signal 取消 / 重复决定 / 隔离）。
+
+    Node 侧同名实现已随 legacy 面板退役（WP7），本类钉死的是服务侧行为。
 
     ``request_confirmation`` 是**阻塞**调用（Node 的 Promise 等价物），因此「等人作答」的
     用例在后台线程里发起，主线程用 ``confirmation_view`` 看到待确认项后再决定。超时与取消
@@ -615,7 +618,8 @@ class ConfirmationTest(StoreAccessBase):
         return json.loads(sa.store_file(home).read_text(encoding="utf-8"))["activity"]
 
     # —— 常量与纯函数 ——
-    def test_confirm_ttl_and_operations_match_store_js(self):
+    def test_confirm_ttl_and_operations_are_frozen(self):
+        """确认常量现为服务自有（Node 侧同名实现已随 legacy 面板退役），值钉死。"""
         self.assertEqual(sa.CONFIRM_TTL_MS, 120_000)
         self.assertEqual(sa.CONFIRM_OPERATIONS, {"input": "下单", "modify": "改单",
                                                  "cancel": "撤单"})
@@ -629,7 +633,7 @@ class ConfirmationTest(StoreAccessBase):
         self.assertIsNone(sa.confirmation_view(self.home))
 
     def test_summary_renders_chinese_order_fields(self):
-        """摘要与 store.js 同形：中文可核对字段 + 未知枚举原样显示 + raw 原样保留。"""
+        """中文可核对字段 + 未知枚举原样显示 + raw 原样保留（与退役前 Node 实现同语义）。"""
         summary = sa.describe_order_args(self.TOOL, self.ARGS)
         self.assertEqual(summary["tool"], self.TOOL)
         self.assertEqual(summary["raw"], self.ARGS)

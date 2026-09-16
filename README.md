@@ -5,9 +5,9 @@
 DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 多角色投研流水线装进 Harness，数据与交易能力来自[富途远程 MCP](https://github.com/FutunnOpen/futu-agent-plugin)（免 OpenD、OAuth 授权）。
 
 **Harness 是唯一对话与指令入口。** 工作台自 WP6 起是**独立 Web**（FastAPI 单进程托管，
-默认 `http://127.0.0.1:8397`；同一批能力另有 `mcp__quantwb__*` MCP 工具面），Harness 内
-legacy 面板过渡期并存。两种形态都只用于查看研报、交易概要、量化信息预览及切换
-模拟盘/实盘；没有独立聊天、下单或撤单入口。
+默认 `http://127.0.0.1:8397`；同一批能力另有 `mcp__quantwb__*` MCP 工具面），也是**唯一
+工作台界面**（Harness 内 legacy 面板已于 WP7 退役）。工作台只用于查看研报、交易概要、
+量化信息预览及切换模拟盘/实盘；没有独立聊天、下单或撤单入口。
 
 ```
 市场分析师 ┐
@@ -105,7 +105,7 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 
 ## 维护：清掉"进行中"的研究记录
 
-被中断的会话会留下停在 `running` 的研究 run，面板「研究」页会一直显示"进行中"。
+被中断的会话会留下停在 `running` 的研究 run，工作台「研究」页会一直显示"进行中"。
 
 **首选方式：直接在对话里说**（工作台是只读展示，指令入口只有对话）：
 
@@ -130,7 +130,7 @@ node "$ADMIN" prune-runs [--hours 2]                  # 删除孤儿 run（有�
 ```
 
 - **取消**（`cancelled`）：用户主动决定不做，**保留记录**供追溯，并写一条 `research_cancelled` 活动日志；
-- **自动判定**（`abandoned`）：超过 **2 小时**仍 `running` 的，面板按派生状态显示为已中断
+- **自动判定**（`abandoned`）：超过 **2 小时**仍 `running` 的，工作台按派生状态显示为已中断
   （不改写磁盘数据）。阈值较宽是因为真实投研 run 可能跑较久；
 - **删除**（`prune-runs`）：只删无研报的孤儿，**有研报的一律保留**。
 
@@ -178,9 +178,8 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 会话内的富途写工具（`mcp__futu__sim_trade_*`/`trading_*` 的下单/改单/撤单动词）被工具
 策略**一律拒绝并指引工作台**，不会产生待确认项；真实下单走 `mcp__quantwb__trade_*` 工具，
 待确认项出现在**独立 Web 的确认卡片**（中文订单摘要，批准/拒绝各一次；TTL 120s 超时按
-拒绝收尾）。历史上 Harness 会话侧发起、legacy 面板作答的确认路径已随收窄不可达（面板
-确认 UI 保留至退役）。跨进程的历史约束与设计参考见
-[docs/architecture.md](docs/architecture.md) 的「业务确认」两节。
+拒绝收尾）。历史上 Harness 会话侧发起、legacy 面板作答的确认路径已随收窄不可达，
+该路径连同面板确认 UI 已于 WP7 退役删除——服务侧 Web 确认卡片是唯一确认通道。
 
 ## WP7：独立量化平台（服务内调度 / 因子收集 / 交易闸门）
 
@@ -205,8 +204,8 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 
 ## 工作台与指令示例
 
-完整安装并重启 Harness、刷新页面后，点击右下角 **「交易工作台」**（legacy 面板，
-过渡期保留）；或按上节启动独立 Web 后在浏览器打开 `http://127.0.0.1:8397`：
+按上节启动独立 Web 后在浏览器打开 `http://127.0.0.1:8397`（Harness 内没有工作台面板，
+插件只提供 `tradingWorkbench` 服务锚）：
 
 | 页面内容 | 数据从哪里来 |
 |---|---|
@@ -216,7 +215,7 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 | 持仓风险 | 按账户分组的集中度（占持仓市值 / 占总资产两个口径）与浮盈亏分布；**不跨账户合计** |
 | K 线图 | 富途 K 线（默认日线，可切 60m/15m/5m/1m）；按周期缓存，切页签不重复取数；**鼠标悬停显示该根 K 线的日期、开高低收、涨跌幅与成交量** |
 | 量化预览 | 在 Harness 请求 `quant_signal`、`quant_backtest`、`quant_report` 的结果 |
-| 模拟盘/实盘切换 | 独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）显式操作；实盘输入「确认实盘」，但不授权订单（legacy 面板过渡期仍有同款口令流程） |
+| 模拟盘/实盘切换 | 独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）显式操作；实盘输入「确认实盘」，但不授权订单 |
 
 仍然在 **Harness 对话中**下达指令，例如：
 
@@ -228,7 +227,7 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 >
 > 展示这笔订单的完整摘要，等我确认后再提交。
 
-面板打开时每 3 秒刷新本地快照，关闭后停止刷新；不会自动调用模型、券商或回测。
+工作台页面打开时每 3 秒刷新本地快照，关闭后停止刷新；不会自动调用模型、券商或回测。
 **工具响应不等于成交**，当前尚未接入券商实时成交推送。没有账户数据时显示未知，
 本地量化模拟资金也不会冒充富途账户余额。
 
@@ -312,13 +311,13 @@ quote:read quote:write trade:read trade:write accid:...
 
 即**多授了 `trade:write`**。所以不要指望通过收窄 `scope` 参数来限制权限——真正的执行边界是
 本仓库自己的两层：**账户模式互斥（默认 sim）** + **工作台业务确认（实盘写操作逐笔由用户在
-legacy 面板作答；独立服务侧的确认通道见 [docs/architecture.md](docs/architecture.md) 的「业务确认的跨进程边界」）**。
+独立 Web 的确认卡片作答，见 [docs/architecture.md](docs/architecture.md) 的「业务确认表述统一」）**。
 这带来一个必须知道的推论：模式守卫是**插件级**的，凭据本身允许写操作；
 若绕过插件直接以 HTTP 调券商接口（本仓库明令禁止），模式守卫不会拦你。请在授权页面上
 按需选择权限，并始终经由 Harness 的工具体系下单。
 
 **安全说明**：未设置模式时默认模拟盘；完整插件模式下有账户工具守卫与**工作台业务确认**
-（实盘写操作在 legacy 面板逐笔作答，独立于权限档位），
+（实盘写操作在独立 Web 确认卡片逐笔作答，独立于权限档位），
 会话仍需逐笔复述并确认订单。仅安装 skill 不具备插件级守卫。日常建议只授权只读 scope。
 
 ## 模拟盘 / 实盘互斥开关
@@ -332,7 +331,7 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # �
 ```
 
 实盘启用只能由用户在工作台确认；脚本不再支持写入 live，模型也不能用参数替用户确认。
-切回模拟盘可在面板操作，或在 Harness 请求 `quant_switch(mode="sim")`。
+切回模拟盘可在工作台操作，或在 Harness 请求 `quant_switch(mode="sim")`。
 配置 `DSH_HOME` 时，安装器和运行时共同使用该目录。
 
 
@@ -348,7 +347,7 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # �
 ├── plugins/core/         # 量化平台核心库 trading_core（库，非插件）：PIT 存储/研究/执行/调度与运维
 ├── plugins/engine/       # 研究记录/发布、量化工具、账户策略；含 Python 量化实现
 ├── plugins/fin-data/     # 统一新闻与舆情工具
-├── plugins/workbench/    # Host 状态服务 + Harness Client 面板与卡片（legacy 面板，过渡期保留）
+├── plugins/workbench/    # tradingWorkbench 服务锚（engine 工具与账户策略依赖；面板已退役，UI 在 platform/）
 ├── plugins/quant/        # 旧量化脚本兼容入口
 ├── platform/             # 独立工作台服务：server/（FastAPI 单进程：HTTP API + MCP + 静态托管）
 │                         #   + web/（Vite + antd5 + ProComponents 前端，构建产物 dist/）
@@ -359,7 +358,7 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # �
 
 ## 实盘交易（P4）
 
-尚未达到无人值守实盘准入条件。模式开关和展示面板可用不代表策略、券商对账、
+尚未达到无人值守实盘准入条件。模式开关和工作台展示可用不代表策略、券商对账、
 监控熔断都已完成。实盘前置条件与边界见 [docs/P4-live-trading.md](docs/P4-live-trading.md)。
 
 ## 免责声明

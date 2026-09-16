@@ -1,11 +1,14 @@
 """WP6 补遗 B2 差分测试：交易概要 / 审计链 / 中文标签的 Python 移植。
 
-对照基准是 plugins/workbench/src/broker_trades.js、plugins/workbench/src/audit.js 与
-plugins/workbench/src/labels.js 的**实际运行结果**，不是对 JS 源码的二次解读：
+对照基准是 plugins/workbench/src/broker_trades.js（仍在）与 plugins/workbench/src/audit.js、
+plugins/workbench/src/labels.js（labels.js 仍在；audit.js 已随 legacy 面板于 WP7 退役删除）
+的**实际运行结果**，不是对 JS 源码的二次解读：
 
-  * 每个 fixture 的 Python 字典由本文件顶部的夹具函数构造（与 tests/broker-trades.test.mjs /
-    tests/audit.test.mjs 的 entry()/ORDER/envelope 形状逐字对应）；
-  * 同一组 fixture 送进 Node 侧真实函数，把返回的完整 JSON 快照压进 _NODE_REFERENCE_B64；
+  * 每个 fixture 的 Python 字典由本文件顶部的夹具函数构造（与 tests/broker-trades.test.mjs
+    的 entry()/ORDER/envelope 形状逐字对应；audit 组的形状来源 = Node 历史实跑参照，
+    audit.js 已随面板退役，其原测试 tests/audit.test.mjs 一并删除）；
+  * 同一组 fixture 送进 Node 侧真实函数（一次性探针，audit.js 退役前实跑），把返回的
+    完整 JSON 快照压进 _NODE_REFERENCE_B64——该串是 audit.js 行为的**最终定格**；
   * test_node_reference_parity 对每个 fixture 做 `self.assertEqual(python_out, node_out)` 递归比较，
     test_node_shape_parity 再递归比对键集**与叶子数值类型**（integer / float 分开）。
 
@@ -96,7 +99,7 @@ def _entry(tool, payload, extra=None):
 
 
 def _envelope(payload):
-    """audit.test.mjs:100：MCP 信封（业务 JSON 是 value.content[].text 里的**字符串**）。"""
+    """MCP 信封（业务 JSON 是 value.content[].text 里的**字符串**）；形状来源 = Node 历史实跑参照（audit.js 已随面板退役）。"""
     return {"value": {"content": [{"type": "text", "text": json.dumps(payload, ensure_ascii=False,
                                                                      separators=(",", ":"))}]}}
 
@@ -491,7 +494,7 @@ def _max_entries_cases():
 
 
 def _field_cases():
-    """extractBrokerFields 的用例（audit.test.mjs:59-64/102-121 的输入）。"""
+    """extractBrokerFields 的用例（输入取自 Node 历史实跑参照；audit.js 已随面板退役）。"""
     return {
         "prefix_strip": {"data": {"code": "HK.00700", "order_id": 42, "status": "FILLED"}},
         "suffix_strip": {"symbol": "600519.SH"},
@@ -1139,7 +1142,7 @@ class AuditBehaviourTest(unittest.TestCase):
         self.assertEqual(ac.build_audit_chain({}, {}), chain, "空 dict 必须等价于空输入")
 
     def test_trades_without_snapshot_still_returns_chain(self):
-        """audit.test.mjs:87-95 的等价物：台账可读、快照空时链路仍在。"""
+        """台账可读、快照空时链路仍在（Node 历史实跑参照用例；audit.js 已随面板退役）。"""
         chain = ac.build_audit_chain({}, _SIGNAL_TRADES)
         self.assertEqual(chain["stats"]["fills"], 1)
         self.assertEqual(chain["stats"]["orders"], 0)

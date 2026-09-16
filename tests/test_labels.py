@@ -1,14 +1,16 @@
-"""中文标签表的三份拷贝必须一致。
+"""中文标签表的两份拷贝必须一致。
 
 唯一事实来源是 `trading_datasource/labels.py`：
 
   * 产出侧（engine/backtest/analytics）用它给结论字段附中文标签；
-  * `plugins/workbench/src/labels.js` 是 Host 侧镜像，用于翻译旧记录；
-  * `plugins/workbench/src/client.js` 里的 `ZH` 是浏览器侧回退表
-    （client 是单文件、无法 import，只能内置）。
+  * `plugins/workbench/src/labels.js` 是 Host 侧镜像，用于翻译旧记录。
 
-三份表一旦漂移，界面就会在旧记录上翻出英文，或者同一结论在不同页面
-显示成不同中文。因此这里直接解析三份源码比对，而不是相信"记得同步"。
+（历史上第三份拷贝是 `plugins/workbench/src/client.js` 里的浏览器侧回退表 `ZH`；
+该文件已随 legacy 面板于 WP7 退役——独立 Web 前端直接复用 labels.py 的产出，
+不再内置回退表——相应比对段随之删除。）
+
+两份表一旦漂移，界面就会在旧记录上翻出英文，或者同一结论在不同页面
+显示成不同中文。因此这里直接解析两份源码比对，而不是相信"记得同步"。
 """
 import importlib.util
 import re
@@ -22,7 +24,6 @@ sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 from trading_datasource import labels as canonical  # noqa: E402
 
 LABELS_JS = ROOT / "plugins" / "workbench" / "src" / "labels.js"
-CLIENT_JS = ROOT / "plugins" / "workbench" / "src" / "client.js"
 
 # labels.py 里所有"表"，以及它们对应的导出名
 TABLES = ["SIGNAL", "ACTION", "SIDE", "TRADE_TYPE", "TRADE_STATUS", "RATING",
@@ -70,15 +71,6 @@ class LabelParityTests(unittest.TestCase):
                 self.assertIsNotNone(parsed, f"labels.js 缺少 {name}")
                 self.assertEqual(parsed, python_table(name),
                                  f"{name} 在 labels.py 与 labels.js 之间不一致")
-
-    def test_client_embedded_mirror_matches_python(self):
-        source = CLIENT_JS.read_text(encoding="utf-8")
-        for name in TABLES:
-            with self.subTest(table=name):
-                parsed = parse_js_object(source, name)
-                self.assertIsNotNone(parsed, f"client.js 的 ZH 缺少 {name}")
-                self.assertEqual(parsed, python_table(name),
-                                 f"{name} 在 labels.py 与 client.js 之间不一致")
 
     def test_every_conclusion_code_has_a_chinese_label(self):
         """结论枚举不能有漏网的英文值——漏了就说明界面还可能显示英文。"""

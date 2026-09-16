@@ -128,13 +128,10 @@ test("读类保留模式互斥（R1 口径）：模式外的账户查询仍拒�
 
 // ===================== 三、pre-execute：业务确认退役 =====================
 
-test("pre-execute 不再发起业务确认：requestConfirmation 不被调用、无待确认、next 正常放行", async (t) => {
+test("pre-execute 不再发起业务确认：只透传 next 的结论、无任何确认副作用", async (t) => {
   await inTempHome(t);
   const store = new WorkbenchStore();
   await store.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
-  let confirmCalls = 0;
-  const original = store.requestConfirmation.bind(store);
-  store.requestConfirmation = (...args) => { confirmCalls += 1; return original(...args); };
   const { guard, preExecute } = fakeHarness(store);
 
   // 写类在 guard 已拒（Harness 内不可达）
@@ -143,8 +140,9 @@ test("pre-execute 不再发起业务确认：requestConfirmation 不被调用、
   const decision = await preExecute(execOf("mcp__futu__trading_input_order",
     { acc_id: "A1", market: 100, symbol: "AAPL", order_type: 1, order_side: 1, qty: 1 }), ALLOW);
   assert.equal(decision.kind, "allow", "pre-execute 对写类只放行透传（决策=allow）");
-  assert.equal(confirmCalls, 0, "store.requestConfirmation 不得被调用");
-  assert.equal(store.confirmationView(), null, "不得产生任何待确认");
+  // WP7 面板退役：store 的确认三方法已删除，确认只存在于服务侧
+  assert.equal(store.requestConfirmation, undefined);
+  assert.equal(store.confirmationView, undefined);
 });
 
 // ===================== 四、非 futu 工具不受影响；execute/result 保留 =====================
@@ -180,19 +178,9 @@ test("tools/execute 租约与 tools/result 观察保留（账户读类照常生�
   assert.equal(store.snapshot().broker.value.position_list.length, 0, "最终响应照记");
 });
 
-// ===================== 五、store 确认方法保留（legacy，不删） =====================
-
-test("store.requestConfirmation/decideConfirmation 仍可用（legacy 面板过渡期 + 服务侧同语义）", async (t) => {
-  await inTempHome(t);
-  const store = new WorkbenchStore();
-  await store.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
-  const settling = store.requestConfirmation({
-    tool: "mcp__futu__trading_input_order", mode: "live", args: { qty: 1 }, session_id: "s1" });
-  const view = store.confirmationView();
-  assert.ok(view, "store 层确认流保留：仍能产生并裁决待确认");
-  store.decideConfirmation({ id: view.id, decision: "approved" });
-  assert.equal((await settling).decision, "approved");
-});
+// ===================== 五、store 确认方法退役（WP7 面板退役） =====================
+// 原此处的「store.requestConfirmation/decideConfirmation 仍可用（legacy 过渡期）」用例
+// 随三方法删除一并移除：确认现在只存在于服务侧（store_access.py + Web 确认卡片）。
 
 // ===================== 六、fail-closed：未知动词（WP7 任务 5 序言修复） =====================
 // 拒绝名单只列已知写动词的话，上游新增写动词（如 trading_order_place_v2）会被当

@@ -18,14 +18,15 @@
 #   labels.js:36-46   zh                  -> zh
 #   labels.js:49-52   labeled             -> labeled
 #
-# 镜像关系（同一份表的第四份拷贝，四者必须一致）：
+# 镜像关系（同一份表的三份拷贝，三者必须一致）：
 #   1. plugins/datasource/python/trading_datasource/labels.py —— 唯一事实来源（产出侧打 *_label）；
 #   2. plugins/workbench/src/labels.js —— Host 侧镜像，本文件的逐行来源；
-#   3. plugins/workbench/src/client.js 里的内置 ZH —— 浏览器侧回退表；
-#   4. 本文件 —— 平台服务（FastAPI 进程）侧的第四份镜像。
-# 关系 1↔2↔3 由 tests/test_labels.py 解析比对守护；本文件不在那份守护内（该测试只认
-# JS 侧三份），由 tests/test_wp6_summary_audit.py 的 test_tables_match_labels_js 逐表比对
-# labels.js 的键值，防止这第四份漂移。
+#   3. 本文件 —— 平台服务（FastAPI 进程）侧镜像。
+# （历史第四份：plugins/workbench/src/client.js 的内置 ZH 浏览器回退表，已随 legacy 面板
+#   于 WP7 退役删除。）
+# 关系 1↔2 由 tests/test_labels.py 解析比对守护；本文件不在那份守护内（该测试只认 JS 侧），
+# 由 tests/test_wp6_summary_audit.py 的 test_tables_match_labels_js 逐表比对 labels.js
+# 的键值，防止这第三份漂移。
 #
 # 有意差异（诚实边界）：
 #   1. `Object.prototype.hasOwnProperty.call(dict, value)` 会把 value 强制成**对象键**再查表

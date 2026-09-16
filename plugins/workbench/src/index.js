@@ -1,26 +1,11 @@
+// tradingWorkbench 服务锚：engine 的 8 个对话工具与 policy 的模式互斥/租约/观察记录
+// 都依赖这个进程内服务。WP7 面板退役（用户决策 2026-09-16）后，本插件不再注册任何
+// Connection RPC——工作台 UI 由独立服务（platform/，FastAPI 单进程）承接。
 import { WorkbenchStore } from "./store.js";
-import { createRpcFetchHandler } from "./rpc.js";
-import { createSeriesProvider } from "./series.js";
-import { createAnalyticsProvider } from "./analytics.js";
-import { ENDPOINTS } from "./endpoints.js";
 
 export const name = "trading-workbench";
 export const inject = [];
 
 export function apply(ctx) {
-  const store = new WorkbenchStore();
-  ctx.provide("tradingWorkbench", store);
-
-  // 图表数据通道：K 线序列按需拉取（Host 侧校验 + 短时缓存）。
-  const deps = { fetchSeries: createSeriesProvider(), analytics: createAnalyticsProvider() };
-
-  ctx.inject(["connection"], (apiCtx) => {
-    for (const endpoint of ENDPOINTS) {
-      apiCtx.connection.fetch.register({
-        path: `/api/trading-workbench/${endpoint}`,
-        methods: ["POST"], requestBody: "buffered",
-        fetch: createRpcFetchHandler(store, endpoint, deps),
-      });
-    }
-  });
+  ctx.provide("tradingWorkbench", new WorkbenchStore());
 }

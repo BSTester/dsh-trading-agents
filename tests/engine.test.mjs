@@ -66,7 +66,6 @@ test("policy：futu 写类一律拒绝并指引工作台；读类照模式互斥
   // 业务确认移至工作台服务侧（WP7）：pre-execute 不再发起确认，只透传下游结论
   const decision = await hooks.get("tools/pre-execute")(liveOrder, async () => ({ kind: "allow" }));
   assert.equal(decision.kind, "allow");
-  assert.equal(store.confirmationView(), null, "不得产生任何待确认");
   const denied = await hooks.get("tools/pre-execute")(liveOrder, async () => ({ kind: "deny", reason: "other policy" }));
   assert.equal(denied.kind, "deny");
 

@@ -1,7 +1,7 @@
 // 声明端点预检（对齐既有「缺失端点自检」口径：HTTP 404 + snapshot.endpoints 声明比对）。
 // 纯函数、无浏览器依赖：snapshot 响应里声明的端点集合与本次要调的端点比对；
 // 未声明即说明服务版本陈旧，页面直接给出可读提示且不发起请求（404 分支只作兜底）。
-// 集合来源：服务端 app.py snapshot 分支写入 store_access.endpoints()（endpoints.js 文本提取）。
+// 集合来源：服务端 app.py snapshot 分支写入 store_access.endpoints()（WP7 起服务自有清单）。
 
 /**
  * 取出 snapshot 响应声明的端点数组；非数组（含缺失、旧服务未带该字段）返回 null，

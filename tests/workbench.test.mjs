@@ -1,27 +1,14 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import { mkdtemp, rm, writeFile, unlink } from "node:fs/promises";
-import { mkdtempSync, rmSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { WorkbenchStore, withRunStatus, ABANDONED_AFTER_MS } from "../plugins/workbench/src/store.js";
-import { createRpcHandler, createRpcFetchHandler, CACHE_TTL_MS } from "../plugins/workbench/src/rpc.js";
-import { ENDPOINTS } from "../plugins/workbench/src/endpoints.js";
 
 async function fixture(t) {
   const home = await mkdtemp(path.join(os.tmpdir(), "trading-workbench-"));
   t.after(() => rm(home, { recursive: true, force: true }));
   return { home, store: new WorkbenchStore(home) };
-}
-
-/**
- * 磁盘缓存是跨进程共享的，测试若不注入独立目录，会读到上一次运行留下的条目。
- * 这里统一给每个用例一个一次性目录。
- */
-function isolatedCache(t) {
-  const dir = mkdtempSync(path.join(os.tmpdir(), "trading-cache-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  return { dir };
 }
 
 const published = {
@@ -86,16 +73,6 @@ test("observed responses are not fills and snapshots never mix sim/live", async 
   assert.equal(live.activity.some(row => row.kind === "broker_response"), false);
 });
 
-test("RPC exposes only snapshot and explicit mode switch, never tools or orders", async (t) => {
-  const { store } = await fixture(t);
-  const rpc = createRpcHandler(store, isolatedCache(t));
-  assert.equal((await rpc("snapshot", {})).ok, true);
-  assert.equal((await rpc("execute", { tool: "trading_order_place" })).ok, false);
-  assert.equal((await rpc("switch-mode", { mode: "live", expected_mode: "sim" })).ok, false);
-  assert.equal((await rpc("switch-mode", { mode: "sim", expected_mode: "sim", extra: true })).ok, false);
-  assert.equal((await rpc("switch-mode", { mode: "live", expected_mode: "sim", confirmation: "确认实盘" })).value.mode, "live");
-});
-
 test("completed broker observation survives another writer's lock and process restart", async (t) => {
   const { home, store } = await fixture(t);
   const lock = path.join(home, "trading-workbench.lock");
@@ -108,99 +85,6 @@ test("completed broker observation survives another writer's lock and process re
   assert.equal(snapshot.broker.value.order_id, "123");
   assert.equal(snapshot.pending_observations, 0);
   assert.equal(new WorkbenchStore(home).snapshot().activity.filter(row => row.kind === "broker_response").length, 1);
-});
-
-test("native RPC envelope rejects endpoint mismatch before any mutation", async (t) => {
-  const { store } = await fixture(t);
-  const fetch = createRpcFetchHandler(store, "switch-mode");
-  const response = await fetch(new Request("http://localhost/api/trading-workbench/switch-mode", {
-    method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ type: "client-request", rpcId: "x", method: "execute",
-      payload: { mode: "live", expected_mode: "sim", confirmation: "确认实盘" } }),
-  }));
-  assert.equal(response.status, 400);
-  assert.equal(store.readMode(), "sim");
-});
-
-test("snapshot 声明 Host 实际提供的接口清单", async (t) => {
-  const { store } = await fixture(t);
-  const handle = createRpcHandler(store, isolatedCache(t));
-  const result = await handle("snapshot", {});
-  assert.equal(result.ok, true);
-  assert.deepEqual(result.value.endpoints, ENDPOINTS);
-  // 客户端据此识别"进程陈旧"，因此清单必须与注册的路由同源
-  assert.ok(result.value.endpoints.includes("positions"));
-});
-
-test("重复请求命中 Host 缓存，不再重跑取数", async (t) => {
-  const { store } = await fixture(t);
-  let calls = 0;
-  const handle = createRpcHandler(store, {
-    ...isolatedCache(t),
-    analytics: { async positions() { calls += 1; return { mode: "sim", groups: [] }; } },
-  });
-  const first = await handle("positions", { mode: "sim" });
-  const second = await handle("positions", { mode: "sim" });
-  assert.equal(calls, 1, "同一请求不应重复调用 provider");
-  assert.equal(first.cached, false);
-  assert.equal(second.cached, true);
-  assert.equal(typeof second.cached_at, "string");
-  assert.deepEqual(second.value, first.value);
-});
-
-test("_refresh 绕过缓存但仍是合法请求", async (t) => {
-  const { store } = await fixture(t);
-  let calls = 0;
-  const handle = createRpcHandler(store, {
-    ...isolatedCache(t),
-    analytics: { async positions() { calls += 1; return { mode: "sim", groups: [], n: calls }; } },
-  });
-  await handle("positions", { mode: "sim" });
-  const forced = await handle("positions", { mode: "sim", _refresh: true });
-  assert.equal(calls, 2);
-  assert.equal(forced.cached, false);
-  assert.equal(forced.value.n, 2);
-});
-
-test("不同参数各自缓存，互不串味", async (t) => {
-  const { store } = await fixture(t);
-  const seen = [];
-  const handle = createRpcHandler(store, {
-    ...isolatedCache(t),
-    analytics: { async instrument(payload) { seen.push(payload.ticker); return { ticker: payload.ticker }; } },
-  });
-  await handle("instrument", { ticker: "600519" });
-  await handle("instrument", { ticker: "00700.HK" });
-  await handle("instrument", { ticker: "600519" });
-  assert.deepEqual(seen, ["600519", "00700.HK"], "第三个请求应命中缓存");
-});
-
-test("缓存过期后重新取数", async (t) => {
-  const { store } = await fixture(t);
-  let calls = 0;
-  let clock = 1_000_000;
-  const handle = createRpcHandler(store, {
-    ...isolatedCache(t),
-    now: () => clock,
-    analytics: { async positions() { calls += 1; return { mode: "sim", groups: [], n: calls }; } },
-  });
-  await handle("positions", { mode: "sim" });
-  clock += CACHE_TTL_MS.positions - 1;
-  assert.equal((await handle("positions", { mode: "sim" })).cached, true);
-  clock += 2;
-  const after = await handle("positions", { mode: "sim" });
-  assert.equal(after.cached, false);
-  assert.equal(calls, 2);
-});
-
-test("_refresh 不参与各接口的字段校验", async (t) => {
-  const { store } = await fixture(t);
-  const handle = createRpcHandler(store, { ...isolatedCache(t),
-    analytics: { async positions() { return { mode: "sim", groups: [] }; } } });
-  const ok = await handle("positions", { mode: "sim", _refresh: true });
-  assert.equal(ok.ok, true);
-  const bad = await handle("positions", { mode: "sim", unexpected: 1 });
-  assert.equal(bad.ok, false, "其他多余字段仍必须被拒绝");
 });
 
 test("被中断的会话不会留下永远「进行中」的 run", async (t) => {
@@ -260,7 +144,7 @@ test("可以显式取消一条进行中的研究记录，且保留记录", async
   const after = store.read().runs;
   assert.equal(after.length, 1);
   assert.equal(after[0].status, "cancelled");
-  // 面板只把 running 当"进行中"，取消后不再出现在那条提示里
+  // 快照只把 running 当"进行中"，取消后不再出现在那条提示里
   assert.deepEqual(store.snapshot().runs.filter((row) => row.status === "running"), []);
   // 留痕
   assert.ok(store.read().activity.some((row) => row.kind === "research_cancelled"));
@@ -286,4 +170,16 @@ test("cancel-stale 只取消超时的，不动新鲜的和已结算的", async (
   const byId = Object.fromEntries(store.read().runs.map((row) => [row.id, row.status]));
   assert.equal(byId[stale.id], "cancelled");
   assert.equal(byId[fresh.id], "running");
+});
+
+test("WP7 面板退役后 store 不再有确认面：确认类端点/方法不存在，快照无 confirmation 键", async (t) => {
+  const { store } = await fixture(t);
+  // 实盘确认只存在于服务侧（platform/server/store_access.py + Web 确认卡片）
+  for (const gone of ["requestConfirmation", "confirmationView", "decideConfirmation"]) {
+    assert.equal(store[gone], undefined, `${gone} 必须已删除`);
+  }
+  assert.equal("confirmation" in store.snapshot(), false, "快照不得再携带 confirmation 键");
+  store.recordObservation({ tool: "mcp__futu__sim_trade_position_list", mode: "sim",
+    session_id: "s1", is_error: false, value: { positions: [] } });
+  assert.equal(store.snapshot().confirmation, undefined);
 });

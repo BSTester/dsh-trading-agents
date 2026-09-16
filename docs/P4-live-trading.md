@@ -36,11 +36,11 @@ sim 时相反。完整安装的引擎才提供这层工具守卫；仅克隆 pre
 8. kill switch 演练通过（`scripts/drills.sh` 风控联动 + 熔断/恢复处置，见 RUNBOOK 场景 3）；
 9. 对账零差异连续 3 个交易日（sim）；
 10. 独立 Web + MCP 入口审批回归通过（规格 §5.3 人工清单 5 步：33 工具出现 / MCP
-    拒绝切 live / Web 口令切 live / live 写操作在 **Harness 内 legacy 工作台面板**出现待确认
+    拒绝切 live / Web 口令切 live / live 写操作在**独立 Web 确认卡片**出现待确认
     （**业务确认**，不是原生审批卡）/ 计划执行窄门 + kill 联动），
     证据留档于 `docs/superpowers/plans/2026-09-15-wp6-standalone-service.md` 末节。
-    **WP7 起该清单第 4 步的通道变更**：live 写待确认走**独立 Web 确认卡片**
-    （`trade_*` 工具触发，服务进程内），legacy 面板路径对 futu 写已不可达；
+    **WP7 起确认通道在服务进程内闭环**：live 写待确认走**独立 Web 确认卡片**
+    （`trade_*` 工具触发，服务进程内）；原 legacy 面板路径已随面板于 WP7 退役删除；
 11. **live broker 协议实现 + sim→live 冒烟通过（WP7 追加，未完成）**：live 写协议接入前，
     live 下 `trade_*` 提交即拒（`trading/broker-unavailable`「live 写通道尚未接入券商执行
     协议」）是**设计内行为**；接入需实现 live 适配器（声明 `supports_live_write`）、

@@ -15,7 +15,9 @@ for (const directory of ["engine", "fin-data", "workbench"]) {
     assert.equal(paths.some(file => file.endsWith(".pyc")), false);
     assert.ok(paths.includes(manifest.main));
     if (directory === "workbench") {
-      assert.ok(paths.includes(manifest.exports["./client"].replace(/^\.\//, "")));
+      // WP7 面板退役：不再有 ./client 导出；Host 服务锚 + patch 行仍是分发内容
+      assert.equal(manifest.exports["./client"], undefined);
+      assert.equal(manifest.dsh.client, undefined);
       assert.equal(manifest.dsh.bundle?.patch, "./cordis.patch.yml");
       assert.ok(paths.includes("cordis.patch.yml"));
       const patch = await readFile(new URL("cordis.patch.yml", root), "utf8");

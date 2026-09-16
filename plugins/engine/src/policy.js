@@ -72,10 +72,10 @@ export function installTradingPolicy(ctx) {
   });
   ctx.on("tools/pre-execute", async (exec, next) => {
     // 业务确认移至工作台服务侧（WP7）：futu 写类在 guard 已一律拒绝，到不了
-    // pre-execute；main 624ccd0 引入的 requestConfirmation 分支就此退役。
-    // store 三方法与 confirmation/confirm-decide 端点**保留**（legacy 面板过渡期 +
-    // 服务侧 Python 移植同语义）。本钩子只做下游结论的显式透传：别人 deny/ask
-    // 的结论不归我们改。
+    // pre-execute；main 624ccd0 引入的 requestConfirmation 分支就此退役，store 三方法与
+    // Connection RPC 端点已随 WP7 面板退役（2026-09-16）删除——确认的唯一实现与作答通道
+    // 都在独立服务进程（store_access.py + Web 确认卡片）。本钩子只做下游结论的显式透传：
+    // 别人 deny/ask 的结论不归我们改。
     return next();
   });
   ctx.on("tools/execute", async (exec, next) => {

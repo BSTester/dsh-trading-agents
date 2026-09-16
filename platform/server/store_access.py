@@ -1,18 +1,15 @@
 # WP6 补遗任务 B1：store 访问层（Python 移植）。规格 §八-7 / 补遗任务 B。
 #
-# 唯一事实来源：plugins/workbench/src/store.js（549 行）。逐行对应关系：
+# 移植基准：plugins/workbench/src/store.js（WP7 面板退役后的服务锚版本——确认三方法、
+# CONFIRM_TTL_MS/CONFIRM_OPERATIONS 等已随 legacy 面板在 Node 侧删除，确认逻辑现为本模块
+# **服务自有**实现，不再有 Node 侧对应物）。移植时的逐行对应关系（行号为退役前 main）：
 #   store.js:9       LIMIT                  -> LIMIT
 #   store.js:13      ABANDONED_AFTER_MS     -> ABANDONED_AFTER_MS
 #   store.js:15-16   WorkbenchError/Busy    -> WorkbenchError/WorkbenchBusyError
-#   store.js:21      CONFIRM_TTL_MS         -> CONFIRM_TTL_MS
 #   store.js:25-28   modeValue              -> mode_value()
-#   store.js:29      CONFIRM_OPERATIONS     -> CONFIRM_OPERATIONS
 #   store.js:30-38   atomicWrite            -> _atomic_write()
-#   store.js:31-35   orderOperation         -> order_operation()
-#   store.js:37-45   ORDER_SIDE/MARKET_HINT -> ORDER_SIDE/MARKET_HINT
 #   store.js:48-50   emptyState             -> _empty_state()
 #   store.js:52-64   withRunStatus          -> with_run_status()
-#   store.js:53-77   describeOrderArgs      -> describe_order_args()
 #   store.js:66-73   构造器里的四组路径      -> store_file/mode_file/observations_dir/lock_file
 #   store.js:75-82   inFlight               -> _active_leases()
 #   store.js:84-91   readMode               -> read_mode()
@@ -25,39 +22,32 @@
 #   store.js:205-224 snapshot               -> snapshot()
 #   store.js:226-240 switchMode             -> switch_mode()
 #   store.js:242-259 enterBrokerCall        -> 只取租约命名/在途判定（_active_leases）
-#   store.js:299-368 requestConfirmation    -> request_confirmation()
-#   store.js:370-377 confirmationView       -> confirmation_view()
-#   store.js:379-399 decideConfirmation     -> decide_confirmation()
-#   store.js:401-410 recordConfirmationEvent-> _record_confirmation_event()
 #   store.js:329-336 pendingObservations    -> pending_observations()
 #   scripts/workbench_admin.mjs            hoursArg/ageMinutes -> _hours_to_ms/admin_runs
-#   plugins/workbench/src/endpoints.js:12-37 ENDPOINTS         -> endpoints()
+# 服务自有（Node 侧无对应物；WP7 起确认与端点清单只在服务侧）：
+#   CONFIRM_TTL_MS / CONFIRM_OPERATIONS / order_operation() / describe_order_args() /
+#   request_confirmation() / confirmation_view() / decide_confirmation() /
+#   _record_confirmation_event() / endpoints()（22 项基础清单冻结自已删的
+#   plugins/workbench/src/endpoints.js + WP7_ENDPOINTS）
 # 本模块只用标准库；不写回任何 Node 侧尚未写入的键，错误语义（消息、类型）对齐 Node。
 # JS 语义助手（真值、字段访问）统一来自 server/_js.py：store_access/summary/audit_chain 不再
 # 各留一份，避免补遗 B 移植审查抓到的那种漂移（同一语义两处两种答案）。
 #
 # ---------------------------------------------------------------------------
-# 业务确认的**跨进程边界**（2026-09-15 main 修订；必须如实告知，不得隐瞒）
+# 业务确认的**进程内边界**（2026-09-15 main 修订；WP7 面板退役后即服务自有语义）
 # ---------------------------------------------------------------------------
-# Node 侧 `WorkbenchStore.pendingConfirmation` 是**实例内存态**（store.js:136 注释：确认是
-# 「此刻等人回答」的瞬时状态，刻意不落盘）。Python 侧照抄这一语义：待确认表是本模块的
-# **进程内模块级表**（`_PENDING`，按 home 归一化路径分槽），进程重启即消失，也不与任何其他
-# 进程共享。由此产生一个**用户可见的限制**：
+# 确认是「此刻等人回答」的瞬时状态，刻意不落盘——进程重启后无人回答，落盘会让陈旧请求
+# 复活；持久化的只有 activity 里的事件留痕。Python 侧沿用这一语义：待确认表是本模块的
+# **进程内模块级表**（`_PENDING`，按 home 归一化路径分槽），进程重启即消失。
+# WP7 面板退役（用户决策 2026-09-16）后，确认只有一个发起方与一个作答方，都在本服务进程：
 #
-#   * Harness 会话（Node 进程，policy.js 发起 `requestConfirmation`）产生的待确认，**服务
-#     进程（FastAPI/uvicorn）看不到**——两边各自持有自己的内存表，没有任何共享介质；
-#   * 服务进程的 `confirmation_view()` 只反映**经服务自身处理函数发起**的确认（本文件
-#     `request_confirmation`，即未来服务侧实盘写路径的调用点）；
-#   * 因此独立 Web 的「待确认」列表可能显示为空，而 Harness 会话其实正卡在等人确认上；
-#     反之亦然。`confirmation`/`confirm-decide` 两个端点**不是**跨进程的确认总线。
+#   * 发起：服务自身处理函数（工作台 `trade_*` 工具的交易闸门，本文件 `request_confirmation`）；
+#   * 作答：独立 Web 确认卡片经 `confirmation`/`confirm-decide` 两个端点（同进程直读内存表）；
+#   * Node 侧（Harness 进程）已无确认实现——policy 对 futu 写一律拒绝并指引工作台，
+#     因此历史上「两进程各持一份待确认表、互不可见」的跨进程限制不复存在。
 #
-# 最小缓解（本次不改 Node 存储协议，规格以 main 实现为准）：
-#   1. 主会话仍在 Harness 内用 legacy 面板（Connection RPC 的 `confirmation`/`confirm-decide`）
-#      作答——那条链路与 Node Host 同进程，是本轮实盘操作**唯一可用**的作答通道；
-#   2. 服务侧 `confirmation` 端点把「本进程内存态」如实呈现为空（不伪造、不合并），页面与
-#      文档按此标注限制，避免用户以为「没有待确认 = 不需要确认」而误判；
-#   3. 未来若要让两进程共享，正确做法是把确认落到共享文件（例如 `$DSH_HOME/trading-confirmations/`
-#      下的请求/裁决文件 + 现有原子写与租约协议），那是另一项需要同时改 Node 侧的变更。
+# 仍须遵守的边界：待确认表是**本进程内存态**，不是持久总线；服务重启即清空（超时语义
+# 等价于 fail-closed，TTL 120s）。
 #
 # 有意差异（诚实边界，须与 Node 行为区分；规格 §八-7 与补遗任务 B 明文允许）：
 #   1. 只读快照：snapshot() 不调用 flushObservations()（store.js:206）。trading-observations/
@@ -106,11 +96,6 @@ MARKET_HINT = {"1": "港股", "3": "A股", "100": "美股"}
 # store.js:222 原文（服务端不一致地改写这句话会让两个实现的快照出现假差异）。
 NOTICE = ("交易动态来自 Harness 最近的富途工具响应，不是券商成交推送；"
           "下单、撤单及对话请在 Harness 中完成。")
-
-ROOT = Path(__file__).resolve().parents[2]
-ENDPOINTS_JS = ROOT / "plugins" / "workbench" / "src" / "endpoints.js"
-
-_ENDPOINTS_CACHE = None
 
 
 class WorkbenchError(Exception):
@@ -306,32 +291,55 @@ def pending_observations(home):
     return [name for name in names if name.endswith(".json")]
 
 
-# WP7 起服务自有的端点（legacy 面板源 endpoints.js 不再回写，见 endpoints() 说明）。
-# 任务 2：factors-history；任务 3：受约束交易工具（写三个走交易闸门 + Web 确认卡片，
-# 读三个 mode 约束直通 broker——均不进 TTL/形状表，与 plan-execute 同类）。
+# ---------------------------------------------------------------------------
+# 端点清单：WP7 起服务自有（legacy 面板退役）
+# ---------------------------------------------------------------------------
+# WP7 面板退役（用户决策 2026-09-16）：legacy 面板源 `plugins/workbench/src/endpoints.js`
+# 已随面板（client.js + Connection RPC）一并删除，端点清单改为本模块自有常量——
+# `_BASE_ENDPOINTS`（22 项，按已删文件的原序冻结）+ `WP7_ENDPOINTS`（7 项服务自有端点），
+# 合成 `endpoints()` 返回的 29 项，顺序与退役前完全一致（服务与前端零行为变化）。
+#
+# `_BASE_ENDPOINTS` 的来源是已删 endpoints.js 的数组字面量（含尾部两个业务确认端点）：
+# 业务确认现在只由服务进程发起与作答（Web 确认卡片），这两个端点是唯一确认通道。
+_BASE_ENDPOINTS = (
+    "snapshot",
+    "switch-mode",
+    "series",
+    "equity",
+    "positions",
+    "correlation",
+    "sensitivity",
+    "risk",
+    "trades",
+    "events",
+    "factors",
+    "ic",
+    "audit",
+    "sources",
+    "instrument",
+    "quality",
+    "plan",
+    "plan-execute",
+    "schedule",
+    "reconcile",
+    "confirmation",
+    "confirm-decide",
+)
+
+# WP7 起服务自有的端点。任务 2：factors-history；任务 3：受约束交易工具（写三个走交易闸门
+# + Web 确认卡片，读三个 mode 约束直通 broker——均不进 TTL/形状表，与 plan-execute 同类）。
 WP7_ENDPOINTS = ("factors-history", "trade_place", "trade_modify", "trade_cancel",
                  "account_positions", "account_orders", "account_funds")
 
 
 def endpoints():
-    """endpoints.js:12-37 的 22 端点清单 + WP7 服务自有端点；从 JS 文本正则提取，首次调用缓存。
+    """服务端点清单（29 项）：22 项 legacy 基础清单 + 7 项 WP7 服务自有端点。
 
-    先剥 ``//`` 行注释：main 在数组内加的业务确认注释里带 ASCII 双引号（``"待确认"``），
-    不剥注释会被字符串正则误认成一个端点（实测 23 项，且会把 ``待确认`` 放进 HTTP 白名单）。
-
-    WP7 起新增端点不再回写 legacy 面板源（endpoints.js 冻结，删除另行决策）：
-    服务自有端点在 ``WP7_ENDPOINTS`` 登记，追加在 legacy 清单之后；锁定测试按
-    「JS 清单 + WP7 增量 ≡ 本函数结果」比对。
+    WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
+    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7 端点登记在
+    ``WP7_ENDPOINTS`` 并追加在基础清单之后；锁定测试把 29 项整体钉死。
     """
-    global _ENDPOINTS_CACHE
-    if _ENDPOINTS_CACHE is None:
-        text = ENDPOINTS_JS.read_text(encoding="utf-8")
-        block = re.search(r"export const ENDPOINTS\s*=\s*\[(.*?)\]", text, re.S)
-        if block is None:
-            raise WorkbenchError("Cannot read endpoints manifest: plugins/workbench/src/endpoints.js")
-        body = re.sub(r"//[^\n]*", "", block.group(1))
-        _ENDPOINTS_CACHE = re.findall(r'"([^"]+)"', body) + list(WP7_ENDPOINTS)
-    return list(_ENDPOINTS_CACHE)
+    return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS)
 
 
 def read_mode(home):
@@ -423,9 +431,8 @@ def snapshot(home):
         "broker": broker_state.get(mode) if isinstance(broker_state, dict) else None,
         # 有意差异 3：服务进程不派发券商调用，恒为 0（在途护栏在 switch_mode 内按租约文件判）。
         "in_flight": 0,
-        # store.js:291-292：待确认的业务动作也进快照（legacy 面板轮询 confirmation 端点，
-        # 快照 60 秒一次太慢，这里只是同源冗余）。**注意跨进程边界**：见文件头 —— 只反映本
-        # 进程内存表，看不到 Harness（Node）进程发起的确认。
+        # 待确认的业务动作也进快照（Web 确认卡片轮询 `confirmation` 端点读它，
+        # 快照轮询太慢，这里只是同源冗余）。确认是本服务进程的内存态，见文件头。
         "confirmation": confirmation_view(home),
         # 有意差异 1：只报暂存箱里待合并的文件数，不在读路径上合并（store.js:220 是同名计数）。
         "pending_observations": len(pending_observations(home)),
@@ -437,12 +444,11 @@ def snapshot(home):
 
 
 # ---------------------------------------------------------------------------
-# 实盘业务确认（store.js:299-410）
+# 实盘业务确认（服务自有；Node 侧同名实现已随 legacy 面板退役）
 # ---------------------------------------------------------------------------
-# 待确认表：**进程内内存态**，按归一化后的 home 路径分槽（Node 侧一实例一个 home）。
-# 与 Node 的差异只有存储介质（模块级 dict + 互斥锁 vs 实例字段 + 事件循环单线程），
-# 语义逐条对齐：一次只允许一笔、TTL 超时按拒绝、signal 取消按拒绝、只有 decide 能批准。
-# 跨进程可见性限制见文件头，这里再强调一次：**本表不跨进程**。
+# 待确认表：**进程内内存态**，按归一化后的 home 路径分槽。
+# 语义：一次只允许一笔、TTL 超时按拒绝、signal 取消按拒绝、只有 decide 能批准。
+# 进程内边界见文件头，这里再强调一次：**本表不跨进程、不落盘**。
 _PENDING = {}
 _PENDING_LOCK = threading.Lock()
 
@@ -481,7 +487,7 @@ def _settle(request, decision, reason):
 
 def request_confirmation(home, tool=None, mode=None, args=None, session_id=None,
                          ttl_ms=CONFIRM_TTL_MS, signal=None):
-    """store.js:299-368 requestConfirmation：发起一次**业务确认**并阻塞等人作答。
+    """发起一次**业务确认**并阻塞等人作答（服务自有实现；Node 侧同名方法已随面板退役）。
 
     与 DSH 的 approval 系统完全无关：权限确认回答的是「这个动作准不准做」，由会话的
     approval policy 裁决；full-access（policy="never"）下 ``approval.decide()`` 会直接返回
@@ -538,7 +544,7 @@ def request_confirmation(home, tool=None, mode=None, args=None, session_id=None,
     deadline = time.monotonic() + ttl_ms / 1000
 
     def abort():
-        """store.js:348-353：会话中断 → 清待确认、记 cancelled、按拒绝兑现。"""
+        """会话中断 → 清待确认、记 cancelled、按拒绝兑现（移植自退役前 Node 实现）。"""
         if request["_settled"] or not _clear_pending(key, request):
             return  # 已被 decide/expire 兑现：先到者定论（等价于 JS 里 settle 会解绑监听）
         request["status"] = "cancelled"
@@ -546,17 +552,17 @@ def request_confirmation(home, tool=None, mode=None, args=None, session_id=None,
         _settle(request, "rejected", "会话已中断")
 
     def expire():
-        """store.js:354-362：TTL 到期 → 清待确认、记 expired、按拒绝兑现。"""
+        """TTL 到期 → 清待确认、记 expired、按拒绝兑现（移植自退役前 Node 实现）。"""
         if request["_settled"] or not _clear_pending(key, request):
             return
         request["status"] = "expired"
-        # store.js:360/361 的 `Math.round(ttlMs / 1000)`：半数向 +∞（Python round 是银行家舍入）
+        # `Math.round(ttlMs / 1000)`（退役前 Node 实现）：半数向 +∞（Python round 是银行家舍入）
         seconds = _js.js_round(ttl_ms / 1000)
         _record_confirmation_event(home, "confirmation_expired", request,
                                   f"超过 {seconds} 秒未确认")
         _settle(request, "rejected", f"超过 {seconds} 秒未确认，按拒绝处理")
 
-    # 已 aborted 的 signal 也要走同一条取消路径（store.js:365-366 先设 settle 再判 aborted）。
+    # 已 aborted 的 signal 也要走同一条取消路径（先设 settle 再判 aborted，同退役前 Node 实现）。
     while True:
         if _signal_aborted(signal):
             abort()
@@ -581,7 +587,7 @@ def _clear_pending(key, request):
 
 
 def confirmation_view(home):
-    """store.js:370-377 confirmationView：当前待确认项的只读视图（不含内部 settle 句柄）。
+    """当前待确认项的只读视图（不含内部 settle 句柄）。
 
     字段与 store.js 逐字一致：``id/at/expires_at/mode/tool/operation/session_id/status/summary``。
     """
@@ -595,7 +601,7 @@ def confirmation_view(home):
 
 
 def decide_confirmation(home, confirmation_id=None, decision=None):
-    """store.js:379-399 decideConfirmation：用户作出决定。**唯一能批准实盘操作的入口**。
+    """用户作出决定。**唯一能批准实盘操作的入口**（服务侧 Web 确认卡片）。
 
     ``confirmation_id`` 对应 RPC 载荷的 ``id``（此处不叫 id 是为了不遮蔽内建函数；
     app.handle 负责 ``id`` → ``confirmation_id`` 的映射）。
@@ -625,7 +631,7 @@ def decide_confirmation(home, confirmation_id=None, decision=None):
 
 
 def _record_confirmation_event(home, kind, request, note=None):
-    """store.js:401-410 recordConfirmationEvent：确认链路的活动留痕。
+    """确认链路的活动留痕。
 
     写盘失败不影响确认本身（锁被占用时不能卡住等人回答）——与 Node 的空 catch 同义。
     """
@@ -633,7 +639,7 @@ def _record_confirmation_event(home, kind, request, note=None):
         payload = {"kind": kind, "mode": request["mode"], "tool": request["tool"],
                    "operation": request["operation"], "confirmation_id": request["id"],
                    "session_id": request["session_id"],
-                   # store.js:407 `request.summary?.fields ?? []`
+                   # `request.summary?.fields ?? []`（退役前 Node 实现语义）
                    "summary": _js.field(request.get("summary") or {}, "fields") or []}
         if note:
             payload["note"] = note

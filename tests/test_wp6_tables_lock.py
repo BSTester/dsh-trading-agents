@@ -1,30 +1,21 @@
-"""WP6 表锁定（补遗 C）：Python 侧常量与 JS 移植源逐项比对。
+"""WP7 表锁定（纯 Python 断言；2026-09-16 面板退役时改写）。
 
-为什么解析 JS 源而不是再抄一份期望值：这些表是「单一事实来源」，两边各写一份就必然漂移。
-本测试把 ``plugins/workbench/src`` 里的 JS 字面量提取出来，与 Python 常量逐项比对——
-JS 源被改动而 Python 没跟上时立刻红。Python 侧一律直接 import 后比对常量（不重复解析）。
-
-**迁移说明（任务 E）**：JS 服务层已退役（platform/server 下的 Node 服务源已删除）；本测试
-锁定的是 workbench legacy 面板源（``plugins/workbench/src/*.js``，仍保留），其删除另行决策。
-届时本文件应当**二选一**：
-  1. 改成纯 Python 断言——把下面 ``js_*`` 提取出来的值内联成期望常量（等于把 JS 的
-     当前事实冻结在测试里），或
-  2. 整体删除——若那时已有更权威的单一事实来源（例如 Python 表本身就是唯一来源）。
-两条路都不需要改 ``caches.py``/``app.py``/``compute.py`` 的表；只要别让 JS 文件消失后
-本文件因 ``FileNotFoundError`` 变成整套测试的红。
+历史：本测试原把 ``plugins/workbench/src`` 里的 JS 字面量（rpc.js/endpoints.js/
+analytics.js/series.js）提取出来与 Python 常量逐项比对，防「单一事实来源」两侧漂移。
+WP7 面板退役（用户决策 2026-09-16）后 JS 面板源已整体删除，Python 表成为**唯一**实现，
+因此改写为纯 Python 断言——把当前事实冻结成内嵌期望值，任何一侧被无意改动立刻红。
 
 覆盖：
-  * rpc.js ``CACHE_TTL_MS`` ↔ ``caches.CACHE_TTL_MS``（业务确认两端点**都不在**表里 = TTL 0；
-    WP7 起服务自有端点不回写 legacy JS，按「JS 表 + WP7 增量 ≡ Python 表」比对）；
-  * endpoints.js ``ENDPOINT_SHAPE`` ↔ ``caches.ENDPOINT_SHAPE``（含 ``confirmation: ["pending"]``
-    与 WP7 增量 ``factors-history: ["snapshots"]``）；
-  * endpoints.js ``ENDPOINTS`` + ``store_access.WP7_ENDPOINTS`` ↔ ``store_access.endpoints()``
-    （22 legacy + WP7 增量，含 confirmation/confirm-decide）；
-  * rpc.js 各端点 allowed 字段表 ↔ ``app.ANALYTICS_ENDPOINTS`` / ``SWITCH_MODE_FIELDS``
-    / ``CONFIRM_DECIDE_FIELDS`` / ``PLAN_EXECUTE_FIELDS`` / ``SERIES_FIELDS``
-    / ``EMPTY_PAYLOAD_ENDPOINTS``；
-  * analytics.js + series.js 的内层缓存 TTL ↔ ``compute.INNER_CACHE_TTL_MS``；
-  * analytics.js 的逐端点 timeout ↔ ``compute.ENDPOINT_TIMEOUT_MS`` / ``compute.TIMEOUT``。
+  * ``store_access.endpoints()`` ≡ 29 项内嵌清单（22 项基础清单按已删 endpoints.js
+    原序冻结 + 7 项 WP7 服务自有端点，逐项与顺序都钉死）；
+  * ``caches.CACHE_TTL_MS``：17 项 legacy TTL 逐项钉死 + WP7 增量
+    ``factors-history: 5 分钟``；业务确认两端点不在表里（TTL 恒 0，不得缓存「待确认」）；
+  * ``caches.ENDPOINT_SHAPE``：16 项 legacy 形状逐项钉死 + WP7 增量
+    ``factors-history: ["snapshots"]``；``confirmation: ["pending"]`` 保留；
+  * ``app.ANALYTICS_ENDPOINTS`` 逐端点字段白名单与各动作端点字段表；
+  * ``compute`` 的内层缓存 TTL / 逐端点 timeout / 端点→脚本映射（脚本真实存在，
+    analytics.py 子命令白名单对齐——这两条原由 tests/analytics-routing.test.mjs
+    钉在 Node 侧，面板退役后由本文件接管）。
 """
 
 import re
@@ -39,196 +30,208 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 from server import app as app_module  # noqa: E402
 from server import caches, compute, store_access  # noqa: E402
 
-SRC = ROOT / "plugins" / "workbench" / "src"
-# WP7 起服务自有端点不回写 legacy 面板源（三张表的比对基准 = JS 字面量 + 本增量）。
-WP7_ENDPOINTS = store_access.WP7_ENDPOINTS
+# 工作台 Python 脚本目录（服务取数子进程的真实落点，面板退役后仍是唯一脚本源）
+PYTHON_DIR = ROOT / "plugins" / "workbench" / "python"
+
+# 22 项基础清单：按已删 plugins/workbench/src/endpoints.js 的数组原序冻结
+# （服务与前端零行为变化的锚点——顺序变了就是破坏性变更）。
+BASE_ENDPOINTS = [
+    "snapshot",
+    "switch-mode",
+    "series",
+    "equity",
+    "positions",
+    "correlation",
+    "sensitivity",
+    "risk",
+    "trades",
+    "events",
+    "factors",
+    "ic",
+    "audit",
+    "sources",
+    "instrument",
+    "quality",
+    "plan",
+    "plan-execute",
+    "schedule",
+    "reconcile",
+    "confirmation",
+    "confirm-decide",
+]
+
+# WP7 服务自有端点（任务 2：factors-history；任务 3：受约束交易工具 × 6）
+WP7_ENDPOINTS = ["factors-history", "trade_place", "trade_modify", "trade_cancel",
+                 "account_positions", "account_orders", "account_funds"]
 
 
-def without_wp7(table):
-    """Python 表去掉 WP7 增量后的 legacy 部分（与 JS 字面量逐项比对用）。"""
-    return {name: value for name, value in table.items() if name not in WP7_ENDPOINTS}
+class EndpointListLockTests(unittest.TestCase):
+    def test_endpoints_is_frozen_29_item_list(self):
+        """``store_access.endpoints()`` ≡ 22 项基础清单 + 7 项 WP7 增量 = 29 项，同序。"""
+        self.assertEqual(store_access.endpoints(), BASE_ENDPOINTS + WP7_ENDPOINTS)
+        self.assertEqual(len(store_access.endpoints()), 29)
+        self.assertEqual(len(store_access._BASE_ENDPOINTS), 22)
+        self.assertEqual(list(store_access.WP7_ENDPOINTS), WP7_ENDPOINTS)
+        # 尾部锚点：业务确认两端点收尾基础清单；WP7 增量按任务顺序追加
+        self.assertEqual(store_access.endpoints()[-9:-7], ["confirmation", "confirm-decide"])
+        self.assertEqual(store_access.endpoints()[-7:], WP7_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[0], "snapshot")
+        # 无重复；重复调用返回等值副本（调用方改动不污染后续结果）
+        self.assertEqual(len(set(store_access.endpoints())), 29)
+        sample = store_access.endpoints()
+        sample.append("bogus")
+        self.assertEqual(len(store_access.endpoints()), 29)
 
-
-def read(name):
-    return (SRC / name).read_text(encoding="utf-8")
-
-
-RPC_JS = read("rpc.js")
-ENDPOINTS_JS = read("endpoints.js")
-ANALYTICS_JS = read("analytics.js")
-SERIES_JS = read("series.js")
-
-
-def js_strings(block):
-    """JS 字符串数组字面量的元素：``["a", "b"]`` → ``["a", "b"]``。"""
-    return re.findall(r'"([^"]*)"', block)
-
-
-def js_number(expr):
-    """把 JS 数字字面量（可含 ``_`` 与 ``*``）算成 int：``10 * 60_000`` → 600000。"""
-    cleaned = expr.replace("_", "").strip()
-    if not re.fullmatch(r"[0-9]+(?:\s*\*\s*[0-9]+)*", cleaned):
-        raise AssertionError(f"不是可解析的 JS 数字字面量：{expr!r}")
-    result = 1
-    for part in cleaned.split("*"):
-        result *= int(part.strip())
-    return result
-
-
-def js_cache_ttls(text):
-    """rpc.js:11-32 的 ``export const CACHE_TTL_MS = {...}`` → ``{endpoint: ms}``。"""
-    block = re.search(r"export const CACHE_TTL_MS = \{(.*?)\n\};", text, re.S)
-    assert block, "rpc.js 里找不到 CACHE_TTL_MS"
-    return {name: js_number(expr)
-            for name, expr in re.findall(r"^\s*([A-Za-z][\w-]*):\s*([0-9][0-9_ *]*),",
-                                         block.group(1), re.M)}
-
-
-def js_shape_table(text):
-    """endpoints.js:42-60 的 ``ENDPOINT_SHAPE`` → ``{endpoint: [fields]}``（先剥注释）。"""
-    block = re.search(r"export const ENDPOINT_SHAPE = \{(.*?)\n\};", text, re.S)
-    assert block, "endpoints.js 里找不到 ENDPOINT_SHAPE"
-    body = re.sub(r"//[^\n]*", "", block.group(1))
-    return {name: js_strings(arr)
-            for name, arr in re.findall(r"(\w+):\s*(\[[^\]]*\])", body)}
-
-
-def js_endpoint_list(text):
-    """endpoints.js:12-37 的 ``ENDPOINTS`` 数组（先剥 ``//`` 行注释）。
-
-    必须剥注释：数组内的业务确认注释里带 ASCII 双引号（``"待确认"``），不剥会被字符串正则
-    误当成第 23 个端点（``store_access.endpoints()`` 侧同样剥注释，两边口径一致）。
-    """
-    block = re.search(r"export const ENDPOINTS = \[(.*?)\];", text, re.S)
-    assert block, "endpoints.js 里找不到 ENDPOINTS"
-    return js_strings(re.sub(r"//[^\n]*", "", block.group(1)))
-
-
-def js_allowed_fields(text):
-    """rpc.js 的逐端点 allowed 字段表 → ``{endpoint: [fields]}``。
-
-    * equity/positions 与 correlation 走同一行的三元（rpc.js:115）；
-    * sensitivity/trades/events/factors/ic/sources/instrument/quality 是 147-155 的链；
-    * risk 落在链尾的 ``: []``。
-    """
-    allowed = {}
-    branch = re.search(r'endpoint === "correlation"\s*\?\s*(\[[^\]]*\])\s*:\s*(\[[^\]]*\])', text)
-    assert branch, "rpc.js 里找不到 equity/positions/correlation 的 allowed 表"
-    allowed["correlation"] = js_strings(branch.group(1))
-    allowed["equity"] = allowed["positions"] = js_strings(branch.group(2))
-    for name, arr in re.findall(r'endpoint === "([a-z-]+)"\s*\?\s*(\[[^\]]*\])', text):
-        allowed[name] = js_strings(arr)
-    allowed.setdefault("risk", [])
-    return allowed
-
-
-def js_guard_lists(text):
-    """rpc.js 里所有 ``![...].includes(key)`` 的白名单数组（按出现顺序）。"""
-    return [js_strings(block)
-            for block in re.findall(r"!\[([^\]]*)\]\.includes\(key\)", text)]
+    def test_analytics_endpoints_are_declared(self):
+        self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))
 
 
 class CacheTtlLockTests(unittest.TestCase):
-    def test_cache_ttl_table_matches_rpc_js(self):
-        self.assertEqual(js_cache_ttls(RPC_JS), without_wp7(dict(caches.CACHE_TTL_MS)))
-        self.assertEqual(js_cache_ttls(RPC_JS)["instrument"], 10 * 60_000)
-        # WP7 增量逐项钉死：JS 表不含、Python 表含且值锁定
+    #: legacy 17 项 TTL（毫秒）——面板退役前 rpc.js/CACHE_TTL_MS 的最终事实
+    LEGACY_TTL_MS = {
+        "instrument": 10 * 60_000,
+        "series": 10 * 60_000,
+        "equity": 5 * 60_000,
+        "positions": 5 * 60_000,
+        "correlation": 30 * 60_000,
+        "sensitivity": 60 * 60_000,
+        "risk": 15 * 60_000,
+        "trades": 5 * 60_000,
+        "events": 60 * 60_000,
+        "factors": 30 * 60_000,
+        "ic": 30 * 60_000,
+        "audit": 2 * 60_000,
+        "sources": 5 * 60_000,
+        "quality": 60 * 60_000,
+        "plan": 60_000,
+        "schedule": 30_000,
+        "reconcile": 5 * 60_000,
+    }
+
+    def test_legacy_ttl_table_is_frozen(self):
+        self.assertEqual({name: ttl for name, ttl in caches.CACHE_TTL_MS.items()
+                          if name not in WP7_ENDPOINTS}, self.LEGACY_TTL_MS)
+        self.assertEqual(self.LEGACY_TTL_MS["instrument"], 10 * 60_000)
+
+    def test_wp7_ttl_delta_is_pinned(self):
+        """WP7 增量钉死：factors-history 5 分钟（面板退役前的服务自有值）。"""
         self.assertEqual(caches.CACHE_TTL_MS.get("factors-history"), 5 * 60_000)
+        self.assertEqual(len(caches.CACHE_TTL_MS), len(self.LEGACY_TTL_MS) + 1)
 
     def test_business_confirmation_endpoints_are_not_cached(self):
-        """业务确认两端点 TTL 恒为 0：rpc.js 的 CACHE_TTL_MS 本就不含它们，Python 侧同样不加。
-
-        缓存住「待确认」会让界面拿到已经处理掉的请求（rpc.js:116 的注释），因此这里既比对 JS
-        源（``test_cache_ttl_table_matches_rpc_js`` 已逐项相等），也显式钉死「不在表里」。
-        """
+        """业务确认两端点 TTL 恒为 0：缓存住「待确认」会让界面拿到已处理掉的请求。"""
         for endpoint in ("confirmation", "confirm-decide"):
-            self.assertNotIn(endpoint, js_cache_ttls(RPC_JS), endpoint)
             self.assertNotIn(endpoint, caches.CACHE_TTL_MS, endpoint)
             self.assertEqual(caches.CACHE_TTL_MS.get(endpoint, 0), 0, endpoint)
 
 
-class EndpointTableLockTests(unittest.TestCase):
-    def test_shape_table_matches_endpoints_js(self):
-        self.assertEqual(js_shape_table(ENDPOINTS_JS), without_wp7(dict(caches.ENDPOINT_SHAPE)))
+class EndpointShapeLockTests(unittest.TestCase):
+    #: legacy 16 项形状——面板退役前 endpoints.js/ENDPOINT_SHAPE 的最终事实
+    LEGACY_SHAPE = {
+        "series": ["ticker", "bars"],
+        "equity": ["mode", "points"],
+        "positions": ["mode", "groups"],
+        "correlation": ["matrix"],
+        "sensitivity": ["ticker", "matrix"],
+        "risk": ["config"],
+        "trades": ["trades"],
+        "events": ["ticker", "events"],
+        "factors": ["tickers"],
+        "ic": ["points"],
+        "sources": ["sources"],
+        "instrument": ["ticker"],
+        "quality": ["ticker"],
+        "plan": ["plans", "alerts"],
+        "confirmation": ["pending"],
+        "schedule": ["heartbeat", "jobs"],
+        "reconcile": ["diffs", "tca"],
+    }
+
+    def test_legacy_shape_table_is_frozen(self):
+        self.assertEqual({name: fields for name, fields in caches.ENDPOINT_SHAPE.items()
+                          if name not in WP7_ENDPOINTS}, self.LEGACY_SHAPE)
         self.assertEqual(caches.ENDPOINT_SHAPE["confirmation"], ["pending"])
+
+    def test_wp7_shape_delta_is_pinned(self):
+        """WP7 增量钉死：factors-history 最小字段只有一个快照数组。"""
         self.assertEqual(caches.ENDPOINT_SHAPE["factors-history"], ["snapshots"])
-
-    def test_endpoint_list_matches_endpoints_js_plus_wp7_delta(self):
-        """legacy JS 清单（22）+ WP7 服务自有端点 ≡ store_access.endpoints()（29）。"""
-        endpoints = js_endpoint_list(ENDPOINTS_JS)
-        self.assertEqual(len(endpoints), 22)
-        self.assertEqual(endpoints[-2:], ["confirmation", "confirm-decide"])
-        self.assertEqual(store_access.endpoints(), endpoints + list(WP7_ENDPOINTS))
-        self.assertEqual(len(store_access.endpoints()), 22 + len(store_access.WP7_ENDPOINTS))
-        self.assertEqual(len(store_access.endpoints()), 29)
-        # WP7 任务 3 增量逐项钉死（写三个 + 读三个，与 mcp_tools.ENDPOINT_TOOL_ENDPOINTS 对齐）
-        self.assertEqual(list(store_access.WP7_ENDPOINTS),
-                         ["factors-history", "trade_place", "trade_modify", "trade_cancel",
-                          "account_positions", "account_orders", "account_funds"])
-
-    def test_analytics_endpoints_are_declared_by_endpoints_js(self):
-        self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))
+        self.assertEqual(len(caches.ENDPOINT_SHAPE), len(self.LEGACY_SHAPE) + 1)
 
 
 class WhitelistLockTests(unittest.TestCase):
-    def test_analytics_allowed_fields_match_rpc_js(self):
-        expected = {name: list(fields)
-                    for name, fields in app_module.ANALYTICS_ENDPOINTS.items()}
-        self.assertEqual(js_allowed_fields(RPC_JS), expected)
+    #: 12 个分析端点的字段白名单——面板退役前 app.ANALYTICS_ENDPOINTS 的最终事实
+    ANALYTICS_FIELDS = {
+        "equity": ("mode", "window"),
+        "positions": ("mode", "window"),
+        "correlation": ("tickers", "window"),
+        "sensitivity": ("ticker", "strategy", "metric", "fast_grid", "slow_grid",
+                        "buy_grid", "sell_grid", "start"),
+        "risk": (),
+        "trades": ("mode", "limit"),
+        "events": ("ticker", "days"),
+        "factors": ("tickers", "window"),
+        "ic": ("tickers", "factor", "forward", "window"),
+        "sources": ("no_probe",),
+        "instrument": ("ticker",),
+        "quality": ("ticker",),
+    }
 
-    def test_guard_lists_match_python_field_tables(self):
-        guards = js_guard_lists(RPC_JS)
-        # guards[0] 是 platform/server/rpc fetch 的 RPC 信封白名单（与端点无关）
-        self.assertEqual(guards[0], ["type", "rpcId", "method", "payload"])
-        self.assertIn(list(app_module.SWITCH_MODE_FIELDS), guards)
-        self.assertIn(list(app_module.CONFIRM_DECIDE_FIELDS), guards)
-        self.assertIn(list(app_module.PLAN_EXECUTE_FIELDS), guards)
-        self.assertIn(list(app_module.SERIES_FIELDS), guards)
+    def test_analytics_allowed_fields_are_frozen(self):
+        self.assertEqual(app_module.ANALYTICS_ENDPOINTS, self.ANALYTICS_FIELDS)
+
+    def test_action_endpoint_field_tables_are_frozen(self):
+        self.assertEqual(list(app_module.SWITCH_MODE_FIELDS), ["mode", "expected_mode", "confirmation"])
         # 确认通道的载荷只有 id/decision：白名单外字段在 handle 层就被拒（不能变成下单通道）
         self.assertEqual(list(app_module.CONFIRM_DECIDE_FIELDS), ["id", "decision"])
-
-    def test_empty_payload_endpoints_match_rpc_js(self):
-        named = set(re.findall(r'WorkbenchError\("([a-z-]+) takes no payload"\)', RPC_JS))
-        literal = ('if (endpoint === "plan" || endpoint === "schedule" '
-                   '|| endpoint === "reconcile") {')
-        start = RPC_JS.find(literal)
-        self.assertGreaterEqual(start, 0, "rpc.js 的 plan/schedule/reconcile 空载荷分支变了形")
-        window = RPC_JS[start:RPC_JS.find("takes no payload`", start)]
-        templated = set(re.findall(r'endpoint === "([a-z-]+)"', window))
-        self.assertEqual(named | templated | {"snapshot"},
-                         set(app_module.EMPTY_PAYLOAD_ENDPOINTS))
-        self.assertIn("confirmation", app_module.EMPTY_PAYLOAD_ENDPOINTS)
-        self.assertIn('endpoint === "snapshot" && Object.keys(payload).length === 0', RPC_JS)
+        self.assertEqual(list(app_module.PLAN_EXECUTE_FIELDS),
+                         ["plan_hash", "expected_mode", "confirmation", "action"])
+        self.assertEqual(list(app_module.SERIES_FIELDS), ["ticker", "period", "limit"])
+        self.assertEqual(set(app_module.EMPTY_PAYLOAD_ENDPOINTS),
+                         {"snapshot", "audit", "confirmation", "plan", "schedule", "reconcile"})
 
 
 class ComputeTableLockTests(unittest.TestCase):
-    def test_inner_cache_ttl_matches_analytics_and_series_js(self):
-        for text in (ANALYTICS_JS, SERIES_JS):
-            found = re.search(r"const CACHE_TTL_MS = ([0-9_]+);", text)
-            self.assertIsNotNone(found, "找不到 JS 侧内层缓存 TTL")
-            self.assertEqual(compute.INNER_CACHE_TTL_MS, js_number(found.group(1)))
-
-    def test_instrument_timeout_matches_analytics_js(self):
-        # analytics.js:169-170 的 instruments.py 调用写死 120_000
-        found = re.search(r'instruments\.py"\), "--ticker", ticker\],\s*'
-                          r"\{ timeout: ([0-9_]+),", ANALYTICS_JS)
-        self.assertIsNotNone(found, "analytics.js:169-170 的 instrument timeout 变了形")
-        self.assertEqual(compute.ENDPOINT_TIMEOUT_MS["instrument"], js_number(found.group(1)))
+    def test_inner_cache_ttl_and_timeouts_are_frozen(self):
+        self.assertEqual(compute.INNER_CACHE_TTL_MS, 30_000)
+        self.assertEqual(compute.TIMEOUT, 180_000)
+        self.assertEqual(compute.ENDPOINT_TIMEOUT_MS, {"instrument": 120_000})
         self.assertEqual(compute.timeout_for("instrument"), 120_000)
         self.assertEqual(compute.timeout_for("equity"), 180_000)
-        # 其余端点共用 analytics.js:67 的默认 180s；series.js:37 也是 120s（compute.series 内联）
-        self.assertIn("{ timeout: 180_000,", ANALYTICS_JS)
-        self.assertEqual(compute.TIMEOUT, 180_000)
-        self.assertIn("timeout: 120_000", SERIES_JS)
 
-    def test_endpoint_script_map_is_consistent(self):
-        """12 个分析端点都有 (脚本, 参数构造, 源行号)，且脚本名出现在 analytics.js 里。"""
+    def test_endpoint_script_map_is_frozen_and_scripts_exist(self):
+        """12 个分析端点都有 (脚本, 参数构造, 源行号)，且脚本真实存在。
+
+        「脚本都真实存在」原由 tests/analytics-routing.test.mjs 在 Node 侧钉死
+        （该文件随 analytics.js 退役删除），现由本断言接管。
+        """
         self.assertEqual(set(compute.ENDPOINTS), set(app_module.ANALYTICS_ENDPOINTS))
-        for name, (script, build, source) in compute.ENDPOINTS.items():
+        for name, (script, build, _source) in compute.ENDPOINTS.items():
             self.assertTrue(script.endswith(".py"), name)
             self.assertTrue(callable(build), name)
-            self.assertTrue(source.startswith("analytics.js:"), name)
-            self.assertIn(script, ANALYTICS_JS, name)
+            self.assertTrue((PYTHON_DIR / script).is_file(),
+                            f"{name} 指向了不存在的脚本 {script}")
+
+    def test_analytics_py_subcommand_whitelist(self):
+        """analytics.py 的子命令只能来自它自己声明的集合。
+
+        规则来源：曾有五个接口把不存在的子命令交给 analytics.py，运行时表现为
+        argparse `invalid choice`（原 analytics-routing 测试的立项理由）。
+        """
+        source = (PYTHON_DIR / "analytics.py").read_text(encoding="utf-8")
+        subcommands = {m.group(1) for m in re.finditer(r'add_parser\(\s*"([^"]+)"', source)}
+        self.assertEqual(sorted(subcommands),
+                         ["correlation", "equity", "positions", "risk", "trades"],
+                         "analytics.py 的子命令变了，请同步检查 compute.ENDPOINTS 的路由")
+        # 子命令由参数构造函数决定，这里抽查三个直接可见的路由（其余由
+        # test_wp6_service.test_arg_construction_matches_analytics_js 逐参数钉死）
+        self.assertEqual(compute.ENDPOINTS["equity"][0], "analytics.py")
+        self.assertEqual(compute.ENDPOINTS["risk"][0], "analytics.py")
+        self.assertEqual(compute.ENDPOINTS["trades"][0], "analytics.py")
+
+    def test_series_routes_to_bars_script(self):
+        """series 不在 ENDPOINTS 映射里，走独立的 compute.series → bars.py。"""
+        self.assertNotIn("series", compute.ENDPOINTS)
+        self.assertTrue((PYTHON_DIR / "bars.py").is_file())
 
 
 if __name__ == "__main__":

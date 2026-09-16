@@ -51,8 +51,9 @@ test("R1 模式互斥：sim 拒 live 类工具；live 拒 sim 类工具", async 
 // **不可达**——guard 不分模式一律拒绝并指引工作台通道（quantwb 的 trade_* 工具，
 // 或计划执行）；业务确认移至工作台服务侧（Web 确认卡片作答），Node 侧不再发起。
 // 历史：R2 曾断言「live 写走业务确认而非 ask」（full-access 下 ask 被静默 rejected 的
-// 教训）——该 pre-execute 确认分支已退役，store 三方法与端点保留（legacy）。
-test("R2 live 下 futu 写类 guard 拒绝含指引；不产生待确认；mcp__futu__* 只读放行", async (t) => {
+// 教训）——该 pre-execute 确认分支已退役，store 三方法与 Connection RPC 端点已随
+// WP7 面板退役（2026-09-16）一并删除。
+test("R2 live 下 futu 写类 guard 拒绝含指引；mcp__futu__* 只读放行", async (t) => {
   await inTempHome(t);
   const store = new WorkbenchStore();
   await store.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
@@ -65,13 +66,10 @@ test("R2 live 下 futu 写类 guard 拒绝含指引；不产生待确认；mcp__
   assert.match(refusal, /trade_\*/);
   assert.match(refusal, /计划执行/);
   assert.match(String(guards[0](execOf("mcp__futu__sim_trade_place_order", {}))), /请通过工作台交易/);
-  // 不产生任何待确认
-  assert.equal(store.confirmationView(), null, "写类被拒不得产生待确认");
-  // pre-execute 只透传（不再发起业务确认；写类在 guard 已拒，正常到不了这里）
+  // pre-execute 只透传（确认分支已退役；写类在 guard 已拒，正常到不了这里）
   const decision = await hooks["tools/pre-execute"][0](
     execOf("mcp__futu__trading_modify_order", {}), async () => ({ kind: "allow" }));
   assert.equal(decision.kind, "allow");
-  assert.equal(store.confirmationView(), null);
   // mcp__futu__* 只读放行
   assert.equal(guards[0](execOf("mcp__futu__account_positions")), undefined);
   assert.equal(guards[0](execOf("mcp__futu__quote_news_search")), undefined);

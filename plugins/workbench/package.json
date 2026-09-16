@@ -1,12 +1,11 @@
 {
   "name": "@bstester/dsh-trading-workbench",
-  "description": "Harness-native research, activity and quant preview workbench; no chat or order entry",
-  "version": "0.36.0",
+  "description": "Harness Host service anchor for the trading workbench (research records, broker observations, quant previews); no chat, panel, or order entry",
+  "version": "0.37.0",
   "type": "module",
   "main": "src/index.js",
   "exports": {
     ".": "./src/index.js",
-    "./client": "./src/client.js",
     "./cordis.patch.yml": "./cordis.patch.yml"
   },
   "files": [
@@ -17,14 +16,6 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
-    },
-    "client": {
-      "platform": "web",
-      "inject": [
-        "@deepseek-ai/dsh-client-connection",
-        "@deepseek-ai/dsh-client-ui-renderer",
-        "@deepseek-ai/dsh-client-ui-layout"
-      ]
     }
   },
   "license": "MIT"

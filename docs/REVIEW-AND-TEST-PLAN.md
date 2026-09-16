@@ -99,6 +99,9 @@ analytics.py: error: argument cmd: invalid choice: 'sources'
 逐个 provider 断言它执行的脚本与首个参数、断言期望表覆盖了全部 provider
 （新增接口必须同步登记）、断言 `analytics.py` 的子命令集合没变、
 断言被执行的脚本真实存在、断言选项式脚本不得收到位置参数。
+> （2026-09-16 更新：该测试文件已随 legacy 面板的 analytics.js 于 WP7 退役删除；
+> 「脚本真实存在 + analytics.py 子命令白名单」两条由 `tests/test_wp6_tables_lock.py`
+> 接管，逐参数路由断言由 `tests/test_wp6_service.py` 钉死。）
 
 修复后端到端实测：
 

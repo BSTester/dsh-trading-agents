@@ -14,8 +14,9 @@
 
 - Harness 负责全部 AI 对话、投研/量化指令、交易指令和逐笔人工确认。
 - 工作台自 WP6 起是**独立 Web**（`platform/` FastAPI 单进程托管，默认
-  `http://127.0.0.1:8397`），Harness 内 legacy 面板过渡期并存；两种形态都只展示研报、
-  最近交易响应、量化预览，并提供 sim/live 切换。
+  `http://127.0.0.1:8397`），也是**唯一工作台界面**（Harness 内 legacy 面板已于 WP7
+  退役，用户决策 2026-09-16）；工作台只展示研报、最近交易响应、量化预览，
+  并提供 sim/live 切换。
 - 不另建聊天入口，不在工作台提供下单、撤单或任意工具执行接口。
 - 模式切换不授权交易；本地模拟台账不代表富途模拟账户或真实账户。
 
@@ -29,11 +30,11 @@
 | preset / skill | 明确 Harness 单入口、12 角色 6 阶段、发布步骤与模式边界 |
 | 研究引擎 | 不再私建无取数能力的 LLM 循环；`run_trading_analysis` 启动记录，Harness 完成研究，`research_publish` 发布 |
 | 发布约束 | 校验 run、会话、标的、当前模式、五档评级、报告与带时间的来源；不猜测评级 |
-| 工作台 Host | 根级 `tradingWorkbench` 服务，持久报告/预览/响应；认证后的 Harness Connection RPC |
+| 工作台 Host | 根级 `tradingWorkbench` **服务锚**（engine 对话工具与账户策略的进程内依赖），持久报告/预览/响应；面板退役后不再注册任何 Connection RPC |
 | 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，22 端点）+ `/mcp`（streamable-http，33 工具；`confirm-decide` 有意不进工具面）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
-| 工作台 Client | 正确的 Host/Client 双入口、宿主 React module factory；结果卡片与面板，不需重建 Harness Web |
-| 交易动态 | 观察原生账户工具最终响应；打开面板时每 3 秒刷新快照；不伪装券商成交推送 |
-| 模式切换 | 用户在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）明确确认 live，携带预期旧模式；legacy 面板过渡期保留同款口令流程；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |
+| 工作台 Client | ~~Host/Client 双入口、宿主 React module factory；结果卡片与面板~~ **已于 WP7 退役**：UI 由 `platform/web` 独立前端承接 |
+| 交易动态 | 观察原生账户工具最终响应；工作台页面打开时轮询刷新快照；不伪装券商成交推送 |
+| 模式切换 | 用户在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）明确确认 live，携带预期旧模式；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |
 | 执行策略 | 账户工具按 sim/live 拒绝不匹配调用；真实写工具经**工作台业务确认**（独立于权限审批，任何档位下都必须确认）；不允许模型走其他通道绕过 |
 | 量化 | 修正风险/成本/成交时序；本地模拟与券商数据分离，失败不能回退为零价格或虚构资产 |
 | 安装 | Bash/PowerShell 共用插件安装流程，包路径、失败退出、幂等启用与更新行为可重复核对 |
@@ -76,7 +77,7 @@ python -B -m unittest discover -s tests -p 'test_*.py' -v
 ```
 
 Node 用内置测试运行器，包括真实 Cordis + 钉版工具服务组合、账户守卫与结果事件、
-工作台持久状态和模式切换、客户端入口及 RPC 白名单。
+工作台持久状态和模式切换（历史：客户端入口与 RPC 白名单用例已随面板退役删除）。
 Python 用标准库 unittest，行情与账户使用隔离样本/临时目录，不发真实交易请求。
 
 本轮本地基线：17 项 Node、52 项 Python 用例通过，覆盖包内根级 patch、模拟台账提交与
@@ -84,7 +85,7 @@ Python 用标准库 unittest，行情与账户使用隔离样本/临时目录，
 PowerShell 安装器，也未启动完整 Harness Web。后续券商模拟订单实测见下节。
 
 本地合约成立不等于完整部署验收。仍需在目标 Harness 版本、实际操作系统和新会话中
-确认 preset 发现、插件加载、工作台业务确认（legacy 面板作答）、客户端加载及真实数据接口行为。
+确认 preset 发现、插件加载、工作台业务确认（服务侧 Web 确认卡片）及真实数据接口行为。
 
 ### 2026-09-12：富途模拟账户实测
 
@@ -146,7 +147,7 @@ HTTP/shell 调券商接口，模式守卫不会拦截——仓库文档明令禁
 | 富途模拟盘订单生命周期 | 查询、受理、改单、撤单和资金释放已实测；成交/部分成交、断线后订单去重与自动对账仍需完善 |
 | 业务错误归一化 | `ret_code != 0` 可能包在 `isError=false` 内；工作台当前错误标记只跟随工具外层状态，不能把无错误标记视为业务成功 |
 | 授权续期 | **官方 `expires_in = 7200`（2 小时）**，续期不换发 refresh_token。实测 token 过期时 `initialize` 仍成功、而所有 `tools/call` 返回 `internal error`（不是 401）。两条通道处理不同：脚本通道遇该特征自动续期并重试一次；MCP 通道由 preset 里的 `futu-keepalive` 行按节奏提前续期（其 Authorization 头在行挂载时求值一次并被 Zod 压平，重连不重读，因此无法做到每请求刷新）。**实测 preset 目录无 watcher**，所以续期只对新建会话生效——已在运行的会话必须新建会话才会重新读取组合 |
-| 实时交易推送 | 面板刷新已有工具响应，不自动查询券商，也未建立成交订阅 |
+| 实时交易推送 | 工作台刷新已有工具响应，不自动查询券商，也未建立成交订阅 |
 | 多市场量化 | 首期为 A 股日线，港美历史数据、费用和交易规则需要独立完善 |
 | 生产级风控 | 本地风险公式/止损意图不等于券商托管止损、日内熔断、组合风险与紧急停机 |
 | 自动运行 | 定时调度、指令队列、监控告警由 WP4 daemon 交付（以 WP4 合并后实测为准）；合并前无生产级定时调度与无人值守服务 |
@@ -198,24 +199,22 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   `<DSH_HOME>/trading-workbench.json`、模式文件 `trading-account-mode` 与指令目录
   `trading-commands/`；写路径靠既有**原子写 + 独占锁**互斥，两处同时切换模式的竞态由
   `expected_mode` 复核兜底（后到者拒绝）。排查数据不一致时先确认没有两个进程同时在写。
-- **实盘写确认 = 工作台业务确认（2026-09-15 main 修订；⚠️ WP7 收窄后该路径对 futu 写不可达，见条目末尾标注）**：live 的 `trading_*` 写操作由插件
-  在 pre-execute 自己发起确认，用户在 **Harness 内 legacy 工作台面板**作答（**不再走 Harness
-  原生审批**，`policy.js` 永不返回 `{kind:"ask"}`；`sim_trade_*` 永不确认）。确认是**进程内存态**
-  （刻意不落盘），**跨进程不可见**：Harness 会话发起的待确认，独立 Web 的 `confirmation` 端点
-  读到的是 `pending: null`——那是「读不到」，不是「无需确认」；服务进程自身也没有实盘写路径
-  去发起确认。**独立 Web 暂无确认界面**（有意不做，长期空白界面会误导），过渡期一律回 Harness
-  面板作答；将来若要跨进程，需把请求/裁决落到共享文件且**同时改 Node 侧**
-  （见 `docs/architecture.md` 的「业务确认的跨进程边界」与规格 §4.5:5、§八-8）。
-  ⚠️ **WP7 起该路径对 futu 写已不可达**：guard 对 futu 写类一律拒绝，实盘写确认唯一路径是
-  服务进程内发起 + Web 确认卡片作答（即 `docs/architecture.md`「业务确认表述统一（WP7 修订）」
-  的路径①）；本条保留作历史依据与跨进程化设计参考。
+- **实盘写确认 = 工作台业务确认（唯一路径在服务侧；WP7 起现行，2026-09-16 面板退役后无第二条）**：
+  确认由**服务进程**发起（工作台 `trade_*` 工具的交易闸门，`store_access.request_confirmation`），
+  用户在**独立 Web 确认卡片**作答（`confirmation`/`confirm-decide`，同进程，中文订单摘要，
+  TTL 120s 超时按拒绝收尾 fail-closed）。确认是**进程内存态**（刻意不落盘），服务重启即清空。
+  Harness 侧富途写类被 policy guard 一律拒绝并指引工作台，**不产生任何待确认**。
+  （历史：main `624ccd0`~WP6 期间曾有「插件 pre-execute 发起、Harness 内 legacy 面板作答」的
+  路径与「两进程确认表互不可见」的跨进程限制；该路径连同面板、Host RPC 与 Node 侧确认三方法
+  已于 WP7 随面板退役删除，详见 `docs/architecture.md` 的「业务确认表述统一」。）
 - **Python 侧快照的诚实边界（WP6）**：服务进程的 store 访问层只读
   `trading-workbench.json`，**不合并** pending observations（合并仍由 Harness Host 完成），
   因此合并前的账户响应不会出现在独立 Web 快照里；`trade_summary`/`audit` 链是 Node
   原实现的 Python 移植版，等价性由差分测试钉死（见 `tests/test_wp6_summary_audit.py`）。
-- **legacy 面板过渡期并存（WP6）**：`plugins/workbench` 的 Host 行与面板**必须保留**
-  （`tradingWorkbench` 服务是 engine 账户策略的进程内锚）；面板本身在独立 Web 验收后
-  **另行提交**移除，不在 WP6 范围内。
+- **面板已退役；Host 仅作服务锚（WP7，用户决策 2026-09-16）**：legacy 面板（client.js）、
+  Host Connection RPC 面与 Node 侧确认三方法已删除；`plugins/workbench` 的 Host 行保留仅为
+  `tradingWorkbench` 服务锚（engine 对话工具与账户策略——模式互斥/租约/观察记录——的
+  进程内依赖），删除该行即破坏 engine。工作台 UI 与数据访问只在 `platform/` 独立服务。
 - **服务依赖与启动（WP6）**：依赖 `platform/requirements.txt`（FastAPI/uvicorn/mcp/httpx，
   装在 `~/.dsh/trading-venv`）；启动 `cd platform && ~/.dsh/trading-venv/bin/python -m server.run`；
   未构建 `platform/web/dist` 时 `GET /` 404，取数类工具全报 `trading/*-unavailable`

@@ -10,11 +10,16 @@ import * as workbench from "../plugins/workbench/src/index.js";
 
 const require = createRequire(new URL("../plugins/engine/src/index.js", import.meta.url));
 const load = name => import(pathToFileURL(require.resolve(name)));
-const { Context, Service } = await load("@deepseek-ai/cordis");
+const { Context } = await load("@deepseek-ai/cordis");
 const { ToolRuntime, defineTool } = await load("@deepseek-ai/dsh-tools");
 const { SystemPrompt } = await load("@deepseek-ai/dsh-system-prompt");
 
-test("real Cordis composes root workbench, tool service, policy, and observed broker responses", async (t) => {
+// WP7 面板退役：本测试原经 Connection RPC（/api/trading-workbench/snapshot）读 Host 数据，
+// 面板与 Host RPC 面删除后改为直调 `ctx.tradingWorkbench`（服务锚不变式）：
+//   1. 真实 Cordis 组合出 workbench 服务锚 + engine 工具 + policy 三层；
+//   2. 账户工具的 execute 租约与 result 观察记录进 store；
+//   3. 模式互斥拒绝跨模式账户调用；futu 写类 guard 一律拒绝并指引工作台。
+test("real Cordis composes workbench service anchor, engine tools, policy, and observed broker responses", async (t) => {
   const home = await mkdtemp(path.join(os.tmpdir(), "trading-harness-"));
   const previous = process.env.DSH_HOME;
   process.env.DSH_HOME = home;
@@ -29,25 +34,6 @@ test("real Cordis composes root workbench, tool service, policy, and observed br
       await rm(home, { recursive: true, force: true });
     }
   });
-  const routes = new Map();
-  class Connection extends Service {
-    constructor(owner) { super(owner, "connection"); }
-    get fetch() {
-      const owner = this.ctx;
-      return { register: route => this.register(owner, route) };
-    }
-    register(owner, route) {
-      return owner.effect(() => {
-        routes.set(route.path, route);
-        return () => routes.delete(route.path);
-      });
-    }
-  }
-  for (const plugin of [Connection]) {
-    const fiber = ctx.plugin(plugin);
-    fibers.push(fiber);
-    await fiber;
-  }
   const prompt = ctx.plugin(SystemPrompt);
   fibers.push(prompt);
   await prompt;
@@ -58,6 +44,9 @@ test("real Cordis composes root workbench, tool service, policy, and observed br
   fibers.push(host);
   await host;
   await new Promise(resolve => setImmediate(resolve));
+  // 服务锚就位：面板退役后 workbench 插件只 provide 服务，不再注册任何路由
+  assert.ok(ctx.tradingWorkbench, "tradingWorkbench 服务必须可用");
+  assert.equal(typeof ctx.tradingWorkbench.snapshot, "function");
   const tools = ctx.plugin(engine);
   fibers.push(tools);
   await tools;
@@ -75,14 +64,10 @@ test("real Cordis composes root workbench, tool service, policy, and observed br
     signal: new AbortController().signal,
   });
   assert.equal(result.isError, false, JSON.stringify(result));
-  const response = await routes.get("/api/trading-workbench/snapshot").fetch(new Request(
-    "http://localhost/api/trading-workbench/snapshot", {
-      method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ type: "client-request", rpcId: "snapshot-1", method: "trading-workbench/snapshot", payload: {} }),
-    }));
-  const { result: snapshot } = await response.json();
-  assert.equal(snapshot.value.in_flight, 0);
-  assert.equal(snapshot.value.broker.value.orders[0].status, "SUBMITTED");
+  // 观察链路：最终响应进 store（原经 RPC 快照断言，现直读服务锚）
+  const snapshot = ctx.tradingWorkbench.snapshot();
+  assert.equal(snapshot.in_flight, 0);
+  assert.equal(snapshot.broker.value.orders[0].status, "SUBMITTED");
   ctx.tradingWorkbench.switchMode({ mode: "live", expected_mode: "sim", confirmation: "确认实盘" });
   const denied = await ctx.tools.execute({
     name: "mcp__futu__sim_trade_history_order_list", arguments: {}, callId: "fixture-2",
@@ -104,5 +89,4 @@ test("real Cordis composes root workbench, tool service, policy, and observed br
   assert.equal(placed, false);
   assert.equal(ctx.tradingWorkbench.inFlight, 0);
   await host.dispose();
-  assert.equal(routes.size, 0);
 });

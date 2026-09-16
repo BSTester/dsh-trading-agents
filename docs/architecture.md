@@ -14,9 +14,8 @@
 `*_label` 中文标签，**机器码保留不动**（台账已落盘、逻辑在比较、旧记录要能读）。
 
 唯一事实来源是 `plugins/datasource/python/trading_datasource/labels.py`；
-`plugins/workbench/src/labels.js` 是 Host 侧镜像，`src/client.js` 里的 `ZH`
-是浏览器侧回退表（client 是单文件、无法 import）。三份表由
-`tests/test_labels.py` 解析比对，漂移即失败。
+`plugins/workbench/src/labels.js` 是 Host 侧镜像（浏览器侧回退表随 legacy 面板
+client.js 于 WP7 退役删除）。两份表由 `tests/test_labels.py` 解析比对，漂移即失败。
 
 回退表存在的唯一理由是**渲染历史记录**：旧台账/旧预览/旧研报里只有 `BUY`、
 `buy`、`open`、`Buy` 这类英文码，界面必须能翻成中文。
@@ -25,14 +24,15 @@
 
 本项目是 **DeepSeek Harness 的对话模式与插件组合**，不是独立交易终端。
 Harness 是唯一 AI 对话、分析请求和交易指令入口。工作台自 WP6 起是
-**独立 Web（FastAPI 单进程托管）+ Harness 内 legacy 面板过渡期并存**：
+**独立 Web（FastAPI 单进程托管）**，也是唯一工作台界面——Harness 内 legacy 面板
+已于 WP7 退役（用户决策 2026-09-16，随独立服务承接全部工作台能力而移除）。
 独立 Web 只用于研报结果、交易动态、量化信息预览与模拟盘/实盘模式切换；
-Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户策略依赖它），
-面板移除另行提交。
+Harness 内 `plugins/workbench` 保留 `tradingWorkbench` 服务锚
+（engine 对话工具与账户策略的进程内依赖），不再有任何 UI。
 
 ```text
-用户 ↔ Harness 对话 / 工作台业务确认（服务进程内 Web 卡片作答；legacy 面板确认 UI
-      │                          对 futu 写已不可达，保留至面板退役）
+用户 ↔ Harness 对话 / 工作台业务确认（服务进程内 Web 卡片作答，唯一确认通道）
+      │
       ├─ trading-agents skill + Harness 子代理
       │    └─ 富途 MCP（只读研究）/ fin_news / fin_sentiment / web 取数
       │
@@ -96,9 +96,8 @@ Harness 内面板仍是 `tradingWorkbench` 服务的进程内锚（engine 账户
 | `skills/trading-agents/SKILL.md` | Harness 主会话与子代理执行 12 角色、6 阶段研究，数据不足显式说明 |
 | `plugins/engine/src/tools.js` | `run_trading_analysis` 启动记录、`research_publish` 发布有来源的报告、量化结果保存 |
 | `plugins/engine/src/policy.js` | 拒绝跨模式账户工具；WP7 收窄：futu 写类（`sim_trade_*`/`trading_*` 的下单/改单/撤单动词）guard **一律拒绝并指引工作台**（不返回 `ask`，与权限档位无关；`trading_*` 族未知动词按写拒绝=**fail-closed**，`sim_trade_*` 未知动词按读处理——sim 写伤害有界）；记录最终工具响应 |
-| `plugins/workbench/src/index.js` | 根级 Host 插件，提供 `tradingWorkbench` 服务与认证后的 Connection RPC |
+| `plugins/workbench/src/index.js` | 根级 Host 插件，只提供 `tradingWorkbench` 服务锚（研报/预览/观察记录；WP7 面板退役后不再注册任何 Connection RPC） |
 | `plugins/workbench/src/store.js` | JSON 持久结果、原子替换、写锁、账户调用租约、模式隔离 |
-| `plugins/workbench/src/client.js` | Harness 原生 module factory，使用宿主 React；`shell.overlay` 面板及 `tool.call.toolview` 卡片 |
 | `plugins/engine/python` | 量化计算与本地模拟台账的权威实现 |
 | `plugins/datasource/python` | **统一数据层**：唯一的富途 MCP 客户端、行情路由与回测核心，被 engine/workbench 共同依赖（不是 Harness 插件） |
 | `plugins/core/python/trading_core` | **量化平台核心库**（非 Harness 插件）：PIT 存储/日历/同步/质量（WP1）、因子/策略/组合回测/walk-forward（WP2）、风控八规则/计划冻结/OMS 状态机/券商适配/对账/TCA（WP3）、daemon 调度/指令目录/告警（WP4） |
@@ -157,35 +156,33 @@ Host 校验会话归属、标的、模式、五档评级及来源。报告不会
 
 账户工具的 `tools/result` 事件记录为 `broker_response`，包含模式、时间、
 工具名、会话和结果/错误。敏感认证字段脱敏，超大响应不完整复制。
-面板打开时通过 Connection RPC 拉取快照（默认 60 秒兜底轮询），关闭后停止轮询。
+独立 Web 的工作台页面打开时轮询 `/api/wb/snapshot`（默认 60 秒兜底轮询），
+关闭后停止轮询（legacy 面板的 Connection RPC 通道已随面板退役）。
 
 ### 本地缓存与"不追求实时"
 
-面板是查看用途，不需要实时取数。这些接口背后是 python 子进程与富途调用，
-每次切页签都重跑既慢又浪费额度，因此有两层缓存：
+工作台是查看用途，不需要实时取数。这些接口背后是 python 子进程与富途调用，
+每次切页签都重跑既慢又浪费额度，因此有两层缓存（legacy 面板的双层结构在独立 Web
+中原样保留，只是宿主从 Harness Client/Host 换成了浏览器/服务进程）：
 
 | 层 | 位置 | 作用 |
 |---|---|---|
-| 客户端内存缓存 | `client.js`（按接口 TTL） | 切页签、重开面板不再重复请求 |
-| Host TTL 缓存 | `rpc.js` 的 `CACHE_TTL_MS`（按接口粒度，1–30 分钟） | 即使客户端重新请求也不会重跑取数 |
+| 客户端内存缓存 | `platform/web/src/services/api.js`（按接口 TTL，对齐旧 client.js） | 切页签、重开页面不再重复请求 |
+| 服务 TTL 缓存 | `platform/server/caches.py` 的 `CACHE_TTL_MS`（按接口粒度，1–30 分钟） | 即使客户端重新请求也不会重跑取数 |
 
-`_refresh: true` 是显式旁路标记（不参与各接口的字段校验）；面板的「刷新」按钮会清空
-客户端缓存，并让随后 5 秒内的请求穿透 Host 缓存。切换模拟/实盘会清缓存，
+`_refresh: true` 是显式旁路标记（不参与各接口的字段校验）；页面的「刷新」按钮会清空
+客户端缓存，并让随后 5 秒内的请求穿透服务缓存。切换模拟/实盘会清缓存，
 避免展示上一个模式的数据。界面上明确写出"数据按 TTL 本地缓存，不追求实时行情"。
 
-### 接口自检：让"进程陈旧"可诊断
+### 接口自检：让"版本陈旧"可诊断
 
-Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动时加载一次。
-插件升级后若没重启，客户端会调用一批 Host 根本没有的路由，表现为满屏
-`transport failure ... HTTP 404`，完全看不出原因。现在：
-
-- Host 在 `snapshot` 响应里**声明**它实际提供的接口（`endpoints`，与路由注册同源）；
-- 客户端据此**不发起**已知缺失的请求，直接给出可读原因；
-- 对不声明清单的旧 Host，客户端从 404 反推并记住，同样停止重试；
-- 面板顶部显示缺失接口清单与修复动作（重启 `dsh web`）。
-
-业务失败（如台账不可读）不会被误判成路由缺失。点击「刷新」会清掉缺失记忆，
-让重启后的 Host 有机会恢复。
+服务在 `snapshot` 响应里**声明**它实际提供的接口（`endpoints`，与端点清单同源）；
+前端据此**不发起**已知缺失的请求，直接给出可读原因（「服务版本陈旧，请重启服务后
+刷新」），声明集合取不到时一律放行，不把旧服务拦死。业务失败（如台账不可读）
+不会被误判成路由缺失。点击「刷新」会清掉缺失记忆，让重启后的服务有机会恢复。
+（历史：这一自检机制原为诊断 legacy 面板的 Host/Client 半边加载时差而生，该形态已随
+面板退役；独立 Web 是服务端单进程，不存在半边版本差，前端预检保留为版本陈旧提示，
+并继续以 404 分支兜底。）
 
 这里的“动态”是 **Harness 已观察到的工具响应**，不是已建立的券商成交推送。
 `SUBMITTED`、超时、拒单不能转换成“已成交”。没有账户响应时显示未知，
@@ -228,7 +225,7 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
 | 1d | 3.0–4.6 s | 29.0 KB | 1.2 年 |
 
 300 根就是 300 根——payload 与往返成本基本相同，成本变量是**调用频率**而非周期。
-因此分钟级并不比日线贵；配合两层缓存（客户端与 Host 各 5 分钟），切页签为 0 次调用。
+因此分钟级并不比日线贵；配合两层缓存（浏览器与服务各 5 分钟），切页签为 0 次调用。
 
 根数上限受富途单次 370 根约束（预设 200–250）。图表仅在标的解析后挂载，
 未解析时不发请求；canvas 自绘，不引入依赖。
@@ -259,7 +256,7 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
   因此只做「按账户小计」；实盘响应自带 `currency`，才按币种小计。
   页面上不会出现把港币和美元加在一起的"总市值"。
 - 单个账户读取失败**不掩盖**：计入 `errors` 并在界面上列出，同时继续展示其他账户。
-- 缓存分三层：客户端内存 → Host RPC（2 分钟）→ python 磁盘缓存（5 分钟）。
+- 缓存分三层：浏览器内存 → 服务端 TTL（2 分钟）→ python 磁盘缓存（5 分钟）。
   命中时界面标注 `as_of` 与"本地缓存"；实时读取失败时展示上次缓存并标 `stale`，
   而不是显示空白或编造数字。
 - 真实账户在界面上只显示末四位，不泄露完整账户号。
@@ -287,19 +284,18 @@ Client 半边每次请求都从磁盘读取，而 Host 半边只在进程启动�
 这是插件管理的 MCP 工具边界，不是操作系统沙箱。拥有宿主 shell、文件权限或券商凭据
 的人仍能绕过插件，因此禁止模型绕路，日常只授只读权限，不能宣称已经具备完整实盘安全保证。
 
-## Host / Client 协议与存储
+## 服务协议与存储
 
-工作台通过原生 `ctx.connection.fetch.register` 注册精确 POST 路由，
-Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
-采用 Harness 的请求/响应 envelope，继承 Connection 的信任、认证和生命周期。
-不占用 Gateway 的共享 interceptor。
+（历史：legacy 面板时代工作台经原生 `ctx.connection.fetch.register` 注册 POST 路由、
+Client 用 `ctx.connection.rpc.call` 调用并继承 Connection 信任——该 Host RPC 面已随
+面板于 WP7 退役。）
 
 **WP6 起同一批端点在 `platform/` 独立服务进程内以 `POST /api/wb/<endpoint>` 暴露**
 （envelope 契约不变：`{ok, value?, cached?, cached_at?, error?{code,message,details}}`）；
 `/mcp` 的 33 个 MCP 工具与 HTTP 路由在该进程内调用**同一批 Python 处理函数**
 （同一 `(endpoint, payload) -> envelope`），行为对等由代码结构 + 审批回归矩阵共同保障。
 `snapshot` / `switch-mode` 之外，WP4 新增 4 个受约束端点
-（读侧一律经只读子命令取数，Node 侧经 `pycore`、Python 侧经 `trading_core snapshot-*`
+（读侧一律经只读子命令取数，Python 侧经 `trading_core snapshot-*`
 读 SQLite，不直接改库；写侧只落指令目录，不直接操作业务状态）：
 
 | Endpoint | 输入 | 输出 |
@@ -311,7 +307,7 @@ Client 使用 `ctx.connection.rpc.call("/api", "trading-workbench/...", ...)`，
 | `schedule` | `{}` | daemon 心跳、作业历史、下次运行 |
 | `reconcile` | `{}` | 最近对账差异、TCA 摘要、告警列表 |
 | `confirmation` | `{}`（空载荷，**不进缓存**） | `{pending, ttl_ms}`；`pending` 为待用户确认的实盘写操作（编号、工具、中文订单摘要、创建/到期时间）或 `null` |
-| `confirm-decide` | `{id, decision: "approved"\|"rejected"}` | 提交用户的决定；**唯一能批准实盘操作的通道**，只由独立 Web 的用户点击触发（不进 MCP 工具面） |
+| `confirm-decide` | `{id, decision: "approved"\|"rejected"}` | 提交用户的决定；**唯一能批准实盘操作的通道**，只由独立 Web 确认卡片的用户点击触发（不进 MCP 工具面） |
 | `factors-history`（WP7） | `{limit?}`（1..120，TTL 5m 缓存） | 定时收集的因子快照历史（按交易日倒序） |
 | `trade_place` / `trade_modify` / `trade_cancel`（WP7） | `{symbol[, side, qty, price, order_id, client_order_id]}` | 经交易闸门链的写操作；失败一律信封化 `trading/order-rejected` / `trading/broker-unavailable` / `trading/invalid-operation`，绝不 500 |
 | `account_positions` / `account_orders` / `account_funds`（WP7） | `{mode?}` | 券商账户查询直通（模式文件约束；不进任何缓存；失败账户列入 `errors` 不掩盖） |
@@ -327,35 +323,36 @@ WP7 的 `trade_*` 写端点（必须通过交易闸门链：模式→风控 8 �
    触发的确认在**服务进程内**发起（`store_access.request_confirmation`），用户在**独立 Web
    的确认卡片**作答（`confirmation`/`confirm-decide` 端点，同进程，无跨进程问题）。
    这是当前**唯一可达**的实盘写确认路径（TTL 120s 超时=拒绝，fail-closed）。
-2. **legacy 面板的确认 UI**：futu 写通道收窄后（engine guard 对 futu 写一律拒绝），
-   Harness 会话侧**不再产生**新的 futu 写确认——面板的确认 UI 对 futu 写已**不可达**，
-   仅为历史留痕与面板退役前的过渡保留。
+2. ~~**legacy 面板的确认 UI**~~（**已于 WP7 退役，用户决策 2026-09-16**）：futu 写通道收窄后
+   （engine guard 对 futu 写一律拒绝），Harness 会话侧不再产生新的 futu 写确认；该确认 UI
+   连同 Host Connection RPC 的 `confirmation`/`confirm-decide` 路由与 store 确认三方法
+   已随面板整体删除。**实盘写确认自 WP7 起只有路径①。**
 
-下文的「跨进程边界」清单按 WP6 时点撰写，作为路径②的历史依据与将来跨进程化的设计参考保留。
+下文的「跨进程边界」清单按 WP6 时点撰写，仅作历史依据与设计参考保留（其中「Harness
+会话发起确认、面板作答」的路径已不存在）。
 
 **业务确认的跨进程边界（诚实清单，2026-09-15 业务确认修订）**：实盘写操作的确认是
 “此刻等人回答”的**内存态**，刻意不落盘（进程重启后无人回答，落盘会让陈旧请求复活；
-持久化的只有 `activity` 里的事件留痕）。因此 **Harness 进程与独立服务进程各自持有自己的
-待确认表，互不可见**：
+持久化的只有 `activity` 里的事件留痕）。
 
-- Harness 会话里实盘写操作触发的确认，**独立 Web 的 `confirmation` 端点读不到**（它会
-  诚实地显示为空，而不是“没有待确认＝不需要确认”）；该笔确认只能在 **Harness 内的
-  工作台面板**作答（同进程，Connection RPC 的 `confirmation`/`confirm-decide`）。
-- 服务进程的 `confirmation`/`confirm-decide` 只反映**服务自身处理函数发起**的确认。
-- 两进程共享的是数据文件（store JSON、指令目录）与只读快照，**确认表不在共享之列**；
-  若将来需要跨进程作答，正确做法是把请求/裁决落到共享文件（复用现有原子写与租约协议），
-  那是一项需要同时改 Node 侧的变更。
-- **独立 Web 本期不建确认界面**（WP6 范围，有意不做）：服务侧确认通道本身完整
-  （`confirmation` 读、`confirm-decide` 答），但服务进程当前**没有实盘写路径**去发起确认，
-  而 Harness 会话发起的确认它在跨进程下读不到——放一个长期空白的界面会让人误读为
-  「无需确认」。过渡期实盘写确认一律在 **Harness 内 legacy 工作台面板**作答
-  （规格 §4.5:5、§八-8）；将来落共享文件后再实现该界面，并同时带上本条限制标注。
+> **已于 WP7 退役/闭环（用户决策 2026-09-16）**：下述「两进程各持一份待确认表、互不可见」
+> 与「过渡期在 Harness 内 legacy 面板作答」均成历史——Node 侧确认三方法与 Connection RPC
+> 的 `confirmation`/`confirm-decide` 路由已随面板删除，Harness 进程不再有确认实现；WP7 的
+> 交易闸门让服务进程自身发起确认（工作台 `trade_*` 工具），独立 Web 确认卡片就是作答界面，
+> **确认在服务单进程内闭环**，跨进程问题不复存在。以下清单保留作 WP6 时点的历史依据。
+
+- ~~Harness 会话里实盘写操作触发的确认，独立 Web 的 `confirmation` 端点读不到；该笔确认
+  只能在 Harness 内的工作台面板作答（同进程，Connection RPC）~~（该路径已随面板退役删除）。
+- 服务进程的 `confirmation`/`confirm-decide` 只反映**服务自身处理函数发起**的确认
+  （WP7 起即交易闸门的 `trade_*` 写路径——这是唯一的确认发起方）。
+- ~~独立 Web 本期不建确认界面~~（WP6 时点的有意不做；WP7 已落成确认卡片，本条失效）。
 
 `confirmation` 与 `confirm-decide` 因此是**同一进程内**的读/答两端，不是跨进程确认总线；
-页面若展示待确认列表，必须同时标注这条限制（服务侧看不到 Harness 的待确认）。
+确认是本进程内存态，服务重启即清空（超时语义等价于 fail-closed）。
 
 **端点声明自检（前端）**：`snapshot` 响应带 `endpoints` 数组（服务端 `store_access.endpoints()`，
-恰 22 项），前端 `services/endpoints.js` 用纯函数比对本次要调的端点；未声明即
+29 项 = 22 项基础清单 + WP7 服务自有端点；WP7 起清单为服务自有常量，不再解析面板源文件），
+前端 `services/endpoints.js` 用纯函数比对本次要调的端点；未声明即
 「服务未提供 X（服务版本陈旧，请重启服务后刷新）」并**不发起请求**
 （`services/api.js` 接线；服务端 404 分支保留作兜底；声明集合取不到时一律放行，
 不把旧服务拦死）。
@@ -374,20 +371,20 @@ loopback 不防同机其他进程，token 是可选加固而非强认证。浏�
 各列表最多保留最近 100 项；这不是完整审计档案，完整过程仍在 Harness 会话记录中。
 写入采用独占锁和同目录原子替换，读取失败不能退回伪造的空成功状态。
 已完成账户响应先写入独立持久暂存文件，写锁冲突时保留，后续快照读取/重启再合并；
-面板显示等待合并数量。这里只重试保存响应，绝不重试券商操作。
+工作台显示等待合并数量。这里只重试保存响应，绝不重试券商操作。
 
 异常退出可能留下写锁或调用租约。恢复时先停掉相关 Harness 进程、核对券商订单状态，
 再检查锁/租约中的 PID 和时间，仅清理确认无持有者的具体文件；不要自动过期删除未知在途订单的租约。
 
 ## 兼容性与后续准入
 
-工具依赖钉在 `@deepseek-ai/dsh-tools@0.1.2-rc.1`。Host/Client API 对照官方源码
-`c291e7961a515f6d7af9304e7fd1d257929aef26`：
-Connection RPC、工具守卫/结果事件、客户端 `./client` 导出和 module factory。
-客户端已经是可分发的原生 factory，无需用户重新构建 Harness Web。
+工具依赖钉在 `@deepseek-ai/dsh-tools@0.1.2-rc.1`。Host API 对照官方源码
+`c291e7961a515f6d7af9304e7fd1d257929aef26` 的工具守卫/结果事件
+（历史：Connection RPC 与客户端 `./client` 导出、module factory 的对照已随 legacy 面板
+于 WP7 退役失效；插件不再使用 `ctx.connection`）。
 
 优先级：安装/宿主集成验收 → 数据源与量化正确性 → 富途模拟盘成交/对账 →
 告警、审计、熔断及恢复 → 样本外策略评估 → 人工决定是否小额实盘。
 券商实时推送、港美历史数据与多市场交易规则仍需后续实现；本地对账/调度/熔断告警
 由 WP3–WP4 交付（已实测，恢复演练见 [RUNBOOK.md](RUNBOOK.md)）；
-面板可用不代表已达到实盘准入条件。
+工作台可用不代表已达到实盘准入条件。

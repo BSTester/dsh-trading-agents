@@ -184,7 +184,7 @@ platform/web/
       geometry.js（barIndexAt / tooltipLeft / compactNumber 纯函数，node --test 直测）
 ```
 
-| 现有实现 | 迁移为 |
+| 现有实现（= 已退役的 legacy 面板 client.js，WP7 删除；本表为迁移映射的历史记录） | 迁移为 |
 |---|---|
 | 页签数组 + switch 分支 | ProLayout 菜单路由（11 页） |
 | Card/Paged 列表 | ProCard + ProTable（分页内建，替 Paged） |
@@ -216,6 +216,9 @@ platform/web/
    也没有实盘写路径去发起确认——建一个长期空白的确认界面会让人误以为「无需确认」。因此过渡期
    的实盘写确认**仍在 Harness 内 legacy 工作台面板作答**；将来若把请求/裁决落到共享文件以支持
    跨进程，该界面必须同时标注这条可见性限制（§5.1「页面责任」）。
+   > **已于 WP7 退役/落成（用户决策 2026-09-16）**：本条的「过渡期面板作答」不再成立——
+   > legacy 面板已删除；WP7 的交易闸门让服务进程自身发起确认（`trade_*` 工具），
+   > 独立 Web 确认卡片就是作答界面，逐笔确认在服务进程内闭环。
 
 ### 4.6 构建与托管（单进程）
 
@@ -306,7 +309,7 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 |---|---|
 | `agent.cordis.yml` | 新增 `quant-platform-mcp` 行（dsh-mcp-client → `http://127.0.0.1:8397/mcp`，serverName quantwb，failOnStartupError: false，toolCallTimeoutMs: 120000）；persona 两条修订：工作台指向独立 Web URL（服务默认 `http://127.0.0.1:8397`），并新增「MCP 工具面与面板对等；live 口令门槛经 MCP 同样生效」 |
 | `plugins/workbench/cordis.patch.yml` | **保持不动**：`trading-workbench` 行是 `tradingWorkbench` 服务与 policy 审批的进程内锚，移除即破坏 A1/A2/A6 |
-| legacy 面板（shell.overlay） | 过渡期保留（同库数据，不冲突）；AntD Web 验收通过后另行提交移除，不在 WP6 范围内 |
+| legacy 面板（shell.overlay） | ~~过渡期保留（同库数据，不冲突）；AntD Web 验收通过后另行提交移除，不在 WP6 范围内~~ **已于 WP7 退役（用户决策 2026-09-16）**：client.js 与 Host Connection RPC 随独立服务承接全部工作台能力而整体移除 |
 | `preset.yml` | 描述行补「独立工作台 + MCP 工具面」表述 |
 
 ### 5.5 回归失败处置
@@ -344,4 +347,10 @@ WP6 新增入口（MCP `switch_mode`/`plan_execute`、HTTP 同名路径）在 Fa
 5. **K 线/热力图移植失真**：几何纯函数带测试移植，视觉回归靠人工清单比对。
 6. **本规格不改台账/审计保留口径**：各列表仍最近 100 项，完整审计仍在 Harness 会话。
 7. **store 双实现并存（FastAPI 架构的固有代价）**：Harness 进程内的 Node Host（观察记录合并、面板写路径）与服务进程内的 Python 访问层（快照读、switch-mode、管理动作）操作同一份 `trading-workbench.json`，依赖既有原子写 + 独占锁协议互斥。诚实边界：Python 侧快照读**不合并** pending observations（留给 Host 完成），合并前的观察不计入快照；`trade_summary`/`audit` 链为 Python 移植版，其与 Node 原实现的等价性由移植测试（差分用例）钉死。双实现漂移是长期风险，legacy 面板移除后 Node 侧写路径只剩观察记录，届时收敛为单一实现。
+   > **已于 WP7 退役（用户决策 2026-09-16）**：legacy 面板与 Host Connection RPC 已删除，
+   > Node 侧只剩观察记录写入，即本条预言的「收敛为单一实现」已落地——快照读、switch-mode、
+   > 管理动作与业务确认的唯一实现在服务进程（Python）。
 8. **业务确认的跨进程边界（诚实清单，2026-09-15 业务确认修订）**：实盘写操作的确认是**进程内存态**（`store.js` 刻意不落盘，进程重启后无人回答；持久化的只有 `activity` 事件留痕），Harness 进程与 FastAPI 服务进程**各持一份待确认表、互不可见**：Harness 会话发起的待确认，独立 Web 的 `confirmation` 端点读不到（`pending` 诚实地为 `null`，不是「无需确认」）；服务进程自身当前也**没有实盘写路径**去发起确认，因此两侧不会互相作答。过渡期口径：实盘写确认**由 Harness 内 legacy 工作台面板作答**，独立 Web 本期**不实现确认界面**（空白界面会误导，§4.5:5）。将来若要跨进程，需把请求/裁决落到共享文件（复用现有原子写 + 租约协议），且**必须同时改 Node 侧**；届时任何展示待确认列表的界面都必须标注这条可见性限制（§5.1「页面责任」）。
+   > **已于 WP7 退役/闭环（用户决策 2026-09-16）**：「过渡期由 Harness 面板作答」与「两进程
+   > 各持一份确认表」均成历史——Node 侧确认三方法与 Connection RPC 端点随面板删除；
+   > 确认只由服务进程发起（交易闸门）、只由独立 Web 确认卡片作答，单进程内闭环。
