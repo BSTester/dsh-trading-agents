@@ -33,6 +33,12 @@ def test_statements_announced_at_preserved(self):
 
 ### 任务 2：OpenApiSimTrade + core_broker sim 分支
 
+> **前置阻断点（WP12 任务 1 锁定表 §D.5，2026-09-16 实测文档）**：官方模拟交易文档写明
+> 「uid 由**登录态 header** 自动透传」，而仓库 OpenAPI 凭据是 AppKey 签名 / OAuth 服务端
+> 凭据——**兼容性未验证**。本任务**第一步必须用真实凭据实测**：通过则按锁定表迁移；
+> 不通过则**保留托管 MCP `sim_trade_*` 通道**，并在 TOOL-LIMITS 登记结论（锁定表不构成
+> 迁移承诺）。另：模拟交易文档**无错误码表**，实现时不得编造错误码映射。
+
 **文件**：修改 `futu_openapi.py`（`OpenApiSimTrade`：account_list/cash_info/position_list/input_order/modify_order/cancel_order/order_list/history_order_list/max_buy_sell 九方法）、`plugins/core/python/trading_core/broker.py`（sim 分支接通道分派）；测试 `tests/test_wp13_simtrade.py`。
 
 - [ ] **步骤 1：失败测试**（mock 传输）：

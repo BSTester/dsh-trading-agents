@@ -59,8 +59,8 @@ def test_plate_list_region_guard(self):
 **文件**：修改 `platform/server/futu_data.py`（FUTU_TOOLS 扩展/新端点路由）、`compute.py`、`app.py`（载荷白名单/EMPTY_PAYLOAD）、`mcp_tools.py`（TOOLS 清单+TOOL_COUNT 预算断言）、`caches.py`（TTL：F10/板块 30m–6h、做空 1h、实时族 0）、`store_access.py`（endpoints 声明）；测试 `tests/test_wp12_surface.py` + 更新 `tests/test_wp8_*` 锁定测试。
 
 - [ ] **步骤 1：失败测试**：
-  ① 直通 12 工具注册（stock_screen/plate_list/plate_stock/short_daily_volume/short_interest/ipo_list/economic_calendar_hot/economic_calendar_search/info_search_stock/info_owner_plate/watchlist_list/watchlist_groups），名称/描述/字段与锁定表一致；
-  ② 聚合工具 `f10_detail(symbol, section)`：section 枚举=23 值白名单；`derivative_detail(symbol, section)` 同理（4 值）；未知 section → `trading/invalid-operation`；
+  ① 直通 11 工具注册（stock_screen/plate_list/plate_stock/short_daily_volume/short_interest/ipo_list/economic_calendar_hot/economic_calendar_search/info_owner_plate/watchlist_list/watchlist_groups），名称/描述/字段与锁定表一致；
+  ② 聚合工具 `f10_detail(symbol, section)`：section 枚举=锁定表 §C.5 的 26 项白名单；`derivative_detail(symbol, section)` 同理（4 值）；未知 section → `trading/invalid-operation`；
   ③ `TOOL_COUNT <= 80` 断言（基线 **61**=WP8 末 59 + WP10 `pipeline` + WP11 `sentiment_history`；加 12 直通 + 2 聚合 = **75**）；
   ④ `modify_user_security` 在 HTTP 端点面、**不在** `TOOL_NAMES`；HTTP-only 族（future_info 等）同理；
   ⑤ 缓存 TTL 登记与既有 `CACHE_TTL_MS` 表一致。
@@ -69,6 +69,16 @@ def test_plate_list_region_guard(self):
 - [ ] **步骤 5：Commit**：`git commit -m "feat(platform): 数据面端点/工具面三档接入（直通12+聚合2，预算75）"`
 
 ### 任务 5：F10/做空/板块 PIT 落库 + research_snapshot 作业
+
+> **锁定表发现（`docs/superpowers/plans/wp12-endpoint-lock.md` §D，任务 1，2026-09-16）**：
+> ① 官方「搜索」= find-news/find-community（**不存在证券搜索端点**）→ 原计划的 `info_search_stock`
+> 已删除，直通工具 12→11；② F10 族真实路径分 7 命名空间（financials/research/valuation/
+> corporate-actions/shareholders/company/top-brokers），llms.txt 的 /f10/*.md 全 404；
+> ③ llms.txt 漏列 `valuation/index-stocks`、`valuation/index-stock-plates`（补入）；
+> ④ 经纪商拆为 top-brokers（实时）+ top-brokers-history（历史，`days_before` 必填）；
+> ⑤ sim `total_asset` 与 live `total_assets` 字段不同名，勿混用；
+> ⑥ `option-exercise-probability` 可能返回 -9（无期权数据权限）→ 如实拒绝不重试。
+> **实现一律以锁定表为准**（路径/参数/错误码），本计划的枚举数字以锁定表为最终口径。
 
 **文件**：修改 `store.py`（三新表）、新建 `plugins/core/python/trading_core/research_sync.py`、`cli.py` 子命令 `research-snapshot`、`daemon.py` build_jobs 追加；测试 `tests/test_wp12_pit.py`。
 
