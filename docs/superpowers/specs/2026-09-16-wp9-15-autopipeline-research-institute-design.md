@@ -380,9 +380,13 @@ ET D）。逐候选回退保证「按本地会话日冻结的计划」在两种�
 - 每日作业 `sentiment_snapshot`（链尾，factors_snapshot 之后）：对关注池标的并行采集，
   逐源落库、逐源标注：
   - **fin_sentiment / 千股千评**（fin-data）：A 股常规情绪通道；
-  - **富途 OpenAPI 资讯/公告/社区**（`find-news`/`find-community`，WP12 起并含 F10
-    研究面）：公告类沿用既有 announcements 通道（WP1 merge-announcements 已落
-    `announced_at`），本作业补资讯面快照；
+  - **fin_news**（fin-data 的新闻路由：futu → AKShare → Yahoo）：资讯面快照。
+    **修订（实现期 2026-09-16）**：初稿写 `find-news`/`find-community`（上游
+    `quote_news_search`/社区端点），但该通道**实测恒空**（`docs/TOOL-LIMITS.md` 三种参数
+    均 `data: []`；`docs/HANDOVER.md` 明示「取新闻用 fin_news」）——接恒空通道等于造一个
+    永远为空的源，违背不编造纪律。故改用 fin_news，并保留 `news_call` 注入缝：WP12 若
+    实测官方 find-news 有数据，经该缝接回。公告类沿用既有 announcements 通道
+    （WP1 merge-announcements 已落 `announced_at`），本作业不重复采；
   - **last30days**（可选组件）：`--emit=json` 结构化输出落库；未安装/未配密钥的来源
     **缺席标注而非报错**（上游降级语义），桥接纪律原样沿用：证据必须带平台/时间/
     互动数三要素，不经富途、不经交易闸门；
