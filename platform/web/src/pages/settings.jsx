@@ -21,7 +21,7 @@ import {
   Alert, App, Button, Card, Descriptions, Form, Input, Radio, Select, Space, Tabs,
   Tag, Typography,
 } from "antd";
-import { callApi } from "../services/api.js";
+import { callApi, clearCache, getToken, setToken } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
 
 const { TextArea } = Input;
@@ -154,6 +154,28 @@ function OAuthPanel({ form, mode, status }) {
   );
 }
 
+/** 服务访问令牌：平台 Bearer token（写入 localStorage，服务端可选项）。 */
+function ServiceTokenSection() {
+  const { message } = App.useApp();
+  const [value, setValue] = React.useState(getToken());
+  return (
+    <Card size="small" title="服务访问令牌">
+      <Space direction="vertical" style={{ width: "100%" }} size="small">
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          平台服务的 Bearer token（服务端 trading-platform.json 的 service.token 配置后生效）；未配置则留空。
+        </Typography.Text>
+        <Input.Password value={value} autoComplete="off" aria-label="服务访问令牌"
+          placeholder="留空 = 服务未启用 token 鉴权"
+          onChange={(event) => setValue(event.target.value)} />
+        <Button size="small" type="primary" disabled={!value.trim()}
+          onClick={() => { setToken(value.trim()); clearCache(); message.success("令牌已保存并清除缓存"); }}>
+          保存令牌
+        </Button>
+      </Space>
+    </Card>
+  );
+}
+
 export default function SettingsPage() {
   const status = useEndpoint("openapi_config", {}, []);
   const [form] = Form.useForm();
@@ -270,6 +292,7 @@ export default function SettingsPage() {
           message={testResult.ok ? "连通性测试通过（ret_code 0）" : "连通性测试失败"}
           description={<Typography.Text copyable={testResult.ok} style={{ fontSize: 12 }}>{testResult.text}</Typography.Text>} />
       )}
+      <ServiceTokenSection />
       <StatusCard status={status} />
     </Space>
   );

@@ -1,9 +1,9 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { App as AntApp, Button, ConfigProvider, Input, Modal, Radio, Space, Tag, Typography, theme } from "antd";
+import { App as AntApp, ConfigProvider, Input, Modal, Radio, Space, Tag, Typography, theme } from "antd";
 import { ProLayout } from "@ant-design/pro-components";
 import zhCN from "antd/locale/zh_CN";
-import { callApi, clearCache, getToken, setToken } from "./services/api.js";
+import { callApi } from "./services/api.js";
 import { LIVE_CONFIRMATION, modeBadge, switchModeRequest } from "./services/mode.js";
 import { useEndpoint, useSnapshotPoll } from "./services/hooks.js";
 import OverviewPage from "./pages/overview.jsx";
@@ -43,22 +43,6 @@ const PAGES = [
 
 function currentKey() {
   return (location.hash.replace(/^#\//, "").split("?")[0]) || "overview";
-}
-
-function TokenButton() {
-  const [open, setOpen] = React.useState(false);
-  const [value, setValue] = React.useState(getToken());
-  return (
-    <>
-      <Button size="small" onClick={() => setOpen(true)}>令牌</Button>
-      <Modal title="访问令牌" open={open} onCancel={() => setOpen(false)}
-        onOk={() => { setToken(value.trim()); clearCache(); setOpen(false); location.reload(); }}
-        okText="保存并刷新" cancelText="取消">
-        <Input value={value} onChange={(event) => setValue(event.target.value)}
-          placeholder="服务未配置 token 时留空" />
-      </Modal>
-    </>
-  );
 }
 
 /** 页头模式切换入口：徽章可点开，sim→live 需逐字口令；服务端仍独立复核一遍。
@@ -169,7 +153,6 @@ function Shell() {
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             数据按 TTL 本地缓存；模式切换不授权下单
           </Typography.Text>
-          <TokenButton />
         </Space>) }}>
       {page.element}
     </ProLayout>
