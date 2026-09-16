@@ -10,6 +10,15 @@ const TTL_MS = {
   events: 3_600_000, factors: 1_800_000, ic: 1_800_000, audit: 120_000,
   sources: 300_000, instrument: 600_000, quality: 3_600_000,
   plan: 60_000, schedule: 30_000, reconcile: 300_000,
+  // WP7：因子快照历史对齐服务端 5 分钟缓存（caches.CACHE_TTL_MS["factors-history"]）
+  "factors-history": 300_000,
+  // WP8 富途实时直通 + OpenAPI 交易只读 + 推送状态：服务端一律 TTL 0（实时直通，
+  // futu_data.py 文件头与 store_access.WP8_*_ENDPOINTS 同口径），客户端同样不缓存。
+  rt_quote: 0, rt_order_book: 0,
+  capital_flow: 0, capital_flow_history: 0, capital_distribution: 0,
+  option_expiration: 0, option_chain: 0, option_screen: 0,
+  trade_max_qty: 0, orders_open: 0, orders_history: 0,
+  deals_today: 0, deals_history: 0, push_status: 0,
 };
 const memory = new Map();
 // snapshot 响应声明的端点集合；null = 尚未取到声明（不拦，交给 404 兜底）。

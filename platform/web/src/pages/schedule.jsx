@@ -28,10 +28,12 @@ import { stampOf } from "../services/format.jsx";
 
 const HEARTBEAT_STALE_MS = 5 * 60_000;
 
-const ALERT_LEVEL_COLOR = { critical: "red", warn: "gold", info: "blue" };
+// 导出供概览页复用（同一张级别色表，不另留第二份漂移副本）。
+export const ALERT_LEVEL_COLOR = { critical: "red", warn: "gold", info: "blue" };
 
 /** 心跳时间戳解析：daemon 写 "YYYY-MM-DD HH:MM:SS"，alerts.emit 可能写 ISO 的 T 分隔。 */
-function parseHeartbeat(text) {
+// 导出供概览页复用（心跳新鲜度判定同口径）。
+export function parseHeartbeat(text) {
   if (typeof text !== "string" || !text) return NaN;
   return Date.parse(text.replace(" ", "T"));
 }

@@ -6,7 +6,10 @@ import zhCN from "antd/locale/zh_CN";
 import { callApi, clearCache, getToken, setToken } from "./services/api.js";
 import { LIVE_CONFIRMATION, modeBadge, switchModeRequest } from "./services/mode.js";
 import { useEndpoint, useSnapshotPoll } from "./services/hooks.js";
+import OverviewPage from "./pages/overview.jsx";
 import MarketPage from "./pages/market.jsx";
+import CapitalPage from "./pages/capital.jsx";
+import OptionsPage from "./pages/options.jsx";
 import SignalPage from "./pages/signal.jsx";
 import PortfolioPage from "./pages/portfolio.jsx";
 import RiskPage from "./pages/risk.jsx";
@@ -19,7 +22,10 @@ import SchedulePage from "./pages/schedule.jsx";
 import AuditPage from "./pages/audit.jsx";
 
 const PAGES = [
+  { key: "overview", name: "概览", element: <OverviewPage /> },
   { key: "market", name: "行情", element: <MarketPage /> },
+  { key: "capital", name: "资金", element: <CapitalPage /> },
+  { key: "options", name: "期权", element: <OptionsPage /> },
   { key: "signal", name: "信号", element: <SignalPage /> },
   { key: "portfolio", name: "组合", element: <PortfolioPage /> },
   { key: "risk", name: "风险", element: <RiskPage /> },
@@ -33,7 +39,7 @@ const PAGES = [
 ];
 
 function currentKey() {
-  return (location.hash.replace(/^#\//, "").split("?")[0]) || "market";
+  return (location.hash.replace(/^#\//, "").split("?")[0]) || "overview";
 }
 
 function TokenButton() {
@@ -168,6 +174,8 @@ function Shell() {
 }
 
 createRoot(document.getElementById("root")).render(
-  <ConfigProvider locale={zhCN} theme={{ algorithm: theme.defaultAlgorithm }}>
+  // 暗色主题：算法切 dark；canvas 图表的暗色配色由 charts/theme.js 读
+  // <html data-theme="dark">（index.html 声明）分支给出，两处同一事实源。
+  <ConfigProvider locale={zhCN} theme={{ algorithm: theme.darkAlgorithm }}>
     <AntApp><Shell /></AntApp>
   </ConfigProvider>);

@@ -22,7 +22,7 @@
 // 「只归纳、不推测」：缺字段一律 —，不补默认值；状态码原样展示，不猜标签；
 // 台账模式取 snapshot.value.mode（当前账户模式），切换模式不授权下单。
 import React from "react";
-import { Alert, App, Button, Card, Collapse, Space, Statistic, Table, Tag, Typography } from "antd";
+import { Alert, App, Button, Card, Collapse, Input, Select, Space, Statistic, Table, Tag, Typography } from "antd";
 import { callApi } from "../services/api.js";
 import { decideDisabled, remainingSeconds, summaryLines } from "../services/confirm.js";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
@@ -162,6 +162,204 @@ function ConfirmationCard() {
     </Card>);
 }
 
+// ---------------------------------------------------------------------------
+// OpenAPI 订单与成交（WP8 任务 3 的 6 个只读端点里页面消费 5 个；orders_detail 不进页）。
+// 字段依据：trading.py OpenApiBroker._read_envelope → {mode, source, as_of, groups,
+// errors, note}；行数据是 OpenAPI REST 原始 JSON（trading.py 不过字段映射），页面按
+// 官方字段名候选键防御式读取（orders: order_id/code/side/order_type/qty/price/
+// fill_qty/fill_avg_price/status…；deals: deal_id/order_id/code/trd_side/qty/price…），
+// 缺失一律 —，行内可展开原始 JSON 核对——形状与文档不符时界面不编造。
+// 通道事实（trading.py _read_route）：这 6 个端点只在 futu_channel=openapi 且 live 模式
+// 可用；sim / mcp 通道服务端如实拒绝（消息含「sim 模式请用 account_*」指引），页面
+// 原样展示，不静默降级、不伪造空表。
+// trade_max_qty 的 max 对象键名取自服务端 note 原文（max_cash_buy/max_position_sell
+// 等原始字段）——那是仓库内唯一的权威线索。
+// ---------------------------------------------------------------------------
+function pickField(row, keys) {
+  for (const key of keys) {
+    if (row && row[key] !== null && row[key] !== undefined) return row[key];
+  }
+  return undefined;
+}
+
+/** OpenAPI 分组结果 → 行数组（附 acc_id/market 上下文列）。 */
+function groupRows(envelope) {
+  return (envelope?.groups ?? []).flatMap((group) =>
+    (group.rows ?? []).map((row) => ({ ...row, accId: group.acc_id, marketTag: group.market })));
+}
+
+const OPENAPI_ORDER_COLUMNS = [
+  { title: "账户", key: "accId", render: (_f, row) => row.accId ?? "—" },
+  { title: "市场", key: "market", render: (_f, row) => row.marketTag ?? "—" },
+  { title: "标的", key: "code", render: (_f, row) => pickField(row, ["code", "symbol"]) ?? "—" },
+  { title: "方向", key: "side", render: (_f, row) => pickField(row, ["trd_side", "side"]) ?? "—" },
+  { title: "类型", key: "order_type", render: (_f, row) => pickField(row, ["order_type"]) ?? "—" },
+  { title: "数量", key: "qty", align: "right", render: (_f, row) => rawCell(pickField(row, ["qty"])) },
+  { title: "委托价", key: "price", align: "right", render: (_f, row) => rawCell(pickField(row, ["price", "aux_price"])) },
+  { title: "已成交", key: "fill_qty", align: "right", render: (_f, row) => rawCell(pickField(row, ["fill_qty", "cum_qty", "filled_qty"])) },
+  { title: "成交均价", key: "fill_avg_price", align: "right", render: (_f, row) => rawCell(pickField(row, ["fill_avg_price", "avg_fill_price"])) },
+  { title: "状态", key: "order_status", render: (_f, row) => pickField(row, ["order_status", "status"]) ?? "—" },
+  { title: "订单号", key: "order_id", render: (_f, row) => pickField(row, ["order_id"]) ?? "—" },
+  { title: "更新时间", key: "time", render: (_f, row) => timeOf(pickField(row, ["update_time", "create_time"])) },
+];
+
+const OPENAPI_DEAL_COLUMNS = [
+  { title: "账户", key: "accId", render: (_f, row) => row.accId ?? "—" },
+  { title: "市场", key: "market", render: (_f, row) => row.marketTag ?? "—" },
+  { title: "标的", key: "code", render: (_f, row) => pickField(row, ["code", "symbol"]) ?? "—" },
+  { title: "方向", key: "side", render: (_f, row) => pickField(row, ["trd_side", "side"]) ?? "—" },
+  { title: "数量", key: "qty", align: "right", render: (_f, row) => rawCell(pickField(row, ["qty"])) },
+  { title: "成交价", key: "price", align: "right", render: (_f, row) => rawCell(pickField(row, ["price"])) },
+  { title: "成交额", key: "turnover", align: "right", render: (_f, row) => rawCell(pickField(row, ["turnover", "amount"])) },
+  { title: "成交编号", key: "deal_id", render: (_f, row) => pickField(row, ["deal_id", "fill_id"]) ?? "—" },
+  { title: "订单号", key: "order_id", render: (_f, row) => pickField(row, ["order_id"]) ?? "—" },
+  { title: "时间", key: "time", render: (_f, row) => timeOf(pickField(row, ["create_time", "update_time", "timestamp"])) },
+];
+
+/** 行展开：原始 JSON（REST 原样字段面，供审计核对；只列事实，不解读状态码）。 */
+function rawRowRender(row) {
+  const rest = { ...row };
+  delete rest.accId;
+  delete rest.marketTag;
+  return (
+    <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 12, maxHeight: 260, overflow: "auto" }}>
+      {JSON.stringify(rest, null, 2)}
+    </pre>);
+}
+
+function OpenApiTable({ query, columns, emptyText }) {
+  const rows = groupRows(query.value);
+  if (query.error) {
+    return <Alert type="warning" showIcon message={query.error} />;
+  }
+  return (
+    <Table size="small"
+      rowKey={(_row, index) => index}
+      dataSource={rows}
+      loading={query.loading}
+      pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
+      scroll={{ x: "max-content" }}
+      locale={{ emptyText: query.loading ? "加载中…" : emptyText }}
+      expandable={{ expandedRowRender: rawRowRender, rowExpandable: () => true }}
+      columns={columns} />);
+}
+
+/** OpenAPI 最大可买可卖：标的 + 订单类型（计算口径）→ acctradinginfo（一次返回
+ *  max_cash_buy 与 max_position_sell，逐账户列出；官方要求带 order_id 的改单查询
+ *  两次间隔 > 0.5s——页面不重试、不睡眠，节奏交给用户）。 */
+function MaxQtyPanel({ mode }) {
+  const [code, setCode] = React.useState("");
+  const [orderType, setOrderType] = React.useState("LIMIT");
+  const [busy, setBusy] = React.useState(false);
+  const [result, setResult] = React.useState(null);   // { value } | { error }
+  const run = async () => {
+    const symbol = code.trim().toUpperCase();
+    if (!symbol) { setResult({ error: "请先输入标的代码（如 HK.00700）" }); return; }
+    setBusy(true);
+    setResult(null);
+    try {
+      const value = await callApi("trade_max_qty", { code: symbol, order_type: orderType, mode });
+      setResult({ value });
+    } catch (error) {
+      setResult({ error: String(error.message || error) });
+    } finally {
+      setBusy(false);
+    }
+  };
+  return (
+    <>
+      <Space size="small" style={{ marginBottom: 8 }} wrap>
+        <Input placeholder="标的代码，如 HK.00700" style={{ width: 200 }} value={code}
+          onChange={(event) => setCode(event.target.value)}
+          onPressEnter={run} aria-label="最大可买卖标的代码" />
+        <Select value={orderType} onChange={setOrderType} style={{ width: 190 }}
+          aria-label="订单类型（计算口径）"
+          options={["LIMIT", "MARKET", "AUCTION", "AUCTION_LIMIT", "STOP", "STOP_LIMIT",
+            "MARKET_IF_TOUCHED", "LIMIT_IF_TOUCHED"].map((item) => ({ value: item, label: item }))} />
+        <Button loading={busy} onClick={run}>查询</Button>
+      </Space>
+      {result?.error && <Alert type="warning" showIcon message={result.error} />}
+      {result?.value && (
+        <>
+          {result.value.note && (
+            <Typography.Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+              {result.value.note}
+            </Typography.Text>)}
+          <Table size="small"
+            rowKey={(row) => `${row.accId}-${row.code}`}
+            dataSource={result.value.groups ?? []}
+            pagination={false}
+            locale={{ emptyText: "没有可交易该市场的授权账户。" }}
+            columns={[
+              { title: "账户", key: "acc_id", render: (_f, row) => row.acc_id ?? "—" },
+              { title: "市场", key: "market", render: (_f, row) => row.market ?? "—" },
+              { title: "标的", key: "code", render: (_f, row) => row.code ?? "—" },
+              { title: "最大可买", key: "max_cash_buy", align: "right", render: (_f, row) => rawCell(row.max?.max_cash_buy) },
+              { title: "最大可卖", key: "max_position_sell", align: "right", render: (_f, row) => rawCell(row.max?.max_position_sell) },
+            ]}
+            expandable={{
+              expandedRowRender: (row) => (
+                <pre style={{ margin: 0, whiteSpace: "pre-wrap", fontSize: 12, maxHeight: 260, overflow: "auto" }}>
+                  {JSON.stringify(row.max ?? {}, null, 2)}
+                </pre>),
+              rowExpandable: () => true,
+            }} />
+          {(result.value.errors ?? []).map((row, index) => (
+            <Alert key={row.acc_id ?? index} type="warning" showIcon
+              message={`账户 ${row.acc_id ?? "—"} 查询失败：${row.reason ?? "—"}`} />))}
+        </>)}
+    </>);
+}
+
+/** 「OpenAPI 订单与成交」区块：全部 useEndpoint，模式取快照（与页面其余区块同口径）。
+ *  历史流水条数可调（page_size，官方上界 100——OpenApiMarket.PAGE_SIZE_RANGE）。 */
+function OpenApiOrdersBlock({ mode }) {
+  const [pageSize, setPageSize] = React.useState(50);
+  const open = useEndpoint("orders_open", mode ? { mode } : null, [mode]);
+  const history = useEndpoint("orders_history", mode ? { mode, page_size: pageSize } : null, [mode, pageSize]);
+  const today = useEndpoint("deals_today", mode ? { mode } : null, [mode]);
+  const dealsHistory = useEndpoint("deals_history", mode ? { mode, page_size: pageSize } : null, [mode, pageSize]);
+  // sim / mcp 通道下四个端点被同一原因拒绝：合并成一条提示，避免四条重复告警刷屏；
+  // 除此之外的单端点失败仍在各自小节如实展示。
+  const errors = [open, history, today, dealsHistory].map((query) => query.error);
+  const allUnavailable = errors.every(Boolean);
+  return (
+    <Card type="inner" title="OpenAPI 订单与成交"
+      extra={(
+        <Space size="small">
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            需要 futu_channel=openapi 且实盘模式；实时直通（TTL 0）
+          </Typography.Text>
+          <Select value={pageSize} onChange={setPageSize} style={{ width: 130 }}
+            aria-label="历史流水条数"
+            options={[10, 20, 50, 100].map((item) => ({ value: item, label: `历史取 ${item} 条` }))} />
+        </Space>)}>
+      {allUnavailable ? (
+        <Alert type="info" showIcon
+          message={`OpenAPI 交易通道不可用：${errors[0]}`}
+          description="以下小节在通道可用后展示未完成订单、历史流水与当日成交；sim 模式的订单与成交请用上方「券商订单」与「本地台账成交」。" />
+      ) : (
+        <Space direction="vertical" size="small" style={{ width: "100%" }}>
+          <Typography.Text strong>未完成订单（orders_open，含最近 24 小时已成交/已撤）</Typography.Text>
+          <OpenApiTable query={open} columns={OPENAPI_ORDER_COLUMNS} emptyText="暂无未完成订单。" />
+          {open.value?.note && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>{open.value.note}</Typography.Text>)}
+          <Typography.Text strong>历史订单（orders_history，取 {pageSize} 条）</Typography.Text>
+          <OpenApiTable query={history} columns={OPENAPI_ORDER_COLUMNS} emptyText="暂无历史订单。" />
+          {history.value?.note && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>{history.value.note}</Typography.Text>)}
+          <Typography.Text strong>当日成交（deals_today）</Typography.Text>
+          <OpenApiTable query={today} columns={OPENAPI_DEAL_COLUMNS} emptyText="今日暂无成交。" />
+          <Typography.Text strong>历史成交（deals_history，取 {pageSize} 条）</Typography.Text>
+          <OpenApiTable query={dealsHistory} columns={OPENAPI_DEAL_COLUMNS} emptyText="暂无历史成交。" />
+          {dealsHistory.value?.note && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>{dealsHistory.value.note}</Typography.Text>)}
+        </Space>)}
+      <Typography.Text strong style={{ display: "block", marginTop: 12 }}>最大可买可卖（trade_max_qty）</Typography.Text>
+      <MaxQtyPanel mode={mode} />
+    </Card>);
+}
+
 export default function ExecutionPage() {
   const snapshot = useSnapshotPoll();
   const summary = snapshot.value?.trade_summary ?? null;
@@ -246,6 +444,9 @@ export default function ExecutionPage() {
           {summary?.notice && (
             <Typography.Text type="secondary">{summary.notice}</Typography.Text>)}
         </Card>
+
+        {/* OpenAPI 订单/成交流水：只读端点直通（sim / mcp 通道下服务端如实拒绝并给指引） */}
+        <OpenApiOrdersBlock mode={mode} />
 
         <Card type="inner" title="本地台账成交（模拟撮合，非券商成交）">
           {trades.error && <Alert type="error" showIcon message={`台账读取失败：${trades.error}`} />}
