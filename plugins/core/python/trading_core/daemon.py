@@ -501,11 +501,65 @@ def _execute_plan(conn, home, cmd, broker_call=None, equity=None, today=None,
             conn, s, stamp, cfg["stop_atr_mult"])
     ctx = {"mode": row["mode"], "kill_path": str(kill_path(home)),
            "equity": equity if equity is not None else 1_000_000.0,
-           "positions_value": {}, "positions_count": 0, "day_pnl_pct": 0.0,
+           "day_pnl_pct": 0.0,
            "is_trading_day": bool(calendar_ok), "config": cfg}
+    # 持仓口径（规格 §4.2 第 7 点）：能取到券商事实就用真值，取不到保留离线保守默认。
+    # 取不到时规则 5 对 SELL 按「本单全额名义」判定 → 大仓位退出会被拒（宁可拒绝，
+    # 也不用未知持仓放宽硬规则）；取到真值后退出单才可能通过（见 execute._order_ctx）。
+    positions_value, positions_count, ctx_source = _positions_ctx(
+        conn, broker_call, row["plan_id"], row["mode"], price_of)
+    ctx.update({"positions_value": positions_value, "positions_count": positions_count,
+                "ctx_source": ctx_source})
     result = execute.run(conn, row["plan_id"], plan_hash, ctx, broker_call,
                          price_of=price_of, stop_dist_of=stop_dist_of)
-    return {"ok": True, "plan_id": row["plan_id"], **result}
+    return {"ok": True, "plan_id": row["plan_id"], "ctx_source": ctx_source, **result}
+
+
+def _positions_ctx(conn, broker_call, plan_id, mode, price_of):
+    """执行侧持仓市值/持仓数：只读券商事实，取不到退回离线保守默认。
+
+    **台账二分原则**：一律券商查询，绝不读本地 OMS 台账冒充实持仓（本地台账可能滞后
+    于券商，用它喂规则 5/6 会让上限判定建立在错误基础上）。
+
+    返回 ``(positions_value, positions_count, source)``，``source`` ∈
+    ``{"broker", "offline_default"}``——调用方放进 ``ctx["ctx_source"]``，供
+    ``execute._order_ctx`` 区分「持仓已知」与「持仓未知」两种判定情境：
+    未知时绝不做卖出方向折算（那等于用未知持仓放宽规则 5）。
+
+    计划的订单可能跨市场（手工计划），按订单里出现的市场逐个查询后合并；任一市场
+    查询失败即整体退回离线默认——半个持仓表比没有更危险（规则 5 会把缺失的存量
+    当成 0，从而放行叠加超限的单）。
+
+    **已知口径限制（如实披露）**：``positions_count`` 只统计**计划所属市场**的持仓，
+    跨市场总持仓数不可得——规则 6（最大持仓数）对「A 股已持 5 只、计划再买港股」这类
+    跨市场叠加会低估。不做三市场全查的理由：任一市场没有账户会抛错，而按上面的口径
+    会把整个 ctx 打成离线默认，**反过来封死本修订要放行的退出单**——用「更严的规则 6」
+    换「退不掉仓」不是好交易。跨市场计数需要各市场查询可独立降级的口径，登记为后续项。
+    """
+    from . import broker as core_broker
+
+    markets = [r["market"] for r in conn.execute(
+        "SELECT DISTINCT market FROM orders WHERE plan_id=?", (plan_id,)).fetchall()]
+    if not markets:
+        return {}, 0, "offline_default"  # 无订单可执行：未取得任何券商事实，如实标注
+    merged = {}
+    for market in markets:
+        try:
+            positions, _equity = core_broker.positions_and_equity(
+                broker_call, mode=mode, market=market)
+        except Exception:  # noqa: BLE001 —— 取不到就整体退回离线默认（既有行为不回退）
+            return {}, 0, "offline_default"
+        merged.update(positions or {})
+    value, count = {}, 0
+    for symbol, info in merged.items():
+        qty = int(info.get("qty") or 0)
+        if not qty:
+            continue
+        count += 1
+        px = price_of(symbol)
+        if px:
+            value[symbol] = abs(qty) * float(px)
+    return value, count, "broker"
 
 
 def auto_execute(conn, home, market, today=None, now=None):

@@ -35,7 +35,8 @@ def _risk_defaults():
 
 
 def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
-                     as_of, lot=100, origin="manual", market=None, risk_config=None):
+                     as_of, lot=100, origin="manual", market=None, risk_config=None,
+                     managed=None):
     """冻结一份计划。``origin``/``market`` 是**来源与归属元数据**（规格 §4.6）：
 
     * ``origin="auto"`` 的计划供自动执行链识别（``store.get_latest_auto_plan`` /
@@ -68,6 +69,18 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
         规则 4 静默废除；
       * ``"SYM(风险预算不足一手)"``：预算连一手都买不起 → 跳过（如实列出，不生成 0 单）。
 
+    **受管集合与退出路径（规格 §4.2 第 6 点，2026-09-16 修订）**：``managed`` 给出该
+    策略**负责的全部标的**（关注池 ∩ 策略 universe）。diff 在 ``managed ∪ target`` 上做：
+    ``managed`` 中缺席者目标权重为 0 → 券商实际持有则**全额卖出**（清仓）。没有这条，
+    策略不再返回的已持仓标的永远不进 diff，自动流水线就**只买不退**。
+
+    * ``managed=None``（缺省）保持既有语义：只遍历 ``target`` 的键——既有调用方与
+      测试行为逐字不变；
+    * ``managed`` **之外**的持仓不进 diff（不清理用户手工持仓）；
+    * 遍历顺序 = ``target`` 原序 + ``managed`` 缺席者的代码升序（确定性，不依赖 dict
+      序），且 ``managed=None`` 时与既有顺序完全一致；
+    * 清仓量不受风险预算约束（减少敞口不是新增风险，与减仓同口径）。
+
     ``risk_config`` 缺省用 ``daemon.RISK_DEFAULTS``；``plan_auto`` 传
     ``daemon.risk_config(home)``（含 ``~/.dsh/trading-risk.json`` 覆盖）。部分字段的
     覆盖字典按「缺省补默认」合并——**不重写配置读取实现**。
@@ -78,16 +91,18 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
         cfg.update(risk_config)
     orders, skipped = [], []
     plan_id = f"PLN-{as_of.replace('-', '')}-{mode}-{uuid.uuid4().hex[:4].upper()}"
-    for symbol, weight in target.items():
+    # target 原序在前、managed 缺席者按代码升序在后：managed=None 时与既有顺序逐字一致
+    symbols = list(target) + [s for s in sorted(set(managed or ())) if s not in target]
+    for symbol in symbols:
         px = prices.get(symbol)
         if not px:
             continue  # 无价（停牌/无行情）：跳过并在审计可见，不猜价
-        want_qty = int(equity * weight / px // lot * lot)
+        want_qty = int(equity * target[symbol] / px // lot * lot) if symbol in target else 0
         have_qty = positions.get(symbol, {}).get("qty", 0)
         delta = want_qty - have_qty
         if delta == 0:
             continue
-        if delta > 0:  # 加仓：受单笔风险预算约束（减仓不受限，见 docstring）
+        if delta > 0:  # 加仓：受单笔风险预算约束（减仓/清仓不受限，见 docstring）
             stop_dist = indicators.stop_distance(conn, symbol, as_of, cfg["stop_atr_mult"])
             if stop_dist is None:
                 skipped.append(f"{symbol}(无ATR)")
@@ -263,6 +278,20 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     target = {s: w for s, w in (weights or {}).items()
               if CALENDAR_MARKET.get(str(s).split(".", 1)[0]) == market}
 
+    # 受管集合（规格 §4.2 第 6 点）= 该市场关注池 ∩ 策略 universe。
+    # 策略 universe 为空（单标的策略、或策略不声明负责范围）→ managed=None：退化为
+    # 只遍历 target（与既有行为一致），结果标注 managed="target-only" 供运维分辨。
+    # universe 读取失败按 fail-closed 软跳过：宁可不生成计划，也不假装「无受管标的」
+    # （后者会让已持仓标的继续逃过 diff，正是本修订要消除的缺口）。
+    u_params = inspect.signature(strategy.universe).parameters
+    try:
+        universe = strategy.universe(conn, today,
+                                     **({"home": home} if "home" in u_params else {}))
+    except Exception as error:  # noqa: BLE001 —— 作业契约「永不抛」
+        return skip(f"策略 universe 读取失败：{str(error)[:120]}", "warn", "策略 universe 失败")
+    universe_set = {str(s).strip().upper() for s in (universe or []) if str(s).strip()}
+    managed = [s for s in symbols if s in universe_set] if universe_set else None
+
     if broker_call is None:
         try:
             from trading_datasource.futu_mcp import call_tool
@@ -291,10 +320,22 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
         # 权益缺失若当 0 处理，目标数量全变 0 = 凭空生成清仓单；如实跳过
         return skip("券商权益不可用（缺失或非正）", "warn", "权益不可用")
 
+    # 受管集合缺席者若券商实际持有 → 要生成清仓单 → 需要价格。只为**实际持有**的缺席
+    # 标的补价：无持仓的标的既不需要价格，也不该污染 no_price（那是数据缺口的清单）。
+    for symbol in (managed or ()):
+        if symbol in prices or (positions.get(symbol, {}).get("qty") or 0) == 0:
+            continue
+        px = daemon._last_close(conn, symbol, today)
+        if px:
+            prices[symbol] = px
+        else:
+            no_price.append(symbol)
+
     plan = build_and_freeze(conn, mode=mode, strategy_id=entry["strategy"], target=target,
                             broker_positions=lambda _mode: (positions, equity),
                             prices=prices, as_of=today, origin="auto", market=market,
-                            risk_config=daemon.risk_config(home))
+                            risk_config=daemon.risk_config(home), managed=managed)
     return {"ok": True, "plan": plan, "expired": expired, "no_price": no_price,
             "no_atr": list(plan.get("skipped") or []), "equity": equity,
-            "watchlist": len(symbols)}
+            "watchlist": len(symbols),
+            "managed": len(managed) if managed is not None else "target-only"}

@@ -76,8 +76,12 @@ class WatchlistRsiStrategy(SingleTicker):
     """关注池 RSI 组合策略（规格 §4.6）：BUY 等权、其余现金，**权重尊重风控上限**。
 
     与单标的 RsiStrategy 的区别只在聚合口径：universe 来自配置关注池，
-    target_weights 把 BUY 标的等权、非 BUY 不入表（0 权重=目标清仓由 planner
-    比较券商实际持仓后的 diff 自然产生，策略层只决定目标持仓）。
+    target_weights 把 BUY 标的等权、**非 BUY 不入表**——入表集合 = 「目标持仓」，
+    缺席 = 目标权重 0。**缺席不等于「已持仓的清仓」**：清仓要由 planner 的
+    **受管集合**（``managed``，规格 §4.2 第 6 点）把不在 target 的已持仓标的
+    纳入 diff 才产生。没有受管集合时 planner 只遍历 target 的键，缺席标的永远
+    不生成 SELL（自动流水线只买不退）——该缺口已于 2026-09-16 由 managed 修复，
+    plan_auto 传 managed = 本市场关注池 ∩ universe。
 
     **风控上限（规格 §4.2 第 5 点，2026-09-16 修订）**：策略不得生成风控规则 5/6
     注定拒绝的目标——单票权重上限取 ``risk_config`` 的 ``max_position_pct``

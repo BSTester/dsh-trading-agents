@@ -34,6 +34,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from datetime import date, timedelta
+
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "platform"))
 sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
@@ -45,7 +47,9 @@ from trading_core import cli, daemon, oms, store, strategies  # noqa: E402
 PREV = "2026-09-15"
 D1 = "2026-09-16"
 D2 = "2026-09-17"
+D3 = "2026-09-18"
 SYMBOL = "SH.600519"
+OUTSIDE = "SH.601398"      # 受管集合之外的持仓（用户手工持有）：自动链不得触碰
 AUTO_COMMANDS = ("plan-auto", "auto-execute", "reconcile-daily")
 
 
@@ -113,7 +117,7 @@ class AutoPipelineE2E(unittest.TestCase):
     def _calendar(self):
         store.upsert_calendar(self.conn, "SH", [
             {"day": day, "trade_date_type": "WHOLE", "trade_second": 14400}
-            for day in (PREV, D1, D2)])
+            for day in (PREV, D1, D2, D3)])
 
     def _bars(self):
         """30 根：前 28 根缓涨 + 末两根急跌 → 末根 RSI 下穿 25（rsi_signal 是穿越
@@ -124,10 +128,28 @@ class AutoPipelineE2E(unittest.TestCase):
             {"t": day, "o": close, "h": close, "l": close, "c": close, "v": 1000.0}
             for day, close in zip(days, closes)], source="test")
 
+    def _flat_bars(self, last=D2, close=200.0, half_range=0.25, count=30):
+        """平盘窄幅 30 根（末日 = D2）：RSI 无穿越 → HOLD（策略不给权重）。
+
+        用途是场景 ⑦：策略**不再**选中该标的，受管集合必须让它进入 diff 生成清仓单。
+        窄幅使 ATR = 0.5 → 止损距离 1.0，规则 4 对 1700 股只计 1,700 元，从而让判定
+        前进到规则 5（本场景要验的正是超上限仓位的退出）。
+        """
+        end = date.fromisoformat(last)
+        days = [(end - timedelta(days=count - 1 - i)).isoformat() for i in range(count)]
+        store.upsert_bars(self.conn, SYMBOL, "1d", [
+            {"t": d, "o": close, "h": close + half_range, "l": close - half_range,
+             "c": close, "v": 1000.0} for d in days], source="test")
+
     # ---- 假件 ----
 
-    def _broker(self, held=0):
-        """sim 假券商：账户/持仓/资金/下单/订单历史。"""
+    def _broker(self, held=0, extra=None):
+        """sim 假券商：账户/持仓/资金/下单/订单历史。
+
+        ``held`` = 受管标的（watchlist 内）持仓；``extra`` = 受管集合**之外**的持仓
+        （用户手工持有，用于验证自动链不去清理它）。都不做成交回填——场景 ⑦ 只跑
+        「计划 → 执行」两跳，不跑对账（对账口径由场景 ③ 覆盖）。
+        """
         calls = []
 
         def call(name, args=None, timeout=30, **kwargs):
@@ -136,7 +158,9 @@ class AutoPipelineE2E(unittest.TestCase):
                 return {"accounts": [{"account_id": "A-1", "market_id": 3,
                                       "account_title": "模拟A股"}]}
             if name == "sim_trade_position_list":
-                return {"positions": [{"symbol": SYMBOL, "qty": held}] if held else []}
+                rows = [{"symbol": SYMBOL, "qty": held}] if held else []
+                rows += [{"symbol": s, "qty": q} for s, q in (extra or {}).items()]
+                return {"positions": rows}
             if name == "sim_trade_cash_info":
                 return {"balance": 1_000_000.0, "total_asset": 1_000_000.0}
             if name == "sim_trade_input_order":
@@ -169,9 +193,9 @@ class AutoPipelineE2E(unittest.TestCase):
         return runner, dispatched
 
     @contextlib.contextmanager
-    def _running(self, held=0):
+    def _running(self, held=0, extra=None):
         """整段两日时间线共用一个假券商与假 runner。"""
-        call, broker_calls = self._broker(held=held)
+        call, broker_calls = self._broker(held=held, extra=extra)
         runner, dispatched = self._runner()
         with mock.patch("trading_datasource.futu_mcp.call_tool", call), \
                 mock.patch.object(daemon, "_subprocess_runner", runner):
@@ -387,6 +411,57 @@ class AutoPipelineE2E(unittest.TestCase):
         self.assertEqual(self._places(broker_calls), [])   # 拦截在触达券商之前
         verdicts = self._risk_checks()
         self.assertTrue(any(v["rule"] == 4 and not v["allowed"] for v in verdicts), verdicts)
+
+
+    # ---- ⑦ 退出链路：受管集合让「不再给权重」的持仓被清仓 ----
+
+    def test_exit_chain_sells_dropped_holding_end_to_end(self):
+        """规格 §4.2 第 6/7 点：策略不再选中的已持仓标的 → 次日计划 SELL → 执行成交。
+
+        构造：券商持有 SYMBOL 1700 股（价 200 → 340,000 = 权益 34%，**超单票上限**），
+        另持有受管集合之外的 ``SH.601398`` 500 股（用户手工持仓）。D2 平盘 bars →
+        策略 target 为空 → 受管集合让 diff 看到已持仓 → 生成清仓单 → D3 09:35 执行。
+
+        钉住的三件事：
+          * 清仓单真的生成并到达券商（修复前该单根本不生成——只买不退）；
+          * 规则 5 对 34% 名义的清仓单**放行**——执行侧「券商持仓 + 卖出方向折算」的
+            端到端证据（同一单在离线 ctx 下必被规则 5 拦，反证见
+            ``tests/test_wp9_exec_ctx.py``）；
+          * 受管集合之外的持仓零订单（不清理用户手工持仓）。
+
+        本场景刻意**不跑 19:00 对账**：受管外持仓与本地台账必然不同，会按规格 §6.3
+        触发熔断（那条语义由场景 ③ 覆盖），与退出路径的验证无关。
+        """
+        self._config(enabled=True)
+        self._mode()
+        self._calendar()
+        self._flat_bars()
+
+        with self._running(held=1700, extra={OUTSIDE: 500}) as (broker_calls, _):
+            self._tick(f"{D2} 16:20:00")
+            plans = self._plans()
+            self.assertEqual(len(plans), 1, plans)
+            self.assertEqual((plans[0]["origin"], plans[0]["market"], plans[0]["as_of"]),
+                             ("auto", "SH", D2), plans)
+            orders = self._orders()
+            self.assertEqual([(o["symbol"], o["side"], o["qty"]) for o in orders],
+                             [(SYMBOL, "SELL", 1700)], orders)
+
+            self._tick(f"{D3} 09:35:00")
+            self.assertTrue(store.kv_get(self.conn, f"auto_exec:SH:{D3}"))
+
+        orders = self._orders()
+        self.assertEqual(orders[0]["status"], "submitted", orders)
+        self.assertIsNone(orders[0]["err"], orders)
+        self.assertNotIn(OUTSIDE, [o["symbol"] for o in orders])
+        verdicts = self._risk_checks()
+        self.assertTrue(any(v["allowed"] for v in verdicts), verdicts)
+        self.assertFalse(any(not v["allowed"] for v in verdicts), verdicts)
+        places = self._places(broker_calls)
+        self.assertEqual(len(places), 1, broker_calls)
+        # broker.place 的 sim 参数字段：order_side 1=BUY 2=SELL（TOOL-LIMITS 实测口径）
+        self.assertEqual((places[0][1]["order_side"], places[0][1]["qty"]), (2, 1700))
+        self.assertEqual(places[0][1]["symbol"], SYMBOL.split(".")[-1])
 
 
 if __name__ == "__main__":  # pragma: no cover
