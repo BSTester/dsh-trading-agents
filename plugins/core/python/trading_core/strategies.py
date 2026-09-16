@@ -4,9 +4,18 @@
 单标的策略的信号函数复用 trading_datasource.backtest 唯一实现（rsi 25/75，
 ma_cross 5/20），导入放在调用时惰性解析，避免库模块导入即强依赖 sys.path 配置。
 """
+import os
+from pathlib import Path
+
 from . import factors, store
 
 REGISTRY = {}
+
+
+def _home(home=None):
+    """关注池配置根：显式 home 优先，否则 $DSH_HOME，再否则 ~/.dsh（daemon 同口径）。"""
+    return Path(home) if home is not None else Path(
+        os.environ.get("DSH_HOME") or (Path.home() / ".dsh"))
 
 
 def strategy(sid):
@@ -59,6 +68,44 @@ class MaCrossStrategy(SingleTicker):
     def _fn(self, df):
         ma_cross_signal, rsi_signal = _signals()
         return ma_cross_signal(df, 5, 20)
+
+
+@strategy("watchlist_rsi")
+class WatchlistRsiStrategy(SingleTicker):
+    """关注池 RSI 组合策略（规格 §4.6）：BUY 等权、其余现金。
+
+    与单标的 RsiStrategy 的区别只在聚合口径：universe 来自配置关注池，
+    target_weights 把 BUY 标的等权、非 BUY 不入表（0 权重=目标清仓由 planner
+    比较券商实际持仓后的 diff 自然产生，策略层只决定目标持仓）。
+
+    配置读取需要 home，而注册表里的策略实例是单例、无可变状态，因此 home 作为
+    显式参数传入（缺省按 $DSH_HOME → ~/.dsh 推导）；这样同一实例可在测试里
+    指向任意临时 home，不需要为每个 home 重新注册实例。
+    关注池元素按富途 symbol（如 SH.600519）原样使用：不猜市场前缀，写错的标的
+    读不到 bar → HOLD → 不入权重（宁缺毋假）。
+    """
+
+    id = "watchlist_rsi"
+
+    def _fn(self, df):
+        ma_cross_signal, rsi_signal = _signals()
+        return rsi_signal(df, 25, 75)
+
+    def universe(self, conn, as_of, home=None):
+        from .daemon import platform_config
+        watchlist = platform_config(_home(home)).get("watchlist") or []
+        if isinstance(watchlist, str):
+            # 兼容逗号分隔写法：字符串按字符迭代会静默产出垃圾标的，这里显式切开
+            watchlist = watchlist.split(",")
+        return [str(s).strip() for s in watchlist if str(s).strip()]
+
+    def target_weights(self, conn, as_of, home=None):
+        buys = [s for s in self.universe(conn, as_of, home=home)
+                if self.signal(conn, s, as_of) == "BUY"]
+        if not buys:
+            return {}
+        w = round(1.0 / len(buys), 4)
+        return {s: w for s in buys}
 
 
 @strategy("momentum_value_top5")
