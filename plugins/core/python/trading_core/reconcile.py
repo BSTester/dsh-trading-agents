@@ -52,10 +52,6 @@ SIM_READ_TOOLS = ("sim_trade_account_list", "sim_trade_position_list",
 SIDE_BY_CODE = {1: "BUY", 2: "SELL"}
 
 
-def _now():
-    return _dt.datetime.now(_TZ8).strftime("%Y-%m-%d %H:%M:%S")
-
-
 def _int_of(value):
     """券商数量字段可能是字符串（TOOL-LIMITS 实测 "200"）；非法/缺失 → None。"""
     if value is None or value == "":
@@ -419,8 +415,14 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     from . import alerts, planner, tca
 
     home = str(home)
-    today = today or _dt.datetime.now(_TZ8).date().isoformat()
-    stamp = (now or _now)()
+    # 时钟口径唯一实现在 daemon（显式 now > DSH_FAKE_NOW > 真实时间）；非法假时钟
+    # fail-closed——对账按错误日期跑会产出误导性的「无差异」。
+    from . import daemon
+    try:
+        stamp = (now or daemon.now_fn())()
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+    today = today or stamp[:10]
 
     if mode is None:
         try:

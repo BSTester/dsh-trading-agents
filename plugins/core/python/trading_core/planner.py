@@ -139,7 +139,12 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
 
     home = str(home)
     market = str(market).upper()
-    today = today or datetime.now(_TZ8).date().isoformat()
+    try:
+        # 时钟口径唯一实现在 daemon（显式 today > DSH_FAKE_NOW > 真实时间）；
+        # 非法假时钟 fail-closed，不静默回落——否则演练会按真实日期生成计划。
+        today = today or daemon.now_stamp()[:10]
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
 
     def skip(reason, level=None, title=None):
         if level:

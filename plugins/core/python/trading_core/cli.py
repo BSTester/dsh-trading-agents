@@ -267,21 +267,17 @@ def main(argv=None):
             # auto_pipeline 的 auto_execute 作业体（WP9）。软跳过=退出 0（当日不执行是
             # 正常结论——守卫拦截/已执行/无计划/超出执行窗口）；配置/模式非法=fail-closed
             # 非零退出，让调度链与运维看得到（计划与规格 §4.3 守卫 1/2 的分级一致）。
-            # --now 是假时钟入口（守卫 9 执行窗口按它判定）：格式非法直接 fail-closed，
-            # 不让一个写错的时间戳静默变成一个总是超窗/总是命中的判定。
+            # 假时钟入口：--now 优先，其次 DSH_FAKE_NOW（跨进程注入，见 daemon.now_stamp），
+            # 最后真实时间。格式非法一律 fail-closed——不让写错的时间戳静默变成
+            # 「总是超窗」或「总是命中」的判定。**时钟解析只有 daemon.now_fn 一处实现。**
             import os
             from . import daemon
-            now = None
-            if args.now is not None:
-                try:
-                    _dt.datetime.strptime(args.now, "%Y-%m-%d %H:%M:%S")
-                except ValueError:
-                    print(json.dumps({"ok": False, "error":
-                                      f"--now 需为 YYYY-MM-DD HH:MM:SS，收到 {args.now!r}"},
-                                     ensure_ascii=False))
-                    return 1
-                now = (lambda stamp: (lambda: stamp))(args.now)
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            try:
+                now = daemon.now_fn(args.now)
+            except ValueError as error:
+                print(json.dumps({"ok": False, "error": str(error)}, ensure_ascii=False))
+                return 1
             result = daemon.auto_execute(conn, home, args.market, today=args.today, now=now)
             if not result.get("ok"):
                 print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
