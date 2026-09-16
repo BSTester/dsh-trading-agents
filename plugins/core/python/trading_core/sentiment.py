@@ -171,12 +171,13 @@ def run(home, market, conn=None, runner=None, news_call=None, now=None, today=No
 
 
 def _collect(conn, home, market, stamp, runner, news_call):
-    from . import alerts, clock, store as store_mod, watchlist
+    from . import alerts, store as store_mod, watchlist
 
     def emit(level, title, detail):
         # detail 一律带 market=XX：pipeline 的阶段归因按该标记归属市场（_alert_market），
         # 标题则是状态映射的**精确键**（源名等变量信息只能进 detail，不能进标题）。
-        alerts.emit(conn, home=home, level=level, title=title, detail=detail[:160])
+        alerts.emit(conn, home=home, level=level, title=title,
+                    detail=detail[:_ERROR_CHARS])
 
     try:
         date, date_source = _observation_date(conn, market, stamp)
@@ -190,8 +191,10 @@ def _collect(conn, home, market, stamp, runner, news_call):
         return {"ok": True, "market": market,
                 "skipped": f"{market} 本次负责的会话尚未收盘"}
     if date_source == "beijing-fallback":
-        # 标题刻意不进 pipeline 的阶段状态映射：采集照常进行，阶段状态以 ran 标记为准，
-        # 把「口径退化」显示成 skipped/failed 会让流程页说谎。
+        # 标题刻意不进 pipeline 的**状态**映射：采集照常进行，作业跑完就有 ran 标记，
+        # 阶段状态以 ran 标记为准，把「口径退化」显示成 skipped/failed 会让流程页说谎。
+        # （内容失败是另一回事：软失败同样不改状态，但结局进阶段摘要，见 pipeline
+        #  的 _SENTIMENT_OUTCOMES。）
         emit("info", "情绪快照日期退化",
              f"market={market} 日历未同步，观测日取北京日 {date}（作业时刻 {stamp}）")
 

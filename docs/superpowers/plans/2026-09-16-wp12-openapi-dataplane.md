@@ -61,12 +61,12 @@ def test_plate_list_region_guard(self):
 - [ ] **步骤 1：失败测试**：
   ① 直通 12 工具注册（stock_screen/plate_list/plate_stock/short_daily_volume/short_interest/ipo_list/economic_calendar_hot/economic_calendar_search/info_search_stock/info_owner_plate/watchlist_list/watchlist_groups），名称/描述/字段与锁定表一致；
   ② 聚合工具 `f10_detail(symbol, section)`：section 枚举=23 值白名单；`derivative_detail(symbol, section)` 同理（4 值）；未知 section → `trading/invalid-operation`；
-  ③ `TOOL_COUNT <= 80` 断言（59+1(WP11 sentiment_history)+12+2=**74**）；
+  ③ `TOOL_COUNT <= 80` 断言（基线 **61**=WP8 末 59 + WP10 `pipeline` + WP11 `sentiment_history`；加 12 直通 + 2 聚合 = **75**）；
   ④ `modify_user_security` 在 HTTP 端点面、**不在** `TOOL_NAMES`；HTTP-only 族（future_info 等）同理；
   ⑤ 缓存 TTL 登记与既有 `CACHE_TTL_MS` 表一致。
 - [ ] **步骤 2：验证失败** → **步骤 3：实现**：路由模式照抄 WP8 任务 2（`futu_channel` 选择：openapi 有凭据走 REST，否则 `trading/openapi-unavailable` 如实）；载荷白名单逐端点（screen 类放行 `screen_queries/retrieve_queries/sort/sorts/next_key/limit`；f10_detail 仅 `symbol/section`）。
 - [ ] **步骤 4：通过**；三套绿。
-- [ ] **步骤 5：Commit**：`git commit -m "feat(platform): 数据面端点/工具面三档接入（直通12+聚合2，预算74）"`
+- [ ] **步骤 5：Commit**：`git commit -m "feat(platform): 数据面端点/工具面三档接入（直通12+聚合2，预算75）"`
 
 ### 任务 5：F10/做空/板块 PIT 落库 + research_snapshot 作业
 
@@ -106,6 +106,6 @@ def test_research_snapshot_job(self):
 
 ### WP12 验收（对照规格 §7.4）
 
-- [ ] 逐端点形状测试 + 锁定表一致；工具面 74 项 ≤80；写端点不进 MCP；
+- [ ] 逐端点形状测试 + 锁定表一致；工具面 75 项 ≤80；写端点不进 MCP；
 - [ ] PIT 三表按交易日累积、announced_at 覆盖率可统计（CLI `research-snapshot --stats` 输出）；
 - [ ] no_data/unsupported 空而非错；单端点失败不阻塞链；三套全绿。

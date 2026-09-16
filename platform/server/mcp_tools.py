@@ -452,7 +452,7 @@ TOOLS = (
     ToolDefinition(
         "sentiment_history",
         "情绪/舆情快照（WP11）：给 symbol 返回该标的按日期倒序的渠道原文记录"
-        "（source 如 fin_sentiment/futu_news/last30days，payload 为渠道原始 JSON）；"
+        "（source 如 fin_sentiment/fin_news/last30days，payload 为渠道原始 JSON）；"
         "不给 symbol 返回最近一日的采集摘要（date/symbols/records/sources）。"
         "数据来自服务每交易日定时采集落库，只作研究与并列参考，不参与信号计算。",
         "sentiment-history",

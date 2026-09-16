@@ -541,7 +541,7 @@ def insert_sentiment(conn, date, symbol, source, payload, fetched_at=None):
 
     payload 为渠道原文：str 必须能解析为 JSON（非法直接 ValueError——宁缺毋假），
     dict/list 显式序列化。fetched_at 缺省为写入时刻（观测时点）。
-    source 取值由采集侧决定（如 fin_sentiment/futu_news/last30days），本层不设白名单。
+    source 取值由采集侧决定（如 fin_sentiment/fin_news/last30days），本层不设白名单。
     """
     if isinstance(payload, (dict, list)):
         payload = json.dumps(payload, ensure_ascii=False)
@@ -563,7 +563,8 @@ def insert_sentiment(conn, date, symbol, source, payload, fetched_at=None):
 def read_sentiments(conn, symbol, limit=30, before=None):
     """倒序（最新在前）返回 [{date,symbol,source,payload(反序列化),fetched_at}]。
 
-    before 给定时只返 date<=before 的观测——研究查询的 PIT 上界，不得看到未来观测。
+    PIT 上界（**含当日**）：``before`` 给定时只返 ``date <= before`` 的观测——闭区间，
+    传当日即包含当日已落库的观测；这是研究查询的上界，不得看到未来观测。
     """
     sql = ("SELECT date,symbol,source,payload,fetched_at FROM sentiment_snapshots"
            " WHERE symbol=?")
@@ -579,19 +580,38 @@ def read_sentiments(conn, symbol, limit=30, before=None):
             for r in rows]
 
 
-def sentiment_days(conn):
+def _market_like(market):
+    """市场过滤的符号前缀模式：快照记录的 symbol 一律是带市场前缀的富途符号。"""
+    return f"{market}.%"
+
+
+def sentiment_days(conn, market=None):
     """有记录的不同日期数——「≥250 交易日可提检验申请」演进条款的口径。
 
     注意这是**累计**口径（允许断档），不是「连续」；连续口径见 sentiment_streak。
+
+    ``market`` 给定时只数**该市场标的**的记录（符号前缀 ``SH.`` 过滤）；缺省（None）是
+    全市场累计。两个范围都允许断档，展示时必须标明是哪一种——流程页按市场取数，
+    ``sentiment_summary`` 的 ``days`` 保持全市场累计（规格 §五·流程页）。
     """
-    row = conn.execute(
-        "SELECT COUNT(DISTINCT date) AS n FROM sentiment_snapshots").fetchone()
+    if market:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT date) AS n FROM sentiment_snapshots"
+            " WHERE symbol LIKE ?", (_market_like(market),)).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT COUNT(DISTINCT date) AS n FROM sentiment_snapshots").fetchone()
     return int(row["n"])
 
 
-def sentiment_latest(conn):
-    """最近有记录的日期；无任何记录返回 None。"""
-    row = conn.execute("SELECT MAX(date) AS d FROM sentiment_snapshots").fetchone()
+def sentiment_latest(conn, market=None):
+    """最近有记录的日期；无任何记录返回 None。``market`` 给定时只算该市场标的。"""
+    if market:
+        row = conn.execute(
+            "SELECT MAX(date) AS d FROM sentiment_snapshots WHERE symbol LIKE ?",
+            (_market_like(market),)).fetchone()
+    else:
+        row = conn.execute("SELECT MAX(date) AS d FROM sentiment_snapshots").fetchone()
     return row["d"]
 
 
@@ -599,8 +619,9 @@ def sentiment_summary(conn, date=None):
     """该日（缺省最近有记录日）的采集摘要：标的数/记录数/各源条数 + 累计积累天数。
 
     WP11 任务 3：``sentiment-history`` 不带 symbol 时的载荷来源。聚合在 SQL 侧完成
-    （不把全表拉进 Python 再数）；``days`` 是**累计**口径（``sentiment_days``，允许断档，
-    不需要市场参数），与流程页按市场算的「连续交易日」是两个口径，页面分别标注。
+    （不把全表拉进 Python 再数）；``days`` 是**全市场累计**口径（``sentiment_days`` 不带
+    market，允许断档）——流程页按市场展示的是**逐市场**口径（``sentiment_days(conn,
+    market=…)`` 与 ``sentiment_streak``），两者范围不同，各自标明。
     无任何记录 → 空结构（空是事实，不是错误）。
     """
     day = date or sentiment_latest(conn)
@@ -621,16 +642,29 @@ def sentiment_streak(conn, market=None, today=None):
 
     与 sentiment_days 的口径差异（必须分辨）：days 是「一共多少天有记录」，
     本函数是「最近一口气连了多少个交易日」——休市日不参与计数，因此不因周末断档。
-    日历未同步（trading_days 抛 RuntimeError）或未给 market 时**退化**为自然日连续
-    计数（该口径会在休市日断档，调用方展示时应知悉，不做静默补齐）。
+
+    **记录集与日历都按市场**：给了 ``market`` 时，只有该市场标的的记录参与计数
+    （别市场的记录不续长本市场的连续数）；未给时是全市场口径（与 ``sentiment_days``
+    的缺省一致）。日历未同步（trading_days 抛 RuntimeError）或未给 market 时**退化**
+    为自然日连续计数（该口径会在休市日断档，调用方展示时应知悉，不做静默补齐）。
+
+    起算边界：``latest`` 落在**非交易日**时（日历未同步的北京日退化路径可能把观测记到
+    休市日），按交易日历取「≤ latest 的最近交易日」起算——该交易日无记录即返回 0，
+    休市日当天的记录本身不计入连续数（它不在交易日序列里）。如实计数，不做补齐。
 
     窗口：today 往前 550 自然日（约 380 个交易日，覆盖 250 日条款的展示余量）；
     窗口用尽即视为序列起点（返回值是窗口内可证实的下界）。
     """
-    latest = sentiment_latest(conn)
+    latest = sentiment_latest(conn, market=market)
     if latest is None:
         return 0
-    have = {r["d"] for r in conn.execute("SELECT DISTINCT date AS d FROM sentiment_snapshots")}
+    if market:
+        have = {r["d"] for r in conn.execute(
+            "SELECT DISTINCT date AS d FROM sentiment_snapshots WHERE symbol LIKE ?",
+            (_market_like(market),))}
+    else:
+        have = {r["d"] for r in conn.execute(
+            "SELECT DISTINCT date AS d FROM sentiment_snapshots")}
     today = today or _now()[:10]
     days = None
     if market:

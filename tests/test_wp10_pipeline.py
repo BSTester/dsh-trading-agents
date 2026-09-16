@@ -472,5 +472,84 @@ class SubprocessBridgeTests(PipelineBase):
         self.assertFalse(value["auto_pipeline"]["enabled"])
 
 
+class SentimentStageTests(PipelineBase):
+    """情绪阶段的内容结局与口径范围（WP11 质量修复）。
+
+    背景：``sentiment.run`` 的软失败（池空/全源失败/会话未收盘）**返回 ok 且退出 0**，
+    tick 照常写 ran 标记——阶段状态因此恒为 ``ok``，内容失败只在摘要里才看得见。
+    ``_ALERT_STATUS`` 的三条情绪标题仍是「作业没跑完（tick 中断，ran 标记未落）」的
+    状态归因路径，与这里的内容口径不重复。
+    """
+
+    def seed_sentiment(self, date, symbol, source="fin_sentiment"):
+        store.insert_sentiment(self.conn, date, symbol, source, "{}", date + " 16:20:00")
+
+    def test_content_failure_is_visible_while_status_stays_ok(self):
+        """ran 标记在 → 状态 ok（事实：作业跑完），但池空结局必须进摘要。"""
+        self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
+        self.emit_alert("情绪快照跳过", "market=SH 关注池为空")
+        stage = self.stages(self.snapshot())["sentiment_snapshot"]
+        self.assertEqual(stage["status"], "ok")
+        self.assertEqual(stage["at"], "2026-09-16 16:25:04")
+        self.assertEqual(stage["summary"], "当日未采集：关注池为空")
+
+    def test_content_failure_visible_when_no_records_accumulated(self):
+        """空库 + 内容失败：仍要显示结局（此前 days==0 直接原样返回，页面全无痕迹）。"""
+        self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
+        self.emit_alert("情绪快照全部失败", "market=SH 2026-09-16：12 次调用无一成功")
+        stage = self.stages(self.snapshot())["sentiment_snapshot"]
+        self.assertEqual(stage["status"], "ok")
+        self.assertEqual(stage["summary"], "当日全部失败：2026-09-16：12 次调用无一成功")
+
+    def test_source_absent_and_accumulation_are_both_shown(self):
+        """源级缺席结局与积累事实用「；」并列，既有归因文案不丢。"""
+        self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
+        self.emit_alert("情绪源不可用", "market=SH 源 last30days：3 个标的全部失败：未安装")
+        self.seed_sentiment("2026-09-15", "SH.600519")
+        self.seed_sentiment("2026-09-16", "SH.600519")
+        summary = self.stages(self.snapshot())["sentiment_snapshot"]["summary"]
+        self.assertIn("当日源不可用：源 last30days：3 个标的全部失败：未安装", summary)
+        self.assertIn("已积累 2 天", summary)
+        self.assertIn("最近 2026-09-16", summary)
+
+    def test_content_outcome_is_market_scoped(self):
+        """SH 的内容失败不写进 HK 的摘要（detail 的 market= 标记消歧）。"""
+        self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
+        self.mark_ran("HK", "sentiment_snapshot", at="2026-09-16 16:45:04")
+        self.emit_alert("情绪快照跳过", "market=SH 关注池为空")
+        out = self.snapshot()
+        self.assertIn("关注池为空", self.stages(out)["sentiment_snapshot"]["summary"])
+        self.assertEqual(self.stages(out, "HK")["sentiment_snapshot"]["summary"], "")
+
+    def test_accumulation_figures_are_market_scoped(self):
+        """多个市场各自只显示本市场的积累事实——同一句话不再复现在每个市场行。"""
+        self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
+        self.mark_ran("HK", "sentiment_snapshot", at="2026-09-16 16:45:04")
+        self.seed_sentiment("2026-09-15", "SH.600519")
+        self.seed_sentiment("2026-09-16", "SH.600519")
+        self.seed_sentiment("2026-09-10", "HK.00700")
+        out = self.snapshot()
+        sh = self.stages(out)["sentiment_snapshot"]["summary"]
+        hk = self.stages(out, "HK")["sentiment_snapshot"]["summary"]
+        self.assertIn("已积累 2 天", sh)
+        self.assertIn("最近 2026-09-16", sh)
+        self.assertIn("已积累 1 天", hk)
+        self.assertIn("最近 2026-09-10", hk)
+
+    def test_no_records_and_no_outcome_keeps_stage_clean(self):
+        """空库且无内容失败：不产生噪声（既有行为不变）。"""
+        self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
+        stage = self.stages(self.snapshot())["sentiment_snapshot"]
+        self.assertEqual(stage["status"], "ok")
+        self.assertEqual(stage["summary"], "")
+
+    def test_crashed_job_alert_still_drives_status(self):
+        """作业没跑完（无 ran 标记）：三条情绪标题仍按状态归因路径生效。"""
+        self.emit_alert("情绪源不可用", "market=SH 源 fin_news：全部失败")
+        stage = self.stages(self.snapshot())["sentiment_snapshot"]
+        self.assertEqual(stage["status"], "failed")
+        self.assertEqual(stage["summary"], "情绪源不可用")
+
+
 if __name__ == "__main__":
     unittest.main()

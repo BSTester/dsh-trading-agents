@@ -331,7 +331,7 @@ class StoreTest(unittest.TestCase):
             store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_sentiment",
                                    "not-json", "2026-09-11 16:20:00")
         # 对象可传（显式序列化），读回等价
-        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "futu_news",
+        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_news",
                                {"items": []}, "2026-09-11 16:20:00")
         self.assertEqual(store.read_sentiments(self.conn, "SH.600519")[0]["payload"],
                          {"items": []})
@@ -368,6 +368,48 @@ class StoreTest(unittest.TestCase):
         self.assertEqual(store.sentiment_streak(self.conn, "SH", today="2026-09-14"), 2)
         # 无 market（不查日历）走同一退化口径
         self.assertEqual(store.sentiment_streak(self.conn, today="2026-09-14"), 2)
+
+    def test_sentiment_market_scope_does_not_mix_markets(self):
+        """市场口径：days/latest/streak 给 market 时只算该市场标的（符号前缀过滤）。
+
+        回归背景（WP11 质量修复）：此前 days/latest 无 market 参数、streak 的 market
+        只用于查日历而**记录集仍是全市场**，流程页于是把「全市场累计」与「本市场连续」
+        拼在一句话里，同一句出现在每个市场行。
+        """
+        store.insert_sentiment(self.conn, "2026-09-10", "SH.600519", "fin_sentiment",
+                               "{}", "x")
+        store.insert_sentiment(self.conn, "2026-09-11", "HK.00700", "fin_sentiment",
+                               "{}", "x")
+        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_sentiment",
+                               "{}", "x")
+        # 全市场（缺省）口径保持累计事实
+        self.assertEqual(store.sentiment_days(self.conn), 2)
+        self.assertEqual(store.sentiment_latest(self.conn), "2026-09-11")
+        # 按市场：SH 两个日期、HK 仅一个；HK 的日期不抬 SH 的 latest
+        self.assertEqual(store.sentiment_days(self.conn, market="SH"), 2)
+        self.assertEqual(store.sentiment_days(self.conn, market="HK"), 1)
+        self.assertEqual(store.sentiment_latest(self.conn, market="SH"), "2026-09-11")
+        store.insert_sentiment(self.conn, "2026-09-12", "HK.00700", "fin_sentiment",
+                               "{}", "x")
+        self.assertEqual(store.sentiment_latest(self.conn, market="SH"), "2026-09-11")
+        self.assertEqual(store.sentiment_latest(self.conn, market="HK"), "2026-09-12")
+        # 无该市场记录 → 空而非借用别市场
+        self.assertIsNone(store.sentiment_latest(self.conn, market="US"))
+        self.assertEqual(store.sentiment_days(self.conn, market="US"), 0)
+
+    def test_sentiment_streak_is_market_scoped(self):
+        """streak 的记录集也按市场过滤：别市场的记录不续长本市场的连续数。"""
+        self._insert_calendar([("2026-09-10", "TRADING"), ("2026-09-11", "TRADING")])
+        # HK 9-10、SH 只有 9-11
+        store.insert_sentiment(self.conn, "2026-09-10", "HK.00700", "fin_sentiment",
+                               "{}", "x")
+        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_sentiment",
+                               "{}", "x")
+        # SH：9-11 有、上一交易日 9-10 **无 SH 记录**（HK 的不算）→ 断档 = 1
+        self.assertEqual(store.sentiment_streak(self.conn, market="SH",
+                                                today="2026-09-11"), 1)
+        # 全市场口径不变：9-11、9-10 都有记录 → 2
+        self.assertEqual(store.sentiment_streak(self.conn, today="2026-09-11"), 2)
 
 
 if __name__ == "__main__":

@@ -43,7 +43,7 @@ CREATE TABLE IF NOT EXISTS sentiment_snapshots(
 
 - [ ] **步骤 1：失败测试**（子进程全部注入假 runner）：
   ① fin_sentiment 源：runner 返回 `{"ticker":"600519","x":[...],"a_share_comment":{...},"sources_status":{...}}` → 落库 source="fin_sentiment"，payload=原文 JSON；
-  ② 富途资讯源（`find-news` 经 `futu_data` 或 `trading_datasource.futu_mcp.call_tool("quote_news_search")` 既有通道——按 WP8 映射，不新开通道）→ source="futu_news"；
+  ② 资讯源（**实现期修正**：`find-news`/`quote_news_search` 实测恒空——docs/TOOL-LIMITS.md「取新闻」行三种参数均 `data: []`，接恒空通道等于造一个永远空的源；改用 fin-data 统一快讯脚本 `fin_news.py`，真实上游 futu/akshare/yahoo 留在 payload.sources_status 自证）→ source="fin_news"；
   ③ last30days 源：引擎路径存在 → `--emit=json` 输出落 source="last30days"；**路径不存在 → 该源缺席，结果标 `absent:["last30days"]`，退出码 0**；
   ④ 单源 runner 抛异常 → 该源 absent + warn 告警，其余源照常；全部失败 → warn 告警 + 退出码 0（**不阻塞链**）；
   ⑤ 关注池为空 → 跳过 + 告警。

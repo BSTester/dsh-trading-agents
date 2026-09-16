@@ -414,13 +414,11 @@ def snapshot_cli(name, timeout=SNAPSHOT_TIMEOUT, runner=None):
 def factors_history(limit=30, timeout=SNAPSHOT_TIMEOUT, runner=None):
     """WP7：``python -m trading_core factors-history --limit N``（解析同 snapshot_cli）。
 
-    limit 缺省/None → 30；越界或非整数报 ``Invalid limit (1..120)``（ComputeError 与
-    全模块同一失败语义，app 侧经 caches.cached 落成 trading/core-unavailable）。
+    limit 缺省/None → 30；越界或非整数走 ``_int_in_range`` → ``Invalid limit (1..120)``
+    （ComputeError 与全模块同一失败语义，app 侧经 caches.cached 落成 trading/core-unavailable）。
     CLI 的失败信封 ``{ok:false, error}`` 由 parse_stdout 的 error 键分支接住。
     """
-    number = 30 if limit is None else limit
-    if not _is_int(number) or number < 1 or number > 120:
-        raise ComputeError("Invalid limit (1..120)")
+    number = _int_in_range(limit, 30, 1, 120, "limit")
     command = [PYTHON, "-m", "trading_core", "factors-history", "--limit", str(number)]
     spawn = _spawn if runner is None else runner
     completed = spawn(command, timeout)
@@ -433,12 +431,10 @@ def sentiment_history(symbol=None, limit=30, timeout=SNAPSHOT_TIMEOUT, runner=No
 
     与 ``factors_history`` 同一出口（parse_stdout：CLI 的 ``{ok:false,error}`` 信封
     → ComputeError，app 侧经 caches.cached 落成 trading/core-unavailable）。
-    limit 缺省/None → 30；越界或非整数报 ``Invalid limit (1..120)``，校验失败不起子进程。
-    symbol 非空时透传（形状/类型白名单在路由层，compute 只做参数拼装）。
+    limit 校验同样走 ``_int_in_range``（缺省 30、区间 1..120，消息逐字一致），
+    校验失败不起子进程。symbol 非空时透传（形状/类型白名单在路由层，compute 只做参数拼装）。
     """
-    number = 30 if limit is None else limit
-    if not _is_int(number) or number < 1 or number > 120:
-        raise ComputeError("Invalid limit (1..120)")
+    number = _int_in_range(limit, 30, 1, 120, "limit")
     command = [PYTHON, "-m", "trading_core", "sentiment-history", "--limit", str(number)]
     if symbol:
         command += ["--symbol", str(symbol)]

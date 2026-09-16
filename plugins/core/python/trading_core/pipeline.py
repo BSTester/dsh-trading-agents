@@ -20,6 +20,12 @@
 
 **不做推断**：没有证据就是 ``pending``；已跑成功的阶段不会因为别处的告警被改写。
 
+**状态与内容分开说**（情绪阶段，WP11 质量修复）：``sentiment.run`` 的软失败（池空/全源
+失败/会话未收盘）**返回 ok 且退出 0**，tick 照常写 ran 标记——作业确实跑完了，状态仍是
+``ok``；「今天什么都没采到」并进 ``summary``（``_SENTIMENT_OUTCOMES``），页面因此看得见
+内容结局而不牺牲状态语义。同理，情绪阶段的积累数字（已积累天数/连续交易日/最近日期）
+**一律按市场**取，不把全市场累计混进单市场行。
+
 告警归因（保守，只在无 ran 标记时生效）：标题取 ``_ALERT_STATUS`` 的**字面量**——它们
 是各 emit 点的稳定常量（``planner.plan_auto`` / ``autopilot.auto_execute`` /
 ``reconcile.daily`` / ``daemon.tick``），不是关键词猜测；跨市场的归属靠告警 detail 里的
@@ -95,11 +101,24 @@ _ALERT_STATUS = {
     "对账通道不可用": ("reconcile", "failed"),
     "对账差异": ("reconcile", "failed"),
     "对账无差异": ("reconcile", "ok"),
-    # sentiment.run（sentiment_snapshot 作业，WP11）
+    # sentiment.run（sentiment_snapshot 作业，WP11）——**仅作业没跑完**（tick 中断、
+    # ran 标记未落）时的状态归因；作业跑完后的内容失败走摘要，见 _SENTIMENT_OUTCOMES
     "情绪快照跳过": ("sentiment_snapshot", "skipped"),
     "情绪源不可用": ("sentiment_snapshot", "failed"),
     "情绪快照全部失败": ("sentiment_snapshot", "failed"),
 }
+
+#: 情绪采集的**内容结局**（作业跑完后的软失败）→ 摘要片段。软失败（池空/全源失败/会话
+#: 未收盘）在采集侧是「返回 ok 且退出 0」，tick 照常写 ran 标记——阶段状态因此恒为 ok。
+#: 状态不改（作业确实跑完了，改状态会让流程页说谎），结局并进 **summary**，否则页面上
+#: 「今天什么都没采到」毫无痕迹。与 _ALERT_STATUS 的三条同源同标题，但路径不同：
+#: 那三条管「没跑完」，这里管「跑完了但内容失败」，两者不重复也不冲突。
+_SENTIMENT_OUTCOMES = {
+    "情绪快照跳过": "当日未采集",
+    "情绪源不可用": "当日源不可用",
+    "情绪快照全部失败": "当日全部失败",
+}
+
 #: 市场链层告警（daemon.tick 在整条链层面发出）→ 作用于该市场所有数据作业
 _CHAIN_ALERT_STATUS = {"日历未同步": "skipped"}
 #: 配置非法会同时阻断 build_plan 与 auto_execute（两处 emit 同名标题）
@@ -251,22 +270,60 @@ def _digest_stage(conn, date):
             "scheduled": None, "summary": summary}
 
 
-def _sentiment_stage(conn, market, date, stage):
-    """情绪快照阶段的积累事实（WP11 任务 3）：累计天数 + 连续交易日 + 最近日期。
+def _strip_market_prefix(detail, market):
+    """告警 detail 的 ``market=XX`` 前缀去掉（摘要里已是该市场行，前缀是重复噪声）。
+
+    只剥**该市场**的前缀；detail 里其它位置的市场标记原样保留（它们是事实内容）。
+    """
+    prefix = f"market={market}"
+    text = str(detail or "").strip()
+    return text[len(prefix):].strip() if text.startswith(prefix) else text
+
+
+def _sentiment_outcome(alerts, market):
+    """当日该市场情绪采集的内容结局 → 摘要片段；全成功（无相关告警）→ ``""``。
+
+    纳入范围只有 ``_SENTIMENT_OUTCOMES`` 的字面量标题（emit 点稳定常量，非关键词猜测），
+    归属沿用 ``_applies`` 的市场消歧；同一结局去重，多个用「；」并列。
+    """
+    parts = []
+    for alert in alerts:
+        label = _SENTIMENT_OUTCOMES.get(str(alert.get("title") or ""))
+        if label is None or not _applies(alert, market):
+            continue
+        detail = _strip_market_prefix(alert.get("detail"), market)
+        text = f"{label}：{detail}" if detail else label
+        if text not in parts:
+            parts.append(text)
+    return "；".join(parts)
+
+
+def _sentiment_stage(conn, market, date, stage, alerts=()):
+    """情绪快照阶段：内容结局（当日，仅作业跑完时）+ 积累事实（本市场）+ 既有摘要。
 
     只读事实、不改状态：作业没跑（pending/skipped/failed）时也照样展示「攒了多少」——
-    采集是长期积累，与当日是否成功是两件事。无任何记录时原样返回（空库不产生噪声）。
-    摘要拼在告警标题之后（用「；」分隔），既有归因文案不丢。
+    采集是长期积累，与当日是否成功是两件事。**口径一律按市场**：days/latest/streak
+    都带 market，避免把全市场累计与逐市场连续拼成一句话（同一句复现在每个市场行的旧态）。
+
+    内容结局只在 ``stage["at"]`` 存在（= 当日有 ran 标记，作业跑完了）时并入：没跑完的
+    阶段已由 ``_ALERT_STATUS`` 的路由给出同名归因摘要，再拼一遍就是复读。
+    无任何内容结局且无任何记录时原样返回（空库不产生噪声）。
     """
-    days = store.sentiment_days(conn)
-    if days == 0:
+    parts = []
+    if stage.get("at"):
+        outcome = _sentiment_outcome(alerts, market)
+        if outcome:
+            parts.append(outcome)
+    days = store.sentiment_days(conn, market=market)
+    if days:
+        latest = store.sentiment_latest(conn, market=market)
+        streak = store.sentiment_streak(conn, market=market, today=date)
+        parts.append(f"已积累 {days} 天（连续 {streak} 个交易日，最近 {latest}）")
+    if not parts:
         return stage
-    latest = store.sentiment_latest(conn)
-    streak = store.sentiment_streak(conn, market=market, today=date)
-    note = f"已积累 {days} 天（连续 {streak} 个交易日，最近 {latest}）"
-    summary = str(stage.get("summary") or "")
+    base = str(stage.get("summary") or "")
     enriched = dict(stage)
-    enriched["summary"] = f"{summary}；{note}" if summary else note
+    enriched["summary"] = "；".join(([base] if base else []) + parts)
     return enriched
 
 
@@ -280,7 +337,7 @@ def _market_stages(conn, market, jobs, state, alerts, date):
         stage = _stage(market, name, state, alerts, date)
         stage["scheduled"] = job.get("at")
         if name == "sentiment_snapshot":
-            stage = _sentiment_stage(conn, market, date, stage)
+            stage = _sentiment_stage(conn, market, date, stage, alerts)
         stages[name] = stage
         if name == "build_plan":
             stages["plan"] = _plan_stage(conn, market)
