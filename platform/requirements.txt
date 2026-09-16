@@ -3,3 +3,5 @@ fastapi==0.141.1
 uvicorn==0.53.0
 mcp==2.2.0
 httpx==0.28.1
+# WP8 富途 OpenAPI AppKey 签名（Ed25519/RSA-SHA256）——trading_datasource.futu_openapi 依赖
+cryptography==50.0.1
