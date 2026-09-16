@@ -10,6 +10,7 @@
 """
 import json
 import sqlite3
+from datetime import date, timedelta
 from pathlib import Path
 
 SCHEMA_VERSION = 4  # WP2 预留 2；WP3 落 3（plans/orders/fills/risk_checks 四表）；
@@ -61,6 +62,10 @@ CREATE TABLE IF NOT EXISTS alerts(
   detail TEXT, created_at TEXT NOT NULL, acked INTEGER NOT NULL DEFAULT 0);
 CREATE TABLE IF NOT EXISTS factor_snapshots(
   date TEXT PRIMARY KEY, payload TEXT NOT NULL, created_at TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS sentiment_snapshots(
+  date TEXT NOT NULL, symbol TEXT NOT NULL, source TEXT NOT NULL,
+  payload TEXT NOT NULL, fetched_at TEXT NOT NULL,
+  PRIMARY KEY(date, symbol, source)) WITHOUT ROWID;
 """
 
 # ---------------------------------------------------------------------------
@@ -517,3 +522,112 @@ def list_factor_snapshots(conn, limit=30):
         (int(limit),)).fetchall()
     return [{"date": r["date"], "payload": json.loads(r["payload"]),
              "created_at": r["created_at"]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# WP11：情绪/资讯快照（服务调度每日收集，规格 §6.1）。表与 WP7 factor_snapshots
+# 同一先例——CREATE TABLE IF NOT EXISTS 幂等追加，SCHEMA_VERSION 不动。
+#
+# 与 bars/fundamentals 的 PIT 语义差异（重要）：本表是**观测记录**，不是 bar 序列。
+# 一行 = 某日对某标的某渠道的一次抓取，payload 是渠道原文 JSON，**不打分**——
+# 打分算法会随模型/口径漂移，原始数据不会（PIT 一致性优先，规格 §6.1）。
+# PIT 上界因此是「观测时间」（date <= 查询上界），而不是 bar 的 as_of 对齐；
+# 采集作业是当日写入，故不套 _require_as_of（那会挡住正常写路径）。
+# ---------------------------------------------------------------------------
+
+
+def insert_sentiment(conn, date, symbol, source, payload, fetched_at=None):
+    """按 (date,symbol,source) upsert：当日重跑幂等覆盖，不产生重复行。
+
+    payload 为渠道原文：str 必须能解析为 JSON（非法直接 ValueError——宁缺毋假），
+    dict/list 显式序列化。fetched_at 缺省为写入时刻（观测时点）。
+    source 取值由采集侧决定（如 fin_sentiment/futu_news/last30days），本层不设白名单。
+    """
+    if isinstance(payload, (dict, list)):
+        payload = json.dumps(payload, ensure_ascii=False)
+    elif not isinstance(payload, str):
+        raise ValueError(
+            f"sentiment payload 必须是 JSON 字符串或对象，收到 {type(payload).__name__}")
+    try:
+        json.loads(payload)
+    except ValueError as error:
+        raise ValueError(f"sentiment payload 不是合法 JSON：{error}") from None
+    conn.execute(
+        "INSERT INTO sentiment_snapshots(date,symbol,source,payload,fetched_at)"
+        " VALUES(?,?,?,?,?) ON CONFLICT(date,symbol,source) DO UPDATE SET"
+        " payload=excluded.payload, fetched_at=excluded.fetched_at",
+        (date, symbol, source, payload, fetched_at or _now()))
+    conn.commit()
+
+
+def read_sentiments(conn, symbol, limit=30, before=None):
+    """倒序（最新在前）返回 [{date,symbol,source,payload(反序列化),fetched_at}]。
+
+    before 给定时只返 date<=before 的观测——研究查询的 PIT 上界，不得看到未来观测。
+    """
+    sql = ("SELECT date,symbol,source,payload,fetched_at FROM sentiment_snapshots"
+           " WHERE symbol=?")
+    params = [symbol]
+    if before:
+        sql += " AND date<=?"
+        params.append(before)
+    sql += " ORDER BY date DESC, source LIMIT ?"
+    params.append(int(limit))
+    rows = conn.execute(sql, params).fetchall()
+    return [{"date": r["date"], "symbol": r["symbol"], "source": r["source"],
+             "payload": json.loads(r["payload"]), "fetched_at": r["fetched_at"]}
+            for r in rows]
+
+
+def sentiment_days(conn):
+    """有记录的不同日期数——「≥250 交易日可提检验申请」演进条款的口径。
+
+    注意这是**累计**口径（允许断档），不是「连续」；连续口径见 sentiment_streak。
+    """
+    row = conn.execute(
+        "SELECT COUNT(DISTINCT date) AS n FROM sentiment_snapshots").fetchone()
+    return int(row["n"])
+
+
+def sentiment_latest(conn):
+    """最近有记录的日期；无任何记录返回 None。"""
+    row = conn.execute("SELECT MAX(date) AS d FROM sentiment_snapshots").fetchone()
+    return row["d"]
+
+
+def sentiment_streak(conn, market=None, today=None):
+    """连续积累**交易日**数：从最近有记录的交易日往前数，遇无记录交易日即停。
+
+    与 sentiment_days 的口径差异（必须分辨）：days 是「一共多少天有记录」，
+    本函数是「最近一口气连了多少个交易日」——休市日不参与计数，因此不因周末断档。
+    日历未同步（trading_days 抛 RuntimeError）或未给 market 时**退化**为自然日连续
+    计数（该口径会在休市日断档，调用方展示时应知悉，不做静默补齐）。
+
+    窗口：today 往前 550 自然日（约 380 个交易日，覆盖 250 日条款的展示余量）；
+    窗口用尽即视为序列起点（返回值是窗口内可证实的下界）。
+    """
+    latest = sentiment_latest(conn)
+    if latest is None:
+        return 0
+    have = {r["d"] for r in conn.execute("SELECT DISTINCT date AS d FROM sentiment_snapshots")}
+    today = today or _now()[:10]
+    days = None
+    if market:
+        try:
+            start = (date.fromisoformat(today) - timedelta(days=550)).isoformat()
+            days = [d for d in trading_days(conn, market, start, today) if d <= latest]
+        except RuntimeError:
+            days = None  # 日历未同步：退化，不抛错也不假装连续
+    if days is not None:
+        count = 0
+        for day in reversed(days):
+            if day not in have:
+                break
+            count += 1
+        return count
+    cursor = date.fromisoformat(latest)
+    count = 0
+    while cursor.isoformat() in have:
+        count += 1
+        cursor -= timedelta(days=1)
+    return count

@@ -1,4 +1,5 @@
 """store 层单测：六张表、PIT 纪律强制、幂等 upsert、kv 游标。全部离线。"""
+import json
 import sqlite3
 import sys
 import tempfile
@@ -280,6 +281,93 @@ class StoreTest(unittest.TestCase):
         plan = self.conn.execute(
             "SELECT status FROM plans WHERE plan_id='MANUAL'").fetchone()
         self.assertEqual(plan["status"], "frozen")
+
+    # ------------------------------------------------------------------
+    # WP11：情绪快照（观测记录表——不是 bar 序列，PIT 上界是观测时间）
+    # ------------------------------------------------------------------
+
+    def _insert_calendar(self, rows):
+        self.conn.executemany(
+            "INSERT OR REPLACE INTO calendar(market,day,trade_date_type) VALUES(?,?,?)",
+            [("SH", day, dtype) for day, dtype in rows])
+        self.conn.commit()
+
+    def test_sentiment_snapshot_roundtrip(self):
+        store.insert_sentiment(self.conn, "2026-09-10", "SH.600519", "fin_sentiment",
+                               '{"a_share_comment": {"score": 1}}', "2026-09-10 16:20:00")
+        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_sentiment",
+                               '{"a_share_comment": {"score": 2}}', "2026-09-11 16:20:00")
+        rows = store.read_sentiments(self.conn, "SH.600519")
+        self.assertEqual([r["date"] for r in rows], ["2026-09-11", "2026-09-10"])
+        self.assertEqual(rows[0]["symbol"], "SH.600519")
+        self.assertEqual(rows[0]["source"], "fin_sentiment")
+        self.assertEqual(rows[0]["fetched_at"], "2026-09-11 16:20:00")
+        # payload 反序列化返回（与 list_factor_snapshots 同口径）
+        self.assertEqual(rows[0]["payload"]["a_share_comment"]["score"], 2)
+
+    def test_sentiment_insert_idempotent_per_day(self):
+        """当日重跑：同 (date,symbol,source) 覆盖而非新增；多源同日共存。"""
+        for score in (1, 9):
+            store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_sentiment",
+                                   json.dumps({"s": score}), "2026-09-11 16:20:00")
+        rows = store.read_sentiments(self.conn, "SH.600519")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["payload"]["s"], 9)
+        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "last30days",
+                               '{"posts": 3}', "2026-09-11 16:21:00")
+        self.assertEqual(len(store.read_sentiments(self.conn, "SH.600519")), 2)
+
+    def test_read_sentiments_before_is_observation_bound(self):
+        for day in ("2026-09-10", "2026-09-11", "2026-09-12"):
+            store.insert_sentiment(self.conn, day, "SH.600519", "fin_sentiment", "{}",
+                                   day + " 16:00:00")
+        rows = store.read_sentiments(self.conn, "SH.600519", before="2026-09-11")
+        self.assertEqual([r["date"] for r in rows], ["2026-09-11", "2026-09-10"])
+        self.assertEqual(len(store.read_sentiments(self.conn, "SH.600519", limit=1)), 1)
+
+    def test_sentiment_insert_rejects_non_json_payload(self):
+        """宁缺毋假：payload 必须是可取证的 JSON（str 校验、dict/list 序列化）。"""
+        with self.assertRaises(ValueError):
+            store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_sentiment",
+                                   "not-json", "2026-09-11 16:20:00")
+        # 对象可传（显式序列化），读回等价
+        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "futu_news",
+                               {"items": []}, "2026-09-11 16:20:00")
+        self.assertEqual(store.read_sentiments(self.conn, "SH.600519")[0]["payload"],
+                         {"items": []})
+
+    def test_sentiment_accumulation_days_and_latest(self):
+        """积累口径（≥250 交易日演进条款）：有记录的不同日期数，不是「连续」。"""
+        self.assertEqual(store.sentiment_days(self.conn), 0)
+        self.assertIsNone(store.sentiment_latest(self.conn))
+        for day in ("2026-09-10", "2026-09-10", "2026-09-11"):
+            store.insert_sentiment(self.conn, day, "SH.600519", "fin_sentiment", "{}",
+                                   day + " 16:00:00")
+        self.assertEqual(store.sentiment_days(self.conn), 2)
+        self.assertEqual(store.sentiment_latest(self.conn), "2026-09-11")
+
+    def test_sentiment_streak_counts_trading_days(self):
+        """连续积累按交易日历计数：休市日不参与，因此不因周末断档。"""
+        self._insert_calendar([("2026-09-10", "TRADING"), ("2026-09-11", "TRADING"),
+                               ("2026-09-12", "CLOSE"), ("2026-09-13", "CLOSE"),
+                               ("2026-09-14", "TRADING")])
+        for day in ("2026-09-10", "2026-09-14"):
+            store.insert_sentiment(self.conn, day, "SH.600519", "fin_sentiment", "{}",
+                                   day + " 16:00:00")
+        # 从 9-14 往前：9-14 有、上一交易日 9-11 无 → 断档 = 1
+        self.assertEqual(store.sentiment_streak(self.conn, "SH", today="2026-09-14"), 1)
+        store.insert_sentiment(self.conn, "2026-09-11", "SH.600519", "fin_sentiment", "{}",
+                               "2026-09-11 16:00:00")
+        # 9-14 / 9-11 / 9-10 连续三个交易日（9-12、9-13 休市不计）
+        self.assertEqual(store.sentiment_streak(self.conn, "SH", today="2026-09-14"), 3)
+
+    def test_sentiment_streak_without_calendar_degrades_to_calendar_days(self):
+        """日历未同步：退化按自然日连续（诚实披露：会在休市日断档），不抛错。"""
+        for day in ("2026-09-13", "2026-09-14"):
+            store.insert_sentiment(self.conn, day, "SH.600519", "fin_sentiment", "{}", "x")
+        self.assertEqual(store.sentiment_streak(self.conn, "SH", today="2026-09-14"), 2)
+        # 无 market（不查日历）走同一退化口径
+        self.assertEqual(store.sentiment_streak(self.conn, today="2026-09-14"), 2)
 
 
 if __name__ == "__main__":
