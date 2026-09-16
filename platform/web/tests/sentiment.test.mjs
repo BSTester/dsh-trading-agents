@@ -27,10 +27,13 @@ test("sentimentRows：空/缺失摘要返回三源全缺席，不抛错", () => 
   }
 });
 
-test("sentimentHeadline：有记录报日期与条数，无记录不给日期", () => {
-  assert.equal(sentimentHeadline({ date: "2026-09-16", records: 42, symbols: 7 }),
-    "2026-09-16 采集 42 条，覆盖 7 个标的");
-  assert.equal(sentimentHeadline({ date: null, records: 0, symbols: 0 }), "暂无情绪快照记录");
+test("sentimentHeadline：有记录报日期/条数/累计天数，无记录不给日期", () => {
+  assert.equal(sentimentHeadline({ date: "2026-09-16", records: 42, symbols: 7, days: 2 }),
+    "2026-09-16 采集 42 条，覆盖 7 个标的；已积累 2 天");
+  assert.equal(sentimentHeadline({ date: "2026-09-16", records: 1, symbols: 1, days: 0 }),
+    "2026-09-16 采集 1 条，覆盖 1 个标的", "累零天不写「已积累 0 天」");
+  assert.equal(sentimentHeadline({ date: null, records: 0, symbols: 0, days: 0 }),
+    "暂无情绪快照记录");
   assert.equal(sentimentHeadline(null), "暂无情绪快照记录");
   assert.equal(sentimentHeadline({}), "暂无情绪快照记录");
 });

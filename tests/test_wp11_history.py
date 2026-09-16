@@ -68,19 +68,23 @@ class SentimentStoreTest(unittest.TestCase):
         seed_rows(self.conn)
         summary = store.sentiment_summary(self.conn)
         self.assertEqual(summary, {"date": DATE, "symbols": 2, "records": 3,
-                                   "sources": {"fin_news": 1, "fin_sentiment": 2}})
+                                   "sources": {"fin_news": 1, "fin_sentiment": 2},
+                                   "days": 2})
 
     def test_summary_honours_explicit_date(self):
         seed_rows(self.conn)
         summary = store.sentiment_summary(self.conn, date=PREV)
         self.assertEqual(summary, {"date": PREV, "symbols": 1, "records": 1,
-                                   "sources": {"fin_sentiment": 1}})
+                                   "sources": {"fin_sentiment": 1}, "days": 2},
+                         "days 是累计口径（含指定日期之后的日子）")
 
     def test_summary_empty_db_is_empty_structure_not_error(self):
         self.assertEqual(store.sentiment_summary(self.conn),
-                         {"date": None, "symbols": 0, "records": 0, "sources": {}})
+                         {"date": None, "symbols": 0, "records": 0, "sources": {},
+                          "days": 0})
         self.assertEqual(store.sentiment_summary(self.conn, date=DATE),
-                         {"date": DATE, "symbols": 0, "records": 0, "sources": {}})
+                         {"date": DATE, "symbols": 0, "records": 0, "sources": {},
+                          "days": 0})
 
     def test_read_sentiments_limit_and_pit_upper_bound(self):
         seed_rows(self.conn)
@@ -119,6 +123,7 @@ class SentimentCliTest(unittest.TestCase):
         self.assertIsNone(out["symbol"])
         self.assertEqual(out["records"], [])
         self.assertEqual(out["summary"]["records"], 3)
+        self.assertEqual(out["summary"]["days"], 2, "摘要含累计天数供因子页展示")
 
     def test_symbol_form_returns_records_and_null_summary(self):
         out = self._run(["sentiment-history", "--db", self.db,
@@ -134,7 +139,8 @@ class SentimentCliTest(unittest.TestCase):
         conn.close()
         out = self._run(["sentiment-history", "--db", empty])
         self.assertEqual(out["summary"],
-                         {"date": None, "symbols": 0, "records": 0, "sources": {}})
+                         {"date": None, "symbols": 0, "records": 0, "sources": {},
+                          "days": 0})
 
 
 class SentimentComputeTest(unittest.TestCase):
@@ -180,7 +186,8 @@ class SentimentHistoryBase(unittest.TestCase):
         self.addCleanup(caches.configure)
         self.value = {"ok": True, "symbol": None, "records": [],
                       "summary": {"date": DATE, "symbols": 2, "records": 3,
-                                  "sources": {"fin_sentiment": 2, "fin_news": 1}}}
+                                  "sources": {"fin_sentiment": 2, "fin_news": 1},
+                                  "days": 2}}
         self.runner = fake_runner(stdout=json.dumps(self.value))
         self.core = {"sentiment-history": lambda symbol=None, limit=30:
                      compute.sentiment_history(symbol, limit, runner=self.runner)}

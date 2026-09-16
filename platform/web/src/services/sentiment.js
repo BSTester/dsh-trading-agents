@@ -31,10 +31,15 @@ export function sentimentRows(summary) {
 }
 
 /**
- * 采集事实一行话：无记录时不给日期（「暂无记录」），有记录才报日期与条数。
- * @param {{date?: string|null, symbols?: number, records?: number}|null|undefined} summary
+ * 采集事实一行话：无记录时不给日期（「暂无记录」），有记录才报日期/条数/累计天数。
+ * ``days`` 是累计口径（服务端 ``store.sentiment_days``，允许断档）；连续交易日口径
+ * 在流程页按市场展示（``sentiment_streak``），两者不混为一谈。
+ * @param {{date?: string|null, symbols?: number, records?: number, days?: number}|null|undefined} summary
  */
 export function sentimentHeadline(summary) {
   if (!summary || !summary.date) return "暂无情绪快照记录";
-  return `${summary.date} 采集 ${Number(summary.records ?? 0)} 条，覆盖 ${Number(summary.symbols ?? 0)} 个标的`;
+  const base = `${summary.date} 采集 ${Number(summary.records ?? 0)} 条，覆盖 `
+    + `${Number(summary.symbols ?? 0)} 个标的`;
+  const days = Number(summary.days ?? 0);
+  return days > 0 ? `${base}；已积累 ${days} 天` : base;
 }
