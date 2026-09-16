@@ -444,9 +444,9 @@ MCP 工具面按研究价值分档，避免工具数无节制膨胀：
 
 | 档 | 策略 | 端点 |
 |---|---|---|
-| **直通工具**（逐端点 1:1） | 研究高频、语义独立 | `stock_screen`、`plate_list`、`plate_stock`、`short_daily_volume`、`short_interest`、`ipo_list`、`economic_calendar_hot`、`economic_calendar_search`、`info_search_stock`、`info_owner_plate`、`watchlist_list`、`watchlist_groups` |
-| **聚合读工具**（一个工具、白名单 section 枚举） | 结构同质、逐项暴露收益低 | `f10_detail(symbol, section)`：section 枚举映射 23 个 F10 端点；`derivative_detail(symbol, section)` 同理 |
-| **HTTP-only**（不进工具面） | 低频/写类/自选修改 | `modify_user_security`（自选修改，仅 Web 用户操作）、期货信息等低频项 |
+| **直通工具**（逐端点 1:1） | 研究高频、语义独立 | `stock_screen`、`plate_list`、`plate_stock`、`short_daily_volume`、`short_interest`、`ipo_list`、`economic_calendar_hot`、`economic_calendar_search`、`info_owner_plate`、`watchlist_list`、`watchlist_groups`（**实现期修订 2026-09-16**：删去 `info_search_stock`——锁定表 §D.1 实测官方「搜索」页只有 find-news/find-community，**不存在证券搜索端点**；故直通 11 项） |
+| **聚合读工具**（一个工具、白名单 section 枚举） | 结构同质、逐项暴露收益低 | `f10_detail(code, section)`：section 枚举映射锁定表 §C.5 的 26 个 F10 端点；`derivative_detail(code, section)` 同理（4 项）。（实现期修订：字段名是 **`code`** 而非 `symbol`，与既有行情端点载荷口径一致，服务端内部再转 futu symbol） |
+| **HTTP-only**（不进工具面） | 低频/写类/自选修改 | `modify_user_security`（写用户富途侧自选，仅 Web 用户操作）、`warrant_screen`（窝轮数据保持 API 面完整但不策略化）、`info_rehab`（同步作业内部用）（实现期清单） |
 
 - 工具面预算不变量：**直通工具 + 聚合工具合计 ≤ 80**（当前基线 61 → WP12 后 75 → WP15 后 77），
   写入测试断言；新增工具必须显式登记档位与理由；
