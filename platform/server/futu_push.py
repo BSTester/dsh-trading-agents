@@ -83,6 +83,37 @@ class PushDisconnected(PushError):
     """连接断开（假连接与真实传输都用它表达「本次会话结束」）。"""
 
 
+# ---------------------------------------------------------------------------
+# WP8 任务 6：推送订阅管理面（push_status / push_subscribe / push_unsubscribe）
+# ---------------------------------------------------------------------------
+# 推送未启用/未接线时订阅意图无法生效 → 如实拒绝（app.create_handler 信封成
+# ``trading/push-unavailable``），绝不假装订阅成功。
+PUSH_UNAVAILABLE_CODE = "trading/push-unavailable"
+PUSH_NOT_WIRED = ("推送运行时未接线（服务未启用富途 WS 推送：futu_channel=openapi 且"
+                  "已配置 OpenAPI 凭据时启用）")
+
+
+class PushUnavailable(RuntimeError):
+    """推送不可用（未启用/未接线/未启动）：订阅意图无法生效时抛出。"""
+
+
+def status_view(runtime):
+    """``push_status`` 的 value：与 ``/healthz`` 的 ``push`` 字段同形（同一事实/同一形状）。"""
+    return safe_status(runtime)
+
+
+def apply_subscription(runtime, action, items):
+    """把订阅意图交给推送运行时（action ∈ subscribe|unsubscribe）；返回意图快照。
+
+    运行时未接线（``create_handler`` 未注入 push）→ ``PushUnavailable``；
+    运行时的 ``subscribe``/``unsubscribe`` 自带启用判定与 ``normalize_items`` 校验
+    （``ValueError`` → 调用方信封成 ``trading/invalid-operation``）。
+    """
+    if runtime is None:
+        raise PushUnavailable(PUSH_NOT_WIRED)
+    return getattr(runtime, action)(items)
+
+
 def _iso_from_ms(at_ms):
     """毫秒时间戳 → UTC ISO 串（与 caches.iso_from_ms 同格式，自带实现不跨模块依赖）。"""
     if at_ms is None:
@@ -292,11 +323,19 @@ def _status_of(client):
 
 
 def safe_status(runtime):
-    """healthz 专用：任何 ``status()`` 异常都不影响主字段（推送是旁路，不是存活条件）。"""
+    """healthz / push_status 专用：任何 ``status()`` 异常都不影响主字段（推送是旁路，不是存活条件）。
+
+    ``runtime`` 为 None（``create_handler`` 未接线 push 的直跑/单测路径）时给出同形状的
+    disabled 态——形状稳定，调用方（前端/healthz）不必分支。
+    """
+    if runtime is None:
+        return {"enabled": False, "started": False, "reason": PUSH_NOT_WIRED,
+                "last_error": None, "quote": empty_status(), "trade": empty_status()}
     try:
         return runtime.status()
     except Exception as error:  # noqa: BLE001 —— healthz 绝不为推送解析失败而 500
-        return {"enabled": False, "error": str(error)[:300],
+        return {"enabled": False, "started": False, "reason": None,
+                "last_error": None, "error": str(error)[:300],
                 "quote": empty_status(), "trade": empty_status()}
 
 
@@ -993,3 +1032,26 @@ class PushRuntime:
         return {"enabled": bool(self._enabled), "started": bool(self._started),
                 "reason": self._skip_reason, "last_error": self._last_error,
                 "quote": _status_of(self._quote), "trade": _status_of(self._trade)}
+
+    # ---- WP8 任务 6：订阅管理面（只改本地连接订阅意图；**不是交易**）----
+    def _admin_client(self):
+        """行情链客户端（订阅意图的唯一持有者）；未启用/未启动 → 如实拒绝。"""
+        if self._quote is None:
+            reason = self._skip_reason or ("推送未启用（futu_channel=openapi 且 OpenAPI "
+                                           "凭据可用时启动富途 WS 推送）")
+            raise PushUnavailable(f"推送未启用：{reason}")
+        return self._quote
+
+    def subscribe(self, items):
+        """把订阅意图并入行情链（幂等；未连接时先记意图，连上后按 diff flush）。"""
+        return self._admin_client().subscribe(items)
+
+    def unsubscribe(self, items):
+        """从本地订阅意图移除（只对已确认订阅的部分发反订阅帧）。"""
+        return self._admin_client().unsubscribe(items)
+
+    def snapshot_intent(self):
+        """当前订阅意图的用户视图（未启用时给空视图，形状恒稳定）。"""
+        if self._quote is None:
+            return intent_view({})
+        return self._quote.snapshot_intent()

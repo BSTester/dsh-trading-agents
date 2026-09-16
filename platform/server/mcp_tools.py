@@ -79,11 +79,12 @@ from server import store_access
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
 
-# 工具面总数：51 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
+# 工具面总数：54 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
 # 工具 + WP8 富途实时直通 8 个 + WP8 任务 2 的 9 个行情工具 + WP8 任务 3 的 6 个
-# OpenAPI 交易只读工具；52 端点扣除有意排除的 confirm-decide）+ 5 维护工具（§3.4）。
-# 锁定测试断言 56 恒成立。
-TOOL_COUNT = 56
+# OpenAPI 交易只读工具 + WP8 任务 6 的 3 个推送订阅管理工具；55 端点扣除有意排除的
+# confirm-decide）+ 5 维护工具（§3.4）。
+# 锁定测试断言 59 恒成立。
+TOOL_COUNT = 59
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
 # ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
@@ -163,10 +164,19 @@ _TYPES = {
     "trd_market": Literal["HK", "US", "SG", "HKCC", "CA", "FUTURES", "JP", "KR"],
     "exchange": Literal["US", "SEHK", "SGX", "SSE", "SZSE", "JP", "CA", "CME", "CBOT",
                         "NYMEX", "COMEX", "CBOE", "HKFE", "KR"],
+    # WP8 任务 6：place-order 的其余官方枚举（naming-dictionary 原文；取值与
+    # trading.OpenApiBroker/OpenApiTrade 的常量一致，锁定测试比对）。
+    "time_in_force": Literal["DAY", "GTC"],
+    "session": Literal["RTH", "RTH+Pre/Post-Mkt", "OVERNIGHT", "ALL_DAY"],
+    "lot_type": Literal["ODD", "ROUND"],
+    "order_class": Literal["NORMAL", "MLEG"],
     # WP8 富途直通：对象入参（option_screen 的 filter；option_chain 的 field_filter）。
     # 顶层模型仍 additionalProperties:false（_forbid_extra_fields），对象**内部**的键
     # 由 server/futu_data.py 的内键白名单校验——嵌套 dict 不进封闭模型。
     "object": dict,
+    # WP8 任务 6：对象列表（kline 订阅项 [{symbol,period,adjust}]；与 object 同理，
+    # 元素内键由 server/futu_push.normalize_items 校验）。
+    "object_list": list[dict],
 }
 
 
@@ -431,17 +441,44 @@ TOOLS = (
     # 注定被拒、还要占用确认通道的提交。
     ToolDefinition(
         "trade_place",
-        "受约束下单（临时订单，限价）：过完整闸门链（模式文件→风控 8 规则→kill→业务确认）"
+        "受约束下单（临时订单）：过完整闸门链（模式文件→风控 8 规则→kill→业务确认）"
         "后提交券商。提交后需在独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
+        "订单类型官方 8 枚举（默认 LIMIT），价格字段按类型条件必填："
+        "price 必填=LIMIT/AUCTION_LIMIT/STOP_LIMIT/LIMIT_IF_TOUCHED，"
+        "禁止=MARKET/AUCTION/STOP/MARKET_IF_TOUCHED（市价类无价格语义）；"
+        "aux_price 必填=STOP/STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED（证券 3 位小数），"
+        "其余类型禁止。MARKET/AUCTION 不带 price，风险基准价取本地最近收盘（本地无数据则"
+        "拒绝）。time_in_force=GTC 表示撤单前有效；session 仅美股、市价单仅 RTH；"
+        "lot_type 仅港股；remark ≤64 字节；多腿下单需 order_class=MLEG 并给 multi_leg_info。"
         "live 写需 futu_channel=openapi 且已配置凭据（券商二次确认由服务端在人工批准后"
-        "自动完成）；未配置时 live 提交会被拒绝，当前仅 sim 可交易。"
-        "模式只认账户模式文件（载荷不带 mode）。",
+        "自动完成）；未配置时 live 提交会被拒绝。sim 通道仅支持限价当日单，其余字段如实"
+        "拒绝（不会静默丢弃）。模式只认账户模式文件（载荷不带 mode）。",
         "trade_place",
         (
             req("symbol", "str", "标的代码，如 SH.600519（支持 SH/SZ/BJ/HK/US 前缀）"),
             req("side", "side", "方向：BUY=买入 / SELL=卖出"),
             req("qty", "int", "数量（股，>=1）", minimum=1),
-            req("price", "number", "限价（>0）"),
+            opt("order_type", "order_type",
+                "订单类型（默认 LIMIT）：LIMIT/MARKET/AUCTION/AUCTION_LIMIT/STOP/"
+                "STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED"),
+            opt("price", "number",
+                "限价类必填（LIMIT/AUCTION_LIMIT/STOP_LIMIT/LIMIT_IF_TOUCHED，>0）；"
+                "市价类（MARKET/AUCTION/STOP/MARKET_IF_TOUCHED）禁止携带"),
+            opt("time_in_force", "time_in_force", "有效期：DAY=当日（默认）/ GTC=撤单前有效"),
+            opt("session", "session",
+                "交易时段（仅美股）：RTH=常规（默认）/RTH+Pre/Post-Mkt=盘前盘后/"
+                "OVERNIGHT=夜盘/ALL_DAY=全日；市价单仅支持 RTH"),
+            opt("aux_price", "number",
+                "触发价（触发类订单必填；证券 3 位小数）：STOP/STOP_LIMIT/"
+                "MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED"),
+            opt("lot_type", "lot_type", "手数类型（仅港股）：ODD=碎股 / ROUND=整手（默认）"),
+            opt("remark", "str", "备注（UTF-8 编码后 ≤64 字节）"),
+            opt("order_class", "order_class",
+                "订单类别：NORMAL=普通单腿（默认）/ MLEG=多腿（必须同时给 multi_leg_info）"),
+            opt("multi_leg_info", "object",
+                "多腿订单信息（官方 MultiLegInfo：option_strategy/underlying_symbol/"
+                "leg_infos[leg_symbol/leg_exchange/leg_ratio_qty/leg_side/"
+                "leg_security_type]）；HTTP 面也接受同构对象列表"),
             opt("client_order_id", "str", "幂等编号：同一编号重复提交只执行一次，不重复下单"),
         ),
     ),
@@ -449,7 +486,10 @@ TOOLS = (
         "trade_modify",
         "受约束改单：过完整闸门链（模式→风控 8 规则→kill→业务确认）后执行，风控按新参数"
         "全额预检。提交后需在独立 Web 确认卡片批准；TTL 120 秒超时自动拒绝（fail-closed）。"
-        "sim 分支=撤旧单+按新参数重下（券商模拟改单接口不可靠）；live（OpenAPI）非 A 股"
+        "官方改单请求体只有 exchange/qty/price/aux_price（**没有 order_type**：订单类型由"
+        "券商侧已有订单决定）；若被改订单是触发类（STOP/STOP_LIMIT/MARKET_IF_TOUCHED/"
+        "LIMIT_IF_TOUCHED），官方要求带 aux_price（触发价，证券 3 位小数），否则触发价沿用"
+        "旧值。sim 分支=撤旧单+按新参数重下（券商模拟改单接口不可靠）；live（OpenAPI）非 A 股"
         "直接原生改单，A 股官方不支持改单（如实拒绝，请改走撤单+重新下单）。"
         "live 写需 futu_channel=openapi 且已配置凭据；未配置时 live 提交会被拒绝。",
         "trade_modify",
@@ -459,6 +499,9 @@ TOOLS = (
             req("side", "side", "新单方向：BUY/SELL"),
             req("qty", "int", "新单数量（股，>=1；不做「仅改价格」的部分语义）", minimum=1),
             req("price", "number", "新单限价（>0）"),
+            opt("aux_price", "number",
+                "触发价（证券 3 位小数；官方：被改订单为 STOP/STOP_LIMIT/"
+                "MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED 时必填）"),
             opt("client_order_id", "str", "幂等编号（标识这次改单产生的新单登记）"),
         ),
     ),
@@ -780,6 +823,45 @@ TOOLS = (
             REFRESH,
         ),
     ),
+    # ---- WP8 任务 6：推送订阅管理面（3 个；**非交易**：只改本地连接订阅意图，
+    # 不改模式、不过风控、不产生订单；TTL 0 实时直通，不进缓存）----
+    # push_status 是读（与 /healthz 的 push 字段同一实现 futu_push.safe_status）；
+    # push_subscribe/push_unsubscribe 在推送未启用时如实返回 trading/push-unavailable
+    # （futu_channel=openapi 且已配置凭据时才启用），坏载荷 → trading/invalid-operation。
+    ToolDefinition(
+        "push_status",
+        "富途 WS 推送状态（只读，TTL 0）：enabled 是否启用，quote/trade 两条链各自的"
+        "connected/authenticated/最后消息时间/重连次数/最后错误，以及当前订阅意图。"
+        "与 /healthz 的 push 字段同一实现、同一事实。",
+        "push_status",
+        (),
+    ),
+    ToolDefinition(
+        "push_subscribe",
+        "追加订阅意图（**非交易**：只改本地连接订阅意图，不改模式/不过风控/不产生订单，"
+        "因此不需要业务确认）。通道：quote/order_book/ticker 给标的列表；kline 给"
+        "[{symbol,period,adjust}]。幂等：重复提交同一意图不会重复发订阅帧；推送未启用时"
+        "返回 trading/push-unavailable（不假装成功）。",
+        "push_subscribe",
+        (
+            opt("quote", "str_list", "实时报价标的列表"),
+            opt("order_book", "str_list", "摆盘标的列表"),
+            opt("ticker", "str_list", "逐笔标的列表"),
+            opt("kline", "object_list", "K 线订阅项：[{symbol, period, adjust}]"),
+        ),
+    ),
+    ToolDefinition(
+        "push_unsubscribe",
+        "移除订阅意图（**非交易**）：精确反订阅给定标的/周期；只对已确认订阅的部分发"
+        "反订阅帧，未订阅的标的不报错（幂等）。推送未启用时返回 trading/push-unavailable。",
+        "push_unsubscribe",
+        (
+            opt("quote", "str_list", "要取消的实时报价标的"),
+            opt("order_book", "str_list", "要取消的摆盘标的"),
+            opt("ticker", "str_list", "要取消的逐笔标的"),
+            opt("kline", "object_list", "要取消的 K 线订阅项：[{symbol, period, adjust}]"),
+        ),
+    ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----
     # 不经 RPC handler，直调 store_access 的 admin_*（与全部端点同库同锁；WP6 口径 23
     # 端点、WP7 任务 3 起 29 端点——2026-09 修订：原文「与 22 端点同库同锁」计数未随
@@ -815,7 +897,7 @@ if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时
 # 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
 TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 
-# 51 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
+# 54 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 

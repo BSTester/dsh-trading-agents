@@ -92,3 +92,22 @@ REST 端点 → quantwb 工具（**分组平铺**，命名 `<域>_<对象>`；�
 
 原模块头与交易段注释写「交易侧与行情侧同一信封」——**不准确**：交易是 `{"s":"ok","d":…}` / `{"s":"error",errcode,errmsg,…}`，行情是 `{"ret_code":0,"data":{…},"pagination":{…}}`（分页在信封顶层），`parse_envelope_meta` 一直同时兼容两者。现已改正注释并显式登记第三种情形 `UnexpectedResponse`（非信封/5xx/429）。
 
+### 6.4 任务 6 收敛（2026-09-16，计划外补充）
+
+用户「完整官方交易链路」要求新增的 WP8 任务 6 收敛了 6.2 的前两项并新增推送订阅管理面：
+
+1. **工具面覆盖缺口 → 已修**：`trade_place` 补齐官方 place-order 全字段（`order_type` 8 枚举、
+   `time_in_force{DAY,GTC}`、美股 `session`（市价单仅 RTH）、`aux_price`（触发类必填，证券 3 位
+   小数）、`lot_type`（仅港股）、`remark`（≤64 字节）、`order_class`/`multi_leg_info`（MLEG）），
+   `validate_order` 与 `OPENAPI_TRADE_FIELDS`/`TRADE_PLACE_FIELDS` 同步扩面；校验在闸门**字段
+   校验层**（风控/确认之前），错误 `trading/invalid-operation` 且带官方允许值；`OpenApiBroker.place`
+   不再硬编码 `LIMIT/DAY`（缺省值由适配层补，显式值逐键透传）。**sim 通道只支持限价当日单**，
+   扩展字段如实拒绝（`trading/broker-unavailable`，适配层第二道守卫），不静默丢弃。
+2. **改单丢 `aux_price` → 已修**：闸门/工具面/`OpenApiBroker.modify` 全链透传 `aux_price`
+   （官方 `PUT /orders/{id}` 请求体无 `order_type`，故不引入类型语义）。
+5. **锁定表计数 → 同步更新**：工具面 56 → **59**、端点 52 → **55**，7 个测试文件与
+   `test_wp6_tables_lock` 的内嵌清单逐处同步（硬编码本身仍保留，改为派生属于独立技术债）。
+   新增推送订阅管理面 3 端点/工具：`push_status`（TTL 0，与 `/healthz` 的 push 同形）、
+   `push_subscribe`/`push_unsubscribe`（**非交易**：只改本地连接订阅意图，未启用如实返回
+   `trading/push-unavailable`）。字段/通道边界登记在 [TOOL-LIMITS 第八节](../../TOOL-LIMITS.md)。
+

@@ -251,6 +251,14 @@ def describe_order_args(tool, args=None):
     push("订单类型", raw("order_type"))
     push("订单号", raw("order_id"))
     push("有效期", _js.js_nullish(raw("time_in_force"), raw("order_trade_time_type")))
+    # WP8 任务 6：官方 place/modify 扩展参数（人批准的就是这些参数，逐项列出来可核对）。
+    # 市价类没有下单价时列闸门实际使用的风控基准价（risk_price，本地收盘），口径透明。
+    push("风控基准价", raw("risk_price"))
+    push("触发价", raw("aux_price"))
+    push("交易时段", raw("session"))
+    push("手数类型", raw("lot_type"))
+    push("订单类别", raw("order_class"))
+    push("多腿信息", raw("multi_leg_info"))
     push("备注", _js.js_nullish(raw("text"), raw("remark")))
     return {"tool": tool, "fields": fields, "raw": source}
 
@@ -352,17 +360,25 @@ WP8_MARKET_ENDPOINTS = ("market_snapshot", "cur_kline", "rt_data", "rt_ticker",
 WP8_TRADE_ENDPOINTS = ("trade_max_qty", "orders_open", "orders_history",
                        "orders_detail", "deals_today", "deals_history")
 
+# WP8 任务 6：推送订阅管理面（3 个；路由在 server/futu_push.py 的运行时门面，
+# app.create_handler 注入 push 运行时）。push_status 是读（TTL 0，与 /healthz 的 push
+# 同形）；push_subscribe/push_unsubscribe **只改本地连接订阅意图**（非交易：不改模式、
+# 不过风控、不产生订单），推送未启用时如实返回 trading/push-unavailable。
+# 全部实时直通：不进 CACHE_TTL_MS / ENDPOINT_SHAPE。名单与 mcp_tools 的 3 个工具逐项锁定。
+WP8_PUSH_ENDPOINTS = ("push_status", "push_subscribe", "push_unsubscribe")
+
 
 def endpoints():
-    """服务端点清单（52 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
-    + 9 项 WP8 OpenAPI 行情 + 6 项 WP8 OpenAPI 交易只读。
+    """服务端点清单（55 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
+    + 9 项 WP8 OpenAPI 行情 + 6 项 WP8 OpenAPI 交易只读 + 3 项 WP8 推送订阅管理。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
     基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8 增量按交付
-    顺序登记在各自常量里；锁定测试把 52 项整体钉死。
+    顺序登记在各自常量里；锁定测试把 55 项整体钉死。
     """
     return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS) \
-        + list(WP8_MARKET_ENDPOINTS) + list(WP8_TRADE_ENDPOINTS)
+        + list(WP8_MARKET_ENDPOINTS) + list(WP8_TRADE_ENDPOINTS) \
+        + list(WP8_PUSH_ENDPOINTS)
 
 
 def read_mode(home):

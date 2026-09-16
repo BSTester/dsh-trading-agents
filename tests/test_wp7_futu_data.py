@@ -15,7 +15,7 @@ capital_distribution/option_expiration/option_chain/option_screen）。
 * 路由契约：8 端点进 ``store_access.endpoints()`` 白名单、字段白名单在 handle 层拒绝、
   实时零缓存（不进 CACHE_TTL_MS/ENDPOINT_SHAPE、响应不带 cached 字段、连调两次
   全部触达通道）、错误 envelope 原样透传；
-* 工具面（WP8 任务 3 起 56）：8 工具 ∈ TOOLS、映射端点同名、字段集与 HTTP 白名单
+* 工具面（WP8 任务 6 起 59）：8 工具 ∈ TOOLS、映射端点同名、字段集与 HTTP 白名单
   同形、``confirm_decide`` 仍禁入、描述注明「服务端经富途实时获取；A 股实时受限见
   错误消息」。
 * ``option_expiration`` 的上游实名是 ``quote_option_expiration_date``（2026-09-16 实测
@@ -337,11 +337,11 @@ class RoutingContractTest(unittest.TestCase):
 
 
 class ToolSurfaceTest(unittest.TestCase):
-    """MCP 工具面 56（WP8 任务 3 起）：8 工具进面、字段同形、描述注明实时直通与 A 股受限。"""
+    """MCP 工具面 59（WP8 任务 6 起）：8 工具进面、字段同形、描述注明实时直通与 A 股受限。"""
 
     def test_tool_surface_is_56(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 56)
-        self.assertEqual(len(mcp_tools.TOOLS), 56)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 59)
+        self.assertEqual(len(mcp_tools.TOOLS), 59)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(FUTU_ENDPOINTS), names)
         self.assertNotIn("confirm_decide", names)

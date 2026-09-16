@@ -18,7 +18,7 @@
   filter_expiration_cycles 逗号串 %2C 编码；capital-flow.section 是独立 4 值枚举
   （非 rt-data 的 6 值）；客户端契约（注入传输异常 → TransportError；5xx/429/非 JSON
   → UnexpectedResponse 且读路径落 trading/futu-unavailable，429 的 Retry-After 进 details）；
-* 工具面 50 锁定（WP8 任务 3 起 56）+ 端点清单 46 锁定（任务 3 起 52）。
+* 工具面 50 锁定（WP8 任务 6 起 59）+ 端点清单 46 锁定（任务 6 起 55）。
 
 官方文档记录（2026-09-16 web_fetch 实抓，路径前缀 ``/api/v1.0/quote``）：
   market-snapshot  POST /quote/snapshot            body {code_list 1..400}
@@ -1022,8 +1022,8 @@ class ToolSurfaceTest(unittest.TestCase):
     """工具面 50 锁定（WP8 任务 3 起 56）+ 9 新工具契约。"""
 
     def test_tool_surface_is_56(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 56)
-        self.assertEqual(len(mcp_tools.TOOLS), 56)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 59)
+        self.assertEqual(len(mcp_tools.TOOLS), 59)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(WP8_MARKET_ENDPOINTS), names)
         self.assertNotIn("confirm-decide", names)
@@ -1079,13 +1079,14 @@ class ToolSurfaceTest(unittest.TestCase):
             tool = next(t for t in mcp_tools.TOOLS if t.name == name)
             self.assertIn("实时", tool.description, name)
 
-    def test_endpoint_registry_is_52(self):
+    def test_endpoint_registry_is_55(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 52)
+        self.assertEqual(len(endpoints), 55)
         self.assertEqual(tuple(store_access.WP8_MARKET_ENDPOINTS), WP8_MARKET_ENDPOINTS)
-        # WP8 任务 3 起尾部再追加 6 个 OpenAPI 交易只读端点（行情 9 项落在其前）
-        self.assertEqual(endpoints[-15:-6], list(WP8_MARKET_ENDPOINTS))
-        self.assertEqual(len(set(endpoints)), 52)
+        # WP8 任务 3 起尾部再追加 6 个 OpenAPI 交易只读端点、任务 6 追加 3 个推送端点
+        # （行情 9 项落在它们之前）
+        self.assertEqual(endpoints[-18:-9], list(WP8_MARKET_ENDPOINTS))
+        self.assertEqual(len(set(endpoints)), 55)
 
 
 class RealChannelComparisonTest(unittest.TestCase):

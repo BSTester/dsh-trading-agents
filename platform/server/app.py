@@ -122,11 +122,23 @@ FACTORS_HISTORY_FIELDS = ("limit",)
 # WP7 任务 3：受约束交易工具的载荷白名单（逐工具定义；与 mcp_tools 的 params 同形）。
 # 交易工具的载荷刻意**不含 mode**（模式只认模式文件，杜绝声明模式旁路）也不含口令
 # （live 授权=Web 业务确认卡片，不是对话口令）；client_order_id 是幂等编号（可省）。
-TRADE_PLACE_FIELDS = ("symbol", "side", "qty", "price", "client_order_id")
-TRADE_MODIFY_FIELDS = ("order_id", "symbol", "side", "qty", "price", "client_order_id")
+# WP8 任务 6 扩面：place 增加 order_type/time_in_force/session/aux_price/lot_type/remark/
+# order_class/multi_leg_info（官方 place-order 全字段；price 改为按 order_type 条件必填，
+# 条件必填/枚举/互斥校验在闸门字段校验层——本层只拒白名单外字段）；modify 增加 aux_price。
+TRADE_PLACE_FIELDS = ("symbol", "side", "qty", "order_type", "price", "time_in_force",
+                      "session", "aux_price", "lot_type", "remark", "order_class",
+                      "multi_leg_info", "client_order_id")
+TRADE_MODIFY_FIELDS = ("order_id", "symbol", "side", "qty", "price", "aux_price",
+                       "client_order_id")
 TRADE_CANCEL_FIELDS = ("order_id", "symbol", "client_order_id")
 # 账户查询只受模式约束直通 broker；mode 缺省读模式文件（实时查询，不进缓存）
 ACCOUNT_QUERY_FIELDS = ("mode",)
+# WP8 任务 6：推送订阅管理面的载荷白名单。push_status 空载荷（只读状态，TTL 0）；
+# push_subscribe/push_unsubscribe 只有 4 个订阅通道——**不是交易**：不改模式、不过风控、
+# 不产生订单。通道内的项（字符串/list）与 kline 内键由 futu_push.normalize_items 校验
+# （坏参数 → trading/invalid-operation），推送未启用 → trading/push-unavailable。
+PUSH_STATUS_FIELDS = ()
+PUSH_SUBSCRIBE_FIELDS = ("quote", "order_book", "ticker", "kline")
 # WP8 任务 3：OpenAPI 交易只读端点的载荷白名单（逐端点定义；与 mcp_tools 的工具字段
 # 逐键同形，锁定测试比对）。这些端点是**读类**：只受模式约束（mode 缺省读模式文件），
 # 业务参数（code/market/exchange/page_flag/...）整体下传 trading.TradeGate._read；
@@ -203,7 +215,7 @@ def _check_fields(endpoint, payload, allowed):
 
 
 def create_handler(home, analytics=None, series=None, core=None, command_home=None,
-                   trade=None, futu=None):
+                   trade=None, futu=None, push=None):
     """``rpc.js:64-231 createRpcHandler`` 的 Python 等价物；返回 ``handle(endpoint, payload)``。
 
     - ``analytics``：``{endpoint: callable(payload, force) -> value}``（缺省走 compute 子进程，
@@ -218,6 +230,10 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
       MCP 通道经 ``trading_datasource.futu_mcp.call_tool``；WP8 任务 2 起
       ``futu_channel=openapi`` 时切 OpenAPI REST 后端，通道路由在 futu_data；
       测试注入替身即可离线）。
+    - ``push``（WP8 任务 6）：富途 WS 推送运行时（``futu_push.PushRuntime``；
+      ``create_app`` 把同一个实例同时给 lifespan 与 handler）。缺省 None = 未接线：
+      ``push_status`` 如实报 disabled，``push_subscribe``/``push_unsubscribe`` 返回
+      ``trading/push-unavailable``——绝不假装订阅成功。
     """
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
@@ -372,6 +388,29 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 # 实时直通：不进 caches.cached（TTL 0，与 account_* 同类）。
                 _check_fields(endpoint, payload, OPENAPI_TRADE_FIELDS[endpoint])
                 return getattr(trade, endpoint)(payload)
+            if endpoint == "push_status":
+                # WP8 任务 6：推送状态（读，TTL 0）——与 /healthz 的 push 字段同一实现
+                # （futu_push.safe_status），因此两处不可能给出不同事实。
+                _takes_no_payload(endpoint, payload)
+                return {"ok": True, "value": futu_push.status_view(push)}
+            if endpoint in ("push_subscribe", "push_unsubscribe"):
+                # WP8 任务 6：订阅管理（**非交易**：只改本地连接订阅意图，不改模式、不过
+                # 风控、不产生订单）。推送未启用/未接线 → trading/push-unavailable（如实拒绝）；
+                # 载荷非法（未知通道/非列表/kline 内键）→ trading/invalid-operation。
+                _check_fields(endpoint, payload, PUSH_SUBSCRIBE_FIELDS)
+                action = "subscribe" if endpoint == "push_subscribe" else "unsubscribe"
+                try:
+                    intent = futu_push.apply_subscription(push, action, payload)
+                except futu_push.PushUnavailable as error:
+                    return {"ok": False, "error": {"code": futu_push.PUSH_UNAVAILABLE_CODE,
+                                                   "message": str(error)[:300],
+                                                   "details": {}}}
+                except ValueError as error:
+                    return {"ok": False, "error": {"code": "trading/invalid-operation",
+                                                   "message": str(error)[:300],
+                                                   "details": {}}}
+                return {"ok": True, "value": {"enabled": True, "action": action,
+                                              "intent": intent}}
             if endpoint in futu_data.FUTU_TOOLS:
                 # WP8 富途实时直通：skills 需要而本地无缓存的数据由服务端实时经富途获取。
                 # 浅白名单在这里拒（与其他端点同形），深校验（code 归一/必填/内键/上游
@@ -423,7 +462,8 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     push = push if push is not None else futu_push.PushRuntime(home=home)
     if futu is None:
         futu = futu_data.FutuData(home=home, push=push.quote_cache)
-    handle = create_handler(home, analytics=analytics, series=series, core=core, futu=futu)
+    handle = create_handler(home, analytics=analytics, series=series, core=core, futu=futu,
+                            push=push)
     endpoints = store_access.endpoints()
     if scheduler is None:
         # 延迟导入：注入替身的调用（绝大多数测试）不必承担 trading_core 的导入

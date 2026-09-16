@@ -63,6 +63,8 @@ import os
 import sys
 import tempfile
 import unittest
+import uuid
+from datetime import date
 from pathlib import Path
 from typing import get_args
 from unittest import mock
@@ -1168,24 +1170,25 @@ class HttpRoutingTest(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
-# 五、工具面/端点清单/字段集锁定（56 / 52）
+# 五、工具面/端点清单/字段集锁定（59 / 55，WP8 任务 6 起）
 # ---------------------------------------------------------------------------
 class SurfaceLockTest(unittest.TestCase):
-    def test_tool_surface_is_56(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 56)
-        self.assertEqual(len(mcp_tools.TOOLS), 56)
+    def test_tool_surface_is_59(self):
+        self.assertEqual(mcp_tools.TOOL_COUNT, 59)
+        self.assertEqual(len(mcp_tools.TOOLS), 59)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(trading.OPENAPI_TRADE_ENDPOINTS), names)
         self.assertNotIn("trade_confirm", names, "券商二次确认不得成为模型可调用工具")
         self.assertNotIn("confirm_decide", names)
 
-    def test_endpoint_registry_is_52_with_new_tail(self):
+    def test_endpoint_registry_is_55_with_new_tail(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 52)
-        self.assertEqual(len(set(endpoints)), 52)
+        self.assertEqual(len(endpoints), 55)
+        self.assertEqual(len(set(endpoints)), 55)
         self.assertEqual(list(store_access.WP8_TRADE_ENDPOINTS),
                          list(trading.OPENAPI_TRADE_ENDPOINTS))
-        self.assertEqual(endpoints[-6:], list(trading.OPENAPI_TRADE_ENDPOINTS))
+        self.assertEqual(endpoints[-9:-3], list(trading.OPENAPI_TRADE_ENDPOINTS))
+        self.assertEqual(endpoints[-3:], list(store_access.WP8_PUSH_ENDPOINTS))
 
     def test_tool_fields_match_http_whitelist(self):
         definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
@@ -1216,6 +1219,526 @@ class SurfaceLockTest(unittest.TestCase):
             if tool.name in trading.OPENAPI_TRADE_ENDPOINTS:
                 self.assertIn("openapi", tool.description.lower(), tool.name)
                 self.assertIn("account_", tool.description, tool.name)
+
+
+# ---------------------------------------------------------------------------
+# 六、WP8 任务 6：place-order 官方全字段（闸门字段校验层 + 券商透传）
+# ---------------------------------------------------------------------------
+# 官方依据（2026-09-16 web_fetch 实抓 place-order.md / modify-order.md / naming-dictionary.md）：
+#   order_type 8 值；time_in_force{DAY,GTC}；session 4 值（仅美股，市价单仅支持 RTH）；
+#   aux_price 在 STOP/STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED 时必填（证券 3 位小数）；
+#   lot_type{ODD,ROUND}（仅港股）；remark UTF-8 ≤64 字节；order_class{NORMAL,MLEG}
+#   （MLEG 必带 multi_leg_info）；multi_leg_info 键集见 naming-dictionary#multi-leg-info。
+OMIT = object()
+MULTI_LEG_LEG = {"leg_symbol": "US.AAPL250926C235000", "leg_exchange": "US",
+                 "leg_ratio_qty": "1", "leg_side": "BUY", "leg_security_type": "OPTION"}
+MULTI_LEG = {"option_strategy": "Straddle", "underlying_symbol": "AAPL",
+             "leg_infos": [MULTI_LEG_LEG]}
+
+
+class PlaceFieldBase(unittest.TestCase):
+    """字段校验/透传用例基类：每个用例独立 home（OMS 在途查重按标的+方向）。"""
+
+    def new_gate(self, mode="live", legacy=None, **plan):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        (home / "trading-account-mode").write_text(f"{mode}\n")
+        plan.setdefault("place_order", {"order_id": "O-1"})
+        plan.setdefault("modify_order", {})
+        plan.setdefault("order_confirm", {"order_id": "O-1"})
+        backend = FakeTradeBackend(**plan)
+        broker = trading.OpenApiBroker(trade=backend, legacy=legacy)
+        confirm = FakeConfirm()
+        gate = trading.TradeGate(str(home), broker=broker, confirm=confirm,
+                                 ctx_builder=fixed_ctx())
+        return gate, backend, confirm, home
+
+    def order(self, **over):
+        payload = {"symbol": "US.AAPL", "side": "BUY", "qty": 10, "price": 1.5,
+                   "client_order_id": f"CID-{uuid.uuid4().hex[:10]}"}
+        for key, value in over.items():
+            if value is OMIT:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        return payload
+
+    def seed_close(self, home, symbol="US.AAPL", close=150.0):
+        """把一根当日日线写进本地库：市价类订单的风控基准价（daemon 同款口径）。"""
+        conn = core_store.connect(core_store.db_path(str(home)))
+        try:
+            core_store.upsert_bars(conn, symbol, "1d",
+                                   [{"t": date.today().isoformat(), "o": close,
+                                     "h": close, "l": close, "c": close, "v": 1.0}],
+                                   "test")
+        finally:
+            conn.close()
+        return close
+
+    def assert_field_error(self, out, needle, backend, confirm):
+        self.assertFalse(out["ok"], out)
+        self.assertEqual(out["error"]["code"], "trading/invalid-operation", out)
+        self.assertIn(needle, out["error"]["message"])
+        self.assertEqual(backend.names(), [], "字段校验失败不得触达券商")
+        self.assertEqual(confirm.requests, [], "字段校验失败不得消耗确认")
+
+
+class PlaceOrderTypeTest(PlaceFieldBase):
+    """order_type/time_in_force：8 枚举出站、默认 LIMIT/DAY、非法枚举本地拒。"""
+
+    def test_defaults_are_limit_day_without_extra_keys(self):
+        gate, backend, confirm, _ = self.new_gate()
+        out = gate.place(self.order())
+        self.assertTrue(out["ok"], out)
+        kwargs = backend.calls[-1][1]
+        self.assertEqual((kwargs["order_type"], kwargs["time_in_force"]), ("LIMIT", "DAY"))
+        for name in ("session", "aux_price", "lot_type", "remark", "order_class",
+                     "multi_leg_info"):
+            self.assertNotIn(name, kwargs, "未提供的字段不得凭空出现")
+        self.assertEqual(len(confirm.requests), 1)
+
+    def test_eight_order_types_are_forwarded_key_by_key(self):
+        """8 种 order_type 逐键出站（券商层契约；限价类带 price / 触发类带 aux_price）。"""
+        self.assertEqual(len(trading.PLACE_ORDER_TYPES), 8)
+        for order_type in sorted(trading.PLACE_ORDER_TYPES):
+            with self.subTest(order_type=order_type):
+                backend = FakeTradeBackend(place_order={"order_id": "O-1"})
+                broker = trading.OpenApiBroker(trade=backend)
+                order = {"symbol": "US.AAPL", "side": "BUY", "qty": 10,
+                         "order_type": order_type, "time_in_force": "GTC"}
+                if order_type in trading.PRICE_ORDER_TYPES:
+                    order["price"] = 1.5
+                if order_type in trading.AUX_PRICE_ORDER_TYPES:
+                    order["aux_price"] = 1.25
+                out = broker.place(order, "live")
+                self.assertEqual(out["status"], "submitted")
+                name, kwargs = backend.calls[-1]
+                self.assertEqual(name, "place_order")
+                self.assertEqual(kwargs["order_type"], order_type)
+                self.assertEqual(kwargs["time_in_force"], "GTC")
+                self.assertEqual(kwargs["code"], "US.AAPL")
+                self.assertEqual((kwargs["qty"], kwargs["side"]), (10, "BUY"))
+                self.assertEqual(kwargs.get("price"), order.get("price"))
+                self.assertEqual(kwargs.get("aux_price"), order.get("aux_price"))
+                self.assertEqual(sorted(kwargs), sorted(
+                    {"acc_id", "code", "qty", "side", "order_type", "time_in_force"}
+                    | {k for k in ("price", "aux_price") if k in order}))
+
+    def test_gate_forwards_all_eight_order_types(self):
+        """闸门→券商整链：8 种 order_type 逐项放行（市价类用本地收盘作风险基准）。"""
+        for order_type in sorted(trading.PLACE_ORDER_TYPES):
+            with self.subTest(order_type=order_type):
+                gate, backend, confirm, home = self.new_gate()
+                self.seed_close(home)
+                over = {"order_type": order_type}
+                if order_type in trading.PRICE_ORDER_TYPES:
+                    over["price"] = 1.5
+                else:
+                    over["price"] = OMIT
+                if order_type in trading.AUX_PRICE_ORDER_TYPES:
+                    over["aux_price"] = 1.25
+                if order_type == "MARKET":
+                    over["session"] = "RTH"
+                out = gate.place(self.order(**over))
+                self.assertTrue(out["ok"], out)
+                kwargs = backend.calls[-1][1]
+                self.assertEqual(kwargs["order_type"], order_type)
+                self.assertEqual(kwargs["time_in_force"], "DAY")
+                self.assertEqual(len(confirm.requests), 1)
+
+    def test_market_and_auction_reject_price_by_mutex(self):
+        """官方 price 与市价类互斥：带上 price 的 MARKET/AUCTION 在字段层拒。"""
+        for order_type in ("MARKET", "AUCTION"):
+            with self.subTest(order_type=order_type):
+                gate, backend, confirm, _ = self.new_gate()
+                out = gate.place(self.order(order_type=order_type, price=1.5))
+                self.assertFalse(out["ok"], out)
+                self.assertEqual(out["error"]["code"], "trading/invalid-operation", out)
+                self.assertIn("price", out["error"]["message"])
+                self.assertEqual(backend.names(), [])
+                self.assertEqual(confirm.requests, [])
+
+    def test_market_types_use_local_close_as_risk_basis(self):
+        """市价类没有请求价格：风控基准价取**本地最近收盘**（daemon._execute_plan 同款口径）。
+
+        没有本地日线时 fail-closed（下一条用例）——绝不编造价、绝不用 0 让规则 4/5 失效。
+        """
+        for order_type in ("MARKET", "AUCTION"):
+            with self.subTest(order_type=order_type):
+                gate, backend, confirm, home = self.new_gate()
+                close = self.seed_close(home)
+                out = gate.place(self.order(order_type=order_type, price=OMIT))
+                self.assertTrue(out["ok"], out)
+                kwargs = backend.calls[-1][1]
+                self.assertEqual(kwargs["order_type"], order_type)
+                self.assertNotIn("price", kwargs, "市价单不得凭空带上 price")
+                # 卡片上人能看到风控基准价（本地收盘）——批准的口径明确
+                self.assertEqual(confirm.requests[0]["args"]["risk_price"], close)
+
+    def test_market_types_without_local_close_are_refused(self):
+        for order_type in ("MARKET", "AUCTION"):
+            with self.subTest(order_type=order_type):
+                gate, backend, confirm, home = self.new_gate()
+                out = gate.place(self.order(order_type=order_type, price=OMIT))
+                self.assertFalse(out["ok"], out)
+                self.assertEqual(out["error"]["code"], "trading/invalid-operation", out)
+                self.assertIn("风控", out["error"]["message"])
+                self.assertEqual(backend.names(), [], "无风险基准价不得触达券商")
+                self.assertEqual(confirm.requests, [])
+                conn = core_store.connect(core_store.db_path(str(home)))
+                try:
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 0)
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM risk_checks").fetchone()[0], 0)
+                finally:
+                    conn.close()
+
+    def test_invalid_order_type_and_time_in_force_rejected_with_allowed_values(self):
+        for over, needle in (({"order_type": "NONE"}, "LIMIT"),
+                             ({"order_type": "TWAP"}, "LIMIT"),
+                             ({"time_in_force": "IOC"}, "DAY"),
+                             ({"time_in_force": "gtc"}, "DAY")):
+            with self.subTest(over=over):
+                gate, backend, confirm, _ = self.new_gate()
+                self.assert_field_error(gate.place(self.order(**over)), needle,
+                                        backend, confirm)
+
+
+class PlaceConditionalFieldTest(PlaceFieldBase):
+    """条件必填/互斥/枚举/结构：aux_price、price、session、lot_type、remark、MLEG。"""
+
+    def test_aux_price_required_for_trigger_order_types(self):
+        for order_type in sorted(trading.AUX_PRICE_ORDER_TYPES):
+            with self.subTest(order_type=order_type):
+                gate, backend, confirm, _ = self.new_gate()
+                over = {"order_type": order_type}
+                if order_type not in trading.PRICE_ORDER_TYPES:
+                    over["price"] = OMIT
+                out = gate.place(self.order(**over))
+                self.assertEqual(out["error"]["code"], "trading/invalid-operation", out)
+                self.assertIn("aux_price", out["error"]["message"])
+                self.assertEqual(backend.names(), [])
+
+    def test_aux_price_mutually_exclusive_with_non_trigger_types(self):
+        gate, backend, confirm, _ = self.new_gate()
+        self.assert_field_error(gate.place(self.order(aux_price=1.2)), "aux_price",
+                                backend, confirm)
+
+    def test_aux_price_format_is_official_three_decimals(self):
+        for bad, needle in ((0, ">0"), (-1, ">0"), ("1.2", "数值"), (1.2345, "3 位小数")):
+            with self.subTest(bad=bad):
+                gate, backend, confirm, _ = self.new_gate()
+                out = gate.place(self.order(order_type="STOP_LIMIT", aux_price=bad))
+                self.assert_field_error(out, needle, backend, confirm)
+        # 3 位小数合法（含末尾 0 归一）
+        gate, backend, _, _ = self.new_gate()
+        out = gate.place(self.order(order_type="STOP", price=OMIT, aux_price=1.25))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(backend.calls[-1][1]["aux_price"], 1.25)
+
+    def test_price_mutually_exclusive_with_market_types(self):
+        for order_type in ("MARKET", "AUCTION"):
+            with self.subTest(order_type=order_type):
+                gate, backend, confirm, _ = self.new_gate()
+                out = gate.place(self.order(order_type=order_type, price=1.5))
+                self.assertFalse(out["ok"])
+                self.assertEqual(out["error"]["code"], "trading/invalid-operation")
+                self.assertEqual(backend.names(), [])
+
+    def test_session_enum_us_only_and_market_rth_only(self):
+        for session in sorted(trading.PLACE_SESSIONS):
+            with self.subTest(session=session):
+                gate, backend, _, _ = self.new_gate()
+                out = gate.place(self.order(session=session))
+                self.assertTrue(out["ok"], out)
+                self.assertEqual(backend.calls[-1][1]["session"], session)
+        for bad in ("PRE", "rth", "RTH+Pre"):
+            with self.subTest(bad=bad):
+                gate, backend, confirm, _ = self.new_gate()
+                self.assert_field_error(gate.place(self.order(session=bad)), "RTH",
+                                        backend, confirm)
+        # 仅美股：非美股带 session 一律拒（官方：仅适用于美股）
+        gate, backend, confirm, _ = self.new_gate()
+        out = gate.place(self.order(symbol="HK.00700", session="RTH"))
+        self.assertFalse(out["ok"])
+        self.assertIn("美股", out["error"]["message"])
+        self.assertEqual(backend.names(), [])
+        # 市价单仅支持 RTH：非 RTH 市价单本地拒（官方明示）
+        for session in ("RTH+Pre/Post-Mkt", "OVERNIGHT", "ALL_DAY"):
+            with self.subTest(session=session):
+                gate, backend, confirm, _ = self.new_gate()
+                out = gate.place(self.order(symbol="US.AAPL", order_type="MARKET",
+                                            price=OMIT, session=session))
+                self.assertFalse(out["ok"])
+                self.assertEqual(out["error"]["code"], "trading/invalid-operation")
+                self.assertIn("RTH", out["error"]["message"])
+                self.assertEqual(backend.names(), [])
+        # 正例：市价单 + RTH + 本地收盘基准 → 放行
+        gate, backend, _, home = self.new_gate()
+        self.seed_close(home)
+        out = gate.place(self.order(symbol="US.AAPL", order_type="MARKET",
+                                    price=OMIT, session="RTH"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(backend.calls[-1][1]["session"], "RTH")
+
+    def test_lot_type_is_hk_only(self):
+        gate, backend, _, _ = self.new_gate()
+        out = gate.place(self.order(symbol="HK.00700", lot_type="ODD"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(backend.calls[-1][1]["lot_type"], "ODD")
+        gate, backend, confirm, _ = self.new_gate()
+        out = gate.place(self.order(symbol="US.AAPL", lot_type="ODD"))
+        self.assertFalse(out["ok"])
+        self.assertIn("港股", out["error"]["message"])
+        self.assertEqual(backend.names(), [])
+        gate, backend, confirm, _ = self.new_gate()
+        self.assert_field_error(gate.place(self.order(symbol="HK.00700", lot_type="HALF")),
+                                "ODD", backend, confirm)
+
+    def test_remark_utf8_byte_limit(self):
+        gate, backend, _, _ = self.new_gate()
+        out = gate.place(self.order(remark="x" * 64))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(backend.calls[-1][1]["remark"], "x" * 64)
+        gate, backend, confirm, _ = self.new_gate()
+        self.assert_field_error(gate.place(self.order(remark="x" * 65)), "64",
+                                backend, confirm)
+        # 中文按 UTF-8 字节计：22 字 = 66 字节 → 拒；21 字 = 63 字节 → 通过
+        gate, backend, confirm, _ = self.new_gate()
+        self.assert_field_error(gate.place(self.order(remark="备注" * 11)), "64",
+                                backend, confirm)
+        gate, backend, _, _ = self.new_gate()
+        out = gate.place(self.order(remark="备注" * 10 + "中"))
+        self.assertTrue(out["ok"], out)
+        gate, backend, confirm, _ = self.new_gate()
+        self.assert_field_error(gate.place(self.order(remark=123)), "字符串",
+                                backend, confirm)
+
+    def test_mleg_requires_multi_leg_info_and_forwards_structure(self):
+        gate, backend, confirm, _ = self.new_gate()
+        out = gate.place(self.order(order_class="MLEG"))
+        self.assertFalse(out["ok"])
+        self.assertIn("multi_leg_info", out["error"]["message"])
+        self.assertEqual(backend.names(), [])
+        # 对象形态透传
+        gate, backend, _, _ = self.new_gate()
+        out = gate.place(self.order(order_class="MLEG", multi_leg_info=MULTI_LEG))
+        self.assertTrue(out["ok"], out)
+        kwargs = backend.calls[-1][1]
+        self.assertEqual(kwargs["multi_leg_info"], MULTI_LEG)
+        self.assertEqual(kwargs["order_class"], "MLEG")
+        # 对象列表形态同样接受（官方 Order.multi_leg_info 是 list[MultiLegInfo]）
+        gate, backend, _, _ = self.new_gate()
+        out = gate.place(self.order(order_class="MLEG", multi_leg_info=[MULTI_LEG]))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(backend.calls[-1][1]["multi_leg_info"], [MULTI_LEG])
+
+    def test_multi_leg_info_requires_order_class_mleg(self):
+        gate, backend, confirm, _ = self.new_gate()
+        out = gate.place(self.order(multi_leg_info=MULTI_LEG))
+        self.assertFalse(out["ok"])
+        self.assertIn("MLEG", out["error"]["message"])
+        self.assertEqual(backend.names(), [])
+
+    def test_multi_leg_structure_is_validated_against_naming_dictionary(self):
+        bad_leg = dict(MULTI_LEG_LEG, leg_typo=1)
+        cases = [
+            ("not-an-object", None, "对象"),
+            ([], None, "不能为空"),
+            ({"option_strategy": "Straddle"}, None, "underlying_symbol"),
+            ({"option_strategy": "Nope", "underlying_symbol": "AAPL",
+              "leg_infos": [MULTI_LEG_LEG]}, None, "option_strategy"),
+            ({"option_strategy": "Straddle", "underlying_symbol": "AAPL",
+              "leg_infos": []}, None, "leg_infos"),
+            ({"option_strategy": "Straddle", "underlying_symbol": "AAPL",
+              "leg_infos": [bad_leg]}, None, "leg_typo"),
+            ({"option_strategy": "Straddle", "underlying_symbol": "AAPL",
+              "leg_infos": [dict(MULTI_LEG_LEG, leg_side="HOLD")]}, None, "leg_side"),
+            ({"option_strategy": "Straddle", "underlying_symbol": "AAPL",
+              "leg_infos": [dict(MULTI_LEG_LEG, leg_exchange="XX")]}, None, "leg_exchange"),
+            ({"option_strategy": "Straddle", "underlying_symbol": "AAPL",
+              "leg_infos": [{"leg_symbol": "US.AAPL"}]}, None, "leg_exchange"),
+        ]
+        for value, _unused, needle in cases:
+            with self.subTest(value=value):
+                gate, backend, confirm, _ = self.new_gate()
+                out = gate.place(self.order(order_class="MLEG", multi_leg_info=value))
+                self.assert_field_error(out, needle, backend, confirm)
+
+    def test_confirmation_summary_renders_official_fields(self):
+        """人工批准前必须能在卡片上核对这些参数（触发价/时段/订单类别/多腿）。"""
+        gate, backend, confirm, _ = self.new_gate()
+        out = gate.place(self.order(order_type="STOP_LIMIT", aux_price=1.25,
+                                    session="RTH", time_in_force="GTC", remark="r-1"))
+        self.assertTrue(out["ok"], out)
+        args = confirm.requests[0]["args"]
+        self.assertEqual(args["order_type"], "STOP_LIMIT")
+        self.assertEqual(args["aux_price"], 1.25)
+        self.assertEqual(args["session"], "RTH")
+        self.assertEqual(args["time_in_force"], "GTC")
+        self.assertEqual(args["remark"], "r-1")
+        summary = store_access.describe_order_args("trade_input_order", args)
+        labels = {field["label"]: field["value"] for field in summary["fields"]}
+        for label in ("订单类型", "触发价", "交易时段", "有效期", "备注"):
+            self.assertIn(label, labels, labels)
+        self.assertEqual(labels["触发价"], "1.25")
+
+
+class SimExtendedFieldRefusalTest(PlaceFieldBase):
+    """sim 通道能力边界：扩展字段如实拒绝，绝不静默丢弃（不变式 2）。"""
+
+    def test_extended_fields_are_refused_with_readable_message(self):
+        cases = [
+            {"order_type": "STOP", "price": OMIT, "aux_price": 1.0},
+            {"time_in_force": "GTC"},
+            {"session": "RTH"},
+            {"remark": "note"},
+            {"lot_type": "ODD", "symbol": "HK.00700"},
+            {"order_class": "MLEG", "multi_leg_info": MULTI_LEG},
+        ]
+        for over in cases:
+            with self.subTest(over=sorted(over)):
+                legacy = RecordingLegacy()
+                gate, backend, confirm, home = self.new_gate(mode="sim", legacy=legacy)
+                out = gate.place(self.order(**over))
+                self.assertFalse(out["ok"], out)
+                self.assertEqual(out["error"]["code"], "trading/broker-unavailable", out)
+                self.assertIn("sim 仅支持限价当日单", out["error"]["message"])
+                self.assertEqual(legacy.calls, [], "sim 适配层同样零调用")
+                self.assertEqual(backend.names(), [], "不得触达 OpenAPI 后端")
+                self.assertEqual(confirm.requests, [])
+                conn = core_store.connect(core_store.db_path(str(home)))
+                try:
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM orders").fetchone()[0], 0)
+                    self.assertEqual(
+                        conn.execute("SELECT COUNT(*) FROM risk_checks").fetchone()[0], 0)
+                finally:
+                    conn.close()
+
+    def test_plain_limit_day_still_passes_on_sim(self):
+        legacy = RecordingLegacy()
+        gate, _backend, confirm, _ = self.new_gate(mode="sim", legacy=legacy)
+        out = gate.place(self.order(order_type="LIMIT", time_in_force="DAY",
+                                    order_class="NORMAL"))
+        self.assertTrue(out["ok"], out)
+        self.assertEqual([name for name, _ in legacy.calls], ["place"])
+        self.assertEqual(confirm.requests, [], "sim 不发起业务确认")
+
+
+class ModifyAuxPriceTest(PlaceFieldBase):
+    """trade_modify 补 aux_price（官方 PUT /orders/{id} 的触发价字段）。"""
+
+    def modify(self, gate, **over):
+        payload = {"order_id": "O-9", "symbol": "US.AAPL", "side": "BUY", "qty": 20,
+                   "price": 2.5, "client_order_id": f"CM-{uuid.uuid4().hex[:10]}"}
+        for key, value in over.items():
+            if value is OMIT:
+                payload.pop(key, None)
+            else:
+                payload[key] = value
+        return gate.modify(payload)
+
+    def test_modify_forwards_aux_price_key_by_key(self):
+        gate, backend, confirm, _ = self.new_gate()
+        out = self.modify(gate, aux_price=2.25)
+        self.assertTrue(out["ok"], out)
+        name, kwargs = backend.calls[-1]
+        self.assertEqual(name, "modify_order")
+        self.assertEqual(kwargs, {"acc_id": "LIVE-1", "order_id": "O-9", "exchange": "US",
+                                  "qty": 20, "price": 2.5, "aux_price": 2.25})
+        self.assertEqual(confirm.requests[0]["args"]["aux_price"], 2.25)
+
+    def test_modify_without_aux_price_keeps_previous_outbound_keys(self):
+        gate, backend, _, _ = self.new_gate()
+        out = self.modify(gate)
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(backend.calls[-1][1], {"acc_id": "LIVE-1", "order_id": "O-9",
+                                                "exchange": "US", "qty": 20, "price": 2.5})
+
+    def test_modify_aux_price_format_rejected(self):
+        for bad, needle in ((0, ">0"), (2.3456, "3 位小数"), ("2.2", "数值")):
+            with self.subTest(bad=bad):
+                gate, backend, confirm, _ = self.new_gate()
+                self.assert_field_error(self.modify(gate, aux_price=bad), needle,
+                                        backend, confirm)
+
+    def test_sim_modify_refuses_aux_price(self):
+        legacy = RecordingLegacy()
+        gate, backend, confirm, _ = self.new_gate(mode="sim", legacy=legacy)
+        out = self.modify(gate, aux_price=2.25)
+        self.assertFalse(out["ok"], out)
+        self.assertEqual(out["error"]["code"], "trading/broker-unavailable")
+        self.assertIn("sim 仅支持限价当日单", out["error"]["message"])
+        self.assertEqual(legacy.calls, [])
+        self.assertEqual(backend.names(), [])
+
+
+class Wp8Task6SurfaceLockTest(unittest.TestCase):
+    """WP8 任务 6 锁定：闸门取值域 ≡ OpenApiTrade 常量；字段表三处同形；59 工具/55 端点。"""
+
+    def test_gate_enum_domains_match_openapi_constants(self):
+        self.assertEqual(set(trading.PLACE_ORDER_TYPES), set(OpenApiTrade.ORDER_TYPES))
+        self.assertEqual(set(trading.PLACE_TIME_IN_FORCE), set(OpenApiTrade.TIME_IN_FORCE))
+        self.assertEqual(set(trading.PLACE_SESSIONS), set(OpenApiTrade.SESSIONS))
+        self.assertEqual(set(trading.AUX_PRICE_ORDER_TYPES),
+                         set(OpenApiTrade.AUX_PRICE_ORDER_TYPES))
+        self.assertEqual(set(trading.PLACE_LOT_TYPES), set(OpenApiTrade.LOT_TYPES))
+        self.assertEqual(set(trading.PLACE_ORDER_CLASSES), set(OpenApiTrade.ORDER_CLASSES))
+        self.assertEqual(tuple(trading.MULTI_LEG_KEYS), tuple(OpenApiTrade.MULTI_LEG_KEYS))
+        self.assertEqual(tuple(trading.MULTI_LEG_REQUIRED),
+                         tuple(OpenApiTrade.MULTI_LEG_REQUIRED))
+        self.assertEqual(tuple(trading.LEG_KEYS), tuple(OpenApiTrade.LEG_KEYS))
+        self.assertEqual(tuple(trading.LEG_REQUIRED), tuple(OpenApiTrade.LEG_REQUIRED))
+        self.assertEqual(set(trading.MULTI_LEG_STRATEGIES),
+                         set(OpenApiTrade.OPTION_STRATEGIES))
+        self.assertEqual(set(trading.LEG_EXCHANGES), set(OpenApiTrade.EXCHANGES))
+        self.assertEqual(set(trading.LEG_SIDES), set(OpenApiTrade.SIDES))
+        self.assertEqual(set(trading.LEG_SECURITY_TYPES), set(OpenApiTrade.SECURITY_TYPES))
+        self.assertEqual(trading.REMARK_MAX_BYTES, OpenApiTrade.REMARK_MAX_BYTES)
+        self.assertEqual(trading.AUX_PRICE_MAX_DECIMALS, 3)
+        # 价格基准类型划分必须与官方条件必填规则自洽
+        self.assertEqual(set(trading.PRICE_ORDER_TYPES) | set(trading.MARKET_ORDER_TYPES),
+                         set(trading.PLACE_ORDER_TYPES))
+        self.assertFalse(set(trading.PRICE_ORDER_TYPES) & set(trading.MARKET_ORDER_TYPES))
+
+    def test_published_extended_enums_match_openapi_constants(self):
+        """工具 schema 的 4 个新枚举域 ≡ OpenApiTrade 常量（防工具面与客户端漂移）。"""
+        self.assertEqual(set(get_args(mcp_tools._TYPES["time_in_force"])),
+                         set(OpenApiTrade.TIME_IN_FORCE))
+        self.assertEqual(set(get_args(mcp_tools._TYPES["session"])),
+                         set(OpenApiTrade.SESSIONS))
+        self.assertEqual(set(get_args(mcp_tools._TYPES["lot_type"])),
+                         set(OpenApiTrade.LOT_TYPES))
+        self.assertEqual(set(get_args(mcp_tools._TYPES["order_class"])),
+                         set(OpenApiTrade.ORDER_CLASSES))
+
+    def test_tool_field_tables_match_http_whitelists(self):
+        definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
+        self.assertEqual(tuple(definitions["trade_place"].fields),
+                         tuple(app_module.TRADE_PLACE_FIELDS))
+        self.assertEqual(tuple(definitions["trade_modify"].fields),
+                         tuple(app_module.TRADE_MODIFY_FIELDS))
+        self.assertEqual(tuple(definitions["trade_cancel"].fields),
+                         tuple(app_module.TRADE_CANCEL_FIELDS))
+
+    def test_push_admin_surface_is_registered_everywhere(self):
+        definitions = {tool.name: tool for tool in mcp_tools.TOOLS}
+        self.assertEqual(list(store_access.WP8_PUSH_ENDPOINTS),
+                         ["push_status", "push_subscribe", "push_unsubscribe"])
+        self.assertEqual(store_access.endpoints()[-3:],
+                         list(store_access.WP8_PUSH_ENDPOINTS))
+        names = {tool.name for tool in mcp_tools.TOOLS}
+        for endpoint in store_access.WP8_PUSH_ENDPOINTS:
+            self.assertIn(endpoint, names)
+            self.assertEqual(mcp_tools.ENDPOINT_TOOL_ENDPOINTS[endpoint], endpoint)
+        self.assertEqual(tuple(app_module.PUSH_SUBSCRIBE_FIELDS),
+                         tuple(definitions["push_subscribe"].fields))
+        self.assertEqual(tuple(app_module.PUSH_SUBSCRIBE_FIELDS),
+                         tuple(definitions["push_unsubscribe"].fields))
+        self.assertEqual(definitions["push_status"].fields, ())
 
 
 if __name__ == "__main__":

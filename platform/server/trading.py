@@ -32,15 +32,19 @@
 #     orders_detail/deals_today/deals_history）：mode 约束 + REST 直通，**不进缓存**。
 #
 # 错误码族（与既有 trading/* 一致）：
-#   trading/order-rejected     参数/模式/风控/确认/OMS 查重等「拒单」类失败
-#   trading/broker-unavailable 券商通道异常（适配器/网络/未接入）
-#   trading/invalid-operation  载荷白名单（app.py 路由层）与查询模式非法
+#   trading/order-rejected     风控/确认/OMS 查重等「拒单」类失败
+#   trading/broker-unavailable 券商通道异常（适配器/网络/未接入）、live 写未接入、sim 通道
+#                              不支持的字段（如实拒绝，不静默丢弃）
+#   trading/invalid-operation  载荷白名单（app.py 路由层）与**字段校验层**（类型/枚举/
+#                              条件必填/互斥/结构，WP8 任务 6 起）与查询模式非法
 # 所有失败一律 {ok:false, error:{code, message≤300, details:{}}}，绝不抛到 500。
+import json
 import re
 import sys
 import threading
 import uuid
 from datetime import date, datetime, timedelta, timezone
+from decimal import Decimal
 from pathlib import Path
 
 try:
@@ -144,6 +148,172 @@ OPENAPI_TRADE_ENDPOINTS = ("trade_max_qty", "orders_open", "orders_history",
 OPENAPI_ONLY_HINT = ("该查询属于 OpenAPI 交易链（trading-platform.json 的 "
                      "futu_channel=openapi 且已配置凭据）" + OPENAPI_AUTH_HINT
                      + "；mcp 通道下可用 account_orders/account_positions/account_funds")
+
+# ---------------------------------------------------------------------------
+# WP8 任务 6：place-order 官方全字段（闸门字段校验层的唯一取值域）
+# ---------------------------------------------------------------------------
+# 官方依据（2026-09-16 web_fetch 实抓 place-order.md / modify-order.md / naming-dictionary.md）：
+#   order_type / time_in_force / session（仅美股，市价单仅 RTH）/ aux_price（触发类必填，
+#   证券 3 位小数）/ lot_type（仅港股）/ remark（UTF-8 ≤64 字节）/ order_class（MLEG 必带
+#   multi_leg_info）/ multi_leg_info（键集照 naming-dictionary#multi-leg-info）。
+# 取值域在**本文件**声明（闸门不在默认部署下拉起 datasource 模块），与
+# ``trading_datasource.futu_openapi.OpenApiTrade`` 的同名常量由锁定测试逐项比对，防两侧漂移。
+# 校验发生在**风控/确认之前**：坏参数零券商往返、零确认消耗、零 OMS 落行。
+PLACE_ORDER_TYPES = ("LIMIT", "MARKET", "AUCTION", "AUCTION_LIMIT", "STOP",
+                     "STOP_LIMIT", "MARKET_IF_TOUCHED", "LIMIT_IF_TOUCHED")
+PLACE_TIME_IN_FORCE = ("DAY", "GTC")
+PLACE_SESSIONS = ("RTH", "RTH+Pre/Post-Mkt", "OVERNIGHT", "ALL_DAY")
+# 触发类：官方明示 aux_price 必填（place-order / modify-order 两页同规则）。
+AUX_PRICE_ORDER_TYPES = ("STOP", "STOP_LIMIT", "MARKET_IF_TOUCHED", "LIMIT_IF_TOUCHED")
+# 限价类需要 price（官方 price 为选填，但限价类没有价格就不是限价单）；市价类带 price 属
+# 含义不明 → 互斥拒绝（不替调用方猜）。
+PRICE_ORDER_TYPES = ("LIMIT", "AUCTION_LIMIT", "STOP_LIMIT", "LIMIT_IF_TOUCHED")
+MARKET_ORDER_TYPES = ("MARKET", "AUCTION", "STOP", "MARKET_IF_TOUCHED")
+PLACE_LOT_TYPES = ("ODD", "ROUND")
+PLACE_ORDER_CLASSES = ("NORMAL", "MLEG")
+# naming-dictionary#multi-leg-info / #order-leg-info 的键集与必填。
+MULTI_LEG_KEYS = ("option_strategy", "underlying_symbol", "underlying_stock_name",
+                  "leg_infos")
+MULTI_LEG_REQUIRED = ("option_strategy", "underlying_symbol", "leg_infos")
+MULTI_LEG_STRATEGIES = ("Covered", "VerticalSpread", "Straddle", "Strangle", "Collar",
+                        "Butterfly", "Condor", "IronButterfly", "IronCondor",
+                        "CalenderSpread", "DiagonalSpread", "Customize")
+LEG_KEYS = ("leg_symbol", "leg_exchange", "leg_ratio_qty", "leg_side",
+            "leg_security_type", "leg_stock_name", "leg_hp_multiplier",
+            "leg_avg_fill_price")
+LEG_REQUIRED = ("leg_symbol", "leg_exchange", "leg_ratio_qty", "leg_side",
+                "leg_security_type")
+LEG_EXCHANGES = ("US", "SEHK", "SGX", "SSE", "SZSE", "JP", "CA", "CME", "CBOT",
+                 "NYMEX", "COMEX", "CBOE", "HKFE", "KR")
+LEG_SIDES = ("BUY", "SELL", "SELL_SHORT", "BUY_BACK")
+LEG_SECURITY_TYPES = ("STOCK", "OPTION", "FUTURES", "MULTILEG_OPTION")
+# 官方 place-order：remark UTF-8 编码后最大长度 64 字节。
+REMARK_MAX_BYTES = 64
+# 证券账户的触发价小数位（官方 place-order/modify-order：aux_price 精确到 3 位小数；
+# 期货 9 位不在本期 symbol 前缀覆盖内）。超出即本地拒绝，**不四舍五入**——静默改价
+# 等于替调用方决定成交条件（拒绝比篡改安全）。
+AUX_PRICE_MAX_DECIMALS = 3
+
+# 市价类里**请求体没有价格**的两类（MARKET/AUCTION）：官方 price 选填且与它们互斥，
+# aux_price 也不适用。闸门的风控规则 4/5 需要 `qty × price` —— 基准价取**本地日线最近
+# 收盘**（daemon._execute_plan 的 price_of 同款兜底口径，真事实而非编造）；本地取不到就
+# fail-closed 拒绝：用 0 兜底会让两条规则静默失效（fail-open），编造价等于伪造风险事实。
+NO_PRICE_ORDER_TYPES = ("MARKET", "AUCTION")
+NO_PRICE_BASIS_REFUSAL = (
+    "参数非法：市价类订单（{order_type}）没有价格/触发价，且本地没有 {symbol} 的日线数据"
+    "可供风控基准（规则 4/5 需要 qty×price；用 0 兜底会让风控静默失效）——请先同步行情"
+    "数据，或改用 LIMIT/AUCTION_LIMIT/STOP_LIMIT/LIMIT_IF_TOUCHED（带 price）或 "
+    "STOP/MARKET_IF_TOUCHED（带 aux_price）")
+
+# sim 通道能力边界（WP3 锁定的 sim_trade_place_order：core_broker.place 的 order_type=1
+# 限价 + price）。显式给出的官方默认值（LIMIT/DAY/NORMAL）仍可用；其余字段一律如实拒绝，
+# **绝不静默丢弃**（不变式 2）。gate 与适配层共用同一条文案。
+SIM_LIMIT_ONLY_FIELDS = ("session", "aux_price", "lot_type", "remark", "multi_leg_info")
+SIM_LIMIT_REFUSAL = ("sim 仅支持限价当日单（order_type=LIMIT / time_in_force=DAY / "
+                     "order_class=NORMAL，不支持 session/aux_price/lot_type/remark/"
+                     "multi_leg_info）；这些字段不会被静默丢弃——请改用 live 通道"
+                     "（futu_channel=openapi 且已配置 OpenAPI 凭据）")
+
+
+def _sim_unsupported(clean):
+    """sim 通道不支持的字段名（空列表 = 限价当日单，sim 可原样执行）。"""
+    unsupported = []
+    if clean.get("order_type", "LIMIT") != "LIMIT":
+        unsupported.append("order_type")
+    if clean.get("time_in_force", "DAY") != "DAY":
+        unsupported.append("time_in_force")
+    if clean.get("order_class", "NORMAL") != "NORMAL":
+        unsupported.append("order_class")
+    unsupported += [name for name in SIM_LIMIT_ONLY_FIELDS if name in clean]
+    return unsupported
+
+
+def _risk_price(clean):
+    """请求体里的风险基准价：限价类用 price；触发类（无 price）用 aux_price。"""
+    price = clean.get("price")
+    return clean.get("aux_price") if price is None else price
+
+
+def _local_close(conn, symbol, today):
+    """本地日线最近收盘价（PIT：``ts <= today``）；没有数据返回 None。
+
+    口径与 ``daemon._last_close`` 逐字一致——市价类订单的风险基准价从这里取，属于**已同步
+    的真事实**，而不是闸门凭空编造的价格。
+    """
+    try:
+        bars = core_store.read_bars(conn, symbol, "1d", today, limit=1)
+    except Exception:  # noqa: BLE001 —— 日历/库表缺失 → 视为「本地无基准」（fail-closed）
+        return None
+    if not bars:
+        return None
+    close = bars[-1].get("c")
+    if isinstance(close, bool) or not isinstance(close, (int, float)) or not (close > 0):
+        return None
+    return float(close)
+
+
+def _too_many_decimals(value, places):
+    """数值的小数位是否超过 ``places``（用 Decimal(str(v))，不受二进制浮点影响）。"""
+    exponent = Decimal(str(value)).normalize().as_tuple().exponent
+    return isinstance(exponent, int) and exponent < 0 and -exponent > places
+
+
+def _enum(value, allowed, name):
+    """枚举取值域校验（错误消息带官方允许值，便于模型自我纠正）。"""
+    if value not in allowed:
+        return f"参数非法：{name} 只接受 {'/'.join(allowed)}，收到 {value!r}"
+    return None
+
+
+def _check_number(value, name, positive=True):
+    """数值校验（bool 不算数值）；positive=True 时要求 > 0。"""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return f"参数非法：{name} 必须是数值，收到 {value!r}"
+    if positive and not (value > 0):
+        return f"参数非法：{name} 必须是 >0 的数值，收到 {value!r}"
+    return None
+
+
+def _multi_leg_error(value):
+    """multi_leg_info 的结构校验（对象或对象列表；键集/必填/枚举照官方命名词典）。"""
+    if value is None or not isinstance(value, (dict, list)):
+        return "参数非法：multi_leg_info 必须是对象或对象列表"
+    items = value if isinstance(value, list) else [value]
+    if not items:
+        return "参数非法：multi_leg_info 不能为空"
+    for item in items:
+        if not isinstance(item, dict):
+            return "参数非法：multi_leg_info 必须是对象或对象列表"
+        unknown = sorted(set(item) - set(MULTI_LEG_KEYS))
+        if unknown:
+            return f"参数非法：multi_leg_info 含未支持字段 {unknown}"
+        for field in MULTI_LEG_REQUIRED:
+            if item.get(field) in (None, ""):
+                return f"参数非法：multi_leg_info.{field} 必填"
+        message = _enum(item["option_strategy"], MULTI_LEG_STRATEGIES,
+                        "multi_leg_info.option_strategy")
+        if message:
+            return message
+        legs = item["leg_infos"]
+        if not isinstance(legs, list) or not legs:
+            return "参数非法：multi_leg_info.leg_infos 必须是至少一条腿的列表"
+        for leg in legs:
+            if not isinstance(leg, dict):
+                return "参数非法：multi_leg_info.leg_infos 元素必须是对象"
+            unknown = sorted(set(leg) - set(LEG_KEYS))
+            if unknown:
+                return f"参数非法：multi_leg_info.leg_infos 含未支持字段 {unknown}"
+            for field in LEG_REQUIRED:
+                if leg.get(field) in (None, ""):
+                    return f"参数非法：multi_leg_info.leg_infos.{field} 必填"
+            for field, allowed in (("leg_exchange", LEG_EXCHANGES),
+                                   ("leg_side", LEG_SIDES),
+                                   ("leg_security_type", LEG_SECURITY_TYPES)):
+                message = _enum(leg[field], allowed,
+                                f"multi_leg_info.leg_infos.{field}")
+                if message:
+                    return message
+    return None
 
 
 class BrokerUnavailable(RuntimeError):
@@ -264,17 +434,31 @@ def default_ctx_builder(conn, mode, order, operation, home, today):
 
 
 def validate_order(payload, operation):
-    """载荷字段校验（类型与范围）。返回 (clean, error_message)；error_message 为 None 表示合法。
+    """载荷字段校验（类型/范围/枚举/条件必填/互斥）。返回 (clean, error_message)。
 
-    clean 只保留闸门与适配层需要的键：symbol/side/qty/price/order_id/client_order_id。
-    撤单不需要 side/qty/price（撤的是已提交订单，不新增敞口），只认 order_id + symbol。
+    clean 只保留闸门与适配层需要的键：symbol/side/qty/price/order_id/client_order_id
+    （WP8 任务 6 起另含官方 place 扩展字段，见下）。撤单不需要 side/qty/price
+    （撤的是已提交订单，不新增敞口），只认 order_id + symbol。
+
+    WP8 任务 6 的官方字段校验（逐条对照 place-order.md / naming-dictionary.md）：
+      * order_type 8 枚举（默认 LIMIT）、time_in_force{DAY,GTC}（默认 DAY）；
+      * session 4 枚举（仅美股；市价单仅支持 RTH）；
+      * price 限价类必填、市价类互斥；
+      * aux_price 触发类必填、非触发类互斥、证券 3 位小数；
+      * lot_type{ODD,ROUND} 仅港股；remark UTF-8 ≤64 字节；
+      * order_class{NORMAL,MLEG}：MLEG 必带 multi_leg_info，反之亦然；
+      * multi_leg_info 结构照 naming-dictionary#multi-leg-info。
+    全部错误在**风控/确认之前**返回（调用方信封成 trading/invalid-operation），
+    消息带官方允许值/字段名，坏参数零券商往返。
     """
     if not isinstance(payload, dict):
         return None, "订单参数必须是对象"
     clean = {}
     required = ["symbol"]
     if operation in ("place", "modify"):
-        required += ["side", "qty", "price"]
+        required += ["side", "qty"]
+    if operation == "modify":
+        required += ["price"]  # 官方改单 price 必填（place 的 price 按 order_type 条件必填）
     if operation in ("modify", "cancel"):
         required += ["order_id"]
     for field in required:
@@ -298,15 +482,38 @@ def validate_order(payload, operation):
                 not float(qty).is_integer() or int(qty) < 1:
             return None, f"参数非法：qty 必须是 >=1 的整数，收到 {qty!r}"
         clean["qty"] = int(qty)
-        price = payload["price"]
-        if isinstance(price, bool) or not isinstance(price, (int, float)) or not (price > 0):
-            return None, f"参数非法：price 必须是 >0 的数值，收到 {price!r}"
-        clean["price"] = float(price)
     if "order_id" in required:
         order_id = payload["order_id"]
         if not isinstance(order_id, str) or not order_id.strip():
             return None, "参数非法：order_id 必须是非空字符串"
         clean["order_id"] = order_id.strip()
+
+    if operation == "place":
+        message = _validate_place_extras(payload, clean)
+        if message is not None:
+            return None, message
+    elif operation == "modify":
+        # 官方改单 price 必填（请求体里没有 order_type：订单类型由券商侧已有订单决定，
+        # 故这里只额外透传触发价 aux_price，不引入类型语义）。
+        message = _check_number(payload["price"], "price")
+        if message is not None:
+            return None, message
+        clean["price"] = float(payload["price"])
+        if payload.get("aux_price") is not None:
+            message = _check_number(payload["aux_price"], "aux_price")
+            if message is None and _too_many_decimals(payload["aux_price"],
+                                                      AUX_PRICE_MAX_DECIMALS):
+                message = (f"参数非法：aux_price 按官方证券账户精确到 "
+                           f"{AUX_PRICE_MAX_DECIMALS} 位小数，收到 {payload['aux_price']!r}")
+            if message is not None:
+                return None, message
+            clean["aux_price"] = float(payload["aux_price"])
+    elif "price" in payload and payload["price"] is not None:
+        # 撤单带 price 无意义（载荷白名单已挡在 HTTP/MCP 层；直调闸门时如实拒绝）
+        message = _check_number(payload["price"], "price")
+        if message is not None:
+            return None, message
+
     cid = payload.get("client_order_id")
     if cid is not None:
         if not isinstance(cid, str) or not cid.strip():
@@ -315,40 +522,175 @@ def validate_order(payload, operation):
     return clean, None
 
 
+def _validate_place_extras(payload, clean):
+    """place 的官方扩展字段校验；返回错误消息或 None（就地写入 clean）。
+
+    只有调用方**显式给出**的扩展字段才写进 clean（进而透传给券商）——缺省值不改写适配层
+    的默认口径（LIMIT/DAY 由 OpenApiBroker 在出站时补），因此既有的 WP7 券商入参逐键不变。
+    """
+    order_type = payload.get("order_type")
+    if order_type is None:
+        order_type = "LIMIT"
+    message = _enum(order_type, PLACE_ORDER_TYPES, "order_type")
+    if message is not None:
+        return message
+    if "order_type" in payload:
+        clean["order_type"] = order_type
+
+    time_in_force = payload.get("time_in_force")
+    if time_in_force is None:
+        time_in_force = "DAY"
+    message = _enum(time_in_force, PLACE_TIME_IN_FORCE, "time_in_force")
+    if message is not None:
+        return message
+    if "time_in_force" in payload:
+        clean["time_in_force"] = time_in_force
+
+    # price：限价类必填、市价类互斥；无条件先校验它给出的值本身合法。
+    price = payload.get("price")
+    if price is not None:
+        message = _check_number(price, "price")
+        if message is not None:
+            return message
+        if order_type in MARKET_ORDER_TYPES:
+            return (f"参数非法：order_type={order_type} 是市价类订单，不带 price"
+                    f"（官方 price 选填且市价类无价格语义）")
+        clean["price"] = float(price)
+    elif order_type in PRICE_ORDER_TYPES:
+        return (f"参数非法：order_type={order_type} 需要 price（限价类订单必填；"
+                f"允许的价格基准见 PRICE_ORDER_TYPES={PRICE_ORDER_TYPES}）")
+
+    # aux_price：触发类必填、非触发类互斥、证券 3 位小数。
+    aux_price = payload.get("aux_price")
+    if aux_price is not None:
+        message = _check_number(aux_price, "aux_price")
+        if message is not None:
+            return message
+        if order_type not in AUX_PRICE_ORDER_TYPES:
+            return (f"参数非法：aux_price 只用于触发类订单 "
+                    f"{'/'.join(AUX_PRICE_ORDER_TYPES)}，收到 order_type={order_type}")
+        if _too_many_decimals(aux_price, AUX_PRICE_MAX_DECIMALS):
+            return (f"参数非法：aux_price 按官方证券账户精确到 "
+                    f"{AUX_PRICE_MAX_DECIMALS} 位小数，收到 {aux_price!r}")
+        clean["aux_price"] = float(aux_price)
+    elif order_type in AUX_PRICE_ORDER_TYPES:
+        return (f"参数非法：order_type={order_type} 时 aux_price 必填"
+                f"（官方触发价规则；证券 3 位小数）")
+
+    # 注意 MARKET/AUCTION（NO_PRICE_ORDER_TYPES）：字段层放行（price 互斥已在上方校验），
+    # 风险基准价由闸门用**本地日线最近收盘**补齐（TradeGate._risk_basis）；取不到即 fail-closed。
+
+    session = payload.get("session")
+    if session is not None:
+        message = _enum(session, PLACE_SESSIONS, "session")
+        if message is not None:
+            return message
+        if clean["symbol"].split(".", 1)[0] != "US":
+            return (f"参数非法：session 仅适用于美股（{clean['symbol']} 不是美股）；"
+                    f"允许值 {'/'.join(PLACE_SESSIONS)}")
+        if order_type == "MARKET" and session != "RTH":
+            return (f"参数非法：市价单仅支持 session=RTH（官方原文），收到 {session!r}；"
+                    f"允许值 {'/'.join(PLACE_SESSIONS)}")
+        clean["session"] = session
+
+    lot_type = payload.get("lot_type")
+    if lot_type is not None:
+        message = _enum(lot_type, PLACE_LOT_TYPES, "lot_type")
+        if message is not None:
+            return message
+        if clean["symbol"].split(".", 1)[0] != "HK":
+            return (f"参数非法：lot_type 仅适用于港股（{clean['symbol']} 不是港股）；"
+                    f"允许值 {'/'.join(PLACE_LOT_TYPES)}")
+        clean["lot_type"] = lot_type
+
+    remark = payload.get("remark")
+    if remark is not None:
+        if not isinstance(remark, str):
+            return f"参数非法：remark 必须是字符串，收到 {remark!r}"
+        if len(remark.encode("utf-8")) > REMARK_MAX_BYTES:
+            return (f"参数非法：remark 的 UTF-8 长度不得超过 {REMARK_MAX_BYTES} 字节"
+                    f"（官方 place-order），收到 {len(remark.encode('utf-8'))} 字节")
+        clean["remark"] = remark
+
+    order_class = payload.get("order_class")
+    if order_class is not None:
+        message = _enum(order_class, PLACE_ORDER_CLASSES, "order_class")
+        if message is not None:
+            return message
+        clean["order_class"] = order_class
+
+    multi_leg_info = payload.get("multi_leg_info")
+    if multi_leg_info is not None:
+        if order_class != "MLEG":
+            return ("参数非法：multi_leg_info 需要与 order_class=MLEG 同时给出"
+                    "（官方：多腿订单需指定为 MLEG）")
+        message = _multi_leg_error(multi_leg_info)
+        if message is not None:
+            return message
+        clean["multi_leg_info"] = multi_leg_info
+    elif order_class == "MLEG":
+        return ("参数非法：order_class=MLEG 时 multi_leg_info 必填"
+                "（官方多腿订单规则；结构见 naming-dictionary#multi-leg-info）")
+    return None
+
+
 def _side_code(side):
     """方向 → 券商代码（broker.py place 的同一线：1=BUY 2=SELL）。"""
     return 1 if side == "BUY" else 2
 
 
-def _summary_args(operation, clean):
+def _summary_args(operation, clean, risk_price=None):
     """确认摘要的入参：键名走券商参数表（store_access.describe_order_args 的渲染口径），
-    让确认卡片显示 账户/市场/标的/方向/数量/价格。acc_id 在批准后由适配层解析
-    （确认前 broker 保持零调用），摘要里如实不含账户。撤单无方向可列（不新增敞口）。"""
+    让确认卡片显示 账户/市场/标的/方向/数量/价格（WP8 任务 6 起含订单类型/触发价/时段/
+    手数类型/订单类别/多腿信息——人批准的就是这些参数）。acc_id 在批准后由适配层解析
+    （确认前 broker 保持零调用），摘要里如实不含账户。撤单无方向可列（不新增敞口）。
+    市价类没有下单价：把闸门实际使用的**风控基准价**如实列进卡片（本地最近收盘），
+    让人知道自己批准的是什么口径。"""
     args = {"market": str(PREFIX_MARKET_ID[clean["symbol"].split(".", 1)[0]]),
             "symbol": clean["symbol"]}
     if "side" in clean:
         args["order_side"] = _side_code(clean["side"])
     if operation in ("place", "modify"):
-        args.update({"qty": clean["qty"], "price": clean["price"],
-                     "order_type": 1})  # 限价单（broker.place 默认口径）
+        args["qty"] = clean["qty"]
+        if "price" in clean:
+            args["price"] = clean["price"]
+        elif "aux_price" not in clean:
+            # 市价类（MARKET/AUCTION）既无下单价也无触发价：把闸门实际使用的风控基准价
+            # （本地最近收盘）如实列进卡片，让人知道自己批准的是什么口径。
+            args["risk_price"] = risk_price
+        # 订单类型：显式给的是官方枚举字符串；缺省沿用券商代码 1=限价（WP7 口径不变）。
+        args["order_type"] = clean.get("order_type", 1)
+        for name in ("time_in_force", "session", "aux_price", "lot_type", "remark",
+                     "order_class"):
+            if name in clean:
+                args[name] = clean[name]
+        if "multi_leg_info" in clean:
+            # 对象原样交给卡片渲染会退化成 "[object Object]"（_js.template 的同 JS 语义），
+            # 这里先序列化成可读 JSON——人要在卡片上核对每一条腿。
+            args["multi_leg_info"] = json.dumps(clean["multi_leg_info"],
+                                                ensure_ascii=False, separators=(",", ":"))
     if operation in ("modify", "cancel"):
         args["order_id"] = clean["order_id"]
     return args
 
 
-def _check_order(operation, clean, mode):
+def _check_order(operation, clean, mode, risk_price=None):
     """送进 pre_trade_checks 的订单：改单按**新参数**全额过闸（改单经济上=撤旧+下新，
     见 FutuBroker.modify 与 TOOL-LIMITS「一律撤单+重下」）；撤单不新增敞口，
     以 qty=0/price=0 过闸（规则 4-7 自然中性，真正约束是 1/2/3——披露于 default_ctx_builder）。
     stop_dist 恒 None：风险额按全额名义计（daemon stop_dist_of 的保守口径）。
-    risk.pre_trade_checks 不读 side（8 规则均不用），撤单缺方向无影响。"""
+    risk.pre_trade_checks 不读 side（8 规则均不用），撤单缺方向无影响。
+    WP8 任务 6：``risk_price`` 是闸门解析出的风险基准价（price / aux_price / 市价类的本地
+    最近收盘，见 TradeGate._risk_price）——规则 4/5 的 `qty × price` 因此恒有真值。"""
     order = {"symbol": clean["symbol"], "mode": mode, "stop_dist": None}
     if "side" in clean:
         order["side"] = clean["side"]
     if operation == "cancel":
         order.update({"qty": 0, "price": 0.0})
     else:
-        order.update({"qty": clean["qty"], "price": clean["price"]})
+        basis = _risk_price(clean)
+        order.update({"qty": clean["qty"],
+                      "price": float(basis if basis is not None else risk_price)})
     return order
 
 
@@ -403,9 +745,19 @@ class FutuBroker:
         if mode == "live":
             raise BrokerUnavailable(LIVE_WRITE_REFUSAL)
 
+    def _sim_options_guard(self, order):
+        """sim 通道的字段能力边界（WP8 任务 6）：sim_trade_place_order/modify 只支持限价
+        当日单，扩展字段在这里**如实拒绝**（抛 BrokerUnavailable → 闸门信封
+        trading/broker-unavailable），绝不静默丢弃。闸门字段层已先置拒绝；本守卫是适配层的
+        第二道（防绕道直调适配器）。"""
+        unsupported = _sim_unsupported(order)
+        if unsupported:
+            raise BrokerUnavailable(f"{SIM_LIMIT_REFUSAL}（不支持的字段：{unsupported}）")
+
     # ---- 写路径 ----
     def place(self, order, mode):
         self._live_guard(mode)
+        self._sim_options_guard(order)
         call = self._tool()
         account = self._sim_account(call, order["symbol"])
         # market 传账户的 market_id（数字口径，与 sim_trade_position_list 实测一致）；
@@ -413,12 +765,15 @@ class FutuBroker:
         return core_broker.place(call, acc_id=account["acc_id"],
                                  market=account["market_id"], symbol=order["symbol"],
                                  side=order["side"], qty=order["qty"],
-                                 price=order["price"])
+                                 price=order.get("price"))
 
     def modify(self, order, mode):
         """改单 = 撤旧单 + 按新参数重新下单（TOOL-LIMITS：sim_trade_modify_order
-        间歇性 -5，一律不用）。旧单已撤而新单超时时返回 unknown（先查询，不重放）。"""
+        间歇性 -5，一律不用）。旧单已撤而新单超时时返回 unknown（先查询，不重放）。
+        WP8 任务 6：官方改单的 aux_price 在 sim 路径无法表达（撤旧重下只带 price）——
+        如实拒绝而不是丢弃触发价（见 _sim_options_guard）。"""
         self._live_guard(mode)
+        self._sim_options_guard(order)
         call = self._tool()
         account = self._sim_account(call, order["symbol"])
         try:
@@ -842,10 +1197,20 @@ class OpenApiBroker:
             return self._legacy.place(order, mode)
         trade = self.trade
         acc_id = self._account_for(order["symbol"])
+        # 官方扩展字段整体透传（WP8 任务 6）：order_type/time_in_force 恒有值（缺省
+        # LIMIT/DAY），其余只在调用方给了才下发——不凭默认值改写券商语义，也不丢字段。
+        kwargs = {"acc_id": acc_id, "code": order["symbol"], "qty": order["qty"],
+                  "side": order["side"],
+                  "order_type": order.get("order_type", "LIMIT"),
+                  "time_in_force": order.get("time_in_force", "DAY")}
+        if "price" in order:
+            kwargs["price"] = order["price"]
+        for name in ("session", "aux_price", "lot_type", "remark", "order_class",
+                     "multi_leg_info"):
+            if name in order:
+                kwargs[name] = order[name]
         try:
-            data = trade.place_order(acc_id=acc_id, code=order["symbol"], qty=order["qty"],
-                                     price=order["price"], side=order["side"],
-                                     order_type="LIMIT", time_in_force="DAY")
+            data = trade.place_order(**kwargs)
         except Exception as error:  # noqa: BLE001 —— 分类见 _classify_openapi_error
             outcome = _classify_openapi_error(error, "下单")
             if outcome is None:
@@ -874,14 +1239,15 @@ class OpenApiBroker:
                            "请先 trade_cancel 再 trade_place（两笔独立批准）"}
         trade = self.trade
         acc_id = self._account_for(symbol)
+        # WP8 任务 6：官方 PUT 改单的辅助字段 aux_price（触发价）整体透传——对在富途客户端
+        # 建的非限价单（STOP/STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED）必须能改触发价；
+        # 官方改单请求体**没有** order_type 字段，故这里不做类型语义。
+        kwargs = {"acc_id": acc_id, "order_id": order["order_id"], "exchange": exchange,
+                  "qty": order["qty"], "price": order["price"]}
+        if "aux_price" in order:
+            kwargs["aux_price"] = order["aux_price"]
         try:
-            # 缺口登记（2026-09-16 审查）：官方 PUT 改单可带 ``aux_price``（触发价），但闸门/
-            # 工具面没有该字段 → 对在富途客户端建的非限价单（STOP/STOP_LIMIT/MARKET_IF_TOUCHED/
-            # LIMIT_IF_TOUCHED）无法正确改单（这里只改 qty/price，触发价沿用旧值）。本期如实
-            # 保留，后续任务补工具字段（见规格「执行偏差与覆盖缺口」）。
-            data = trade.modify_order(acc_id=acc_id, order_id=order["order_id"],
-                                      exchange=exchange, qty=order["qty"],
-                                      price=order["price"])
+            data = trade.modify_order(**kwargs)
         except Exception as error:  # noqa: BLE001
             outcome = _classify_openapi_error(error, "改单")
             if outcome is None:
@@ -1176,6 +1542,30 @@ class TradeGate:
     def _today(self):
         return self.today or date.today().isoformat()
 
+    def _risk_basis(self, conn, clean):
+        """风险基准价 → ``(price, error_message)``（WP8 任务 6）。
+
+        优先级与依据：
+          1. ``price``（限价类）/ ``aux_price``（触发类）——调用方给出的成交或触发价；
+          2. 市价类（MARKET/AUCTION，请求体没有价格）→ **本地日线最近收盘**
+             （``daemon._execute_plan`` 的 ``price_of`` 同款口径：已同步的真事实）；
+          3. 都取不到 → fail-closed：返回可读错误（``NO_PRICE_BASIS_REFUSAL``），
+             绝不用 0 让风控规则 4/5 静默失效，也绝不编造价。
+        """
+        basis = _risk_price(clean)
+        if basis is not None:
+            return float(basis), None
+        close = _local_close(conn, clean["symbol"], self._today())
+        if close is not None:
+            return close, None
+        if clean.get("order_type") in NO_PRICE_ORDER_TYPES:
+            return None, NO_PRICE_BASIS_REFUSAL.format(
+                order_type=clean.get("order_type"), symbol=clean["symbol"])
+        # 理论上不可达（限价类/触发类的基准价在字段校验层已强制存在）：字段层若被绕过，
+        # 这里同样 fail-closed，绝不让风控拿到 None/0。
+        return None, (f"参数非法：order_type={clean.get('order_type')} 缺少风险基准价"
+                      f"（price/aux_price），闸门无法评估单笔风险与单票市值")
+
     # ---- 查询（mode 约束直通，不进任何缓存）----
     def positions(self, mode=None):
         return self._query("positions", mode)
@@ -1263,10 +1653,12 @@ class TradeGate:
         return self._write("cancel", order, session_id)
 
     def _write(self, operation, payload, session_id):
-        # 1) 字段校验（broker/确认零接触）
+        # 1) 字段校验（broker/确认零接触）。WP8 任务 6：字段/枚举/条件必填/互斥属于
+        #    **载荷非法**（与 HTTP/MCP 层白名单同码族）→ trading/invalid-operation，
+        #    消息带官方允许值；风控/确认/券商拒绝仍是 trading/order-rejected。
         clean, message = validate_order(payload, operation)
         if message is not None:
-            return _envelope_fail("trading/order-rejected", message)
+            return _envelope_fail("trading/invalid-operation", message)
         # 2) 模式：只认模式文件（载荷不带 mode，杜绝声明模式与账户模式不一致的旁路；
         #    风控规则 2 在闸门内的形态即「模式文件合法且与订单一致」——订单模式由这里
         #    统一赋值，二者恒等）。
@@ -1276,10 +1668,18 @@ class TradeGate:
             return _envelope_fail("trading/order-rejected", f"账户模式非法：{error}")
         # 2.5) live 写前置拒绝：适配器未声明 supports_live_write 时，确认通过后也注定
         #      被 FutuBroker._live_guard 拒绝——在确认之前快速失败，不发起确认、不产生
-        #      待确认、不落 OMS/风控行。getattr 对未声明该属性的鸭子类型适配器按
-        #      「不支持」处理（fail-safe：没显式声明支持 live 写，就不得写 live）。
+        #      待确认、不落 OMS/风控行。getattr 对未声明该属性的适配器按「不支持」处理
+        #      （fail-safe：没显式声明支持 live 写，就不得写 live）。
         if mode == "live" and not getattr(self.broker, "supports_live_write", False):
             return _envelope_fail("trading/broker-unavailable", LIVE_WRITE_UNAVAILABLE)
+        # 2.6) sim 通道能力边界（WP8 任务 6）：sim_trade_place_order/modify 只支持限价当日单
+        #      （core_broker.place 的 order_type=1 锁定口径），扩展字段在 sim 下**如实拒绝**
+        #      ——不静默丢弃、不落 OMS/风控行、零券商调用（适配层还有第二道守卫）。
+        if mode == "sim":
+            unsupported = _sim_unsupported(clean)
+            if unsupported:
+                return _envelope_fail("trading/broker-unavailable", SIM_LIMIT_REFUSAL,
+                                      fields=unsupported)
         # 3) 幂等编号：调用方提供则复用（重复提交不重复下单），否则生成（OMS uuid 口径）
         cid = clean.get("client_order_id") or uuid.uuid4().hex
         conn = self._conn()
@@ -1301,6 +1701,15 @@ class TradeGate:
         # cancel 不产生新订单（无可执行物），无 OMS 行可登记——其重复提交由券商侧
         # 「撤已撤单」语义兜底，这里不伪造幂等（如实披露）。
         has_row = operation in ("place", "modify")
+        # 3.5) 风险基准价（WP8 任务 6）：限价类=price、触发类=aux_price、市价类
+        #      （MARKET/AUCTION）=本地日线最近收盘（daemon._execute_plan 的 price_of 同款）。
+        #      取不到就 fail-closed 拒绝——**不落 OMS/风控行、零券商调用**；绝不用 0 让
+        #      规则 4/5 静默失效，也绝不编造价。放在重复提交回放之后（幂等优先）。
+        risk_price = None
+        if operation != "cancel":
+            risk_price, message = self._risk_basis(conn, clean)
+            if message is not None:
+                return _envelope_fail("trading/invalid-operation", message)
         if has_row:
             # OMS 幂等三件套之二（oms.register_order 同款查重，adhoc 槽）：同标的同方向
             # 在途临时单拒绝重复登记。
@@ -1326,7 +1735,7 @@ class TradeGate:
             conn.commit()
 
         # 4) 风控 8 规则（kill 是规则 1）——拒绝即跳过并留痕，无覆盖按钮
-        order = _check_order(operation, clean, mode)
+        order = _check_order(operation, clean, mode, risk_price)
         ctx = self.ctx_builder(conn, mode, order, operation, self.home, self._today())
         verdict = self.risk_fn(order, ctx)
         core_store.insert_risk_check(conn, ADHOC_PLAN_ID, clean["symbol"], verdict.rule,
@@ -1345,7 +1754,8 @@ class TradeGate:
             core_oms.transition(conn, cid, "frozen")
         if mode == "live":
             answer = self.confirm.request(self.home, tool=CONFIRM_TOOL[operation],
-                                          mode="live", args=_summary_args(operation, clean),
+                                          mode="live",
+                                          args=_summary_args(operation, clean, risk_price),
                                           session_id=session_id or "mcp",
                                           ttl_ms=self.confirm_ttl_ms)
             if answer.get("decision") != "approved":
@@ -1361,8 +1771,12 @@ class TradeGate:
         # 6) broker（唯一触达点）。适配器契约：调用超时在适配层消化成 unknown，
         #    只有「确定未发出」的故障才抛 BrokerUnavailable（此时 OMS 落 rejected，
         #    不谎称已提交）。
+        # WP8 任务 6：官方扩展字段整体透传（只在调用方给了才带上——不改写适配层的默认值）；
+        # 市价类的 price 缺失在这里自然不带（字段校验层已保证风险基准价的处置）。
         broker_order = {key: clean[key] for key in
-                        ("symbol", "side", "qty", "price", "order_id") if key in clean}
+                        ("symbol", "side", "qty", "price", "order_id", "order_type",
+                         "time_in_force", "session", "aux_price", "lot_type", "remark",
+                         "order_class", "multi_leg_info") if key in clean}
         try:
             result = getattr(self.broker, operation)(broker_order, mode)
         except Exception as error:  # noqa: BLE001 —— 信封化，绝不 500

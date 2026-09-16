@@ -168,8 +168,8 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 
 要让 Harness 会话直接调用工作台能力，把 `agent.cordis.yml` 里 `quant-platform-mcp` 行的
 `disabled: true` 改成 `false`，然后**新建会话**（已挂载的会话不会重新读取组合）：会话内
-出现 `mcp__quantwb__*` 共 33 个工具，与 Web 同源（HTTP 与 MCP 调用同一批处理函数；
-`confirm-decide` 有意不进工具面，模型不能自批实盘单）。
+出现 `mcp__quantwb__*` 共 59 个工具（WP8 任务 6 起），与 Web 同源（HTTP 与 MCP 调用同一批
+处理函数；`confirm-decide` 有意不进工具面，模型不能自批实盘单）。
 实盘切换只能在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）
 输入口令「确认实盘」完成，成功后提示带 `order_authorized: false`；`switch_mode` 工具
 只接受切到 sim（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
@@ -201,6 +201,22 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 - **一键安装**：把 `install/HARNESS_SETUP.md` 的提示词整段发给一个 Harness 会话，
   即可完成「依赖 → Web 构建 → 服务启动 → preset 行启用 → 工具面验证」全流程
   （幂等，可分层跳过）。
+
+## WP8：富途 OpenAPI 统一 + 交易能力完整暴露
+
+- **行情/交易统一到富途 OpenAPI**：`trading-platform.json` 的 `futu_channel=openapi`
+  且已配置凭据（`scripts/futu_auth.py --openapi`）时，行情与交易都走 REST；
+  通道未配置时行为与 WP7 完全一致（默认零变化）。
+- **交易字段完整暴露（任务 6）**：`trade_place` 支持官方 8 种 `order_type`、`GTC`、
+  美股 `session`（市价单仅 RTH）、`aux_price` 触发价（证券 3 位小数）、港股 `lot_type`、
+  `remark`（≤64 字节）、`order_class=MLEG` + `multi_leg_info`；`trade_modify` 补 `aux_price`。
+  字段校验仍在闸门字段校验层（风控/确认之前），坏参数零券商往返、零确认消耗。
+  **sim 通道只支持限价当日单**，扩展字段如实拒绝（消息说明），不静默丢弃。
+- **推送订阅管理面（任务 6）**：`push_status`（与 `/healthz` 的 push 同形，前端页头 10 秒
+  轮询显示「实时推送已连接 / 推送连接中 / 推送未启用」）、`push_subscribe`、
+  `push_unsubscribe`（只改本地连接订阅意图，非交易；未启用如实返回
+  `trading/push-unavailable`）。工具面 56 → **59**，端点 52 → **55**，锁定表同步。
+  受限字段与通道边界见 [docs/TOOL-LIMITS.md](docs/TOOL-LIMITS.md) 第八节。
 
 
 ## 工作台与指令示例

@@ -1102,5 +1102,226 @@ class RealWsSmokeTest(unittest.TestCase):
         self.assertEqual(status["intent"]["quote"], [], "交易 WS 不发订阅帧")
 
 
+# ---------------------------------------------------------------------------
+# 9. WP8 任务 6：推送订阅管理面（push_status / push_subscribe / push_unsubscribe）
+# ---------------------------------------------------------------------------
+PUSH_CHANNELS = ("quote", "order_book", "ticker", "kline")
+SUBSCRIBE_ITEMS = {"quote": ["US.AAPL"], "order_book": ["US.AAPL"],
+                   "ticker": ["US.AAPL"],
+                   "kline": [{"symbol": "US.AAPL", "period": "1m", "adjust": "qfq"}]}
+
+
+class PushAdminTest(unittest.TestCase):
+    """三端点契约：状态（TTL 0，与 /healthz 的 push 同形）、订阅、精确反订阅。
+
+    推送未启用（futu_channel!=openapi 或凭据缺失）时**如实拒绝**（trading/push-unavailable），
+    不假装订阅成功；启用时只改本地连接订阅意图，**不触达任何交易写路径**。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name) / "home"
+        self.home.mkdir(parents=True, exist_ok=True)
+        (self.home / "dist-missing").mkdir()
+
+    def write_channel(self, channel):
+        (self.home / "trading-platform.json").write_text(
+            json.dumps({"futu_channel": channel}), encoding="utf-8")
+
+    def write_cred(self):
+        path = self.home / "cred.json"
+        path.write_text(json.dumps(oauth_cred()), encoding="utf-8")
+        return str(path)
+
+    def runtime(self, transport):
+        return futu_push.PushRuntime(home=str(self.home), transport=transport,
+                                     credential_path=self.write_cred(),
+                                     now_ms=Clock(), sleep=FakeSleeper())
+
+    def make_app(self, runtime):
+        return app_module.create_app(home=str(self.home),
+                                     dist=str(self.home / "dist-missing"),
+                                     scheduler=IdleScheduler(), push=runtime)
+
+    def post(self, client, endpoint, payload):
+        return client.post(f"/api/wb/{endpoint}", json=payload).json()
+
+    def test_disabled_push_reports_status_and_refuses_subscriptions(self):
+        """未启用：状态如实 enabled=false 且与 /healthz 逐键同形；订阅两端点如实拒绝。"""
+        self.write_channel("mcp")
+        runtime = self.runtime(FakeTransport())
+        with TestClient(self.make_app(runtime)) as client:
+            status = self.post(client, "push_status", {})
+            self.assertTrue(status["ok"], status)
+            value = status["value"]
+            self.assertEqual(set(value),
+                             {"enabled", "started", "reason", "last_error", "quote", "trade"})
+            self.assertFalse(value["enabled"])
+            self.assertFalse(value["quote"]["connected"])
+            self.assertFalse(value["trade"]["connected"])
+            self.assertEqual(value, client.get("/healthz").json()["push"],
+                             "push_status 与 healthz 的 push 必须同一形状/同一事实")
+            for endpoint in ("push_subscribe", "push_unsubscribe"):
+                with self.subTest(endpoint=endpoint):
+                    out = self.post(client, endpoint, {"quote": ["US.AAPL"]})
+                    self.assertFalse(out["ok"], out)
+                    self.assertEqual(out["error"]["code"], "trading/push-unavailable")
+                    self.assertIn("推送未启用", out["error"]["message"])
+
+    def test_unwired_runtime_is_refused_truthfully(self):
+        """create_handler 未接线 push（直跑/单测路径）：状态 disabled、订阅如实拒绝，不 500。"""
+        handle = app_module.create_handler(str(self.home), analytics={}, series=None,
+                                           core={})
+        status = handle("push_status", {})
+        self.assertTrue(status["ok"], status)
+        self.assertFalse(status["value"]["enabled"])
+        out = handle("push_subscribe", {"quote": ["US.AAPL"]})
+        self.assertFalse(out["ok"], out)
+        self.assertEqual(out["error"]["code"], "trading/push-unavailable")
+        self.assertIn("未接线", out["error"]["message"])
+
+    def test_enabled_push_roundtrips_intent_and_is_idempotent(self):
+        self.write_channel("openapi")
+        quote_conn, trade_conn = FakeConnection(), FakeConnection()
+        quote_conn.push(auth_ack("q-1"))
+        trade_conn.push(auth_ack("t-1"))
+        runtime = self.runtime(FakeTransport(quote_conn, trade_conn))
+        with TestClient(self.make_app(runtime)) as client:
+            out = self.post(client, "push_subscribe", dict(SUBSCRIBE_ITEMS))
+            self.assertTrue(out["ok"], out)
+            self.assertEqual(out["value"]["action"], "subscribe")
+            intent = out["value"]["intent"]
+            self.assertEqual(set(intent), set(PUSH_CHANNELS))
+            self.assertEqual(intent["quote"], ["US.AAPL"])
+            self.assertEqual(intent["kline"],
+                             [{"symbol": "US.AAPL", "period": "1m", "adjust": "qfq"}])
+            # 幂等/乱序无关：重复提交同一意图 → 同一快照
+            again = self.post(client, "push_subscribe", dict(SUBSCRIBE_ITEMS))
+            self.assertEqual(again["value"]["intent"], intent)
+            # 状态里能看到订阅意图（与 healthz 同形）
+            status = self.post(client, "push_status", {})["value"]
+            self.assertTrue(status["enabled"])
+            self.assertEqual(status["quote"]["intent"], intent)
+            # 精确反订阅：只移除给定标的，其余通道不受影响
+            out2 = self.post(client, "push_unsubscribe", {"order_book": ["US.AAPL"]})
+            self.assertTrue(out2["ok"], out2)
+            self.assertEqual(out2["value"]["action"], "unsubscribe")
+            self.assertEqual(out2["value"]["intent"]["order_book"], [])
+            self.assertEqual(out2["value"]["intent"]["quote"], ["US.AAPL"])
+            # 反订阅从未订阅的标的：无变化、不报错（幂等）
+            out3 = self.post(client, "push_unsubscribe", {"ticker": ["HK.00700"]})
+            self.assertEqual(out3["value"]["intent"], out2["value"]["intent"])
+
+    def test_invalid_subscription_payloads_are_invalid_operation(self):
+        self.write_channel("openapi")
+        quote_conn, trade_conn = FakeConnection(), FakeConnection()
+        quote_conn.push(auth_ack("q-1"))
+        trade_conn.push(auth_ack("t-1"))
+        runtime = self.runtime(FakeTransport(quote_conn, trade_conn))
+        cases = [
+            ({"quotes": ["US.AAPL"]}, "Unexpected"),        # 白名单外字段（HTTP 层拒）
+            ({"unknown": []}, "Unexpected"),                # 未知通道同样白名单外
+            ({"quote": "US.AAPL"}, "必须是列表"),
+            ({"kline": [{"period": "1m"}]}, "订阅标的"),
+            ({"quote": [""]}, "非空字符串"),
+            ({"kline": ["US.AAPL"]}, "对象"),
+        ]
+        with TestClient(self.make_app(runtime)) as client:
+            for payload, needle in cases:
+                with self.subTest(payload=payload):
+                    out = self.post(client, "push_subscribe", payload)
+                    self.assertFalse(out["ok"], out)
+                    self.assertEqual(out["error"]["code"], "trading/invalid-operation")
+                    self.assertIn(needle, out["error"]["message"])
+            # 坏载荷过后意图不受污染
+            status = self.post(client, "push_status", {})["value"]
+            self.assertEqual(status["quote"]["intent"],
+                             {channel: [] for channel in PUSH_CHANNELS})
+
+    def test_status_rejects_any_payload(self):
+        self.write_channel("mcp")
+        with TestClient(self.make_app(self.runtime(FakeTransport()))) as client:
+            out = self.post(client, "push_status", {"refresh": True})
+            self.assertFalse(out["ok"], out)
+            self.assertEqual(out["error"]["code"], "trading/invalid-operation")
+
+
+class PushAdminFrameTest(unittest.TestCase):
+    """运行时门面：订阅/反订阅真的出站 WS 帧（幂等、增量、精确反订阅）。"""
+
+    def test_subscribe_and_unsubscribe_emit_exact_frames(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        (home / "trading-platform.json").write_text(
+            json.dumps({"futu_channel": "openapi"}), encoding="utf-8")
+        cred = home / "cred.json"
+        cred.write_text(json.dumps(oauth_cred()), encoding="utf-8")
+        items = {"quote": ["US.AAPL"], "kline": [{"symbol": "US.AAPL", "period": "1m"}]}
+
+        async def case():
+            quote_conn, trade_conn = FakeConnection(), FakeConnection()
+            quote_conn.push(auth_ack("q-1"))
+            trade_conn.push(auth_ack("t-1"))
+            runtime = futu_push.PushRuntime(
+                home=str(home), transport=FakeTransport(quote_conn, trade_conn),
+                credential_path=str(cred), now_ms=Clock(), sleep=FakeSleeper())
+            self.assertTrue(await runtime.start())
+            try:
+                view = runtime.subscribe(dict(items))
+                self.assertEqual(view["quote"], ["US.AAPL"])
+                await quote_conn.wait_sent(2)
+                self.assertEqual(quote_conn.sent[1]["action"], "subscribe")
+                self.assertEqual(quote_conn.sent[1]["quote"], ["US.AAPL"])
+                self.assertEqual(quote_conn.sent[1]["kline"],
+                                 [{"symbol": "US.AAPL", "period": "1m"}])
+                quote_conn.push({"id": quote_conn.sent[1]["id"], "code": 0, "message": ""})
+                await asyncio.sleep(0.02)
+                # 幂等：同一意图重复订阅不重发帧
+                runtime.subscribe(dict(items))
+                await asyncio.sleep(0.05)
+                self.assertEqual(quote_conn.actions(), ["auth", "subscribe"])
+                # 乱序：反订阅从未订阅的标的 → 零帧
+                runtime.unsubscribe({"ticker": ["HK.00700"]})
+                await asyncio.sleep(0.05)
+                self.assertEqual(quote_conn.actions(), ["auth", "subscribe"])
+                # 精确反订阅：只发被移除的通道
+                runtime.unsubscribe({"quote": ["US.AAPL"]})
+                await quote_conn.wait_sent(3)
+                self.assertEqual(quote_conn.sent[2]["action"], "unsubscribe")
+                self.assertEqual(quote_conn.sent[2]["quote"], ["US.AAPL"])
+                self.assertNotIn("kline", quote_conn.sent[2])
+                intent = runtime.snapshot_intent()
+                self.assertEqual(intent["quote"], [])
+                self.assertEqual(intent["kline"], [{"symbol": "US.AAPL", "period": "1m"}])
+                return quote_conn
+            finally:
+                await runtime.stop()
+
+        conn = asyncio.run(case())
+        self.assertTrue(conn.closed, "stop() 关闭行情连接")
+
+    def test_disabled_runtime_facade_raises_push_unavailable(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        home = Path(tmp.name)
+        runtime = futu_push.PushRuntime(home=str(home))
+        for call in (lambda: runtime.subscribe({"quote": ["US.AAPL"]}),
+                     lambda: runtime.unsubscribe({"quote": ["US.AAPL"]})):
+            with self.assertRaises(futu_push.PushUnavailable) as caught:
+                call()
+            self.assertIn("推送未启用", str(caught.exception))
+        self.assertEqual(runtime.snapshot_intent(),
+                         {channel: [] for channel in PUSH_CHANNELS})
+        with self.assertRaises(futu_push.PushUnavailable):
+            futu_push.apply_subscription(None, "subscribe", {"quote": ["US.AAPL"]})
+        self.assertFalse(futu_push.status_view(None)["enabled"])
+        # 通道白名单在 normalize_items（HTTP 层白名单之外的第二道，防绕道直调）
+        with self.assertRaises(ValueError) as caught:
+            futu_push.normalize_items({"unknown": []})
+        self.assertIn("未知订阅通道", str(caught.exception))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

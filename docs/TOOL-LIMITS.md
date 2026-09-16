@@ -167,3 +167,40 @@ Node 侧 store 三方法与 `confirmation`/`confirm-decide` 端点**保留**（l
   表现为 `the user rejected tool ...`——看起来像用户拒绝了，实际没人被问过。
 - 业务确认回答"这笔参数对不对"，**与权限档位无关**，任何档位下都必须确认。
 因此 policy 对写类的拒绝是 deny（guard 即拒）而非 `{kind:"ask"}`，不会落到审批档位上。
+
+## 八、交易字段与通道边界（WP8 任务 6，2026-09-16）
+
+**官方 place-order 字段在工具面全部可达**（`trade_place`；官方依据：
+`/zh-cn/api/trading/trade/place-order.md` 与 naming-dictionary，2026-09-16 实抓原文）：
+`order_type` 8 枚举（默认 LIMIT）、`time_in_force{DAY,GTC}`（默认 DAY）、`session` 4 枚举、
+`aux_price`、`lot_type`、`remark`、`order_class` + `multi_leg_info`。闸门在**风控/确认之前**
+做字段校验（条件必填/枚举/互斥/结构），错误一律 `trading/invalid-operation` 且消息给出官方
+允许值。以下边界是**按设计**，不是故障：
+
+- **触发价必填**：`order_type ∈ {STOP, STOP_LIMIT, MARKET_IF_TOUCHED, LIMIT_IF_TOUCHED}`
+  必须带 `aux_price`（证券 3 位小数，超出即拒，**不四舍五入**）；非触发类带 `aux_price` 拒。
+- **价格互斥**：限价类 `{LIMIT, AUCTION_LIMIT, STOP_LIMIT, LIMIT_IF_TOUCHED}` 必带 `price`；
+  市价类 `{MARKET, AUCTION, STOP, MARKET_IF_TOUCHED}` 带 `price` 拒。
+- **市价类的风险基准价**：`MARKET`/`AUCTION` 请求体没有价格，闸门用**本地日线最近收盘**
+  （`daemon._execute_plan` 的 `price_of` 同款口径）作为风控规则 4/5 的 `qty × price` 基准；
+  本地没有该标的日线时**如实拒绝**（`trading/invalid-operation`）——绝不用 0 让风控静默
+  失效，也绝不编造价格。确认卡片会把实际使用的「风控基准价」列出。
+- **时段/手数**：`session` 仅美股（非美股带 session 拒），且**市价单仅支持 RTH**；
+  `lot_type` 仅港股（非港股带 lot_type 拒）。
+- **多腿**：`order_class=MLEG` 必须带 `multi_leg_info`，反之 `multi_leg_info` 必须与 MLEG
+  同时给出；`multi_leg_info` 的键集/必填/枚举照 naming-dictionary（`option_strategy`/
+  `underlying_symbol`/`leg_infos[leg_symbol/leg_exchange/leg_ratio_qty/leg_side/
+  leg_security_type]`），坏结构零网络往返即拒。
+- **备注**：`remark` UTF-8 编码后 ≤64 字节（中文按 3 字节计）。
+- **改单**：官方 `PUT /orders/{id}` 只有 `exchange/qty/price/aux_price`（**没有 order_type**）；
+  被改订单是触发类时官方要求带 `aux_price`，闸门透传。
+- **sim 通道只支持限价当日单**：`sim_trade_place_order` 的 WP3 锁定口径是
+  `order_type=1`（限价）+`price`，因此 sim 下 `order_type≠LIMIT`、`time_in_force≠DAY`、
+  `order_class≠NORMAL` 或带 `session/aux_price/lot_type/remark/multi_leg_info` 一律
+  `trading/broker-unavailable`（消息「sim 仅支持限价当日单」）——**如实拒绝，不静默丢弃**；
+  适配层（`FutuBroker`）还有第二道同样守卫，防绕道直调。
+- **推送订阅管理面**（`push_status` / `push_subscribe` / `push_unsubscribe`，非交易）：
+  `push_status` 与 `/healthz` 的 `push` 同一实现/同一事实；订阅两端点只改本地连接订阅
+  意图（不改模式、不过风控、不产生订单），推送未启用时返回 `trading/push-unavailable`
+  （不假装成功），载荷非法返回 `trading/invalid-operation`。幂等：重复提交同一意图不重发
+  订阅帧，反订阅从未订阅的标的无副作用。

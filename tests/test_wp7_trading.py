@@ -172,6 +172,8 @@ class GateChainTest(GateTestBase):
         self.assertEqual(self.confirm.requests, [])
 
     def test_field_validation_rejects_before_mode_and_broker(self):
+        """字段校验层失败 = 载荷非法 → ``trading/invalid-operation``（WP8 任务 6 起与
+        HTTP/MCP 白名单同码族，消息带官方允许值）；风控/确认/券商拒绝仍是 order-rejected。"""
         cases = [
             {"side": "BUY", "qty": 100, "price": 1.0},                    # 缺 symbol
             dict(ORDER, symbol="600519"),                                  # 无市场前缀
@@ -188,7 +190,7 @@ class GateChainTest(GateTestBase):
             with self.subTest(payload=payload):
                 out = self.gate().place(payload)
                 self.assertFalse(out["ok"], payload)
-                self.assertEqual(out["error"]["code"], "trading/order-rejected")
+                self.assertEqual(out["error"]["code"], "trading/invalid-operation")
                 self.assertEqual(self.broker.calls, [])
                 self.assertEqual(self.confirm.requests, [])
 
@@ -726,8 +728,8 @@ class SurfaceLockTest(unittest.TestCase):
 
     def test_tool_surface_is_56(self):
         from server import mcp_tools
-        self.assertEqual(mcp_tools.TOOL_COUNT, 56)
-        self.assertEqual(len(mcp_tools.TOOLS), 56)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 59)
+        self.assertEqual(len(mcp_tools.TOOLS), 59)
         names = {t.name for t in mcp_tools.TOOLS}
         self.assertLessEqual({"trade_place", "trade_modify", "trade_cancel",
                               "account_positions", "account_orders", "account_funds"}, names)

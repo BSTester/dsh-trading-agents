@@ -5,7 +5,7 @@ import { ProLayout } from "@ant-design/pro-components";
 import zhCN from "antd/locale/zh_CN";
 import { callApi, clearCache, getToken, setToken } from "./services/api.js";
 import { LIVE_CONFIRMATION, modeBadge, switchModeRequest } from "./services/mode.js";
-import { useSnapshotPoll } from "./services/hooks.js";
+import { useEndpoint, useSnapshotPoll } from "./services/hooks.js";
 import MarketPage from "./pages/market.jsx";
 import SignalPage from "./pages/signal.jsx";
 import PortfolioPage from "./pages/portfolio.jsx";
@@ -120,6 +120,23 @@ function ModeButton({ mode, onSwitched }) {
   );
 }
 
+/** 页头推送状态指示：10 秒轮询 push_status（服务端与 /healthz 的 push 同一实现）。
+ *  文案只有三类白名单：已连接 / 连接中 / 未启用；取数失败（旧服务无该端点）不显示，
+ *  不猜状态、不把「未知」说成任何一类。 */
+function PushBadge() {
+  const status = useEndpoint("push_status", {}, []);
+  React.useEffect(() => {
+    const timer = setInterval(() => status.refresh(), 10_000);
+    return () => clearInterval(timer);
+  }, [status.refresh]);
+  const push = status.value;
+  if (status.error || !push) return null;
+  if (!push.enabled) return <Tag>推送未启用</Tag>;
+  const quote = push.quote ?? {};
+  if (quote.connected && quote.authenticated) return <Tag color="green">实时推送已连接</Tag>;
+  return <Tag color="blue">推送连接中</Tag>;
+}
+
 function Shell() {
   const [key, setKey] = React.useState(currentKey());
   React.useEffect(() => {
@@ -139,6 +156,7 @@ function Shell() {
       avatarProps={{ render: () => (
         <Space size="small">
           <ModeButton mode={mode} onSwitched={() => snapshot.refresh()} />
+          <PushBadge />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             数据按 TTL 本地缓存；模式切换不授权下单
           </Typography.Text>
