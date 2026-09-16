@@ -1,12 +1,13 @@
-# WP6 补遗任务 D：MCP 工具面（33 工具，WP7 任务 3 起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
+# WP6 补遗任务 D：MCP 工具面（41 工具，WP8 富途直通起）与通道分级（规格 §3.2 / §3.4 / §3.6）。
 #
-# 唯一事实来源：本文件的 ``TOOLS`` 清单（28 端点工具 + 5 维护工具）。MCP 工具不复制任何
+# 唯一事实来源：本文件的 ``TOOLS`` 清单（36 端点工具 + 5 维护工具）。MCP 工具不复制任何
 # 业务逻辑：端点工具一律 ``handle(endpoint, payload)``（app.create_handler 的产物，与 HTTP
 # 面同一个实例），维护工具一律 ``store_api.admin_*``——两条通道对同一 payload 因此必然同源
 # （规格 §5.1 A3/A4 的结构保证）。
 #
 # **``confirm-decide`` 有意不进工具面**（规格 §5.1 A7，2026-09-15 业务确认修订）：
-# HTTP 面 WP6 时 23 端点里有 22 个各有一个 MCP 工具（WP7 任务 3 起 29 端点 28 工具），
+# HTTP 面 WP6 时 23 端点里有 22 个各有一个 MCP 工具（WP7 任务 3 起 29 端点 28 工具，
+# WP8 富途直通起 37 端点 36 工具），
 # 唯一被排除的始终是 ``confirm-decide``。
 # 理由是通道分级：它是**唯一能批准实盘操作**的通道，必须只由独立 Web 上的用户点击触发。
 # 若把它做成工具，模型就能"自己发起、自己批准"，业务确认会退化成模型自批实盘单——
@@ -31,7 +32,7 @@
 # SDK 适配结论（mcp 2.2.0 实测，非推测）：
 #   * ``from mcp.server.mcpserver import MCPServer``（2.x 由 FastMCP 更名）；
 #   * 注册面是 ``MCPServer.add_tool(fn, name=..., description=..., structured_output=...)``，
-#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 33 个工具共用一个
+#     inputSchema **由 pydantic 从函数签名的类型注解生成**——因此 41 个工具共用一个
 #     ``**kwargs`` 派发函数 + 每个工具自带的 ``__signature__`` 表达字段集，注解即契约；
 #   * ``MCPServer.list_tools/call_tool`` 是 async；``streamable_http_app()`` 返回的 Starlette
 #     app 自带 ``lifespan=session_manager.run()``，挂载时须并入主 app 的 lifespan；
@@ -76,9 +77,10 @@ from server import store_access
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
 
-# 工具面总数：28 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
-# 工具；29 端点扣除有意排除的 confirm-decide）+ 5 维护工具（§3.4）。锁定测试断言 33 恒成立。
-TOOL_COUNT = 33
+# 工具面总数：36 端点工具（§3.2 + WP7 factors-history + WP7 任务 3 的 6 个受约束交易
+# 工具 + WP8 富途实时直通 8 个；37 端点扣除有意排除的 confirm-decide）+ 5 维护工具
+# （§3.4）。锁定测试断言 41 恒成立。
+TOOL_COUNT = 41
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订）。
 # ``confirm-decide`` 是唯一能批准实盘操作的通道，只由独立 Web 的用户点击触发；做成工具就等于
@@ -149,6 +151,10 @@ _TYPES = {
     "action": Literal["execute", "cancel", "kill", "unkill"],
     # WP7 任务 3：交易方向（broker.py place 的 side 口径，1=BUY 2=SELL 由闸门映射）
     "side": Literal["BUY", "SELL"],
+    # WP8 富途直通：对象入参（option_screen 的 filter；option_chain 的 field_filter）。
+    # 顶层模型仍 additionalProperties:false（_forbid_extra_fields），对象**内部**的键
+    # 由 server/futu_data.py 的内键白名单校验——嵌套 dict 不进封闭模型。
+    "object": dict,
 }
 
 
@@ -218,7 +224,7 @@ class ToolDefinition:
 
 
 # ---------------------------------------------------------------------------
-# 33 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history 与 6 个
+# 41 工具清单（规格 §3.2 表 1-20 + 20b / §3.4 表 21-25 + WP7 factors_history、6 个
 # 受约束交易工具，逐项对应）
 # ---------------------------------------------------------------------------
 # 名称、描述、输入字段集与 Node 原实现（已退役）的 ENDPOINT_TOOLS/ADMIN_TOOLS 一一对应，
@@ -474,6 +480,77 @@ TOOLS = (
         "account_funds",
         (opt("mode", "mode", "账户模式，缺省读模式文件"),),
     ),
+    # ---- WP8：富途实时数据直通（8 个；取数在 server/futu_data.py，实时零缓存）----
+    # 数据由服务端**实时**经富途托管 MCP 通道获取（skills 不再回退直连富途）；全部实时
+    # 不进缓存。描述统一注明「服务端经富途实时获取；A 股实时受限见错误消息」——A 股
+    # 行情仅延时权限（quote_stock_quote/quote_order_book 对 A 股统一 -9），错误消息里
+    # 带替代路径（capital_flow / history-kline），这是数据事实不是故障。
+    ToolDefinition(
+        "rt_quote",
+        "实时报价快照（服务端经富途实时获取）：代码/名称/最新价/涨跌幅等原始字段，"
+        "codes 1..10 个。A 股实时无权限（统一 -9，见错误消息里的替代路径提示）；"
+        "港股/美股实时。",
+        "rt_quote",
+        (req("codes", "str_list", "标的代码列表，1..10 个，如 [\"HK.00700\", \"SH.600519\"]"),),
+    ),
+    ToolDefinition(
+        "rt_order_book",
+        "实时盘口买卖档（服务端经富途实时获取）：档数随行情权限不同（HK 10 / US 60），"
+        "不要假定固定档数。A 股实时无权限（统一 -9，见错误消息里的替代路径提示）。",
+        "rt_order_book",
+        (req("code", "str", "标的代码，如 HK.00700"),),
+    ),
+    ToolDefinition(
+        "capital_flow",
+        "分钟级资金流入/流出（服务端经富途实时获取；A 股分钟级实测可用——A 股实时报价"
+        "受限时的替代路径）。",
+        "capital_flow",
+        (req("code", "str", "标的代码，如 HK.00700 / SZ.000001"),),
+    ),
+    ToolDefinition(
+        "capital_flow_history",
+        "历史资金流入/流出（服务端经富途实时获取）：按日粒度回看 days 天（默认 30）。",
+        "capital_flow_history",
+        (
+            req("code", "str", "标的代码，如 SH.600519"),
+            opt("days", "int", "回看天数（映射上游 count），1..1000，默认 30",
+                minimum=1, maximum=1000),
+        ),
+    ),
+    ToolDefinition(
+        "capital_distribution",
+        "日内资金分布（服务端经富途实时获取）：大/中/小单累计净流入流出。",
+        "capital_distribution",
+        (req("code", "str", "标的代码，如 SZ.000001"),),
+    ),
+    ToolDefinition(
+        "option_expiration",
+        "期权到期日列表（服务端经富途实时获取；HK/US/JP，其他市场上游不支持）。",
+        "option_expiration",
+        (req("code", "str", "期权正股代码，如 HK.00700 / US.AAPL"),),
+    ),
+    ToolDefinition(
+        "option_chain",
+        "期权链（服务端经富途实时获取）：按正股代码返回到期范围内的 CALL/PUT 合约。"
+        "field_filter 可选透传（上游当前对该参数不生效；需要字段裁剪用 option_screen，"
+        "那里 field_filter 必填非空）。",
+        "option_chain",
+        (
+            req("code", "str", "期权正股代码，如 US.AAPL"),
+            opt("field_filter", "object", "可选透传对象；上游 option_chain 当前对该参数不生效"),
+        ),
+    ),
+    ToolDefinition(
+        "option_screen",
+        "期权筛选器（服务端经富途实时获取）：filter 对象**必须**含非空 field_filter"
+        "（省略时上游只返回 4 个默认字段、其余全 null，见 docs/TOOL-LIMITS.md）与非空"
+        " strategy（如 {\"market_category_list\": [1]}；类别码是整数）；可选 limit/next_key/"
+        "sort_obj。",
+        "option_screen",
+        (req("filter", "object",
+             "筛选对象：必须含非空 field_filter 与非空 strategy；可选 limit/next_key/"
+             "request_exact_data/sort_obj/strategy_param"),),
+    ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----
     # 不经 RPC handler，直调 store_access 的 admin_*（与全部端点同库同锁；WP6 口径 23
     # 端点、WP7 任务 3 起 29 端点——2026-09 修订：原文「与 22 端点同库同锁」计数未随
@@ -509,7 +586,7 @@ if len(TOOLS) != TOOL_COUNT:  # pragma: no cover —— 常量与清单漂移时
 # 本模块注册面的工具名集合：``_forbid_extra_fields`` 只遍历它，不碰同进程其他工具的 arg_model。
 TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 
-# 28 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
+# 36 个端点工具 → 服务端端点名（R5 断言其值集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS）。
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 
@@ -651,7 +728,7 @@ class BoundTool:
 
 
 def build_tools(handle, store_api):
-    """33 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
+    """41 个工具（名称/描述/输入字段集来自 ``TOOLS``，行为绑定到 handle/store_api）。
 
     ``handle`` 必须是 ``app.create_handler`` 的产物——与 HTTP 面同一个实例（规格 §5.2 R6）。
     """
@@ -677,7 +754,7 @@ def _bind(definition, handle, store_api):
 
 
 def register(server: MCPServer, handle, store_api=None):
-    """把 33 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
+    """把 41 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
 
     ``store_api`` 在生产路径上由 create_app 显式传入；缺省 None 只为单测里手搓 server 的便利
     （此时维护工具调用会抛 AttributeError，并按程序异常包成 tool-failed）。

@@ -3,7 +3,7 @@
 起**真实** uvicorn 线程（``TRADING_SERVICE_PORT=0`` + 临时 ``DSH_HOME``），用官方 ``mcp``
 Python 客户端的 streamable-http 传输连 ``/mcp``，逐条钉死：
 
-  * S1 —— initialize → tools/list 恰 33（WP7 任务 3 起）、名单与 ``mcp_tools.TOOLS`` 一致，且每个工具的
+  * S1 —— initialize → tools/list 恰 41（WP8 富途直通起）、名单与 ``mcp_tools.TOOLS`` 一致，且每个工具的
     inputSchema 字段集/必填集与规格清单逐项一致（additionalProperties:false）；工具面
     **不含** ``confirm_decide``（人工批准通道，规格 §5.1 A7），含只读的 ``confirmation``；
     另有取值域断言：``series.limit`` 的 ``20..2000`` 与 ``series.period`` 的六值枚举
@@ -156,7 +156,7 @@ class McpProtocolSmoke(unittest.TestCase):
     # ---- S1 ----
 
     def test_s1_initialize_and_tool_surface(self):
-        """initialize → tools/list 恰 33；名单与输入字段集逐个对齐规格清单（WP7 任务 3 增量）。"""
+        """initialize → tools/list 恰 41；名单与输入字段集逐个对齐规格清单（WP7/WP8 增量）。"""
         async def runner():
             async with streamable_http_client(self.url) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -167,7 +167,7 @@ class McpProtocolSmoke(unittest.TestCase):
         init, listing = asyncio.run(runner())
         self.assertEqual(init.server_info.name, mcp_tools.SERVER_NAME)
         names = [tool.name for tool in listing.tools]
-        self.assertEqual(len(names), 33)
+        self.assertEqual(len(names), 41)
         self.assertEqual(len(names), mcp_tools.TOOL_COUNT)
         self.assertEqual(names, [definition.name for definition in mcp_tools.TOOLS])
         # 不变式 1：唯一能批准实盘操作的通道绝不进工具面（两种写法都不允许出现）

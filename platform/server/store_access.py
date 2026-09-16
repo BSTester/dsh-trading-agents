@@ -28,7 +28,7 @@
 #   CONFIRM_TTL_MS / CONFIRM_OPERATIONS / order_operation() / describe_order_args() /
 #   request_confirmation() / confirmation_view() / decide_confirmation() /
 #   _record_confirmation_event() / endpoints()（22 项基础清单冻结自已删的
-#   plugins/workbench/src/endpoints.js + WP7_ENDPOINTS）
+#   plugins/workbench/src/endpoints.js + WP7_ENDPOINTS + WP8 FUTU_ENDPOINTS）
 # 本模块只用标准库；不写回任何 Node 侧尚未写入的键，错误语义（消息、类型）对齐 Node。
 # JS 语义助手（真值、字段访问）统一来自 server/_js.py：store_access/summary/audit_chain 不再
 # 各留一份，避免补遗 B 移植审查抓到的那种漂移（同一语义两处两种答案）。
@@ -331,15 +331,22 @@ _BASE_ENDPOINTS = (
 WP7_ENDPOINTS = ("factors-history", "trade_place", "trade_modify", "trade_cancel",
                  "account_positions", "account_orders", "account_funds")
 
+# WP8 富途实时直通端点（8 个：skills 需要而本地无缓存的数据，由服务端实时经富途获取）。
+# 取数在 server/futu_data.py（FUTU_TOOLS 与本表键集锁定比对）；全部实时不进缓存，
+# 不进 CACHE_TTL_MS/ENDPOINT_SHAPE（与 WP7 交易/账户端点同一增量模式）。
+FUTU_ENDPOINTS = ("rt_quote", "rt_order_book", "capital_flow", "capital_flow_history",
+                  "capital_distribution", "option_expiration", "option_chain", "option_screen")
+
 
 def endpoints():
-    """服务端点清单（29 项）：22 项 legacy 基础清单 + 7 项 WP7 服务自有端点。
+    """服务端点清单（37 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
     基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7 端点登记在
-    ``WP7_ENDPOINTS`` 并追加在基础清单之后；锁定测试把 29 项整体钉死。
+    ``WP7_ENDPOINTS``，WP8 富途直通端点登记在 ``FUTU_ENDPOINTS``，按交付顺序追加；
+    锁定测试把 37 项整体钉死。
     """
-    return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS)
+    return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS)
 
 
 def read_mode(home):

@@ -6,8 +6,8 @@ WP7 面板退役（用户决策 2026-09-16）后 JS 面板源已整体删除，P
 因此改写为纯 Python 断言——把当前事实冻结成内嵌期望值，任何一侧被无意改动立刻红。
 
 覆盖：
-  * ``store_access.endpoints()`` ≡ 29 项内嵌清单（22 项基础清单按已删 endpoints.js
-    原序冻结 + 7 项 WP7 服务自有端点，逐项与顺序都钉死）；
+  * ``store_access.endpoints()`` ≡ 37 项内嵌清单（22 项基础清单按已删 endpoints.js
+    原序冻结 + 7 项 WP7 服务自有端点 + 8 项 WP8 富途实时直通端点，逐项与顺序都钉死）；
   * ``caches.CACHE_TTL_MS``：17 项 legacy TTL 逐项钉死 + WP7 增量
     ``factors-history: 5 分钟``；业务确认两端点不在表里（TTL 恒 0，不得缓存「待确认」）；
   * ``caches.ENDPOINT_SHAPE``：16 项 legacy 形状逐项钉死 + WP7 增量
@@ -64,23 +64,31 @@ BASE_ENDPOINTS = [
 WP7_ENDPOINTS = ["factors-history", "trade_place", "trade_modify", "trade_cancel",
                  "account_positions", "account_orders", "account_funds"]
 
+# WP8 富途实时直通端点（8 个：取数在 server/futu_data.py，实时零缓存；
+# 与 store_access.FUTU_ENDPOINTS 逐项同序）
+FUTU_ENDPOINTS = ["rt_quote", "rt_order_book", "capital_flow", "capital_flow_history",
+                  "capital_distribution", "option_expiration", "option_chain", "option_screen"]
+
 
 class EndpointListLockTests(unittest.TestCase):
-    def test_endpoints_is_frozen_29_item_list(self):
-        """``store_access.endpoints()`` ≡ 22 项基础清单 + 7 项 WP7 增量 = 29 项，同序。"""
-        self.assertEqual(store_access.endpoints(), BASE_ENDPOINTS + WP7_ENDPOINTS)
-        self.assertEqual(len(store_access.endpoints()), 29)
+    def test_endpoints_is_frozen_37_item_list(self):
+        """``store_access.endpoints()`` ≡ 22 项基础清单 + 7 项 WP7 增量 + 8 项 WP8 直通 = 37 项，同序。"""
+        self.assertEqual(store_access.endpoints(),
+                         BASE_ENDPOINTS + WP7_ENDPOINTS + FUTU_ENDPOINTS)
+        self.assertEqual(len(store_access.endpoints()), 37)
         self.assertEqual(len(store_access._BASE_ENDPOINTS), 22)
         self.assertEqual(list(store_access.WP7_ENDPOINTS), WP7_ENDPOINTS)
-        # 尾部锚点：业务确认两端点收尾基础清单；WP7 增量按任务顺序追加
-        self.assertEqual(store_access.endpoints()[-9:-7], ["confirmation", "confirm-decide"])
-        self.assertEqual(store_access.endpoints()[-7:], WP7_ENDPOINTS)
+        self.assertEqual(list(store_access.FUTU_ENDPOINTS), FUTU_ENDPOINTS)
+        # 尾部锚点：业务确认两端点收尾基础清单；WP7/WP8 增量按任务顺序追加
+        self.assertEqual(store_access.endpoints()[-17:-15], ["confirmation", "confirm-decide"])
+        self.assertEqual(store_access.endpoints()[-15:-8], WP7_ENDPOINTS)
+        self.assertEqual(store_access.endpoints()[-8:], FUTU_ENDPOINTS)
         self.assertEqual(store_access.endpoints()[0], "snapshot")
         # 无重复；重复调用返回等值副本（调用方改动不污染后续结果）
-        self.assertEqual(len(set(store_access.endpoints())), 29)
+        self.assertEqual(len(set(store_access.endpoints())), 37)
         sample = store_access.endpoints()
         sample.append("bogus")
-        self.assertEqual(len(store_access.endpoints()), 29)
+        self.assertEqual(len(store_access.endpoints()), 37)
 
     def test_analytics_endpoints_are_declared(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))

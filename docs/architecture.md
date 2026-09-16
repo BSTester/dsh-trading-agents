@@ -2,7 +2,7 @@
 
 > **状态标注（WP7 修订，2026-09-16）：** WP6 的独立服务（FastAPI 单进程）升级为**独立量化
 > 平台**：服务内调度器（吸收 daemon 常驻循环）、因子快照定时收集与 `factors-history`、
-> 交易闸门 + 受约束交易工具（工具面 27→33）、Harness 富途写通道收窄（policy 拒绝并指引）、
+> 交易闸门 + 受约束交易工具（工具面 27→33）、富途实时数据直通（33→41：资金流/衍生品/实时报价）、Harness 富途写通道收窄（policy 拒绝并指引）、
 > 一键安装（`install/HARNESS_SETUP.md`）。规格/验收见
 > `docs/superpowers/specs/2026-09-16-wp7-standalone-platform.md` 与
 > `docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md` 末节验收记录。
@@ -46,7 +46,7 @@ Harness 内 `plugins/workbench` 保留 `tradingWorkbench` 服务锚
         ├─ 服务内调度器（吸收 daemon 作业链：sync→quality→factors_snapshot；
         │   心跳/告警协议不变，daemon CLI 保留为手动入口）
         ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
-        ├─ /mcp（mcp SDK streamable-http，33 工具）→ Harness 的 mcp__quantwb__*
+        ├─ /mcp（mcp SDK streamable-http，41 工具）→ Harness 的 mcp__quantwb__*
         ├─ 交易闸门：mode → 风控 8 规则（kill=规则 1）→ 业务确认（Web 卡片，进程内）
         │   └ broker 适配（sim 下单/改单/撤单/查询；live 写协议未接入=提交即拒）
         └─ 静态托管 platform/web/dist；同一份 store/模式/指令文件

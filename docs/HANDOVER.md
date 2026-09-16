@@ -4,7 +4,7 @@
 > 心跳文件运维操作按 WP4 计划规格撰写，**以 WP4 合并后实测为准**（逐步操作见
 > [RUNBOOK.md](RUNBOOK.md)）。
 > **WP7 状态标注（2026-09-16）：** 服务内调度器（吸收 daemon）、因子快照收集与
-> `factors-history`、交易闸门 + 受约束交易工具（工具面 33）、富途写通道收窄、一键安装
+> `factors-history`、交易闸门 + 受约束交易工具、富途实时数据直通 8 工具（工具面 41）、富途写通道收窄、一键安装
 > 已落地（提交清单与测试证据见
 > `docs/superpowers/plans/2026-09-16-wp7-standalone-platform.md` 末节「WP7 验收记录」）。
 
@@ -31,7 +31,7 @@
 | 研究引擎 | 不再私建无取数能力的 LLM 循环；`run_trading_analysis` 启动记录，Harness 完成研究，`research_publish` 发布 |
 | 发布约束 | 校验 run、会话、标的、当前模式、五档评级、报告与带时间的来源；不猜测评级 |
 | 工作台 Host | 根级 `tradingWorkbench` **服务锚**（engine 对话工具与账户策略的进程内依赖），持久报告/预览/响应；面板退役后不再注册任何 Connection RPC |
-| 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，22 端点）+ `/mcp`（streamable-http，33 工具；`confirm-decide` 有意不进工具面）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
+| 独立服务进程（WP6） | `platform/` FastAPI 单进程：`POST /api/wb/<endpoint>`（envelope，22 端点）+ `/mcp`（streamable-http，41 工具；`confirm-decide` 有意不进工具面）+ `platform/web/dist` 静态托管；HTTP 与 MCP 同源调用同一批处理函数；不启动时 preset 行安静降级 |
 | 工作台 Client | ~~Host/Client 双入口、宿主 React module factory；结果卡片与面板~~ **已于 WP7 退役**：UI 由 `platform/web` 独立前端承接 |
 | 交易动态 | 观察原生账户工具最终响应；工作台页面打开时轮询刷新快照；不伪装券商成交推送 |
 | 模式切换 | 用户在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）明确确认 live，携带预期旧模式；在途账户调用租约阻止跨进程切换；脚本只查询/恢复 sim |

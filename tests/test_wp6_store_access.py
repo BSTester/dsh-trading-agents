@@ -264,19 +264,21 @@ class SnapshotTest(StoreAccessBase):
 
     def test_endpoints_manifest_is_23_and_cached(self):
         endpoints = sa.endpoints()
-        # 29 项 = 22 项基础清单（WP7 面板退役后冻结在 sa._BASE_ENDPOINTS，原序=已删
-        # endpoints.js 的数组原序）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS；
-        # 任务 3 起含 factors-history + 6 个交易端点，共 29）。整表钉死见 test_wp6_tables_lock。
-        expected = 22 + len(sa.WP7_ENDPOINTS)
+        # 37 项 = 22 项基础清单（WP7 面板退役后冻结在 sa._BASE_ENDPOINTS，原序=已删
+        # endpoints.js 的数组原序）+ WP7 服务自有端点（store_access.WP7_ENDPOINTS；任务 3
+        # 起含 factors-history + 6 个交易端点）+ WP8 富途实时直通 8 端点
+        # （store_access.FUTU_ENDPOINTS）。整表钉死见 test_wp6_tables_lock。
+        expected = 22 + len(sa.WP7_ENDPOINTS) + len(sa.FUTU_ENDPOINTS)
         self.assertEqual(len(endpoints), expected)
-        self.assertEqual(expected, 29)
+        self.assertEqual(expected, 37)
         self.assertEqual(endpoints[0], "snapshot")
-        self.assertEqual(endpoints[-7], "factors-history")
-        self.assertEqual(endpoints[-6:],
+        self.assertEqual(endpoints[-15], "factors-history")
+        self.assertEqual(endpoints[-14:-8],
                          ["trade_place", "trade_modify", "trade_cancel",
                           "account_positions", "account_orders", "account_funds"])
+        self.assertEqual(endpoints[-8:], list(sa.FUTU_ENDPOINTS))
         # 业务确认两端点必须在白名单里（HTTP 面据此注册路由）
-        self.assertEqual(endpoints[-9:-7], ["confirmation", "confirm-decide"])
+        self.assertEqual(endpoints[-17:-15], ["confirmation", "confirm-decide"])
         self.assertEqual(len(set(endpoints)), expected)
         self.assertEqual(endpoints, sa.endpoints())
         # 缓存返回副本：调用方改动不会污染下一次
@@ -323,7 +325,7 @@ class SnapshotTest(StoreAccessBase):
         self.assertEqual(snap["mode"], "sim")
         self.assertEqual(snap["runs"], [])
         self.assertEqual(snap["activity"], [])
-        self.assertEqual(len(snap["endpoints"]), 22 + len(sa.WP7_ENDPOINTS))
+        self.assertEqual(len(snap["endpoints"]), 22 + len(sa.WP7_ENDPOINTS) + len(sa.FUTU_ENDPOINTS))
         self.assertIsNone(snap["confirmation"])
         self.assertFalse(sa.store_file(self.home).exists())  # 只读：连空 store 都不落盘
 

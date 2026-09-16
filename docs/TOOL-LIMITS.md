@@ -110,6 +110,18 @@ for the requested market`。
 | `quote_company_executive_background` | `leader_name`（如 `马化腾`） | `display_leader_name` | 查不到 |
 | `quote_order_book` | 档数由权限决定 | 假定固定档数 | HK 10 / US 60 / A股 5 / 其余 1 |
 
+### 通道名与返回形状（2026-09-16 实测，富途实时直通交付时复核）
+
+- `quote_option_expiration` **已停用**（tools/call 返回 "tool has been deactivated or does
+  not exist"）；实名是 `quote_option_expiration_date`（`symbol` 必填，HK.00700 实测
+  `ret_code=0`）。工作台直通层的 `FUTU_TOOLS` 按实测事实登记。
+- `quote_order_book` 的 `data` 是**数组**（`[{books: …}]`），不是对象——按对象解包会
+  丢数据（工作台 futu_data 已按"对象或数组"透传）。
+- `quote_option_chain` 对 `US.AAPL` 实测 `ret=-5 backend business error`（HK.00700 正常）；
+  美股个股期权链当前不可依赖，属上游业务错误，工作台按 `trading/futu-error` 如实透出。
+- `quote_option_screen` 除 `field_filter` 外 `strategy` 也是必填（缺省 `ret=-3`），且
+  `market_category_list` 元素是**整数**类别码（传 "US" 字符串同样 `ret=-3`）。
+
 ## 五、不确定项（勿依赖）
 
 - `quote_ipo_list_sg`：新加坡 IPO 列表恒为空（同日 hk/us/my/cn 均有数据）；

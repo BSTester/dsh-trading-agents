@@ -722,12 +722,12 @@ class RoutingTest(unittest.TestCase):
 
 
 class SurfaceLockTest(unittest.TestCase):
-    """工具面 33：新工具进面、confirm-decide 仍排除、字段集与 HTTP 白名单同形。"""
+    """工具面 41：新工具进面、confirm-decide 仍排除、字段集与 HTTP 白名单同形。"""
 
-    def test_tool_surface_is_33(self):
+    def test_tool_surface_is_41(self):
         from server import mcp_tools
-        self.assertEqual(mcp_tools.TOOL_COUNT, 33)
-        self.assertEqual(len(mcp_tools.TOOLS), 33)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 41)
+        self.assertEqual(len(mcp_tools.TOOLS), 41)
         names = {t.name for t in mcp_tools.TOOLS}
         self.assertLessEqual({"trade_place", "trade_modify", "trade_cancel",
                               "account_positions", "account_orders", "account_funds"}, names)

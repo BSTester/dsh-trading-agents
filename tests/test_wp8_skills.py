@@ -6,9 +6,12 @@
 * 数据通道纪律：每个 SKILL.md 都有「数据通道」「工作流程」「安全」三段与免责声明句，
   README 有总览映射表、依赖说明与免责声明；
 * 工具引用真实性（核心）：SKILL.md 里出现的每个 ``mcp__quantwb__<tool>`` 引用都必须
-  真的在平台工具面（platform/server/mcp_tools.py 的 ``TOOLS``，33 工具）里——WP8 任务 5
-  规划的 flow_*/deriv_* 与行情域 quote_snapshot 等**未交付工具不得写成可调用引用**，
-  只能以「待交付」文字出现；
+  真的在平台工具面（platform/server/mcp_tools.py 的 ``TOOLS``，41 工具）里——WP8 规划
+  的行情域 quote_snapshot、screen_*/watchlist_*/fund_* 等**未交付工具不得写成可调用
+  引用**，只能以「待交付」文字出现；capital/option 家族已由「富途实时数据直通」
+  交付（rt_quote/rt_order_book/capital_flow/capital_flow_history/capital_distribution/
+  option_expiration/option_chain/option_screen，工具面 33 → 41），capital-alerts 与
+  derivatives-alerts 必须引用新工具且**不再保留** mcp__futu__ 只读降级段；
 * 交易安全：trading skill 必须给 Web 确认卡片指引并如实说明 live 写通道未接入；
   任何 skill 都不得指引直连富途下单（富途写类 sim_trade_*/trading_* 动词与
   mcp__futu__ 写动词一律不出现）。
@@ -44,15 +47,25 @@ CHANNEL_SECTION = "## 数据通道"
 WORKFLOW_SECTION = "## 工作流程"
 SAFETY_SECTION = "## 安全"
 
-# 规划中未交付的 quantwb 工具前缀（WP8 任务 5 的 flow_*/deriv_*、行情域 quote_* 等）：
-# 只能以「待交付」文字出现，绝不作为 mcp__quantwb__ 前缀的可调用引用。
-UNDELIVERED_PREFIXES = ("mcp__quantwb__flow", "mcp__quantwb__deriv",
-                        "mcp__quantwb__quote", "mcp__quantwb__screen",
+# 规划中未交付的 quantwb 工具前缀（行情域 quote_*、筛选 screen_*、自选股 watchlist_*、
+# 深度数据 fund_*/research_*/valuation_*/corp_*/holders_*/short_* 等）：只能以「待交付」
+# 文字出现，绝不作为 mcp__quantwb__ 前缀的可调用引用。
+# 资金/衍生品家族已由「富途实时数据直通」交付（capital_flow*/capital_distribution/
+# option_expiration/option_chain/option_screen/rt_quote/rt_order_book），对应的
+# flow_*/deriv_* 规划前缀随之移出禁入清单；confirm_decide 是人工批准通道
+# （MCP_EXCLUDED_ENDPOINTS），连名字都禁入。
+UNDELIVERED_PREFIXES = ("mcp__quantwb__quote", "mcp__quantwb__screen",
                         "mcp__quantwb__watchlist", "mcp__quantwb__ipo",
                         "mcp__quantwb__plate", "mcp__quantwb__info_",
                         "mcp__quantwb__fund_", "mcp__quantwb__research_",
                         "mcp__quantwb__valuation_", "mcp__quantwb__corp_",
-                        "mcp__quantwb__holders_", "mcp__quantwb__short_")
+                        "mcp__quantwb__holders_", "mcp__quantwb__short_",
+                        "mcp__quantwb__confirm_decide")
+# capital/derivatives 两技能已切换到已交付的实时直通工具；引用清单按技能钉死。
+DELIVERED_CHANNEL_TOOLS = {
+    "capital-alerts": ("capital_flow", "capital_flow_history", "capital_distribution"),
+    "derivatives-alerts": ("option_expiration", "option_chain", "option_screen"),
+}
 # 富途写类工具动词（WP7 收窄族）：skills 里连名字都不该出现，出现即视为下单指引。
 FUTU_WRITE_VERBS = re.compile(
     r"mcp__futu__\w*(input_order|place_order|modify_order|cancel_order)\w*")
@@ -131,21 +144,33 @@ class FutuSkillsToolReferenceTests(unittest.TestCase):
                     "规划未交付的工具只能以「待交付」文字提及，不得写成可调用引用）")
 
     def test_undelivered_tools_only_mentioned_as_pending_text(self):
-        """flow_*/deriv_*/quote_* 等 WP8 规划工具只能以待交付文字出现。"""
+        """quote_*/screen_*/confirm_decide 等未交付工具只能以待交付文字出现。"""
         for sub in EXPECTED_SKILLS:
             text = skill_text(sub)
             with self.subTest(skill=sub):
                 for prefix in UNDELIVERED_PREFIXES:
                     self.assertNotIn(prefix, text,
-                                     f"{sub}/SKILL.md 把未交付工具写成了 mcp__quantwb__ 引用")
-        for sub in ("capital-alerts", "derivatives-alerts"):
+                                     f"{sub}/SKILL.md 把未交付/禁入工具写成了 mcp__quantwb__ 引用")
+
+    def test_capital_and_derivatives_use_delivered_realtime_passthrough(self):
+        """capital/derivatives 两技能：数据通道已切换为已交付的 quantwb 实时直通工具。
+
+        「富途实时数据直通」交付后，两技能不得再保留 ``mcp__futu__`` 只读降级段，也不得
+        再把通道写成「待交付」——技能必须引用新工具并如实按已交付口径工作。
+        """
+        for sub, tools in DELIVERED_CHANNEL_TOOLS.items():
             text = skill_text(sub)
+            refs = quantwb_refs(text)
             with self.subTest(skill=sub):
-                self.assertIn("WP8 任务 5", text,
-                              f"{sub}/SKILL.md 必须标注缺口能力的交付来源（WP8 任务 5）")
-                self.assertIn("待交付", text, f"{sub}/SKILL.md 必须如实标注待交付")
-                self.assertIn("mcp__futu__", text,
-                              f"{sub}/SKILL.md 必须给出只读降级路径")
+                for tool in tools:
+                    self.assertIn(tool, refs,
+                                  f"{sub}/SKILL.md 必须引用已交付的 mcp__quantwb__{tool}")
+                self.assertNotIn("mcp__futu__", text,
+                                 f"{sub}/SKILL.md 不得再保留 mcp__futu__ 只读降级段")
+                self.assertNotIn("待交付", text,
+                                 f"{sub}/SKILL.md 的通道已交付，不得再标注待交付")
+                self.assertNotIn("WP8 任务 5", text,
+                                 f"{sub}/SKILL.md 不得再引用过期的交付来源标注")
 
 
 class FutuSkillsTradingSafetyTests(unittest.TestCase):
