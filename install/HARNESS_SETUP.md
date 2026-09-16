@@ -4,6 +4,11 @@
 > 安装手册、失败排查、安全边界都在这一段里，Harness 无需阅读本文件其余部分也能执行。
 > ②③④ 是同一份手册的**人类对照版**（含预期输出与背景解释），供人查阅与维护，不是第二执行依据。
 
+> **能力清单**：一键安装覆盖「拉代码 → 对话模式（preset 行 + `skills/`）→ 平台服务
+> （venv/依赖/Web 构建/服务启动/验证）→ MCP 集成（quantwb 工作台 + 可选富途只读）」全栈，
+> 并包含**富途官方 skills 参考集成（7 个，数据通道对接工作台，工具清单见
+> `skills/futu-skills/README.md`）**。
+
 ---
 
 ## ① 提示词（整段粘贴给 Harness）
@@ -37,6 +42,12 @@
      git clone --depth 1 https://github.com/BSTester/dsh-trading-agents.git "$REPO_ROOT"
 3. 安装插件并激活 preset 工具行：
    python3 scripts/install_plugins.py install --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"
+3b. skills 技能就位：skills/ 随仓库分发（preset 的 customSkillDirs 直读仓库目录，
+    含 skills/trading-agents 与 skills/futu-skills 七个富途技能），第 2 步的 clone/pull
+    已把它们带到本地，无需单独安装；**已安装过对话模式**的旧副本在本步用
+    python3 scripts/install_plugins.py update --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"
+    更新（skills/ 与 preset 行一并刷新，幂等，可重复运行）。
+    校验：ls "$REPO_ROOT/skills/futu-skills" 应列出 7 个技能目录与 README.md。
 4. 平台安装器（幂等，重复运行安全）：
    python3 scripts/install_platform.py --home "$HOME/.dsh"
    依次输出 venv/deps/web/service/verify 五步 JSON 摘要。「venv 已存在报
@@ -52,6 +63,9 @@
    - 确认「- id: fin-data」与「- id: trading-engine」两行为 disabled: false
      （仓库默认已是 false，确认即可）；
    - 不要动其他行：futu-keepalive 等保持原状。
+6b. 技能可用提示：preset 的 customSkillDirs 直读仓库 skills/ 目录，此时
+    futu-skills 的 7 个技能已可用（新建会话生效）；每个技能用哪些工具、缺口能力
+    如何降级，工具清单见 skills/futu-skills/README.md。
 7. 后台启动服务（若第 4 步已报 already-running 则跳过本步）：
    cd "$REPO_ROOT/platform" && "$HOME/.dsh/trading-venv/bin/python" -m server.run
    放在 Harness 的后台终端/pty 里保持进程存活。启动成功会打印单行 JSON
@@ -86,7 +100,8 @@
    ~/.dsh/trading-platform.json 配置 service.token（/api 与 /mcp 需 Bearer，/healthz 豁免）。
 2. 模式切换：Harness 侧只能 live→sim；sim→live 只能在独立 Web 工作台由用户输入口令完成。
 3. 富途写通道已收窄至工作台：Harness 进程内 sim_trade_*/trading_* 写类工具被策略一律拒绝
-   （未知动词同样按写拒绝），实盘下单唯一路径是 Web 确认卡片批准后的 quantwb trade_* 或计划执行。
+   （未知动词同样按写拒绝），实盘下单唯一路径是 Web 确认卡片批准后的 quantwb trade_* 或计划执行；
+   futu-skills 的 7 个技能同样遵守本条——它们的交易动作也只走工作台确认卡片。
 4. 不要为绕过工具策略而用 shell/HTTP 直接调券商接口；分析结论都应标注数据时间与不确定性。
 ```
 
@@ -111,9 +126,11 @@
 |---|---|---|---|
 | 2 获取/更新 | `git -C "$REPO_ROOT" pull --ff-only` 或 `git clone --depth 1 …` | 更新/克隆成功 | 已是最新则 `Already up to date.` |
 | 3 插件安装 | `python3 scripts/install_plugins.py install --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | 安装 web profile 工作台 Host 与投研/数据插件，激活 preset 工具行 | 重复安装覆盖同版本包 |
+| 3b skills 就位 | skills/ 随仓库分发（customSkillDirs 直读仓库，无需单独安装）；已安装过对话模式的旧副本跑 `python3 scripts/install_plugins.py update --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | `ls skills/futu-skills` 列出 7 个技能目录与 README.md | update = git pull + preset 行翻转回填，幂等，可重复运行 |
 | 4 平台安装器 | `python3 scripts/install_platform.py --home "$HOME/.dsh"` | 五行 JSON 摘要：`venv`/`deps`/`web`/`service`/`verify` | venv 已存在 → `already-exists`；dist 新于 src → 跳过重建；端口在跑 → `already-running` |
 | 5 数据层链接 | `python3 scripts/install_plugins.py link --repo "$REPO_ROOT" --dsh-home "$HOME/.dsh"` | 把 `trading_core`/`trading_datasource` 写入 venv（.pth） | 每次合并 WP 分支后重新 link 一次 |
 | 6 启用行 | 编辑 `agent.cordis.yml` | `quant-platform-mcp` 行 `disabled: false`；`fin-data`/`trading-engine` 确认 `disabled: false` | 只改 quant-platform-mcp 行的 disabled，`toolCallTimeoutMs: 180000` 保持不动（确认 TTL 120s + 作答余量）；`futu-keepalive` 不动 |
+| 6b 技能可用 | 无命令（提示项） | futu-skills 的 7 个技能已可用（新建会话生效）；工具清单见 `skills/futu-skills/README.md` | 技能由 customSkillDirs 直读仓库目录，随 3b 的仓库副本更新 |
 | 7 启动服务 | `cd platform && "$HOME/.dsh/trading-venv/bin/python" -m server.run`（后台） | 单行 JSON：`{"ok":true,"service":"quant-platform","url":…,"tools":…}` | 已在跑则跳过（第 4 步会报 `already-running`） |
 | 8 验证 | `curl -fsS http://127.0.0.1:8397/healthz` | `{"ok":true,"mode":"sim","scheduler":{…}}` | 只读探测 |
 | 9 新会话验证 | 用户新建 Harness 会话 | 工具面出现 `mcp__quantwb__*`（如 `trading_status`） | 行加载发生在会话创建时 |
@@ -168,3 +185,5 @@ python3 scripts/install_platform.py --home ~/.dsh --skip-all             # 干�
   进程内被工具策略一律拒绝，且未知动词同样按写拒绝（fail-closed）；实盘下单唯一路径是
   **Web 确认卡片批准后的 `quantwb trade_*` 工具或计划执行（需用户打字确认）**。
   不要尝试用 shell/HTTP 绕过工具策略直连券商。
+- **futu-skills 同规**：`skills/futu-skills/` 的 7 个富途技能只提供只读分析与工作台取数，
+  它们的交易动作同样只走工作台确认卡片；任何技能里出现"直连富途下单"的指引都属异常。

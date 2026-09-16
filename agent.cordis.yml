@@ -97,6 +97,10 @@
   config:
     customSkillDirs:
       - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/', baseUrl))"
+      # futu-skills（WP8 参考集成）嵌套在 skills/ 下一层，而技能扫描器只认
+      # <root>/<dir>/SKILL.md 一层深度，故把该技能包根单独挂载；
+      # 其下 README.md 无 frontmatter 会被忽略（一条无害 warn）。
+      - !!js "process.getBuiltinModule('node:url').fileURLToPath(new URL('skills/futu-skills/', baseUrl))"
 
 - id: tool-skill
   name: '@deepseek-ai/dsh-tool-skill'
