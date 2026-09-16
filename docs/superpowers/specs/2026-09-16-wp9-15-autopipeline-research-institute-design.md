@@ -321,7 +321,12 @@ ET D）。逐候选回退保证「按本地会话日冻结的计划」在两种�
 
 ## 五、WP10：流程页签
 
-### 5.1 pipeline 端点（GET /api/wb/pipeline，只读）
+### 5.1 pipeline 端点（POST /api/wb/pipeline 空载荷，只读）
+
+> 措辞修订（实现期，2026-09-16）：规格初稿写作 `GET /api/wb/pipeline`；实现与仓库既有
+> 约定一致——只读快照类端点（`plan`/`schedule`/`reconcile`）一律走
+> `POST /api/wb/<endpoint>` 空载荷 + envelope 契约，故 pipeline 同此口径（`GET` 专用
+> 路由仅 `openapi_config`/`auto_pipeline` 两个设置读端点使用）。
 
 每市场返回今日各阶段状态，来源全部是既有事实，**只读不造**：
 
@@ -339,7 +344,9 @@ ET D）。逐候选回退保证「按本地会话日冻结的计划」在两种�
 - 每市场一条 antd Steps 横向链，状态着色（完成/跳过/失败/待运行），
   点击阶段下钻到计划/调度/审计页；
 - 页头：模式徽章（SIM/LIVE）+ auto_pipeline 开关徽章；
-- 开关按钮走 settings 扩展（5.3），页面上明确提示「关闭时流水线不自动运行」。
+- 开关**在设置页**（settings 扩展，见 5.3），流程页只显示开关状态徽章；设置页开关区
+  明确提示「关闭时流水线不自动运行」（措辞修订，实现期 2026-09-16：初稿「页面上」指代
+  不清，实现按计划把开关落在设置页）。
 
 ### 5.3 auto_pipeline 开关（settings_api 扩展）
 
