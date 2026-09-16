@@ -331,6 +331,7 @@ Client 用 `ctx.connection.rpc.call` 调用并继承 Connection 信任——该 
 | `confirmation` | `{}`（空载荷，**不进缓存**） | `{pending, ttl_ms}`；`pending` 为待用户确认的实盘写操作（编号、工具、中文订单摘要、创建/到期时间）或 `null` |
 | `confirm-decide` | `{id, decision: "approved"\|"rejected"}` | 提交用户的决定；**唯一能批准实盘操作的通道**，只由独立 Web 确认卡片的用户点击触发（不进 MCP 工具面） |
 | `factors-history`（WP7） | `{limit?}`（1..120，TTL 5m 缓存） | 定时收集的因子快照历史（按交易日倒序） |
+| `sentiment-history`（WP11） | `{symbol?, limit?}`（1..120，TTL 5m 缓存） | 给了 `symbol` → 该标的情绪快照倒序记录；未给 → 最近有记录日摘要 `{date, symbols, sources, days}`。**只作研究参考，不参与信号计算**（`factors.py` 铁律：情绪永不入因子计算） |
 | `trade_place` / `trade_modify` / `trade_cancel`（WP7；WP8 任务 6 扩面） | `trade_place`: `{symbol*, side*, qty*, order_type?, price?, time_in_force?, session?, aux_price?, lot_type?, remark?, order_class?, multi_leg_info?, client_order_id?}`（官方 place-order 全字段：8 种 order_type / GTC / 美股时段（市价单仅 RTH）/ 触发价 / 港股手数 / 备注 ≤64B / 多腿 MLEG）；`trade_modify`: 另加 `aux_price?`（官方改单请求体无 order_type）；`trade_cancel`: `{order_id*, symbol*, client_order_id?}` | 经交易闸门链的写操作；字段校验（条件必填/枚举/互斥/结构，**早于风控与确认**）失败 → `trading/invalid-operation`（消息带官方允许值），风控/确认/券商失败 → `trading/order-rejected` / `trading/broker-unavailable`，绝不 500；sim 通道仅支持限价当日单，扩展字段如实拒绝、不静默丢弃 |
 | `account_positions` / `account_orders` / `account_funds`（WP7） | `{mode?}` | 券商账户查询直通（模式文件约束；不进任何缓存；失败账户列入 `errors` 不掩盖） |
 | `push_status`（WP8 任务 6） | `{}`（空载荷，TTL 0） | 富途 WS 推送状态：`{enabled, started, reason, last_error, quote, trade}`——与 `/healthz` 的 `push` **同一实现、同一事实**（quote/trade 各含 connected/authenticated/最后消息时间/重连次数/订阅意图） |
