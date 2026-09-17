@@ -185,6 +185,17 @@ def build_parser():
     s.add_argument("--limit", type=int, default=10, help="告警条数（默认 10）")
     _add_db(s)
 
+    # ── 受约束的一次性订单终态对齐（E2E S2 遗留；对账覆盖不到时的人工路径）──
+    s = sub.add_parser("oms-align",
+                       help="把 OMS 订单对齐到终态（cancelled/rejected；写告警留痕，"
+                            "不触达券商；优先用 reconcile-daily 收敛）")
+    s.add_argument("--broker-order-id", required=True, help="券商订单号")
+    s.add_argument("--status", required=True, choices=("cancelled", "rejected"))
+    s.add_argument("--reason", required=True, help="对齐原因（必填，进审计告警）")
+    s.add_argument("--operator", default="cli", help="操作者标识（默认 cli）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    _add_db(s)
+
     # ── 首启配置（E2E 缺陷 7）：从 universe 的指数成分快照生成关注池 ──
     s = sub.add_parser("watchlist-init",
                        help="从指数成分快照初始化关注池（首启必做：否则数据作业不采集）")
@@ -750,6 +761,16 @@ def main(argv=None):
         elif args.cmd == "snapshot-reconcile":
             from . import snapshots
             result = snapshots.reconcile_snapshot(conn, chain_limit=args.limit)
+        elif args.cmd == "oms-align":
+            import os
+            from . import reconcile
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = reconcile.align_terminal(conn, home, args.broker_order_id,
+                                              args.status, args.reason,
+                                              operator=args.operator)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False))
+                return 1
         elif args.cmd == "watchlist-init":
             import os
             from . import watchlist

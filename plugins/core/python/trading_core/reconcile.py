@@ -36,7 +36,7 @@ critical 告警 + halt（**只暂停后续执行，绝不自动平仓**）→ TC
 import datetime as _dt
 import hashlib
 
-from . import oms, store
+from . import alerts, oms, store
 
 _TZ8 = _dt.timezone(_dt.timedelta(hours=8))
 
@@ -50,6 +50,29 @@ SIM_READ_TOOLS = ("sim_trade_account_list", "sim_trade_position_list",
 
 #: 券商订单行 side 码 → 仓库方向（TOOL-LIMITS 实测：1=Buy 2=Sell）。
 SIDE_BY_CODE = {1: "BUY", 2: "SELL"}
+
+#: 官方 **已发布** 的订单终态 → OMS 目标状态（`naming-dictionary#order-status`，
+#: 2026-09-17 现场核对官方文档）。**只认字符串枚举**：托管 MCP 的未公开整数码
+#: （TOOL-LIMITS 明示禁止猜标签）不在表内，遇到即「不确定」→ 不迁移、交给差异判定。
+#:
+#: * ``CANCELLED_ALL``（全部撤单、无成交）→ ``cancelled``；
+#: * ``CANCELLED_PART``（部分成交、剩余已撤）→ ``partial``（**数量口径优先于状态文本**，
+#:   延续 WP8 P1 遗留项：有成交就不能标 cancelled；该单因此仍非终态，属已知遗留）；
+#: * ``FAILED``（服务端拒绝）→ ``rejected``。
+BROKER_TERMINAL_STATUS = {
+    "CANCELLED_ALL": "cancelled",
+    "CANCELLED_PART": "partial",
+    "FAILED": "rejected",
+}
+
+#: 官方**已发布**的模拟交易订单状态码（`sim-trade/order-list.md`「字段说明」原文，
+#: 2026-09-17 现场核对：``2=已提交 3=部分成交 4=全部成交 5=已撤 6=拒绝``）。
+#:
+#: 与上面那张表的区别：模拟交易 REST/托管 MCP 返回的是**整数** ``status``，而这张表是官方
+#: 文档逐值列出的契约——因此解释它**不再是猜标签**（本仓库此前「禁止猜整数码」是因为当时
+#: 没有契约可用）。对账只查模拟交易订单工具（``SIM_READ_TOOLS``），本表即适用。
+#: 表外的整数码一律视为不确定（不迁移，交差异判定）。
+SIM_ORDER_STATUS = {2: "submitted", 3: "partial", 4: "filled", 5: "cancelled", 6: "rejected"}
 
 
 def _int_of(value):
@@ -140,10 +163,20 @@ def _broker_order_rows(rows, normalize):
             "symbol": normalize(row.get("symbol") or row.get("code")),
             "side": SIDE_BY_CODE.get(side_code, ""),
             "qty": _int_of(row.get("qty")),
-            "cum_qty": _int_of(row.get("cum_qty")),
+            # 累计成交：官方 REST 用 dealt_qty，托管 MCP 用 cum_qty——两者都是数量事实
+            "cum_qty": _int_of(row.get("cum_qty")
+                               if row.get("cum_qty") is not None else row.get("dealt_qty")),
             "price": _float_of(row.get("price")),
-            "avg_fill_price": _float_of(row.get("avg_fill_price")),
-            "status_raw": row.get("status"),
+            "avg_fill_price": _float_of(row.get("avg_fill_price")
+                                        or row.get("dealt_avg_price")),
+            "status_raw": row.get("status") if row.get("status") is not None
+                          else row.get("order_status"),
+            # 整数状态码原样保留（模拟交易文档已发布 2/3/4/5/6 的取值，见 SIM_ORDER_STATUS）
+            "status_code": _int_of(row.get("status")),
+            # 官方 **已发布** 的字符串状态（naming-dictionary#order-status）。只有它进终态
+            # 对齐判定；托管 MCP 的未公开整数码一律不解释（沿用既有保守口径）。
+            "order_status": (str(row.get("order_status")).strip().upper()
+                             if isinstance(row.get("order_status"), str) else None),
         })
     return out
 
@@ -335,8 +368,31 @@ def _advance_order_states(conn, pairs):
     advanced, skipped = [], []
     for order, broker_row, _match in pairs:
         cum = broker_row["cum_qty"]
+        # —— 终态对齐（E2E S2 遗留，2026-09-17）——
+        # 券商已给**已发布**的终态时，本地仍在途的单必须跟着收敛，否则 `orders` 里留下
+        # 永久 `submitted` 的幽灵行：闸门在途查重会一直挡住同标的同方向新单，审计链也失真。
+        # 判据只认两件事：①官方字符串枚举；②数量事实不矛盾（全撤必须无成交）。
+        # 任何不确定（未公开整数码、状态与数量矛盾、迁移不在合法路径）→ **不猜**，
+        # 保持原状并交给 `_pair_diffs` 报差异（保守方向）。
+        terminal = _terminal_target(broker_row, cum)
+        if terminal is not None:
+            before = order["status"]
+            outcome, why = _try_terminal(conn, order, terminal, broker_row)
+            if outcome:
+                # 记录形状与数量口径推进**统一**（消费方不必分辨两条路径）
+                outcome.setdefault("broker_cum_qty", int(cum) if cum else 0)
+                outcome.setdefault("oms_qty", _int_of(order["qty"]))
+                advanced.append(outcome)
+            elif why:
+                skipped.append({"client_order_id": order["client_order_id"],
+                                "from": before, "to": terminal,
+                                "broker_order_id": broker_row["broker_order_id"],
+                                "broker_cum_qty": int(cum) if cum else 0,
+                                "oms_qty": _int_of(order["qty"]), "reason": why})
+            continue
+        # 终态不确定（表外码、或状态与数量矛盾）→ 落到下面的数量口径推进；无成交则不动
         if not cum or cum <= 0:
-            continue                                  # 未成交：状态不动
+            continue                                  # 未成交且无终态事实：状态不动
         oms_qty = _int_of(order["qty"])
         if oms_qty is None or oms_qty <= 0:
             continue                                  # 委托量不可解：不猜目标状态
@@ -359,6 +415,74 @@ def _advance_order_states(conn, pairs):
                          "broker_cum_qty": int(cum), "oms_qty": oms_qty})
     return {"count": len(advanced), "skipped": len(skipped),
             "orders": advanced, "skipped_orders": skipped}
+
+
+def _mapped_terminal(mapped, cum, broker_row, explicit_no_fill):
+    """已发布枚举值 + 数量事实 → OMS 目标；矛盾/不确定一律 ``None``。
+
+    ``explicit_no_fill``：官方字符串 ``CANCELLED_ALL`` 的语义就是「**全部撤单、无成交**」
+    ——若同时有累计成交，两侧事实自相矛盾，**不猜**（留给差异判定）。模拟交易的整数码
+    ``5`` 只标「已撤」、不区分是否部分成交，故 ``5`` + 有成交时按**数量口径**给 ``partial``
+    （有成交就不能标撤单，延续 WP8 P1）。
+    """
+    if mapped is None or mapped == "submitted":
+        return None
+    if mapped == "cancelled":
+        if not cum:
+            return "cancelled"
+        return None if explicit_no_fill else "partial"
+    if mapped == "partial":
+        return "partial" if cum else None
+    if mapped == "filled":
+        qty = broker_row.get("qty")
+        return "filled" if (cum and qty and cum >= qty) else None
+    return mapped                                     # rejected
+
+
+def _terminal_target(broker_row, cum):
+    """券商订单状态 → OMS 目标状态；**不确定返回 None**（不猜）。
+
+    只认两份**已发布**契约：官方 live 的字符串 ``order_status``（``BROKER_TERMINAL_STATUS``）
+    与官方模拟交易的整数 ``status``（``SIM_ORDER_STATUS``，`sim-trade/order-list.md` 逐值列出）。
+    表外的取值（含托管 MCP 历史遗留的未标注整数）一律视为不确定。
+    """
+    text = str(broker_row.get("order_status") or "").strip().upper()
+    if text:
+        return _mapped_terminal(BROKER_TERMINAL_STATUS.get(text), cum, broker_row,
+                                explicit_no_fill=(text == "CANCELLED_ALL"))
+    code = broker_row.get("status_code")
+    if isinstance(code, int) and not isinstance(code, bool):
+        return _mapped_terminal(SIM_ORDER_STATUS.get(code), cum, broker_row,
+                                explicit_no_fill=False)
+    return None
+
+
+def _try_terminal(conn, order, target, broker_row):
+    """按合法路径迁移；返回 ``(记录, 跳过原因)``。
+
+    三种结果（消费方据此分类，**不制造噪音**）：
+
+      * 已在目标态 → ``(None, None)``：什么都没发生，既不算推进也不算跳过；
+      * 非法迁移（如 ``submitting → filled`` 须先经 ``submitted``）→ ``(None, "非法迁移 …")``：
+        计入 ``skipped`` 并**保留状态机给的原因**（不绕开状态机、不替它猜多步路径）；
+      * 迁移成功 → ``(记录, None)``，并**就地刷新**共享结构（紧随的 `_pair_diffs` 必须看到
+        同步后的状态，否则对齐过的单会被用旧状态再判一次）。
+    """
+    if order["status"] == target:
+        return None, None
+    if not oms.TRANSITIONS.get(order["status"]):
+        return None, None                             # 本地已是终态：不回退，也不算跳过
+    cid = order["client_order_id"]
+    before = order["status"]
+    try:
+        oms.transition(conn, cid, target,
+                       err=f"reconcile:{broker_row.get('order_status') or 'terminal'}")
+    except ValueError as error:
+        return None, f"非法迁移 {before} → {target}：{error}"
+    order["status"] = target
+    return ({"client_order_id": cid, "from": before, "to": target,
+             "broker_order_id": broker_row["broker_order_id"],
+             "broker_order_status": broker_row.get("order_status")}, None)
 
 
 def _sim_broker_state(call, today):
@@ -508,3 +632,55 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     return {"ok": True, "diffs": diffs, "untracked": untracked,
             "orders": digest["orders"], "tca": tca_summary, "digest": digest,
             "fills_backfilled": backfill, "orders_advanced": advance, "halted": halted}
+
+#: 允许经 `align_terminal` 人工对齐的目标状态（只允许**终态**，且不含 `filled`——
+#: 「已成交」是对券商事实的断言，必须由对账按数量口径得出，不能由人一键写成）。
+ALIGN_ALLOWED_TARGETS = ("cancelled", "rejected")
+
+
+def align_terminal(conn, home, broker_order_id, status, reason, operator="cli"):
+    """受约束的**一次性**订单终态对齐（E2E S2 遗留入口，2026-09-17）。
+
+    存在理由：对账（`daily`）已能按官方终态枚举收敛，但**对账覆盖不到的历史行**（例如
+    S2 修复之前撤单成功却没回写的幽灵 `submitted`）过去只能手改库——那是不可审计操作。
+    本入口给它一条留痕路径。
+
+    纪律（每条都有测试）：
+      * 目标**只允许** `cancelled`/`rejected`（`ALIGN_ALLOWED_TARGETS`）；
+      * 必须命中本地 `orders` 行（按 `broker_order_id`）——无对应行**拒绝且不伪造**；
+      * 必须走 `oms.TRANSITIONS` 的**合法路径**（`filled` 等终态无出边 → 自然拒绝，
+        因此**不可能把已成交的单降级**）；
+      * `reason` 必填（空/纯空白拒绝）——审计要能回答「为什么改」；
+      * 成功写一条 **warn 告警**（含券商单号、from→to、原因、操作者）；
+      * 只写本地 OMS 与告警，**绝不触达券商**（不撤单、不下单、不重放）。
+    返回 `{"ok": True, ...}` 或 `{"ok": False, "error": str}`（调用方据此非零退出）。
+    """
+    target = str(status or "").strip().lower()
+    if target not in ALIGN_ALLOWED_TARGETS:
+        return {"ok": False,
+                "error": f"status 只允许 {'/'.join(ALIGN_ALLOWED_TARGETS)}（收到 {status!r}）"
+                         "；成交类状态必须由对账按数量口径得出"}
+    if not str(reason or "").strip():
+        return {"ok": False, "error": "reason 必填：审计需要知道为什么人工对齐"}
+    row = conn.execute(
+        "SELECT client_order_id, status FROM orders WHERE broker_order_id=?",
+        (str(broker_order_id),)).fetchone()
+    if row is None:
+        return {"ok": False,
+                "error": f"本地没有 broker_order_id={broker_order_id} 的订单行"
+                         "（不伪造：先确认该单是否属于本台账）"}
+    before = row["status"]
+    try:
+        oms.transition(conn, row["client_order_id"], target,
+                       err=f"align:{operator}:{str(reason)[:80]}")
+    except ValueError as error:
+        return {"ok": False,
+                "error": f"非法迁移 {before} → {target}：{error}"
+                         "（终态不可回退；已成交的单不能人工降级）"}
+    alerts.emit(conn, home=str(home), level="warn", title="订单终态人工对齐",
+                detail=f"broker_order_id={broker_order_id} "
+                       f"{before}→{target}；原因：{str(reason)[:120]}；操作者：{operator}")
+    return {"ok": True, "client_order_id": row["client_order_id"],
+            "from": before, "to": target, "broker_order_id": str(broker_order_id),
+            "operator": operator}
+

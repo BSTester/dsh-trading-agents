@@ -11,6 +11,23 @@
 
 > **首启必做（否则平台在跑但什么都没发生）**：配置关注池——`~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300`（需 universe 表已有该指数成分快照；缺它是全部数据作业静默跳过的原因，流程页会显示「关注池未配置」提示）。
 
+### 订单终态人工对齐（`oms-align`，最后手段）
+
+**优先顺序**：① 先跑 `reconcile-daily`（对账会按官方模拟交易状态码自动收敛「券商已撤、
+本地仍在途」的行）；② 对账覆盖不到时才用人工入口（例如 S2 修复之前留下的历史行）：
+
+```bash
+~/.dsh/trading-venv/bin/python -m trading_core oms-align \
+  --broker-order-id 7148788 --status cancelled \
+  --reason "券商订单已撤且 cum_qty=0（E2E 探针遗留，对账未覆盖）" --operator <你的标识>
+```
+
+纪律：只允许 `cancelled`/`rejected`；必须命中本地订单行（不伪造）；必须走合法状态机路径
+（**已成交的单不可能被降级**）；`reason` 必填；成功写一条 `warn` 告警（含券商单号、
+from→to、原因、操作者）；**绝不触达券商**。用一个受约束入口而不是手改 SQLite——后者
+不可审计。
+
+
 ## 0. 前置与路径速查
 
 前置：`~/.dsh/trading-venv` 存在，且执行过 `install_plugins.py link` 把 `trading_core`/`trading_datasource` 同步进 `~/.dsh/trading-python/`（**每次合并 WP 分支后重新 link 一次**，否则 venv 里的 core 是旧副本）。
