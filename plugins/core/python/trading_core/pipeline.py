@@ -117,6 +117,9 @@ _ALERT_STATUS = {
     "情绪快照跳过": ("sentiment_snapshot", "skipped"),
     "情绪源不可用": ("sentiment_snapshot", "failed"),
     "情绪快照全部失败": ("sentiment_snapshot", "failed"),
+    # 预算耗尽（S-1，2026-09-17 实机加固）：**作业跑完了但没采完**——不判 failed（数据
+    # 采到了一部分，把它显示成失败会让运维以为通道坏了），归 skipped。
+    "情绪快照预算耗尽": ("sentiment_snapshot", "skipped"),
     # research_sync.run（research_snapshot 作业，WP12 任务 5）——仅作业**没跑完**时的状态
     # 归因；作业跑完（有 ran 标记）时软失败不改状态，结局在结算 failed/absent 与告警明细里
     # 可查（与情绪阶段同一分工：状态说「跑没跑」，内容说「采到什么」）。
@@ -145,6 +148,7 @@ _ALERT_STATUS = {
 _CONTENT_OUTCOMES = {
     "作业跳过：关注池为空": (None, "skipped", "当日未执行：关注池为空"),
     "情绪快照跳过": ("sentiment_snapshot", "skipped", "当日未采集"),
+    "情绪快照预算耗尽": ("sentiment_snapshot", "skipped", "当日未采完：预算耗尽"),
     "情绪源不可用": ("sentiment_snapshot", None, "部分源不可用"),
     "情绪快照全部失败": ("sentiment_snapshot", "failed", "当日全部失败"),
     "研究快照跳过": ("research_snapshot", "skipped", "当日未采集"),
