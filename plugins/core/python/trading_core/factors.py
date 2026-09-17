@@ -1,12 +1,24 @@
 """因子注册表：@factor 注册，统一签名 fn(conn, futu_symbol, as_of) -> float|None。
 
 可复现性（规格 §5.1）：输入只有 PIT store 与 as_of；情绪永不入内。
+
+本模块另含**验证门统计**（WP14 任务 3，规格 §9.3）：IC 报告（t 检验/分层单调）、
+因子半衰期、Top-N 换手率与门槛判定 ``passes_gate``——阈值集中定义，CLI 与
+``rules-validate`` 共用同一实现，不在各处重写。
 """
 import math
+from statistics import NormalDist
 
 from . import store
 
 REGISTRY = {}
+
+#: IC 均值 t 检验门槛：正态近似下约 5% 双侧
+IC_T_THRESHOLD = 2.0
+#: IC 序列最少期数：正态近似在极小样本下不可用（不是小样本 t 分布）
+IC_MIN_SAMPLES = 20
+#: 分层单调性门槛：分位序（1..Q）与各组收益的 Spearman
+LAYER_MONOTONIC_MIN = 0.9
 
 
 def factor(name):
@@ -171,15 +183,24 @@ def _rank(values):
     return {k: i for i, k in enumerate(order)}
 
 
+def _spearman_ordered(xs, ys):
+    """已配对序列的 Spearman；样本 < 3 返回 None。"""
+    n = len(xs)
+    if n < 3:
+        return None
+    rx, ry = _rank({i: v for i, v in enumerate(xs)}), _rank({i: v for i, v in enumerate(ys)})
+    d2 = sum((rx[i] - ry[i]) ** 2 for i in range(n))
+    denom = n * (n * n - 1)
+    return 1 - 6 * d2 / denom if denom else None
+
+
 def rank_ic(factor_values, forward_returns):
     """Spearman 秩相关；样本 < 3 或零方差返回 None。"""
     common = [k for k in factor_values if k in forward_returns]
     if len(common) < 3:
         return None
-    rf, rr = _rank({k: factor_values[k] for k in common}), _rank({k: forward_returns[k] for k in common})
-    n = len(common)
-    d2 = sum((rf[k] - rr[k]) ** 2 for k in common)
-    return 1 - 6 * d2 / (n * (n * n - 1))
+    return _spearman_ordered([factor_values[k] for k in common],
+                             [forward_returns[k] for k in common])
 
 
 def quintile_returns(factor_values, forward_returns, buckets=5):
@@ -193,3 +214,109 @@ def quintile_returns(factor_values, forward_returns, buckets=5):
         part = common[q * size:(q + 1) * size] if q < buckets - 1 else common[(buckets - 1) * size:]
         out[f"Q{q + 1}"] = sum(forward_returns[k] for k in part) / len(part)
     return out
+
+
+def ic_report(factor_panel, forward_panel, quantiles=5):
+    """多期 IC 报告——验证门的唯一统计入口（规格 §9.3）。
+
+    ``factor_panel``/``forward_panel`` 形状 ``{date: {symbol: value}}``：两侧日期键取
+    交集，单期共同样本 < 3 的日期跳过（沿用 ``rank_ic`` 语义）。返回::
+
+        {"rank_ic_mean", "t_stat", "p_value", "n",
+         "layers": [{"q": 1..Q, "ret": 各分位组前向收益的跨期均值}],
+         "monotonic": 分位序 vs 组收益 Spearman >= LAYER_MONOTONIC_MIN}
+
+    **口径披露**：t 统计用 IC 序列的均值/标准误 + **正态近似**（``statistics.NormalDist``），
+    不是小样本 t 分布；IC 序列零方差时 ``t_stat``/``p_value`` 为 ``None``（无法检验），
+    由 ``passes_gate`` 判不通过。样本量要求见 ``IC_MIN_SAMPLES``。
+    """
+    ics, layer_acc = [], {}
+    for date in sorted(set(factor_panel) & set(forward_panel)):
+        fv, fr = factor_panel[date], forward_panel[date]
+        ic = rank_ic(fv, fr)
+        if ic is not None:
+            ics.append(ic)
+        for key, value in quintile_returns(fv, fr, buckets=quantiles).items():
+            layer_acc.setdefault(key, []).append(value)
+    n = len(ics)
+    layers = [{"q": index + 1, "ret": sum(values) / len(values)}
+              for index, (_key, values) in enumerate(sorted(layer_acc.items()))]
+    monotonic = False
+    if len(layers) >= 3:
+        spread = _spearman_ordered([row["q"] for row in layers],
+                                   [row["ret"] for row in layers])
+        monotonic = spread is not None and spread >= LAYER_MONOTONIC_MIN
+    if n == 0:
+        return {"rank_ic_mean": None, "t_stat": None, "p_value": None, "n": 0,
+                "layers": layers, "monotonic": monotonic}
+    mean = sum(ics) / n
+    t_stat = p_value = None
+    if n >= 2:
+        var = sum((x - mean) ** 2 for x in ics) / (n - 1)
+        std = math.sqrt(var)
+        if std > 0:
+            t_stat = mean / (std / math.sqrt(n))
+            p_value = 2 * (1 - NormalDist().cdf(abs(t_stat)))
+    return {"rank_ic_mean": mean, "t_stat": t_stat, "p_value": p_value, "n": n,
+            "layers": layers, "monotonic": monotonic}
+
+
+def factor_half_life(series):
+    """因子半衰期（lag-1 自相关估计）。
+
+    单位是**采样间隔（调仓期数）**，不是自然日——日频序列下才是「交易日」。
+    ``None`` 从序列剔除；样本 < 3、零方差、自相关 >= 1 → ``None``（不可估计）；
+    自相关 <= 0 → ``0.0``（该间隔内即无持续性）。
+    """
+    xs = [float(v) for v in series if v is not None]
+    if len(xs) < 3:
+        return None
+    left, right = xs[:-1], xs[1:]
+    mean_left, mean_right = sum(left) / len(left), sum(right) / len(right)
+    cov = sum((x - mean_left) * (y - mean_right) for x, y in zip(left, right))
+    var_left = sum((x - mean_left) ** 2 for x in left)
+    var_right = sum((y - mean_right) ** 2 for y in right)
+    if var_left <= 0 or var_right <= 0:
+        return None
+    rho = cov / math.sqrt(var_left * var_right)
+    if rho <= 0:
+        return 0.0
+    if rho >= 1:
+        return None
+    return math.log(0.5) / math.log(rho)
+
+
+def turnover(top_sets):
+    """相邻期 Top-N 成员的**新进比例**均值：(|当期 − 上期|) / |当期|。
+
+    期数 < 2 或空集输入 → ``None``；空期（``set()``）跳过，不计入均值。
+    """
+    periods = [set(item) for item in top_sets if item]
+    if len(periods) < 2:
+        return None
+    ratios = [len(cur - prev) / len(cur) for prev, cur in zip(periods, periods[1:]) if cur]
+    return sum(ratios) / len(ratios) if ratios else None
+
+
+def passes_gate(report, t_threshold=IC_T_THRESHOLD, min_samples=IC_MIN_SAMPLES,
+                monotonic_min=LAYER_MONOTONIC_MIN):
+    """验证门判定（规格 §9.3）：``(ok, reasons)``。
+
+    通过条件：IC 样本量达标 **且** t 统计为正且 >= 门槛（因子方向统一为「越大越看多」，
+    负 t 一律拒绝）**且** 分层单调。``reasons`` 为空表示通过，非空逐条即为验证报告
+    的拒绝依据（供 ``rules-validate`` 落库，不在此处写库）。
+    """
+    reasons = []
+    n = report.get("n") or 0
+    if n < min_samples:
+        reasons.append(f"IC 样本不足：{n} < {min_samples}（正态近似在极小样本下不可用）")
+    t_stat = report.get("t_stat")
+    if t_stat is None:
+        reasons.append("IC 序列无方差或样本不足，无法做 t 检验")
+    elif t_stat < 0:
+        reasons.append(f"因子方向为负：t={t_stat:.2f}（要求越大越看多）")
+    elif t_stat < t_threshold:
+        reasons.append(f"t 检验不显著：t={t_stat:.2f} < {t_threshold}")
+    if not report.get("monotonic"):
+        reasons.append(f"分层不单调：分位序与组收益的 Spearman < {monotonic_min}")
+    return (not reasons), reasons

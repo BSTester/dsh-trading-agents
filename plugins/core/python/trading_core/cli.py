@@ -60,11 +60,15 @@ def build_parser():
     s.add_argument("--end", required=True)
     _add_db(s)
 
-    s = sub.add_parser("ic", help="因子 RankIC 序列")
+    s = sub.add_parser("ic", help="因子 RankIC 序列 + 验证门报告（t 检验/分层/单调）")
     s.add_argument("--factor", default="momentum_60")
     s.add_argument("--symbols", required=True)
     s.add_argument("--as-of", required=True)
     s.add_argument("--horizon", type=int, default=20)
+    # WP14 任务 3：多期 IC 序列取样参数。--step 缺省 0 = 按 horizon 取步长
+    # （非重叠窗口，避免重叠收益把 IC 序列自相关带进 t 检验）。
+    s.add_argument("--lookback", type=int, default=60, help="IC 观测期数（默认 60）")
+    s.add_argument("--step", type=int, default=0, help="取样步长（0=按 horizon 非重叠）")
     _add_db(s)
 
     s = sub.add_parser("backtest", help="walk-forward 组合回测")
@@ -236,6 +240,74 @@ def _factors_snapshot(conn, tickers, date):
     return {"ok": True, "date": date, "tickers": len(per_ticker)}
 
 
+def _forward_return(conn, symbol, as_of, horizon):
+    """单标的前向收益：取 as_of 之后窗口的首尾收盘（近似口径——对齐由 bars 保证）。
+
+    与 WP2 起的既有 ic 口径逐字一致；样本不足返回 None（宁缺毋假）。
+    """
+    as_of2 = (_dt.date.fromisoformat(as_of) + _dt.timedelta(days=horizon * 2)).isoformat()
+    bars = store.read_bars(conn, symbol, "1d", as_of=as_of2, limit=horizon)
+    return bars[-1]["c"] / bars[0]["c"] - 1 if len(bars) >= 2 else None
+
+
+def _ic_sample_dates(conn, symbols, as_of, lookback, step):
+    """多期 IC 的取样日期：≤ as_of 的并集交易日后，从末尾每隔 step 取一个（升序返回）。
+
+    步长缺省为 horizon（非重叠窗口）——重叠收益会把自相关带进 IC 序列、
+    让 t 统计虚高，这是刻意的口径选择而非精度损失。
+    """
+    dates = set()
+    for symbol in symbols:
+        for bar in store.read_bars(conn, symbol, "1d", as_of=as_of, limit=lookback * step + 1):
+            if bar["t"] <= as_of:
+                dates.add(bar["t"])
+    ordered = sorted(dates)
+    if not ordered:
+        return []
+    window = ordered[-lookback * step - 1:]
+    return window[::-1][::step][::-1]
+
+
+def _ic_result(conn, args):
+    """`ic` 子命令实现：as_of 当期 RankIC（既有键不动）+ 多期验证门报告（新增键）。
+
+    保持向后兼容：``factor``/``rank_ic``/``samples`` 语义与 WP2 完全一致；
+    新增 ``rank_ic_mean``/``t_stat``/``p_value``/``n``/``layers``/``monotonic``
+    与门槛结论 ``passes_gate``/``gate_reasons``。
+    """
+    from . import factors
+    symbols = [s.strip() for s in args.symbols.split(",") if s.strip()]
+    factor_fn = factors.REGISTRY[args.factor]
+    step = args.step if args.step and args.step > 0 else max(args.horizon, 1)
+    lookback = max(args.lookback, 1)
+    # ① 当期（as_of）截面：既有输出键的来源
+    vals = {s: factor_fn(conn, s, args.as_of) for s in symbols}
+    vals = {k: v for k, v in vals.items() if v is not None}
+    fwd = {}
+    for symbol in vals:
+        value = _forward_return(conn, symbol, args.as_of, args.horizon)
+        if value is not None:
+            fwd[symbol] = value
+    # ② 多期面板：逐取样日算因子值与前向收益 → ic_report
+    factor_panel, forward_panel = {}, {}
+    for date in _ic_sample_dates(conn, symbols, args.as_of, lookback, step):
+        day_factors = {s: factor_fn(conn, s, date) for s in symbols}
+        day_factors = {k: v for k, v in day_factors.items() if v is not None}
+        day_forward = {}
+        for symbol in day_factors:
+            value = _forward_return(conn, symbol, date, args.horizon)
+            if value is not None:
+                day_forward[symbol] = value
+        if day_factors:
+            factor_panel[date], forward_panel[date] = day_factors, day_forward
+    report = factors.ic_report(factor_panel, forward_panel)
+    ok, reasons = factors.passes_gate(report)
+    return {"factor": args.factor, "rank_ic": factors.rank_ic(vals, fwd),
+            "samples": len(vals), **report,
+            "passes_gate": ok, "gate_reasons": reasons,
+            "lookback": lookback, "step": step, "horizon": args.horizon}
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     conn = store.connect(args.db)
@@ -265,20 +337,7 @@ def main(argv=None):
                                          [t.strip() for t in args.symbols.split(",") if t.strip()],
                                          args.start, args.end)
         elif args.cmd == "ic":
-            from . import factors
-            vals = {s.strip(): factors.REGISTRY[args.factor](conn, s.strip(), args.as_of)
-                    for s in args.symbols.split(",")}
-            vals = {k: v for k, v in vals.items() if v is not None}
-            # 前向收益：取 as_of 之后的窗口（近似口径——交易日对齐由 bars 本身保证）
-            as_of2 = (_dt.date.fromisoformat(args.as_of)
-                      + _dt.timedelta(days=args.horizon * 2)).isoformat()
-            fwd = {}
-            for s in vals:
-                bars = store.read_bars(conn, s, "1d", as_of=as_of2, limit=args.horizon)
-                if len(bars) >= 2:
-                    fwd[s] = bars[-1]["c"] / bars[0]["c"] - 1
-            result = {"factor": args.factor, "rank_ic": factors.rank_ic(vals, fwd),
-                      "samples": len(vals)}
+            result = _ic_result(conn, args)
         elif args.cmd == "backtest":
             from . import walkforward
             result = walkforward.run(conn, strategy_id=args.strategy, train=args.train,
