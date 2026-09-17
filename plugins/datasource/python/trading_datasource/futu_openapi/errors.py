@@ -17,6 +17,18 @@ class OpenApiError(Exception):
         self.jump_url = jump_url
         self.retry_after = retry_after
 
+    def __str__(self):
+        """带**上游错误码**的文本（E2E 缺陷 2，2026-09-17）。
+
+        此前只有 ``ret_msg``（如「backend business error」）——写进 OMS ``orders.err``
+        后无法判断是价格越界、账户权限还是限频，诊断只能靠猜。错误码是上游给的**事实**，
+        必须跟着错误文本走；无码（传输层失败等）时保持原文不变，不凭空造码。
+        """
+        base = "" if self.errmsg is None else str(self.errmsg)
+        if self.errcode is None:
+            return base
+        return f"[errcode={self.errcode}] {base}"
+
 
 class TransportError(OpenApiError):
     """传输层异常（DNS 解析失败 / 连接拒绝 / 超时 / 连接重置 / 响应中断）。

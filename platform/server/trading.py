@@ -1722,12 +1722,20 @@ class TradeGate:
         if has_row:
             # OMS 幂等三件套之二（oms.register_order 同款查重，adhoc 槽）：同标的同方向
             # 在途临时单拒绝重复登记。
-            dup = conn.execute(
-                "SELECT 1 FROM orders WHERE plan_id=? AND symbol=? AND side=? AND "
+            # **改单例外**（E2E S2 同类缺口，2026-09-17）：被替换的那一笔自己也算「在途」，
+            # 若不排除它，`trade_modify` 永远撞自己的查重（撤旧重下根本无法发起）。
+            # 只有**别的**在途单才阻塞；被替换单号用 ``order_id`` 识别。
+            dup_rows = conn.execute(
+                "SELECT client_order_id, broker_order_id FROM orders WHERE plan_id=?"
+                " AND symbol=? AND side=? AND "
                 f"status IN ({','.join('?' * len(core_oms.OPEN_STATES))})",
                 (ADHOC_PLAN_ID, clean["symbol"], clean["side"], *core_oms.OPEN_STATES)
-            ).fetchone()
-            if dup is not None:
+            ).fetchall()
+            replaced = str(clean.get("order_id") or "")
+            blockers = [r for r in dup_rows
+                        if not (operation == "modify" and replaced
+                                and str(r["broker_order_id"] or "") == replaced)]
+            if blockers:
                 return _envelope_fail(
                     "trading/order-rejected",
                     f"{clean['symbol']} {clean['side']} 已有在途临时单（OMS 在途查重）",
@@ -1794,8 +1802,8 @@ class TradeGate:
                 core_oms.transition(conn, cid, "rejected", err=f"broker: {str(error)[:140]}")
             return _envelope_fail("trading/broker-unavailable", message,
                                   client_order_id=cid)
+        status = result.get("status")
         if has_row:
-            status = result.get("status")
             if status == "submitted":
                 core_oms.transition(conn, cid, "submitted",
                                     broker_order_id=result.get("broker_order_id"))
@@ -1807,7 +1815,59 @@ class TradeGate:
                                       {"order": cid, "err": result.get("err")})
             else:  # pragma: no cover —— 适配器契约外的状态立即暴露
                 raise ValueError(f"broker 适配返回未知状态：{status!r}")
+        # S2（E2E 取证，2026-09-17）：**撤单/撤旧成功必须回写 OMS**。此前
+        # ``has_row = operation in ("place","modify")`` 让 cancel 完全不走状态回写，
+        # 券商已撤而本地永久停在 submitted——幽灵在途单会阻塞同标的同方向新单
+        # （oms.register_order 的在途去重）、对账持续报差异、审计链失真。
+        if operation == "cancel":
+            if status == "cancelled":
+                self._cancel_oms_row(conn, result.get("order_id") or clean.get("order_id"),
+                                     "broker:cancelled")
+        elif operation == "modify" and status == "submitted":
+            old_id = clean.get("order_id")
+            new_id = result.get("broker_order_id")
+            # 单号变了 = 撤旧重下（sim 路径）→ 旧行落 cancelled；单号没变 = 原地改单
+            # （live 官方 PUT），同一笔订单仍在途，不动状态。
+            if old_id and str(old_id) != str(new_id):
+                self._cancel_oms_row(conn, old_id, "broker:replaced")
+        # 缺陷 3（E2E 取证，2026-09-17）：**被券商拒的单不是「请求成功」**。此前一律回
+        # {ok:true, status:"rejected"}，调用方/页面据 ok 判定会把拒单当成功；OMS 行照旧保留
+        # （rejected 是审计事实），失败经 error 信封如实上抛。unknown 语义不变（可能已到券商，
+        # 铁律是「先查询、不重放」，不是失败）。
+        if status == "rejected":
+            return _envelope_fail("trading/order-rejected",
+                                  f"券商拒单：{result.get('err') or '未给出原因'}",
+                                  client_order_id=cid)
         return _envelope_ok({**result, "client_order_id": cid})
+
+    def _cancel_oms_row(self, conn, broker_order_id, reason):
+        """按券商单号把 OMS 行迁移到 ``cancelled``（撤单/撤旧重下成功后回写）。
+
+        返回 True=已迁移；False=**没有对应行**或**前驱态非法**——两种情况都发告警且
+        **绝不伪造状态**（迁移由 `oms.transition` 的合法路径表把关，例如已 filled 的单
+        不允许退回 cancelled，那种分叉应留给对账与人工，而不是本地硬改）。
+        """
+        if not broker_order_id:
+            return False
+        row = conn.execute(
+            "SELECT client_order_id, status FROM orders WHERE broker_order_id=?",
+            (str(broker_order_id),)).fetchone()
+        if row is None:
+            core_alerts.emit(conn, home=str(self.home), level="warn",
+                             title="撤单回写：OMS 无对应订单",
+                             detail=f"broker_order_id={broker_order_id}（券商已撤，"
+                                    f"本地无该单——审计链缺口，需人工核对）")
+            return False
+        try:
+            core_oms.transition(conn, row["client_order_id"], "cancelled", err=reason)
+        except ValueError as error:
+            core_alerts.emit(conn, home=str(self.home), level="warn",
+                             title="撤单回写：状态迁移非法",
+                             detail=f"{row['client_order_id']} "
+                                    f"{row['status']}→cancelled 被状态机拒绝：{error}"
+                                    f"（本地状态不伪造，留待对账）")
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------

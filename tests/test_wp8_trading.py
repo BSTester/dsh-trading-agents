@@ -961,14 +961,20 @@ class GateOpenApiTest(unittest.TestCase):
         self.assertTrue(http.calls[-1]["url"].endswith("/accounts/LIVE-1/orders"))
 
     def test_business_error_still_rejected_and_oms_rejected(self):
-        """真业务错误信封（-2000）→ rejected——不因非信封改判而回归。"""
+        """真业务错误信封（-2000）→ rejected——不因非信封改判而回归。
+
+        契约更新（E2E 缺陷 3，2026-09-17）：**拒单不是「请求成功」**——此前回
+        ``{ok:true, status:"rejected"}``，调用方/页面据 ok 判定会把拒单当成功。现在
+        拒单走 ``ok:false`` + ``trading/order-rejected``，而 OMS 行照旧落 ``rejected``
+        （审计事实不变）；错误码也必须可诊断（缺陷 2）。
+        """
         backend = FakeTradeBackend(place_order=OpenApiError("资金不足", errcode=-2000))
         out = self.gate(broker=trading.OpenApiBroker(trade=backend)).place(
             dict(ORDER, client_order_id="CID-BIZ"))
-        self.assertTrue(out["ok"], out)
-        self.assertEqual(out["value"]["status"], "rejected")
-        self.assertIn("资金不足", out["value"]["err"])
-        self.assertIn("errcode=-2000", out["value"]["err"])
+        self.assertFalse(out["ok"], out)
+        self.assertEqual(out["error"]["code"], "trading/order-rejected")
+        self.assertIn("资金不足", out["error"]["message"])
+        self.assertIn("errcode=-2000", out["error"]["message"], "错误码必须可见（缺陷 2）")
         self.assertEqual(self.order_row("CID-BIZ")["status"], "rejected")
         self.assertEqual(backend.count("place_order"), 1)
 
