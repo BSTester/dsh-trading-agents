@@ -17,6 +17,8 @@
 #   scripts/platform_service.sh stop       # 优雅 TERM → 等待端口释放 → 超时才 KILL
 #   scripts/platform_service.sh status     # 端口/健康/PID/日志尾部/工具面计数
 #   scripts/platform_service.sh restart    # stop + start
+#   scripts/platform_service.sh refresh    # 刷新安装副本（core/datasource/fin-data）——
+#                                          # 改了量化侧代码后、重启服务前跑；生产生效的唯一路径
 #
 # 环境变量：
 #   DSH_HOME                  数据根（默认 ~/.dsh）
@@ -288,6 +290,19 @@ _status_body() {
   return 1
 }
 
+cmd_refresh() {
+  # 刷新安装副本（$DSH_HOME/trading-python/{datasource,fin-data,core}）。
+  # 为什么改代码后需要它：副本是**安装时**解出的产物，venv 的 .pth 以它为准；有仓库的
+  # 开发机上子进程优先仓库代码（trading_datasource.repo_paths），**生产没有仓库可优先**，
+  # 所以「仓库改了 → 刷新副本 → 重启服务」是生产生效的唯一路径。
+  # 不重启服务：刷新只换磁盘上的代码，服务进程在下次启动/子进程下次拉起时生效。
+  require_prereqs || return 2
+  echo "刷新安装副本（core / datasource / fin-data）…"
+  "$VENV_PY" "$REPO_ROOT/scripts/install_plugins.py" refresh \
+    --repo "$REPO_ROOT" --dsh-home "$HOME_DIR"
+  echo "✅ 副本已刷新；服务在下次启动/子进程拉起时使用新代码（无需重启也能生效于子进程）"
+}
+
 usage() {
   sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
 }
@@ -298,8 +313,9 @@ main() {
     stop)    cmd_stop ;;
     status)  cmd_status ;;
     restart) cmd_stop && cmd_start ;;
+    refresh) cmd_refresh ;;
     ""|-h|--help|help) usage ;;
-    *) echo "未知子命令：$1（可用：start|stop|status|restart）" >&2; usage >&2; exit 2 ;;
+    *) echo "未知子命令：$1（可用：start|stop|status|restart|refresh）" >&2; usage >&2; exit 2 ;;
   esac
 }
 

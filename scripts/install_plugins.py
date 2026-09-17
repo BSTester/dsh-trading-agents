@@ -171,6 +171,52 @@ def unified_python_root(dsh_home):
     return Path(dsh_home) / UNIFIED_ROOT_NAME
 
 
+def refresh_python(repo, dsh_home):
+    """只刷新统一数据层副本（core/datasource/fin-data），**不动 profile / preset / pnpm**。
+
+    为什么单独一条入口（2026-09-17 实机部署缺口）：``$DSH_HOME/trading-python/*`` 是
+    **安装时**由本脚本解出的副本，venv 的 ``.pth`` 以它为准。代码改了之后若不刷新，
+    **无仓库的环境（生产）仍跑旧副本**——有仓库的开发机上子进程会优先仓库代码
+    （``trading_datasource.repo_paths`` 的策略），但生产没有仓库可优先。
+
+    ``install`` 也刷新副本，但它顺带跑 ``dsh plugin add`` + pnpm（慢、且改 web profile）；
+    只改量化侧代码时不需要那些副作用，故单列一条幂等入口（重跑即刷新）。
+    """
+    repo, dsh_home = Path(repo).resolve(), Path(dsh_home).expanduser().resolve()
+    npm = shutil.which("npm")
+    if not npm:
+        raise FileNotFoundError("npm not found; install Node/npm and rerun")
+    env = {**os.environ, "DSH_HOME": str(dsh_home)}
+    refreshed = []
+    with tempfile.TemporaryDirectory(dir=repo, prefix=".refresh-pack-") as staging:
+        for plugin in UNIFIED_PYTHON:
+            result = subprocess.run(
+                [npm, "pack", "--json", "--pack-destination", staging],
+                cwd=repo / "plugins" / plugin, env=env, check=True,
+                stdout=subprocess.PIPE, text=True,
+            )
+            packed = json.loads(result.stdout)
+            if not isinstance(packed, list) or len(packed) != 1:
+                raise ValueError("npm pack must return exactly one tarball for " + plugin)
+            filename = packed[0].get("filename")
+            if not isinstance(filename, str) or Path(filename).name != filename:
+                raise ValueError(f"npm pack returned an invalid tarball filename for {plugin}")
+            destination = extract_python(Path(staging) / filename, plugin, dsh_home,
+                                         LIBRARY_MARKERS[plugin])
+            modules = sum(1 for path in destination.rglob("*.py")
+                          if "__pycache__" not in path.parts)
+            refreshed.append((plugin, destination, modules))
+    for plugin, destination, modules in refreshed:
+        print(f"refreshed {plugin}: {destination} ({modules} 个 .py)")
+    linked = write_data_layer_pth(dsh_home)
+    if linked is None:
+        print("NOTE: 数据层 .pth 未更新（datasource 未解出或交易 venv 不存在）", file=sys.stderr)
+    else:
+        site, lines = linked
+        print(f"data layer .pth -> {site}: {', '.join(lines)}")
+    return 0
+
+
 def site_packages_dir(dsh_home):
     """定位交易 venv 的 site-packages；venv 尚未创建时返回 None。"""
     venv = Path(dsh_home) / "trading-venv"
@@ -373,7 +419,7 @@ def install_plugins(repo, dsh_home):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("action", choices=("install", "update", "link", "check"))
+    parser.add_argument("action", choices=("install", "update", "link", "check", "refresh"))
     parser.add_argument("--repo", type=Path, required=True)
     parser.add_argument("--dsh-home", type=Path,
                         default=Path(os.environ.get("DSH_HOME", str(Path.home() / ".dsh"))))
@@ -384,6 +430,8 @@ def main():
             write_repo_marker(args.repo, args.dsh_home)
         elif args.action == "check":
             return check_install(args.repo, args.dsh_home)
+        elif args.action == "refresh":
+            return refresh_python(args.repo, args.dsh_home)
         elif args.action == "link":
             result = write_data_layer_pth(args.dsh_home)
             if result is None:

@@ -64,6 +64,41 @@ fin-data/engine 只在 preset 中启用。安装器保留内容寻址的 tarball
   `python -m platform.server.run`——标准库 `platform` 遮蔽同名包。
 - `plugins/trading-agents` 为未启用旧脚手架；当前工具实现位于 `plugins/engine`。
 
+### 代码解析路径（开发机 vs 生产）——2026-09-17 实机部署缺口修复
+
+**问题**：量化侧代码有**两份**——仓库源码与安装器解出的**副本**
+（`~/.dsh/trading-python/{datasource,fin-data,core}`，venv 的 `dsh-trading-python.pth` 指向它）。
+父进程与子进程解析规则不同：
+
+| 场景 | 谁启动 | 解析到 | 机制 |
+|---|---|---|---|
+| 服务进程（Web/MCP/调度器主体） | `server.run` | **仓库源码** | `run.py` 把仓库数据层插到 `sys.path` 最前 |
+| 作业子进程（`python -m trading_core …`） | `daemon._subprocess_runner` | **安装副本** ← 缺口 | `subprocess` 是新解释器，不继承父进程 `sys.path`，只按 `.pth` 找 |
+| 脚本子进程（fin-data 的 `fin_sentiment.py` 等） | `sentiment._default_runner` | 同上 | 同上 |
+
+**后果**：开发机上「代码改了、修复不生效」——实测副本与仓库多份文件 md5 不一致、
+新符号在副本里出现 0 次，作业链每条腿都在跑旧代码。
+
+**修复**：`trading_datasource/repo_paths.py`（**唯一实现**，core 与平台侧共用）把
+**存在的**仓库数据层经 `PYTHONPATH` 前置给子进程；仓库不在场时返回 `None`（继承环境
+→ 回落副本，即生产的正确行为）。fin-data 脚本路径同样**优先仓库**
+（`plugins/fin-data/python/<script>`），保证「脚本与数据层同版本」。
+
+**运维要点（生产/无仓库环境）**：**改了 `core`/`datasource`/`fin-data` 后必须刷新副本**，
+否则重启也只是重跑旧代码：
+
+```bash
+scripts/platform_service.sh refresh   # 只重解这三份副本 + 重写 .pth，不动 profile/pnpm/服务
+scripts/platform_service.sh restart   # 服务进程自身换代码需要它（子进程下次拉起即生效）
+```
+
+判据：`~/.dsh/trading-python/core/trading_core/<file>.py` 的 md5 应与
+`plugins/core/python/trading_core/<file>.py` 一致（`refresh` 会打印各目录模块数）。
+**开发机（有仓库）不需要刷新**——子进程已优先仓库代码；但**跑真实 CLI 验证时要注意**：
+直接 `python -m trading_core …` 仍走副本（没有我们的环境前置），这正是刷新后应复跑一次
+真机命令的原因。
+
+
 ## 四、验证分层
 
 仓库提供可重复的本地测试，而不是依赖上一会话的口头“已跑通”结论：

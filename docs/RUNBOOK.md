@@ -90,7 +90,14 @@ scripts/platform_service.sh start      # 未运行才拉起（已在运行则打
 scripts/platform_service.sh stop       # 优雅 TERM → 等端口释放 → 超时才 KILL
 scripts/platform_service.sh status     # 端口/健康/PID/日志尾部/端点与工具面计数
 scripts/platform_service.sh restart    # stop + start
+scripts/platform_service.sh refresh    # 刷新安装副本（core/datasource/fin-data）；改量化侧代码后跑
 ```
+
+- **改了 core/datasource/fin-data 的代码 → 先 `refresh` 再（按需）`restart`**：生产环境
+  没有仓库可优先，子进程经 venv 的 `.pth` 加载 `~/.dsh/trading-python/*` 这份**安装副本**；
+  不刷新就是「代码改了、行为没变」。`refresh` 只重解这三份副本并重写 `.pth`，**不碰
+  web profile、不跑 pnpm、不重启服务**（子进程下次拉起即用新代码；服务进程自身仍需
+  `restart` 才换代码）。幂等，可随时重跑。原理见 `HANDOVER.md`「代码解析路径」。
 
 - **地址来自配置**：`<home>/trading-platform.json` 的 `service.host` / `service.port`
   （脚本不硬编码 8397；坏 JSON 回落默认）。
