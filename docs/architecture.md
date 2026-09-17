@@ -20,11 +20,13 @@
 > **当前计数：quantwb 工具面 77（72 端点工具 + 5 维护）、服务端点 82**——工具面按
 > **三档**治理（见「富途数据面」节）：直通 11 / 聚合 2 / HTTP-only 3（数据面内），
 > 另有值班队列 `research-tasks-list` 整体排除（WP15）。
-> **WP15（部分交付，2026-09-16）：值班研究员（L3）队列面**——`research_tasks` 状态机
-> （WP15 任务 1）、`enqueue-research` 入链（任务 2）、领取/回报/列表三端点 + 工具面两条
-> （`research_tasks_claim`/`research_tasks_report`）+ 技能值班模式手册（任务 3）已落地；
-> **外部定时器与 headless 唤醒（任务 4/5）待交付**，在此之前 L3 由「会话打开时补跑」
-> 路径可用。
+> **WP15（已交付，2026-09-16）：值班研究员（L3）**——`research_tasks` 状态机（任务 1）、
+> `enqueue-research` 入链（任务 2）、领取/回报/列表三端点 + 工具面两条
+> （`research_tasks_claim`/`research_tasks_report`）+ 技能值班模式手册（任务 3）、
+> **外部定时器与 headless 唤醒**（任务 4：`scripts/research_duty.sh` +
+> `install/research-duty.{service,timer}`）与 L3 端到端验收（任务 5）已落地。
+> L3 的两条消费路径（定时唤醒 / 会话打开补跑）共用同一队列，定时器没跑只延后不丢任务；
+> 运维见 `docs/RUNBOOK.md`「值班研究员（L3）」。
 > 规格见 `docs/superpowers/specs/2026-09-16-wp9-15-autopipeline-research-institute-design.md`，
 > 端点锁定表见 `docs/superpowers/plans/wp12-endpoint-lock.md`，逐端点口径见
 > `docs/TOOL-LIMITS.md` §十。
@@ -182,10 +184,10 @@ SH.000300 成分 300 只 6 页游标跑通）；
 
 ## 三层任务模型（L1 机械 / L2 即时 / L3 定时）
 
-> 状态：**L1 + L2 已实现**（WP9–WP14）；**L3（值班研究员）队列面已交付**（WP15 任务 1–3：
-> `research_tasks` 状态机 / `enqueue-research` 入链 / 领取·回报·列表三端点 / 技能值班模式），
-> **外部定时器与 headless 唤醒待交付**（WP15 任务 4–5）——在那之前 L3 走「会话打开时补跑」
-> 路径，本节表格即为现状。
+> 状态：**三层全部已实现**（WP9–WP15）。L3 的两条消费路径都可用：外部定时器
+> （`install/research-duty.{service,timer}` → `scripts/research_duty.sh` → `dsh --profile headless`）
+> 与「会话打开时补跑」，二者消费同一张 `research_tasks` 表——定时器没装/机器关机/headless
+> 被杀只**延后**不丢任务（超时 `running` 在下次领取时被 `reclaim`）。
 
 平台的任务按「谁触发、谁执行、有没有 LLM」分三层，**层间只经文件/API 交换数据，不相互调用**：
 
@@ -221,7 +223,8 @@ SH.000300 成分 300 只 6 页游标跑通）；
 | `plugins/core/python/trading_core` | **量化平台核心库**（非 Harness 插件）：PIT 存储/日历/同步/质量（WP1）、因子/策略/组合回测/walk-forward（WP2）、风控八规则/计划冻结/OMS 状态机/券商适配/对账/TCA（WP3）、daemon 调度/指令目录/告警（WP4） |
 | `trading_core.rule_engine` | **规则协议的唯一实现**（WP14）：`validate_spec`（字段白名单/枚举/`top_n` 域/未注册与未成熟因子拒绝）、`load_rule`（构造即二次校验，fail-closed）、`RuleStrategy`（声明式 spec → `universe`/`target_weights`，`zscore_equal_weight`/`ic_weighted` 两种合成）、`set_rule_status`/`decide_rule`（状态机；`enabled` 只经 `decide_rule` 并记录批准人）。配套 `strategies.register_rule`/`is_rule`/`unregister_rule`：规则名与内置策略在解析器里待遇不同——**规则每次回查 DB 状态**，非 `enabled` 立即摘除进程内实例（防「停用」被进程内缓存掩盖的 fail-open） |
 | `trading_core` daemon | 无 LLM 单进程守护进程（`python -m trading_core daemon`）：按交易日历触发作业链（sync→质量→信号→计划、对账→TCA→摘要，WP7 起各市场链末尾追加 `factors_snapshot`）、心跳落 `~/.dsh/trading-daemon.json`（> 5 分钟未刷新工作台标红）、轮询指令目录 `~/.dsh/trading-commands/`、告警分级落 `alerts` 表（WP4）。**WP7 起常驻循环由平台服务内调度器承担（见 `platform/` 行）；daemon CLI 保留为手动/兼容入口，与调度器共享 kv `daemon:state` 的 ran 标记，同日作业不重复执行** |
-| `platform/` 独立服务进程（WP6，WP7 独立量化平台） | FastAPI/uvicorn **单进程**，WP7 起承载四块新增职责：**①服务内调度器**（`server/scheduler.py`：daemon 作业链 sync→quality→factors_snapshot 原样复用，tick-first——启动即先跑一轮并补跑当日到期作业，与手动 daemon 共享 ran 标记不重复执行；心跳/告警协议不变；线程随 lifespan 启停，`/healthz` 附 `scheduler:{alive,last_error}`，`last_error` 保留最近一次异常、成功不清除、300 字符截断）；**②富途交易闸门**（`server/trading.py`：模式文件→风控 8 规则（kill 文件=规则 1）→业务确认（`store_access.request_confirmation` 进程内阻塞，**Web 确认卡片作答**，TTL 120s 超时=拒绝 fail-closed）→broker 适配（sim 下单/改单/撤单=撤旧重下/查询；WP8 起 live 经 OpenAPI 执行协议 place/modify/cancel/order-confirm，**未经真实 live 下单验证**，sim→live 冒烟属 P4 人工准入；无 OpenAPI 凭据 → `trading/openapi-unavailable`）；OMS 落 `orders`/`risk_checks` 表，超时→unknown 只查询不重放）；**③受约束交易工具**（`trade_place/trade_modify/trade_cancel` + `account_positions/account_orders/account_funds`，工具面 27→**33**）；**④`factors-history`**（定时快照按交易日落 `factor_snapshots` 表，HTTP/CLI/`mcp__quantwb__factors_history` 三路同源）。**WP8 起新增：⑤OpenAPI 统一通道**（`trading_datasource.futu_openapi`：OAuth2.1+PKCE/AppKey 双认证、限频/错误码映射、`futu_channel` 通道选择）；**⑥WS 推送**（`server/futu_push.py`：行情订阅+交易事件→OMS 状态迁移+告警，重连/refresh 保活，断线事件不补发→**对账兜底轮询保留**，事件仅加速不作唯一事实源）；**⑦推送订阅面**（`push_status/push_subscribe/push_unsubscribe`，与 `/healthz` 的 `push` 同一实现）；**⑧设置页凭据配置**（WP8 任务 7：`openapi_config`/`openapi_test` 读写在 `server/settings_api.py`；OAuth 集成增补 `openapi_oauth`：OAuth 2.1+PKCE 授权流程 start/status/cancel 在 `server/oauth_flow.py`（注册 client→PKCE→127.0.0.1 回调→换 token→凭据落盘 0600，与 AppKey 模式并存；code_verifier 只存内存，state 逐字校验，600s 超时自动停），Web 表单保存 AppKey 凭据（私钥 PEM 粘贴落盘 0600 或已有路径）、联动 `futu_channel`、连通性自检；**私钥原文绝不回显**，状态只给掩码 app_key 与公钥指纹）。既有职责不变：`POST /api/wb/<endpoint>` + `GET /api/wb/openapi_config`（envelope 契约，**77 端点**）+ `/mcp`（mcp SDK streamable-http，**74 工具**=69 端点工具+5 维护；**`confirm-decide` 与设置页两端点有意不进工具面**，防模型自批实盘单/自改凭据）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/业务确认/维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*`/`factors-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
+| `platform/` 独立服务进程（WP6，WP7 独立量化平台） | FastAPI/uvicorn **单进程**，WP7 起承载四块新增职责：**①服务内调度器**（`server/scheduler.py`：daemon 作业链 sync→quality→factors_snapshot 原样复用，tick-first——启动即先跑一轮并补跑当日到期作业，与手动 daemon 共享 ran 标记不重复执行；心跳/告警协议不变；线程随 lifespan 启停，`/healthz` 附 `scheduler:{alive,last_error}`，`last_error` 保留最近一次异常、成功不清除、300 字符截断）；**②富途交易闸门**（`server/trading.py`：模式文件→风控 8 规则（kill 文件=规则 1）→业务确认（`store_access.request_confirmation` 进程内阻塞，**Web 确认卡片作答**，TTL 120s 超时=拒绝 fail-closed）→broker 适配（sim 下单/改单/撤单=撤旧重下/查询；WP8 起 live 经 OpenAPI 执行协议 place/modify/cancel/order-confirm，**未经真实 live 下单验证**，sim→live 冒烟属 P4 人工准入；无 OpenAPI 凭据 → `trading/openapi-unavailable`）；OMS 落 `orders`/`risk_checks` 表，超时→unknown 只查询不重放）；**③受约束交易工具**（`trade_place/trade_modify/trade_cancel` + `account_positions/account_orders/account_funds`，工具面 27→**33**）；**④`factors-history`**（定时快照按交易日落 `factor_snapshots` 表，HTTP/CLI/`mcp__quantwb__factors_history` 三路同源）。**WP8 起新增：⑤OpenAPI 统一通道**（`trading_datasource.futu_openapi`：OAuth2.1+PKCE/AppKey 双认证、限频/错误码映射、`futu_channel` 通道选择）；**⑥WS 推送**（`server/futu_push.py`：行情订阅+交易事件→OMS 状态迁移+告警，重连/refresh 保活，断线事件不补发→**对账兜底轮询保留**，事件仅加速不作唯一事实源）；**⑦推送订阅面**（`push_status/push_subscribe/push_unsubscribe`，与 `/healthz` 的 `push` 同一实现）；**⑧设置页凭据配置**（WP8 任务 7：`openapi_config`/`openapi_test` 读写在 `server/settings_api.py`；OAuth 集成增补 `openapi_oauth`：OAuth 2.1+PKCE 授权流程 start/status/cancel 在 `server/oauth_flow.py`（注册 client→PKCE→127.0.0.1 回调→换 token→凭据落盘 0600，与 AppKey 模式并存；code_verifier 只存内存，state 逐字校验，600s 超时自动停），Web 表单保存 AppKey 凭据（私钥 PEM 粘贴落盘 0600 或已有路径）、联动 `futu_channel`、连通性自检；**私钥原文绝不回显**，状态只给掩码 app_key 与公钥指纹）。既有职责不变：`POST /api/wb/<endpoint>` + `GET /api/wb/openapi_config`（envelope 契约，**82 端点**）+ `/mcp`（mcp SDK streamable-http，**77 工具**=72 端点工具+5 维护；**`confirm-decide` 与设置页两端点有意不进工具面**，防模型自批实盘单/自改凭据）+ `<DSH_HOME>/trading-workbench.json` store 访问层（只读快照/模式切换/业务确认/维护动作）+ `platform/web/dist` 静态托管（`GET /`，SPA fallback）；数据路径复用 `plugins/workbench/python/*` 脚本、`trading_core snapshot-*`/`factors-*` CLI 与指令目录协议，HTTP 与 MCP 同一批处理函数（同源，规格 §3.1） |
+| `scripts/research_duty.sh` + `install/research-duty.{service,timer}` | **L3 值班研究员的唤醒入口**（WP15）：探活平台服务（不可达即非零退出并给指引，**不自己拉起服务**）→ 拼装提示词（内含领取→处理→回报循环与禁用写端点点名清单，防定时执行体提示漂移）→ `dsh --profile headless "<任务>"` 单次运行（`timeout` 包裹，默认 1800s）→ 日志落 `~/.dsh/logs/research-duty-*.log`。systemd timer `Mon..Fri 16:50` + `Persistent=true`（错过的触发在恢复后补跑）；service 不带 `[Install]`——只有 timer 能拉起它，避免每次登录跑一次值班。两条消费路径（本脚本 / 会话打开补跑）共用 `research_tasks` 表 |
 
 `plugins/trading-agents` 是旧的未启用脚手架，不是当前执行引擎。
 workbench 包通过 `dsh.bundle.patch` 插入根级 Host 行；fin-data/engine 是普通插件包，

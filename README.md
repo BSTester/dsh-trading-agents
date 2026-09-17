@@ -330,6 +330,45 @@ DB="${DSH_HOME:-$HOME/.dsh}/trading-data/trading.sqlite"
 规则协议字段、样例与四子代理的工具通道清单见
 [skills/research-institute/SKILL.md](skills/research-institute/SKILL.md)。
 
+## WP15：值班研究员（L3 定时研究任务）
+
+**定位**：研究院的**定时化**——没人开口时自己开工，消费 L1 机械层排好的任务队列。
+它只产**简报 / 因子巡检 / 候选提案**，**不下单、不启用策略**（与 WP14 同一套边界）。
+
+### 开起来（一次性）
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp install/research-duty.service install/research-duty.timer ~/.config/systemd/user/
+# 单元内 %h/dsh-trading-agents 为示例路径，按实际安装位置替换
+systemctl --user daemon-reload && systemctl --user enable --now research-duty.timer
+systemctl --user list-timers research-duty.timer      # NEXT 即下一次唤醒
+```
+
+不想用 systemd 就用 cron（等价行写在 `install/research-duty.timer` 注释里）：
+
+```
+50 16 * * 1-5 /home/<user>/dsh-trading-agents/scripts/research_duty.sh >> ~/.dsh/logs/research-duty-cron.log 2>&1
+```
+
+### 它做什么
+
+| 任务（白名单三种） | 何时入队 | 产出 |
+|---|---|---|
+| `daily_brief` | 每交易日数据就绪后 | 当日资讯影响简报 → 研究页 |
+| `factor_patrol` | 每交易日 | 因子衰减巡检（RankIC/t 值/分层/半衰期/换手）→ 巡检报告 + 异常告警 |
+| `mining_round` | 每周首次 | 因子/规则候选提案 → 候选池（**待你在 Web 批准**） |
+
+入队是**机械层**动作（`enqueue_research`，基础链尾，零 LLM），与 `auto_pipeline` 开关**解耦**：
+关掉自动交易，研究照常产出；反过来，研究产物在人工批准前也进不了交易链。
+
+### 没跑成也不会丢
+
+定时器没装、机器关机、headless 被杀，都只是**延后**：任务留在 `research_tasks`，
+你下次打开会话时由 Harness 补跑（领取时顺手回收超时任务，`attempts` 达 3 次才判 failed）。
+**该脚本不会自己拉起平台服务**——探活失败即非零退出并给指引；日志在
+`~/.dsh/logs/research-duty-*.log`。安装/启停/排查表见
+[docs/RUNBOOK.md](docs/RUNBOOK.md)「值班研究员（L3）」。
 
 ## 工作台与指令示例
 
