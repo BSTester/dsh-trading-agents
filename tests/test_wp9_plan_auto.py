@@ -20,9 +20,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "platform"))
 sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
+sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 
 from server import trading as server_trading  # noqa: E402
 from trading_core import broker, cli, planner, strategies, store  # noqa: E402
+from trading_datasource.market_ids import (  # noqa: E402
+    OPENAPI_ENABLE_MARKET as CANON_OPENAPI_ENABLE_MARKET,
+    SIM_MARKET_IDS)
 
 TODAY = "2026-09-16"
 PREV = "2026-09-15"
@@ -441,12 +445,15 @@ class PlanAutoTest(unittest.TestCase):
         self.assertEqual(planner.CALENDAR_MARKET, server_trading.CALENDAR_MARKET)
 
     def test_market_ids_mapping_matches_platform(self):
-        """模拟账户 market_id 口径同为镜像：港股 1 / A股 3 / 美股 100。"""
-        self.assertEqual(broker.MARKET_IDS, server_trading.PREFIX_MARKET_ID)
+        """模拟账户 market_id 口径：core 与 platform 引用**同一个规范对象**
+        （WP13 审查 M1 收敛镜像——不再用等值断言维护重复）。"""
+        self.assertIs(broker.MARKET_IDS, SIM_MARKET_IDS)
+        self.assertIs(server_trading.PREFIX_MARKET_ID, broker.MARKET_IDS)
 
     def test_openapi_enable_market_matches_platform(self):
-        """live 账户挑选用 enable_market（另一套数字口径）——镜像漂移必须在此处炸掉。"""
-        self.assertEqual(broker.OPENAPI_ENABLE_MARKET, server_trading.OPENAPI_ENABLE_MARKET)
+        """live 账户挑选用 enable_market（另一套数字口径）：同为规范对象。"""
+        self.assertIs(broker.OPENAPI_ENABLE_MARKET, server_trading.OPENAPI_ENABLE_MARKET)
+        self.assertIs(server_trading.OPENAPI_ENABLE_MARKET, CANON_OPENAPI_ENABLE_MARKET)
 
     def test_chain_prefixes_cover_calendar_markets(self):
         """持仓过滤前缀集合与日历市场映射同源（SH 链含 SZ/BJ）。"""

@@ -96,6 +96,14 @@ class _RestValidators:
             raise ValueError(f"{name} 含非法字符（不得含 / ? # 或空白）：{text[:40]!r}")
         return text
 
+    def _acc_id(self, value):
+        """acc_id 进路径：非空字符串且不含路径分隔符/空白（避免拼出意外路径）。
+
+        WP13 审查次要项：原先 ``OpenApiTrade`` 与 ``OpenApiSimTrade`` 各有一份**逐字
+        相同**的实现（提升到基类，单一实现）。
+        """
+        return self._path_token(value, "acc_id")
+
     def _symbol(self, code):
         """标的代码校验（官方 exchange.symbol 形状；大小写归一为大写）。"""
         if not isinstance(code, str) or not self._SYMBOL_RE.fullmatch(code.strip().upper()):

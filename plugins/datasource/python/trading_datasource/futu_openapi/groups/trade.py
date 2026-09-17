@@ -65,13 +65,9 @@ class OpenApiTrade(_RestValidators):
     def __init__(self, client):
         self.client = client
 
-    # ------------------------------------------------------------ 校验助手（交易专有）
-
-    def _acc_id(self, value):
-        """acc_id 进路径：非空字符串且不含路径分隔符/空白（避免拼出意外路径）。"""
-        return self._path_token(value, "acc_id")
-
-    # _path_token / _symbol / _text 由 _RestValidators 提供（WP12 任务 2 起共用一份实现）
+    # _acc_id / _path_token / _symbol / _text 由 _RestValidators 提供（WP12 任务 2 起
+    # 共用一份实现；_acc_id 于 WP13 审查次要项从本类与 OpenApiSimTrade 的重复定义
+    # 提升到基类，单一实现）。
     # _micros / _page_flag / _page_size 亦已提升到基类（WP13 任务 2：模拟交易历史订单
     # 同口径使用，两处各写一份迟早会错位）。
 

@@ -49,7 +49,7 @@ from .auth import (NONCE_ALPHABET, NONCE_PATTERN, AppKeySigner,  # noqa: F401
                    CredentialStore, Pkce, default_credential_path)
 from .envelope import (_safe_json_dict, json_body_bytes, parse_envelope,  # noqa: F401
                        parse_envelope_meta, query_string)
-from .client import DEFAULT_HOST, TOKEN_PATH  # noqa: F401
+from .client import DEFAULT_HOST, DEFAULT_TIMEOUT, TOKEN_PATH  # noqa: F401
 from .client import OpenApiClient, _default_http  # noqa: F401
 from .validators import _RestValidators  # noqa: F401
 from .groups.market import OpenApiMarket  # noqa: F401

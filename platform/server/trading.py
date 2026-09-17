@@ -70,6 +70,9 @@ except ImportError:
 from server import futu_data
 from server import store_access
 from server.store_access import WorkbenchError
+# 市场口径常量：规范模块唯一实现（WP13 审查 M1）——本模块与 trading_core.broker 都从这里取，
+# 不再各存镜像。``market_ids`` 是零依赖纯常量模块（不拉起 futu_mcp 会话）。
+from trading_datasource.market_ids import OPENAPI_ENABLE_MARKET, SIM_MARKET_IDS
 
 # ---------------------------------------------------------------------------
 # 常量（对照源码，不猜）
@@ -91,10 +94,11 @@ ADHOC_PLAN_ID = ""
 # A 股日历挂在 "SH"（daemon JOBS_DEFAULT 的市场名），SZ/BJ 标的共用同一 A 股日历。
 CALENDAR_MARKET = {"SH": "SH", "SZ": "SH", "BJ": "SH", "HK": "HK", "US": "US"}
 
-# 市场前缀 → 模拟账户 market_id：数字口径来自 store_access.MARKET_HINT 的实测
-# （港股 1 / A股 3 / 美股 100，sim_trade_account_list 实测返回）；SH./SZ./BJ. 是 A 股、
-# HK. 是港股、US. 是美股（broker.py lstrip("SH.ZBJ.") 与仓库标的写法可证）。
-PREFIX_MARKET_ID = {"SH": 3, "SZ": 3, "BJ": 3, "HK": 1, "US": 100}
+# 市场前缀 → 模拟账户 market_id。常量本体在 ``trading_datasource.market_ids``
+# （WP13 审查 M1：原先此处与 ``trading_core.broker`` 各存一份镜像，靠锁定测试守漂移）；
+# 名字保留给既有使用点，对象即规范常量。数字口径来自实测（港股 1 / A股 3 / 美股 100，
+# sim_trade_account_list 实测返回）；SH./SZ./BJ. 是 A 股、HK. 是港股、US. 是美股。
+PREFIX_MARKET_ID = SIM_MARKET_IDS
 
 _SYMBOL_RE = re.compile(r"^([A-Z]+)\.\S+$")
 
@@ -121,11 +125,10 @@ OPENAPI_AUTH_HINT = "（运行 scripts/futu_auth.py --openapi 完成 OAuth/AppKe
 # trading/broker-unavailable —— 闸门既有语义不变）。
 OPENAPI_UNAVAILABLE_CODE = "trading/openapi-unavailable"
 
-# 市场前缀 → OpenAPI 授权账户的 enable_market（naming-dictionary#enable-market：
-# 1=HK 2=US 4=ChinaStock 5=Futures 6=SG 12=CA 15=JP 18=KR）。**与 sim 的
-# PREFIX_MARKET_ID 数字口径不同**（那是券商模拟账户的 market_id：HK 1/A 股 3/US 100），
-# 两套数字各自来自各自通道的实测/文档，不互相换算。
-OPENAPI_ENABLE_MARKET = {"HK": 1, "US": 2, "SH": 4, "SZ": 4, "BJ": 4}
+# 市场前缀 → OpenAPI 授权账户的 enable_market。常量本体在
+# ``trading_datasource.market_ids``（WP13 审查 M1：原先此处与 core 各存一份镜像）。
+# **与 sim 的 PREFIX_MARKET_ID 数字口径不同**（那是券商模拟账户的 market_id：
+# HK 1/A 股 3/US 100），两套数字各自来自各自通道的实测/文档，不互相换算。
 
 # 市场前缀 → OpenAPI exchange（naming-dictionary#exchange）。官方枚举没有北交所（BJ）：
 # 北交所标的的撤单/改单据此如实拒绝（不伪造 exchange 值），下单不受影响（place 只用 code）。
@@ -783,10 +786,13 @@ class FutuBroker:
             cancel_out = core_broker.cancel(call, acc_id=account["acc_id"],
                                             market=account["market_id"],
                                             order_id=order["order_id"])
-        except TimeoutError as error:
-            return {"status": "unknown", "broker_order_id": None,
-                    "err": f"改单撤旧超时：{str(error)[:120]}（先查询，不重放）"}
-        except Exception as error:  # noqa: BLE001 —— 拒单/业务失败如实上抛信息
+        except Exception as error:  # noqa: BLE001 —— 传输失败与业务拒绝在此分流
+            # 分类口径唯一实现在 core_broker.is_transport_failure（真实传输**不抛**
+            # TimeoutError：REST 抛 TransportError/UnexpectedResponse、MCP 抛
+            # FutuUnavailable）——不要在此按异常类型二分支，见该函数说明。
+            if core_broker.is_transport_failure(error):
+                return {"status": "unknown", "broker_order_id": None,
+                        "err": f"改单撤旧传输失败：{str(error)[:120]}（先查询，不重放）"}
             return {"status": "rejected", "broker_order_id": None,
                     "err": f"改单撤旧失败：{str(error)[:160]}"}
         placed = core_broker.place(call, acc_id=account["acc_id"],
@@ -805,10 +811,10 @@ class FutuBroker:
             raw = core_broker.cancel(call, acc_id=account["acc_id"],
                                      market=account["market_id"],
                                      order_id=order["order_id"])
-        except TimeoutError as error:
-            return {"status": "unknown", "order_id": order["order_id"],
-                    "err": f"撤单超时：{str(error)[:120]}（先查询，不重放）"}
-        except Exception as error:  # noqa: BLE001
+        except Exception as error:  # noqa: BLE001 —— 传输失败与业务拒绝在此分流
+            if core_broker.is_transport_failure(error):
+                return {"status": "unknown", "order_id": order["order_id"],
+                        "err": f"撤单传输失败：{str(error)[:120]}（先查询，不重放）"}
             return {"status": "rejected", "order_id": order["order_id"],
                     "err": str(error)[:160]}
         # raw 原样附上：isError=false 不代表业务成功（铁律：仍需查业务码），

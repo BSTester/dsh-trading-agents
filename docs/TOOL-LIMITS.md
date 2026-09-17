@@ -369,6 +369,22 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
 下恒返回空列表，平台组合页 sim 持仓会因此为空。WP13 任务 2 按既有双键口径修正，
 新增用例 `tests/test_wp13_simtrade.py::SimCallBrokerIntegrationTests`。
 
+**REST 传输失败 → `unknown`（先查询，不重放）**（WP13 审查 K1，2026-09-17）：
+
+模拟交易的写路径（下单/改单撤旧/撤单）对**传输失败**一律落 `unknown`——请求可能已到达
+券商，OMS 保持非终态等对账收敛，`rejected`（终态、无出边）只留给券商明确拒绝的业务信封。
+
+分类口径的唯一实现在 `trading_core.broker.is_transport_failure`：REST 的
+`TransportError`（DNS/连接拒绝/超时/连接重置/读响应中断）与 `UnexpectedResponse`
+（5xx/429/非 JSON/非信封——「服务端没给出业务结论」）→ `unknown`；托管 MCP 的
+`FutuUnavailable` → `unknown`；`OpenApiError` 且带 errcode 的业务信封 → `rejected`。
+
+**为什么值得单列**：真实传输**不抛** `TimeoutError`，而修复前 `core_broker.place` 与
+`FutuBroker.modify/cancel` 按异常类型二分支（`except TimeoutError → unknown` /
+`except Exception → rejected`），于是 REST 时代的传输失败全部落成 `rejected` 终态——
+一笔可能已成交的 sim 单从此不再被查询，与仓库铁律冲突。修复后的用例注入的是**真实类型**
+（`TransportError` / `UnexpectedResponse`），旧用例只注入 `TimeoutError` 属假阴性。
+
 ### 九之一、通道统一收口复核（WP13 任务 3，2026-09-17 真机）
 
 **1）`scripts/futu_openapi_check.py --dataplane` 复跑：41/41 `ok`**（覆盖 11 单方法端点 +

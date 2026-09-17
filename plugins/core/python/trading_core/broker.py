@@ -1,10 +1,15 @@
 """券商适配层（规格 §6.2）：本模块是唯一接触券商的代码。
 
-任务 0 只放依赖锁定常量（tools/list schema 实测口径，2026-09-14，见 WP3 计划
-依赖锁定表）；下单/撤单/持仓行为在任务 4 补齐。铁律（P4 实测教训）：
-提交超时 → unknown → 只查询不重放；isError=false 仍需查业务码；
+铁律（P4 实测教训）：**传输失败** → unknown → 只查询不重放（业务拒绝才落 rejected，
+分类见 ``is_transport_failure``）；isError=false 仍需查业务码；
 sim_trade_modify_order 间歇性 -5 → 改单一律撤单 + 重下（TOOL-LIMITS）。
 """
+# 市场口径常量**直接引用规范模块**（WP13 审查 M1：原先这里是镜像副本，靠锁定测试
+# 守漂移——那是「用测试维护重复」）。``market_ids`` 是零依赖纯常量模块，且
+# ``trading_datasource/__init__.py`` 刻意不做 eager 导入，因此模块级导入不会拉起
+# futu_mcp 会话（与 ``quality.py`` 顶层导入 ``trading_datasource.market`` 同一惯例）。
+from trading_datasource.market_ids import (  # noqa: E402
+    OPENAPI_ENABLE_MARKET, SIM_MARKET_IDS)
 
 TOOLS = {"place": "sim_trade_input_order", "cancel": "sim_trade_cancel_order",
          "positions": "sim_trade_position_list", "accounts": "sim_trade_account_list",
@@ -12,13 +17,8 @@ TOOLS = {"place": "sim_trade_input_order", "cancel": "sim_trade_cancel_order",
          "max_buy_sell": "sim_trade_max_buy_sell"}
 PLACE_REQUIRED = ("acc_id", "market", "symbol", "order_type", "order_side", "qty")
 
-# 市场链 → 模拟账户 market_id（数字口径来自 platform/server/store_access.MARKET_HINT
-# 的实测：港股 1 / A股 3 / 美股 100）。**唯一实现在
-# ``trading_datasource.market_ids.SIM_MARKET_IDS``**（WP13 任务 2 起：通道适配器也要
-# 用它翻译 REST 参数）；这里是镜像常量，漂移由 tests/test_wp13_simtrade.py 的锁定用例
-# 与 tests/test_wp9_plan_auto.py 的既有用例一起炸掉。core 不在模块级导入
-# trading_datasource（避免导入期拉起 futu_mcp 会话），故保留镜像而非 import。
-MARKET_IDS = {"SH": 3, "SZ": 3, "BJ": 3, "HK": 1, "US": 100}
+#: 市场链 → 模拟账户 market_id。名字保留给既有调用方；对象即规范常量（同对象别名）。
+MARKET_IDS = SIM_MARKET_IDS
 
 
 def sim_call(home=None, **kwargs):
@@ -35,12 +35,11 @@ def sim_call(home=None, **kwargs):
 # live 账户查询工具名（MCP 通道实名，与 platform/server/trading.py 的实测调用一致）。
 LIVE_TOOLS = {"accounts": "account_authorized_trd_accs", "positions": "account_positions",
               "funds": "account_funds"}
-#: 市场前缀 → OpenAPI 授权账户 enable_market（naming-dictionary#enable-market：
-#: 1=HK 2=US 4=ChinaStock）。**与上面的 MARKET_IDS 数字口径不同**（那是券商模拟账户的
-#: market_id：HK 1/A 股 3/US 100），两套数字各自来自各自通道，不互相换算。core 不能
-#: import server 包，这里是 platform/server/trading.py 的镜像，漂移由
-#: tests/test_wp9_plan_auto.py 的锁定用例炸掉。
-OPENAPI_ENABLE_MARKET = {"HK": 1, "US": 2, "SH": 4, "SZ": 4, "BJ": 4}
+# OPENAPI_ENABLE_MARKET（市场前缀 → OpenAPI 授权账户 enable_market）由上面的 import 引入：
+# 常量本体在 ``trading_datasource.market_ids``（WP13 审查 M1：原先 core 与
+# platform/server/trading.py 各存一份镜像，靠锁定测试守漂移）。**与 MARKET_IDS 数字口径
+# 不同**（那是券商模拟账户的 market_id：HK 1/A 股 3/US 100），两套数字各自来自各自通道，
+# 不互相换算。
 #: 市场链 → 标的/持仓前缀集合（SH 链含 SZ/BJ），与 planner.CALENDAR_MARKET 同源口径。
 CHAIN_PREFIXES = {"SH": ("SH", "SZ", "BJ"), "HK": ("HK",), "US": ("US",)}
 #: 官方 get-funds.md 的权益字段：``total_assets``=总净资产（同页另有 securities_assets/
@@ -48,8 +47,42 @@ CHAIN_PREFIXES = {"SH": ("SH", "SZ", "BJ"), "HK": ("HK",), "US": ("US",)}
 LIVE_EQUITY_FIELD = "total_assets"
 
 
+def is_transport_failure(error):
+    """传输失败（请求**可能已到达券商**）→ 真；业务拒绝 → 假。
+
+    为什么需要这个判定（WP13 审查 K1）：真实传输**不抛** ``TimeoutError``——
+    OpenAPI REST 把 URLError/连接重置/超时统一包装为 ``TransportError``
+    （``futu_openapi/errors.py``），非信封/5xx/429 为 ``UnexpectedResponse``（同样
+    「服务端没给出业务结论」，``errors.py`` 明示请求可能已到达券商），托管 MCP 重试后抛
+    ``FutuUnavailable``。三者都不是 ``TimeoutError`` 子类，故按异常类型二分支的旧写法会把
+    **可能已到券商的单落成 ``rejected``（OMS 终态、无出边）**，从此不再被查询真值——
+    与仓库铁律「先查询，不重放」冲突。
+
+    分类口径：传输类异常 → ``unknown``（等对账/查询收敛）；业务信封错误
+    （``OpenApiError`` 且 errcode 明确、券商已给出拒绝结论）→ 保持 ``rejected``。
+
+    惰性导入（沿用本模块既有惯例：避免导入期拉起网络栈/密码学依赖）；datasource 不可用时
+    退化为「仅超时判定」——宁可少判 unknown，也不能因导入失败连 TimeoutError 都误判。
+    """
+    kinds = [TimeoutError]
+    try:
+        from trading_datasource.futu_openapi.errors import (  # noqa: PLC0415
+            TransportError, UnexpectedResponse)
+        kinds += [TransportError, UnexpectedResponse]
+    except Exception:  # noqa: BLE001 —— datasource 不可用则退化
+        pass
+    try:
+        from trading_datasource.futu_mcp import FutuUnavailable  # noqa: PLC0415
+        kinds.append(FutuUnavailable)
+    except Exception:  # noqa: BLE001
+        pass
+    return isinstance(error, tuple(kinds))
+
+
 def place(call, acc_id, market, symbol, side, qty, price, order_type=1, timeout=30):
-    """下单。铁律：超时/异常 → {"status": "unknown"}，绝不重发（P4 教训代码化）。
+    """下单。铁律：**传输失败** → {"status": "unknown"}（先查询，绝不重发）；业务拒绝
+    → {"status": "rejected"}。分类由 ``is_transport_failure`` 统一承担（不要在此按异常
+    类型二分支——真实传输异常与超时不同型，见该函数说明）。
     改单需求一律「撤单 + 重新下单」：sim_trade_modify_order 间歇性 -5（TOOL-LIMITS）。"""
     side_code = 1 if side == "BUY" else 2
     args = {"acc_id": acc_id, "market": market, "symbol": symbol.lstrip("SH.ZBJ."),
@@ -60,10 +93,10 @@ def place(call, acc_id, market, symbol, side, qty, price, order_type=1, timeout=
         data = call(TOOLS["place"], args, timeout=timeout) or {}
         return {"status": "submitted", "broker_order_id": str(data.get("order_id") or ""),
                 "args": args}
-    except TimeoutError as error:
-        return {"status": "unknown", "broker_order_id": None, "err": str(error)[:120],
-                "args": args}
-    except Exception as error:  # noqa: BLE001 —— 拒单/业务失败如实上抛信息
+    except Exception as error:  # noqa: BLE001 —— 传输失败与业务拒绝在此分流
+        if is_transport_failure(error):
+            return {"status": "unknown", "broker_order_id": None,
+                    "err": str(error)[:120], "args": args}
         return {"status": "rejected", "broker_order_id": None, "err": str(error)[:160],
                 "args": args}
 

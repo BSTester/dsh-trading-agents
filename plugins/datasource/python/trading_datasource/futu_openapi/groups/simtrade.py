@@ -17,7 +17,7 @@
   * ``GET .../3182575/max-buy-sell?market=3&symbol=603993&order_type=1&price=16.80`` →
     ``{max_cash_buy_qty_round_lot, max_sell_qty_round_lot, ...}``。
 
-**实测与官方页面的差异（四条，已在 docs/TOOL-LIMITS.md 登记）**：
+**实测与官方页面的差异（五条，已在 docs/TOOL-LIMITS.md §九 登记）**：
 
   1. ``orders``（今日订单）、``history-orders``、``max-buy-sell`` 官方页面参数表**未列
      ``market``**，实测**必填**——缺参报 ``missing required parameter: market``；
@@ -32,6 +32,10 @@
      随后经本方法组撤单成功。``market`` 是账户列表的 ``market_id``（int），不是交易所前缀
      字符串（示例 ``{"market":1,...}``）；链名 → 数字的归一由
      ``trading_datasource.market_ids.sim_market_id`` 负责，本层只收 int。
+  5. ``history-orders`` 的微秒窗口是**闭区间**：终点若取当日 ``00:00:00``，区间宽度为零，
+     **当天订单一条都查不到**（实测 0 条 vs 取 ``23:59:59.999999`` 的 1 条）——日期 → 微秒
+     的翻译对终点必须取日末，实现在 ``trading_datasource.channel.to_micros_end``
+     （本方法组只收 int，不承担换算）。
 
 本层只做「参数校验 + 一次 REST + 信封解析」，**不做业务聚合**（与其他方法组同纪律）；
 模拟交易官方**无错误码表**，故不编造错误码映射——错误由 ``client.request`` 按信封如实抛出。
@@ -59,10 +63,8 @@ class OpenApiSimTrade(_RestValidators):
         self.client = client
 
     # ------------------------------------------------------------ 校验助手（模拟交易专有）
-
-    def _acc_id(self, acc_id):
-        """acc_id 进路径：非空字符串且不含路径分隔符/空白。"""
-        return self._path_token(acc_id, "acc_id")
+    # _acc_id 由 _RestValidators 提供（WP13 审查次要项：本类与 OpenApiTrade 的重复
+    # 定义已提升到基类，单一实现）。
 
     def _market(self, value, name="market"):
         """market_id：int（或数字字符串）。返回 int；None → None（缺参由后端如实报）。"""

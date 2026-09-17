@@ -16,9 +16,11 @@
 * **通道分派语义**：openapi 就绪走 REST、默认/无凭据回退 MCP、未知工具名原样转 MCP
   （绝不吞掉 live 调用）；REST 异常原样上抛（不静默换通道）；
 * **翻译表正确**：链名 → market_id、日期 → 微秒、qty 数值 → 字符串、撤单丢弃多余 market；
-* **镜像常量不漂移**：``trading_core.broker.MARKET_IDS`` 与
-  ``trading_datasource.market_ids.SIM_MARKET_IDS`` 相等（两处各自被不同调用方依赖）。
+* **市场口径唯一实现**：``trading_core.broker.MARKET_IDS`` /
+  ``OPENAPI_ENABLE_MARKET`` 与 ``trading_datasource.market_ids`` 的规范常量
+  **是同一对象**（WP13 审查 M1：镜像已收敛，测试断言同一性而非等值）。
 """
+import contextlib
 import json
 import re
 import sys
@@ -36,8 +38,11 @@ from test_wp8_market import RecordingClient  # noqa: E402  （复用既有替身
 from trading_datasource import channel  # noqa: E402
 from trading_datasource.futu_openapi import (  # noqa: E402
     WP13_SIM_TRADE_ENDPOINTS,
+    OpenApiClient,
     OpenApiSimTrade,
 )
+from trading_datasource.futu_openapi.errors import (  # noqa: E402
+    OpenApiError, TransportError, UnexpectedResponse)
 from trading_datasource.market_ids import SIM_MARKET_IDS, sim_market_id  # noqa: E402
 from trading_core import broker as core_broker  # noqa: E402
 
@@ -344,6 +349,49 @@ class SimCallBrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(out["status"], "unknown")
         self.assertEqual(len(recording.calls), 1, "铁律：超时只发一次，绝不重放")
 
+    # ---- WP13 审查 K1：真实传输异常不是 TimeoutError，旧用例是假阴性。
+    # ---- 这里的假件注入的是**真实传输会抛的类型**（REST 的 TransportError /
+    # ---- UnexpectedResponse），它们经 sim_call → REST 分支 → broker.place 全程。
+
+    def test_broker_place_transport_error_is_unknown(self):
+        home, cred = openapi_home(self.tmp.name)
+        recording = RecordingClient(error=TransportError("连接被重置"))
+        call = channel.sim_call(home, client=recording, credential_path=cred)
+        out = core_broker.place(call, acc_id="1", market=3, symbol="SH.603993",
+                                side="BUY", qty=100, price=16.8)
+        self.assertEqual(out["status"], "unknown",
+                         "REST 传输失败＝请求可能已到券商，必须 unknown 而非 rejected")
+        self.assertEqual(len(recording.calls), 1, "铁律：绝不重放")
+
+    def test_broker_place_unexpected_response_is_unknown(self):
+        home, cred = openapi_home(self.tmp.name)
+        recording = RecordingClient(error=UnexpectedResponse("502 Bad Gateway"))
+        call = channel.sim_call(home, client=recording, credential_path=cred)
+        out = core_broker.place(call, acc_id="1", market=3, symbol="SH.603993",
+                                side="BUY", qty=100, price=16.8)
+        self.assertEqual(out["status"], "unknown",
+                         "非信封/5xx 不是业务结论（errors.py 明示可能已到券商）")
+
+    def test_broker_place_business_error_still_rejected(self):
+        """防矫枉过正：券商明确拒绝（业务信封 errcode）必须保持 rejected。"""
+        home, cred = openapi_home(self.tmp.name)
+        recording = RecordingClient(error=OpenApiError("资金不足", errcode=-3))
+        call = channel.sim_call(home, client=recording, credential_path=cred)
+        out = core_broker.place(call, acc_id="1", market=3, symbol="SH.603993",
+                                side="BUY", qty=100, price=16.8)
+        self.assertEqual(out["status"], "rejected")
+        self.assertIn("资金不足", out["err"])
+
+    def test_broker_place_timeout_reaches_rest_branch(self):
+        """M2：REST 分支必须兑现调用方的 timeout（过去被静默丢弃）。"""
+        home, cred = openapi_home(self.tmp.name)
+        recording = ScopeRecordingClient(d={"order_id": "999"})
+        call = channel.sim_call(home, client=recording, credential_path=cred)
+        core_broker.place(call, acc_id="1", market=3, symbol="SH.603993",
+                          side="BUY", qty=100, price=16.8, timeout=7)
+        self.assertEqual(recording.timeouts, [7],
+                         "sim_call 的 timeout 必须经 timeout_scope 传到 REST 调用链")
+
     def test_broker_accounts_and_positions_shape(self):
         home, cred = openapi_home(self.tmp.name)
 
@@ -361,11 +409,106 @@ class SimCallBrokerIntegrationTests(unittest.TestCase):
         self.assertEqual(rows, [{"symbol": "600089", "qty": "100"}])
 
 
-class MarketIdsLockTests(unittest.TestCase):
-    """镜像常量锁定：core 的 MARKET_IDS 必须与 datasource 的规范模块逐字相等。"""
+class ScopeRecordingClient(RecordingClient):
+    """记录 ``timeout_scope`` 覆盖值的替身（M2：REST 分支的 timeout 兑现）。"""
 
-    def test_broker_market_ids_mirror(self):
-        self.assertEqual(core_broker.MARKET_IDS, SIM_MARKET_IDS)
+    def __init__(self, d=None, pagination=None, error=None):
+        super().__init__(d=d, pagination=pagination, error=error)
+        self.timeouts = []
+
+    def timeout_scope(self, timeout):
+        self.timeouts.append(timeout)
+        return contextlib.nullcontext()
+
+
+class TimeoutPlumbingTests(unittest.TestCase):
+    """传输层超时兑现（WP13 审查 M2）：``request(timeout=)`` / ``timeout_scope`` /
+    实例缺省三级优先，最终落到 http 传输；4 参老替身继续工作。"""
+
+    class _Cred:
+        def __init__(self, data):
+            self._data = dict(data)
+
+        def load(self):
+            return dict(self._data)
+
+        def save(self, data):
+            self._data = dict(data)
+
+    class _TimeoutHttp:
+        """**5 参**假传输：捕获每次调用的 timeout（老替身是 4 参，两者都要兼容）。"""
+
+        def __init__(self):
+            self.timeouts = []
+
+        def __call__(self, method, url, headers=None, body=None, timeout=None):
+            self.timeouts.append(timeout)
+            return 200, json.dumps({"s": "ok", "d": {"ok": 1}}).encode("utf-8"), {}
+
+    def _client(self, http, **kwargs):
+        cred = self._Cred({"mode": "oauth", "access_token": "t",
+                           "expires_at": 9_999_999_999_999})
+        return OpenApiClient(cred, http=http, host="https://example.invalid", **kwargs)
+
+    def test_default_timeout_reaches_transport(self):
+        http = self._TimeoutHttp()
+        self._client(http).request("GET", "/api/v1.0/x")
+        self.assertEqual(http.timeouts, [30.0], "缺省 30 秒必须落到传输（原为硬编码）")
+
+    def test_request_timeout_override(self):
+        http = self._TimeoutHttp()
+        self._client(http).request("GET", "/api/v1.0/x", timeout=7)
+        self.assertEqual(http.timeouts, [7.0])
+
+    def test_timeout_scope_override(self):
+        http = self._TimeoutHttp()
+        client = self._client(http)
+        with client.timeout_scope(3):
+            client.request("GET", "/api/v1.0/x")
+            client.request("GET", "/api/v1.0/y")   # 块内多次请求都吃覆盖值
+        client.request("GET", "/api/v1.0/z")       # 出块恢复缺省
+        self.assertEqual(http.timeouts, [3.0, 3.0, 30.0])
+
+    def test_timeout_scope_rejects_bad_value(self):
+        client = self._client(self._TimeoutHttp())
+        for bad in (0, -1, "5", True, None):
+            with self.assertRaises(ValueError, msg=f"{bad!r} 必须被拒"):
+                client.timeout_scope(bad)
+
+    def test_four_arg_transport_still_works(self):
+        """兼容契约：老 4 参替身不接收 timeout（签名判定），行为与改造前一致。"""
+        seen = []
+
+        def four_arg(method, url, headers=None, body=None):
+            seen.append(method)
+            return 200, json.dumps({"s": "ok", "d": {"ok": 1}}).encode("utf-8"), {}
+
+        client = self._client(four_arg)
+        with client.timeout_scope(5):
+            self.assertEqual(client.request("GET", "/api/v1.0/x"), {"ok": 1})
+        self.assertEqual(seen, ["GET"])
+
+    def test_call_openapi_ignores_timeout_for_scope_less_fake(self):
+        """注入替身没有 ``timeout_scope`` 时忽略 timeout（不炸、不静默改通道）。"""
+        recording = RecordingClient(d={"order_id": "1"})
+        out = channel.call_openapi(recording, "simtrade.input_order",
+                                   {"acc_id": "1", "market": 3, "symbol": "603993",
+                                    "order_type": 1, "order_side": 1, "qty": 100,
+                                    "price": 16.8}, timeout=7)
+        self.assertEqual(out, {"order_id": "1"})
+        self.assertEqual(len(recording.calls), 1)
+
+
+class MarketIdsLockTests(unittest.TestCase):
+    """市场口径常量：core 与规范模块是**同一对象**（WP13 审查 M1 收敛镜像——
+    不再靠等值断言维护重复）。"""
+
+    def test_broker_market_ids_is_canonical_object(self):
+        self.assertIs(core_broker.MARKET_IDS, SIM_MARKET_IDS)
+
+    def test_broker_openapi_enable_market_is_canonical_object(self):
+        from trading_datasource.market_ids import OPENAPI_ENABLE_MARKET
+        self.assertIs(core_broker.OPENAPI_ENABLE_MARKET, OPENAPI_ENABLE_MARKET)
 
     def test_sim_market_id_normalizes(self):
         self.assertEqual(sim_market_id("SH"), 3)

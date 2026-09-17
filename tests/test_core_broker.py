@@ -1,10 +1,17 @@
-"""券商适配器：参数拼装、信封信任 call_tool 归一化、超时语义。全部假通道。"""
+"""券商适配器：参数拼装、信封信任 call_tool 归一化、传输失败/业务拒绝分类。全部假通道。"""
 import sys
 import unittest
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
+# 真实传输异常族（WP13 审查 K1）：分类助手要按「请求是否可能已到券商」分流，
+# 而真实传输抛的是 TransportError/UnexpectedResponse/FutuUnavailable，不是 TimeoutError。
+sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 from trading_core import broker  # noqa: E402
+from trading_datasource.futu_mcp import FutuUnavailable  # noqa: E402
+from trading_datasource.futu_openapi.errors import (  # noqa: E402
+    OpenApiError, TransportError, UnexpectedResponse)
 
 
 class BrokerTest(unittest.TestCase):
@@ -31,6 +38,57 @@ class BrokerTest(unittest.TestCase):
                            side="BUY", qty=100, price=1580.0, order_type=1)
         self.assertEqual(out["status"], "unknown")   # 绝不重放，交上层查询
         self.assertIsNone(out.get("broker_order_id"))
+
+    # ---- WP13 审查 K1：真实传输异常也必须落 unknown（旧实现只认 TimeoutError，
+    # ---- 而真实 REST/MCP 通道从不抛它 → 可能已到券商的单被落成 rejected 终态）。
+
+    def test_transport_error_maps_to_unknown_and_never_retried(self):
+        calls = []
+
+        def fake_call(name, args, timeout=30):
+            calls.append(name)
+            raise TransportError("连接被重置")
+
+        out = broker.place(fake_call, acc_id="A1", market="SH", symbol="600519",
+                           side="BUY", qty=100, price=1580.0, order_type=1)
+        self.assertEqual(out["status"], "unknown", "传输失败＝可能已到券商，必须 unknown")
+        self.assertEqual(len(calls), 1, "铁律：传输失败绝不重放")
+        self.assertIn("连接被重置", out["err"])
+
+    def test_unexpected_response_maps_to_unknown(self):
+        def fake_call(name, args, timeout=30):
+            raise UnexpectedResponse("502 Bad Gateway")
+
+        out = broker.place(fake_call, acc_id="A1", market="SH", symbol="600519",
+                           side="BUY", qty=100, price=1580.0, order_type=1)
+        self.assertEqual(out["status"], "unknown",
+                         "非信封/5xx 不是业务结论（errors.py 明示可能已到达券商）")
+
+    def test_futu_unavailable_maps_to_unknown(self):
+        def fake_call(name, args, timeout=30):
+            raise FutuUnavailable("MCP 通道不可用")
+
+        out = broker.place(fake_call, acc_id="A1", market="SH", symbol="600519",
+                           side="BUY", qty=100, price=1580.0, order_type=1)
+        self.assertEqual(out["status"], "unknown")
+
+    def test_business_openapi_error_still_rejected(self):
+        """防矫枉过正：业务信封错误（券商明确拒绝）必须保持 rejected 终态。"""
+        def fake_call(name, args, timeout=30):
+            raise OpenApiError("参数非法", errcode=-3)
+
+        out = broker.place(fake_call, acc_id="A1", market="SH", symbol="600519",
+                           side="BUY", qty=100, price=1580.0, order_type=1)
+        self.assertEqual(out["status"], "rejected")
+        self.assertIn("参数非法", out["err"])
+
+    def test_is_transport_failure_classification(self):
+        self.assertTrue(broker.is_transport_failure(TimeoutError("t")))
+        self.assertTrue(broker.is_transport_failure(TransportError("net")))
+        self.assertTrue(broker.is_transport_failure(UnexpectedResponse("502")))
+        self.assertTrue(broker.is_transport_failure(FutuUnavailable("mcp")))
+        self.assertFalse(broker.is_transport_failure(OpenApiError("业务拒绝", errcode=-3)))
+        self.assertFalse(broker.is_transport_failure(RuntimeError("资金不足")))
 
     def test_business_error_maps_to_rejected(self):
         def fake_call(name, args, timeout=30):
