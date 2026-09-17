@@ -42,30 +42,35 @@ SYMBOLS = ["SH.600519", "SH.600000", "SH.601318"]
 
 
 class _FakeClock:
-    """可注入单调时钟：每次读取返回当前值再前进 step（预算逻辑不真等）。"""
+    """可注入单调时钟：**只在 runner 真的跑一次时才推进**（模拟真实耗时），
+    另可设初始偏移（模拟「开工时预算已被前面的源吃掉」）。预算逻辑因此不真等。"""
 
-    def __init__(self, step=1.0):
-        self.t = 0.0
-        self.step = step
+    def __init__(self, cost_per_call=1.0, initial=0.0):
+        self.now = float(initial)
+        self.cost_per_call = float(cost_per_call)
 
     def __call__(self):
-        value = self.t
-        self.t += self.step
-        return value
+        return self.now
+
+    def advance(self, seconds=None):
+        self.now += self.cost_per_call if seconds is None else seconds
 
 
 class _Runner:
     """假子进程执行体：可按标的抛超时/失败，记录每次收到的 timeout。"""
 
-    def __init__(self, fail_symbols=(), timeout_symbols=()):
+    def __init__(self, fail_symbols=(), timeout_symbols=(), clock=None):
         self.fail_symbols = set(fail_symbols)
         self.timeout_symbols = set(timeout_symbols)
+        self.clock = clock            # 有则每次调用推进它（预算裁剪因此可确定性验证）
         self.calls = []
         self.timeouts = []
 
     def __call__(self, cmd, timeout=None):
         self.calls.append(list(cmd))
         self.timeouts.append(timeout)
+        if self.clock is not None:
+            self.clock.advance()
         symbol = next((part for part in cmd if str(part).startswith(("SH.", "SZ.", "HK.", "US."))),
                       "")
         if symbol in self.timeout_symbols:
@@ -121,10 +126,17 @@ class _Base(unittest.TestCase):
 # ① 总预算与优雅收尾（S-1）
 # ---------------------------------------------------------------------------
 class BudgetTest(_Base):
+    """S-1 硬上界：每次调用前按剩余预算裁剪超时；剩余 ≤ 0 不再发起新调用。
+
+    时钟按「runner 真的跑了一次」推进（cost_per_call），因此断言的是**真实语义**：
+    预算由实际耗时消耗，而不是由读时钟的次数消耗。
+    """
+
     def test_budget_exhausts_and_skips_remaining(self):
-        """3 标的、预算只够 1 个 → 处理 1、其余 skipped(budget)、warn、ok=True。"""
-        runner = _Runner()
-        result = self._run(runner, budget_seconds=2, monotonic=_FakeClock(step=1.0))
+        """3 标的、预算只够 1 个（每源耗 1s、在场 2 源）→ 处理 1、其余 skipped(budget)。"""
+        clock = _FakeClock(cost_per_call=1.0)
+        runner = _Runner(clock=clock)
+        result = self._run(runner, budget_seconds=2, monotonic=clock)
 
         self.assertTrue(result["ok"])
         self.assertEqual(result["processed"], 1)
@@ -133,17 +145,16 @@ class BudgetTest(_Base):
         self.assertEqual([item["symbol"] for item in result["skipped_symbols"]],
                          SYMBOLS[1:])
         self.assertEqual({item["reason"] for item in result["skipped_symbols"]}, {"budget"})
-        # 预算内只处理了首个标的（三源各一次；缺席源不计）
+        # 预算内只处理了首个标的（在场源各一次）
         self.assertEqual(set(runner.symbols_called()), {SYMBOLS[0]})
         self.assertIn(sentiment.BUDGET_ALERT_TITLE, self._titles("warn"))
-        # 摘要含 running 计数供运维判断「采了多少」
         self.assertIn("saved", result)
         self.assertIn("elapsed_seconds", result)
 
     def test_budget_alert_detail_carries_counts_and_market(self):
         """告警 detail 必带 market=XX（pipeline 归因）与已处理/剩余数量（运维可读）。"""
-        runner = _Runner()
-        self._run(runner, budget_seconds=2, monotonic=_FakeClock(step=1.0))
+        clock = _FakeClock(cost_per_call=1.0)
+        self._run(_Runner(clock=clock), budget_seconds=2, monotonic=clock)
         row = self.conn.execute(
             "SELECT detail FROM alerts WHERE title=?", (sentiment.BUDGET_ALERT_TITLE,)
         ).fetchone()
@@ -151,21 +162,66 @@ class BudgetTest(_Base):
         self.assertIn("1/3", row["detail"])
         self.assertIn("剩余 2", row["detail"])
 
-    def test_budget_zero_processed_when_budget_exhausted_before_first_symbol(self):
-        """预算在第一个标的之前就耗尽 → 全部 skipped，仍 ok=True（不是失败）。"""
-        runner = _Runner()
-        result = self._run(runner, budget_seconds=1, monotonic=_FakeClock(step=5.0))
+    def test_tiny_budget_bounds_round_to_a_single_call(self):
+        """极小预算（1s）也把整轮限制在**一次被裁剪的调用**内：不会再发起第二次。
+
+        备注：``started`` 与首次检查同一时刻，故「开工前预算就被吃掉」在真实时钟下不可达
+        ——预算耗尽只可能发生在**调用之间**（这条与下一条一起覆盖硬上界的两个分支）。
+        """
+        clock = _FakeClock(cost_per_call=1.0)
+        runner = _Runner(clock=clock)
+        result = self._run(runner, budget_seconds=1, per_symbol_timeout=90, monotonic=clock)
 
         self.assertTrue(result["ok"])
-        self.assertEqual(result["processed"], 0)
-        self.assertEqual(len(result["skipped_symbols"]), len(SYMBOLS))
-        self.assertEqual(runner.calls, [])
+        self.assertEqual(runner.timeouts, [1], "唯一那次调用必须被裁到剩余预算 1s")
+        self.assertEqual(result["processed"], 1)
+        self.assertEqual([item["symbol"] for item in result["skipped_symbols"]],
+                         SYMBOLS[1:])
         self.assertIn(sentiment.BUDGET_ALERT_TITLE, self._titles("warn"))
+
+    def test_per_call_timeout_is_capped_by_remaining_budget(self):
+        """**硬上界核心**：单次调用超时被剩余预算裁剪（不是恒为 symbol_timeout）。"""
+        clock = _FakeClock(cost_per_call=2.0)
+        runner = _Runner(clock=clock)
+        result = self._run(runner, budget_seconds=3, per_symbol_timeout=90,
+                           config={"watchlist": SYMBOLS[:1]}, monotonic=clock)
+
+        # 标的 1：源 1 剩余 3s → timeout 3；跑掉 2s 后源 2 剩余 1s → timeout 1
+        self.assertEqual(runner.timeouts, [3, 1])
+        self.assertEqual(result["processed"], 1)
+        # 只裁剪了最后一次调用的超时、**没有跳过任何调用** → 不标 exhausted（诚实语义：
+        # exhausted 表示「有东西没采到」，不是「预算被用满了」）
+        self.assertFalse(result["budget_exhausted"])
+        self.assertEqual(result["skipped_symbols"], [])
+        self.assertNotIn(sentiment.BUDGET_ALERT_TITLE, self._titles("warn"))
+
+    def test_non_positive_remaining_stops_new_calls(self):
+        """剩余 ≤ 0 时**不再发起**任何新调用（含同一标的的剩余源）。"""
+        clock = _FakeClock(cost_per_call=5.0)
+        runner = _Runner(clock=clock)
+        result = self._run(runner, budget_seconds=2, per_symbol_timeout=90, monotonic=clock)
+
+        self.assertEqual(len(runner.calls), 1, "剩余预算为负后不得再发起调用")
+        self.assertEqual(runner.timeouts, [2])
+        self.assertTrue(result["budget_exhausted"])
+        self.assertEqual([item["symbol"] for item in result["skipped_symbols"]],
+                         SYMBOLS[1:])
+
+    def test_per_call_timeout_never_below_one_second(self):
+        """裁剪结果不得小于 1s（`max(1, …)`）——否则会把在跑的调用瞬间掐死。"""
+        clock = _FakeClock(cost_per_call=0.1, initial=0.6)
+        runner = _Runner(clock=clock)
+        self._run(runner, budget_seconds=1, per_symbol_timeout=90,
+                  config={"watchlist": SYMBOLS[:1]}, monotonic=clock)
+
+        self.assertTrue(runner.timeouts, "至少应发起一次调用")
+        self.assertEqual(min(runner.timeouts), 1)
 
     def test_no_budget_alert_when_collection_completes(self):
         """预算充足 → 无预算告警、无 skipped_symbols、budget_exhausted=False（反证）。"""
-        runner = _Runner()
-        result = self._run(runner, budget_seconds=100, monotonic=_FakeClock(step=1.0))
+        clock = _FakeClock(cost_per_call=1.0)
+        runner = _Runner(clock=clock)
+        result = self._run(runner, budget_seconds=100, monotonic=clock)
 
         self.assertFalse(result["budget_exhausted"])
         self.assertEqual(result["skipped_symbols"], [])
@@ -196,7 +252,11 @@ class BudgetTest(_Base):
                 self.assertIn("sentiment_budget_seconds", result["error"])
 
     def test_budget_plus_worst_overrun_must_fit_job_limit(self):
-        """预算 + 最坏超窗（源数×单标的超时）必须留在作业上限内，否则配置期拒绝。"""
+        """冗余安全界（预算 + 源数×单标的超时）必须留在作业上限内，否则配置期拒绝。
+
+        硬上界生效后真实上界是「预算 + 1s」；这条守的是**裁剪逻辑退化**时的兜底，
+        故保留更保守的判据（见 sentiment._budget_guard docstring）。
+        """
         self._config(sentiment_budget_seconds=700)   # 700 + 3×90 = 970 ≥ 900
         self._calendar()
         result = sentiment.run(str(self.home), "SH", conn=self.conn,

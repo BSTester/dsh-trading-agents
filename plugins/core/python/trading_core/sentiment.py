@@ -27,9 +27,13 @@
 且超过 `daemon._subprocess_runner` 的 900s 上限后会被判失败（数据实际采不到）。三条加固：
 
   * **总预算** ``budget_seconds``（配置 ``sentiment_budget_seconds``，默认 600，**必须小于
-    作业上限 900**）：预算耗尽即停止采集剩余标的，把它们记进 ``skipped_symbols``（原因
-    ``budget``），**照常输出结构化摘要 + 退出 0**（作业确实跑了）并 emit warn
-    「情绪快照预算耗尽」——让调度器与运维看到「今天没采完」而不是「失败」；
+    作业上限 900**）：**硬上界**——每次调用前按剩余预算裁剪单次超时
+    （``per_call = max(1, min(symbol_timeout, remaining))``），剩余 ≤ 0 则**不再发起*
+    *任何新调用**；未开始的标的认识记进 ``skipped_symbols``（原因 ``budget``），
+    **照常输出结构化摘要 + 退出 0**（作业确实跑了）并 emit warn「情绪快照预算耗尽」
+    ——让调度器与运维看到「今天没采完」而不是「失败」。整轮实际耗时因此 ≤ 预算 +
+    已启动调用的允许时长（该时长本身也被剩余预算裁剪），即 **≤ 预算 + 1s**（``max(1,…)``
+    的下限）；实测 ``--budget 120`` 收尾 ≤ ~125s（修前 ``--budget 180`` 用 263s）；
   * **逐标的超时** ``per_symbol_timeout``（配置 ``sentiment_symbol_timeout_seconds``，
     默认 90）：单标的超时只判该标的 failed（原因含「超时」）并继续下一个，**不再无限等**；
   * **子进程清理**：真实子进程一律 ``start_new_session=True`` 建独立进程组，超时用
@@ -167,10 +171,12 @@ def _positive_int(value, default, label):
 def _budget_guard(budget_seconds, symbol_timeout, label=BUDGET_CONFIG_KEY):
     """预算 + 最坏超窗必须留在作业上限内，否则配置期就拒绝。
 
-    预算检查在每个标的**开始前**，所以最坏多跑「一个标的的三源各超时一次」=
-    ``len(SOURCES) * symbol_timeout``。默认 600 + 3×90 = 870 < 900 ✓；若用户把预算调到
-    700，最坏 970 ≥ 900，作业会先被 `daemon._subprocess_runner` 杀掉——正是本次要修的
-    失败模式，故 fail-closed 报错并给出可执行的调整方向。
+    **硬上界生效后**（每次调用前按剩余预算裁剪超时），真实上界是 ``预算 + 1s``；本守卫
+    因此是**保守的冗余检查**：它保证即使裁剪逻辑被误删/退化（回到「只在标的之间检查」），
+    整轮也不会超过 ``调度器的 900s 作业上限``——那时最坏是「一个标的的三源各超时一次」
+    = ``len(SOURCES) * symbol_timeout``（默认 600 + 3×90 = 870 < 900 ✓）。用户把预算调到
+    700 时该冗余上界 970 ≥ 900，会在配置期被拒并给出可执行的调整方向（fail-closed，
+    不静默忽略）。要放宽这条冗余，先确认裁剪逻辑有测试兜住。
     """
     worst = budget_seconds + len(SOURCES) * symbol_timeout
     if worst >= JOB_TIMEOUT_LIMIT_SECONDS:
@@ -440,19 +446,35 @@ def _collect(conn, home, market, stamp, runner, news_call, *, budget, symbol_tim
     processed, ok_symbols = 0, 0
     per_source = {source: 0 for source in SOURCES}
     total = len(targets)
+    cut = {"warned": False}
+
+    def _note_budget_cut(detail_prefix):
+        """预算耗尽只发一条 warn（稳定标题），detail 说明已处理/未采集。"""
+        if cut["warned"]:
+            return
+        cut["warned"] = True
+        emit("warn", BUDGET_ALERT_TITLE, detail_prefix[:_ERROR_CHARS])
+
     for index, symbol in enumerate(targets, start=1):
         if monotonic() - started >= budget:
-            # S-1：预算耗尽——停止剩余标的（不是失败：作业确实跑了，只是没采完）
+            # S-1（硬上界）：剩余预算 ≤ 0 → 不再开始新标的（不是失败：作业确实跑了）
             skipped_symbols.extend({"symbol": rest, "reason": "budget"}
                                    for rest in targets[index - 1:])
-            emit("warn", BUDGET_ALERT_TITLE,
-                 f"market={market} 已处理 {processed}/{total} 个标的"
-                 f"（预算 {budget}s 耗尽），剩余 {total - processed} 个未采集")
+            _note_budget_cut(f"market={market} 已处理 {processed}/{total} 个标的"
+                             f"（预算 {budget}s 耗尽），剩余 {total - processed} 个未采集")
             break
         symbol_saved = 0
         for source in SOURCES:
             if source not in paths:
                 continue  # 缺席源：不逐标的记 failed，最终仍进 absent
+            # S-1 硬上界：**每次调用前**按剩余预算裁剪超时——预算因此是硬上界
+            # （整轮 ≤ 预算 + 已启动调用的允许时长，且该时长本身也被剩余预算裁剪）。
+            remaining = budget - (monotonic() - started)
+            if remaining <= 0:
+                _note_budget_cut(f"market={market} 已处理 {processed}/{total} 个标的"
+                                 f"（预算 {budget}s 耗尽），当前标的剩余源未采集")
+                break
+            per_call = max(1, min(symbol_timeout, remaining))
             try:
                 if source == SOURCE_NEWS and news_call is not None:
                     payload = news_call(symbol)
@@ -461,7 +483,7 @@ def _collect(conn, home, market, stamp, runner, news_call, *, budget, symbol_tim
                     if path is None:
                         continue
                     payload = _payload_of(
-                        runner(_command(home, source, path, symbol), symbol_timeout),
+                        runner(_command(home, source, path, symbol), per_call),
                         source, symbol)
                 store_mod.insert_sentiment(conn, date, symbol, source, payload,
                                            fetched_at=fetched)
@@ -495,5 +517,6 @@ def _collect(conn, home, market, stamp, runner, news_call, *, budget, symbol_tim
             "failed": failed, "sources": per_source,
             "processed": processed, "ok_symbols": ok_symbols,
             "skipped_symbols": skipped_symbols,
-            "budget_exhausted": bool(skipped_symbols),
+            # 硬上界语义：既包含「整标的被跳过」，也包含「预算在标的内部耗尽、剩余源未采」
+            "budget_exhausted": bool(skipped_symbols) or cut["warned"],
             "elapsed_seconds": round(monotonic() - started, 1)}
