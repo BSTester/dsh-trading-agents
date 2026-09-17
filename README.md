@@ -276,6 +276,58 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 排障与演练（假时钟、窗口超时、熔断拦截）见 [docs/RUNBOOK.md](docs/RUNBOOK.md)「自动流水线（WP9）」。
 
 
+## WP14：研究院（因子/规则生产线）
+
+**定位**：把「资讯 + 基本面 + PIT 数据」变成**可验证的规则提案**与研报。提案过机械
+验证门后**必须由你在 Web 批准**才上岗。研究院不下单、不启用策略、不写代码进核心库。
+
+### 怎么让研究院开工（在 Harness 对话里说）
+
+| 你说 | 走哪条 |
+|---|---|
+| "挖个因子"/"提一条规则"/"巡检因子衰减"/"研究 XX 的基本面与资讯面"/"让研究院开工" | **`research-institute`**（四子代理：采集 → 假设 → 检验 → 研报） |
+| "现在能不能买"/"看下信号"/"跑个回测" | `quant-trading` 快路径（秒级） |
+| "帮我深度分析"/"出一份研报"/"辩论一下多空" | `trading-agents` 12 角色流程 |
+
+### 一条规则的上岗路径（全链路可审计）
+
+```
+Harness 提案（rules JSON）→ 机械验证门 rules-validate（IC t 检验 + 5 分位分层单调）
+  → passed 进候选池 → 你在 Web 研究页点「批准」→ enabled（记录批准人）
+  → 把 rule_id 填进 auto_pipeline.strategies → 次日 build_plan 按该规则生成计划
+```
+
+命令行等价物（自动化与排查用；**批准本身仍只能人工做**）：
+
+```bash
+cd <repo>
+DB="${DSH_HOME:-$HOME/.dsh}/trading-data/trading.sqlite"
+# 1) 提案 + 验证（协议非法=退出码 1，连库都不进）
+~/.dsh/trading-venv/bin/python -m trading_core rules-validate --spec /tmp/rule.json --db "$DB"
+# 2) 看候选池
+~/.dsh/trading-venv/bin/python -m trading_core rules-list --db "$DB"
+# 3) 批准 / 停用（等价于 Web 按钮；--by 记录操作来源）
+~/.dsh/trading-venv/bin/python -m trading_core rules-decide --rule-id <id> --decision enable --by cli
+```
+
+### 硬规则（不可绕过）
+
+- **验证不过不许硬凑**：判 `failed` 就改假设、换新 `rule_id` 重走流程——调阈值重跑到
+  通过是多重检验作弊。`factors` 只能引用已注册因子（当前 `momentum_20/60/120`、
+  `volatility_20`、`ep`）；需要新算子 = 提核心库 PR 人工审查。
+- **未成熟因子不得进规则**：情绪 / F10 / 做空域因子先按 PIT 攒历史，连续 **≥250 交易日**
+  才可申请走同一套验证门；在那之前只能出现在假设的文字讨论里。
+- **批准只在 Web**：`rules-decide`（批准）、`auto_pipeline`（开关）、`confirm-decide`
+  （实盘确认）**不进模型工具面**——模型不能自批自己挖的因子、不能自拨流水线开关、
+  不能自批实盘单。模型侧同样禁用 `trade_place/trade_modify/trade_cancel/plan_execute/switch_mode`。
+- **停用随时可停**：Web 停用后**同一进程内立即生效**（规则解析每次回查 DB 状态，失效实例
+  即时摘除——这条是 WP14 端到端演练暴露并修掉的一个 fail-open 缺陷）；`disabled` 是终态。
+- **研报照旧发布到研究页**：`research_publish` 必带 `sources`（名称/数据时间/引用）。
+
+规则协议字段、样例与四子代理的工具通道清单见
+[skills/research-institute/SKILL.md](skills/research-institute/SKILL.md)。
+
+
 ## 工作台与指令示例
 
 按上节启动独立 Web 后在浏览器打开 `http://127.0.0.1:8397`（Harness 内没有工作台面板，

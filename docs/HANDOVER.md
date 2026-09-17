@@ -299,3 +299,26 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
 - **常驻入口二选一（WP9）**：服务内调度器（`platform/`）已包含指令轮询；独立
   `python -m trading_core daemon` 仍可用但**建议只留一个常驻**——两者靠 processed/nonce
   与 kv ran 标记互斥，同跑不会重复执行，但会产生重复的告警噪音。
+- **规则候选池与人工批准（WP14）**：规则 = 声明式 JSON spec（`rules` 表），状态
+  `candidate → validating → passed/failed → enabled/disabled`。
+  - **批准/停用只能人工**：独立 Web 研究页候选池按钮 → 端点 `rules-decide`
+    （`enable` 仅对 `passed` 放行；`disable` 对 candidate/failed/passed/enabled 放行 →
+    终态留档）。该端点与 `auto_pipeline` 一样**有意不进 MCP 工具面**——模型不得自批自己
+    挖的因子；模型侧同时禁用 `trade_place/trade_modify/trade_cancel/plan_execute/switch_mode`
+    （清单见 `skills/research-institute/SKILL.md`，由 `tests/test_wp14_skill.py` 锁定）。
+  - **批准痕迹在哪**：`rules.approved_by`/`approved_at`（Web 端点写 `web`，CLI 可传
+    `--by`）。`rules.validation` 存最近一次验证报告摘要（IC 均值/t 统计/分层单调/半衰期/
+    换手率）；复核对齐一律跑 `rules-validate`（与验证门同一实现，不手写第二份阈值口径）。
+  - **启用的机械落地**：`auto_pipeline.strategies[].strategy` 填 `rule_id`；`plan_auto`
+    解析时**每次回查 DB 状态**，非 `enabled` 一律跳过并在告警里给出当前状态。
+    **停用即时生效**：失效规则实例会从 `strategies.REGISTRY` 摘除——这是 WP14 端到端演练
+    暴露并修掉的 fail-open 缺陷（旧实现把进程内注册表当一级事实来源，长驻服务里停用后
+    仍会被消费），回归门
+    `tests/test_wp14_e2e.py::UnapprovedRuleNeverConsumedTest::test_disable_after_enable_stops_consumption`。
+  - **回滚 = 停用**：`disabled` 是终态（不可再启用）；要复跑同一假设就**换新 `rule_id`**
+    重新提案——`rules-validate` 拒绝重复验证既有 rule_id，防静默重置已通过/已启用的规则。
+  - **验证不过不许硬凑**：`failed` 的规则既不能批准也不能被 `plan_auto` 消费；调阈值重跑
+    到通过属多重检验作弊，正确做法是改假设、换 id、重走流程。协议非法（未注册因子等）
+    在 `rules-validate` 阶段就以非零退出拦下，**连库都不进**。
+  - **未成熟因子**：情绪/F10/做空域（`rule_engine.IMMATURE_FACTOR_PREFIXES`）一写进
+    `factors` 即被协议层拒绝；需连续 ≥250 交易日攒数后按演进条款申请放行。

@@ -116,4 +116,34 @@ def test_cli_ic_output(self):
 
 ### WP14 验收（对照规格 §9.6）
 
-- [ ] 解释器/统计/审批流/工具面回归/端到端全过；LLM 零代码通道、零自批路径；三套全绿。
+- [x] 解释器/统计/审批流/工具面回归/端到端全过；LLM 零代码通道、零自批路径；三套全绿。
+
+### WP14 任务 5+6 验收记录（2026-09-16）
+
+- **任务 5（研究院 skill）**：`skills/research-institute/SKILL.md` 交付；persona 由两条
+  路径扩为三条（INSTITUTE PATH）。`tests/test_wp14_skill.py` 22 项：frontmatter 合法、
+  四子代理与工具通道在场、禁用端点清单（5 个在环写工具 + `rules-decide`/`auto_pipeline`/
+  `confirm-decide` 三个人专属端点）、三要素/未成熟因子/不调阈值条款、**协议样例锁**
+  （SKILL.md 里那段 rules JSON 必须通过真实 `validate_spec` 且能构造策略实例）、
+  **工具引用真实性锁**（SKILL.md 引用的 `mcp__quantwb__*` 必须真在工具面；
+  `fin_news`/`fin_sentiment` 在 fin-data 源码、`research_publish`/`run_trading_analysis`
+  在 engine 源码可查）。
+- **任务 6（端到端 + 文档）**：`tests/test_wp14_e2e.py` 12 项，链路全真实（`momentum_20`
+  真实注册因子 + 构造价格路径 → 真实验证门 → Web 审批端点 → `plan-auto` → `auto-execute`
+  → 真实指令轮询 → `execute.run` → 券商假件收到下单）。文档三处：architecture.md
+  （三层任务模型章节 + `rule_engine`/研究院 skill 组件行 + `rules`/`rules-decide` 端点行）、
+  README（WP14 研究院用法一节）、HANDOVER（审批运维条目）。
+- **e2e 暴露并修掉一个 fail-open 缺陷（`e36f5a9`）**：`planner._resolve_strategy` 曾把
+  `strategies.REGISTRY` 当一级事实来源，规则被解析一次即常驻进程内——此后用户在 Web
+  停用该规则，长驻服务进程的下一次 `plan_auto` 仍会命中陈旧实例继续下单。`disabled` 是
+  终态（`rule_engine.RULE_TRANSITIONS`），等于「停用随时可停」在进程内失效。
+  修复：规则名一律回查 DB 状态（内置策略仍注册表优先）；非 `enabled` 或库内无记录时
+  立即 `strategies.unregister_rule` 摘除实例（fail-closed），加载失败同样摘除。
+  回归门：`test_disable_after_enable_stops_consumption`（**先解析一次**再停用才测得出，
+  仅「启用→停用→解析」的写法不经过注册表、测不出该缺陷）。
+- **三套测试**：Python 1887 项 OK（skipped=5）、Node 66 项 pass、Web 240 项 pass。
+- **规格 §9.6 逐条**：规则解释器单测 ✅（任务 2）、验证门统计单测 ✅（任务 3）、
+  审批流闭环 ✅（任务 4 + 本任务 e2e）、工具面回归 ✅（`rules` 进面、`rules-decide` 不进）、
+  端到端（提案→检验→批准→次日计划→执行）✅。
+- **未尽事项**：第三层（L3 值班研究员队列/定时器）属 WP15，本任务在 architecture.md
+  三层模型里以「设计而非现状」显式标注，落地时同步更新该节。
