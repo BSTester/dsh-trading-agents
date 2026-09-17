@@ -2,6 +2,7 @@
 
 > 📐 [专业量化工作台方案](docs/QUANT-WORKBENCH-PLAN.md) · 📋 [交接与复审文档](docs/HANDOVER.md)：已完成总结、验证结论、未验证项、下一份计划、复审清单。
 > ✅ [E2E 验收工具链](docs/E2E-ACCEPTANCE.md)：后端/前端两个 harness 的用法、退出码、缺陷清单与复验判据；服务启停见 [RUNBOOK](docs/RUNBOOK.md)。
+> 🔄 [更新到最新版本](#更新到最新版本)：五层更新顺序与各层判据、`refresh` 为什么必须在、三个常见的坑。
 
 DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 多角色投研流水线装进 Harness，数据与交易能力来自[富途远程 MCP](https://github.com/FutunnOpen/futu-agent-plugin)（免 OpenD、OAuth 授权）。
 
@@ -108,10 +109,11 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 （要装全部插件，不要只装 skill 基础模式），完成后运行安装器自检并把输出发我。
 ```
 
-## 装完之后：服务启停、代码更新与验收（WP9–WP17）
+## 装完之后：服务启停与验收（WP9–WP17）
 
 安装脚本会把 preset 与统一 Python 层装好；**日常运维用仓库里的一个脚本**，不要用前台
-进程方式长期跑服务：
+进程方式长期跑服务（服务是**常驻件**不是可选件——调度链、Web 工作台、规则批准与计划
+执行都在它进程内；定位见下文「服务不是可选项」）：
 
 ```bash
 scripts/platform_service.sh start     # 分离进程拉起（与 preset 的 platform-autostart 同一语义：
@@ -128,6 +130,7 @@ scripts/platform_service.sh refresh   # 把仓库 python 层重新解到 ~/.dsh/
 > 开发机上父进程（服务）走「仓库优先」（`trading_datasource.repo_paths`：存在仓库则前置到
 > `PYTHONPATH`，否则回落副本），所以**服务内**改动重启即生效，而**手工/调度子进程**依赖副本。
 > 前端改动另需重建：`npm --prefix platform/web run build`。
+> 五层的完整更新顺序与各层判据见下文「[更新到最新版本](#更新到最新版本)」。
 
 **首启必做**：配置关注池，否则平台在跑但什么都没发生（流程页会给「关注池未配置」提示）：
 
@@ -138,19 +141,115 @@ scripts/platform_service.sh refresh   # 把仓库 python 层重新解到 ~/.dsh/
 **验收工具**（交付即可跑，详见 [docs/E2E-ACCEPTANCE.md](docs/E2E-ACCEPTANCE.md)）：
 
 ```bash
-~/.dsh/trading-venv/bin/python scripts/e2e_workbench.py   # 82 端点全扫 + 可逆写探针 + 一致性核对
-node scripts/e2e_web.mjs --fail-on-soft                   # 16 路由真浏览器（CDP，零依赖）
+cd <repo>
+
+# 后端：82 个 HTTP 端点全扫 + 可逆写探针 + 一致性核对（只报告，发现缺陷即非零退出）
+~/.dsh/trading-venv/bin/python scripts/e2e_workbench.py
+#   刚重启过服务不用加参数：脚本自带冷启动暖机（跳过它就加 --no-warmup，
+#   但脚本类端点会因此误报）；与别的任务共用同一服务、或只想只读巡检：加 --read-only
+
+# 前端：16 个路由真浏览器（系统 Chromium + CDP，零新依赖）
+node scripts/e2e_web.mjs
+#   单页复验：--routes overview,plan,pipeline（未知键会报错并列出可用键）
+#   默认把「已知在修」的软断言只记不判；修复落地后加 --fail-on-soft 判闭环
 ```
 
-`AGENTS.md`（仓库根，工程内会话自动加载）写的是**值班研究员队列的兜底纪律**：会话首次交互
-先 `research_tasks_claim` 探测队列，有积压先按 `research-institute` 技能的值班模式消费，
-产出只进研究页与规则候选池（**不碰交易、不启用策略**）；主消费路径是
-`install/research-duty.timer`（外部定时器 → `dsh --profile headless`）。
+> 两个 harness 都**只报告、不修复**：退出码 `0` = 未发现缺陷（后端同时要求无真泄漏）。
+> 冷启动暖机约 10 秒属正常；等待预算可用 `--route-budget`／`--health-timeout` 调。
 
-> 安装来源提示：上文方式 A/B 从 GitHub 克隆。若本机仓库**领先远端**（有未 push 的提交），
-> 从 GitHub 装到的是**已发布版本**；此时以本地仓库为准——预设更新可
-> `git -C ~/.dsh/.agent-presets/dsh-trading-agents remote set-url origin <本地仓库> && git pull --ff-only`，
-> 运行层更新用 `scripts/platform_service.sh refresh && restart`。
+**受约束的运维子命令**（都只碰本地库、**绝不触达券商**，成功与否都留审计痕；口径与排障见
+[docs/RUNBOOK.md](docs/RUNBOOK.md)）：
+
+| 命令 | 何时用 |
+|---|---|
+| `~/.dsh/trading-venv/bin/python -m trading_core oms-align --broker-order-id <单号> --status cancelled\|rejected --reason "<原因>" [--operator <标识>]` | **最后手段**：券商已撤/已拒，本地订单却仍停在「在途」。**先跑 `reconcile-daily`**（对账按官方状态码自动收敛，覆盖大多数）；只有对账覆盖不到的历史行才走这个人工入口。只允许 `cancelled`/`rejected`，必须命中本地订单行（不伪造），提交走合法状态机路径（**已成交的单不可能被降级**），`--reason` 必填，成功写一条 `warn` 告警留痕。用它而不是手改 SQLite——后者不可审计 |
+| `~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300 [--limit N] [--force]` | 首启配置关注池（见上）；已有非空关注池时默认拒绝覆盖，`--force` 才覆盖 |
+
+**`AGENTS.md`（仓库根）是什么**：Harness 的**工程级常驻指令文件**——会话在工程根打开时
+（以 `.git` 标记）由 `@deepseek-ai/dsh-agent-instructions` **自动加载**，因此它写的纪律对
+每个新会话都生效，不依赖你每次提醒。本仓库的 `AGENTS.md` 只有两节：
+
+- **一、值班研究员队列的兜底纪律（L3）**：会话首次交互先 `research_tasks_claim` 探测队列，
+  有积压先按 `research-institute` 技能的**值班模式**消费，产出只进研究页与规则候选池
+  （**不碰交易、不启用策略**）。主消费路径是 `install/research-duty.timer`
+  （外部定时器 → `scripts/research_duty.sh` → `dsh --profile headless`），这条纪律是
+  定时器没装、机器关机、headless 被杀时的兜底。**领取后必须回报**（做不了也要
+  `ok=false` + 原因，不静默离开队列）；重复回报安全（终态任务原样返回、不改状态）。
+- **二、常驻纪律**：直接提交 `main`（本仓库惯例）；每次提交保持三套测试全绿（命令见上）；
+  下单/改单/撤单/切模式/执行计划只经工作台受约束入口，研究侧**永不下单、永不启用策略**
+  （启用只能由人在 Web 点批准）；取不到数据就说取不到，不用估算值替代。
+
+> ⚠️ 它的效力只覆盖**有 turn 的会话**：没有任何交互的会话不会消费队列——任务不丢，只延迟。
+> 这不是后台自动动作，不要对外宣称「已自动处理」。
+
+## 更新到最新版本
+
+平台由**五层**组成，各自的更新方式与判据都不同。**五层按顺序做完**——跳层的典型症状是
+「代码是新的，跑的还是旧的」（第 2 层没刷副本）或「页面白屏」（第 5 层没重建）。
+
+| # | 层 | 是什么 | 更新方式 | 判据 |
+|---|---|---|---|---|
+| 1 | **preset（本仓库）** | `~/.dsh/.agent-presets/dsh-trading-agents`：对话模式组合、skills、`scripts/`、`platform/` 源码 | `git -C <preset> pull --ff-only` | `git -C <preset> log --oneline -1` 与目标版本一致 |
+| 2 | **统一 Python 层** | 解到 `~/.dsh/trading-python/` 的 `datasource`／`core`／`fin-data`；venv 的 `.pth` 以它为准（`.pth` 只收 `datasource`+`core`，`fin-data` 供子进程调用） | `install_plugins.py install`（全量）或 `platform_service.sh refresh`（只刷这一层） | `install_plugins.py check` 打出版本与三层路径 |
+| 3 | **Harness 插件包** | `workbench`／`fin-data`／`engine`／`futu-keepalive`／`platform-autostart` 五个 `@bstester/dsh-*` | `install_plugins.py install`（`dsh plugin add` + pnpm） | 同上自检逐行打出版本号 |
+| 4 | **平台服务进程** | 常驻 FastAPI 单进程：HTTP 82 端点 + MCP 77 工具 + 静态前端 | `scripts/platform_service.sh restart` | `scripts/platform_service.sh status` 健康 + 「端点 82｜工具 77」 |
+| 5 | **前端产物** | `platform/web/dist`（Vite 构建，由服务静态托管） | `npm --prefix platform/web install && npm --prefix platform/web run build` | 刷新 `http://127.0.0.1:8397` 页面正常（无白屏） |
+
+**标准更新流程**（`PRESET` 按实际安装位置改；整段可复制粘贴，各步幂等，可安全重跑）：
+
+```bash
+PRESET="$HOME/.dsh/.agent-presets/dsh-trading-agents"
+
+# 1) preset 取新代码（层 1）
+git -C "$PRESET" pull --ff-only
+
+# 2) 统一 Python 层 + 五个插件包（层 2、3；install 会一并刷新副本）
+python "$PRESET/scripts/install_plugins.py" install --repo "$PRESET" --dsh-home "$HOME/.dsh"
+
+# 3) 自检：必须看到「✅ 安装完整」+ 五个插件版本号 + 三层路径
+python "$PRESET/scripts/install_plugins.py" check --repo "$PRESET" --dsh-home "$HOME/.dsh"
+
+# 4) 重建前端（层 5）
+npm --prefix "$PRESET/platform/web" install
+npm --prefix "$PRESET/platform/web" run build
+
+# 5) 重启服务（层 4），再看一眼健康与计数
+"$PRESET/scripts/platform_service.sh" restart
+"$PRESET/scripts/platform_service.sh" status
+
+# 6) 验收：两个 harness 都不应报出缺陷（后端退出码非 0 即未通过；
+#    前端默认只记软断言，要连软断言一起判闭环就加 --fail-on-soft）
+~/.dsh/trading-venv/bin/python "$PRESET/scripts/e2e_workbench.py"
+node "$PRESET/scripts/e2e_web.mjs"
+```
+
+**只改了量化侧代码**（`plugins/core`、`plugins/datasource`）时，第 2 步可以换成更轻的入口：
+
+```bash
+"$PRESET/scripts/platform_service.sh" refresh   # 只重解三份副本 + 重写 .pth
+                                                # 不跑 dsh plugin add、不碰 web profile、不重启服务
+```
+
+### 更新时的三个坑
+
+1. **`refresh` 是生产生效的唯一路径。** `~/.dsh/trading-python/*` 是**安装时**解出的副本，
+   venv 的 `.pth` 指向它；作业子进程（`python -m trading_core …`，即调度链的每条腿）与手工
+   CLI 都走副本。而开发机上**服务进程**会「仓库优先」（`trading_datasource.repo_paths`：
+   存在仓库则前置到 `PYTHONPATH`）。于是会出现错位：**服务里改了立刻生效，子进程里没生效**。
+   改完代码不 `refresh`，就是「代码改了、行为没变」。
+2. **preset 是一个 git 克隆，`git pull` 只能拿到 origin 上已有的提交。** 若 origin 仍指向
+   GitHub 而本机开发仓库领先远端（本项目的开发机当前即如此：本地领先远端上百个提交），
+   从 GitHub 拉到的是**已发布版本**而非最新代码。此时让 preset 指向本地仓库，或先 push：
+   ```bash
+   git -C "$PRESET" remote set-url origin /path/to/local/dsh-trading-agents
+   git -C "$PRESET" pull --ff-only
+   ```
+   服务脚本读哪个仓库，由解析顺序决定：`DSH_TRADING_REPO` 环境变量 > 标记文件
+   `~/.dsh/trading-platform-repo`（由安装器写入，内容即 `--repo`）> 脚本上一级目录。
+3. **preset 的内容在会话启动时读取。** 更新完 preset，**已挂载的会话仍持旧组合**——要
+   **新建会话**。`mcp__quantwb__*` 工具面同理：把 `quant-platform-mcp` 行的 `disabled: true`
+   改成 `false` 后也要新会话才出现。另外服务刚重启后，脚本类端点在冷启动的头十来秒会偏慢，
+   harness 的暖机就是为它准备的。
 
 ## 维护：清掉"进行中"的研究记录
 
@@ -197,23 +296,38 @@ Harness 会使用原生工具与子代理完成四位分析师报告、多空辩
 （Buy/Overweight/Hold/Underweight/Sell 五档评级 + 参考入场价 + 止损 + 仓位建议）。
 缺少可靠数据时必须注明，不能编造价格或承诺完成时间。
 
-## 可选：启动独立工作台服务（WP6）
+## 服务不是可选项：独立工作台服务（WP6，WP7 起常驻）
 
-不启动也不影响 Harness 的对话、投研与量化能力——`agent.cordis.yml` 的
-`quant-platform-mcp` 行默认 `disabled: true`，服务未起时安静降级。要用独立 Web 工作台：
+**先说结论**：纯 Harness 对话、投研与量化计算，服务没起也能跑（`agent.cordis.yml` 的
+`quant-platform-mcp` 行默认 `disabled: true`，服务未起时安静降级）。但**下面这些能力全都在
+服务进程内**，服务不常驻就等于没有：
+
+| 能力 | 为什么依赖服务进程 |
+|---|---|
+| 服务内调度器（WP7） | 按交易日历跑作业链（sync→质量→信号→计划、对账→TCA→摘要，收盘链尾追加因子快照），启动即补跑当日到期作业；**没有别的进程在跑它** |
+| 自动流水线（WP9） | 计划生成与次日 `auto_execute` 都由调度器驱动——模拟盘「全自动」就是这个开关 |
+| Web 工作台 | 唯一工作台界面（HTTP API + MCP + 静态前端同一个进程）；Harness 内 legacy 面板已于 WP7 退役 |
+| **规则批准**（WP14） | `rules-decide` 是**服务进程内动作端点**：没有 CLI 子命令、不在 MCP 工具面——服务没起就无从批准，模型也永远不能自批 |
+| 计划执行 / 实盘确认 | `plan_execute` 与业务确认卡片（TTL 120s）由服务托管 |
+| 研报/因子/流程/调度/审计各页 | 发布本身写本地存储，但**要看到**得有服务在托管页面 |
+
+所以：**把它当常驻件**。preset 的 `platform-autostart` 行会在**会话开始时**探活 `/healthz`，
+不通才拉起（通了什么都不做）；显式启停用 `scripts/platform_service.sh`：
 
 ```bash
-# 1. 依赖：Python 侧复用交易 venv；前端构建需要 Node（只需联网一次）
+# 一次性依赖：Python 侧复用交易 venv；前端构建需要 Node（只需联网一次）
 ~/.dsh/trading-venv/bin/pip install -r platform/requirements.txt
 npm --prefix platform/web install && npm --prefix platform/web run build
 
-# 2. 启动：HTTP API + MCP + 静态前端同一个进程（默认 127.0.0.1:8397）
-cd platform && ~/.dsh/trading-venv/bin/python -m server.run
+# 耐用拉起（分离进程，随会话结束仍存活）+ 看状态
+scripts/platform_service.sh start
+scripts/platform_service.sh status     # 仓库/解释器/健康/端点与工具计数/日志尾部
 ```
 
-> 上面是**前台**跑法（随当前 shell 结束，仅适合临时调试）。要长期运行、或需要
-> start/stop/status/restart/refresh，请用 `scripts/platform_service.sh`——
-> 见下文「装完之后：服务启停、代码更新与验收」。
+> `start|stop|status|restart|refresh` 的完整口径、退出码与排障见
+> [docs/RUNBOOK.md](docs/RUNBOOK.md)「平台服务」一节。**前台跑法
+> `cd platform && ~/.dsh/trading-venv/bin/python -m server.run` 只适合临时调试**——它随
+> 当前 shell 结束而死（实测：会话结束时进程消失、端口释放）。
 
 浏览器打开 `http://127.0.0.1:8397` 即是工作台（`/healthz` 为存活探针）。
 **不能在仓库根用 `python -m platform.server.run`**——标准库 `platform` 遮蔽同名包。
@@ -226,8 +340,8 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 模型不能自批实盘单、不能自己批准规则、不能自拨自动执行开关）。
 实盘切换只能在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）
 输入口令「确认实盘」完成，成功后提示带 `order_authorized: false`；`switch_mode` 工具
-只接受切到 sim（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
-[docs/RUNBOOK.md](docs/RUNBOOK.md) 的「平台服务」一节。
+只接受切到 sim（live→sim 回模拟盘），sim→live 一律拒绝。服务配置项与 systemd 单元样例见
+同一节。
 
 实盘**写操作**的确认由**工作台业务确认**承载（不再走 Harness 原生审批）：WP7 起 Harness
 会话内的富途写工具（`mcp__futu__sim_trade_*`/`trading_*` 的下单/改单/撤单动词）被工具
@@ -587,23 +701,45 @@ python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/trade_mode.py sim    # �
 
 ## 目录结构
 
-仓库根目录即 preset 目录（放入 `~/.dsh/.agent-presets/` 即完成安装）：
+**仓库根目录即 preset 目录**——放进 `~/.dsh/.agent-presets/` 就完成安装。`agent.cordis.yml`
+（组合）与 `AGENTS.md`（常驻指令）都从这里被会话加载。
 
 ```
-├── agent.cordis.yml       # 对话模式组合：persona + 工具 + 富途 MCP 桥
-├── preset.yml             # 模式元数据（名称/介绍）
-├── skills/trading-agents/ # Harness 十二角色、六阶段工作流
-├── plugins/datasource/   # 统一数据层（库，非插件）：唯一 MCP 客户端/行情路由/回测核心
-├── plugins/core/         # 量化平台核心库 trading_core（库，非插件）：PIT 存储/研究/执行/调度与运维
-├── plugins/engine/       # 研究记录/发布、量化工具、账户策略；含 Python 量化实现
-├── plugins/fin-data/     # 统一新闻与舆情工具
-├── plugins/workbench/    # tradingWorkbench 服务锚（engine 工具与账户策略依赖；面板已退役，UI 在 platform/）
-├── plugins/quant/        # 旧量化脚本兼容入口
-├── platform/             # 独立工作台服务：server/（FastAPI 单进程：HTTP API + MCP + 静态托管）
-│                         #   + web/（Vite + antd5 + ProComponents 前端，构建产物 dist/）
-│                         #   + requirements.txt（fastapi/uvicorn/mcp/httpx 锁定）
-├── install.sh / install.ps1 # 跨平台完整安装
-└── docs/architecture.md   # 架构与路线图
+├── agent.cordis.yml         # 对话模式组合：persona + 工具 + 富途 MCP 桥 + 五个插件行
+├── preset.yml               # 模式元数据（名称/介绍）
+├── AGENTS.md                # 工程级常驻指令（会话自动加载）：值班队列兜底纪律 + 常驻纪律
+├── skills/
+│   ├── trading-agents/      # Harness 十二角色、六阶段投研工作流
+│   ├── quant-trading/       # 快路径：信号/回测/短线量化（"现在能不能买"走这条）
+│   ├── research-institute/  # 研究院：四子代理因子/规则生产线 + 值班模式手册
+│   ├── futu-skills/         # 富途专项技能组（新闻检索/情绪/技术面/衍生品/资金异动…）
+│   └── last30days-bridge/   # 近 30 天社媒叙事广度面（可选组件）
+├── plugins/
+│   ├── datasource/          # 统一数据层（库，非插件）：唯一 MCP 客户端/行情路由/回测核心
+│   ├── core/                # 量化平台核心库 trading_core（库，非插件）：PIT 存储/研究/执行/调度与运维
+│   ├── engine/              # 研究记录/发布、量化工具、账户策略
+│   ├── fin-data/            # 统一新闻与舆情工具
+│   ├── workbench/           # tradingWorkbench 服务锚 + 本地研究存储（UI 在 platform/）
+│   ├── futu-keepalive/      # token 续期：每 10 分钟检查，余量 < 30 分钟时刷新
+│   ├── platform-autostart/  # 会话开始时探活并按需拉起平台服务
+│   ├── quant/               # 旧量化 CLI 兼容入口（唯一实现在 plugins/engine/python/）
+│   └── trading-agents/      # v2 编排插件（已被 skills/trading-agents 取代，未进 preset）
+├── platform/
+│   ├── server/              # FastAPI 单进程：HTTP API + MCP + 静态托管（含服务内调度器）
+│   ├── web/                 # Vite + antd5 + ProComponents 前端，构建产物 dist/
+│   └── requirements.txt     # fastapi/uvicorn/mcp/httpx 锁定
+├── scripts/
+│   ├── install_plugins.py   # 插件 + 统一 Python 层安装与自检（install|update|link|check|refresh）
+│   ├── platform_service.sh  # 平台服务耐用启停与副本刷新（start|stop|status|restart|refresh）
+│   ├── e2e_workbench.py     # 后端 82 端点 E2E 扫描（只报告）
+│   ├── e2e_web.mjs          # 前端 16 路由真浏览器 E2E（CDP，零新依赖）
+│   ├── research_duty.sh     # L3 值班研究员入口（systemd timer / cron 调用）
+│   ├── futu_auth.py         # 富途 OAuth 授权向导（纯标准库，跨平台）
+│   └── workbench_admin.mjs  # 研究 run 命令行维护（list / cancel / prune）
+├── install/                 # systemd 单元（research-duty.service|timer）与 HARNESS_SETUP.md
+├── install.sh / install.ps1 # 跨平台完整安装（preset + 插件 + Python 依赖 + 授权向导）
+├── tests/                   # Python / Node 两套测试（前端测试在 platform/web/tests/）
+└── docs/                    # 架构 / 运维 Runbook / 交接 / E2E 验收 / 工具限额 / 实盘准入
 ```
 
 ## 实盘交易（P4）
