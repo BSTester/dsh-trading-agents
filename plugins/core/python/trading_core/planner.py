@@ -42,7 +42,7 @@ def _risk_defaults():
 
 def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
                      as_of, lot=100, origin="manual", market=None, risk_config=None,
-                     managed=None):
+                     managed=None, broker_cash=None):
     """冻结一份计划。``origin``/``market`` 是**来源与归属元数据**（规格 §4.6）：
 
     * ``origin="auto"`` 的计划供自动执行链识别（``store.get_latest_auto_plan`` /
@@ -90,6 +90,28 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
     ``risk_config`` 缺省用 ``daemon.RISK_DEFAULTS``；``plan_auto`` 传
     ``daemon.risk_config(home)``（含 ``~/.dsh/trading-risk.json`` 覆盖）。部分字段的
     覆盖字典按「缺省补默认」合并——**不重写配置读取实现**。
+
+    **买入按可用现金封顶（2026-09-17 实机修订：模拟盘全自动的结构性阻塞）**：权重定量
+    与风险预算都只看**权益**，不看现金；实机 A 股模拟账户「权益 81 万 / 可用现金 5.5 万 /
+    已持 8 只」时，任何买单都会被券商以**资金不足**拒绝（或先被规则 6 拦），自动闭环
+    结构性跑不起来。因此多一条现金约束::
+
+        可买量 = floor(剩余现金 ÷ (价 × lot)) × lot
+        加仓量 = min(权重定量, 风险预算, 可买量)
+
+    * ``broker_cash``：``fn(mode) -> float | None`` 的券商现金查询（**与权益同源：
+      券商事实，不读本地台账**）。缺省 ``None`` = 调用方未提供现金事实 → 保持既有语义
+      （``plan-build`` 等离线/诊断路径与既有测试不受影响）；
+    * **多买单共享同一笔现金**：按计划内买单顺序（``target`` 原序 + managed 缺席者代码
+      升序，确定性）**逐单累计扣减**，绝不让每单都按全额现金定量。选择顺序分配而非按比例
+      分配，是为了保留策略给出的优先级顺序，且结果可逐单复算；
+    * **卖单不受现金约束**（减少敞口）、**卖出所得不计入可买现金**——成交与到账时点不
+      保证先于买单，把未成交的卖出款当可用资金是无根据的假设（宁可少买，不可凭空多买）；
+    * ``broker_cash`` 返回 ``None``（字段全缺）→ **一笔买单都不生成**，逐个记入
+      ``skipped`` 的 ``"(现金不可得)"``，并在返回值的 ``cash.unavailable`` 如实标注；
+      **绝不用权益冒充现金**；
+    * 现金连一手都买不起 → 该标的记 ``"(现金不足一手)"``（不生成 0 单）；被现金压低
+      数量的标的列入 ``cash.capped``（如实告诉调用方「想买多少、实际能买多少」）。
     """
     positions, equity = broker_positions(mode)
     cfg = _risk_defaults()
@@ -97,6 +119,15 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
         cfg.update(risk_config)
     orders, skipped = [], []
     plan_id = f"PLN-{as_of.replace('-', '')}-{mode}-{uuid.uuid4().hex[:4].upper()}"
+    # 现金约束（见 docstring）：调用方未提供现金事实时 cash_remaining 保持 None（既有语义）
+    cash_available = cash_remaining = None
+    cash_unavailable, cash_capped = False, []
+    if broker_cash is not None:
+        cash_available = broker_cash(mode)
+        if cash_available is None:
+            cash_unavailable = True
+        else:
+            cash_remaining = max(0.0, float(cash_available))
     # target 原序在前、managed 缺席者按代码升序在后：managed=None 时与既有顺序逐字一致
     symbols = list(target) + [s for s in sorted(set(managed or ())) if s not in target]
     for symbol in symbols:
@@ -118,6 +149,19 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
             if delta <= 0:
                 skipped.append(f"{symbol}(风险预算不足一手)")
                 continue
+            if cash_unavailable:
+                skipped.append(f"{symbol}(现金不可得)")
+                continue
+            if cash_remaining is not None:
+                # 可买量按剩余现金（**共享**：每单扣减，见 docstring）
+                affordable = int(cash_remaining // (px * lot)) * lot
+                if affordable < delta:
+                    cash_capped.append(symbol)
+                delta = min(delta, affordable)
+                if delta <= 0:
+                    skipped.append(f"{symbol}(现金不足一手)")
+                    continue
+                cash_remaining -= delta * px
         orders.append({"symbol": symbol, "market": symbol.split(".")[0],
                        "side": "BUY" if delta > 0 else "SELL", "qty": abs(delta),
                        "price": px})
@@ -135,8 +179,14 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
     for order in orders:
         oms.register_order(conn, plan_id, order["symbol"], order["market"],
                            order["side"], order["qty"], order["price"], mode, content_hash)
-    return {"plan_id": plan_id, "as_of": as_of, "mode": mode, "status": "frozen",
-            "orders": orders, "content_hash": content_hash, "skipped": skipped}
+    result = {"plan_id": plan_id, "as_of": as_of, "mode": mode, "status": "frozen",
+              "orders": orders, "content_hash": content_hash, "skipped": skipped}
+    if broker_cash is not None:
+        # 只在调用方提供了现金事实时才带该键：缺省路径的返回字典逐字不变（既有调用方/测试）
+        result["cash"] = {"available": cash_available, "remaining": cash_remaining,
+                          "unavailable": cash_unavailable,
+                          "capped": sorted(cash_capped)}
+    return result
 
 
 def read_mode(home):
@@ -457,8 +507,8 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
             no_price.append(symbol)
 
     try:
-        positions, equity = core_broker.positions_and_equity(broker_call, mode=mode,
-                                                             market=market)
+        positions, equity, cash = core_broker.positions_equity_cash(
+            broker_call, mode=mode, market=market)
     except core_broker.EquityUnavailable as error:
         # 权益口径问题（官方字段缺失/非正）与通道故障分列：告警文案不得互相冒名
         return skip(f"券商权益不可用（缺失或非正）：{str(error)[:120]}", "warn", "权益不可用")
@@ -468,6 +518,26 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     if not equity or equity <= 0:
         # 权益缺失若当 0 处理，目标数量全变 0 = 凭空生成清仓单；如实跳过
         return skip("券商权益不可用（缺失或非正）", "warn", "权益不可用")
+
+    # 可用现金（2026-09-17 实机修订）：权重/风险预算只看权益，不看现金——本机 A 股模拟
+    # 账户「权益 81 万 / 现金 5.5 万 / 已持 8 只」时买单必被券商资金不足拒。现金与权益
+    # 同源于一次账户查询（`positions_equity_cash`，不重复查账户列表）；取不到就不生成
+    # 买单（**绝不用权益冒充现金**），卖单与清仓照常。
+    warnings = []
+    if cash is None:
+        alerts.emit(conn, home=home, level="warn", title="计划预警：现金不可得",
+                    detail=f"{market} 券商可用现金字段缺失：本次不生成买单"
+                           "（卖单与清仓不受影响）")
+    # 结构性预警：持仓数已达上限时新增建仓注定被规则 6 拦——计划期就说清，别让页面显示
+    # 「已完成」而订单全被拦（实机：已持 8 只 > max_positions=5）。
+    max_positions = int(daemon.risk_config(home).get("max_positions") or 0)
+    new_symbols = [s for s in target if (positions.get(s, {}).get("qty") or 0) == 0]
+    if max_positions and len(positions) >= max_positions and new_symbols:
+        warnings.append(f"持仓 {len(positions)} 只 ≥ 上限 {max_positions}："
+                        f"新增建仓将被规则 6 拦（{len(new_symbols)} 只）")
+        alerts.emit(conn, home=home, level="warn", title="计划预警：持仓数超限",
+                    detail=f"{market} 持仓 {len(positions)} ≥ max_positions={max_positions}，"
+                           f"计划含 {len(new_symbols)} 只新建仓，执行时会被规则 6 拒绝")
 
     # 受管集合缺席者若券商实际持有 → 要生成清仓单 → 需要价格。只为**实际持有**的缺席
     # 标的补价：无持仓的标的既不需要价格，也不该污染 no_price（那是数据缺口的清单）。
@@ -483,8 +553,23 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     plan = build_and_freeze(conn, mode=mode, strategy_id=entry["strategy"], target=target,
                             broker_positions=lambda _mode: (positions, equity),
                             prices=prices, as_of=data_date, origin="auto", market=market,
-                            risk_config=daemon.risk_config(home), managed=managed)
+                            risk_config=daemon.risk_config(home), managed=managed,
+                            broker_cash=lambda _mode: cash)
+    # 计划期现金结局如实回告（买了多少、被现金压低哪些）
+    cash_info = plan.get("cash") or {}
+    if cash_info.get("capped"):
+        warnings.append(f"现金封顶：{len(cash_info['capped'])} 只买入量被可用现金压低"
+                        f"（{'、'.join(cash_info['capped'][:5])}）")
+        alerts.emit(conn, home=home, level="warn", title="计划预警：现金封顶",
+                    detail=f"{market} 可用现金 {cash}：{','.join(cash_info['capped'])[:120]}"
+                           " 的买入量按现金封顶")
+    if not plan["orders"]:
+        # 「没做成」不能显示成「已完成」：零订单计划在流程页按跳过口径呈现
+        alerts.emit(conn, home=home, level="warn", title="计划跳过：无可执行订单",
+                    detail=f"{market} 计划 {plan['plan_id']} 无订单："
+                           + ("；".join(warnings)[:120] or "策略目标与当前持仓一致"))
     return {"ok": True, "plan": plan, "expired": expired, "no_price": no_price,
             "no_atr": list(plan.get("skipped") or []), "equity": equity,
+            "cash": cash, "warnings": warnings,
             "watchlist": len(symbols),
             "managed": len(managed) if managed is not None else "target-only"}

@@ -96,6 +96,8 @@ _ALERT_STATUS = {
     "策略 universe 失败": ("build_plan", "failed"),
     "券商通道不可用": ("build_plan", "failed"),
     "权益不可用": ("build_plan", "failed"),
+    # 计划期结构性结局（2026-09-17 现金封顶修订）：「没做成」不得显示成「已完成」
+    "计划跳过：无可执行订单": ("build_plan", "skipped"),
     # autopilot.auto_execute（auto_execute 作业）
     "账户模式非法": ("auto_execute", "failed"),
     "计划等待人工执行": ("auto_execute", "skipped"),
@@ -156,6 +158,12 @@ _CONTENT_OUTCOMES = {
     "研究快照源不可用": ("research_snapshot", None, "部分源不可用"),
     "研究快照全部失败": ("research_snapshot", "failed", "当日全部失败"),
     "研究任务入队跳过": ("enqueue_research", "skipped", "当日未入队"),
+    # 计划期结构性预警（2026-09-17）：作业跑了、计划也生成了，但买入被现金/持仓上限约束
+    # ——状态仍是 ok（确实产出计划），摘要如实写明约束（不在页面上假装「一切都买到了」）。
+    "计划预警：现金不可得": ("build_plan", None, "现金不可得：本次未生成买单"),
+    "计划预警：现金封顶": ("build_plan", None, "买入量按可用现金封顶"),
+    "计划预警：持仓数超限": ("build_plan", None, "持仓数已达上限：新建仓会被规则 6 拦"),
+    "计划跳过：无可执行订单": ("build_plan", "skipped", "当日无可执行订单"),
     # F-a（2026-09-17）：**作业失败**此前完全不可见——`_subprocess_runner` 的整数 returncode
     # 被 `_run_job` 忽略、tick 仍写 ran 标记 → 触发了 content 路径（ran 已存在）。三条标题
     # 由 daemon 发出，归属看 detail 里的 ``job=<name>``：

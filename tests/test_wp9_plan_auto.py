@@ -118,8 +118,14 @@ class PlanAutoTest(unittest.TestCase):
         return call, calls
 
     def _live_broker(self, positions=None, equity="1000000.00", missing_equity=False,
-                     fail=None):
-        """live 假通道：账户（enable_market[4]=A股）/ 持仓（code 前缀）/ 资金（total_assets）。"""
+                     fail=None, cash="1000000.00"):
+        """live 假通道：账户（enable_market[4]=A股）/ 持仓（code 前缀）/ 资金。
+
+        资金响应按**官方 get-funds.md 口径**给足字段：``total_assets``（权益）与
+        ``power``（最大购买力 = 可用现金；2026-09-17 现金封顶修订）。此前假件只给权益，
+        新语义下「现金不可得 → 不生成买单」会把该用例打成零订单——那是假件不完备，
+        不是语义回归。``cash=None`` 用于构造「现金字段缺失」场景。
+        """
         calls = []
 
         def call(name, args=None, timeout=30, **kwargs):
@@ -134,7 +140,10 @@ class PlanAutoTest(unittest.TestCase):
                     {"code": "SH.600519", "qty": 400},
                     {"code": "US.AAPL", "qty": 10}]}  # 非本市场持仓须被过滤
             if name == "account_funds":
-                return {} if missing_equity else {"total_assets": equity}
+                if missing_equity:
+                    return {}
+                return {"total_assets": equity, "power": cash} if cash is not None \
+                    else {"total_assets": equity}
             raise AssertionError(f"意外工具 {name}")
 
         return call, calls

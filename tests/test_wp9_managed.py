@@ -151,6 +151,11 @@ class PlanAutoManagedTest(unittest.TestCase):
             ensure_ascii=False), encoding="utf-8")
 
     def _broker(self, positions):
+        """sim 假通道。资金响应**必须带现金字段**（``balance``/``max_power_long``）：
+        2026-09-17 现金封顶修订后「现金不可得 → 不生成买单」，只给权益的假件会把买入
+        用例打成零订单——那是假件不完备，不是语义回归（口径见
+        ``tests/test_wp17_cash_cap.py``）。
+        """
         def call(name, args=None, timeout=30, **kwargs):
             if name == "sim_trade_account_list":
                 return {"accounts": [{"account_id": "A-1", "market_id": 3}]}
@@ -158,7 +163,8 @@ class PlanAutoManagedTest(unittest.TestCase):
                 return {"positions": [{"symbol": s, "qty": v["qty"]}
                                       for s, v in positions.items()]}
             if name == "sim_trade_cash_info":
-                return {"total_asset": 1_000_000.0}
+                return {"total_asset": 1_000_000.0, "balance": "1000000.0",
+                        "max_power_long": "1000000.0"}
             raise AssertionError(f"意外券商工具 {name}")
         return call
 

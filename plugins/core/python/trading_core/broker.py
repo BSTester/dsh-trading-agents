@@ -46,6 +46,47 @@ CHAIN_PREFIXES = {"SH": ("SH", "SZ", "BJ"), "HK": ("HK",), "US": ("US",)}
 #: cash/market_val 等分类口径，**不作权益用**）。live 权益只认这一个字段。
 LIVE_EQUITY_FIELD = "total_assets"
 
+#: 可用现金字段优先级（**两份都已发布，不猜**）：
+#:   * sim —— ``sim_trade_cash_info`` 的 ``max_power_long``（券商口径最大可买）→ ``balance``
+#:     （2026-09-17 本机 A 股模拟账户实测：``balance=55257.816`` /
+#:     ``max_power_long=55257.816`` / ``long_mv=756974`` / ``total_asset=812231.816``；
+#:     字段清单同 ``docs/TOOL-LIMITS.md`` §九）；
+#:   * live —— 官方 get-funds.md（2026-09-17 取文档）的 ``power``（最大购买力）→
+#:     ``available_funds``（可用资金）→ ``cash``（现金）。
+#: **权益（total_asset/total_assets）绝不冒充现金**——它是分母，不是可动用资金。
+SIM_CASH_FIELDS = ("max_power_long", "balance")
+LIVE_CASH_FIELDS = ("power", "available_funds", "cash")
+
+
+def _positive_number(mapping, fields):
+    """按优先级取第一个可解析的非负数值；全缺/不可解析 → ``None``（不猜）。"""
+    for field in fields:
+        raw = (mapping or {}).get(field)
+        if raw is None or isinstance(raw, bool):
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            continue
+        if value != value:  # NaN
+            continue
+        return max(0.0, value)
+    return None
+
+
+def available_cash(call, mode, market, timeout=30):
+    """按市场取「可用于买入的现金」；**字段全缺返回 ``None``**（调用方不得用权益顶替）。
+
+    查询失败（无账户/通道异常/传输失败）**如实抛错**——调用方据此降级为「不生成买单」或
+    软跳过当日计划，绝不编造一个数字去定量（``planner`` 的现金封顶用它）。
+
+    实现 = ``positions_equity_cash`` 的**现金分量**（现金与权益同源于一份资金响应，
+    字段优先级见 ``SIM_CASH_FIELDS``/``LIVE_CASH_FIELDS``）：需要同时拿持仓与现金的调用方
+    （``planner.plan_auto``）应直接用 ``positions_equity_cash``，避免重复查账户列表。
+    """
+    _positions, _equity, cash = positions_equity_cash(call, mode, market, timeout=timeout)
+    return cash
+
 
 def is_transport_failure(error):
     """传输失败（请求**可能已到达券商**）→ 真；业务拒绝 → 假。
@@ -187,11 +228,38 @@ class EquityUnavailable(RuntimeError):
     """
 
 
-def positions_and_equity(call, mode, market, timeout=30):
-    """按市场取 (持仓 {symbol: {"qty": n}}, 权益)。**任一不可得即抛错**。
+def positions_equity_cash(call, mode, market, timeout=30):
+    """一次账户查询同时给出 ``(持仓, 权益, 可用现金)``——**单次账户列表查询**。
 
-    调用方（planner.plan_auto）拿到异常就跳过当日计划——不用本地台账、不编造权益：
-    权益缺失若被当成 0，目标数量会全变 0，等于凭空生成清仓单。
+    为什么要合并（2026-09-17 现金封顶修订）：现金与权益来自**同一个资金响应**
+    （sim 的 ``sim_trade_cash_info``、live 的 ``account_funds``），分两次调用会重复查账户
+    列表——既有测试明确钉着「账户列表只查一次」的不变量，且线上多一次往返没有收益。
+
+    现金字段全缺 → ``cash=None``（**绝不用权益冒充现金**）。
+
+    **权益不可得的两种结局**（对调用方语义相同：都是「权益不可用」，绝不当作 0——那会
+    凭空生成清仓单）：
+
+    * sim：多账户聚合中任一账户缺 ``total_asset``/``balance`` → 返回 ``equity=None``
+      （拒绝给出不可信的合计）；
+    * live：缺官方 ``total_assets``、或合计非正 → 抛 ``EquityUnavailable``。
+
+    调用方必须显式处理两种结局（``planner.plan_auto`` 两者都按「跳过当日计划」处理）。
+    """
+    if mode == "sim":
+        return _sim_snapshot(call, market, timeout)
+    if mode == "live":
+        return _live_snapshot(call, market, timeout)
+    raise RuntimeError(f"未接入的账户模式：{mode}")
+
+
+def positions_and_equity(call, mode, market, timeout=30):
+    """按市场取 (持仓 {symbol: {"qty": n}}, 权益)。**权益不可得即视为失败**（见下）。
+
+    调用方（planner.plan_auto）拿到不可用结局就跳过当日计划——不用本地台账、不编造权益：
+    权益缺失若被当成 0，目标数量会全变 0，等于凭空生成清仓单。**两种结局面孔不同**
+    （live 抛 ``EquityUnavailable``、sim 返回 ``equity=None``，见
+    ``positions_equity_cash``），调用方必须都处理。
 
     sim：``sim_trade_account_list`` → 该 market_id 的账户 →
     ``sim_trade_position_list(acc_id, market)``（缺 market 会报 ret=-5）+
@@ -201,15 +269,14 @@ def positions_and_equity(call, mode, market, timeout=30):
     （按 code 前缀过滤到目标市场）+ ``account_funds`` 的 ``total_assets``（官方
     get-funds.md 口径）。**只读取，不产生任何写操作**——live 计划的执行仍由工作台
     口令 + Web 确认卡片把守（规格 §4.2 双模式都生成、执行分模式）。
+
+    本函数是 ``positions_equity_cash`` 的**二元薄封装**（既有调用方零改动）。
     """
-    if mode == "sim":
-        return _sim_positions_and_equity(call, market, timeout)
-    if mode == "live":
-        return _live_positions_and_equity(call, market, timeout)
-    raise RuntimeError(f"未接入的账户模式：{mode}")
+    positions, equity, _cash = positions_equity_cash(call, mode, market, timeout=timeout)
+    return positions, equity
 
 
-def _sim_positions_and_equity(call, market, timeout):
+def _sim_snapshot(call, market, timeout):
     market_id = MARKET_IDS.get(market)
     if market_id is None:
         raise RuntimeError(f"未知市场：{market}")
@@ -217,7 +284,7 @@ def _sim_positions_and_equity(call, market, timeout):
     chosen = [a for a in accounts_ if a.get("market_id") == market_id and a.get("account_id")]
     if not chosen:
         raise RuntimeError(f"无 {market} 模拟账户（market_id={market_id}）")
-    positions, equity, missing = {}, 0.0, False
+    positions, equity, cash_total, missing, cash_found = {}, 0.0, 0.0, False, False
     for account in chosen:
         acc_id = str(account["account_id"])
         data = call(TOOLS["positions"], {"acc_id": acc_id, "market": market_id},
@@ -230,25 +297,30 @@ def _sim_positions_and_equity(call, market, timeout):
             if not symbol or qty is None:
                 continue
             positions[symbol] = {"qty": int(qty)}
-        cash = call(TOOLS["cash"], {"acc_id": acc_id}, timeout=timeout) or {}
-        total = cash.get("total_asset", cash.get("balance"))
+        info = call(TOOLS["cash"], {"acc_id": acc_id}, timeout=timeout) or {}
+        total = info.get("total_asset", info.get("balance"))
         if total is None:
             missing = True
         else:
             equity += float(total)
-    return positions, (None if missing else equity)
+        cash = _positive_number(info, SIM_CASH_FIELDS)   # 与权益同一个响应，零额外调用
+        if cash is not None:
+            cash_total += cash
+            cash_found = True
+    return positions, (None if missing else equity), (cash_total if cash_found else None)
 
 
-def _live_positions_and_equity(call, market, timeout):
-    """live 分支（官方口径 2026-09-16 实抓 get-accounts.md / get-funds.md）：
+def _live_snapshot(call, market, timeout):
+    """live 分支（官方口径 2026-09-16/17 实抓 get-accounts.md / get-funds.md）：
 
     * ``account_authorized_trd_accs`` → ``{accounts:[{account_id, enable_market:[int]}]}``
       （enable_market：1=HK 2=US 4=ChinaStock）；无命中账户即抛错，**不退化**到别的市场；
     * ``account_positions {acc_id}`` → 该账户**全部**持仓（接口不接受 market 参数），
       行字段 ``code``/``qty``（实测见 plugins/workbench/python/positions.py）；
       因此按 ``code`` 前缀过滤到目标市场链（跨市场持仓不进本市场计划）；
-    * ``account_funds {acc_id}`` → ``total_assets``（总净资产）。任一命中账户取不到该
-      字段、或汇总权益非正 → 抛错（**绝不编造权益**：当成 0 会凭空生成清仓单）。
+    * ``account_funds {acc_id}`` → ``total_assets``（总净资产）+ ``LIVE_CASH_FIELDS``
+      （``power``/``available_funds``/``cash``，现金封顶修订新增读取）。任一命中账户取不到
+      权益字段、或汇总权益非正 → 抛错（**绝不编造权益**：当成 0 会凭空生成清仓单）。
 
     **权益分母口径（如实披露，不是保守保证）**：官方资金接口只给账户整体的
     ``total_assets``，没有「按市场切分」的权益。多市场同时生成计划时（SH/HK/US 各一份），
@@ -266,7 +338,7 @@ def _live_positions_and_equity(call, market, timeout):
     if not chosen:
         raise RuntimeError(f"无 {market} 授权交易账户（enable_market 未含 {want}）")
     prefixes = tuple(CHAIN_PREFIXES.get(market) or (market,))
-    positions, equity = {}, 0.0
+    positions, equity, cash_total, cash_found = {}, 0.0, 0.0, False
     for account in chosen:
         acc_id = str(account["account_id"])
         rows = call(LIVE_TOOLS["positions"], {"acc_id": acc_id}, timeout=timeout)
@@ -285,6 +357,10 @@ def _live_positions_and_equity(call, market, timeout):
             raise EquityUnavailable(
                 f"账户资金缺 {LIVE_EQUITY_FIELD}（官方 get-funds 字段）：acc_id={acc_id}")
         equity += float(total)
+        cash = _positive_number(funds, LIVE_CASH_FIELDS)
+        if cash is not None:
+            cash_total += cash
+            cash_found = True
     if equity <= 0:
         raise EquityUnavailable(f"账户权益非正：{equity}（拒绝用非正权益算订单数量）")
-    return positions, equity
+    return positions, equity, (cash_total if cash_found else None)

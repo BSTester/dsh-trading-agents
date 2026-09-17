@@ -23,7 +23,7 @@ for _dir in (ROOT / "plugins" / "datasource" / "python",
 sys.path.insert(0, str(ROOT / "platform"))
 
 from trading_core import alerts as core_alerts  # noqa: E402
-from trading_core import daemon, pipeline, store, watchlist  # noqa: E402
+from trading_core import autopipeline, daemon, pipeline, store, watchlist  # noqa: E402
 
 
 class _Case(unittest.TestCase):
@@ -227,7 +227,21 @@ class AlertTitleLockTests(unittest.TestCase):
         self.assertIn(daemon.SKIP_ALERT_TITLE, pipeline._CONTENT_OUTCOMES)
 
     def test_content_outcome_jobs_exist_in_default_chain(self):
+        """归属的作业必须是 daemon **真会装配**的作业：默认链 ∪ auto_pipeline 开启后的链。
+
+        ``build_plan``/``auto_execute`` 只在 ``auto_pipeline.enabled=true`` 时进链
+        （规格 §4.1），因此只按 ``JOBS_DEFAULT`` 取名字会把它们误判成「作业不存在」——
+        锁的意图是「摘要必须落在一个真会跑的作业上」，不是「必须在默认链上」。
+        """
         names = {job["name"] for chain in daemon.JOBS_DEFAULT.values() for job in chain}
+        with tempfile.TemporaryDirectory() as tmp:
+            (Path(tmp) / "trading-platform.json").write_text(json.dumps({
+                "auto_pipeline": {"enabled": True, "strategies": [
+                    {"market": "SH", "strategy": "watchlist_rsi"}]}},
+                ensure_ascii=False), encoding="utf-8")
+            for chain in autopipeline.build_jobs(tmp).values():
+                names.update(job["name"] for job in chain)
+        self.assertIn("build_plan", names, "自动链必须真的装配 build_plan（否则本锁失去意义）")
         for title, (owner, _status, _text) in pipeline._CONTENT_OUTCOMES.items():
             if owner is not None:
                 self.assertIn(owner, names, f"{title} 归属的作业 {owner} 不在作业链里")
