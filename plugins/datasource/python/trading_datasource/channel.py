@@ -230,29 +230,42 @@ _TZ8 = timezone(timedelta(hours=8))
 
 
 def to_micros(value):
-    """``YYYY-MM-DD``（或 ``datetime``/int）→ 微秒 int。
+    """``YYYY-MM-DD``（或 ``datetime``/int）→ 微秒 int（**当日 00:00:00.000000**，东八区）。
 
-    int 原样返回（调用方已给微秒）；``YYYY-MM-DD`` 取该日 **00:00:00.000000**（东八区），
-    与 ``history_order_list`` 的「起始时间（微秒）」语义一致；``None`` → ``None``。
-    解析失败抛 ``ValueError``（不静默丢弃时间窗——丢了就查成另一个区间）。
+    int 原样返回（调用方已给微秒）；``None`` → ``None``；解析失败抛 ``ValueError``
+    （不静默丢弃时间窗——丢了就查成另一个区间）。用于区间**起点**（``time_begin``）。
     """
+    return _micros_of(value, end_of_day=False)
+
+
+def to_micros_end(value):
+    """同 ``to_micros``，但 ``YYYY-MM-DD`` 取**当日 23:59:59.999999**（东八区）。
+
+    用于区间**终点**（``time_end``）。实测教训（2026-09-16）：
+    ``/sim-trade/{acc_id}/history-orders`` 的窗口是闭区间微秒——若终点取 00:00:00，
+    区间宽度为零，**当天订单一条都查不到**（对账会静默看不见当日成交）。真机对照：
+    ``time_end`` 取 00:00 时返回 0 条，取 23:59:59.999999 时返回当日已撤订单。
+    """
+    return _micros_of(value, end_of_day=True)
+
+
+def _micros_of(value, *, end_of_day):
     if value is None or isinstance(value, int):
         return value
-    if isinstance(value, datetime):
-        moment = value if value.tzinfo else value.replace(tzinfo=_TZ8)
-        return int(moment.timestamp() * 1_000_000)
     if isinstance(value, str):
         text = value.strip()
         if not text:
             return None
         try:
-            moment = datetime.fromisoformat(text)
+            value = datetime.fromisoformat(text)
         except ValueError as error:
             raise ValueError(f"时间参数无法解析为 YYYY-MM-DD：{value!r}") from error
-        if moment.tzinfo is None:
-            moment = moment.replace(tzinfo=_TZ8)
-        return int(moment.timestamp() * 1_000_000)
-    raise ValueError(f"时间参数类型不支持（需 YYYY-MM-DD 或微秒 int）：{value!r}")
+    if not isinstance(value, datetime):
+        raise ValueError(f"时间参数类型不支持（需 YYYY-MM-DD 或微秒 int）：{value!r}")
+    moment = value if value.tzinfo else value.replace(tzinfo=_TZ8)
+    if end_of_day and (value.hour, value.minute, value.second, value.microsecond) == (0, 0, 0, 0):
+        moment = moment.replace(hour=23, minute=59, second=59, microsecond=999999)
+    return int(moment.timestamp() * 1_000_000)
 
 
 def sim_call(home=None, *, client=None, mcp_call=None, credential_path=None):
@@ -332,7 +345,8 @@ def sim_call(home=None, *, client=None, mcp_call=None, credential_path=None):
             return call_openapi(rest_client, "simtrade.history_order_list", {
                 "acc_id": acc_id,
                 "market": _market_of(acc_id, p.get("market")),
-                "time_begin": to_micros(p.get("start")), "time_end": to_micros(p.get("end")),
+                "time_begin": to_micros(p.get("start")),
+                "time_end": to_micros_end(p.get("end")),
                 "page_size": p.get("page_size"), "next_key": p.get("next_key")})
         if tool == "sim_trade_max_buy_sell":
             return call_openapi(rest_client, "simtrade.max_buy_sell", {

@@ -357,6 +357,7 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
 | 2 | `history-orders` 时间窗 | `time_begin`/`time_end` int（微秒） | 传 `YYYY-MM-DD` 字符串被拒：`parameter 'time_begin' must be an integer`；响应 `create_time` 亦为微秒 |
 | 3 | `input_order` 数量/价格 | `qty`/`price` 类型 string | 一致（示例 `"100"`/`"400"`）；MCP 通道传数值 → 适配器统一转字符串 |
 | 4 | `cancel_order` / `modify_order` | cancel 页写「无请求体」 | **body 必带 `market`**，缺参 `missing required field in body: market` |
+| 5 | `history-orders` 时间窗语义 | `time_begin`/`time_end` int（微秒） | **闭区间**：终点若取当日 `00:00:00`，区间宽度为零，**当天订单一条都查不到**（实测 0 条 vs 取 `23:59:59.999999` 的 1 条）——日期→微秒的翻译对终点必须取日末（`channel.to_micros_end`） |
 
 **待办（本任务未改策略）**：`sim_trade_modify_order`（MCP）历史记录有间歇性 `-5`，仓库
 因此一律「撤旧重下」；本次 REST `modify_order` 实测成功一次（含 `market`+`new_qty`+

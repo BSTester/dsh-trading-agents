@@ -298,8 +298,11 @@ class SimCallAdapterTests(unittest.TestCase):
                           "/api/v1.0/sim-trade/3182575/history-orders"])
         query = recording.calls[1][3]
         self.assertEqual(query["market"], 3)
+        # 起点=当日 00:00；**终点=当日 23:59:59.999999**（实测：取 00:00 时区间宽度为零，
+        # 当天订单一律查不到——见 to_micros_end 的 docstring 与 TOOL-LIMITS §九）
         self.assertEqual(query["time_begin"], channel.to_micros("2026-08-01"))
-        self.assertEqual(query["time_end"], channel.to_micros("2026-08-02"))
+        self.assertEqual(query["time_end"], channel.to_micros_end("2026-08-02"))
+        self.assertGreater(query["time_end"] - query["time_begin"], 24 * 3600 * 1_000_000)
 
     def test_rest_error_propagates_without_channel_switch(self):
         home, cred = openapi_home(self.tmp.name)
@@ -397,7 +400,18 @@ class LockTableBindingTests(unittest.TestCase):
             channel.to_micros("not-a-date")
         with self.assertRaises(ValueError):
             channel.to_micros([1])
+        with self.assertRaises(ValueError):
+            channel.to_micros_end([1])
         self.assertIsNone(channel.to_micros(None))
+        self.assertIsNone(channel.to_micros_end(None))
+
+    def test_to_micros_end_covers_the_whole_day(self):
+        begin = channel.to_micros("2026-09-17")
+        end = channel.to_micros_end("2026-09-17")
+        self.assertEqual(begin, 1789574400000000)  # 2026-09-17 00:00:00 +08:00
+        self.assertEqual(end - begin, 86_399_999_999)  # 差 1µs 即全天
+        # int 直通（调用方已给精确微秒，不做日界改写）
+        self.assertEqual(channel.to_micros_end(123), 123)
 
 
 if __name__ == "__main__":
