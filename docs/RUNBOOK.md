@@ -416,6 +416,29 @@ unset DSH_FAKE_NOW                              # 演练结束必须清理
 | 逐标的超时 `sentiment_symbol_timeout_seconds`（90） | 该标的判失败、**继续下一个**（不再一个卡住拖死整轮） | 该标的进结果 `failed`（原因含「超时」）；全部超时 → warn `情绪快照全部失败` |
 | 子进程回收 | 超时/中断都整组 `SIGKILL` | 无孤儿（下面「孤儿检查」应为空） |
 
+**信号语义（为什么这么实现，2026-09-17 实机验证）**：`SIGTERM` 的**默认动作直接终止
+进程，`finally` 不会执行** → 子进程组（fin_sentiment 及其拉起的浏览器）被留下来，这正是
+实机观察到孤儿的原因。因此真实子进程一律 `start_new_session=True` 建独立进程组，并在三条
+路径上回收：① 超时分支 `os.killpg(SIGKILL)`；② `finally`（异常/`KeyboardInterrupt`）；
+③ **SIGTERM 守卫**（先回收进程组，再恢复默认动作重发信号，保持「被信号杀死」的语义与退出码）。
+`SIGINT` 不必拦（Python 抛 `KeyboardInterrupt`，走 `finally`）。
+
+**一个不可拦截的例外（如实登记）**：`SIGKILL` 无法捕获——作业在 **900s 上限被外部
+`SIGKILL`** 时，本进程内的所有清理代码都不会执行，其子进程会变孤儿（已实测复现）。
+人工中断作业后请**照下面的「孤儿检查」看一眼并手工清理**；长期解法（`PR_SET_PDEATHSIG`
+或让外层按进程组杀）已登记为遗留项，见 `docs/HANDOVER.md`。
+
+**孤儿检查与手工清理**（超时/中断/kill 之后都应跑一眼）：
+
+```bash
+# 1) 查（无输出=干净）
+pgrep -af "python.*(fin_sentiment|fin_news|last30days|x_search|reddit)" | grep -v pgrep
+# 2) 清理：按进程组杀（fin_sentiment 自建进程组，浏览器等子进程同组）
+for pid in $(pgrep -f "python.*fin_sentiment\.py"); do
+  kill -KILL -"$(ps -o pgid= -p "$pid" | tr -d ' ')" 2>/dev/null || kill -KILL "$pid"
+done
+```
+
 **硬约束**：`预算 + 3 × 单标的超时 < 900s`（默认 870 ✓）。调大预算会 fail-closed 报错并
 提示调整方向——这是刻意的：预算若被静默忽略，作业仍会撞上 900s 上限，等于没修。
 
@@ -438,7 +461,7 @@ unset DSH_FAKE_NOW                              # 演练结束必须清理
 | 阶段 `skipped` + 摘要「当日未采完：预算耗尽」 | 同上，流程页如实呈现 | 同上；不要当故障处理 |
 | 告警 `情绪源不可用`（单源全标的失败） | 该源通道坏了（如 X 浏览器登录失效），其余源照常 | 按 `docs/TOOL-LIMITS.md` 的渠道口径排查；`last30days` 未安装属正常缺席 |
 | 告警 `情绪快照全部失败` | 在场源无一成功 | 先看 detail 的首次错误；多半是 fin-data 脚本环境（浏览器/venv）问题 |
-| 想确认「有没有留下孤儿进程」 | 超时/中断后不应残留 | `pgrep -af "fin_sentiment|fin-data/.*\.py" \|\| echo 无孤儿` |
+| 想确认「有没有留下孤儿进程」 | 超时/中断后不应残留；**SIGKILL（900s 上限）例外** | 用上文「孤儿检查与手工清理」的两条命令 |
 
 **为什么进度行写 stderr**：作业摘要（stdout 的 JSON）由服务用
 `daemon._last_json_object` 解析后进告警 detail；进度若混进 stdout 会干扰该解析。stderr
