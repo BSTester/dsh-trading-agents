@@ -108,6 +108,50 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 （要装全部插件，不要只装 skill 基础模式），完成后运行安装器自检并把输出发我。
 ```
 
+## 装完之后：服务启停、代码更新与验收（WP9–WP17）
+
+安装脚本会把 preset 与统一 Python 层装好；**日常运维用仓库里的一个脚本**，不要用前台
+进程方式长期跑服务：
+
+```bash
+scripts/platform_service.sh start     # 分离进程拉起（与 preset 的 platform-autostart 同一语义：
+                                      # 会话结束仍存活）；已在跑则不重复拉起
+scripts/platform_service.sh status    # 端口/健康/PID/日志尾部/scheduler 字段
+scripts/platform_service.sh stop      # 优雅 TERM → 等端口释放 → 超时 KILL
+scripts/platform_service.sh restart   # stop + start（改了服务侧代码后必须做）
+scripts/platform_service.sh refresh   # 把仓库 python 层重新解到 ~/.dsh/trading-python/
+```
+
+> ⚠️ **改完代码要 `refresh`，服务侧改动还要 `restart`**。原因：作业子进程
+> （`python -m trading_core …`，即调度链的每条腿）经 venv 的 `.pth` 解析到
+> `~/.dsh/trading-python/` 下的**安装副本**；只改仓库文件不改副本，作业仍跑旧代码。
+> 开发机上父进程（服务）走「仓库优先」（`trading_datasource.repo_paths`：存在仓库则前置到
+> `PYTHONPATH`，否则回落副本），所以**服务内**改动重启即生效，而**手工/调度子进程**依赖副本。
+> 前端改动另需重建：`npm --prefix platform/web run build`。
+
+**首启必做**：配置关注池，否则平台在跑但什么都没发生（流程页会给「关注池未配置」提示）：
+
+```bash
+~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300 --limit 20
+```
+
+**验收工具**（交付即可跑，详见 [docs/E2E-ACCEPTANCE.md](docs/E2E-ACCEPTANCE.md)）：
+
+```bash
+~/.dsh/trading-venv/bin/python scripts/e2e_workbench.py   # 82 端点全扫 + 可逆写探针 + 一致性核对
+node scripts/e2e_web.mjs --fail-on-soft                   # 16 路由真浏览器（CDP，零依赖）
+```
+
+`AGENTS.md`（仓库根，工程内会话自动加载）写的是**值班研究员队列的兜底纪律**：会话首次交互
+先 `research_tasks_claim` 探测队列，有积压先按 `research-institute` 技能的值班模式消费，
+产出只进研究页与规则候选池（**不碰交易、不启用策略**）；主消费路径是
+`install/research-duty.timer`（外部定时器 → `dsh --profile headless`）。
+
+> 安装来源提示：上文方式 A/B 从 GitHub 克隆。若本机仓库**领先远端**（有未 push 的提交），
+> 从 GitHub 装到的是**已发布版本**；此时以本地仓库为准——预设更新可
+> `git -C ~/.dsh/.agent-presets/dsh-trading-agents remote set-url origin <本地仓库> && git pull --ff-only`，
+> 运行层更新用 `scripts/platform_service.sh refresh && restart`。
+
 ## 维护：清掉"进行中"的研究记录
 
 被中断的会话会留下停在 `running` 的研究 run，工作台「研究」页会一直显示"进行中"。
@@ -167,13 +211,19 @@ npm --prefix platform/web install && npm --prefix platform/web run build
 cd platform && ~/.dsh/trading-venv/bin/python -m server.run
 ```
 
+> 上面是**前台**跑法（随当前 shell 结束，仅适合临时调试）。要长期运行、或需要
+> start/stop/status/restart/refresh，请用 `scripts/platform_service.sh`——
+> 见下文「装完之后：服务启停、代码更新与验收」。
+
 浏览器打开 `http://127.0.0.1:8397` 即是工作台（`/healthz` 为存活探针）。
 **不能在仓库根用 `python -m platform.server.run`**——标准库 `platform` 遮蔽同名包。
 
 要让 Harness 会话直接调用工作台能力，把 `agent.cordis.yml` 里 `quant-platform-mcp` 行的
 `disabled: true` 改成 `false`，然后**新建会话**（已挂载的会话不会重新读取组合）：会话内
-出现 `mcp__quantwb__*` 共 59 个工具（WP8 任务 6 起），与 Web 同源（HTTP 与 MCP 调用同一批
-处理函数；`confirm-decide` 有意不进工具面，模型不能自批实盘单）。
+出现 `mcp__quantwb__*` 共 **77** 个工具（WP17 起；服务同时声明 **82** 个 HTTP 端点），
+与 Web 同源（HTTP 与 MCP 调用同一批处理函数；`confirm-decide`、`rules-decide`、
+`auto_pipeline`、`modify_user_security`、`research-tasks-list` 等**人类专属端点有意不进工具面**——
+模型不能自批实盘单、不能自己批准规则、不能自拨自动执行开关）。
 实盘切换只能在独立 Web 的模式切换入口（页头 SIM/LIVE 徽章 →「账户模式」对话框）
 输入口令「确认实盘」完成，成功后提示带 `order_authorized: false`；`switch_mode` 工具
 只接受切到 sim（live→sim 回模拟盘），sim→live 一律拒绝。启停/配置/systemd 见
