@@ -14,7 +14,134 @@
 是某条任务的执行结局，不是某个作业阶段的没跑完；流程页的阶段归因不该被它改写，任务明细
 由队列列表端点与告警列表各自呈现（状态说阶段，明细说任务）。
 """
+import datetime as _dt
+
 from . import alerts, store
+
+#: 支持的市场链（与 ``planner.data_date_for`` 同一集合——入队要折算会话本地观测日）
+CHAIN_MARKETS = ("SH", "HK", "US")
+#: 因子巡检窗口（交易日）：足够覆盖一条因子的中周期衰减，也不至于拉太长历史。
+FACTOR_WINDOW_DAYS = 120
+#: 每日摘要的 kv 引用（reconcile 链的 ``daily:digest``，值班研究员据此读到当日口径）
+DIGEST_REF = "kv:daily:digest"
+_CHARS = 300
+
+
+def enqueue(home, market, conn=None, now=None, today=None):
+    """入队一轮 → 结果信封（**永不抛**）。
+
+    返回契约::
+
+      {"ok": True, "market", "date", "date_source",
+       "tasks": [{"kind", "task_id", "created"}, ...]}
+      {"ok": True, "market", "skipped": <原因>}   软跳过（会话未收盘/关注池为空）
+      {"ok": False, "error": <原因>}              市场链/时钟非法（fail-closed）
+
+    入队是**纯本地动作**：只读配置与本地库、只写本地队列表——不调 LLM、不开子进程、
+    不触达任何外部通道（「零 LLM」是基础链作业的硬约束，规格 §10.5）。
+    """
+    from . import clock
+
+    home = str(home)
+    market = str(market).upper()
+    if market not in CHAIN_MARKETS:
+        return {"ok": False,
+                "error": f"未知市场链：{market}（应为 {'/'.join(CHAIN_MARKETS)}）"}
+    try:
+        # 与采集链同一时钟口径：today（可纯日期）> now > DSH_FAKE_NOW > 真实时间
+        stamp = today or clock.now_stamp(now)
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+
+    owns_conn = conn is None
+    if owns_conn:
+        conn = store.connect(store.db_path(home))
+    try:
+        return _enqueue_round(conn, home, market, str(stamp))
+    finally:
+        if owns_conn:
+            conn.close()
+
+
+def _enqueue_round(conn, home, market, stamp):
+    from . import factors, planner, watchlist
+
+    def emit(level, title, detail):
+        # detail 一律带 market=XX：pipeline 的阶段归因按该标记归属市场。
+        alerts.emit(conn, home=home, level=level, title=title,
+                    detail=f"market={market} {detail}"[:_CHARS])
+
+    try:
+        date, date_source = planner.observation_date(conn, market, stamp)
+    except ValueError as error:
+        # 注入时刻非法（--today/--now 是人工输入）：fail-closed，不静默回落真实时间
+        return {"ok": False, "error": str(error)}
+    if date_source == "beijing-fallback":
+        emit("info", "日期口径退化",
+             f"日历未同步，观测日退化为北京日 {date}（date_source=beijing-fallback）")
+    if date is None:
+        emit("info", "研究任务入队跳过", f"本次负责的会话尚未收盘（{stamp}）")
+        return {"ok": True, "market": market,
+                "skipped": f"{market} 本次负责的会话尚未收盘"}
+
+    symbols = watchlist.watchlist_symbols(home, market=market)
+    if not symbols:
+        emit("info", "研究任务入队跳过", "关注池为空（无标的可研究）")
+        return {"ok": True, "market": market, "skipped": f"关注池为空：market={market}"}
+
+    try:
+        refs = _refs(conn, date)
+        tasks = [
+            _put(conn, "daily_brief", date, market,
+                 {"as_of": date, "market": market, "digest_ref": DIGEST_REF,
+                  "symbols": symbols, "refs": refs}),
+            _put(conn, "factor_patrol", date, market,
+                 {"as_of": date, "market": market,
+                  "factor_list": sorted(factors.REGISTRY),
+                  "window": FACTOR_WINDOW_DAYS}),
+        ]
+        # 周度挖掘轮：本周（ISO 周，周一起算）该市场尚未入队才补一条——周一休市时
+        # 本周第一个交易日照样会入队，不做「必须周一」的硬判定。
+        if not store.task_exists_since(conn, "mining_round", market, _week_start(date)):
+            tasks.append(_put(conn, "mining_round", date, market,
+                              {"as_of": date, "market": market, "refs": refs}))
+    except ValueError as error:
+        # 载荷/参数非法（本模块自建载荷，正常不该发生）：暴露为告警，不静默丢任务
+        emit("warn", "研究任务入队失败", str(error))
+        return {"ok": False, "error": str(error)}
+    return {"ok": True, "market": market, "date": date, "date_source": date_source,
+            "tasks": tasks}
+
+
+def _refs(conn, date):
+    """当日研究数据引用（结构化，只带行数——值班研究员据此决定读哪张表）。"""
+    counts = store.snapshot_counts(conn, date)
+    return [{"source": "sentiment_snapshots", "date": date,
+             "records": counts["sentiment"]},
+            {"source": "f10_snapshots", "date": date, "rows": counts["f10"]},
+            {"source": "short_snapshots", "date": date, "rows": counts["short"]},
+            {"source": "plate_snapshots", "date": date, "rows": counts["plate"]},
+            {"source": "factor_registry", "date": date, "rows": len(_fresh_factors())}]
+
+
+def _fresh_factors():
+    from . import factors
+    return factors.REGISTRY
+
+
+def _week_start(date_text):
+    """该日期所属 ISO 周（周一起算）的周一日期字符串。"""
+    day = _dt.date.fromisoformat(str(date_text)[:10])
+    return (day - _dt.timedelta(days=day.isoweekday() - 1)).isoformat()
+
+
+def _put(conn, kind, date, market, payload):
+    """入队一条并回报是否为本次新建（幂等复用时 created=False）。"""
+    existed = conn.execute(
+        "SELECT 1 FROM research_tasks WHERE kind=? AND as_of=? AND market=? LIMIT 1",
+        (kind, date, market)).fetchone() is not None
+    task_id = store.enqueue_task(conn, kind, date, market, payload)
+    return {"kind": kind, "task_id": task_id, "created": not existed}
 
 
 def reclaim(conn, home, now, timeout_minutes=store.TASK_TIMEOUT_MINUTES):

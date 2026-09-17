@@ -115,6 +115,10 @@ _ALERT_STATUS = {
     "研究数据面未配置": ("research_snapshot", "skipped"),
     "研究快照源不可用": ("research_snapshot", "failed"),
     "研究快照全部失败": ("research_snapshot", "failed"),
+    # research_queue.enqueue（enqueue_research 作业，WP15 任务 2）——同样是「作业没跑完」
+    # 才生效；跑完（有 ran 标记）时软跳过只留告警明细，阶段仍是 ok（状态说跑没跑）。
+    "研究任务入队跳过": ("enqueue_research", "skipped"),
+    "研究任务入队失败": ("enqueue_research", "failed"),
 }
 
 #: 情绪采集的**内容结局**（作业跑完后的软失败）→ 摘要片段。软失败（池空/全源失败/会话

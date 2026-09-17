@@ -111,19 +111,6 @@ def _payload_of(text, source, symbol):
     return data
 
 
-def _observation_date(conn, market, stamp):
-    """→ ``(date | None, date_source)``；``None`` = 本次负责的会话尚未收盘。"""
-    from . import planner
-    try:
-        local = planner.data_date_for(conn, market, stamp)
-    except (RuntimeError, KeyError):
-        # 日历未同步/市场缺表：退化北京日，但**显式标源**（调用方落 info 告警）
-        return str(stamp)[:10], "beijing-fallback"
-    if local is None:
-        return None, "session-open"
-    return local, "session"
-
-
 def _fetched_at(stamp):
     """观测时点：完整时刻直接用它（演练/补跑可复现），纯日期则取真实当前时刻。"""
     from . import clock
@@ -171,7 +158,7 @@ def run(home, market, conn=None, runner=None, news_call=None, now=None, today=No
 
 
 def _collect(conn, home, market, stamp, runner, news_call):
-    from . import alerts, store as store_mod, watchlist
+    from . import alerts, planner, store as store_mod, watchlist
 
     def emit(level, title, detail):
         # detail 一律带 market=XX：pipeline 的阶段归因按该标记归属市场（_alert_market），
@@ -180,7 +167,7 @@ def _collect(conn, home, market, stamp, runner, news_call):
                     detail=detail[:_ERROR_CHARS])
 
     try:
-        date, date_source = _observation_date(conn, market, stamp)
+        date, date_source = planner.observation_date(conn, market, stamp)
     except ValueError as error:
         # 注入口径非法（--today/--now 是人工输入）：fail-closed 信封，**永不抛**——
         # 非法时刻若静默回落真实时间，演练结论会失真（沿用 planner/daemon 同一分级）。

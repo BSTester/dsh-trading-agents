@@ -133,6 +133,17 @@ def build_parser():
                    help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用）")
     _add_db(s)
 
+    s = sub.add_parser("enqueue-research",
+                       help="值班研究员任务入队（daily_brief/factor_patrol/mining_round；"
+                            "落 research_tasks，零 LLM）")
+    s.add_argument("--market", required=True, help="市场链：SH/HK/US（SH 链含 SZ/BJ）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    s.add_argument("--today", default=None,
+                   help="观测日覆盖 YYYY-MM-DD 或完整时刻（测试/补跑用）")
+    s.add_argument("--now", default=None,
+                   help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用）")
+    _add_db(s)
+
     s = sub.add_parser("reconcile-diff", help="离线比对本地与券商持仓 JSON")
     s.add_argument("--local", required=True)
     s.add_argument("--broker", required=True)
@@ -666,6 +677,19 @@ def main(argv=None):
                 if not result.get("ok"):
                     print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
                     return 1
+        elif args.cmd == "enqueue-research":
+            # 值班研究员任务入队（WP15 任务 2）。**基础链**作业，与交易开关解耦：
+            # 软跳过（会话未收盘/关注池为空）退出 0——入队只是「把当日的活记下来」，
+            # 队列积压不阻塞调度链；市场链/时钟非法=非零退出（fail-closed）。
+            # 本命令零 LLM、零子进程：不领取、不执行任何任务（执行体是 Harness 会话）。
+            import os
+            from . import research_queue
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = research_queue.enqueue(home, args.market, conn=conn,
+                                            today=args.today, now=args.now)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
+                return 1
         elif args.cmd == "reconcile-diff":
             from . import reconcile
             diffs = reconcile.compare(

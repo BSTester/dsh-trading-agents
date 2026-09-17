@@ -1121,3 +1121,32 @@ def get_tasks(conn, status=None, limit=50):
     sql += " ORDER BY created_at, task_id LIMIT ?"
     rows = conn.execute(sql, (*params, int(limit))).fetchall()
     return [_task_row(row) for row in rows]
+
+
+def task_exists_since(conn, kind, market, since):
+    """该 ``(kind, market)`` 是否存在 ``as_of >= since`` 的任务（周度任务的周内判定）。"""
+    row = conn.execute(
+        "SELECT 1 FROM research_tasks WHERE kind=? AND market=? AND as_of>=? LIMIT 1",
+        (kind, str(market).upper(), since)).fetchone()
+    return row is not None
+
+
+def snapshot_counts(conn, date):
+    """该日的 PIT 快照行数（研究任务入队 refs 的取数口径，只读）。
+
+    日期口径逐表如实：情绪/做空/板块按各自的 ``date`` 列；F10 的日期是**观测日**
+    （``fetched_at`` 的日期部分）——F10 行的语义时点是财报期（``period_end``）与披露时点
+    （``announced_at``），观测日只用来回答「今天采到了几行」，不冒充数据时点。
+    """
+    day = str(date)[:10]
+    sentiment = conn.execute("SELECT COUNT(*) AS n FROM sentiment_snapshots WHERE date=?",
+                             (day,)).fetchone()["n"]
+    f10 = conn.execute(
+        "SELECT COUNT(*) AS n FROM f10_snapshots WHERE substr(fetched_at,1,10)=?",
+        (day,)).fetchone()["n"]
+    short = conn.execute("SELECT COUNT(*) AS n FROM short_snapshots WHERE date=?",
+                         (day,)).fetchone()["n"]
+    plate = conn.execute("SELECT COUNT(*) AS n FROM plate_snapshots WHERE date=?",
+                         (day,)).fetchone()["n"]
+    return {"sentiment": int(sentiment), "f10": int(f10), "short": int(short),
+            "plate": int(plate)}

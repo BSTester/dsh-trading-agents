@@ -220,6 +220,27 @@ def data_date_for(conn, market, stamp):
     return days[-1]
 
 
+def observation_date(conn, market, stamp):
+    """本次作业负责的**会话本地观测日** → ``(date | None, date_source)``。
+
+    ``None`` = 本次负责的会话尚未收盘（调用方按软跳过处理，规格 §4.2）。
+    ``date_source`` 三值：``session``（正常折算）/ ``session-open``（未收盘）/
+    ``beijing-fallback``（日历未同步或市场缺表 → 退化北京日，调用方**必须**为此发
+    info 告警：口径退化要可见，不能静默改语义）。
+
+    与 ``data_date_for`` 的关系：后者是「折算 + 拿最近交易日」的唯一实现，本函数只是把
+    它的三种结局整理成调用方需要的二元组——采集链（sentiment/research_sync）与值班
+    研究员入队（research_queue）共用同一处，避免各写一份导致口径漂移。
+    """
+    try:
+        local = data_date_for(conn, market, stamp)
+    except (RuntimeError, KeyError):
+        return str(stamp)[:10], "beijing-fallback"
+    if local is None:
+        return None, "session-open"
+    return local, "session"
+
+
 def recent_trading_days(conn, market, today, window=1):
     """最近 window 个交易日（≤ today，降序，最近在前）。
 

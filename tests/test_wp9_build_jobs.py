@@ -73,7 +73,8 @@ class BuildJobsTest(unittest.TestCase):
         self.assertEqual(g[0]["cmd"], ["reconcile-daily"])
         # deepcopy：不改动全局常量，也不残留上一次装配的痕迹
         self.assertNotIn(daemon.GLOBAL_CHAIN, daemon.JOBS_DEFAULT)
-        self.assertEqual(len(daemon.JOBS_DEFAULT["SH"]), 7)  # WP11 sentiment + WP12 research 快照
+        self.assertEqual(len(daemon.JOBS_DEFAULT["SH"]), 8)
+        # 基础链：WP11 sentiment + WP12 research 快照 + WP15 研究任务入队
 
     # ③ GLOBAL 链不查市场日历：日历缺失时市场链跳过并告警，全局链照常执行
     def test_global_chain_ignores_calendar(self):

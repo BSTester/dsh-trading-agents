@@ -159,19 +159,6 @@ def _note_payload(payload):
     return {"items": [payload], **note}
 
 
-def _observation_date(conn, market, stamp):
-    """→ ``(date | None, date_source)``；``None`` = 本次负责的会话尚未收盘（与采集链同口径）。"""
-    from . import planner
-    try:
-        local = planner.data_date_for(conn, market, stamp)
-    except (RuntimeError, KeyError):
-        # 日历未同步/市场缺表：退化北京日，但**显式标源**（调用方落 info 告警）
-        return str(stamp)[:10], "beijing-fallback"
-    if local is None:
-        return None, "session-open"
-    return local, "session"
-
-
 def run(home, market, conn=None, client=None, now=None, today=None,
         credential_path=None, sleep_seconds=None):
     """采集一轮 → 结果信封（**永不抛**）。
@@ -217,7 +204,7 @@ def run(home, market, conn=None, client=None, now=None, today=None,
 
 
 def _collect(conn, home, market, stamp, client, credential_path, sleep_seconds):
-    from . import alerts, sync as sync_mod, watchlist
+    from . import alerts, planner, sync as sync_mod, watchlist
 
     def emit(level, title, detail):
         # detail 一律带 market=XX：pipeline 的阶段归因按该标记归属市场（_alert_market），
@@ -226,7 +213,7 @@ def _collect(conn, home, market, stamp, client, credential_path, sleep_seconds):
                     detail=detail[:_ERROR_CHARS])
 
     try:
-        date, date_source = _observation_date(conn, market, stamp)
+        date, date_source = planner.observation_date(conn, market, stamp)
     except ValueError as error:
         # 注入时刻非法（--today/--now 是人工输入）：fail-closed 信封，**永不抛**
         return {"ok": False, "error": str(error)}
