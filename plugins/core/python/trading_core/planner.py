@@ -238,29 +238,39 @@ def recent_trading_days(conn, market, today, window=1):
 def _resolve_strategy(conn, name):
     """按名字取策略实例，返回 ``(instance | None, error | None)``。
 
-    两条来源，**顺序即优先级**：
+    两类名字，**待遇不同**（WP14 任务 6 e2e 修正后的口径）：
 
-    1. ``strategies.REGISTRY``——内置策略（``watchlist_rsi`` 等）与已显式注册的规则；
-    2. **规则表里的 ``enabled`` 规则**（WP14 任务 4）：规则提案不预注册，改由本函数在
-       计划时按 DB 状态加载——这就是「人工批准 = 启用」的机械落地：
-       ``candidate``/``passed``/``failed``/``disabled`` 的规则一律**不得被消费**，
-       由第二条分支如实报「规则未启用」；只有 ``enabled``（经 ``decide_rule`` 记录
-       批准人）才注册进注册表。
+    1. **内置策略**（``watchlist_rsi`` 等，模块级 ``@strategy`` 注册）：注册表命中即用；
+    2. **规则名**（``strategies.register_rule`` 动态注册，见 ``strategies.is_rule``）：
+       **每次都回查 DB 状态**，进程内实例不作数——``candidate``/``passed``/``failed``/
+       ``disabled`` 一律不得被消费，只有 ``enabled``（经 ``decide_rule`` 记录批准人）
+       才注册进注册表。
+
+    为什么规则不能只信注册表：旧实现把 REGISTRY 当一级事实来源，规则被解析过一次就
+    常驻进程内；此后用户在 Web 停用该规则，长驻服务进程的下一次计划生成仍会命中陈旧
+    实例继续下单——``disabled`` 是终态，等于「停用随时可停」在进程内失效（fail-open）。
+    状态不再匹配时由 ``strategies.unregister_rule`` 立刻摘除实例。
 
     规则加载失败（spec 被改坏/因子被摘）按 fail-closed 返回 error，不做静默回退。
     """
     from . import strategies  # 模块级 import 在 plan_auto 内是惰性的，这里自带一份
     instance = strategies.REGISTRY.get(name)
-    if instance is not None:
-        return instance, None
+    if instance is not None and not strategies.is_rule(name):
+        return instance, None  # 内置策略：注册表是权威
     row = store.find_rule(conn, name)
     if row is None:
+        if instance is not None:
+            # 动态注册过但库内无记录：没有批准痕迹 → 不得消费（fail-closed）
+            strategies.unregister_rule(name)
+            return None, f"规则未启用：{name}（库内无该规则记录，需人工批准后启用）"
         return None, None  # 不是规则名：交由调用方按「策略未注册」处理
     if row["status"] != "enabled":
+        strategies.unregister_rule(name)  # 停用/状态变化：立刻摘掉进程内实例
         return None, f"规则未启用：{name}（当前 {row['status']}，需人工批准后启用）"
     try:
         return strategies.register_rule(row["spec"]), None
     except ValueError as error:
+        strategies.unregister_rule(name)
         return None, f"规则加载失败：{name}（{str(error)[:100]}）"
 
 

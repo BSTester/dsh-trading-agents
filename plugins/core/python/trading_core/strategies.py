@@ -11,6 +11,9 @@ from pathlib import Path
 from . import factors, store
 
 REGISTRY = {}
+#: 由 ``register_rule`` 动态注册的规则名（内置策略不在此集合）。
+#: 解析器据此区分两类名字：内置策略命中即用；规则必须每次回查 DB 状态。
+RULE_NAMES = set()
 
 
 def _home(home=None):
@@ -32,11 +35,34 @@ def register_rule(spec, registry=None):
     协议校验与实例构造都在 ``rule_engine``（规则协议的**唯一实现**）；本函数只负责
     「注册进策略注册表」这一 strategies 侧职责。反向 import 放在函数内：rule_engine
     的实例要回调本模块的 ``risk_capped_weights``，模块级互相 import 会成环。
+
+    规则名会记进 ``RULE_NAMES``：内置策略与规则在解析器里**待遇不同**——规则每次都要
+    回查 DB 状态（见 ``planner._resolve_strategy``），进程内实例不得覆盖「停用」这一
+    人工决定。``unregister_rule`` 是配套的摘除入口。
     """
     from . import rule_engine
     instance = rule_engine.load_rule(spec, registry=registry)
     REGISTRY[spec["rule_id"]] = instance
+    RULE_NAMES.add(spec["rule_id"])
     return instance
+
+
+def is_rule(name):
+    """该名字是否由 ``register_rule`` 动态注册（= 规则，而非内置策略）。"""
+    return name in RULE_NAMES
+
+
+def unregister_rule(name):
+    """摘掉进程内的规则实例（状态不再是 ``enabled`` 或加载失败时调用，fail-closed）。
+
+    背景（WP14 任务 6 e2e 暴露的缺陷）：``_resolve_strategy`` 原先把 REGISTRY 当作
+    一级事实来源，规则一旦被解析过一次就会常驻进程内——此后用户在 Web 上停用该规则，
+    同一进程内的下一次计划生成**仍会命中陈旧实例并继续下单**。``disabled`` 是终态
+    （``rule_engine.RULE_TRANSITIONS``），这等于「停用」在长驻服务进程里失效。
+    规则名一律以 DB 状态为准，本函数负责把失效实例清出注册表。
+    """
+    RULE_NAMES.discard(name)
+    REGISTRY.pop(name, None)
 
 
 def risk_capped_weights(selected, home=None):
