@@ -48,21 +48,17 @@ PYTHON = sys.executable
 # sys.path——那是安装器解出的**副本**，新增子命令/模块不会自动同步。服务进程自己已由
 # run.py 把仓库路径插到最前，但 ``subprocess`` 起的是**新解释器**，不继承父进程 sys.path，
 # 因此仓库内运行时会解析到旧副本（实测：新子命令报 ``invalid choice``）。
-# 这里把仓库数据层路径经 PYTHONPATH 传给子进程，让「代码版本 = 数据层版本」在子进程
-# 边界同样成立；无仓库（打包安装）时保持原样，回落 $DSH_HOME 副本。
-_DATA_LAYER_DIRS = tuple(str(ROOT / "plugins" / name / "python")
-                         for name in ("datasource", "core"))
+#
+# 该策略与 core 作业的 ``daemon._subprocess_runner`` 共用同一实现
+# （``trading_datasource.repo_paths``）：两处要回答的是同一个问题——「子进程该吃仓库
+# 代码还是安装副本」——各写一份必然漂移（历史上正是两份）。行为不变：仓库数据层存在
+# 才前置、保留既有 PYTHONPATH 其它项且不重复、无仓库时返回 None 回落副本。
+from trading_datasource import repo_paths  # noqa: E402
 
 
 def _subprocess_env():
     """子进程环境：仓库数据层优先（存在才前置，绝不覆盖既有 PYTHONPATH 的其它项）。"""
-    existing = [part for part in os.environ.get("PYTHONPATH", "").split(os.pathsep) if part]
-    prefix = [path for path in _DATA_LAYER_DIRS if Path(path).is_dir()]
-    if not prefix:
-        return None
-    env = dict(os.environ)
-    env["PYTHONPATH"] = os.pathsep.join(prefix + [p for p in existing if p not in prefix])
-    return env
+    return repo_paths.repo_pythonpath_env()
 
 TIMEOUT = 180_000  # analytics.js:67 execFile 默认 timeout 180s
 SNAPSHOT_TIMEOUT = 60_000  # pycore.js:18 默认 timeout 60s

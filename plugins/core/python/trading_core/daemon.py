@@ -10,6 +10,10 @@ import subprocess
 import sys
 from pathlib import Path
 
+# 子进程的代码版本解析（仓库优先 / 无仓库回落安装副本）——与平台侧
+# `compute._subprocess_env` 共用同一实现，见 `_subprocess_runner` docstring。
+from trading_datasource import repo_paths
+
 from . import alerts, commands, execute, indicators, store
 # WP9 拆分（规格 §3.1）：配置/作业装配 → autopipeline；自动执行作业体 → autopilot；
 # 统一时钟 → clock。以下为**向后兼容再导出**——既有调用方（cli/planner/reconcile/
@@ -173,13 +177,26 @@ def _subprocess_runner(cmd):
     **日志去向**：子进程输出**捕获后转写**回本进程 stdout/stderr——内容不丢（仍在服务
     日志里），代价是失去实时性。作业输出都是收尾的结构化摘要（量级很小），故可接受；
     若将来有长输出作业需要实时性，改 Popen 流式即可（此处不做，避免引入线程）。
+
+    **代码版本（2026-09-17 实机部署缺口修复）**：作业链里的每条腿都经这里起子进程，
+    而 ``subprocess`` 是**新解释器**、不继承父进程 ``sys.path``——venv 的 ``.pth`` 会把
+    ``$DSH_HOME/trading-python/{datasource,core}``（安装器解出的**副本**）加进来，因此在
+    仓库内开发时子进程跑的是**旧副本代码**，表现为「修复不生效」（实测：副本里新符号
+    0 次出现、副本与仓库 md5 不一致）。故把仓库数据层经 ``PYTHONPATH`` 前置——策略与
+    平台侧 ``compute._subprocess_env`` **同一实现**（``trading_datasource.repo_paths``，
+    两处各写一份必然漂移）。
+
+    生产（无仓库）语义不变：``repo_paths.repo_pythonpath_env()`` 返回 ``None`` → 继承
+    环境 → 走安装副本。**改了 core/datasource/fin-data 后若要在无仓库环境生效，必须
+    重跑安装刷新副本**（``scripts/platform_service.sh refresh``）。
     """
     home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
     resolved = resolve_command(cmd, home)
     if resolved is None:
         return {"skipped": "关注池为空"}
+    env = repo_paths.repo_pythonpath_env()
     proc = subprocess.run([sys.executable, "-m", "trading_core", *resolved],
-                          timeout=900, capture_output=True, text=True)
+                          timeout=900, capture_output=True, text=True, env=env)
     if proc.stdout:
         sys.stdout.write(proc.stdout)
         sys.stdout.flush()

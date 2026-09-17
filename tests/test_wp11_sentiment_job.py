@@ -28,7 +28,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "platform"))
 sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 
+import unittest.mock as mock  # noqa: E402
+
 from trading_core import alerts, cli, daemon, sentiment, store  # noqa: E402
+from trading_datasource import repo_paths  # noqa: E402
 
 TODAY = "2026-09-16"
 WATCHLIST = ["SH.600519", "SZ.300750", "HK.00700"]
@@ -228,7 +231,14 @@ class SentimentJobTest(unittest.TestCase):
         self.assertIn("2026-09-32", result["error"])
 
     def test_scripts_not_installed_marks_sources_absent(self):
-        """通道未安装（fin-data/last30days 脚本都不在场）→ 三源全 absent，仍 ok。"""
+        """通道未安装（fin-data/last30days 脚本都不在场）→ 三源全 absent，仍 ok。
+
+        「不在场」必须**同时**排除仓库脚本：`sentiment.scripts_for` 自 2026-09-17 起
+        优先 `plugins/fin-data/python/<script>`（开发机上安装副本会滞后，跑副本等于跑旧
+        代码），仓库不存在时才回落副本。故这里显式模拟「无仓库 + 空 home」这一真正的
+        未安装形态——直接跑在仓库里时 fin-data 脚本总是存在的（那条路径由
+        `test_scripts_for_prefers_repo` 覆盖）。
+        """
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         other = Path(tmp.name)
@@ -236,8 +246,9 @@ class SentimentJobTest(unittest.TestCase):
             json.dumps({"watchlist": ["SH.600519"]}), encoding="utf-8")
         conn = store.connect(str(other / "t.sqlite"))
         self.addCleanup(conn.close)
-        result = sentiment.run(other, "SH", conn=conn, runner=_FakeRunner(),
-                               today=TODAY)
+        with mock.patch.object(repo_paths, "repo_root", lambda: None):
+            result = sentiment.run(other, "SH", conn=conn, runner=_FakeRunner(),
+                                   today=TODAY)
         self.assertTrue(result["ok"], result)
         for source in ("fin_sentiment", "fin_news", "last30days"):
             self.assertIn(source, result["absent"])

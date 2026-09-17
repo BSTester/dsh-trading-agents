@@ -50,6 +50,10 @@ import sys
 import time
 from pathlib import Path
 
+# 脚本与数据层的代码版本解析（仓库优先 / 无仓库回落安装副本）：与 daemon 的作业
+# 子进程同策略、同一实现——见 `scripts_for` 与 `_default_runner` 的说明。
+from trading_datasource import repo_paths
+
 #: 源名（落库 source 列）：只反映**实际取数实现**，不写渠道品牌——上游可能降级到
 #: AKShare/Yahoo，用渠道名当源名会让数据说谎（真实上游留在 payload.sources_status）
 SOURCE_FIN_SENTIMENT = "fin_sentiment"
@@ -89,11 +93,18 @@ def scripts_for(home):
     """→ ``({source: Path}, [缺席源])``：只认**已安装**的脚本，缺一个就缺席一个源。
 
     缺席是正常状态（可选组件未装/未配置），不是错误：调用方据此标 absent 并继续。
+
+    **代码版本**：fin-data 脚本**优先仓库**（``plugins/fin-data/python/<script>``，存在才用），
+    否则回落安装副本（``$DSH_HOME/trading-python/fin-data/<script>``）。理由与作业子进程
+    相同：开发机上副本会滞后，跑副本等于跑旧代码；生产无仓库时自然回落副本。
+    ``last30days`` 是外部可选组件（``$DSH_HOME/last30days-skill/...``），不存在仓库副本，
+    保持原样。
     """
     paths, absent = {}, []
     fin_data = Path(home) / FIN_DATA_DIR
     for source, name in _FIN_DATA_SCRIPTS.items():
-        path = fin_data / name
+        path = repo_paths.repo_script(f"plugins/fin-data/python/{name}") \
+            or (fin_data / name)
         if path.exists():
             paths[source] = path
         else:
@@ -228,10 +239,17 @@ def _default_runner(cmd, timeout=PER_CALL_TIMEOUT):
 
     返回 stdout；非零退出即为失败（stderr 摘要进异常）。超时抛 ``TimeoutError``
     （消息含「超时」，调用方据此把该标的记 failed 并继续下一个）。
+
+    **数据层版本**：fin-data 脚本会 ``import trading_datasource.market``——子进程是新
+    解释器，若只靠 venv 的 ``.pth`` 会解析到**安装副本**。这里与 ``daemon._subprocess_runner``
+    同策略前置仓库数据层（``repo_paths`` 单一实现），让「脚本代码 + 数据层版本」一起对齐；
+    无仓库时返回 None，走副本。
     """
     _install_signal_guard()
     proc = subprocess.Popen([str(part) for part in cmd], stdout=subprocess.PIPE,
-                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+                            stderr=subprocess.PIPE, text=True, start_new_session=True,
+                            env=repo_paths.repo_pythonpath_env(
+                                layers=("datasource", "fin-data")))
     try:  # noqa: SIM105 —— 进程组登记必须在 wait 之前，故不用 suppress
         pgid = os.getpgid(proc.pid)
     except (ProcessLookupError, OSError):
