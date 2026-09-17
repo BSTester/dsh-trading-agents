@@ -74,6 +74,12 @@ BROKER_TERMINAL_STATUS = {
 #: 表外的整数码一律视为不确定（不迁移，交差异判定）。
 SIM_ORDER_STATUS = {2: "submitted", 3: "partial", 4: "filled", 5: "cancelled", 6: "rejected"}
 
+#: 收编行（券商有、OMS 无的订单被导入台账）在 ``orders.plan_id`` 上的专用标记：与真实
+#: 计划号永不冲突，审计时一眼可辨「这条是收编进台账的历史单，不是某次计划下的单」。
+#: 定义在常量区（而非紧邻 ``_import_broker_only_orders``）：``footprint_symbols`` 也要
+#: 用它（收编行**不建立持仓知识**，见该函数 docstring）。
+IMPORT_PLAN_ID = "reconcile-import"
+
 
 def _int_of(value):
     """券商数量字段可能是字符串（TOOL-LIMITS 实测 "200"）；非法/缺失 → None。"""
@@ -131,15 +137,24 @@ def local_net_positions(conn):
 
 
 def footprint_symbols(conn):
-    """OMS 有足迹的标的（任何订单或成交记录）。
+    """本地台账**有持仓知识**的标的（成交记录，或非收编的订单记录）。
 
     用**累计**口径而非「当日增量」：本地台账（fills 净持仓）本就是累计的，拿当日足迹
     去比会把昨日建仓的标的整个排除在核对之外，只减少噪音却漏掉真实差异。
+
+    **收编行本身不算持仓知识**（2026-09-18 实机复盘）：``IMPORT_PLAN_ID`` 的行是对账
+    自己写下的记账产物，只回答「这张券商单本地为什么没有」，**不含任何持仓事实**。若把
+    它计入足迹，收编一张**已撤/零成交**的历史单就会让该标的从 ``untracked``（历史存量，
+    如实列出、不计差异）升级成 ``missing_side``（critical + halt）——收敛路径用自己的
+    产物制造新差异，闭环照样锁死（实机：券商持 ``SH.603993`` 2100 股，收编单 0 成交）。
+    收编单**确有成交**时，其 fills 由回填产生，经下面的 fills 分支照常进足迹，持仓差异
+    不会被放过（见 ``tests/test_wp17_reconcile_import.py`` 的两个对偶用例）。
     """
     rows = conn.execute(
-        "SELECT symbol FROM orders"
+        "SELECT symbol FROM orders WHERE plan_id != ?"   # 见 docstring：收编行不建持仓知识
         " UNION SELECT o.symbol AS symbol FROM fills f"
-        " JOIN orders o ON o.client_order_id=f.client_order_id").fetchall()
+        " JOIN orders o ON o.client_order_id=f.client_order_id",
+        (IMPORT_PLAN_ID,)).fetchall()
     return {row["symbol"] for row in rows}
 
 
@@ -278,6 +293,84 @@ def _order_diffs(conn, today, broker_rows, matched=None):
                       "side": row["side"], "qty": row["qty"],
                       "broker_status_raw": row["status_raw"], "kind": "missing_in_oms"})
     return diffs
+
+
+def _import_status(broker_row, cum):
+    """可导入的 OMS 状态；**不确定返回 None**（不导入 → 仍按差异暴露，保守）。
+
+    只认两份已发布契约（``SIM_ORDER_STATUS`` / ``BROKER_TERMINAL_STATUS``）：
+    ``submitted`` 这类非终态照实导入（在途单进台账才能被后续对账收敛）；
+    表外取值、或枚举与数量事实矛盾（如「已撤」却有成交且非 ``CANCELLED_ALL``）→ None。
+    """
+    code = broker_row.get("status_code")
+    if isinstance(code, int) and not isinstance(code, bool):
+        name, explicit_no_fill = SIM_ORDER_STATUS.get(code), False
+    else:
+        text = str(broker_row.get("order_status") or "").strip().upper()
+        name, explicit_no_fill = BROKER_TERMINAL_STATUS.get(text), (text == "CANCELLED_ALL")
+    if name is None:
+        return None
+    if name == "submitted":
+        return "submitted"
+    return _mapped_terminal(name, cum, broker_row, explicit_no_fill)
+
+
+def _import_broker_only_orders(conn, mode, unmatched_broker, today=None):
+    """把「券商有、OMS 无」的订单**收编进 OMS 台账**（缺失差异的收敛路径）。
+
+    为什么需要（实机 2026-09-17）：券商侧存在一张本地从未登记的单（历史遗留/收编前下的
+    单）→ 每日对账报 ``missing_in_oms`` → critical + ``set_halt`` → 自动闭环天天被自己
+    的历史差异锁死；而 ``oms-align`` 要求本地已有该单号，**没有收敛入口**。
+
+    ``today``：本次对账的日期，收编行按它落 ``created_at``（缺省墙钟=生产路径二者相同）。
+    **必须传**：订单匹配按 ``created_at LIKE <今天>%`` 取台账，收编行若按墙钟落日期，重放
+    历史日期时它会落在窗口外——刚收编的行仍被判成 ``missing_in_oms``（critical + halt
+    原样复现），同时污染今天的订单窗口。
+
+    OMS 的定位是「与券商往来的真实订单状态」的权威台账，因此收编是**记账**而非下单：
+    * **只读券商**：本函数不产生任何写类券商调用；
+    * **幂等**：``client_order_id`` 由券商单号派生（``imp-<sha1(broker_order_id)[:24]>``），
+      且先按「该编号或该券商单号是否已存在」判定——重复运行不产生重复行；
+    * **不猜状态**：只认已发布枚举（``_import_status``），表外/矛盾一律不导入、保留为差异；
+    * **来源可辨**：``plan_id`` 固定 ``IMPORT_PLAN_ID``、``err`` 以 ``reconcile-import:``
+      开头并带券商编号与原始状态码（审计链能回答「这行从哪来」）；
+    * 收编成功的订单**不再计为差异**（配对在重新匹配后成立），因此不再触发 critical/halt。
+    """
+    imported, skipped = [], []
+    for row in unmatched_broker or []:
+        bid = str(row.get("broker_order_id") or "").strip()
+        if not bid:
+            skipped.append({"broker_order_id": None,
+                            "reason": "券商行无订单号：无法建立确定性指纹"})
+            continue
+        cid = "imp-" + hashlib.sha1(bid.encode("utf-8")).hexdigest()[:24]
+        exists = conn.execute(
+            "SELECT 1 FROM orders WHERE client_order_id=? OR broker_order_id=?",
+            (cid, bid)).fetchone()
+        if exists is not None:
+            continue  # 幂等：已收编过，或本地本就有这张券商单
+        cum = _int_of(row.get("cum_qty")) or 0
+        status = _import_status(row, cum)
+        if status is None:
+            skipped.append({"broker_order_id": bid,
+                            "reason": "状态未发布或与数量事实矛盾：不猜，保留为差异"})
+            continue
+        symbol = str(row.get("symbol") or "")
+        if not symbol:
+            skipped.append({"broker_order_id": bid, "reason": "券商行无标的"})
+            continue
+        store.insert_order(conn, cid, IMPORT_PLAN_ID, symbol, symbol.split(".", 1)[0],
+                           row.get("side"), _int_of(row.get("qty")) or 0,
+                           _float_of(row.get("price")), mode, status=status,
+                           broker_order_id=bid,
+                           created_at=f"{today} 00:00:00" if today else None)
+        conn.execute("UPDATE orders SET err=? WHERE client_order_id=?",
+                     (f"reconcile-import: broker_order_id={bid} "
+                      f"broker_status={row.get('status_raw')}", cid))
+        conn.commit()
+        imported.append({"broker_order_id": bid, "client_order_id": cid,
+                         "symbol": symbol, "status": status})
+    return {"imported": imported, "skipped": skipped}
 
 
 def _fill_fingerprint(broker_order_id, cum_qty, price):
@@ -591,6 +684,16 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     # 事实学进本地，③④ 就会把「本地尚未学习」判成差异 → critical + halt → 自锁熔断。
     # 匹配结果三处共用（一次匹配，避免两处错位把钱/状态记到别的订单上）。
     matched = _match_orders(conn, today, broker_rows)
+    # ③ 收编「券商有、OMS 无」的订单（缺失差异的收敛路径，见 _import_broker_only_orders）：
+    #    必须在差异判定**之前**，且导入后**重新匹配**——否则刚收编的行仍会被判成 missing_in_oms，
+    #    每日 critical + halt 的老问题原样复现。
+    imported = _import_broker_only_orders(conn, mode, matched[2], today=today)
+    if imported["imported"]:
+        alerts.emit(conn, home=home, level="warn", title="订单导入：券商独有",
+                    detail=f"收编 {len(imported['imported'])} 条券商订单进 OMS 台账（"
+                           + ",".join(str(x["broker_order_id"])
+                                      for x in imported["imported"])[:120] + "）")
+        matched = _match_orders(conn, today, broker_rows)
     backfill = _backfill_fills(conn, matched[0])
     advance = _advance_order_states(conn, matched[0])
     diffs = _order_diffs(conn, today, broker_rows, matched=matched)
@@ -624,6 +727,9 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     digest = {"as_of": today, "mode": mode, "orders": order_status_counts(conn, today),
               "diffs": len(diffs), "untracked": len(untracked), "tca": tca_summary,
               "fills_backfilled": backfill_digest, "orders_advanced": advance_digest,
+              # 收编计数（2026-09-17）：券商独有订单被导入台账的条数（0 = 无需收敛）
+              "orders_imported": len(imported["imported"]),
+              "import_skipped": len(imported["skipped"]),
               **store.halt_summary(conn), "at": stamp}
     # snapshot-reconcile 的既有取数口径（diffs/at）+ 本任务新增 untracked/mode
     store.kv_set(conn, "reconcile:latest",

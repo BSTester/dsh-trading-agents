@@ -291,16 +291,27 @@ class ReconcileDailyTest(unittest.TestCase):
         self.assertTrue(store.is_halted(self.conn))
 
     def test_missing_in_oms_survives_advance(self):
-        """⑧ 券商有单、OMS 完全无对应行 → 同步无从推进（无本地行可改）→ 仍 missing_in_oms。"""
+        """⑧ 券商有单、OMS 完全无对应行 → 推进无从下手（无本地行可改）→ 由收编路径收敛。
+
+        2026-09-17 语义修订（WP17）：本用例原先断言「仍报 ``missing_in_oms``」，但那正是
+        实机自锁的成因（历史遗留单让每日对账 critical + halt，自动链永不解锁）。现在
+        「券商独有」由 ``_import_broker_only_orders`` 收编进台账后重新匹配 → 不再是差异。
+        **保留的断言是推进路径的边界**：``_advance_order_states`` 只改本地已存在的行，
+        收编不是它的职责（谁的职责谁计数）。表外状态码/无单号的券商行仍照旧 critical +
+        halt（不猜、不静默吞），见 ``test_wp17_reconcile_import.ReconcileImportTest``。
+
+        假件须自洽：该单 ``cum_qty=100``（已成交）→ 券商的持仓列表里必须有对应 100 股，
+        否则「券商订单说成交、券商持仓说没有」本身就该报差异（假件不完整，不是语义回归）。
+        """
         broker = _FakeBroker(
             orders_by_market={"SIM-SH": [self._sim_order("B-9", "600519", qty="100",
                                                          cum_qty="100")]},
-            positions_by_market={3: []})
+            positions_by_market={3: [{"symbol": "600519", "qty": 100}]})
         result = reconcile.daily(self.conn, self.home, broker_call=broker, today=TODAY)
-        self.assertEqual(result["orders_advanced"]["count"], 0)
-        kinds = self._kinds(result["diffs"])
-        self.assertEqual(kinds.get("missing_in_oms"), 1, result["diffs"])
-        self.assertTrue(store.is_halted(self.conn))
+        self.assertEqual(result["orders_advanced"]["count"], 0)    # 推进不动无本地行的单
+        self.assertEqual(result["digest"]["orders_imported"], 1)   # 收编路径接管
+        self.assertEqual(result["diffs"], [])
+        self.assertFalse(store.is_halted(self.conn))
 
     # ---- ② 持仓级 ----
 

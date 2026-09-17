@@ -519,8 +519,11 @@ def cancel_stale_auto_plans(conn, today):
 
 
 def insert_order(conn, client_order_id, plan_id, symbol, market, side, qty, price,
-                 mode, status="draft", broker_order_id=None):
-    now = _now()
+                 mode, status="draft", broker_order_id=None, created_at=None):
+    """登记一行订单。``created_at`` 缺省取墙钟；对账收编显式传**对账日期**（见
+    ``reconcile._import_broker_only_orders``：收编行必须落在本次对账窗口内，否则
+    重放历史日期时既看不见它，又会把行写进今天的窗口）。"""
+    now = created_at or _now()
     conn.execute(
         "INSERT INTO orders(client_order_id,plan_id,symbol,market,side,qty,price,"
         "status,broker_order_id,mode,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
