@@ -6,14 +6,19 @@
     反向因子=failed（原因含「方向为负」）、空库=样本不足 failed、已通过规则不得重复验证、
     ``--spec -`` 走 stdin、walk-forward 未请求时如实记 not_run（**不假装跑过**）；
   * 状态机：人工批准是规则上岗的唯一通道（candidate/failed 调 enable → 拒绝且库零变化）；
+  * **批准无反证通道（本文件的核心反证）**：``rules-decide`` **没有 CLI 子命令**、
+    ``compute.rules_decide`` **没有 ``by`` 参数**、端点载荷带 ``by`` 被白名单拒绝、
+    批准是**进程内**动作（不 spawn 任何子进程）——四道结构门共同保证
+    「``approved_by`` 只可能由人在 Web 点出来」（规格 §9.4/§9.5）；
   * plan_auto 消费：``enabled`` 规则被加载并生成计划；``candidate`` 规则**零消费**（反证）；
     未知名字仍是「策略未注册」；
   * 端点：``rules`` 只读（空载荷白名单、不进缓存、库零变化）；``rules-decide`` 动作端点
-    （字段白名单挡死 spec 字段、业务拒绝落 trading/invalid-operation、真的写库）；
+    （字段白名单挡死 spec 字段与 by、业务拒绝落 trading/invalid-operation、真的写库）；
   * 工具面：``rules`` 进面、``rules-decide`` **不进**（模型不得自批）；
     端点 79 / 工具 75 / 端点工具集 ≡ 端点清单 − 排除集。
 """
 import io
+import inspect
 import json
 import subprocess
 import sys
@@ -102,7 +107,10 @@ class ApproveBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
-        self.db = str(self.home / "t.sqlite")
+        # 与生产同构：服务侧按 ``$DSH_HOME`` 推库路径（``store.db_path`` = home/trading-data/…）。
+        # 批准端点不再 spawn CLI、也就没有 ``--db`` 注入口——测试必须走真实路径解析，
+        # 否则测的是「测试自己指定的库」而不是「服务真正读写的库」。
+        self.db = str(store.db_path(str(self.home)))
         self.conn = store.connect(self.db)
         self.addCleanup(self.conn.close)
         store.migrate(self.conn)
@@ -145,6 +153,14 @@ class ApproveBase(unittest.TestCase):
             return subprocess.CompletedProcess(command, code, buf.getvalue(), "")
 
         return run
+
+    def approve(self, rule_id="wp14_momentum_v1", decision="enable"):
+        """走**生产唯一批准路径**：服务进程内 ``compute.rules_decide``。
+
+        （测试里不再有 CLI 批准路径可用——``rules-decide`` 子命令已删除；
+        这个 helper 本身就是反证的一部分：批准只能从服务端函数进入。）
+        """
+        return compute.rules_decide(rule_id, decision, home=str(self.home))
 
 
 # ---------------------------------------------------------------------------
@@ -228,8 +244,7 @@ class RulesValidateCliTest(ApproveBase):
     def test_approved_rule_cannot_be_silently_revalidated(self):
         seed_bars(self.conn)
         self.validate()
-        self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                       "--decision", "enable", "--by", "web"])
+        self.approve()
         body = self.run_json(["rules-validate", "--spec", self.write_spec(),
                               "--symbols", ",".join(SYMBOLS)], expect_code=1)
         self.assertFalse(body["ok"])
@@ -312,41 +327,43 @@ class RulesListCliTest(ApproveBase):
         self.assertIsNone(row["approved_by"])
 
 
-class RulesDecideCliTest(ApproveBase):
+class RulesDecideInProcessTest(ApproveBase):
+    """批准走服务端进程内路径（``compute.rules_decide``）——生产唯一通道。
+
+    这些用例覆盖的是**真实批准路径**（home → ``store.db_path`` → ``rule_engine.decide_rule``），
+    与端点 ``rules-decide`` 走同一个函数；CLI 路径已不存在（反证见下方
+    ``RulesNoSelfApprovalChannelTest``）。
+    """
+
     def test_enable_requires_passed(self):
         store.upsert_rule(self.conn, "wp14_momentum_v1", _spec(), status="candidate")
-        body = self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                              "--decision", "enable"], expect_code=1)
-        self.assertFalse(body["ok"])
-        self.assertIn("仅通过验证的规则可启用", body["error"])
+        with self.assertRaises(compute.ComputeError) as caught:
+            self.approve()
+        self.assertIn("仅通过验证的规则可启用", str(caught.exception))
         self.assertEqual(store.find_rule(self.conn, "wp14_momentum_v1")["status"],
                          "candidate", "拒绝时库零变化")
 
     def test_failed_rule_cannot_be_enabled(self):
         store.upsert_rule(self.conn, "wp14_momentum_v1", _spec(), status="failed")
-        body = self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                              "--decision", "enable"], expect_code=1)
-        self.assertFalse(body["ok"])
+        with self.assertRaises(compute.ComputeError):
+            self.approve()
         self.assertEqual(store.find_rule(self.conn, "wp14_momentum_v1")["status"], "failed")
 
     def test_unknown_rule_is_rejected(self):
-        body = self.run_json(["rules-decide", "--rule-id", "nope", "--decision", "enable"],
-                             expect_code=1)
-        self.assertFalse(body["ok"])
-        self.assertIn("规则不存在", body["error"])
+        with self.assertRaises(compute.ComputeError) as caught:
+            self.approve(rule_id="nope")
+        self.assertIn("规则不存在", str(caught.exception))
 
     def test_enable_records_approver_and_disable_keeps_trace(self):
         seed_bars(self.conn)
         self.validate()
-        body = self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                              "--decision", "enable", "--by", "web"])
-        self.assertEqual(body["status"], "enabled")
+        value = self.approve()
+        self.assertEqual(value["status"], "enabled")
         row = store.find_rule(self.conn, "wp14_momentum_v1")
-        self.assertEqual(row["approved_by"], "web")
+        self.assertEqual(row["approved_by"], "web", "来源由服务端固定，调用方无法指定")
         self.assertTrue(row["approved_at"])
-        body = self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                              "--decision", "disable", "--by", "web"])
-        self.assertEqual(body["status"], "disabled")
+        value = self.approve(decision="disable")
+        self.assertEqual(value["status"], "disabled")
         row = store.find_rule(self.conn, "wp14_momentum_v1")
         self.assertEqual(row["status"], "disabled")
         self.assertEqual(row["approved_by"], "web", "停用保留批准的留痕")
@@ -391,8 +408,7 @@ class PlanAutoRuleConsumptionTest(ApproveBase):
     def test_enabled_rule_is_consumed(self):
         seed_bars(self.conn)
         self.validate()
-        self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                       "--decision", "enable", "--by", "web"])
+        self.approve()
         result = planner.plan_auto(self.conn, str(self.home), "SH", today=TODAY,
                                    broker_call=self._broker())
         self.assertTrue(result["ok"], result)
@@ -421,10 +437,8 @@ class PlanAutoRuleConsumptionTest(ApproveBase):
     def test_disabled_rule_is_never_consumed(self):
         seed_bars(self.conn)
         self.validate()
-        self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                       "--decision", "enable", "--by", "web"])
-        self.run_json(["rules-decide", "--rule-id", "wp14_momentum_v1",
-                       "--decision", "disable", "--by", "web"])
+        self.approve()
+        self.approve(decision="disable")
         result = planner.plan_auto(self.conn, str(self.home), "SH", today=TODAY,
                                    broker_call=self._broker())
         self.assertIn("规则未启用", result["skipped"])
@@ -462,8 +476,9 @@ class RulesEndpointTest(ApproveBase):
         self.core = {
             "rules": lambda status=None: compute.rules_list(
                 status, runner=self.cli_runner("--db", self.db)),
+            # 批准桥与生产一致：进程内、home 显式、无 runner（不 spawn 子进程）
             "rules-decide": lambda rule_id, decision: compute.rules_decide(
-                rule_id, decision, runner=self.cli_runner("--db", self.db))}
+                rule_id, decision, home=str(self.home))}
 
     def handler(self, core=None):
         return app_module.create_handler(str(self.home), analytics={}, series=None,
@@ -515,6 +530,18 @@ class RulesEndpointTest(ApproveBase):
         self.assertFalse(body["ok"])
         self.assertIn("Unexpected rules-decide field", body["error"]["message"])
         self.assertEqual(store.find_rule(self.conn, "wp14_momentum_v1")["status"], before)
+
+    def test_decide_whitelist_blocks_caller_supplied_by(self):
+        """``by`` 不是载荷字段：批准来源由服务端固定，客户端无法自报来源（反证）。"""
+        before = store.find_rule(self.conn, "wp14_momentum_v1")
+        body = self.handler()("rules-decide", {"rule_id": "wp14_momentum_v1",
+                                               "decision": "enable", "by": "cli"})
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"]["code"], "trading/invalid-operation")
+        self.assertIn("Unexpected rules-decide field", body["error"]["message"])
+        after = store.find_rule(self.conn, "wp14_momentum_v1")
+        self.assertEqual(after["status"], before["status"], "被拒的载荷不得改动库")
+        self.assertIsNone(after["approved_by"], "更不得写出任何批准人")
 
     def test_decide_enable_writes_through_the_core_bridge(self):
         body = self.handler()("rules-decide", {"rule_id": "wp14_momentum_v1",
@@ -569,43 +596,101 @@ class RulesComputeTest(ApproveBase):
         self.assertEqual(value["rules"], [])
         self.assertEqual(calls[0][0], "rules-list")
 
-    def test_rules_decide_validates_before_spawn(self):
-        recorded = []
+    def test_rules_decide_validates_before_touching_core(self):
+        """非法参数在**接触 core（因此也接触 DB）之前**就拒绝。"""
+        def boom(name):  # pragma: no cover - 不该被调用
+            raise AssertionError("非法参数不得加载 core 模块")
 
-        def runner(command, timeout):  # pragma: no cover - 不该被调用
-            recorded.append(command)
-            raise AssertionError("非法参数不得起子进程")
+        with mock.patch.object(compute, "_core_module", boom):
+            for bad_decision in ("maybe", "ENABLE", None, 1):
+                with self.assertRaises(compute.ComputeError):
+                    compute.rules_decide("r1", bad_decision)
+            for bad_id in ("", "   ", None, 5):
+                with self.assertRaises(compute.ComputeError):
+                    compute.rules_decide(bad_id, "enable")
 
-        for bad_decision in ("maybe", "ENABLE", None, 1):
-            with self.assertRaises(compute.ComputeError):
-                compute.rules_decide("r1", bad_decision, runner=runner)
-        for bad_id in ("", "   ", None, 5):
-            with self.assertRaises(compute.ComputeError):
-                compute.rules_decide(bad_id, "enable", runner=runner)
-        self.assertEqual(recorded, [])
-
-    def test_rules_decide_command_shape(self):
+    def test_rules_decide_is_in_process_and_spawns_nothing(self):
+        """批准不 spawn 子进程、也不经 CLI——进程内直连 core（反证：两条旁路都炸）。"""
         store.upsert_rule(self.conn, "r1", _spec(rule_id="r1"), status="passed")
-        runner = self.cli_runner("--db", self.db)
-        captured = []
-        original = cli.main
 
-        def spy(argv):
-            captured.append(list(argv))
-            return original(argv)
+        def boom(*args, **kwargs):  # pragma: no cover - 不该被调用
+            raise AssertionError("批准不得起子进程/走 CLI")
 
-        with mock.patch.object(cli, "main", spy):
-            value = compute.rules_decide("r1", "enable", runner=runner)
+        with mock.patch.object(compute, "_spawn", boom), \
+                mock.patch.object(cli, "main", boom):
+            value = compute.rules_decide("r1", "enable", home=str(self.home))
         self.assertEqual(value["status"], "enabled")
-        self.assertEqual(captured[0][:4], ["rules-decide", "--rule-id", "r1", "--decision"])
-        self.assertIn("--by", captured[0])
+        self.assertEqual(store.find_rule(self.conn, "r1")["approved_by"], "web")
 
-    def test_cli_error_maps_to_compute_error(self):
+    def test_business_rejection_maps_to_compute_error(self):
         store.upsert_rule(self.conn, "r1", _spec(rule_id="r1"), status="candidate")
-        runner = self.cli_runner("--db", self.db)
         with self.assertRaises(compute.ComputeError) as caught:
-            compute.rules_decide("r1", "enable", runner=runner)
+            compute.rules_decide("r1", "enable", home=str(self.home))
         self.assertIn("仅通过验证的规则可启用", str(caught.exception))
+
+
+class RulesNoSelfApprovalChannelTest(ApproveBase):
+    """**反证**：自批通道已不存在——四道结构门（规格 §9.4/§9.5）。
+
+    历史缺陷：``rules-decide`` CLI 子命令存在且 ``--by`` 可自报，Web 端点正是 spawn
+    这条命令——shell 与 Web 同路径，「批准只在 Web」结构性不成立。以下四门分别封死
+    「离线命令」「来源伪造」「参数伪造」「进程内假象」。
+    """
+
+    def test_cli_has_no_rules_decide_subcommand(self):
+        """门①：CLI 层面没有批准子命令（连参数解析都进不去）。"""
+        parser = cli.build_parser()
+        choices = set(parser._subparsers._group_actions[0].choices)  # noqa: SLF001
+        self.assertNotIn("rules-decide", choices)
+        # 只读/验证两条仍在（批准被删不是把整族砍掉）
+        self.assertIn("rules-list", choices)
+        self.assertIn("rules-validate", choices)
+
+    def test_cli_rejects_rules_decide_invocation(self):
+        """门①的行为面：真的敲这条命令 → argparse 直接拒绝（SystemExit），零写库。"""
+        store.upsert_rule(self.conn, "r1", _spec(rule_id="r1"), status="passed")
+        with self.assertRaises(SystemExit), redirect_stdout(io.StringIO()):
+            cli.main(["rules-decide", "--rule-id", "r1", "--decision", "enable",
+                      "--db", self.db])
+        row = store.find_rule(self.conn, "r1")
+        self.assertEqual(row["status"], "passed", "离线路径不得改动状态")
+        self.assertIsNone(row["approved_by"], "更不得写出 approved_by='web'")
+
+    def test_compute_rules_decide_has_no_by_parameter(self):
+        """门②：来源不是参数——调用方**无法**指定 approved_by（传了就 TypeError）。"""
+        params = inspect.signature(compute.rules_decide).parameters
+        self.assertEqual(list(params), ["rule_id", "decision", "home"])
+        self.assertNotIn("by", params)
+        with self.assertRaises(TypeError):
+            compute.rules_decide("r1", "enable", by="cli")  # type: ignore[call-arg]
+
+    def test_approver_constant_is_the_only_written_source(self):
+        """门③：``approved_by`` 只可能等于服务端常量（生产代码里 by= 的写法只有一处）。"""
+        self.assertEqual(compute.APPROVER_WEB, "web")
+        rule_engine_source = (ROOT / "plugins" / "core" / "python" / "trading_core"
+                              / "rule_engine.py").read_text(encoding="utf-8")
+        # decide_rule 的 by 只落库，不自造来源
+        self.assertIn("approved_by=by", rule_engine_source)
+        cli_source = (ROOT / "plugins" / "core" / "python" / "trading_core"
+                      / "cli.py").read_text(encoding="utf-8")
+        self.assertNotIn("decide_rule(", cli_source,
+                         "CLI 不得再有任何批准调用点（离线自批入口）")
+        compute_source = (ROOT / "platform" / "server" / "compute.py").read_text(
+            encoding="utf-8")
+        self.assertEqual(compute_source.count("by=APPROVER_WEB"), 1,
+                         "批准来源只能在 rules_decide 内固定一次")
+
+    def test_passing_rule_is_not_enabled_without_the_web_action(self):
+        """门④的行为面：验证通过（passed）本身**不**产 enabled——必须有人点批准。"""
+        seed_bars(self.conn)
+        self.validate()
+        row = store.find_rule(self.conn, "wp14_momentum_v1")
+        self.assertEqual(row["status"], "passed")
+        self.assertIsNone(row["approved_by"])
+        self.assertIsNone(row["approved_at"])
+        # 未批准 → 计划零消费（与 PlanAutoRuleConsumptionTest 的 candidate 反证同源）
+        self.assertEqual(self.conn.execute(
+            "SELECT COUNT(*) AS n FROM plans").fetchone()["n"], 0)
 
 
 class RulesListFilterTest(ApproveBase):

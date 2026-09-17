@@ -42,6 +42,37 @@ class ValidateSpecTest(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("combine" in e for e in errors), errors)
 
+    def test_combine_and_rebalance_reject_explicit_null(self):
+        """闭集字段必须显式取值：``null`` 不得溜过去让解释器静默取默认。
+
+        历史缺陷：``is not None`` 判定 + 解释器 ``or "weekly"`` 兜底，使
+        ``combine=null``/``rebalance=null`` 校验通过而回测口径变成默认值——
+        「提案写了什么」与「实际按什么跑」分叉，回测不可复现。
+        """
+        for field in ("combine", "rebalance"):
+            ok, errors = rule_engine.validate_spec(_spec(**{field: None}), registry=REGISTRY)
+            self.assertFalse(ok, f"{field}=null 应被拒绝（闭集必填）")
+            self.assertTrue(any(field in e for e in errors), errors)
+        # 缺失仍是「缺少必填」单一原因（不复读第二条白名单错误）
+        missing = _spec()
+        del missing["combine"]
+        ok, errors = rule_engine.validate_spec(missing, registry=REGISTRY)
+        self.assertFalse(ok)
+        self.assertEqual([e for e in errors if "combine" in e],
+                         ["缺少必填字段 combine"], errors)
+
+    def test_interpreter_has_no_silent_defaults(self):
+        """解释器不再兜默认值：协议保证非空，绕过校验构造实例会显式 KeyError。"""
+        import inspect
+        source = inspect.getsource(rule_engine.RuleStrategy)
+        self.assertNotIn('or "weekly"', source)
+        self.assertNotIn('or "zscore_equal_weight"', source)
+        instance = rule_engine.RuleStrategy(
+            {"rule_id": "r-null", "factors": ["momentum_20"], "top_n": 1,
+             "universe": "watchlist.SH"})  # 故意缺 combine/rebalance
+        with self.assertRaises(KeyError):
+            instance.target_weights(None, "2026-09-16")
+
     def test_top_n_bounds(self):
         for bad in (0, -1, 101, "5"):
             ok, errors = rule_engine.validate_spec(_spec(top_n=bad), registry=REGISTRY)

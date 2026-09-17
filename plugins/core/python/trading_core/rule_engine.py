@@ -111,9 +111,13 @@ def validate_spec(spec, registry=None, immature=frozenset()):
                     f"因子未满 250 交易日，不得进规则：{name}"
                     "（资讯/F10/做空域因子先攒 PIT 历史，转正走同一套验证门）")
 
-    combine = spec.get("combine")
-    if combine is not None and combine not in COMBINES:
-        errors.append(f"combine 不在白名单：{combine!r}（允许：{'/'.join(COMBINES)}）")
+    # combine/rebalance 是**闭集必填**：缺失由上面的必填检查报错，显式 ``null`` 同样
+    # 拒绝（``is not None`` 会让 null 溜过去、解释器再静默取默认值——协议一旦允许
+    # 「不写就等于默认」，回测口径就不可复现了）。
+    if "combine" in spec:
+        combine = spec["combine"]
+        if not isinstance(combine, str) or combine not in COMBINES:
+            errors.append(f"combine 不在白名单：{combine!r}（允许：{'/'.join(COMBINES)}）")
 
     universe = spec.get("universe")
     if not isinstance(universe, str) or not universe.strip():
@@ -125,9 +129,10 @@ def validate_spec(spec, registry=None, immature=frozenset()):
     elif not 1 <= top_n <= MAX_TOP_N:
         errors.append(f"top_n 超出取值域 1..{MAX_TOP_N}：{top_n}")
 
-    rebalance = spec.get("rebalance")
-    if rebalance is not None and rebalance not in REBALANCES:
-        errors.append(f"rebalance 不在白名单：{rebalance!r}（允许：{'/'.join(REBALANCES)}）")
+    if "rebalance" in spec:
+        rebalance = spec["rebalance"]
+        if not isinstance(rebalance, str) or rebalance not in REBALANCES:
+            errors.append(f"rebalance 不在白名单：{rebalance!r}（允许：{'/'.join(REBALANCES)}）")
 
     provenance = spec.get("provenance")
     if not isinstance(provenance, dict):
@@ -315,7 +320,10 @@ class RuleStrategy:
 
     def target_weights(self, conn, as_of, home=None, market=None):
         from . import strategies as strategies_mod
-        rebalance = self.spec.get("rebalance") or "weekly"
+        # 协议保证二者必填且落在闭集内（validate_spec 拒绝缺失与显式 null；
+        # load_rule/register_rule 构造前二次校验）——这里**不再兜默认值**：
+        # 静默取默认会让「提案写了什么」与「回测/执行用什么」分叉。
+        rebalance = self.spec["rebalance"]
         cached = self._cached_weights(conn, as_of, rebalance)
         if cached is not None:
             return cached
@@ -356,7 +364,7 @@ class RuleStrategy:
                 per[symbol] = values  # 完整样本口径：缺任一因子整只跳过
         if len(per) < MIN_CROSS_SECTION:
             return []
-        if (self.spec.get("combine") or "zscore_equal_weight") == "ic_weighted":
+        if self.spec["combine"] == "ic_weighted":  # 闭集必填，无默认（同 rebalance）
             fused = _ic_factor_weights(conn, names, end=as_of)
         else:
             fused = {name: 1.0 / len(names) for name in names}

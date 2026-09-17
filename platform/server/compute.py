@@ -1,4 +1,9 @@
-"""计算桥（WP6 补遗 C）：Host 侧取数一律经子进程，绝不在服务进程内 import 分析模块。
+"""计算桥（WP6 补遗 C）：Host 侧**取数一律经子进程**。
+
+唯一例外是两条**写路径**在服务进程内直连 core（``_core_module``）：指令写盘
+（``commands.write_command``）与规则批准（``rule_engine.decide_rule``，来源固定
+``APPROVER_WEB``）——它们必须与人工动作同进程，且不允许存在能被脚本等价复现的
+离线入口（``rules-decide`` CLI 已删除，见 ``rules_decide`` docstring）。
 
 移植源（逐行为准）：
   * ``plugins/workbench/src/analytics.py`` 的参数构造与调用 —— ``analytics.js:59-197``
@@ -22,6 +27,7 @@
   5. 白名单集合判定统一加 ``isinstance(str)``：JS 的 ``Set.has``/``includes`` 对任意类型
      都返回布尔，而 Python 的 ``in frozenset`` 对不可哈希值抛 TypeError。
 """
+import importlib
 import json
 import os
 import re
@@ -462,25 +468,41 @@ def rules_list(status=None, timeout=SNAPSHOT_TIMEOUT, runner=None):
                         completed.returncode, completed.stderr)
 
 
-def rules_decide(rule_id, decision, by="web", timeout=SNAPSHOT_TIMEOUT, runner=None):
-    """WP14 任务 4：``python -m trading_core rules-decide --rule-id X --decision Y``。
+#: 规则批准的操作来源：**唯一写入点**，不是参数、不经载荷（见 ``rules_decide``）。
+APPROVER_WEB = "web"
 
-    写路径（enabled/disabled 落库）**经 CLI 子进程**——与读侧同一实现（``rule_engine``
-    的状态机是唯一入口），服务进程不直连 rules 表。参数在**起子进程前**校验：
-    非法 decision/空 rule_id 走 ComputeError，零进程开销。
-    CLI 的业务拒绝（未通过就启用等）以 ``{ok:false,error}`` 信封返回 →
-    parse_stdout 抛 ComputeError，app 侧落成 ``trading/invalid-operation``（携带原因）。
+
+def rules_decide(rule_id, decision, home=None):
+    """WP14 任务 4：人工批准/停用规则（**服务进程内动作端点**，无 CLI 等价物）。
+
+    批准是「规则上岗」的唯一通道，因此这里刻意没有任何离线入口：
+
+      * ``rules-decide`` **CLI 子命令已删除**——历史实现让 Web 端点 spawn 该子命令、
+        操作来源由 ``--by`` 自报，于是 shell 跑同一条命令就能写出
+        ``approved_by='web'``，「批准只在 Web」结构性不成立（规格 §9.4/§9.5）；
+      * ``by`` **不是参数**：来源由本函数固定为 ``APPROVER_WEB``，调用方无法伪造；
+      * 端点载荷白名单（``app.py:RULES_DECIDE_FIELDS``）只留 ``rule_id``/``decision``。
+
+    写路径进程内直连 core：``rule_engine.decide_rule`` 是状态机唯一入口（``enabled``
+    只能由它产生并记录批准人），服务进程不另写一份状态流转。非法参数在**连接数据库
+    之前**就拒绝（零 DB 开销）；业务拒绝（未过验证门就启用/规则不存在/非法流转）以
+    ``ComputeError`` 回，app 侧落 ``trading/invalid-operation``，绝不当成功。
     """
     if not isinstance(rule_id, str) or not rule_id.strip():
         raise ComputeError("Invalid rule_id")
     if decision not in ("enable", "disable"):
         raise ComputeError(f"Invalid decision {decision!r} (enable/disable)")
-    command = [PYTHON, "-m", "trading_core", "rules-decide",
-               "--rule-id", rule_id, "--decision", decision, "--by", str(by)]
-    spawn = _spawn if runner is None else runner
-    completed = spawn(command, timeout)
-    return parse_stdout("trading_core rules-decide", completed.stdout,
-                        completed.returncode, completed.stderr)
+    store = _core_module("store")
+    rule_engine = _core_module("rule_engine")
+    conn = store.connect(store.db_path(str(command_home(home))))
+    try:
+        try:
+            status = rule_engine.decide_rule(conn, rule_id, decision, by=APPROVER_WEB)
+        except ValueError as error:
+            raise ComputeError(str(error)) from error
+    finally:
+        conn.close()
+    return {"rule_id": rule_id, "status": status}
 
 
 def command_home(home):
@@ -488,21 +510,29 @@ def command_home(home):
     return Path(home if home is not None else os.environ.get("DSH_HOME") or Path.home() / ".dsh")
 
 
-def _load_write_command():
-    """进程内导入 ``trading_core.commands``（指令写盘唯一入口，白名单在该模块内）。
+def _core_module(name):
+    """进程内导入 ``trading_core`` 子模块（**只服务写路径**：指令写盘 + 规则审批）。
+
+    读路径一律仍走子进程（``_spawn``）——取数/快照不把分析模块拉进服务进程；
+    只有「必须与人工动作同进程、且不能被离线脚本等价复现」的两条写路径例外：
+    ``commands.write_command``（计划执行指令落盘）与 ``rule_engine.decide_rule``
+    （规则批准，来源固定为 ``APPROVER_WEB``）。
 
     先直接 import（venv 里已 ``pip install -e`` 了 trading_core）；失败时退回
     ``plugins/core/python``（与 tests/test_core_wp6_approval.py 的导入方式一致）。
     """
     try:
-        from trading_core import commands  # noqa: PLC0415 —— 延迟导入，避免 import 期副作用
-        return commands.write_command
+        return importlib.import_module(f"trading_core.{name}")
     except ImportError:
         core_python = str(ROOT / "plugins" / "core" / "python")
         if core_python not in sys.path:
             sys.path.insert(0, core_python)
-        from trading_core import commands  # noqa: PLC0415
-        return commands.write_command
+        return importlib.import_module(f"trading_core.{name}")
+
+
+def _load_write_command():
+    """进程内导入 ``trading_core.commands``（指令写盘唯一入口，白名单在该模块内）。"""
+    return _core_module("commands").write_command
 
 
 def write_command(home, type_, payload):

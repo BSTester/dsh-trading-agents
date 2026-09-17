@@ -306,8 +306,12 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
             symbol, limit)
         # WP14 任务 4：规则候选池读/批准同走 core 桥（读取与状态流转的**唯一实现**在
         # trading_core：rule_engine 状态机 + rules 表；服务进程不直连该表）。
+        # ``rules-decide`` 是**进程内动作端点**（compute 直接调 ``rule_engine.decide_rule``），
+        # **没有 CLI 等价物**：批准来源由 compute 固定为 "web"，不经载荷、不经参数——
+        # 离线可复现的批准入口就是模型自批入口（规格 §9.4/§9.5）。
         core["rules"] = lambda status=None: compute.rules_list(status)
-        core["rules-decide"] = lambda rule_id, decision: compute.rules_decide(rule_id, decision)
+        core["rules-decide"] = lambda rule_id, decision: compute.rules_decide(
+            rule_id, decision, home=home)
     if trade is None:
         trade = trading.TradeGate(home)
     if futu is None:
@@ -358,8 +362,11 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 return {"ok": True, "value": value}
             if endpoint == "rules-decide":
                 # WP14 任务 4：规则上岗的唯一通道（passed → enabled 只在 rule_engine 放行）。
-                # 载荷白名单挡死 spec 字段——审批不是改规则。业务拒绝（未过门就启用/规则
+                # 载荷白名单挡死 spec 字段——审批不是改规则；也挡死 ``by``——批准来源由
+                # compute 固定为 "web"，客户端无法自报来源。业务拒绝（未过门就启用/规则
                 # 不存在）以 ``trading/invalid-operation`` 如实回，绝不当成功。
+                # 实现是**进程内**调用（compute.rules_decide → rule_engine.decide_rule），
+                # 不 spawn 子进程：``rules-decide`` CLI 子命令已删除，不存在离线等价入口。
                 _check_fields(endpoint, payload, RULES_DECIDE_FIELDS)
                 provider = core.get("rules-decide")
                 if provider is None:

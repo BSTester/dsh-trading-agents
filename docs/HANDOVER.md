@@ -306,9 +306,13 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
     终态留档）。该端点与 `auto_pipeline` 一样**有意不进 MCP 工具面**——模型不得自批自己
     挖的因子；模型侧同时禁用 `trade_place/trade_modify/trade_cancel/plan_execute/switch_mode`
     （清单见 `skills/research-institute/SKILL.md`，由 `tests/test_wp14_skill.py` 锁定）。
-  - **批准痕迹在哪**：`rules.approved_by`/`approved_at`（Web 端点写 `web`，CLI 可传
-    `--by`）。`rules.validation` 存最近一次验证报告摘要（IC 均值/t 统计/分层单调/半衰期/
-    换手率）；复核对齐一律跑 `rules-validate`（与验证门同一实现，不手写第二份阈值口径）。
+    该端点还是**进程内动作**（服务直调 `rule_engine.decide_rule`），**没有 CLI 子命令**：
+    批准一旦有可脚本化的等价入口，「批准只在 Web」就形同虚设（历史缺陷：CLI 与 Web 同
+    路径、来源靠 `--by` 自报），因此批准来源由服务端固定、不接受任何传入。
+  - **批准痕迹在哪**：`rules.approved_by`/`approved_at`（只可能由服务端写成 `web`——
+    没有 CLI 批准入口，也没有可传的来源参数）。`rules.validation` 存最近一次验证报告
+    摘要（IC 均值/t 统计/分层单调/半衰期/换手率）；复核对齐一律跑 `rules-validate`
+    （与验证门同一实现，不手写第二份阈值口径）。
   - **启用的机械落地**：`auto_pipeline.strategies[].strategy` 填 `rule_id`；`plan_auto`
     解析时**每次回查 DB 状态**，非 `enabled` 一律跳过并在告警里给出当前状态。
     **停用即时生效**：失效规则实例会从 `strategies.REGISTRY` 摘除——这是 WP14 端到端演练

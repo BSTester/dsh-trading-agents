@@ -212,11 +212,6 @@ def build_parser():
                    help="DSH_HOME（读关注池/风控配置；默认 $DSH_HOME 或 ~/.dsh）")
     _add_db(s)
 
-    s = sub.add_parser("rules-decide", help="人工批准/停用规则（Web 端点唯一入口）")
-    s.add_argument("--rule-id", required=True)
-    s.add_argument("--decision", required=True, choices=("enable", "disable"))
-    s.add_argument("--by", default="web", help="操作来源（审计字段，默认 web）")
-    _add_db(s)
     return p
 
 
@@ -341,14 +336,18 @@ def _ic_result(conn, args):
 
 
 # ---------------------------------------------------------------------------
-# WP14 任务 4：规则候选池 CLI（列表 / 提案验证 / 人工批准）
+# WP14 任务 4：规则候选池 CLI（列表 / 提案验证）
 # ---------------------------------------------------------------------------
-# 三条子命令的分工与退出码口径：
+# 两条子命令的分工与退出码口径：
 #   * rules-list     只读列表（候选池 UI 与运维查看同一出口）；
 #   * rules-validate 提案入口 + 验证门：**协议非法 = 非零退出**（提案写错了，是操作
 #     错误）；**验证门不通过 = 退出 0 + status="failed"**（研究结论，不是故障——
-#     与 plan-auto 的软跳过同一分级，脚本据 status 字段分流而不是据退出码）；
-#   * rules-decide   人工批准/停用：非法流转（未通过就启用等）= 非零退出。
+#     与 plan-auto 的软跳过同一分级，脚本据 status 字段分流而不是据退出码）。
+# **批准/停用刻意没有 CLI 子命令**（`rules-decide` 已删除）：批准只能由人在独立 Web
+# 的研究页候选池点击（服务进程内动作端点 → `rule_engine.decide_rule`）。历史缺陷是
+# CLI 与 Web 走同一条路径、操作来源靠 `--by` 自报，于是 shell 也能写出
+# `approved_by='web'`——「批准只在 Web」形同虚设（规格 §9.4/§9.5）。离线无批准路径
+# 不是遗漏，是设计：任何能被脚本调用的批准入口都是模型自批的入口。
 # 验证门统计一律复用 ``factors.ic_report``/``passes_gate``（阈值唯一实现在 factors），
 # 本模块**不重写任何阈值**；取样口径与 ``ic`` 子命令逐字一致（``_ic_sample_dates`` +
 # ``_forward_return``），保证验证报告能被 ``ic`` 手工复核。
@@ -561,15 +560,6 @@ def _rules_validate(conn, args):
     return {"ok": True, "rule_id": rule_id, "status": status, "validation": validation}
 
 
-def _rules_decide(conn, args):
-    from . import rule_engine
-    try:
-        status = rule_engine.decide_rule(conn, args.rule_id, args.decision, by=args.by)
-    except ValueError as error:
-        return {"ok": False, "error": str(error)}
-    return {"ok": True, "rule_id": args.rule_id, "status": status}
-
-
 def main(argv=None):
     args = build_parser().parse_args(argv)
     conn = store.connect(args.db)
@@ -747,11 +737,6 @@ def main(argv=None):
                 return 1
         elif args.cmd == "rules-validate":
             result = _rules_validate(conn, args)
-            if not result.get("ok"):
-                print(json.dumps(result, ensure_ascii=False, indent=1))
-                return 1
-        elif args.cmd == "rules-decide":
-            result = _rules_decide(conn, args)
             if not result.get("ok"):
                 print(json.dumps(result, ensure_ascii=False, indent=1))
                 return 1

@@ -4,8 +4,9 @@
 
   提案 spec（``momentum_20``——**真实注册因子**，喂构造的可行价格路径）
     → ``rules-validate`` CLI（真实验证门：IC t 检验 + 5 分位分层单调）→ ``passed``
-    → Web 审批端点 ``rules-decide``（服务 ``create_handler``，等价于独立 Web 的
-      「批准」按钮，``by=web``）→ ``enabled`` + 记录批准人
+    → Web 审批端点 ``rules-decide``（服务 ``create_handler`` → 进程内
+      ``rule_engine.decide_rule``，等价于独立 Web 的「批准」按钮，来源固定 ``web``；
+      **没有 CLI 等价物**）→ ``enabled`` + 记录批准人
     → 次日 ``plan-auto`` CLI（真实作业体）→ ``origin=auto`` 冻结计划（``strategy_id=rule_id``）
     → ``auto-execute`` CLI（九守卫，D2 09:36 落在执行窗口内）→ 落 ``execute_plan`` 指令
     → ``daemon.poll_commands``（真实指令轮询）→ ``execute.run`` → 券商收到下单
@@ -77,7 +78,8 @@ class ChainBase(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.home = Path(self.tmp.name)
-        self.db = str(self.home / "t.sqlite")
+        # 与生产同构：批准端点按 $DSH_HOME 推库路径（store.db_path），无 --db 注入口
+        self.db = str(store.db_path(str(self.home)))
         self.conn = store.connect(self.db)
         self.addCleanup(self.conn.close)
         store.migrate(self.conn)
@@ -134,7 +136,11 @@ class ChainBase(unittest.TestCase):
                               "--lookback", "20", "--horizon", "2"])
 
     def handler(self):
-        """服务 handler：审批端点绑真实 CLI（进程内跑真库）——等价于 Web 批准按钮。"""
+        """服务 handler：读走真实 CLI（进程内跑真库），批准走**进程内**动作端点。
+
+        批准没有 CLI 等价物（``rules-decide`` 子命令已删除）：端点 → compute →
+        ``rule_engine.decide_rule``，来源固定 "web"——等价于 Web 批准按钮。
+        """
         def runner(command, timeout):
             buf = io.StringIO()
             with redirect_stdout(buf):
@@ -144,7 +150,7 @@ class ChainBase(unittest.TestCase):
 
         core = {"rules": lambda status=None: compute.rules_list(status, runner=runner),
                 "rules-decide": lambda rule_id, decision: compute.rules_decide(
-                    rule_id, decision, runner=runner)}
+                    rule_id, decision, home=str(self.home))}
         return app_module.create_handler(str(self.home), analytics={}, series=None,
                                          core=core)
 

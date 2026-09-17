@@ -297,7 +297,7 @@ Harness 提案（rules JSON）→ 机械验证门 rules-validate（IC t 检验 +
   → 把 rule_id 填进 auto_pipeline.strategies → 次日 build_plan 按该规则生成计划
 ```
 
-命令行等价物（自动化与排查用；**批准本身仍只能人工做**）：
+命令行等价物（自动化与排查用；**批准没有命令行等价物**）：
 
 ```bash
 cd <repo>
@@ -306,8 +306,9 @@ DB="${DSH_HOME:-$HOME/.dsh}/trading-data/trading.sqlite"
 ~/.dsh/trading-venv/bin/python -m trading_core rules-validate --spec /tmp/rule.json --db "$DB"
 # 2) 看候选池
 ~/.dsh/trading-venv/bin/python -m trading_core rules-list --db "$DB"
-# 3) 批准 / 停用（等价于 Web 按钮；--by 记录操作来源）
-~/.dsh/trading-venv/bin/python -m trading_core rules-decide --rule-id <id> --decision enable --by cli
+# 3) 批准 / 停用：**只能在独立 Web 研究页候选池点按钮**。没有 CLI 子命令、没有 MCP 工具、
+#    批准来源（approved_by）由服务端固定——任何能被脚本跑出来的批准入口都是模型自批入口，
+#    所以刻意不提供（`rules-decide` 子命令已删除）。
 ```
 
 ### 硬规则（不可绕过）
@@ -317,9 +318,11 @@ DB="${DSH_HOME:-$HOME/.dsh}/trading-data/trading.sqlite"
   `volatility_20`、`ep`）；需要新算子 = 提核心库 PR 人工审查。
 - **未成熟因子不得进规则**：情绪 / F10 / 做空域因子先按 PIT 攒历史，连续 **≥250 交易日**
   才可申请走同一套验证门；在那之前只能出现在假设的文字讨论里。
-- **批准只在 Web**：`rules-decide`（批准）、`auto_pipeline`（开关）、`confirm-decide`
-  （实盘确认）**不进模型工具面**——模型不能自批自己挖的因子、不能自拨流水线开关、
-  不能自批实盘单。模型侧同样禁用 `trade_place/trade_modify/trade_cancel/plan_execute/switch_mode`。
+- **批准只在 Web（且无离线等价物）**：`rules-decide`（批准）是**服务进程内动作端点**——
+  不进模型工具面、**也没有 CLI 子命令**，批准来源由服务端固定为 `web`，连"自报来源"的
+  参数都不存在；`auto_pipeline`（开关）、`confirm-decide`（实盘确认）同样不进模型工具面。
+  模型不能自批自己挖的因子、不能自拨流水线开关、不能自批实盘单。模型侧同样禁用
+  `trade_place/trade_modify/trade_cancel/plan_execute/switch_mode`。
 - **停用随时可停**：Web 停用后**同一进程内立即生效**（规则解析每次回查 DB 状态，失效实例
   即时摘除——这条是 WP14 端到端演练暴露并修掉的一个 fail-open 缺陷）；`disabled` 是终态。
 - **研报照旧发布到研究页**：`research_publish` 必带 `sources`（名称/数据时间/引用）。
