@@ -449,7 +449,8 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                     raise WorkbenchError("Analytics provider unavailable")
                 return caches.cached(endpoint, payload, force,
                                      lambda: provider(payload, force),
-                                     "trading/analytics-unavailable")
+                                     "trading/analytics-unavailable",
+                                     payload_error_types=(compute.ComputeError,))
             if endpoint == "audit":
                 # rpc.js:132-145：空载荷；trades 取不到时仍给出信号/响应链路
                 _takes_no_payload(endpoint, payload)
@@ -804,9 +805,15 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
             # 白名单 404 先于 handle（规格 §5.1 A7 封闭性）
             return error_envelope("trading/unknown-endpoint", f"未知端点 {endpoint}", 404)
         content_type = request.headers.get("content-type", "").split(";")[0].strip()
-        if content_type != "application/json":
+        declared_body = request.headers.get("content-length")
+        # 空 body 的 POST 按空载荷处理（E2E 缺陷 5，2026-09-17）：只读端点
+        # （如 ``openapi_config``）在浏览器/脚本里用 POST 探测时既没 body 也没 Content-Type，
+        # 严格回 415 等于「读都读不到」。没有内容就没有「媒体类型不对」可言——有 body 却
+        # 声明成非 JSON 仍是 415（下面那条分支），载荷合法性仍由端点自己判（fail-closed）。
+        if content_type != "application/json" and not (
+                content_type == "" and declared_body in (None, "0")):
             return error_envelope("trading/invalid-operation", "Expected application/json", 415)
-        declared = request.headers.get("content-length")
+        declared = declared_body  # 同一次读取，避免两处各查一遍 header
         if declared and declared.isdigit() and int(declared) > MAX_PAYLOAD:
             # 快路径：声明就超限时不必读体（Node 原实现 collectBody 同样先看 content-length）
             return error_envelope("trading/payload-too-large", "请求体超过 1MB 上限", 413)

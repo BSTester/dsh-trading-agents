@@ -354,8 +354,14 @@ def iso_from_ms(at_ms):
     return moment.strftime("%Y-%m-%dT%H:%M:%S.") + f"{moment.microsecond // 1000:03d}Z"
 
 
-def cached(endpoint, payload, force, produce, error_code):
+def cached(endpoint, payload, force, produce, error_code,
+           payload_error_types=(), payload_error_code="trading/invalid-operation"):
     """``rpc.js:73-95 cached()``：命中/取数/形状校验/失败信封，逐条对齐。
+
+    ``payload_error_types``/``payload_error_code``（E2E 缺陷 4，2026-09-17）：取数抛出的
+    **调用方载荷错误**（如 ``compute.ComputeError`` 的 tickers 数量校验）此前与「引擎不可用」
+    共用一个 ``error_code``，界面据此把拼错的参数说成服务故障。传入异常类型即按
+    ``payload_error_code`` 归类；默认空元组 = 行为与从前逐字一致（其他调用方零变化）。
 
     返回四种形态之一：
       ``{"ok": True, "value": ..., "cached": True,  "cached_at": ISO}``
@@ -379,4 +385,7 @@ def cached(endpoint, payload, force, produce, error_code):
         return {"ok": True, "value": value, "cached": False, "cached_at": iso_from_ms(entry["at"])}
     except Exception as error:  # noqa: BLE001 —— rpc.js:91 同样兜住任何异常
         message = str(error) if str(error) else error.__class__.__name__
-        return {"ok": False, "error": {"code": error_code, "message": message[:300], "details": {}}}
+        code = (payload_error_code
+                if payload_error_types and isinstance(error, tuple(payload_error_types))
+                else error_code)
+        return {"ok": False, "error": {"code": code, "message": message[:300], "details": {}}}
