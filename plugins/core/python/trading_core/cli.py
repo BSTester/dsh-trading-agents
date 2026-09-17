@@ -136,7 +136,10 @@ def build_parser():
     s = sub.add_parser("enqueue-research",
                        help="值班研究员任务入队（daily_brief/factor_patrol/mining_round；"
                             "落 research_tasks，零 LLM）")
-    s.add_argument("--market", required=True, help="市场链：SH/HK/US（SH 链含 SZ/BJ）")
+    s.add_argument("--market", required=True,
+                   help="市场链：SH/HK/US（SH 链含 SZ/BJ）；逗号分隔可多市场，"
+                        "如 GLOBAL 链的 SH,HK,US——各市场按自己的会话收盘与日历独立判定"
+                        "（未收盘/非交易日软跳过）")
     s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
     s.add_argument("--today", default=None,
                    help="观测日覆盖 YYYY-MM-DD 或完整时刻（测试/补跑用）")
@@ -682,11 +685,26 @@ def main(argv=None):
             # 软跳过（会话未收盘/关注池为空）退出 0——入队只是「把当日的活记下来」，
             # 队列积压不阻塞调度链；市场链/时钟非法=非零退出（fail-closed）。
             # 本命令零 LLM、零子进程：不领取、不执行任何任务（执行体是 Harness 会话）。
+            #
+            # 多市场（审查 A-2）：`--market SH,HK,US` 逐市场独立入队——各市场按自己的
+            # 会话收盘与交易日历折算观测日，未收盘/非交易日软跳过（GLOBAL 链一条作业
+            # 覆盖三市场）。单市场保持原信封（向后兼容），多市场回 {"markets": [...]}。
             import os
             from . import research_queue
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
-            result = research_queue.enqueue(home, args.market, conn=conn,
-                                            today=args.today, now=args.now)
+            markets = [part.strip().upper() for part in str(args.market).split(",")
+                       if part.strip()]
+            if not markets:
+                print(json.dumps({"ok": False, "error": "未提供市场链"},
+                                 ensure_ascii=False, indent=1))
+                return 1
+            results = [research_queue.enqueue(home, market, conn=conn,
+                                              today=args.today, now=args.now)
+                       for market in markets]
+            # 单市场保持原信封（向后兼容）；多市场回 {"ok", "markets": [...]}，
+            # 统一交由尾部公共打印（成功路径）——失败路径此处提前打印并返回非零。
+            result = results[0] if len(results) == 1 else {
+                "ok": all(item.get("ok") for item in results), "markets": results}
             if not result.get("ok"):
                 print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
                 return 1

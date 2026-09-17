@@ -163,6 +163,8 @@ class FactorsSnapshotJobWiringTest(unittest.TestCase):
     def test_every_market_chain_has_factors_snapshot_after_bars_sync(self):
         self.assertTrue(daemon.JOBS_DEFAULT)
         for market, chain in daemon.JOBS_DEFAULT.items():
+            if market == daemon.GLOBAL_CHAIN:
+                continue   # GLOBAL 是不绑市场日历的基础作业链（研究入队），无行情同步
             self.assertGreaterEqual(len(chain), 2, market)
             names = [job["name"] for job in chain]
             self.assertEqual(names.count("factors_snapshot"), 1, market)

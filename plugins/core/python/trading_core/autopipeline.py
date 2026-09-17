@@ -140,6 +140,8 @@ def apply_overlay(cfg, overlay):
             maximum=EXEC_WINDOW_MAX_MINUTES)
     if "reconcile_at" in overlay:
         merged["reconcile_at"] = _hhmm(overlay["reconcile_at"], "auto_pipeline.reconcile_at")
+        # 派生校验共用同一实现：过晚会跨日回绕（入队排到对账之前）→ 当场拒绝配置
+        enqueue_time_after_reconcile(merged["reconcile_at"])
     return merged
 
 
@@ -157,11 +159,18 @@ def auto_pipeline_config(home):
     return apply_overlay(cfg, overlay)
 
 
-#: 全局作业链的键（规格 §4.4）：承载不绑市场日历的作业（reconcile）。
+#: 全局作业链的键（规格 §4.4）：承载不绑市场日历的作业（reconcile、enqueue_research）。
 GLOBAL_CHAIN = "GLOBAL"
 #: build_plan 相对该市场 factors_snapshot 的偏移（分钟，规格 §4.1）——先让数据与
 #: 因子快照落库，自动计划再吃当日数据。
 BUILD_PLAN_OFFSET_MINUTES = 5
+#: 研究任务入队（基础链）默认时刻与命令：**关闭态**（无 reconcile 作业）用这个固定点；
+#: **开启态**由 ``build_jobs`` 按 ``reconcile_at`` + ``ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES``
+#: 派生，保证入队严格晚于当日 digest 落库（规格 §10.2/§10.3；审查 A-2）。
+#: 命令与 daemon.JOBS_DEFAULT 共用（单一事实源），避免两处时刻/参数漂移。
+ENQUEUE_RESEARCH_BASE_AT = "19:05"
+ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES = 5
+ENQUEUE_RESEARCH_CMD = ["enqueue-research", "--market", "SH,HK,US"]
 
 
 def _plus_minutes(hhmm, minutes):
@@ -179,6 +188,22 @@ def _factors_at(chain):
     return None
 
 
+def enqueue_time_after_reconcile(reconcile_at):
+    """由 ``reconcile_at`` 派生研究入队时刻（+``ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES``）。
+
+    **单一实现**：配置校验（``apply_overlay``）与作业装配（``build_jobs``）共用。
+    跨日回绕一律 ValueError（fail-closed）：``reconcile_at`` 过晚时派生时刻会回到次日
+    凌晨，按时刻排序会把入队排到对账之前——「digest 先落库、入队紧随其后」的时序假设
+    不成立。宁可拒绝配置，也不让 daily_brief 悄悄引用上一份摘要（审查 A-2）。
+    """
+    derived = _plus_minutes(reconcile_at, ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES)
+    if derived <= reconcile_at:
+        raise ValueError(
+            f"auto_pipeline.reconcile_at 过晚：{reconcile_at!r} + "
+            f"{ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES} 分钟跨日，研究入队会排到对账之前")
+    return derived
+
+
 def build_jobs(home, conn=None):
     """作业表装配（规格 §4.1）：JOBS_DEFAULT + auto_pipeline 派生的自动作业。
 
@@ -189,8 +214,12 @@ def build_jobs(home, conn=None):
 
       * 各市场：build_plan（= 该市场 factors_snapshot + ``BUILD_PLAN_OFFSET_MINUTES``）、
         auto_execute（= ``auto_pipeline.exec_at[market]``）；
-      * ``GLOBAL_CHAIN``：reconcile（= ``auto_pipeline.reconcile_at``）——**不查交易日历**
-        （见 tick），只受时点与当日 ran 标记约束。
+      * ``GLOBAL_CHAIN``：reconcile（= ``auto_pipeline.reconcile_at``），其后是
+        enqueue_research（= ``reconcile_at`` + ``ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES``，
+        **入队时刻跟随配置**，保证严格晚于当日 digest 落库——审查 A-2）。两者都**不查
+        交易日历**（见 tick），只受时点与当日 ran 标记约束。整条 GLOBAL 链按 ``at``
+        升序排列——tick-first 补跑时同一轮里可能同时到期多个作业，**顺序必须与时间
+        顺序一致**：digest 先落库，研究任务入队才拿得到当日 digest。
 
     作业体自身的软跳过（未启用/无匹配策略/数据未就绪/守卫拦截）由 ``plan-auto`` 与
     ``auto-execute`` 实现并留痕；这里不重复做关注池或策略门槛——避免两处判定漂移，
@@ -221,6 +250,17 @@ def build_jobs(home, conn=None):
                           "cmd": ["plan-auto", "--market", market]})
         chain.append({"name": "auto_execute", "at": cfg["exec_at"][market],
                       "cmd": ["auto-execute", "--market", market]})
-    jobs[GLOBAL_CHAIN] = [{"name": "reconcile", "at": cfg["reconcile_at"],
-                           "cmd": ["reconcile-daily"]}]
+    # GLOBAL 链：reconcile（对账 → 写 digest）在前，enqueue_research（基础链作业）**按
+    # reconcile_at 派生**紧随其后——开启态下入队时刻跟随配置，保证严格晚于当日 digest；
+    # 关闭态则保持 JOBS_DEFAULT 的固定点（ENQUEUE_RESEARCH_BASE_AT，无 reconcile 作业）。
+    # 整条链按 at 升序排序：tick-first 补跑时同一轮可能同时到期多个作业，顺序必须与
+    # 时间顺序一致，否则 enqueue 会先于 reconcile 执行（审查 A-2）。
+    global_chain = [job for job in jobs.setdefault(GLOBAL_CHAIN, [])
+                    if job["name"] != "enqueue_research"]
+    global_chain.append({"name": "reconcile", "at": cfg["reconcile_at"],
+                         "cmd": ["reconcile-daily"]})
+    global_chain.append({"name": "enqueue_research",
+                         "at": enqueue_time_after_reconcile(cfg["reconcile_at"]),
+                         "cmd": list(ENQUEUE_RESEARCH_CMD)})
+    jobs[GLOBAL_CHAIN] = sorted(global_chain, key=lambda job: job["at"])
     return jobs

@@ -66,15 +66,21 @@ class BuildJobsTest(unittest.TestCase):
         self.assertEqual(jobs["HK"][-1]["cmd"], ["auto-execute", "--market", "HK"])
         self.assertEqual([j["at"] for j in jobs["US"][-2:]], ["05:40", "22:35"])
 
+        # GLOBAL 链：reconcile 在前，enqueue_research **按 reconcile_at 派生**紧随其后
+        # （19:30 + 5 = 19:35）——开启态入队时刻跟随配置，严格晚于当日 digest（审查 A-2）
         g = jobs[daemon.GLOBAL_CHAIN]
-        self.assertEqual(len(g), 1)
-        self.assertEqual(g[0]["name"], "reconcile")
+        self.assertEqual([j["name"] for j in g], ["reconcile", "enqueue_research"])
         self.assertEqual(g[0]["at"], "19:30")
         self.assertEqual(g[0]["cmd"], ["reconcile-daily"])
-        # deepcopy：不改动全局常量，也不残留上一次装配的痕迹
-        self.assertNotIn(daemon.GLOBAL_CHAIN, daemon.JOBS_DEFAULT)
-        self.assertEqual(len(daemon.JOBS_DEFAULT["SH"]), 8)
-        # 基础链：WP11 sentiment + WP12 research 快照 + WP15 研究任务入队
+        self.assertEqual(g[1]["at"], "19:35")
+        self.assertEqual(g[1]["cmd"], ["enqueue-research", "--market", "SH,HK,US"])
+        self.assertLess(g[0]["at"], g[1]["at"])
+        # deepcopy：不改动全局常量，也不残留上一次装配的痕迹——基础链的固定点原样保留
+        self.assertEqual([j["name"] for j in daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN]],
+                         ["enqueue_research"])
+        self.assertEqual(daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN][0]["at"], "19:05")
+        self.assertEqual(len(daemon.JOBS_DEFAULT["SH"]), 7)
+        # 基础链：WP11 sentiment + WP12 research 快照（入队自审查 A-2 起移入 GLOBAL 链）
 
     # ③ GLOBAL 链不查市场日历：日历缺失时市场链跳过并告警，全局链照常执行
     def test_global_chain_ignores_calendar(self):

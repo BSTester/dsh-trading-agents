@@ -383,25 +383,32 @@ journalctl --user -u research-duty.service -n 50     # 单次运行记录（与�
 ```
 
 - **停用**：`systemctl --user disable --now research-duty.timer`。停用不影响队列——
-  任务照常入队，只是等你打开会话时补跑。
+  任务照常入队，只在**会话首次交互**时由 Harness 按启动纪律补跑（见下节）。
 - **cron 等价**（不想用 systemd 时；同样的行也写在 `install/research-duty.timer` 注释里）：
   ```
-  50 16 * * 1-5 /home/<user>/dsh-trading-agents/scripts/research_duty.sh >> ~/.dsh/logs/research-duty-cron.log 2>&1
+  20 19 * * 1-5 /home/<user>/dsh-trading-agents/scripts/research_duty.sh >> ~/.dsh/logs/research-duty-cron.log 2>&1
   ```
-- **时刻依据**：`enqueue_research` 在各市场链尾（本机默认 SH 16:00 收盘后约 16:15–16:30
-  跑完），16:50 唤醒留余量；港美股任务在下一次唤醒被消费（**不丢、只延后**）。
+- **时刻依据**（一条链，按时间顺序）：`reconcile` 19:00（auto_pipeline 开启时）写当日
+  `digest` → **基础链 `enqueue_research` 19:05** 入队 → 本定时器 **19:20** 唤醒消费。
+  入队必须在 digest 之后，否则 `daily_brief` 的 `digest_ref` 指向前一日摘要（审查 A-2）。
+  19:05 时三市场的观测日与其 digest 的 `as_of` 天然同日：SH/HK = 北京日 D；US = 会话本地日
+  D-1（digest(D-1) 正是昨天 19:00 写下的那份）。
+  前提是**平台服务在 19:05 前已运行**；服务若更晚才起，tick-first 会在启动时补跑
+  `reconcile` → `enqueue_research`（GLOBAL 链按时刻排序保证顺序），任务留在队列等下一次
+  唤醒或会话兜底——**不丢、只延后**。
 - **手动演练**（不装定时器也能跑）：
   ```bash
-  ~/.dsh/trading-venv/bin/python -m trading_core enqueue-research --market SH   # 手工入队
-  scripts/research_duty.sh                                                      # 单次唤醒
+  ~/.dsh/trading-venv/bin/python -m trading_core enqueue-research --market SH,HK,US  # 手工入队
+  scripts/research_duty.sh                                                          # 单次唤醒
   ```
 
-### 与「会话打开补跑」的关系（兜底语义）
+### 与「会话首次交互补跑」的关系（兜底语义）
 
-两条路径消费**同一张表**：定时器唤醒 headless 会话，或你打开/恢复会话时由 Harness 读队列
-补跑。互斥靠状态迁移（`claim_task` 只把 `pending` 迁 `running`），不会重复执行。
-定时器没装、机器关机、headless 被杀，都只是**延后**：超时的 `running` 在下次领取时被回收
-（`reclaim_tasks`，幂等），`attempts` 达 3 次才判 `failed`。
+两条路径消费**同一张表**：定时器唤醒 headless 会话（**自动**），或你在会话开始/恢复后的
+**首次交互**里由 Harness 按 `AGENTS.md` 的启动纪律消费积压（**非自动**：没有任何 turn 的
+会话不会消费队列，任务只延迟不丢）。互斥靠状态迁移（`claim_task` 只把 `pending` 迁
+`running`），不会重复执行。定时器没装、机器关机、headless 被杀，都只是**延后**：超时的
+`running` 在下次领取时被回收（`reclaim_tasks`，幂等），`attempts` 达 3 次才判 `failed`。
 
 ### 排查表
 
@@ -409,7 +416,8 @@ journalctl --user -u research-duty.service -n 50     # 单次运行记录（与�
 |---|---|---|
 | 脚本退出码 127，提示「找不到 dsh」 | `dsh` 不在 PATH | 用 `DSH_BIN=/abs/path/to/dsh` 指定，或修好 PATH 后重跑 |
 | 脚本退出码 2，提示「平台服务不可达」 | 队列端点由服务提供，服务没起 | 启动服务或确认 platform-autostart；脚本**不会**自己拉起服务 |
-| 脚本退出码 124，提示「超过上限已中止」 | 单次值班超 `DSH_DUTY_TIMEOUT`（默认 1800s） | 未完成任务留在队列，下次唤醒/开会话继续；持续超时先看日志卡在哪一步 |
+| 脚本退出码 124，提示「超过上限已中止」 | 单次值班超 `DSH_DUTY_TIMEOUT`（默认 1800s） | 未完成任务留在队列，下次唤醒/会话首次交互继续；持续超时先看日志卡在哪一步 |
+| 唤醒时队列为空，且服务是刚启动的 | 服务在 19:05 之后才起，入队晚于 19:20 唤醒 | 确认服务在 19:05 前运行；本次任务等下一次唤醒或会话兜底消费（不丢、只延后） |
 | 队列一直 `pending` | 定时器没跑或服务没起 | 查 `systemctl --user list-timers research-duty.timer` 与 `~/.dsh/logs/research-duty-*.log` |
 | 任务长期 `running` | 执行体死在半路（headless 被杀/会话中断） | 下次 `claim` 自动回收；急用可手工触发一次唤醒让 `reclaim` 生效 |
 | 任务被拒领 + critical 告警 | 载荷被直改库塞进了自由文本（队列即攻击面） | **队列暂停在队首**（fail-closed）。人工核对 `research_tasks.payload`，修正或删除该行后才继续 |

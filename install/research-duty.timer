@@ -1,18 +1,23 @@
-# 值班研究员（L3）定时唤醒（WP15 任务 4；规格 §10.4）
+# 值班研究员（L3）定时唤醒（WP15 任务 4；规格 §10.4；2026-09-16 审查 A-2 修订）
 #
-# 时刻依据：基础链的 enqueue_research 在各市场链尾（digest 之后）入队——
-# 本机默认 SH 16:00 收盘，链上 sync/quality/factors_snapshot/sentiment_snapshot/
-# research_snapshot/build_plan/enqueue_research 约 16:15–16:30 跑完；16:50 唤醒留出余量。
-# 港股链 16:30 起、美股链次日 05:30 起：它们的任务在下一次唤醒被消费（**任务不丢、只延后**，
-# 规格 §10.4 的兜底语义），需要更早看到就在 Web 开会话，由「会话打开补跑」消费。
-# 周末/节假日不做交易日判定：非交易日 enqueue_research 本就不跑，唤醒后队列为空、立即收工。
+# 时刻依据（一条链，按时间顺序）：
+#   reconcile(19:00，auto_pipeline 开启时) → 写当日 digest → enqueue_research(19:05，基础链)
+#   → 本定时器唤醒(19:20) 消费队列。
+# **入队必须在 digest 之后**（规格 §10.2/§10.3）：否则 daily_brief 的 digest_ref 指向前一日
+# 摘要。19:05 时三市场的观测日与其 digest 的 as_of 天然同日：SH/HK = 北京日 D；US = 会话
+# 本地日 D-1，而 digest(D-1) 正是昨天 19:00 写下的那份。
+#
+# 依赖：平台服务必须在 19:05 前已运行（作业由服务内调度器执行）。服务若在 19:05 之后才起，
+# tick-first 会在启动时补跑 reconcile+enqueue（顺序由 GLOBAL 链按时刻排序保证），任务随后
+# 留在队列等下一次唤醒或会话兜底——**任务不丢、只延迟**。
+# 非交易日：enqueue_research 各市场软跳过，唤醒后队列为空、立即收工。
 # cron 等价行（分 时 日 月 周；用户与路径按实际替换）：
-#   50 16 * * 1-5 /home/<user>/dsh-trading-agents/scripts/research_duty.sh >> ~/.dsh/logs/research-duty-cron.log 2>&1
+#   20 19 * * 1-5 /home/<user>/dsh-trading-agents/scripts/research_duty.sh >> ~/.dsh/logs/research-duty-cron.log 2>&1
 [Unit]
 Description=quant platform duty researcher timer (L3)
 
 [Timer]
-OnCalendar=Mon..Fri 16:50
+OnCalendar=Mon..Fri 19:20
 # 关机/睡眠错过触发 → 恢复后补跑一次（与队列「不丢只延后」的兜底语义一致）
 Persistent=true
 Unit=research-duty.service

@@ -68,6 +68,11 @@
 6b. 技能可用提示：preset 的 customSkillDirs 直读仓库 skills/ 目录，此时
     futu-skills 的 7 个技能已可用（新建会话生效）；每个技能用哪些工具、缺口能力
     如何降级，工具清单见 skills/futu-skills/README.md。
+6c. 值班队列的兜底纪律：仓库根 `AGENTS.md` 由 `@deepseek-ai/dsh-agent-instructions`
+    在会话开始时自动加载（工程根 = 本仓库，以 `.git` 标记；**会话工作目录必须在本仓库内**
+    才会加载）。它要求会话首次交互先消费研究任务队列积压（L3 兜底）。定时器
+    （`install/research-duty.{service,timer}`，19:20 唤醒）是**主**路径，本纪律是**兜底**：
+    没有任何 turn 的会话不会消费队列（任务不丢、只延迟）。
 7. （备用）手动启动服务（若第 4 步已报 already-running 则跳过本步）：
    会话自动拉起已默认启用（preset 行 platform-autostart）：之后新建的会话会自动
    /healthz 检测并以分离进程拉起服务，通常无需手动；本步仅用于在当前安装会话里

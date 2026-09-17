@@ -275,7 +275,10 @@ class AutoPipelineEndToEndTests(SettingsBase):
 
     def test_disabled_then_enabled_changes_build_jobs(self):
         names = self.auto_job_names()
-        self.assertNotIn(autopipeline.GLOBAL_CHAIN, names)
+        # 关闭态：GLOBAL 链只有**基础**研究入队（与交易开关解耦，审查 A-2），没有
+        # reconcile 这类 auto_pipeline 派生作业；市场链也没有 build_plan/auto_execute
+        self.assertEqual(names[autopipeline.GLOBAL_CHAIN], ["enqueue_research"])
+        self.assertNotIn("reconcile", names[autopipeline.GLOBAL_CHAIN])
         self.assertNotIn("auto_execute", names["SH"])
 
         with self.client() as client:
@@ -285,6 +288,11 @@ class AutoPipelineEndToEndTests(SettingsBase):
         names = self.auto_job_names()
         self.assertIn(autopipeline.GLOBAL_CHAIN, names)
         self.assertIn("reconcile", names[autopipeline.GLOBAL_CHAIN])
+        self.assertIn("enqueue_research", names[autopipeline.GLOBAL_CHAIN])
+        # 开启态：入队排在 reconcile 之后（同链按时刻排序，digest 先落库）
+        global_chain = autopipeline.build_jobs(str(self.home))[autopipeline.GLOBAL_CHAIN]
+        self.assertEqual([job["name"] for job in global_chain],
+                         ["reconcile", "enqueue_research"])
         self.assertIn("build_plan", names["SH"])
         self.assertIn("auto_execute", names["SH"])
         self.assertIn("auto_execute", names["HK"])

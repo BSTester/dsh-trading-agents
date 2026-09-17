@@ -14,7 +14,8 @@ from . import alerts, commands, execute, indicators, store
 # WP9 拆分（规格 §3.1）：配置/作业装配 → autopipeline；自动执行作业体 → autopilot；
 # 统一时钟 → clock。以下为**向后兼容再导出**——既有调用方（cli/planner/reconcile/
 # server.scheduler/各测试）继续以 ``daemon.X`` 取用，无需改动。
-from .autopipeline import (AUTO_PIPELINE_DEFAULTS, EXEC_WINDOW_MAX_MINUTES,  # noqa: F401
+from .autopipeline import (AUTO_PIPELINE_DEFAULTS, ENQUEUE_RESEARCH_BASE_AT,  # noqa: F401
+                           ENQUEUE_RESEARCH_CMD, EXEC_WINDOW_MAX_MINUTES,
                            GLOBAL_CHAIN, auto_pipeline_config, build_jobs)
 from .autopilot import auto_execute
 from .clock import FAKE_NOW_ENV, _real_now, now_fn, now_stamp, warn_fake_now  # noqa: F401
@@ -31,28 +32,36 @@ JOBS_DEFAULT = {
     # **基础链**作业（研究数据积累不受交易开关控制）：F10 关键 section/做空/板块目录每日
     # 落 PIT 表，是 250 交易日演进条款的数据地基；数据面未配置凭据时软跳过退出 0。
     # 错峰 5 分钟：与情绪采集的浏览器/网络负载分开，避免同刻争用同一通道。
-    # WP15 任务 2：链尾再追加 enqueue_research（research_snapshot + 5 分钟）。同样是
-    # **基础链**作业（研究与交易开关解耦，规格 §10.4）：把当日的简报/因子巡检/周度挖掘轮
-    # 写进 research_tasks 队列，供值班研究员（headless 或会话补跑）领取——入队本身零 LLM、
-    # 零子进程，只是「把活记下来」；关掉 auto_pipeline 也不影响研究任务照常入队。
+    # WP15 任务 2（2026-09-16 审查 A-2 修订）：研究任务入队放**基础 GLOBAL 链**，
+    # 时点 19:05 = 默认对账时刻（19:00）之后 5 分钟——**必须在当日 digest 落库之后**，
+    # 否则 daily_brief 的 digest_ref 会指向前一日摘要（规格 §10.2/§10.3「紧随 digest 之后」）。
+    #
+    # 一条作业覆盖三市场（`--market SH,HK,US`）：各市场按自己的会话收盘与交易日历折算
+    # 观测日（planner.observation_date），未收盘/非交易日一律软跳过。19:05 北京时间下三市场
+    # 的观测日与其 digest 的 as_of 天然同日：SH/HK = 北京日 D；US = 会话本地日 D-1，而
+    # digest(D-1) 正是昨天 19:00 写下的那份（research_queue 的 refs 逐日自校验，见该模块）。
+    #
+    # 与交易开关解耦（规格 §10.4）：本作业在 JOBS_DEFAULT 里，auto_pipeline 关闭时照常入队——
+    # 研究任务只进队列，不碰交易；入队本身零 LLM、零子进程，只是「把活记下来」。
+    # 时刻/命令取自 autopipeline 常量（单一事实源）：**开启态**由 build_jobs 按 reconcile_at
+    # 派生（= 对账 + 5 分钟，严格晚于 digest）；这里的固定点只在关闭态生效。
+    GLOBAL_CHAIN: [{"name": "enqueue_research", "at": ENQUEUE_RESEARCH_BASE_AT,
+                    "cmd": list(ENQUEUE_RESEARCH_CMD)}],
     "SH": [{"name": "sync_bars", "at": "16:00", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "sync_fundamentals", "at": "16:00", "cmd": ["fundamentals", "--tickers", "@watchlist"]},
             {"name": "merge_announcements", "at": "16:05", "cmd": ["merge-announcements", "--period", "@latest-quarter"]},
             {"name": "quality", "at": "16:10", "cmd": ["quality", "--market", "SH"]},
             {"name": "factors_snapshot", "at": "16:15", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
             {"name": "sentiment_snapshot", "at": "16:25", "cmd": ["sentiment-snapshot", "--market", "SH"]},
-            {"name": "research_snapshot", "at": "16:30", "cmd": ["research-snapshot", "--market", "SH"]},
-            {"name": "enqueue_research", "at": "16:35", "cmd": ["enqueue-research", "--market", "SH"]}],
+            {"name": "research_snapshot", "at": "16:30", "cmd": ["research-snapshot", "--market", "SH"]}],
     "HK": [{"name": "sync_bars", "at": "16:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "factors_snapshot", "at": "16:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
             {"name": "sentiment_snapshot", "at": "16:45", "cmd": ["sentiment-snapshot", "--market", "HK"]},
-            {"name": "research_snapshot", "at": "16:50", "cmd": ["research-snapshot", "--market", "HK"]},
-            {"name": "enqueue_research", "at": "16:55", "cmd": ["enqueue-research", "--market", "HK"]}],
+            {"name": "research_snapshot", "at": "16:50", "cmd": ["research-snapshot", "--market", "HK"]}],
     "US": [{"name": "sync_bars", "at": "05:30", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "factors_snapshot", "at": "05:35", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
             {"name": "sentiment_snapshot", "at": "05:45", "cmd": ["sentiment-snapshot", "--market", "US"]},
-            {"name": "research_snapshot", "at": "05:50", "cmd": ["research-snapshot", "--market", "US"]},
-            {"name": "enqueue_research", "at": "05:55", "cmd": ["enqueue-research", "--market", "US"]}],
+            {"name": "research_snapshot", "at": "05:50", "cmd": ["research-snapshot", "--market", "US"]}],
 }
 
 # 风控参数默认值：镜像 engine/python/risk_config.py 的 DEFAULTS（venv 只链接

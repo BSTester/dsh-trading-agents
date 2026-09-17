@@ -26,7 +26,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 
-from trading_core import cli, daemon, factors, pipeline, research_queue, store  # noqa: E402
+from trading_core import (autopipeline, cli, daemon, factors, pipeline,  # noqa: E402
+                          research_queue, store)
 
 TODAY = "2026-09-16"          # 周三（ISO 2026-W38）
 THURSDAY = "2026-09-17"       # 同周
@@ -115,6 +116,133 @@ class EnqueueJobTest(unittest.TestCase):
         self.assertIn("momentum_20", patrol["payload"]["factor_list"])
         self.assertEqual(sorted(patrol["payload"]["factor_list"]),
                          sorted(factors.REGISTRY), "因子清单取自注册表（唯一事实源）")
+
+        # A-3：周度挖掘轮载荷含「候选因子域」——已注册因子基线（挖据的合法引用集与
+        # 去重依据；新候选由本轮提出，攒数中的域见 refs 的数据源行数）
+        mining = next(t for t in self._tasks() if t["kind"] == "mining_round")
+        self.assertTrue(mining["payload"]["factor_list"], "factor_list 不得为空")
+        self.assertEqual(sorted(mining["payload"]["factor_list"]),
+                         sorted(factors.REGISTRY))
+        self.assertTrue(all(name in factors.REGISTRY
+                            for name in mining["payload"]["factor_list"]))
+
+    def test_digest_ref_is_self_checked_freshness(self):
+        """A-2：refs 的 daily_digest 行显式承载 as_of/fresh_enough——过时摘要必须可见。
+
+        判据是「digest.as_of 不早于研究日」而非「同日」：19:05 北京时间下美股观测日是
+        会话本地日 D-1，而 digest 的 as_of 已是北京日 D（更新）——同日判据会误判。
+        """
+        prev = "2026-09-15"
+        self._watchlist(symbols=["SH.600519", "HK.00700", "US.AAPL"])
+        self._calendar(days=(prev, TODAY))                       # SH
+        store.upsert_calendar(self.conn, "HK", [
+            {"day": TODAY, "trade_date_type": "WHOLE", "trade_second": 14400}])
+        store.upsert_calendar(self.conn, "US", [
+            {"day": prev, "trade_date_type": "WHOLE", "trade_second": 14400}])
+        self._seed_snapshots()
+
+        def brief_of(market):
+            return next(t for t in self._tasks()
+                        if t["kind"] == "daily_brief" and t["market"] == market)
+
+        def digest_ref_of(market):
+            return next(r for r in brief_of(market)["payload"]["refs"]
+                        if r["source"] == "daily_digest")
+
+        # ① 无 digest → 照常入队（任务不丢），refs 如实标 as_of=None / fresh_enough=False
+        self.assertTrue(self._enqueue("SH")["ok"])
+        self.assertIsNone(digest_ref_of("SH")["as_of"])
+        self.assertFalse(digest_ref_of("SH")["fresh_enough"])
+        self.assertIn("当日摘要尚未生成", self._alert_titles())
+
+        # ② digest 比研究日新（美股观测日 = 北京日 − 1 = prev，digest as_of = TODAY）
+        store.kv_set(self.conn, "daily:digest",
+                     {"as_of": TODAY, "mode": "sim", "orders": {}})
+        self.assertTrue(self._enqueue("US")["ok"])
+        self.assertEqual(brief_of("US")["payload"]["as_of"], prev, "美股观测日折算")
+        self.assertEqual(digest_ref_of("US")["as_of"], TODAY)
+        self.assertTrue(digest_ref_of("US")["fresh_enough"])
+
+        # ③ digest 比研究日旧（HK 研究日 = TODAY，digest as_of = prev）→ 告警，不静默
+        store.kv_set(self.conn, "daily:digest",
+                     {"as_of": prev, "mode": "sim", "orders": {}})
+        before = self._alert_titles().count("当日摘要尚未生成")
+        self.assertTrue(self._enqueue("HK")["ok"])
+        self.assertFalse(digest_ref_of("HK")["fresh_enough"])
+        self.assertEqual(self._alert_titles().count("当日摘要尚未生成"), before + 1)
+
+    def test_global_enqueue_time_covers_all_markets_after_digest(self):
+        """A-2 时序：19:05 时三市场观测日都已收盘，且当日 digest 不早于任一观测日。"""
+        from trading_core import planner
+        prev = "2026-09-15"
+        self._calendar(days=(prev, TODAY))
+        store.upsert_calendar(self.conn, "HK", [
+            {"day": prev, "trade_date_type": "WHOLE", "trade_second": 14400},
+            {"day": TODAY, "trade_date_type": "WHOLE", "trade_second": 14400}])
+        store.upsert_calendar(self.conn, "US", [
+            {"day": prev, "trade_date_type": "WHOLE", "trade_second": 14400}])
+
+        stamp = f"{TODAY} 19:05:00"
+        expect = {"SH": TODAY, "HK": TODAY, "US": prev}
+        for market, research_day in expect.items():
+            date, source = planner.observation_date(self.conn, market, stamp)
+            self.assertEqual(source, "session", market)
+            self.assertEqual(date, research_day, market)
+
+        # 19:00 写下的 digest（as_of=北京今日）覆盖三者：不早于任一观测日
+        store.kv_set(self.conn, "daily:digest",
+                     {"as_of": TODAY, "mode": "sim", "orders": {}})
+        for research_day in expect.values():
+            self.assertGreaterEqual(TODAY, research_day)
+
+        # 对照：旧时序（16:35）下 SH 的 digest 只能取到前一日 —— 修复的正是这一点
+        store.kv_set(self.conn, "daily:digest",
+                     {"as_of": prev, "mode": "sim", "orders": {}})
+        early = planner.observation_date(self.conn, "SH", f"{TODAY} 16:35:00")[0]
+        self.assertEqual(early, TODAY)
+        self.assertLess(prev, early, "16:35 时当日 digest 尚未生成（旧时序的问题）")
+
+    def test_enqueue_research_is_base_global_job_after_reconcile(self):
+        """A-2 修订：入队在基础 GLOBAL 链 19:05（对账 19:00 之后），一条作业覆盖三市场；
+        关闭态仍与 JOBS_DEFAULT 逐键相等（研究不受交易开关控制）。"""
+        chain = daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN]
+        self.assertEqual([job["name"] for job in chain], ["enqueue_research"])
+        job = chain[0]
+        self.assertEqual(job["at"], "19:05")
+        self.assertEqual(job["cmd"], ["enqueue-research", "--market", "SH,HK,US"])
+        # 各市场链不再带 enqueue_research（阶段归属随之移到 GLOBAL 链）
+        for market in ("SH", "HK", "US"):
+            self.assertNotIn("enqueue_research",
+                             [j["name"] for j in daemon.JOBS_DEFAULT[market]], market)
+        self.assertEqual(daemon.build_jobs(str(self.home), self.conn),
+                         daemon.JOBS_DEFAULT)
+
+    def test_enabled_global_chain_orders_reconcile_before_enqueue(self):
+        """开启态：reconcile 追加进 GLOBAL 链并按时刻排序——补跑同一轮里 digest 先落库，
+        enqueue 才拿得到当日 digest（A-2 的时序保证）。"""
+        self._watchlist(auto=True)
+        chain = daemon.build_jobs(str(self.home), self.conn)[daemon.GLOBAL_CHAIN]
+        self.assertEqual([job["name"] for job in chain],
+                         ["reconcile", "enqueue_research"])
+        self.assertEqual(chain[0]["at"], "19:00")
+        self.assertEqual(chain[1]["at"], "19:05")
+        self.assertLess(chain[0]["at"], chain[1]["at"])
+
+    def test_late_reconcile_at_is_rejected_not_wrapped(self):
+        """派生时刻跨日回绕 → 配置非法（fail-closed）：宁可拒绝，也不让入队排到对账之前。"""
+        base = dict(autopipeline.AUTO_PIPELINE_DEFAULTS)
+        for too_late in ("23:55", "23:58", "23:59"):
+            with self.assertRaises(ValueError, msg=too_late):
+                autopipeline.apply_overlay(base, {"enabled": True, "reconcile_at": too_late})
+        # 仍留得下 5 分钟余量的最晚值通过，且装配出的顺序仍是 reconcile → enqueue
+        self._watchlist(auto=True)
+        merged = autopipeline.apply_overlay(base, {"enabled": True, "reconcile_at": "23:54"})
+        (self.home / "trading-platform.json").write_text(
+            json.dumps({"watchlist": WATCHLIST, "auto_pipeline": merged}),
+            encoding="utf-8")
+        chain = daemon.build_jobs(str(self.home), self.conn)[daemon.GLOBAL_CHAIN]
+        self.assertEqual([(job["name"], job["at"]) for job in chain],
+                         [("reconcile", "23:54"), ("enqueue_research", "23:59")])
 
     def test_refs_are_empty_but_task_still_enqueued_without_data(self):
         """当日无任何快照数据 → 任务仍然入队（引用行数为 0），不假装有数据。"""
@@ -250,22 +378,6 @@ class EnqueueJobTest(unittest.TestCase):
         self.assertEqual(payload["date"], TODAY)
         self.assertEqual(len(payload["tasks"]), 3)
         self.assertEqual(len(self._tasks()), 3)
-
-    def test_jobs_default_contains_enqueue_research(self):
-        """入链（基础链）：每市场链尾 research_snapshot + 5 分钟；关闭态零差异。"""
-        expect = {"SH": ("16:30", "16:35"), "HK": ("16:50", "16:55"),
-                  "US": ("05:50", "05:55")}
-        for market, (snap_at, enqueue_at) in expect.items():
-            chain = daemon.JOBS_DEFAULT[market]
-            names = [job["name"] for job in chain]
-            self.assertIn("enqueue_research", names, names)
-            job = chain[names.index("enqueue_research")]
-            self.assertEqual(job["at"], enqueue_at, market)
-            self.assertEqual(job["cmd"], ["enqueue-research", "--market", market])
-            self.assertEqual(chain[names.index("research_snapshot")]["at"], snap_at)
-            self.assertLess(chain[names.index("research_snapshot")]["at"], job["at"])
-        self.assertEqual(daemon.build_jobs(str(self.home), self.conn),
-                         daemon.JOBS_DEFAULT)
 
     def test_pipeline_registers_enqueue_stage_and_alert_titles(self):
         self.assertEqual(pipeline._JOB_LABELS["enqueue_research"], "研究任务入队")

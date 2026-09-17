@@ -43,7 +43,9 @@ class OwnershipTest(unittest.TestCase):
     """归属：拆分方案明示 daemon 保留的，不许跟着搬走。"""
 
     def test_jobs_default_stays_in_daemon(self):
-        self.assertEqual(list(daemon.JOBS_DEFAULT), ["SH", "HK", "US"])
+        # 基础作业表（三市场链 + 基础 GLOBAL 链的研究入队）归 daemon；装配归 autopipeline
+        self.assertEqual(list(daemon.JOBS_DEFAULT),
+                         [daemon.GLOBAL_CHAIN, "SH", "HK", "US"])
         self.assertTrue(daemon.JOBS_DEFAULT["SH"])
         self.assertFalse(hasattr(autopipeline, "JOBS_DEFAULT"))
 

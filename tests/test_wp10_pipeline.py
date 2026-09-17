@@ -106,7 +106,7 @@ class StageDerivationTests(PipelineBase):
         stages = self.stages(out)
         self.assertEqual(list(stages), ["sync_bars", "sync_fundamentals", "merge_announcements",
                                         "quality", "factors_snapshot", "sentiment_snapshot",
-                                        "research_snapshot", "enqueue_research",
+                                        "research_snapshot",
                                         "plan", "execute"])
         self.assertEqual({s["status"] for s in stages.values()}, {"pending"})
         self.assertFalse(out["auto_pipeline"]["enabled"])
@@ -119,9 +119,10 @@ class StageDerivationTests(PipelineBase):
         out = self.snapshot()
         stages = self.stages(out)
         # 阶段顺序：真实作业链 + plan 紧跟 build_plan、execute 紧跟 auto_execute
+        # （enqueue_research 自审查 A-2 起属基础 GLOBAL 链，不在市场链阶段里）
         self.assertEqual(list(stages), ["sync_bars", "sync_fundamentals", "merge_announcements",
                                         "quality", "factors_snapshot", "sentiment_snapshot",
-                                        "research_snapshot", "enqueue_research",
+                                        "research_snapshot",
                                         "build_plan", "plan",
                                         "auto_execute", "execute"])
         sync = stages["sync_bars"]
@@ -246,9 +247,12 @@ class GlobalStageTests(PipelineBase):
                      {"as_of": DATE, "orders": {"submitted": 2, "filled": 1}})
         out = self.snapshot()
         stages = out["global"]["stages"]
-        self.assertEqual(list(stages), ["reconcile", "digest"])
+        # GLOBAL 链按时刻排序：reconcile 19:00 → enqueue_research 19:05（基础链），
+        # digest 由 reconcile 派生、附在链末（审查 A-2 后入队归 GLOBAL）
+        self.assertEqual(list(stages), ["reconcile", "enqueue_research", "digest"])
         self.assertEqual(stages["reconcile"]["status"], "ok")
         self.assertEqual(stages["reconcile"]["scheduled"], "19:00")
+        self.assertEqual(stages["enqueue_research"]["scheduled"], "19:05")
         self.assertEqual(stages["digest"]["status"], "ok")
         self.assertEqual(stages["digest"]["summary"], "filled 1, submitted 2")
 
@@ -257,9 +261,12 @@ class GlobalStageTests(PipelineBase):
         store.kv_set(self.conn, "daily:digest", {"as_of": "2026-09-15", "orders": {}})
         self.assertEqual(self.snapshot()["global"]["stages"]["digest"]["status"], "pending")
 
-    def test_disabled_config_has_digest_only(self):
+    def test_disabled_config_keeps_base_enqueue_and_digest(self):
+        """关闭态：GLOBAL 链只有基础入队作业 + digest，**没有 reconcile**（对账属
+        auto_pipeline 派生作业；研究入队与交易开关解耦——审查 A-2）。"""
         out = self.snapshot()
-        self.assertEqual(list(out["global"]["stages"]), ["digest"])
+        self.assertEqual(list(out["global"]["stages"]),
+                         ["enqueue_research", "digest"])
 
 
 class ConfigAndSafetyTests(PipelineBase):

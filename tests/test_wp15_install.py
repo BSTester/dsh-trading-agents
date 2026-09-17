@@ -118,8 +118,13 @@ class ResearchDutyScriptTest(unittest.TestCase):
         self.assertIn("research-duty.service", timer)
         self.assertIn("WantedBy=timers.target", timer)
         self.assertIn("Persistent=true", timer)
-        # 时刻依据必须写在单元里（改时刻的人得知道为什么是这个点）
+        # 时刻依据必须写在单元里（改时刻的人得知道为什么是这个点）：唤醒**晚于**
+        # 基础链入队（19:05），而入队又晚于对账写 digest（19:00）——审查 A-2 的时序链
+        self.assertIn("OnCalendar=Mon..Fri 19:20", timer)
         self.assertIn("enqueue_research", timer)
+        self.assertIn("19:05", timer)
+        self.assertIn("19:00", timer)
+        self.assertIn("20 19 * * 1-5", timer, "cron 等价行必须与新时刻一致")
 
     def test_docs_document_enable_and_troubleshooting(self):
         runbook, handover = _read(RUNBOOK), _read(HANDOVER)

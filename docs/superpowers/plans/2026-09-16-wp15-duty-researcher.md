@@ -64,7 +64,7 @@ def test_payload_whitelist(self):
 
 ### 任务 4：headless 唤醒脚本 + 定时器交付
 
-**文件**：新建 `scripts/research_duty.sh`（唤醒入口：`dsh --profile headless "值班研究员：调用 research_tasks_claim 逐条执行队列任务直到返回 null，每条按 research-institute 技能值班模式手册处理并 research_tasks_report"`）与 `install/research-duty.timer`+`.service`（systemd 单元，OnCalendar 每交易日 16:50 本地，文档同时给 cron 行）；`docs/RUNBOOK.md`/`docs/HANDOVER.md` 追加；测试 `tests/test_wp15_install.py`（脚本/单元文件存在性+内容断言：脚本含 `--profile headless` 与循环退出条件；timer 含 OnCalendar）。
+**文件**：新建 `scripts/research_duty.sh`（唤醒入口：`dsh --profile headless "值班研究员：调用 research_tasks_claim 逐条执行队列任务直到返回 null，每条按 research-institute 技能值班模式手册处理并 research_tasks_report"`）与 `install/research-duty.timer`+`.service`（systemd 单元，OnCalendar 每交易日 **19:20** 本地——排在 `reconcile`(19:00) → digest → `enqueue_research`(19:05) 之后（审查 A-2 修订），文档同时给 cron 行）；`docs/RUNBOOK.md`/`docs/HANDOVER.md` 追加；测试 `tests/test_wp15_install.py`（脚本/单元文件存在性+内容断言：脚本含 `--profile headless` 与循环退出条件；timer 含 OnCalendar 与时刻依据链）。
 
 - [x] **步骤 1：失败测试** → **步骤 2：实现**（脚本含总时长上限 `timeout 1800` 包裹；无凭据/无 dsh 时退出码非零并打印排查行——RUNBOOK 指引）。
 - [x] **步骤 3：三套绿**。

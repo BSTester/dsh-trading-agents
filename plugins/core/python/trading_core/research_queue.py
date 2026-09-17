@@ -88,7 +88,13 @@ def _enqueue_round(conn, home, market, stamp):
         return {"ok": True, "market": market, "skipped": f"关注池为空：market={market}"}
 
     try:
-        refs = _refs(conn, date)
+        refs, digest_ok = _refs(conn, date)
+        if not digest_ok:
+            # 审查 A-2：入队时点（GLOBAL 链 19:05 = 对账 + 5 分钟）保证 digest **不早于**
+            # 当日研究日。走到这里说明对账没跑成/被延后/时刻被配置到 19:05 之后——**不阻塞
+            # 入队**（任务不丢），但必须让「digest 比研究日旧」这件事可见，不能默认当日口径。
+            emit("info", "当日摘要尚未生成",
+                 f"daily_brief 的 digest_ref 早于研究日（date={date}）")
         tasks = [
             _put(conn, "daily_brief", date, market,
                  {"as_of": date, "market": market, "digest_ref": DIGEST_REF,
@@ -100,9 +106,14 @@ def _enqueue_round(conn, home, market, stamp):
         ]
         # 周度挖掘轮：本周（ISO 周，周一起算）该市场尚未入队才补一条——周一休市时
         # 本周第一个交易日照样会入队，不做「必须周一」的硬判定。
+        # 载荷含 candidate 因子域（审查 A-3，规格 §10.3「as_of、候选因子域、数据引用」）：
+        # factor_list = 已注册因子全集（挖掘的基线与去重依据；新候选由本轮提出，
+        # 攒数中的域见 refs 的数据源行数）。
         if not store.task_exists_since(conn, "mining_round", market, _week_start(date)):
             tasks.append(_put(conn, "mining_round", date, market,
-                              {"as_of": date, "market": market, "refs": refs}))
+                              {"as_of": date, "market": market,
+                               "factor_list": sorted(factors.REGISTRY),
+                               "refs": refs}))
     except ValueError as error:
         # 载荷/参数非法（本模块自建载荷，正常不该发生）：暴露为告警，不静默丢任务
         emit("warn", "研究任务入队失败", str(error))
@@ -112,14 +123,29 @@ def _enqueue_round(conn, home, market, stamp):
 
 
 def _refs(conn, date):
-    """当日研究数据引用（结构化，只带行数——值班研究员据此决定读哪张表）。"""
+    """当日研究数据引用（结构化，只带行数/时点——值班研究员据此决定读哪张表）。
+
+    返回 ``(refs, digest_ok)``：``digest_ok`` = 最近一次 digest 的 ``as_of`` **不早于**
+    该市场观测日（规格 §10.2/§10.3 的当日口径）。判据是「不早于」而非「同日」——19:05
+    北京时间下美股观测日是会话本地日 D-1，而此刻 digest 的 as_of 已是北京日 D（更新，
+    涵盖该美股会话之后的账户状态），同日判据会把它误判为隔日。比研究日**旧**或缺失
+    一律 False——调用方据此发 info 告警，让「简报读到的是过时摘要」可见（审查 A-2），
+    而不是默默当成当日。
+    """
     counts = store.snapshot_counts(conn, date)
-    return [{"source": "sentiment_snapshots", "date": date,
-             "records": counts["sentiment"]},
-            {"source": "f10_snapshots", "date": date, "rows": counts["f10"]},
-            {"source": "short_snapshots", "date": date, "rows": counts["short"]},
-            {"source": "plate_snapshots", "date": date, "rows": counts["plate"]},
-            {"source": "factor_registry", "date": date, "rows": len(_fresh_factors())}]
+    digest = store.kv_get(conn, "daily:digest", default=None) or {}
+    digest_as_of = str(digest.get("as_of") or "") or None
+    research_day = str(date)[:10]
+    fresh = digest_as_of is not None and digest_as_of >= research_day
+    return ([{"source": "sentiment_snapshots", "date": date,
+              "records": counts["sentiment"]},
+             {"source": "f10_snapshots", "date": date, "rows": counts["f10"]},
+             {"source": "short_snapshots", "date": date, "rows": counts["short"]},
+             {"source": "plate_snapshots", "date": date, "rows": counts["plate"]},
+             {"source": "factor_registry", "date": date, "rows": len(_fresh_factors())},
+             {"source": "daily_digest", "date": date, "as_of": digest_as_of,
+              "fresh_enough": fresh}],
+            fresh)
 
 
 def _fresh_factors():

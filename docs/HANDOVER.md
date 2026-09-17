@@ -199,7 +199,11 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
 - **值班研究员（L3）定时研究任务（WP15）**：`scripts/research_duty.sh` + `install/research-duty.{service,timer}`
   是**研究侧**定时执行体——只消费 `research_tasks` 队列产简报/巡检/提案，**永不直接下单、
   永不直接启用策略**，与交易侧自动流水线（WP9）互不调用。定时器没装/机器关机/headless 被杀
-  都只是**延后**：任务留在队列，你打开会话时由 Harness 补跑（`claim` 会顺手回收超时任务）。
+  都只是**延后**：任务留在队列，等**会话开始/恢复后的首次交互**由 Harness 按仓库根
+  `AGENTS.md` 的启动纪律补跑（`claim` 会顺手回收超时任务）——**这不是后台自动动作**，
+  没有任何 turn 的会话不会消费队列（任务不丢、只延迟）。
+  时刻链：`reconcile` 19:00 → 当日 `digest` → `enqueue_research` 19:05（基础 GLOBAL 链）→
+  定时器 19:20 唤醒；服务需在 19:05 前已运行，否则任务留待下次唤醒或会话兜底。
   该脚本**不会**自己拉起平台服务（探活失败即非零退出并给指引；拉起是 platform-autostart 的职责）；
   日志在 `~/.dsh/logs/research-duty-*.log`，排查表见 `docs/RUNBOOK.md`「值班研究员（L3）」。
   队列载荷是白名单结构化引用（队列即攻击面）：直接改库塞自由文本会被领取侧拒领并留 critical 告警，
