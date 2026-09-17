@@ -18,8 +18,6 @@ import datetime as _dt
 
 from . import alerts, store
 
-#: 支持的市场链（与 ``planner.data_date_for`` 同一集合——入队要折算会话本地观测日）
-CHAIN_MARKETS = ("SH", "HK", "US")
 #: 因子巡检窗口（交易日）：足够覆盖一条因子的中周期衰减，也不至于拉太长历史。
 FACTOR_WINDOW_DAYS = 120
 #: 每日摘要的 kv 引用（reconcile 链的 ``daily:digest``，值班研究员据此读到当日口径）
@@ -40,13 +38,13 @@ def enqueue(home, market, conn=None, now=None, today=None):
     入队是**纯本地动作**：只读配置与本地库、只写本地队列表——不调 LLM、不开子进程、
     不触达任何外部通道（「零 LLM」是基础链作业的硬约束，规格 §10.5）。
     """
-    from . import clock
+    from . import clock, planner
 
     home = str(home)
     market = str(market).upper()
-    if market not in CHAIN_MARKETS:
+    if market not in planner.CHAIN_MARKETS:
         return {"ok": False,
-                "error": f"未知市场链：{market}（应为 {'/'.join(CHAIN_MARKETS)}）"}
+                "error": f"未知市场链：{market}（应为 {'/'.join(planner.CHAIN_MARKETS)}）"}
     try:
         # 与采集链同一时钟口径：today（可纯日期）> now > DSH_FAKE_NOW > 真实时间
         stamp = today or clock.now_stamp(now)
