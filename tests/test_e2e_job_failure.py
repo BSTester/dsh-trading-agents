@@ -14,6 +14,7 @@
 import sys
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -54,6 +55,42 @@ class _Case(unittest.TestCase):
         alerts = [dict(r) for r in self.conn.execute(
             "SELECT level,title,detail,created_at FROM alerts ORDER BY id DESC").fetchall()]
         return pipeline._stage(market, name, state, alerts, date)
+
+
+class SubprocessRunnerParsingTests(_Case):
+    """`_subprocess_runner` 的输出捕获与摘要解析（部分失败告警的基础，F-b）。
+
+    CLI 用 ``json.dumps(..., indent=1)`` 打印**多行** JSON，故解析必须能从整段输出里认出
+    那个对象；这条路径此前无覆盖（部分失败能否被发现全靠它）。
+    """
+
+    def test_last_json_object_handles_pretty_multiline_and_noise(self):
+        pretty = '前置日志\n{\n "ok": [],\n "failed": {"SH.600519": "超时"},\n "failed_count": 1\n}\n'
+        self.assertEqual(daemon._last_json_object(pretty),
+                         {"ok": [], "failed": {"SH.600519": "超时"}, "failed_count": 1})
+        self.assertIsNone(daemon._last_json_object("没有 JSON 的日志\n"))
+        self.assertIsNone(daemon._last_json_object(""))
+        # 后一个对象优先（作业可能打印多段）
+        two = '{"a": 1}\n{"b": 2}\n'
+        self.assertEqual(daemon._last_json_object(two), {"b": 2})
+
+    def test_subprocess_runner_returns_structured_result(self):
+        import subprocess
+        fake = subprocess.CompletedProcess(
+            args=["python"], returncode=1,
+            stdout='{"ok": [], "failed": {"SH.600519": "boom"}, "failed_count": 1}\n',
+            stderr="RuntimeError: 取数失败\n")
+        with mock.patch.object(daemon.subprocess, "run", return_value=fake):
+            out = daemon._subprocess_runner(["sync-bars", "--tickers", "SH.600519"])
+        self.assertEqual(out["exit_code"], 1)
+        self.assertEqual(out["summary"]["failed"], {"SH.600519": "boom"})
+        self.assertTrue(out["tail"], "保留输出尾部供告警引用")
+
+    def test_subprocess_runner_skip_marker_is_unchanged(self):
+        """关注池为空时仍是跳过标记（不跑子进程、不报失败）。"""
+        with mock.patch.object(daemon, "resolve_command", return_value=None):
+            self.assertEqual(daemon._subprocess_runner(["sync-bars", "--tickers", "@watchlist"]),
+                             {"skipped": "关注池为空"})
 
 
 class NonZeroExitTests(_Case):
