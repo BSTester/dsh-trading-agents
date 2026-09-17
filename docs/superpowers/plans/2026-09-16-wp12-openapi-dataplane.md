@@ -119,3 +119,10 @@ def test_research_snapshot_job(self):
 - [ ] 逐端点形状测试 + 锁定表一致；工具面 74 项 ≤80；写端点不进 MCP；
 - [ ] PIT 三表按交易日累积、announced_at 覆盖率可统计（CLI `research-snapshot --stats` 输出）；
 - [ ] no_data/unsupported 空而非错；单端点失败不阻塞链；三套全绿。
+
+## WP13 审查遗留项（2026-09-17）
+
+- **`groups/dataplane.py` 单文件承载七族**（screen/plate/short/basic/ipo/watchlist/derivatives）——
+  WP13 代码质量审查判定「本次不做」：文件已偏大，但与十族方法组同构、边界清晰，
+  拆分收益低于改动风险。**后续项**：下一轮触及该文件时按族拆分（一族一文件，
+  与 `groups/trade.py` / `groups/simtrade.py` / `groups/f10.py` 的既有粒度一致）。
