@@ -46,6 +46,12 @@ const CHROME =
   path.join(homedir(), ".cache/ms-playwright/chromium-1234/chrome-linux/chrome");
 const IDLE_MS = Number(process.env.E2E_IDLE_MS ?? 400);
 const MAX_WAIT_MS = Number(process.env.E2E_MAX_WAIT_MS ?? 25000);
+// 冷启动护栏（2026-09-18 实测）：服务刚重启时脚本类端点首次调用很慢（建富途会话/导入），
+// 单路由的等待会被拖长，16 个路由累加会把整轮拖过外部超时（实测 600s 被杀）。
+// 因此：①跑之前先过健康门；②每个路由有等待预算，超预算就**跳过剩余等待**、
+// 用当前 DOM 出结论并标 `budgetExceeded`（记一条「重要」缺陷），**继续跑其余路由**。
+const HEALTH_TIMEOUT_MS = Number(process.env.E2E_HEALTH_TIMEOUT_MS ?? 60000);
+const ROUTE_BUDGET_MS = Number(process.env.E2E_ROUTE_BUDGET_MS ?? 90000);
 const TS = new Date().toISOString().replace(/[:.]/g, "-");
 const OUT_DIR = path.join(homedir(), ".dsh", "logs", `e2e-web-${TS}`);
 const SHOT_ROUTES = new Set(["overview", "pipeline", "research", "settings"]);
@@ -54,8 +60,11 @@ const SHOT_ROUTES = new Set(["overview", "pipeline", "research", "settings"]);
 // `--routes a,b`   只跑指定路由（单页复验；未知键会提示并列出可用键）
 // `--no-screenshot` 不落截图（CI 友好，产物只剩 report.json）
 // `--fail-on-soft`  把「已知在修」的软断言也计入退出码（修复落地后用它判闭环）
+// `--route-budget S` 单路由等待预算（秒，默认 90）
+// `--health-timeout S` 健康门等待上限（秒，默认 60）
 function parseArgs(argv) {
-  const opts = { routes: null, screenshot: true, failOnSoft: false, help: false };
+  const opts = { routes: null, screenshot: true, failOnSoft: false, help: false,
+    routeBudgetMs: ROUTE_BUDGET_MS, healthTimeoutMs: HEALTH_TIMEOUT_MS };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") opts.help = true;
@@ -63,6 +72,8 @@ function parseArgs(argv) {
     else if (arg === "--fail-on-soft") opts.failOnSoft = true;
     else if (arg === "--routes") opts.routes = String(argv[++i] ?? "");
     else if (arg.startsWith("--routes=")) opts.routes = arg.slice("--routes=".length);
+    else if (arg === "--route-budget") opts.routeBudgetMs = Number(argv[++i] ?? 90) * 1000;
+    else if (arg === "--health-timeout") opts.healthTimeoutMs = Number(argv[++i] ?? 60) * 1000;
     else {
       process.stderr.write(`未知参数：${arg}\n`);
       opts.help = true;
@@ -293,10 +304,32 @@ async function main() {
     log("    --routes a,b      只跑指定路由（单页复验；未知键报错并列出可用键）");
     log("    --no-screenshot   不落截图（CI 友好）");
     log("    --fail-on-soft    把「已知在修」的软断言也计入退出码（修复落地后判闭环用）");
+    log("    --route-budget S  单路由等待预算秒数（默认 90；超预算记缺陷但继续跑其余路由）");
+    log("    --health-timeout S 健康门等待秒数（默认 60；服务未就绪则不跑页面扫描）");
     log("  环境变量：E2E_BASE / E2E_CHROME / E2E_IDLE_MS / E2E_MAX_WAIT_MS");
     log(`  可用路由：${ROUTES.map((r) => r.key).join(",")}`);
     return 0;
   }
+  // 健康门（2026-09-18）：服务未就绪就开跑，会把「冷启动/未启动」当成页面缺陷。
+  const healthDeadline = Date.now() + OPTS.healthTimeoutMs;
+  let health = null;
+  let healthError = null;
+  while (Date.now() < healthDeadline) {
+    try {
+      const body = await getJson(`${BASE}/healthz`, 3000);
+      if (body?.ok) { health = body; break; }
+      healthError = `ok=${body?.ok}`;
+    } catch (error) {
+      healthError = String(error?.message ?? error);
+    }
+    await sleep(1000);
+  }
+  if (!health) {
+    log(`❌ 服务未就绪：${BASE}/healthz 在 ${OPTS.healthTimeoutMs}ms 内未就绪（${healthError ?? "无响应"}）`);
+    log("   先启动服务（scripts/platform_service.sh start）或稍后重试；本次不跑页面扫描。");
+    return 2;
+  }
+  log(`  健康门：/healthz ok（mode=${health.mode ?? "?"}，调度器 ${health.scheduler?.alive ? "alive" : "?"}）`);
   await mkdir(OUT_DIR, { recursive: true });
   const profileDir = await mkdtemp(path.join(tmpdir(), "e2e-web-profile-"));
   const port = 20000 + Math.floor(Math.random() * 20000);
@@ -313,7 +346,8 @@ async function main() {
     chrome: CHROME,
     cdpPort: port,
     outDir: OUT_DIR,
-    options: { routes: OPTS.routes, screenshot: OPTS.screenshot, failOnSoft: OPTS.failOnSoft },
+    options: { routes: OPTS.routes, screenshot: OPTS.screenshot, failOnSoft: OPTS.failOnSoft,
+      routeBudgetMs: OPTS.routeBudgetMs, healthTimeoutMs: OPTS.healthTimeoutMs },
     routes: [],
     defects: [],
     observations: [],
@@ -373,6 +407,9 @@ async function main() {
     }
 
     for (const route of selected) {
+      // 单路由预算：冷启动/卡页时不让一个路由拖垮整轮（见顶部说明）
+      const routeStart = Date.now();
+      const routeDeadline = routeStart + OPTS.routeBudgetMs;
       const state = { console: [], exceptions: [], logs: [], network: [] };
       cdp.on("Runtime.consoleAPICalled", (p) => {
         if (["error", "warning", "assert"].includes(p.type)) {
@@ -433,7 +470,7 @@ async function main() {
       // 真实网络空闲：在途为 0 且 IDLE_MS 内无网络事件
       const waitStart = Date.now();
       let idle = false;
-      while (Date.now() - waitStart < MAX_WAIT_MS) {
+      while (Date.now() - waitStart < MAX_WAIT_MS && Date.now() < routeDeadline) {
         if (net.inflight.size === 0 && Date.now() - net.lastEventAt >= IDLE_MS) {
           idle = true;
           break;
@@ -450,7 +487,7 @@ async function main() {
       let stableRuns = 1;
       let lastSig = sig(domFinal);
       const stableStart = Date.now();
-      while (Date.now() - stableStart < 12000) {
+      while (Date.now() - stableStart < Math.min(12000, Math.max(0, routeDeadline - Date.now()))) {
         await sleep(500);
         const cur = await evaluate(cdp, DOM_PROBE);
         const curSig = sig(cur);
@@ -497,11 +534,15 @@ async function main() {
       const http4xx = state.network.filter((n) => n.kind === "http" && n.status >= 400 && n.status < 500);
       const failed = state.network.filter((n) => n.kind === "failed");
 
+      const budgetExceeded = Date.now() > routeDeadline;
+      const routeMs = Date.now() - routeStart;
       const entry = {
         route: route.key,
         name: route.name,
         url,
         loadFired,
+        budgetExceeded,
+        routeMs,
         idle,
         idleWaitMs: waitMs,
         domStableMs,
@@ -539,6 +580,7 @@ async function main() {
       report.routes.push(entry);
 
       const flags = [];
+      if (budgetExceeded) flags.push(`超预算${routeMs}ms`);
       if (!loadFired) flags.push("无loadEvent");
       if (!idle) flags.push(`未空闲(在途${pendingAtSnapshot.length})`);
       if (blank) flags.push("白屏");
@@ -570,6 +612,11 @@ async function main() {
       for (const a of r.required.filter((x) => !x.found)) push("重要", "内容区必需锚点缺失", `未找到「${a.anchor}」`);
       if (!r.loadFired) push("重要", "导航未完成", "15s 内无 loadEventFired");
       if (!r.idle) push("重要", "网络未空闲", `等待 ${r.idleWaitMs}ms 后仍有 ${r.pendingAtSnapshot.length} 个在途请求`);
+      if (r.budgetExceeded) {
+        push("重要", "路由等待超预算",
+          `单路由等待 ${r.routeMs}ms 超过预算 ${OPTS.routeBudgetMs}ms（冷启动慢或页面卡住）；` +
+          "已跳过剩余等待、用当前 DOM 出结论，并继续跑其余路由");
+      }
 
       const anyRequestFailed = (r.failedRequests?.length ?? 0) > 0
         || (r.http5xx?.length ?? 0) > 0
@@ -696,6 +743,13 @@ async function main() {
     `  软断言失败 ${s.softFailed ?? 0}（其中「已知在修」${s.softKnownBeingFixed ?? 0}）` +
       `｜--fail-on-soft＝${OPTS.failOnSoft ? "开" : "关"}`,
   );
+  const overBudget = (report.routes ?? []).filter((r) => r.budgetExceeded);
+  if (overBudget.length) {
+    log(`  超预算路由 ${overBudget.length} 个（单路由 >${OPTS.routeBudgetMs}ms，已跳过剩余等待并继续）：`
+      + overBudget.map((r) => `${r.route}(${r.routeMs}ms)`).join("、"));
+  } else {
+    log(`  超预算路由：无（单路由预算 ${OPTS.routeBudgetMs}ms）`);
+  }
   log(`  报告：${reportFile}`);
   if (report.softAssertions?.length) {
     log("  软断言（默认不计入退出码）：");

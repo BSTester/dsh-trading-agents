@@ -194,7 +194,8 @@ class Client:
         self.base = base.rstrip("/")
         self.timeout = timeout
 
-    def call(self, endpoint: str, payload=None, method: str = "POST"):
+    def call(self, endpoint: str, payload=None, method: str = "POST", timeout=None):
+        """``timeout`` 覆盖单次调用时限（缺省用实例值）——冷启动重试与暖机需要更长时限。"""
         url = f"{self.base}/api/wb/{endpoint}" if not endpoint.startswith("/") else f"{self.base}{endpoint}"
         body = None if payload is None else json.dumps(payload).encode()
         req = urllib.request.Request(url, data=body if method == "POST" else None, method=method)
@@ -202,7 +203,8 @@ class Client:
             req.add_header("Content-Type", "application/json")
         t0 = time.time()
         try:
-            with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+            with urllib.request.urlopen(
+                    req, timeout=self.timeout if timeout is None else timeout) as resp:
                 raw = resp.read().decode("utf-8", "replace")
                 status = resp.status
         except urllib.error.HTTPError as error:  # 4xx/5xx 也要拿到 body
@@ -252,6 +254,67 @@ def classify(result):
     if code in DEGRADED_CODES or errcode in DEGRADED_ERRCODES:
         return "degraded", code, str(error["message"])[:160], problems
     return "error", code, str(error["message"])[:160], problems
+
+
+# --------------------------------------------------------------------------- 冷启动容忍
+# 为什么需要（2026-09-18 实测）：`platform_service.sh restart` 后**立即**扫描时，
+# 走 workbench 脚本子进程的端点（instrument/quality/…）**首次**调用要建富途会话并导入
+# 模块，可能远超扫描超时（默认 30s）→ 服务端超时/空响应 → harness 把**冷启动**判成
+# 产品缺陷（read error=2）。暖机后同一端点 0 秒返回 ok，同一轮扫描发现 0。
+# 判据分层（强度不变）：瞬时失败 → 暖机或重试一次（更长时限）；重试成功记
+# ``degraded(cold-start)``（**不计阻断**）；重试仍失败 → 仍记 error。
+_TRANSIENT_MARKERS = ("timeout", "timed out", "connectionreset", "connection refused",
+                      "remotedisconnected", "incompleteread", "connection aborted",
+                      "broken pipe", "urlerror", "temporarily unavailable")
+
+
+def is_transient(result) -> bool:
+    """瞬时失败：连接层超时/重置，或 HTTP 200 但**空响应体**（服务端在等子进程，回写了空壳）。"""
+    if not isinstance(result, dict):
+        return False
+    transport = str(result.get("transport_error") or "")
+    if transport:
+        lowered = transport.lower()
+        if any(marker in lowered for marker in _TRANSIENT_MARKERS):
+            return True
+        # 其余连接层失败也先给一次重试机会：重试仍失败才会被判 error（判定强度不变）
+        return True
+    if result.get("http") == 200 and not str(result.get("raw") or "").strip():
+        return True
+    return False
+
+
+def warmup(client, probes, timeout, enabled=True):
+    """冷启动暖机：正式扫描前先调一次脚本类端点，让服务端把富途会话/子进程建起来。
+
+    结果**不计分**（冷启动慢不是产品缺陷），只打印与入档；扫描阶段因此不受首次冷启动影响。
+    """
+    if not enabled:
+        print("  暖机：已跳过（--no-warmup）")
+        return {"skipped": True}
+    chosen = [(endpoint, payload) for endpoint, payload, _ in probes
+              if endpoint in WARMUP_ENDPOINTS]
+    if not chosen:
+        print("  暖机：无匹配端点（跳过）")
+        return {"endpoints": [], "ok": 0, "not_ready": 0, "seconds": 0.0}
+    t0 = time.time()
+    ready = not_ready = 0
+    for endpoint, payload in chosen:
+        result = client.call(endpoint, payload, timeout=timeout)
+        category, _code, _message, _problems = classify(result)
+        if category == "ok":
+            ready += 1
+        else:
+            not_ready += 1
+    seconds = round(time.time() - t0, 1)
+    print(f"  暖机：{len(chosen)} 个端点，耗时 {seconds}s"
+          f"（就绪 {ready} / 未就绪 {not_ready}；不计分）")
+    return {"endpoints": [endpoint for endpoint, _ in chosen], "ok": ready,
+            "not_ready": not_ready, "seconds": seconds}
+
+
+# 走脚本子进程、冷启动明显的端点（按需扩展；不在此列的端点仍有瞬时重试兜底）
+WARMUP_ENDPOINTS = ("instrument", "quality", "series", "factors", "ic", "audit")
 
 
 # --------------------------------------------------------------------------- 状态快照
@@ -414,7 +477,8 @@ def baseline(client):
 
 
 # --------------------------------------------------------------------------- 阶段 1
-def scan_reads(client, read_probes, results, findings):
+def scan_reads(client, read_probes, results, findings, cold_start=None):
+    cold_start = cold_start if cold_start is not None else []
     print("\n=== 阶段 1：读端点全扫 ===")
     for endpoint, payload, expect in read_probes:
         # GET 专用端点用 GET（此前误用 POST 造成一条假阳性：openapi_config 报
@@ -422,10 +486,29 @@ def scan_reads(client, read_probes, results, findings):
         method = "GET" if endpoint in GET_ENDPOINTS else "POST"
         result = client.call(endpoint, payload if method == "POST" else None, method=method)
         category, code, message, problems = classify(result)
+        # 冷启动容忍：瞬时失败（超时/连接重置/空响应体）→ 用更长时限重试一次；
+        # 成功则记 degraded(cold-start) 并单列，**不计阻断**（强度不变：重试仍失败仍记 error）。
+        cold_retry = None
+        if category == "error" and is_transient(result):
+            retry = client.call(endpoint, payload if method == "POST" else None, method=method,
+                                timeout=client.timeout * 3)
+            retry_category, retry_code, retry_message, retry_problems = classify(retry)
+            cold_retry = {"first_attempt": {"ms": result.get("ms"),
+                                            "transport_error": result.get("transport_error"),
+                                            "http": result.get("http")},
+                          "retry": {"ms": retry.get("ms"), "category": retry_category,
+                                    "code": retry_code},
+                          "recovered": retry_category != "error"}
+            if retry_category != "error":
+                result, category, code, message, problems = (
+                    retry, "degraded", f"cold-start:{retry_code or retry_message}",
+                    retry_message, retry_problems)
+                cold_start.append({"endpoint": endpoint, "payload": payload, **cold_retry})
         results.append({"phase": "read", "endpoint": endpoint, "payload": payload,
                         "category": category, "code": code, "message": message,
                         "http": result.get("http"), "ms": result.get("ms"),
                         "expect": expect, "shape_problems": problems,
+                        "cold_retry": cold_retry,
                         "snippet": (result.get("raw") or "")[:220]})
         mark = {"ok": "✅", "degraded": "🟡", "error": "❌"}[category]
         print(f"  {mark} {endpoint:26s} {str(code or ''):34s} {str(message or '')[:70]}")
@@ -1441,6 +1524,10 @@ def main():
     parser.add_argument("--out", default=str(LOGS))
     parser.add_argument("--read-only", action="store_true",
                         help="跳过阶段 2 的全部写/动作检查（并行任务占用同一服务或 CI 只读巡检时用）")
+    parser.add_argument("--no-warmup", action="store_true",
+                        help="跳过冷启动暖机（默认会先调脚本类端点，避免刚重启时误报）")
+    parser.add_argument("--warmup-timeout", type=float, default=None,
+                        help="暖机单次调用时限（默认 --timeout 的 3 倍）")
     args = parser.parse_args()
 
     LOGS.mkdir(parents=True, exist_ok=True)
@@ -1477,7 +1564,14 @@ def main():
     # openapi_config 的 GET 用法与 POST 读等价；declared 里它是 GET 专用
     read_map["openapi_config"] = (None, "GET")
 
-    scan_reads(client, probes, results, findings)
+    print("\n=== 阶段 0.5：冷启动暖机 ===")
+    warm = warmup(client, probes,
+                  timeout=args.warmup_timeout if args.warmup_timeout is not None
+                  else args.timeout * 3,
+                  enabled=not args.no_warmup)
+
+    cold_start = []
+    scan_reads(client, probes, results, findings, cold_start)
     scan_sections(client, results, findings)
     scan_contract_params(client, results, findings)
     if args.read_only:
@@ -1558,6 +1652,7 @@ def main():
         "suspicious": suspicious, "transitional": transitional, "blocking": blocking,
         "conditional": conditional,
         "stale_service_contract": stale_contract,
+        "warmup": warm, "cold_start": cold_start,
         "results": results, "baseline": {k: v for k, v in base.items() if k != "db"},
         "baseline_db_keys": len(base["db"]),
     }
@@ -1567,6 +1662,18 @@ def main():
     print("\n=== 汇总 ===")
     for name, t in phases.items():
         print(f"  {name:12s} 共 {t['total']:3d}：ok={t['ok']} degraded={t['degraded']} error={t['error']}")
+    if not warm.get("skipped"):
+        print(f"  冷启动暖机：{len(warm.get('endpoints') or [])} 个端点 / {warm.get('seconds')}s"
+              f"（就绪 {warm.get('ok')}、未就绪 {warm.get('not_ready')}；不计分）")
+    if cold_start:
+        print(f"  冷启动慢（瞬时失败后重试成功，**不计阻断**）{len(cold_start)} 项：")
+        for item in cold_start:
+            first = item.get("first_attempt") or {}
+            print(f"      · {item['endpoint']}：首次 {first.get('ms')}ms"
+                  f"（{first.get('transport_error') or 'HTTP ' + str(first.get('http'))}）"
+                  f" → 重试 {((item.get('retry') or {}).get('ms'))}ms 成功")
+    else:
+        print("  冷启动慢：无")
     by_sev = {}
     for item in findings:
         by_sev[item["severity"]] = by_sev.get(item["severity"], 0) + 1
