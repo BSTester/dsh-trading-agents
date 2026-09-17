@@ -362,7 +362,7 @@ unset DSH_FAKE_NOW                              # 演练结束必须清理
 | 对象 | 路径 / 键 | 说明 |
 |---|---|---|
 | 唤醒脚本 | `scripts/research_duty.sh` | 探活服务 → 拼提示词 → `dsh --profile headless` 单次运行 → 落日志 |
-| systemd 单元 | `install/research-duty.{service,timer}` | `OnCalendar=Mon..Fri 16:50`（`Persistent=true` 补跑错过的触发） |
+| systemd 单元 | `install/research-duty.{service,timer}` | `OnCalendar=Mon..Fri 19:20`（= 对账 19:00 → 入队 19:05 之后；`Persistent=true` 补跑错过的触发） |
 | 任务队列 | SQLite 表 `research_tasks` | 状态机 `pending/running/done/failed`；`TASK_MAX_ATTEMPTS=3`、`TASK_TIMEOUT_MINUTES=30` |
 | 任务种类 | `daily_brief` / `factor_patrol` / `mining_round` | 白名单；载荷只含结构化引用（`TASK_PAYLOAD_KEYS`），无自由文本 |
 | 入队作业 | `enqueue_research` | 基础链尾（digest 之后）自动入队，**零 LLM**；研究与交易开关解耦 |
