@@ -54,6 +54,7 @@
 #   trading/futu-error         富途业务错误（MCP ret_code!=0 / s=error；OpenAPI errcode/
 #                              ret_code!=0 信封）
 #   trading/invalid-operation  参数白名单/必填/类型（与 handle 层载荷校验同码）
+import inspect
 import re
 import time
 from datetime import datetime, timezone
@@ -223,15 +224,90 @@ def _f10_class():
     return cls
 
 
-def _oa_derivative_detail(groups, arguments):
-    """``derivative_detail``：section 白名单 → OpenApiDerivatives 专用方法。"""
+def _spread_params(method, params, supplied=()):
+    """聚合端点 ``params`` 展开前的**签名校验**：载荷错误与通道故障必须分开。
+
+    ``f10_detail``/``derivative_detail`` 把调用方 ``params`` 展开进传输层方法。若不做
+    校验，一个拼错的键会变成 ``TypeError``，被 ``_fetch_openapi`` 的兜底 ``except`` 归成
+    ``trading/futu-unavailable``——界面据此把用户引去「设置页配凭据」，而真实原因是参数
+    错误（应为 ``trading/invalid-operation``）。
+
+    实现选**签名内省前置校验**而非「捕获 TypeError 再归类」：后者要靠异常文本匹配才能
+    不吞内部真 bug，且归类点在兜底分支里、离现场远。这里在展开处按目标方法签名判定，
+    未知键 → ``_param_error``（与逐端点白名单同码族），内部真 bug 仍按原样浮出。
+
+    ``supplied`` 是已按位置传入的参数名（如 ``symbol``），不得再出现在 params 里
+    （否则会变成重复实参）。方法自带 ``**kwargs`` 时无键契约可校验，原样透传。
+    """
+    if params is None:
+        return {}
+    if not isinstance(params, dict):
+        raise _param_error(f"params 必须是对象（收到 {type(params).__name__}）")
+    if not params:
+        return {}
+    try:
+        parameters = inspect.signature(method).parameters
+    except (TypeError, ValueError):  # 无法内省（C 扩展/特殊 callable）：交调用点自然失败
+        return params
+    if any(p.kind is p.VAR_KEYWORD for p in parameters.values()):
+        return params
+    allowed = {name for name, p in parameters.items()
+               if p.kind in (p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+               and name not in set(supplied)}
+    unknown = sorted(set(params) - allowed)
+    if unknown:
+        raise _param_error(f"params 含不支持字段：{unknown}"
+                           f"（允许：{sorted(allowed)}）")
+    return params
+
+
+def _oa_f10_detail(groups, arguments):
+    """``f10_detail``：section 白名单 → OpenApiF10 专用方法（params 按签名校验）。"""
     section = arguments["section"]
-    method = DERIVATIVE_SECTIONS.get(section)
-    if method is None:
+    # section 名单以传输层常量为单一事实源（不复制名单，避免漂移）；校验用类常量而非
+    # 注入实例的同名属性——替身无需复刻 SECTIONS 也能走通校验。
+    sections = _f10_class().SECTIONS
+    if section not in sections:
+        raise _param_error(f"section 取值非法：{section!r}"
+                           f"（允许：{sorted(sections)}）")
+    method = getattr(groups.f10, section)
+    params = _spread_params(method, arguments.get("params"), supplied=("symbol",))
+    return method(arguments["symbol"], **params)
+
+
+def _oa_derivative_detail(groups, arguments):
+    """``derivative_detail``：section 白名单 → OpenApiDerivatives 专用方法（params 同上）。"""
+    section = arguments["section"]
+    method_name = DERIVATIVE_SECTIONS.get(section)
+    if method_name is None:
         raise _param_error(f"section 取值非法：{section!r}"
                            f"（允许：{sorted(DERIVATIVE_SECTIONS)}）")
-    params = arguments.get("params") or {}
-    return getattr(groups.derivatives, method)(arguments["symbol"], **params)
+    method = getattr(groups.derivatives, method_name)
+    params = _spread_params(method, arguments.get("params"), supplied=("symbol",))
+    return method(arguments["symbol"], **params)
+
+
+# 数据面方法组的公开方法清单（**锁定绑定的单一事实源**）：反射不变式测试逐组比对
+# 「公开方法 == 本表」。新增公开方法必须在此登记——防未来用内联字面量路径绕过锁定表
+# 与 DATAPLANE_ADAPTERS 注册（表外的路径既不进端点面、也不受 TTL/形状表约束）。
+DATAPLANE_GROUP_METHODS = {
+    "basic": ("economic_calendar_hot", "economic_calendar_search", "owner_plate", "rehab"),
+    "plate": ("plate_list", "plate_stock"),
+    "screen": ("stock_screen", "warrant_screen"),
+    "ipo": ("ipo_list",),
+    "short": ("short_daily_volume", "short_interest"),
+    "watchlist": ("watchlist_list", "watchlist_groups", "modify_user_security"),
+}
+
+# 方法组属性名 → 传输层类名（不变式测试用；与 DataPlaneGroups.__slots__ 前六项一致）。
+DATAPLANE_GROUP_CLASSES = {
+    "basic": "OpenApiBasicData",
+    "plate": "OpenApiPlate",
+    "screen": "OpenApiScreen",
+    "ipo": "OpenApiIpo",
+    "short": "OpenApiShort",
+    "watchlist": "OpenApiWatchlist",
+}
 
 
 # 端点 → 适配器：canonical arguments（服务载荷归一后的形状）→ 方法组调用。
@@ -251,7 +327,7 @@ DATAPLANE_ADAPTERS = {
     "watchlist_list": lambda g, a: g.watchlist.watchlist_list(**a),
     "watchlist_groups": lambda g, a: g.watchlist.watchlist_groups(**a),
     "modify_user_security": lambda g, a: g.watchlist.modify_user_security(**a),
-    "f10_detail": lambda g, a: g.f10.f10(a["symbol"], a["section"], **(a.get("params") or {})),
+    "f10_detail": _oa_f10_detail,
     "derivative_detail": _oa_derivative_detail,
 }
 

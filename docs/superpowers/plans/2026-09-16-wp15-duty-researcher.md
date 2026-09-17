@@ -55,7 +55,7 @@ def test_payload_whitelist(self):
 - [ ] **步骤 1：失败测试**：
   ① claim：pending → running 返回载荷；队列空 → `{task: null}`（幂等语义明确）；
   ② report ok → done + result_ref；report err → attempts+1，<3 置回 pending，≥3 failed+告警；
-  ③ **两端点进 MCP 工具面**（`research_tasks_claim/report`——L3 执行体是 Harness 会话，经 MCP 调用最顺；读+受控写，非交易写；工具计数 75+2=**77** ≤80 断言更新）；`list` 动作 HTTP-only；
+  ③ **两端点进 MCP 工具面**（`research_tasks_claim/report`——L3 执行体是 Harness 会话，经 MCP 调用最顺；读+受控写，非交易写；工具计数 74+2=**76** ≤80 断言更新）；`list` 动作 HTTP-only；
   ④ 领取侧对 payload 再校验：被篡改（自由文本键）→ 拒绝领取 + critical 告警（队列即攻击面，规格 §十一.13）；
   ⑤ skill 值班模式节存在性断言（frontmatter/动作清单/三 kind 执行手册各一段：daily_brief 读 refs→research_publish 简报；factor_patrol 读 factor_snapshots→ic_report→衰减告警；mining_round→候选提案→rules-validate）。
 - [ ] **步骤 2：验证失败** → **步骤 3：实现**：动作端点模式照 `plan-execute`（不进缓存形状表）；MCP 两工具绑定同一 provider。

@@ -6,7 +6,7 @@
 
 **目标**：附录 A.3 全部缺口端点接入权威 OpenAPI 通道：传输层方法组 → 服务端点面 1:1 → MCP 工具面分档（预算 ≤80）→ F10/做空/板块 PIT 落库 + 每日快照作业。
 
-**架构**：传输层新增 8 个方法组类（挂 `OpenApiClient`，`_RestValidators` 同构：签名即白名单、枚举/区间本地校验、`parse_envelope` 复用）；服务端点面全量 1:1；工具面「直通 12 + 聚合 2（f10_detail/derivative_detail）+ HTTP-only」三档；`research_snapshot` 作业把 F10 关键 section 与做空数据按交易日落 PIT 表。
+**架构**：传输层新增 8 个方法组类（挂 `OpenApiClient`，`_RestValidators` 同构：签名即白名单、枚举/区间本地校验、`parse_envelope` 复用）；服务端点面全量 1:1；工具面「直通 11 + 聚合 2（f10_detail/derivative_detail）+ HTTP-only 3」三档；`research_snapshot` 作业把 F10 关键 section 与做空数据按交易日落 PIT 表。
 
 ---
 
@@ -61,7 +61,7 @@ def test_plate_list_region_guard(self):
 - [ ] **步骤 1：失败测试**：
   ① 直通 11 工具注册（stock_screen/plate_list/plate_stock/short_daily_volume/short_interest/ipo_list/economic_calendar_hot/economic_calendar_search/info_owner_plate/watchlist_list/watchlist_groups），名称/描述/字段与锁定表一致；
   ② 聚合工具 `f10_detail(symbol, section)`：section 枚举=锁定表 §C.5 的 26 项白名单；`derivative_detail(symbol, section)` 同理（4 值）；未知 section → `trading/invalid-operation`；
-  ③ `TOOL_COUNT <= 80` 断言（基线 **61**=WP8 末 59 + WP10 `pipeline` + WP11 `sentiment_history`；加 12 直通 + 2 聚合 = **75**）；
+  ③ `TOOL_COUNT <= 80` 断言（基线 **61**=WP8 末 59 + WP10 `pipeline` + WP11 `sentiment_history`；加 11 直通 + 2 聚合 = **74**，实测一致）；
   ④ `modify_user_security` 在 HTTP 端点面、**不在** `TOOL_NAMES`；HTTP-only 族（future_info 等）同理；
   ⑤ 缓存 TTL 登记与既有 `CACHE_TTL_MS` 表一致。
 - [ ] **步骤 2：验证失败** → **步骤 3：实现**：路由模式照抄 WP8 任务 2（`futu_channel` 选择：openapi 有凭据走 REST，否则 `trading/openapi-unavailable` 如实）；载荷白名单逐端点（screen 类放行 `screen_queries/retrieve_queries/sort/sorts/next_key/limit`；f10_detail 仅 `symbol/section`）。
@@ -116,6 +116,6 @@ def test_research_snapshot_job(self):
 
 ### WP12 验收（对照规格 §7.4）
 
-- [ ] 逐端点形状测试 + 锁定表一致；工具面 75 项 ≤80；写端点不进 MCP；
+- [ ] 逐端点形状测试 + 锁定表一致；工具面 74 项 ≤80；写端点不进 MCP；
 - [ ] PIT 三表按交易日累积、announced_at 覆盖率可统计（CLI `research-snapshot --stats` 输出）；
 - [ ] no_data/unsupported 空而非错；单端点失败不阻塞链；三套全绿。

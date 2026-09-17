@@ -734,10 +734,19 @@ class _RestValidators:
         return self._int_in(value, low, high, name)
 
     def _merge_pagination(self, d, pagination):
-        """信封顶层 pagination 并入 d（对齐 futu_mcp._unwrap；无分页原样返回）。"""
-        if pagination:
+        """信封顶层 pagination 并入 d（对齐 futu_mcp._unwrap；无分页原样返回）。
+
+        数据层是**数组**的端点（实测 ``economic-calendar/search`` 的 data 就是数组，
+        分页只在信封顶层）无法 ``{**d}``——数组没有键可并入，旧写法直接 TypeError
+        （真机 ``--dataplane`` 自检抓到）。这里按官方 screen 一族使用的词汇归一为
+        ``{"items": [...], "pagination": {...}}``：不丢官方游标（``has_more``/
+        ``next_key``），也不假装数组是对象；无分页时数组原样返回（不包壳）。
+        """
+        if not pagination:
+            return d
+        if isinstance(d, dict):
             return {**d, "pagination": pagination}
-        return d
+        return {"items": d, "pagination": pagination}
 
     # ------------------------------------------------------------ 错误码语义
     # 锁定表 §A「无数据语义」与 §C.7/§C.8/§D.3 的权限项在此机械落地——两个语义是

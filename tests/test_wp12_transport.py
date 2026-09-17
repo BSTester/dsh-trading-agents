@@ -260,6 +260,36 @@ class BasicDataTransportTests(unittest.TestCase):
                     OpenApiBasicData(client).economic_calendar_search(*args)
                 self.assertEqual(client.calls, [])
 
+    def test_economic_calendar_search_list_data_keeps_pagination(self):
+        """实测：该端点 data 层是**数组**，信封顶层才带 pagination。
+
+        `{**d, "pagination": ...}` 对数组直接 TypeError（真机 --dataplane 自检抓到）。
+        数组无法承载合并键，故按官方 screen 一族的词汇归一为
+        `{"items": [...], "pagination": {...}}`——既不丢游标，也不假装数组是对象。
+        """
+
+        class _ListClient:
+            def __init__(self, d, pagination=None):
+                self.calls = []
+                self.d = d
+                self.pagination = pagination
+
+            def request(self, method, path, query=None, json_body=None):
+                self.calls.append(("request", method, path, query, json_body))
+                return self.d
+
+            def request_meta(self, method, path, query=None, json_body=None):
+                self.calls.append(("request_meta", method, path, query, json_body))
+                return self.d, self.pagination
+
+        rows = [{"event_text": "澳大利亚 CPI 年率"}]
+        client = _ListClient(rows, {"has_more": True, "next_key": "20"})
+        out = OpenApiBasicData(client).economic_calendar_search("CPI", 1)
+        self.assertEqual(out, {"items": rows, "pagination": {"has_more": True, "next_key": "20"}})
+        # 无分页时数组原样返回（不包壳）
+        client = _ListClient(rows)
+        self.assertEqual(OpenApiBasicData(client).economic_calendar_search("CPI", 1), rows)
+
     def test_owner_plate_path_and_symbol_shape(self):
         basic = make(OpenApiBasicData, d={"plate_list": []})
         basic.owner_plate("SH.600519")

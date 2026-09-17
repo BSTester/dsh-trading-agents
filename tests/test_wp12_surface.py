@@ -72,7 +72,10 @@ EXPECTED_CALLS = {
     "watchlist_list": ("watchlist", "watchlist_list"),
     "watchlist_groups": ("watchlist", "watchlist_groups"),
     "modify_user_security": ("watchlist", "modify_user_security"),
-    "f10_detail": ("f10", "f10"),
+    # f10_detail 直调 section 方法（不再经 f10() 分发器）——分发器形参是 **section_params，
+    # 没有键契约，正是聚合 params 无法前置校验的原因；section 白名单仍以传输层类常量为
+    # 单一事实源（见 test_aggregate_sections_are_whitelisted）。
+    "f10_detail": ("f10", "analyst_consensus"),
     "derivative_detail": ("derivatives", "reference_future"),
 }
 
@@ -210,6 +213,124 @@ class DataPlaneEndpointSurfaceTests(unittest.TestCase):
         envelope = data._envelope("plate_list", {"market": "HK", "plate_class": "ALL"})
         self.assertFalse(envelope["ok"])
         self.assertEqual(envelope["error"]["code"], futu_data.OPENAPI_UNAVAILABLE_CODE)
+
+
+class _StrictF10:
+    """带真实签名的 F10 替身：让聚合端点的 params 键校验有契约可依（并记录调用）。"""
+
+    def __init__(self, calls):
+        self._calls = calls
+
+    def analyst_consensus(self, symbol, lang=None, limit=None):
+        self._calls.append(("analyst_consensus", symbol, {"lang": lang, "limit": limit}))
+        return {"ok": 1}
+
+
+class _StrictDerivatives:
+    """带真实签名的衍生品替身（同上）。"""
+
+    def __init__(self, calls):
+        self._calls = calls
+
+    def option_volatility(self, symbol, count=None):
+        self._calls.append(("option_volatility", symbol, {"count": count}))
+        return {"ok": 1}
+
+
+class _StrictGroups:
+    """只实现被测聚合路径所需方法的替身（签名与真实方法组一致）。"""
+
+    def __init__(self):
+        self.calls = []
+        self.f10 = _StrictF10(self.calls)
+        self.derivatives = _StrictDerivatives(self.calls)
+
+
+class DataPlaneAggregateParamTests(unittest.TestCase):
+    """聚合端点 ``params`` 的键契约：载荷错误不得被归类成「通道不可用」。
+
+    审查实证：未经校验的 params 展开进传输层方法 → TypeError → 被 _fetch_openapi 的
+    兜底 except 归成 ``trading/futu-unavailable``，界面据此把用户引向「去设置页配凭据」，
+    而真实原因是参数拼写错误（应为 ``trading/invalid-operation``）。
+    """
+
+    def setUp(self):
+        self.home = str(ROOT / "tests" / "_tmp_wp12_surface")
+
+    def _data(self, groups=None):
+        return futu_data.FutuData(home=self.home, channel=futu_data.CHANNEL_OPENAPI,
+                                  dataplane=groups if groups is not None else _StrictGroups())
+
+    def test_f10_unknown_param_is_invalid_operation(self):
+        groups = _StrictGroups()
+        envelope = self._data(groups)._envelope(
+            "f10_detail", {"code": "HK.00700", "section": "analyst_consensus",
+                           "params": {"bogus_key": 1}})
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], futu_data.PARAM_CODE)
+        self.assertIn("bogus_key", envelope["error"]["message"])
+        self.assertEqual(groups.calls, [], "坏 params 不得触达方法组")
+
+    def test_derivative_unknown_param_is_invalid_operation(self):
+        groups = _StrictGroups()
+        envelope = self._data(groups)._envelope(
+            "derivative_detail", {"code": "HK.00700", "section": "option_volatility",
+                                  "params": {"bogus_key": 1}})
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], futu_data.PARAM_CODE)
+        self.assertIn("bogus_key", envelope["error"]["message"])
+        self.assertEqual(groups.calls, [], "坏 params 不得触达方法组")
+
+    def test_aggregate_params_must_be_object(self):
+        for endpoint, section in (("f10_detail", "analyst_consensus"),
+                                  ("derivative_detail", "option_volatility")):
+            envelope = self._data()._envelope(
+                endpoint, {"code": "HK.00700", "section": section, "params": [1]})
+            self.assertFalse(envelope["ok"], endpoint)
+            self.assertEqual(envelope["error"]["code"], futu_data.PARAM_CODE, endpoint)
+
+    def test_valid_aggregate_params_are_passed_through(self):
+        groups = _StrictGroups()
+        envelope = self._data(groups)._envelope(
+            "f10_detail", {"code": "HK.00700", "section": "analyst_consensus",
+                           "params": {"limit": 5}})
+        self.assertTrue(envelope["ok"], envelope)
+        self.assertEqual(groups.calls,
+                         [("analyst_consensus", "HK.00700", {"lang": None, "limit": 5})])
+
+    def test_channel_really_unavailable_stays_unavailable(self):
+        """反证：真正不可用（无凭据）仍归 openapi-unavailable，不被参数校验吞掉。"""
+        data = futu_data.FutuData(home=self.home, channel=futu_data.CHANNEL_OPENAPI,
+                                  credential_path=str(ROOT / "tests" / "_no_creds.json"))
+        envelope = data._envelope("f10_detail", {"code": "HK.00700",
+                                                 "section": "analyst_consensus",
+                                                 "params": {"limit": 5}})
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], futu_data.OPENAPI_UNAVAILABLE_CODE)
+
+
+class DataPlaneMethodBindingTests(unittest.TestCase):
+    """方法组公开方法必须全部有锁定绑定（防内联字面量路径绕过锁定表/注册表）。"""
+
+    def test_every_group_public_method_is_bound(self):
+        from trading_datasource import futu_openapi as fo  # noqa: PLC0415
+        for attr, expected in futu_data.DATAPLANE_GROUP_METHODS.items():
+            cls = getattr(fo, futu_data.DATAPLANE_GROUP_CLASSES[attr])
+            public = {name for name in dir(cls)
+                      if not name.startswith("_") and callable(getattr(cls, name))}
+            self.assertEqual(public, set(expected), attr)
+
+    def test_f10_sections_cover_every_section_method(self):
+        cls = futu_data._f10_class()
+        public = {name for name in dir(cls)
+                  if not name.startswith("_") and callable(getattr(cls, name))}
+        self.assertEqual(public - {"f10"}, set(cls.SECTIONS))
+
+    def test_derivative_sections_cover_every_method(self):
+        from trading_datasource.futu_openapi import OpenApiDerivatives  # noqa: PLC0415
+        public = {name for name in dir(OpenApiDerivatives)
+                  if not name.startswith("_") and callable(getattr(OpenApiDerivatives, name))}
+        self.assertEqual(public, set(futu_data.DERIVATIVE_SECTIONS.values()))
 
 
 class DataPlaneCacheTests(unittest.TestCase):

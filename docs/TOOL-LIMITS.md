@@ -294,3 +294,37 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
   （空对象/空列表/`-10`）与「失败」分开展示：前者给如实说明，后者给服务端原因 + 下一步；
 - 每张数据卡末尾保留「原始返回（核对用）」折叠块（`src/lib/raw-collapse.jsx`）——
   界面不编造数据，但必须留一个能看见上游原样的出口。
+
+### 10.4 逐方法真机自检（`--dataplane`，2026-09-16 实测）
+
+**入口**：`~/.dsh/trading-venv/bin/python scripts/futu_openapi_check.py --dataplane`
+（`--json` 机器可读；`--option-symbol <合约>` 覆盖期权类方法用的合约；统一凭据文件
+`~/.dsh/futu-openapi.json`，AppKey 与 OAuth 两种模式通用）。
+
+**覆盖**：41 项 = 11 个单方法端点（锁定表 §C.1–§C.4、§C.6 加 HTTP-only 的
+`info_rehab`/`warrant_screen`）+ F10 的 26 个 section + 衍生品 4 项。
+**不在内**：自选 3 项（`watchlist_list`/`watchlist_groups`/`modify_user_security`——
+需 OAuth 用户登录态，AppKey 模式未验证）与模拟交易 9 项（WP13）。
+
+**实测结果（2026-09-16，AppKey 凭据）**：**41/41 `ok`**。
+
+**分类语义**（决定退出码）：`ok`／`no_data`（`-10` 合法无数据）／`business`（其余业务码
+原样列出，证明通道可达）三类算「可达」；`param`（传输层本地参数拒绝）与 `unavailable`
+（传输/凭据故障）才让本次自检失败（退出码 1）；凭据未配置如实报「未配置」并退出 2。
+
+**自检发现并修复的缺陷（本条最有价值）**：`economic-calendar/search` 的 **data 层是
+数组**，分页只在信封顶层——旧 `_merge_pagination` 对数组执行 `{**d}` 抛
+`TypeError: 'list' object is not a mapping`，被服务层兜底归类为「通道不可用」（用户会被
+引去改凭据，而实际是形状缺陷）。已归一为 `{"items": [...], "pagination": {...}}`
+（沿用官方 screen 一族的词汇；无分页时数组原样返回不包壳），
+`tests/test_wp12_transport.py::test_economic_calendar_search_list_data_keeps_pagination`
+锁定。
+
+**最小参数注意事项（实测）**：
+
+- **板块代码会随市场变动**：静态编号（如 `HK.LIST23618`）被上游拒为 `-7 invalid symbol`
+  → 自检改为现取 `plate_list` 首个板块，同时顺带验证 `plate_list → plate_stock` 串联；
+- **期权类 `symbol` 必须是当前有效合约**：静态示例合约会随到期失效（`-7`）→ 自检先用
+  既有 `option_expiration` → `option_chain` 取最近到期日首个合约再调用；
+- **`-9` 与标的无关**：行权概率在无期权数据权限时回 `-9`（见 §10.2），不是标的错误；
+- 上述三条同样适用于人工排查：**看到 `-7` 先怀疑参数取值是否已过期/变动，不要先怀疑通道**。

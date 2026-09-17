@@ -448,7 +448,9 @@ MCP 工具面按研究价值分档，避免工具数无节制膨胀：
 | **聚合读工具**（一个工具、白名单 section 枚举） | 结构同质、逐项暴露收益低 | `f10_detail(code, section)`：section 枚举映射锁定表 §C.5 的 26 个 F10 端点；`derivative_detail(code, section)` 同理（4 项）。（实现期修订：字段名是 **`code`** 而非 `symbol`，与既有行情端点载荷口径一致，服务端内部再转 futu symbol） |
 | **HTTP-only**（不进工具面） | 低频/写类/自选修改 | `modify_user_security`（写用户富途侧自选，仅 Web 用户操作）、`warrant_screen`（窝轮数据保持 API 面完整但不策略化）、`info_rehab`（同步作业内部用）（实现期清单） |
 
-- 工具面预算不变量：**直通工具 + 聚合工具合计 ≤ 80**（当前基线 61 → WP12 后 75 → WP15 后 77），
+- 工具面预算不变量：**直通工具 + 聚合工具合计 ≤ 80**（基线链路：WP8 末 59 → WP10
+  `pipeline` 后 60 → WP11 `sentiment_history` 后 61 → **WP12 后 74**（+直通 11 +聚合 2）
+  → **WP15 后 76**（+`research_tasks_claim/report`）；实测 `TOOL_COUNT = 74`），
   写入测试断言；新增工具必须显式登记档位与理由；
 - **写端点纪律不变**：只有只读研究端点可批量进工具面；`modify_user_security` 触及
   用户富途侧数据，仅 Web 端点可达且不复用交易闸门（非交易写）；

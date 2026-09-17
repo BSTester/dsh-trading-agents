@@ -174,7 +174,7 @@ function OptionScreen() {
       <Alert type="info" showIcon style={{ marginBottom: 8 }} message={(
         <Typography.Text style={{ fontSize: 12 }}>
           filter 必须是非空对象，且必须带非空 field_filter（省略时上游只返回 4 个默认字段、
-          其余全 null）；strategy 为上游必填，服务端提示示例：{STRATEGY_EXAMPLE}。
+          其余全 null）；strategy 为上游必填，服务端提示取值如：{STRATEGY_EXAMPLE}。
           参数校验失败时服务端会直接拒绝并给出原因，页面原样展示。
         </Typography.Text>)} />
       <Space direction="vertical" size="small" style={{ width: "100%", marginBottom: 8 }}>
