@@ -27,13 +27,24 @@ def parse_date(value):
     return None
 
 
-def futu_dividends(ticker):
-    """富途分红/除权除息（全市场，主通道）。"""
+def futu_dividends(ticker, home=None, client=None, credential_path=None):
+    """富途分红/除权除息（全市场，主通道）。
+
+    WP13 任务 1：经 ``trading_datasource.channel.fetch`` 分派——``futu_channel=openapi``
+    且有凭据走 REST ``f10.dividends``，否则 mcp（无凭据时标注回退）。响应容器名兜底
+    ``dividend_list``（mcp 形状）→ ``items``（传输层对数组+分页的归一形状），两者都是
+    既定契约、不是猜；输出行结构与 source 字面量不变。``home/client/credential_path``
+    供离线测试注入（与 core 侧同口径）。
+    """
+    from trading_datasource import channel
     from trading_datasource.market import to_futu_symbol
-    from trading_datasource.futu_mcp import FutuUnavailable, call_tool
-    data = call_tool("quote_corporate_actions_dividends", {"symbol": to_futu_symbol(ticker)})
+    params = {"symbol": to_futu_symbol(ticker)}
+    data, _channel = channel.fetch("quote_corporate_actions_dividends", params,
+                                   method="f10.dividends", home=_home(home), client=client,
+                                   credential_path=credential_path)
+    data = data or {}  # None 视为无分红记录（既有容忍口径不变）
     rows = []
-    for item in data.get("dividend_list") or []:
+    for item in (data.get("dividend_list") or data.get("items") or []):
         ex_date = parse_date(str(item.get("ex_date", "")).replace("/", "-"))
         when = ex_date or parse_date(str(item.get("pub_date", "")).replace("/", "-"))
         if when is None:
@@ -47,13 +58,37 @@ def futu_dividends(ticker):
     return rows
 
 
-def futu_economic_calendar():
-    """富途经济日历（best-effort；无数据时返回空列表，不报错）。"""
-    from trading_datasource.futu_mcp import FutuUnavailable, call_tool
+def _home(home=None):
+    """数据根目录（显式 home > ``$DSH_HOME`` > ``~/.dsh``；channel.config_home 同一实现）。"""
+    from trading_datasource import channel
+    return channel.config_home(home)
+
+
+def futu_economic_calendar(home=None, client=None, credential_path=None, today=None):
+    """富途经济日历（best-effort；无数据时返回空列表，不报错）。
+
+    WP13 任务 1：通道分派——**两边日期口径不同**（mcp 收 ``YYYYMMDD``，REST 收
+    ``YYYY-MM-DD``，锁定表 §C.1 的 ``date`` 为 ``YYYY-MM-DD``），故显式给出两套参数；
+    差异摆在调用点，不藏进助手。``FutuUnavailable`` 仍按 best-effort 返回空列表。
+    ``today`` 供离线测试钉住日期（缺省今天）。
+    """
+    from trading_datasource import channel
+    from trading_datasource.futu_mcp import FutuUnavailable
+    from trading_datasource.futu_openapi import OpenApiError
+    day = today or date.today()
     try:
-        data = call_tool("quote_economic_calendar_hot", {"date": date.today().strftime("%Y%m%d")})
-    except FutuUnavailable:
+        data, _channel = channel.fetch(
+            "quote_economic_calendar_hot",
+            {"date": day.strftime("%Y%m%d")},
+            method="basic.economic_calendar_hot",
+            openapi_params={"date": day.strftime("%Y-%m-%d")},
+            home=_home(home), client=client, credential_path=credential_path)
+    except (FutuUnavailable, OpenApiError):
+        # best-effort 语义跨通道保持：两条通道各自的「上游取数失败」都收敛为「该源缺席」。
+        # 配置错误（channel_of 的坏 JSON ValueError）**不在此吞掉**——那是配置问题，
+        # 应如实暴露，而不是伪装成「今天没有经济事件」。
         return []
+    data = data or {}  # None 视为无事件（既有容忍口径不变）
     rows = []
     for item in (data.get("economic_calendar_list") or data.get("hot_list") or []):
         when = parse_date(str(item.get("date") or item.get("publish_time") or "")[:10])

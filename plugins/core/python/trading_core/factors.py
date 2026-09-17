@@ -49,26 +49,38 @@ factor("momentum_120")(_momentum(120))
 factor("volatility_20")(_volatility(20))
 
 
-def valuation_values(ticker, fetcher=None, akshare_module=None):
+def valuation_values(ticker, fetcher=None, akshare_module=None, home=None, client=None,
+                     credential_path=None):
     """估值因子唯一实现（实现体自 plugins/workbench/python/factors.py 收敛，WP2 任务 3；
     字段路径 2026-09-14 三市场 48 通道实测锁定，不另猜）。
 
     优先富途（PE/PB/PS + 历史分位，全市场），失败回退同花顺（**仅 A 股**，含 PEG）。
     返回 (values, source)。fetcher 替换富途 call_tool、akshare_module 替换 akshare
     （离线测试注入口，仓库既有模式）；online 缺省行为与收敛前逐字一致。
+
+    取数通道（WP13 任务 1）：``fetcher`` 未注入时经 ``trading_datasource.channel.fetch``
+    ——openapi 有凭据走 REST ``f10.valuation_detail``（响应同为 ``trend`` 形状，锁定表
+    §C.5），否则 mcp（无凭据时标注回退）。``home/client/credential_path`` 为通道分派参数；
+    source 字面量 ``futu/quote_valuation_detail`` 不变（落库口径零变化）。
     """
+    from trading_datasource import channel
     from trading_datasource.market import is_a_share, to_futu_symbol
     values, sources = {}, []
 
-    # ① 富途 MCP（优先通道）
+    # ① 富途（优先通道：openapi 就绪走 REST，否则 mcp）
     try:
-        from trading_datasource.futu_mcp import call_tool  # 共享客户端
-        get = fetcher or call_tool
         symbol = to_futu_symbol(ticker)
         for vt, key in ((1, "pe_ttm"), (2, "pb"), (3, "ps")):
             try:
-                data = get("quote_valuation_detail",
-                           {"symbol": symbol, "valuation_type": vt})
+                params = {"symbol": symbol, "valuation_type": vt}
+                if fetcher is not None:
+                    data = fetcher("quote_valuation_detail", params)
+                else:
+                    data, _channel = channel.fetch("quote_valuation_detail", params,
+                                                   method="f10.valuation_detail",
+                                                   home=home, client=client,
+                                                   credential_path=credential_path)
+                    data = data or {}  # None 视为无数据（下轮 trend 取空、跳过该指标）
                 trend = data.get("trend") or {}
                 value, percentile = trend.get("current_value"), trend.get("valuation_percentile")
                 if isinstance(value, (int, float)) and value > 0:

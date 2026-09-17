@@ -8,6 +8,7 @@ import datetime as _dt
 import re
 import time
 
+from trading_datasource import channel
 from trading_datasource.futu_mcp import call_tool
 from trading_datasource.market import load_bars, load_raw_bars, to_futu_symbol
 
@@ -95,13 +96,26 @@ def ms_to_date(ms):
     return _dt.datetime.fromtimestamp(ms / 1000, _TZ8).strftime("%Y-%m-%d")
 
 
-def sync_adjustments(conn, ticker, divi_mode="include_divi", fetcher=None):
+def sync_adjustments(conn, ticker, divi_mode="include_divi", fetcher=None, home=None,
+                     client=None, credential_path=None):
     """复权因子：quote_corporate_actions_rehab（炸弹工具，单标的调用；divi_mode
-    默认 include_divi = A股/富途口径，schema 实测确认）。"""
-    fetcher = fetcher or call_tool
+    默认 include_divi = A股/富途口径，schema 实测确认）。
+
+    取数通道（WP13 任务 1）：``fetcher`` 未注入时走 ``trading_datasource.channel.fetch``
+    ——``futu_channel=openapi`` 且有凭据走 REST（``basic.rehab``，路径在
+    ``/corporate-actions/rehab``，见锁定表 §C.1），否则 mcp（无凭据时标注回退）。
+    两边响应形状一致（``rehabs[]``，锁定表 §C.1 与 futu_mcp 同一后端），故无需 adapter；
+    落库口径与 source 字面量均不变。``fetcher`` 注入即完全绕过通道分派（离线测试口径）。
+    """
     futu_symbol = to_futu_symbol(ticker)
-    data = fetcher("quote_corporate_actions_rehab",
-                   {"symbol": futu_symbol, "divi_mode": divi_mode}) or {}
+    params = {"symbol": futu_symbol, "divi_mode": divi_mode}
+    if fetcher is None:
+        data, _channel = channel.fetch("quote_corporate_actions_rehab", params,
+                                       method="basic.rehab", home=home, client=client,
+                                       credential_path=credential_path)
+        data = data or {}  # 与 fetcher 分支同一容忍：None 视为无数据（宁缺毋假）
+    else:
+        data = fetcher("quote_corporate_actions_rehab", params) or {}
     rows = [{"ex_date": r["ex_div_date"],
              "cum_forward": r.get("cum_forward_adj_factorA"),
              "cum_backward": r.get("cum_backward_adj_factorA"),
@@ -110,14 +124,27 @@ def sync_adjustments(conn, ticker, divi_mode="include_divi", fetcher=None):
     return store.upsert_adjustments(conn, futu_symbol, rows, "futu/rehab")
 
 
-def sync_fundamentals(conn, ticker, fetcher=None):
+def sync_fundamentals(conn, ticker, fetcher=None, home=None, client=None,
+                      credential_path=None):
     """财务报表：quote_financials_statements → 4 个核心字段。
-    富途不含公告日，announced_at 落 NULL，由 merge_announcements_akshare 补齐。"""
-    fetcher = fetcher or call_tool
+    富途不含公告日，announced_at 落 NULL，由 merge_announcements_akshare 补齐。
+
+    取数通道（WP13 任务 1）：同 ``sync_adjustments``——openapi 走 ``f10.statements``。
+    响应容器名兜底 ``report_list`` → ``items``：前者是 mcp 形状（既有行为），后者是
+    传输层对「data 层为数组且有分页」时的归一形状（``_merge_pagination`` 注释）。
+    两者都是既定契约，不是猜；两个都取不到即当作没有数据（宁缺毋假）。
+    """
     futu_symbol = to_futu_symbol(ticker)
-    data = fetcher("quote_financials_statements", {"symbol": futu_symbol}) or {}
+    params = {"symbol": futu_symbol}
+    if fetcher is None:
+        data, _channel = channel.fetch("quote_financials_statements", params,
+                                       method="f10.statements", home=home, client=client,
+                                       credential_path=credential_path)
+        data = data or {}  # None 视为无数据
+    else:
+        data = fetcher("quote_financials_statements", params) or {}
     rows = []
-    for report in data.get("report_list") or []:
+    for report in (data.get("report_list") or data.get("items") or []):
         stamp = report.get("date_time")
         if not stamp:
             continue  # 无报告期：无法定位 PIT，宁缺毋假
@@ -192,19 +219,23 @@ def sync_universe(conn, index_symbol, as_of, fetcher=None, bias_note=UNIVERSE_BI
     return len(bare)
 
 
-def sync_valuations(conn, symbols, fetcher=None, today=None, akshare_module=None):
+def sync_valuations(conn, symbols, fetcher=None, today=None, akshare_module=None,
+                    home=None, client=None, credential_path=None):
     """估值因子按日落库（WP2 任务 3）：对每个 futu symbol 调用收敛后的唯一估值实现
     （trading_core.factors.valuation_values，字段路径 2026-09-14 实测锁定），
     把返回的 {field: value} 落 valuations 表（source=futu/valuation）。
     fetcher/akshare_module/today 均可注入（离线测试与 PIT 确定性）；单项失败如实缺字段，
-    不中断其余标的（宁缺毋假）。"""
+    不中断其余标的（宁缺毋假）。``home/client/credential_path`` 透传给估值取数的通道分派
+    （WP13 任务 1；注入 ``fetcher`` 时它们不生效——注入即绕过通道分派）。"""
     from . import factors
     day = today or _dt.date.today().isoformat()
     out = {}
     for symbol in symbols:
         try:
             values, _source = factors.valuation_values(symbol, fetcher=fetcher,
-                                                       akshare_module=akshare_module)
+                                                       akshare_module=akshare_module,
+                                                       home=home, client=client,
+                                                       credential_path=credential_path)
         except Exception as error:
             out[symbol] = {"error": str(error)[:120]}
             continue

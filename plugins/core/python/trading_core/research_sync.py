@@ -66,32 +66,15 @@ def credential_file(home):
 
 
 def openapi_ready(path=None):
-    """数据面凭据是否可用（**服务端 ``futu_data.openapi_ready`` 的镜像**）。
+    """数据面凭据是否可用（WP13 任务 1 起 = ``trading_datasource.channel.openapi_ready``）。
 
-    为什么镜像而不是复用：core 不得 import ``server`` 包（服务进程与库的依赖方向固定），
-    而「凭据可用」的判定必须与服务端一致，两份实现因此刻意保持同形；判据（oauth 有
-    token / appkey 有 app_key 且私钥可加载 / 其余不可用）如有变更需**两处同步**。
-    只看文件存在会让作业在签名期才失败，白烧一次链路。
+    为什么不 import ``server``：core 不得依赖服务进程包（依赖方向固定）。此前是服务端实现的
+    **刻意镜像**（判据变更需两处同步）；WP13 任务 1 把判定下沉到双方共同依赖的
+    ``trading_datasource``，这里改为委托——**同一份实现、同一个答案**，人工同步的负担消除。
+    只看文件存在会让作业在签名期才失败，白烧一次链路，故此处必须与调用路径同源。
     """
-    from trading_datasource.futu_openapi import CredentialStore  # noqa: PLC0415
-    try:
-        cred = CredentialStore(path).load()
-    except (OSError, ValueError):
-        return False
-    mode = cred.get("mode")
-    if mode == "oauth":
-        return bool(cred.get("access_token") or cred.get("refresh_token"))
-    if mode == "appkey":
-        if not (cred.get("app_key") and cred.get("private_key_path")):
-            return False
-        from trading_datasource.futu_openapi import AppKeySigner  # noqa: PLC0415
-        try:
-            AppKeySigner.from_path(cred["private_key_path"],
-                                   cred.get("algorithm", "Ed25519"))
-        except Exception:  # noqa: BLE001 —— 私钥缺失/坏 PEM/算法不支持 → 不可用
-            return False
-        return True
-    return False
+    from trading_datasource import channel as channel_mod  # noqa: PLC0415
+    return channel_mod.openapi_ready(path)
 
 
 def default_client(path=None):

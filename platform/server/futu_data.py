@@ -364,20 +364,13 @@ def load_channel(home=None):
 
     读取语义复用 server/config.py（容错）：缺文件 → 默认值；坏 JSON → ValueError
     （与服务配置同一处理，不静默吞掉配置错误）；非法值/缺键 → 默认 mcp。
+
+    WP13 任务 1：实现下沉到 ``trading_datasource.channel.channel_of``——core 与 workbench
+    脚本同样要判通道，放在双方共同依赖的包里才只有一份实现。本函数保留为服务侧入口
+    （调用方与既有测试按原签名使用，行为逐字不变）。
     """
-    from server.config import config_path  # noqa: PLC0415 —— 保持本模块可独立导入
-    path = config_path(home)
-    import json
-    try:
-        text = path.read_text(encoding="utf-8")
-    except FileNotFoundError:
-        return CHANNEL_MCP
-    try:
-        raw = json.loads(text)
-    except json.JSONDecodeError as error:
-        raise ValueError(f"trading-platform.json 解析失败：{error}") from error
-    channel = raw.get("futu_channel") if isinstance(raw, dict) else None
-    return channel if channel in (CHANNEL_MCP, CHANNEL_OPENAPI) else CHANNEL_MCP
+    from trading_datasource import channel as channel_mod  # noqa: PLC0415
+    return channel_mod.channel_of(home)
 
 
 def openapi_ready(credential_path=None):
@@ -391,26 +384,13 @@ def openapi_ready(credential_path=None):
     「私钥可加载」是凭据就绪的一部分：只看路径存在会让 live 写穿过闸门（**人工确认被消耗**）
     后才在签名时失败；判在这里则确认零消耗、零 HTTP 调用、错误码 ``trading/broker-unavailable``
     （见 tests/test_wp8_trading.py 的私钥缺失用例）。
+
+    WP13 任务 1：实现下沉到 ``trading_datasource.channel.openapi_ready``（同一函数），
+    本入口与 ``trading_core.research_sync.openapi_ready`` 从此是同一个答案，
+    ``tests/test_wp12_ready_equivalence.py`` 的等价矩阵继续成立（且不再需要人工同步）。
     """
-    from trading_datasource.futu_openapi import CredentialStore  # noqa: PLC0415
-    try:
-        cred = CredentialStore(credential_path).load()
-    except (OSError, ValueError):
-        return False
-    mode = cred.get("mode")
-    if mode == "oauth":
-        return bool(cred.get("access_token") or cred.get("refresh_token"))
-    if mode == "appkey":
-        if not (cred.get("app_key") and cred.get("private_key_path")):
-            return False
-        from trading_datasource.futu_openapi import AppKeySigner  # noqa: PLC0415
-        try:
-            AppKeySigner.from_path(cred["private_key_path"],
-                                   cred.get("algorithm", "Ed25519"))
-        except Exception:  # noqa: BLE001 —— 私钥缺失/坏 PEM/算法不支持 → 凭据不可用
-            return False
-        return True
-    return False
+    from trading_datasource import channel as channel_mod  # noqa: PLC0415
+    return channel_mod.openapi_ready(credential_path)
 
 
 class FutuDataError(RuntimeError):
