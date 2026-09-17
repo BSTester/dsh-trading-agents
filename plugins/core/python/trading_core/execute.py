@@ -42,6 +42,27 @@ def _order_ctx(ctx, order, plan_hash):
     return order_ctx
 
 
+def _order_account(ctx, broker_call, market, cache):
+    """下单账户：``ctx["acc_id"]`` 显式指定优先，否则按市场解析真实模拟账户。
+
+    为什么必须有这一步（2026-09-17 实机缺陷）：旧实现在这里下发 ``"SIM"`` 占位符。
+    MCP 通道下上游忽略它，openapi 通道下 REST 把它拼进 URL
+    （``POST /api/v1.0/sim-trade/SIM/orders``）→ 券商 ``-3 invalid parameter``——
+    自动执行链的订单**从未到达模拟账户**。解析口径见 ``broker.sim_account_for_market``；
+    解析不到（未知市场/账户表不可用）保留占位符，由券商如实报错——**不猜账户，
+    也不静默丢弃订单**。``cache`` 按市场缓存（逐单查账户表会放大通道往返）。
+    """
+    explicit = ctx.get("acc_id")
+    if explicit:
+        return explicit
+    if market not in cache:
+        try:
+            cache[market] = broker.sim_account_for_market(broker_call, market) or None
+        except Exception:  # noqa: BLE001 —— 账户表不可用不改变既有行为（照旧尝试下单）
+            cache[market] = None
+    return cache[market] or broker.PLACEHOLDER_ACCOUNT
+
+
 def run(conn, plan_id, plan_hash, ctx, broker_call, price_of, stop_dist_of):
     plan = store.get_plan(conn, plan_id)
     if plan["status"] not in ("frozen", "approved") or plan["content_hash"] != plan_hash:
@@ -55,6 +76,7 @@ def run(conn, plan_id, plan_hash, ctx, broker_call, price_of, stop_dist_of):
             oms.transition(conn, o["client_order_id"], "frozen")
     blocked = submitted = 0
     halted = False
+    accounts = {}
     for o in orders:
         order = {"symbol": o["symbol"], "side": o["side"], "qty": o["qty"],
                  "price": o["price"] or price_of(o["symbol"]), "mode": o["mode"],
@@ -71,7 +93,8 @@ def run(conn, plan_id, plan_hash, ctx, broker_call, price_of, stop_dist_of):
                            err="risk:" + verdict.reason)
             continue
         oms.transition(conn, o["client_order_id"], "submitting")
-        out = broker.place(broker_call, acc_id=ctx.get("acc_id", "SIM"),
+        out = broker.place(broker_call,
+                           acc_id=_order_account(ctx, broker_call, o["market"], accounts),
                            market=o["market"], symbol=o["symbol"].split(".")[-1],
                            side=o["side"], qty=o["qty"], price=o["price"])
         if out["status"] == "submitted":

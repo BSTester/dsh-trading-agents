@@ -124,6 +124,34 @@ def accounts(call, timeout=30):
     return call(TOOLS["accounts"], {}, timeout=timeout) or {}
 
 
+#: 计划执行链历史上的占位账户号（``execute.run`` 的 ``ctx`` 缺省值）。REST 通道会把它
+#: 拼进 URL（``/api/v1.0/sim-trade/SIM/orders``）→ 券商 ``-3 invalid parameter``；
+#: 见 ``sim_account_for_market``。
+PLACEHOLDER_ACCOUNT = "SIM"
+
+
+def sim_account_for_market(call, market, timeout=30):
+    """市场（链名或 market_id）→ 该市场的模拟账户 id；解析不到返回 ``None``。
+
+    存在理由（2026-09-17 实机验证「模拟盘全自动闭环」时暴露）：``execute.run`` 用
+    ``ctx.get("acc_id", "SIM")`` 的**占位符**下单——MCP 通道下上游忽略它（所以历史上
+    没暴露），切到 ``futu_channel: openapi`` 后 REST 把 acc_id 拼进 URL，券商如实回
+    ``errcode=-3 invalid parameter``：计划/守卫/指令/风控全部正常，**订单却从未到达
+    模拟账户**。市场→market_id 归一交给 ``market_ids.sim_market_id``（唯一实现，含
+    SH/SZ/BJ 同属 A 股 3）；账户事实与 ``_sim_positions_and_equity`` 同一张
+    ``sim_trade_account_list``，不新增第二份市场判定。**不猜**：解析不到就返回 None，
+    由调用方决定回落（不拿别的市场的账户去下单）。
+    """
+    market_id = sim_market_id(market)
+    if market_id is None:
+        return None
+    rows = (call(TOOLS["accounts"], {}, timeout=timeout) or {}).get("accounts") or []
+    for account in rows:
+        if account.get("market_id") == market_id and account.get("account_id"):
+            return str(account["account_id"])
+    return None
+
+
 def normalize_symbol(value):
     """券商持仓/订单行的标的 → 仓库统一写法（SH.600519）。
 
