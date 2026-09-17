@@ -77,6 +77,9 @@ CREATE TABLE IF NOT EXISTS plate_snapshots(
   date TEXT NOT NULL, market TEXT NOT NULL, plate_class TEXT NOT NULL,
   payload TEXT NOT NULL, fetched_at TEXT NOT NULL,
   PRIMARY KEY(date, market, plate_class)) WITHOUT ROWID;
+CREATE TABLE IF NOT EXISTS rules(
+  rule_id TEXT PRIMARY KEY, spec TEXT NOT NULL, status TEXT NOT NULL,
+  validation TEXT, created_at TEXT NOT NULL, approved_at TEXT, approved_by TEXT);
 """
 
 # ---------------------------------------------------------------------------
@@ -367,6 +370,81 @@ def list_plans_newest_first(conn):
     与 ``list_plans`` 的差异只在排序方向：端点（plan/pipeline/reconcile 快照）里的
     「当前计划」都取 ``[0]``，多计划并存时按升序取会拿到最旧的一条。"""
     return list(reversed(list_plans(conn)))
+
+
+# ---------------------------------------------------------------------------
+# WP14：规则（rules）持久化——spec 与状态机的存储侧。
+# 状态流转**不**在本层校验：rule_engine.set_rule_status / decide_rule 是唯一入口
+# （非法流转在那里报错），本层只做读写与 JSON 序列化。
+# ---------------------------------------------------------------------------
+
+
+def upsert_rule(conn, rule_id, spec, status="candidate", validation=None,
+                created_at=None):
+    """规则提案落库（幂等覆盖 spec/status/validation）。
+
+    created_at 仅首次写入；approved_at/approved_by 由 rule_engine.decide_rule 维护，
+    覆盖 spec 不重置批准痕迹（ON CONFLICT 只更新 spec/status/validation）。
+    """
+    conn.execute(
+        "INSERT INTO rules(rule_id,spec,status,validation,created_at,approved_at,approved_by)"
+        " VALUES(?,?,?,?,?,NULL,NULL)"
+        " ON CONFLICT(rule_id) DO UPDATE SET spec=excluded.spec, status=excluded.status,"
+        " validation=excluded.validation",
+        (rule_id, json.dumps(spec, ensure_ascii=False), status,
+         None if validation is None else json.dumps(validation, ensure_ascii=False),
+         created_at or _now()))
+    conn.commit()
+
+
+def update_rule(conn, rule_id, status=None, validation=None,
+                approved_at=None, approved_by=None):
+    """字段级更新（状态机的落地写入，由 rule_engine 校验流转后调用）。
+
+    None = 不改该字段；缺失行报错（不静默插入）。validation 为 dict 或 None。
+    """
+    if conn.execute("SELECT 1 FROM rules WHERE rule_id=?", (rule_id,)).fetchone() is None:
+        raise ValueError(f"规则不存在 {rule_id}")
+    sets, params = [], []
+    for col, val in (("status", status), ("approved_at", approved_at),
+                     ("approved_by", approved_by)):
+        if val is not None:
+            sets.append(f"{col}=?")
+            params.append(val)
+    if validation is not None:
+        sets.append("validation=?")
+        params.append(json.dumps(validation, ensure_ascii=False))
+    if not sets:
+        return
+    params.append(rule_id)
+    conn.execute(f"UPDATE rules SET {','.join(sets)} WHERE rule_id=?", params)
+    conn.commit()
+
+
+def get_rule(conn, rule_id):
+    row = conn.execute("SELECT * FROM rules WHERE rule_id=?", (rule_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"规则不存在 {rule_id}")
+    return _rule_row(row)
+
+
+def get_rules(conn, status=None):
+    """规则列表（可按状态过滤），按创建时间与 rule_id 稳定排序。"""
+    sql = "SELECT * FROM rules"
+    params = ()
+    if status is not None:
+        sql += " WHERE status=?"
+        params = (status,)
+    sql += " ORDER BY created_at, rule_id"
+    return [_rule_row(row) for row in conn.execute(sql, params).fetchall()]
+
+
+def _rule_row(row):
+    rule = dict(row)
+    rule["spec"] = json.loads(rule["spec"])
+    rule["validation"] = (json.loads(rule["validation"])
+                          if rule["validation"] is not None else None)
+    return rule
 
 
 # ---------------------------------------------------------------------------
