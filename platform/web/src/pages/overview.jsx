@@ -91,23 +91,32 @@ export default function OverviewPage() {
   const heartbeat = schedule.value?.heartbeat ?? null;
   const heartbeatMs = parseHeartbeat(heartbeat?.heartbeat);
   const heartbeatMinutes = Number.isFinite(heartbeatMs) ? minutesSince(heartbeatMs) : null;
+  // 加载态与空态分离（E2E 取证：加载窗口曾把「还没读到」显示成「无心跳记录 / —」）。
+  // 空态文案只在一个确定性结论下出现：请求已结束且结果为空。
+  const pushField = fieldState(push, { emptyText: "—" });
+  const scheduleField = fieldState(
+    { loading: schedule.loading, error: schedule.error, value: heartbeat },
+    { emptyText: "无心跳记录" });
+  const sourcesField = fieldState(
+    { loading: sources.loading, error: sources.error, value: sources.value?.summary },
+    { emptyText: "—" });
   const statusItems = [
     { label: "推送", node: pushStatus
       ? <Tag color={pushStatus.color}>{pushStatus.text}</Tag>
-      : <Typography.Text type="secondary">{push.error ? "推送状态读取失败" : (push.value && !push.value.enabled ? "推送未启用" : "—")}</Typography.Text> },
+      : pushField.kind === "value" && !push.value?.enabled
+        ? <Typography.Text type="secondary">推送未启用</Typography.Text>
+        : <Typography.Text type="secondary">{pushField.text}</Typography.Text> },
     { label: "调度器", node: (
       <Space size={4} wrap>
-        {heartbeatMinutes === null
-          ? <Typography.Text type="secondary">{schedule.error ? "读取失败" : "无心跳记录"}</Typography.Text>
-          : <Typography.Text type={heartbeatMinutes > 5 ? "warning" : undefined}>心跳 {heartbeatMinutes} 分钟前</Typography.Text>}
+        {heartbeatMinutes !== null
+          ? <Typography.Text type={heartbeatMinutes > 5 ? "warning" : undefined}>心跳 {heartbeatMinutes} 分钟前</Typography.Text>
+          : <Typography.Text type="secondary">{scheduleField.text}</Typography.Text>}
         {schedule.value?.kill ? <Tag color="red">kill 已落下</Tag> : null}
         {schedule.value?.halt ? <Tag color="orange">已暂停</Tag> : null}
       </Space>) },
-    { label: "数据源", node: sources.error
-      ? <Typography.Text type="secondary">读取失败</Typography.Text>
-      : sources.value?.summary
-        ? <Typography.Text>正常 {sources.value.summary.ok ?? "—"} · 待配置 {sources.value.summary.warn ?? "—"} · 异常 {sources.value.summary.fail ?? "—"}</Typography.Text>
-        : <Typography.Text type="secondary">—</Typography.Text> },
+    { label: "数据源", node: sourcesField.kind === "value"
+      ? <Typography.Text>正常 {sources.value.summary.ok ?? "—"} · 待配置 {sources.value.summary.warn ?? "—"} · 异常 {sources.value.summary.fail ?? "—"}</Typography.Text>
+      : <Typography.Text type="secondary">{sourcesField.text}</Typography.Text> },
   ];
 
   return (

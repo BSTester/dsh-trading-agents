@@ -17,13 +17,14 @@ import React from "react";
 import { Alert, Button, Card, Space, Steps, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { modeBadge } from "../services/mode.js";
+import { configWarningRows, stageChainEmptyText } from "../services/fieldState.js";
 import {
   MARKETS, autoPipelineBadge, marketLabel, stageDrill, stageEntries,
   stageStatus, stageStatusText, stageTagColor, stageTimeText,
 } from "../services/pipeline.js";
 
 /** 一条阶段链：节点标题用服务端 label，副标题用 at/scheduled，点击下钻来源页。 */
-function StageChain({ stages }) {
+function StageChain({ stages, loading = false }) {
   const items = stageEntries(stages).map((stage) => ({
     title: <a href={stageDrill(stage.key)}>{stage.label ?? stage.key}</a>,
     subTitle: stageTimeText(stage),
@@ -38,7 +39,8 @@ function StageChain({ stages }) {
     status: stageStatus(stage.status),
   }));
   if (!items.length) {
-    return <Typography.Text type="secondary">今日无该链阶段。</Typography.Text>;
+    // 加载中不得断言「今日无该链阶段」（E2E 取证：加载窗口把未知说成事实）
+    return <Typography.Text type="secondary">{stageChainEmptyText(loading)}</Typography.Text>;
   }
   // 阶段数随作业链增长：横向可滚动，避免挤压节点文案。
   return (
@@ -70,6 +72,11 @@ export default function PipelinePage() {
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
         {pipeline.error && (
           <Alert type="error" showIcon message={`流程读取失败：${pipeline.error}`} />)}
+        {/* 首启配置缺口（如关注池未配置 → 数据作业不会采集）：服务端只读给出，原样展示 */}
+        {configWarningRows(value).map((warning) => (
+          <Alert key={warning.code} type="warning" showIcon
+            message={warning.message}
+            description={warning.hint || undefined} />))}
 
         <Space size="small" wrap>
           <Typography.Text type="secondary">账户模式</Typography.Text>
@@ -83,17 +90,17 @@ export default function PipelinePage() {
           {killActive && <Tag color="red">kill switch 生效中</Tag>}
           {halted && <Tag color="red">日内熔断已触发</Tag>}
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            日期 {value.date ?? "—"}
+            {pipeline.loading && !value.date ? "日期 读取中…" : `日期 ${value.date ?? "—"}`}
           </Typography.Text>
         </Space>
 
         {MARKETS.map((market) => (
           <Card type="inner" key={market} title={marketLabel(market)}>
-            <StageChain stages={stagesOf(value.markets?.[market])} />
+            <StageChain stages={stagesOf(value.markets?.[market])} loading={pipeline.loading} />
           </Card>))}
 
         <Card type="inner" title="全局（晚间链）">
-          <StageChain stages={stagesOf(value.global)} />
+          <StageChain stages={stagesOf(value.global)} loading={pipeline.loading} />
         </Card>
 
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
