@@ -6,7 +6,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 import {
   RULE_STATUS, canDisable, canEnable, decideDisabledReason, ruleRows, ruleRowsForTable,
-  statusColor, statusLabel, validationSummary,
+  statusColor, statusLabel, validationSummary, walkforwardSummary,
 } from "../src/services/rules.js";
 
 const PASSED = {
@@ -62,18 +62,40 @@ test("decideDisabledReason：不可用时给出原因，可用时为 null", () =
   assert.match(decideDisabledReason(PASSED, "remove"), /未知决定 remove/);
 });
 
-test("validationSummary：未验证/通过/未通过三态如实表达", () => {
+test("validationSummary：未验证/通过/未通过三态如实表达（并带样本外状态）", () => {
   assert.equal(validationSummary({ status: "candidate" }), "尚未验证（先跑 rules-validate）");
-  assert.equal(validationSummary(PASSED), "通过：momentum_20(t=2.41, n=21)、ep(t=3.02, n=21)");
+  assert.equal(validationSummary(PASSED),
+               "通过：momentum_20(t=2.41, n=21)、ep(t=3.02, n=21)；样本外：未请求");
   assert.equal(
     validationSummary({ validation: { passed: false,
       gate_reasons: ["momentum_20：t 检验不显著：t=1.20 < 2.0"], factors: {} } }),
-    "未通过：momentum_20：t 检验不显著：t=1.20 < 2.0");
+    "未通过：momentum_20：t 检验不显著：t=1.20 < 2.0；样本外：未请求");
   assert.equal(validationSummary({ validation: { passed: false, gate_reasons: [] } }),
-               "未通过（未记录原因）");
+               "未通过（未记录原因）；样本外：未请求");
   // 统计缺失时用 — 而不是编造 0
   assert.equal(validationSummary({ validation: { passed: true, factors: { f: {} } } }),
-               "通过：f(t=—, n=—)");
+               "通过：f(t=—, n=—)；样本外：未请求");
+});
+
+test("walkforwardSummary：样本外状态三态如实表达（批准人必须看得到）", () => {
+  // ① 未请求（缺字段 / not_run）
+  assert.equal(walkforwardSummary(undefined), "样本外：未请求");
+  assert.equal(walkforwardSummary(null), "样本外：未请求");
+  assert.equal(walkforwardSummary({}), "样本外：未请求");
+  assert.equal(walkforwardSummary({ status: "not_run",
+    reason: "--walkforward 需同时给 --start 与 --end（与 backtest 同口径）" }),
+    "样本外：未请求——--walkforward 需同时给 --start 与 --end（与 backtest 同口径）");
+  // ② 未跑通 + 原因
+  assert.equal(walkforwardSummary({ status: "failed", reason: "规则注册失败：combine 非法" }),
+               "样本外：未跑通——规则注册失败：combine 非法");
+  assert.equal(walkforwardSummary({ status: "failed" }), "样本外：未跑通");
+  assert.equal(walkforwardSummary({ status: "no_folds", reason: "数据窗口不足，未产出 OOS 折" }),
+               "样本外：未产出 OOS 折——数据窗口不足，未产出 OOS 折");
+  // ③ 已跑 N 折
+  assert.equal(walkforwardSummary({ status: "ok", folds: 3 }), "样本外：已跑 3 折");
+  assert.equal(walkforwardSummary({ status: "ok" }), "样本外：已跑（折数未记录）");
+  // 未知状态原样回显，不猜档位
+  assert.equal(walkforwardSummary({ status: "archived" }), "样本外：archived");
 });
 
 test("ruleRows：参数/来源/批准逐项落地，缺值显示 —", () => {
@@ -92,6 +114,12 @@ test("ruleRows：参数/来源/批准逐项落地，缺值显示 —", () => {
   const empty = Object.fromEntries(ruleRows({}).map((row) => [row.label, row.value]));
   assert.equal(empty["因子"], "—");
   assert.equal(empty["Top-N / 再平衡"], "— / —");
+  assert.equal(empty["样本外"], "样本外：未请求", "展开区也要能看到样本外是否跑过");
+  const withOos = Object.fromEntries(
+    ruleRows({ ...PASSED,
+      validation: { ...PASSED.validation, walkforward: { status: "ok", folds: 3 } } })
+      .map((row) => [row.label, row.value]));
+  assert.equal(withOos["样本外"], "样本外：已跑 3 折");
 });
 
 test("ruleRowsForTable：稳定 rowKey，缺 rule_id 时按序补位", () => {

@@ -267,16 +267,6 @@ def _factors_snapshot(conn, tickers, date):
     return {"ok": True, "date": date, "tickers": len(per_ticker)}
 
 
-def _forward_return(conn, symbol, as_of, horizon):
-    """单标的前向收益：取 as_of 之后窗口的首尾收盘（近似口径——对齐由 bars 保证）。
-
-    与 WP2 起的既有 ic 口径逐字一致；样本不足返回 None（宁缺毋假）。
-    """
-    as_of2 = (_dt.date.fromisoformat(as_of) + _dt.timedelta(days=horizon * 2)).isoformat()
-    bars = store.read_bars(conn, symbol, "1d", as_of=as_of2, limit=horizon)
-    return bars[-1]["c"] / bars[0]["c"] - 1 if len(bars) >= 2 else None
-
-
 def _ic_sample_dates(conn, symbols, as_of, lookback, step):
     """多期 IC 的取样日期：≤ as_of 的并集交易日后，从末尾每隔 step 取一个（升序返回）。
 
@@ -298,7 +288,11 @@ def _ic_sample_dates(conn, symbols, as_of, lookback, step):
 def _ic_result(conn, args):
     """`ic` 子命令实现：as_of 当期 RankIC（既有键不动）+ 多期验证门报告（新增键）。
 
-    保持向后兼容：``factor``/``rank_ic``/``samples`` 语义与 WP2 完全一致；
+    键集与 WP2 一致（``factor``/``rank_ic``/``samples``）；``samples`` 按**因子值**
+    样本数计，与 ``rank_ic`` 是否算得出无关。``rank_ic`` 依赖前向收益——阶段 B 起
+    统一走 ``factors.forward_return``（精确窗口），因此在**最新 bar 日**（前向窗口
+    尚不存在）如实为 ``null``，不再用近似窗口编造一个值（旧口径在此处返回过 1.0）；
+    要看有前向窗口的日期，把 ``--as-of`` 指到历史日期即可。
     新增 ``rank_ic_mean``/``t_stat``/``p_value``/``n``/``layers``/``monotonic``
     与门槛结论 ``passes_gate``/``gate_reasons``。
     """
@@ -312,7 +306,7 @@ def _ic_result(conn, args):
     vals = {k: v for k, v in vals.items() if v is not None}
     fwd = {}
     for symbol in vals:
-        value = _forward_return(conn, symbol, args.as_of, args.horizon)
+        value = factors.forward_return(conn, symbol, args.as_of, args.horizon)
         if value is not None:
             fwd[symbol] = value
     # ② 多期面板：逐取样日算因子值与前向收益 → ic_report
@@ -322,7 +316,7 @@ def _ic_result(conn, args):
         day_factors = {k: v for k, v in day_factors.items() if v is not None}
         day_forward = {}
         for symbol in day_factors:
-            value = _forward_return(conn, symbol, date, args.horizon)
+            value = factors.forward_return(conn, symbol, date, args.horizon)
             if value is not None:
                 day_forward[symbol] = value
         if day_factors:
@@ -350,7 +344,9 @@ def _ic_result(conn, args):
 # 不是遗漏，是设计：任何能被脚本调用的批准入口都是模型自批的入口。
 # 验证门统计一律复用 ``factors.ic_report``/``passes_gate``（阈值唯一实现在 factors），
 # 本模块**不重写任何阈值**；取样口径与 ``ic`` 子命令逐字一致（``_ic_sample_dates`` +
-# ``_forward_return``），保证验证报告能被 ``ic`` 手工复核。
+# ``factors.forward_return``——前向收益只有一份实现，与 ``ic_weighted`` 运行时同源，
+# 否则「批准时的 IC」与「运行时的 IC」按不同前向收益计算），保证验证报告能被
+# ``ic`` 子命令手工复核。
 
 
 def _home_of(args):
@@ -407,7 +403,7 @@ def _rule_panels(conn, spec, symbols, as_of, horizon, lookback, step, registry=N
     for day in _ic_sample_dates(conn, symbols, as_of, lookback, step):
         forward = {}
         for symbol in symbols:
-            value = _forward_return(conn, symbol, day, horizon)
+            value = factors.forward_return(conn, symbol, day, horizon)
             if value is not None:
                 forward[symbol] = value
         if not forward:

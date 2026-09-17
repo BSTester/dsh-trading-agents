@@ -194,6 +194,43 @@ def _spearman_ordered(xs, ys):
     return 1 - 6 * d2 / denom if denom else None
 
 
+#: 前向收益定位窗口：从 end 往前最多读这么多根 bar。
+#: 需覆盖验证门最大取样跨度（lookback*step）与运行时 IC 窗口（IC_WINDOW_DAYS）。
+FORWARD_LOOKBACK_BARS = 400
+
+
+def forward_return(conn, symbol, as_of, horizon, end=None):
+    """``as_of`` 起 ``horizon`` 个交易日的前向收益（**唯一实现**，规格 §9.3）。
+
+    验证门（``cli._rule_panels``）与 ``ic_weighted`` 运行时
+    （``rule_engine._ic_factor_weights``）共用本函数——两处各写一份会让「批准时的 IC」
+    与「运行时的 IC」按不同前向收益计算，统计有效性无从谈起（阶段 B 修复的缺陷）。
+
+    口径：
+      * 基准 = ``as_of`` **当根** bar 收盘；终点 = 其后第 ``horizon`` 根收盘；
+      * 找不到 ``as_of`` 当根，或其后不足 ``horizon`` 根 → ``None``
+        （宁缺毋假：绝不返回短窗口收益冒充 horizon 日收益）；
+      * ``end`` 是数据上限——``None`` 表示到该标的**最新** bar（历史验证：
+        前向收益已实现，本就应该用它）；给定值表示不得越界（运行时防前视：
+        评估日之后的数据不得参与 IC 加权）；
+      * 定位窗口为 ``FORWARD_LOOKBACK_BARS`` 根：``as_of`` 早于该窗口起点的样本
+        定位不到当根 → ``None``（如实缺值，不外推）。
+    """
+    if horizon < 1:
+        raise ValueError(f"horizon 必须为正整数，收到 {horizon!r}")
+    limit = end if end is not None else store.last_bar_date(conn, symbol, "1d")
+    if limit is None:
+        return None
+    bars = store.read_bars(conn, symbol, "1d", as_of=limit, limit=FORWARD_LOOKBACK_BARS)
+    for index, bar in enumerate(bars):
+        if bar["t"] == as_of:
+            future = index + horizon
+            if future < len(bars):
+                return bars[future]["c"] / bar["c"] - 1.0
+            return None
+    return None
+
+
 def rank_ic(factor_values, forward_returns):
     """Spearman 秩相关；样本 < 3 或零方差返回 None。"""
     common = [k for k in factor_values if k in forward_returns]

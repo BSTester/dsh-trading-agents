@@ -202,22 +202,6 @@ def _period_key(rebalance, date_text):
     return (iso[0], iso[1])
 
 
-def _forward_return(conn, symbol, as_of, horizon, end):
-    """``as_of`` 起 ``horizon`` 个交易日的前向收益（读库；只用到 ``end`` 为止的数据）。
-
-    找不到 ``as_of`` 当根 bar，或其后不足 ``horizon`` 根 → ``None``
-    （不猜、不外推：宁可该日不参与 IC，也不编造前向收益）。
-    """
-    bars = store.read_bars(conn, symbol, "1d", as_of=end, limit=400)
-    for index, bar in enumerate(bars):
-        if bar["t"] == as_of:
-            future = index + horizon
-            if future < len(bars):
-                return bars[future]["c"] / bar["c"] - 1.0
-            return None
-    return None
-
-
 def _ic_factor_weights(conn, factor_names, horizon=IC_HORIZON_DAYS, window=IC_WINDOW_DAYS,
                        min_days=IC_MIN_DAYS, end=None, snapshots=None, fwd_return=None):
     """各因子近期 ``|RankIC|`` 的归一权重（``combine=ic_weighted`` 的权重来源）。
@@ -227,16 +211,18 @@ def _ic_factor_weights(conn, factor_names, horizon=IC_HORIZON_DAYS, window=IC_WI
     - ``end``：前向收益的数据上限，缺省取最新快照日；规则解释器传**评估日** ``as_of``
       （PIT：前向收益只能用到评估日为止的数据，最新快照自然算不出收益而被跳过）；
     - ``snapshots`` / ``fwd_return`` 是测试注入口（缺省读库）；
+    - 前向收益**只有一份实现**（``factors.forward_return``）：验证门与运行时共用同一
+      口径，否则「批准时的 IC」与「运行时的 IC」不可比（阶段 B 修复的缺陷）；
     - 任一因子在窗口内算不出 IC → ``ValueError``：**算不出预测力的因子不得靠等权
       兜底混进权重**，否则「IC 加权」名不副实。
     """
+    from . import factors as factors_mod
     loader = snapshots or (lambda: store.list_factor_snapshots(conn, limit=window))
     records = list(loader())
     if len(records) < min_days:
         raise ValueError(f"IC 加权需 ≥{min_days} 日历史（当前 {len(records)} 日）")
-    forward = fwd_return or _forward_return
+    forward = fwd_return or factors_mod.forward_return
     end = end or records[0]["date"]
-    from . import factors as factors_mod
     ics = {}
     for name in factor_names:
         series = []

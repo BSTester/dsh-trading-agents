@@ -279,7 +279,7 @@ function RulePool() {
                     <Button size="small" type="primary" disabled={busy || !!enableBlocked}
                       title={enableBlocked ?? undefined}>批准启用</Button>
                   </Popconfirm>
-                  <Popconfirm title={`停用「${rule.rule_id}」？停用后不再被自动计划采用。`}
+                  <Popconfirm title={`停用「${rule.rule_id}」？停用后不再被自动计划采用；停用不可逆，需换新 rule_id 才能重新启用。`}
                     okText="停用" cancelText="取消" disabled={busy || !!disableBlocked}
                     onConfirm={() => decide(rule, "disable")}>
                     <Button size="small" disabled={busy || !!disableBlocked}
