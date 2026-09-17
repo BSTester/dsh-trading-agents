@@ -196,6 +196,14 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   失联（工作台标红）；`critical: true` 是告警常驻红点标志位，处置后随恢复流程清除。
 - **不自动清除未知在途租约/订单**：执行中断留下的 `unknown` 订单与调用租约，
   一律先查券商核对真实状态，再按 RUNBOOK 场景 2/3 迁移状态机或清 halt；禁止重放。
+- **值班研究员（L3）定时研究任务（WP15）**：`scripts/research_duty.sh` + `install/research-duty.{service,timer}`
+  是**研究侧**定时执行体——只消费 `research_tasks` 队列产简报/巡检/提案，**永不直接下单、
+  永不直接启用策略**，与交易侧自动流水线（WP9）互不调用。定时器没装/机器关机/headless 被杀
+  都只是**延后**：任务留在队列，你打开会话时由 Harness 补跑（`claim` 会顺手回收超时任务）。
+  该脚本**不会**自己拉起平台服务（探活失败即非零退出并给指引；拉起是 platform-autostart 的职责）；
+  日志在 `~/.dsh/logs/research-duty-*.log`，排查表见 `docs/RUNBOOK.md`「值班研究员（L3）」。
+  队列载荷是白名单结构化引用（队列即攻击面）：直接改库塞自由文本会被领取侧拒领并留 critical 告警，
+  队列**暂停在队首等人处置**——这是刻意的 fail-closed，不要为「让它跑起来」而绕过校验。
 - **双进程数据约定（WP6）**：独立服务进程与 Harness 进程共享同一份
   `<DSH_HOME>/trading-workbench.json`、模式文件 `trading-account-mode` 与指令目录
   `trading-commands/`；写路径靠既有**原子写 + 独占锁**互斥，两处同时切换模式的竞态由

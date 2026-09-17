@@ -1,0 +1,17 @@
+# 值班研究员（L3）单次运行单元（WP15 任务 4；规格 §10.4）
+#
+# 由 research-duty.timer 定时触发，也可手动演练：systemctl --user start research-duty
+# 路径按实际安装位置替换（preset 安装在 ~/.dsh/.agent-presets/dsh-trading-agents）。
+[Unit]
+Description=quant platform duty researcher (L3 headless wake)
+# 服务没起就没有可领取的任务：声明顺序依赖；服务不在时脚本自己探活失败并以非零退出，
+# 给出可读指引（不静默成功）。
+After=quant-platform.service
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/dsh-trading-agents
+ExecStart=%h/dsh-trading-agents/scripts/research_duty.sh
+Environment=DSH_HOME=%h/.dsh
+# 脚本内 timeout（DSH_DUTY_TIMEOUT，默认 1800s）是主上限；这里再加 systemd 侧硬上限兜底。
+TimeoutStartSec=2100

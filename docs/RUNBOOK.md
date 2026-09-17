@@ -351,6 +351,78 @@ unset DSH_FAKE_NOW                              # 演练结束必须清理
 排查入口：`snapshot-schedule`（ran 标记/心跳/告警）、`snapshot-reconcile`（差异/TCA/
 链路）、`snapshot-plan`（计划→订单→风控预检）。
 
+## 值班研究员（L3 定时研究任务）
+
+> 定位：**研究侧**的定时执行体。它只消费任务队列产简报/巡检/提案，**永不直接下单、
+> 永不直接启用策略**；交易侧自动执行是另一条链（见「自动流水线（WP9）」），两者互不调用。
+> 队列与「会话打开补跑」共用同一状态机——定时器没跑成也不丢任务（详见下）。
+
+### 组件与路径
+
+| 对象 | 路径 / 键 | 说明 |
+|---|---|---|
+| 唤醒脚本 | `scripts/research_duty.sh` | 探活服务 → 拼提示词 → `dsh --profile headless` 单次运行 → 落日志 |
+| systemd 单元 | `install/research-duty.{service,timer}` | `OnCalendar=Mon..Fri 16:50`（`Persistent=true` 补跑错过的触发） |
+| 任务队列 | SQLite 表 `research_tasks` | 状态机 `pending/running/done/failed`；`TASK_MAX_ATTEMPTS=3`、`TASK_TIMEOUT_MINUTES=30` |
+| 任务种类 | `daily_brief` / `factor_patrol` / `mining_round` | 白名单；载荷只含结构化引用（`TASK_PAYLOAD_KEYS`），无自由文本 |
+| 入队作业 | `enqueue_research` | 基础链尾（digest 之后）自动入队，**零 LLM**；研究与交易开关解耦 |
+| 领取/回报 | `mcp__quantwb__research_tasks_claim` / `..._report` | 执行体（Harness 会话或 headless）经 MCP 调用；`research-tasks-list` 只给 Web |
+| 日志 | `~/.dsh/logs/research-duty-<时间戳>.log` | 每次唤醒一份；脚本 stdout/stderr 全文 |
+
+### 安装与启停（systemd user）
+
+```bash
+mkdir -p ~/.config/systemd/user
+cp install/research-duty.service install/research-duty.timer ~/.config/systemd/user/
+# 路径按实际安装位置替换（单元内 %h/dsh-trading-agents 为示例）
+systemctl --user daemon-reload
+systemctl --user enable --now research-duty.timer
+systemctl --user list-timers research-duty.timer     # 看 NEXT
+systemctl --user status research-duty.timer
+journalctl --user -u research-duty.service -n 50     # 单次运行记录（与脚本日志互为印证）
+```
+
+- **停用**：`systemctl --user disable --now research-duty.timer`。停用不影响队列——
+  任务照常入队，只是等你打开会话时补跑。
+- **cron 等价**（不想用 systemd 时；同样的行也写在 `install/research-duty.timer` 注释里）：
+  ```
+  50 16 * * 1-5 /home/<user>/dsh-trading-agents/scripts/research_duty.sh >> ~/.dsh/logs/research-duty-cron.log 2>&1
+  ```
+- **时刻依据**：`enqueue_research` 在各市场链尾（本机默认 SH 16:00 收盘后约 16:15–16:30
+  跑完），16:50 唤醒留余量；港美股任务在下一次唤醒被消费（**不丢、只延后**）。
+- **手动演练**（不装定时器也能跑）：
+  ```bash
+  ~/.dsh/trading-venv/bin/python -m trading_core enqueue-research --market SH   # 手工入队
+  scripts/research_duty.sh                                                      # 单次唤醒
+  ```
+
+### 与「会话打开补跑」的关系（兜底语义）
+
+两条路径消费**同一张表**：定时器唤醒 headless 会话，或你打开/恢复会话时由 Harness 读队列
+补跑。互斥靠状态迁移（`claim_task` 只把 `pending` 迁 `running`），不会重复执行。
+定时器没装、机器关机、headless 被杀，都只是**延后**：超时的 `running` 在下次领取时被回收
+（`reclaim_tasks`，幂等），`attempts` 达 3 次才判 `failed`。
+
+### 排查表
+
+| 现象 | 含义 | 处置 |
+|---|---|---|
+| 脚本退出码 127，提示「找不到 dsh」 | `dsh` 不在 PATH | 用 `DSH_BIN=/abs/path/to/dsh` 指定，或修好 PATH 后重跑 |
+| 脚本退出码 2，提示「平台服务不可达」 | 队列端点由服务提供，服务没起 | 启动服务或确认 platform-autostart；脚本**不会**自己拉起服务 |
+| 脚本退出码 124，提示「超过上限已中止」 | 单次值班超 `DSH_DUTY_TIMEOUT`（默认 1800s） | 未完成任务留在队列，下次唤醒/开会话继续；持续超时先看日志卡在哪一步 |
+| 队列一直 `pending` | 定时器没跑或服务没起 | 查 `systemctl --user list-timers research-duty.timer` 与 `~/.dsh/logs/research-duty-*.log` |
+| 任务长期 `running` | 执行体死在半路（headless 被杀/会话中断） | 下次 `claim` 自动回收；急用可手工触发一次唤醒让 `reclaim` 生效 |
+| 任务被拒领 + critical 告警 | 载荷被直改库塞进了自由文本（队列即攻击面） | **队列暂停在队首**（fail-closed）。人工核对 `research_tasks.payload`，修正或删除该行后才继续 |
+| `attempts=3` 转 `failed` | 坏任务不无限重试（防烧额度） | 看 `err` 字段定位；确认是任务本身问题再人工重新入队 |
+| 日志为空但退出码 0 | 队列本来为空（非交易日/已消费完） | 属预期；要验证链路就手工 `enqueue-research` 再来一次 |
+
+排查入口：
+
+```bash
+sqlite3 ~/.dsh/trading-data/trading.sqlite \
+  "SELECT task_id,kind,status,attempts,created_at,err FROM research_tasks ORDER BY created_at DESC LIMIT 10;"
+```
+
 ## 演练记录（待 WP4 daemon 合并后执行）
 
 > 以下四场景须在 WP4 daemon 合并、`install_plugins.py link` 同步后按上文步骤实际执行，输出原文（JSON/命令回显）粘贴到对应条目，并回填至 `docs/superpowers/plans/2026-09-14-wp5-ops-acceptance.md` 的 WP5 验收记录。
