@@ -22,6 +22,7 @@ import { Card, Col, Row, Space, Statistic, Table, Tag, Tooltip, Typography } fro
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { num, stampOf } from "../services/format.jsx";
 import { modeBadge } from "../services/mode.js";
+import { fieldState } from "../services/fieldState.js";
 import { LineChart } from "../charts/line.jsx";
 import { ALERT_LEVEL_COLOR, parseHeartbeat } from "./schedule.jsx";
 
