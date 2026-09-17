@@ -136,21 +136,40 @@ REST（否则原样回退 MCP，默认通道行为逐字不变）。通道选择
 | 下单/撤单 | `execute.run` → `core_broker.place` | 同上 |
 | 对账（订单/持仓） | `reconcile.daily` | 同上 |
 | sync 五项（rehab/statements/估值/分红/经济日历） | `trading_core.sync` / `events` / `factors` | `trading_datasource.channel.fetch` |
+| **K 线同步**（增量/回填，全市场日线） | `sync.sync_bars_incremental` / `backfill_bars` → `market.load_raw_bars`、`market.load_bars` 富途腿 | 同上（`market.history_kline`） |
+| **交易日历** | `calendar.sync_calendar` | 同上（`market.trading_days`） |
+| **指数成分股** | `sync.sync_universe` | 同上（`f10.valuation_index_stocks`——官方等价端点，见 §A-1 补记） |
 
-**回退可观测性（如实披露）**：`channel.fetch`（sync 五项）返回第二元素 `"mcp(fallback)"`，
-调用方可据此告警；`channel.sim_call` 出来的 callable 只返回数据，**回退标记在 sim 调用
-路径被丢弃**（遗留项，运维侧目前靠「凭据是否配置」判断，见
+**A-1 补记（阶段 A 审查修复，2026-09-17）**：上表末尾三行是审查发现的**硬编码 MCP 残留**——
+此前 K 线同步、交易日历、指数成分股各自直连 `futu_mcp.call_tool`，`futu_channel=openapi`
+下**并未闭环**。现三条腿统一经 `channel.fetch` 分派。形状核对（官方文档 2026-09-17）：
+K 线的 `kline_list[]` 与 MCP 同字段（官方 `date` 为 int YYYYMMDD，`market.fetch_futu` 的
+`str()` 归一兼容；入参 `autype` MCP 字符串 ↔ REST 枚举 int 由调用点显式转换）；交易日历
+`trading_days[]` 与 MCP 逐字段一致；指数成分股的**官方等价端点**是
+`GET /quote/valuation/index-stocks`（`stock_list[].symbol` + `pagination{has_more,next_key}`、
+limit≤50 同形），**三腿都不存在「无等价端点」问题**。真机抽样三腿 `channel_used=openapi`
+（详见 [TOOL-LIMITS.md](TOOL-LIMITS.md) §九之一 第 5 条）。**本补记只覆盖这三条腿**：
+`instruments.py`/`quality.py` 两处脚本路径与 `positions.py` 非 sim 工具按通道表
+「未 REST 化的读取」如实登记，不在本次修复范围。
+
+**回退可观测性（如实披露）**：`channel.fetch`（sync 五项与上述三腿）返回第二元素
+`"mcp(fallback)"`，调用方可据此告警；`channel.sim_call` 出来的 callable 只返回数据，
+**回退标记在 sim 调用路径被丢弃**（遗留项，运维侧目前靠「凭据是否配置」判断，见
 [HANDOVER.md](HANDOVER.md) §七）。两条路径的共同语义：REST 调用失败**原样上抛、不静默
-换通道**（`tests/test_wp13_e2e.py` 的 `test_rest_failure_does_not_switch_to_mcp` 钉住）。
+换通道**（`tests/test_wp13_e2e.py` 的 `test_rest_failure_does_not_switch_to_mcp` 与
+`tests/test_wp13_sync_channel.py::SyncLegsChannelTests` 共同钉住）。`load_bars` 的
+**数据源降级链**（富途 → 新浪/Yahoo）不属通道分派范围，语义不变。
 
 **真机复核（2026-09-17）**：`scripts/futu_openapi_check.py --dataplane` **41/41 ok**；
 sim 只读路径经生产分派抽样（9 账户 / 8 持仓 / `total_asset` 权益 / 历史订单可读）；
+**三条同步腿经生产分派抽样**（K 线 3 根最新 2026-09-17 / 日历 23 个交易日 /
+SH.000300 成分 300 只 6 页游标跑通）；
 `f10.statements` 与 `f10.dividends` 的 REST 容器键实测为 `report_list` / `dividend_list`
 （与 MCP 同名，双键兜底的第一支即真实契约，见 TOOL-LIMITS §九）。
 
 | 通道 | WP8 后定位 | WP13 后事实 |
 |---|---|---|
-| 工作台 OpenAPI（`mcp__quantwb__*` + Web） | **唯一权威通道**：行情/交易/推送/账户全链路，写路径唯一（闸门链 + 业务确认） | `futu_channel=openapi` 为**完整通道**：行情/交易/推送/**sync 五项**/**计划生成与对账的券商取数**/**模拟交易九端点**全 REST；默认 `mcp` 行为逐字不变 |
+| 工作台 OpenAPI（`mcp__quantwb__*` + Web） | **唯一权威通道**：行情/交易/推送/账户全链路，写路径唯一（闸门链 + 业务确认） | `futu_channel=openapi` **已 REST 化的腿（可逐项核对）**：①行情（实时/K 线/资金流/期权/筛选/基础数据）②交易（下单/改单/撤单/确认/订单/成交/账户）③WS 推送（行情 + 交易事件）④sync 五项（复权/财报/估值/分红/经济日历）⑤**K 线同步**（`load_raw_bars`/`load_bars` 富途腿）⑥**交易日历**⑦**指数成分股**⑧计划生成与对账的券商取数 ⑨模拟交易九端点。**未 REST 化的读取（如实登记，勿误以为全覆盖）**：a) workbench 脚本 `instruments.py`（服务 `instrument` 端点的快照/基础信息）与 `quality.py`（服务 `quality` 端点的财报核对）仍走 MCP 容器——两者是脚本路径，不在 A-1 三腿范围内，REST 等价端点已存在（`market.stock_quote`/`market.stock_basicinfo`/`f10.statements`），列为后续迁移项；b) `positions.py` 非 sim 工具（live 账户查询）按 `channel.sim_call` 的 7 工具翻译表边界保留 MCP，live 账户的权威 REST 读取在闸门/`OpenApiTrade` 路径；c) `load_bars` 的新浪/Yahoo 降级源非富途通道（设计如此）。默认 `mcp` 行为逐字不变 |
 | Harness 直连富途（`mcp__futu__*`） | **只读研究**（不变）：写类仍被 policy 拒绝并指引工作台 | 不变 |
 | 托管 MCP（`futu-mcp` preset 行，91 工具） | **可选只读研究通道**（preset 默认 disabled——用户可自行启用做自由研究）；写通道唯一在工作台 | 在服务侧降为 **`futu_channel=mcp`（默认）与 openapi 凭据缺失时的回退通道**；分派实现唯一在 `trading_datasource.channel` |
 | SkillHub | 仅作能力对照，不作为集成通道（其 OpenD 形态与单进程服务冲突） | 不变 |

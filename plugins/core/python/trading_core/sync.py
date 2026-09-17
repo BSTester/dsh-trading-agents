@@ -194,18 +194,39 @@ def merge_announcements_akshare(conn, period, akshare_module=None):
     return {"matched": matched, "rows": int(len(df)), "skipped": skipped}
 
 
+def _mcp_universe(tool, params):
+    """成分股的 MCP 取数（两参调用，与改造前 ``fetcher = fetcher or call_tool`` 逐字等价）。"""
+    return call_tool(tool, params)
+
+
 def sync_universe(conn, index_symbol, as_of, fetcher=None, bias_note=UNIVERSE_BIAS_NOTE,
-                  limit=50):
+                  limit=50, *, channel_name=None, home=None, client=None,
+                  credential_path=None):
     """指数成分快照：quote_valuation_index_component_stock_list 键集分页（limit≤50；
     实测协议 2026-09-14：游标在响应的 pagination.next_key，stop 于 pagination.has_more=false，
-    tools/list schema 同口径）。bias_note 承载缺口②的幸存者偏差标注。"""
-    fetcher = fetcher or call_tool
+    tools/list schema 同口径）。bias_note 承载缺口②的幸存者偏差标注。
+
+    取数通道（WP13 A-1）：未注入 ``fetcher`` 时经 ``trading_datasource.channel.fetch``
+    分派——openapi 走 ``f10.valuation_index_stocks``（``GET /quote/valuation/index-stocks``，
+    **官方等价端点**：指数成分股估值列表，2026-09-17 锁定表 §C.5 + 官方文档复核）。
+    两通道同形：``stock_list[].symbol`` + ``pagination{has_more, next_key}``、``limit`` 上限
+    同为 50（官方文档「单次最多 50 条，更多数据请通过 next_key 翻页」与 MCP 一致），
+    故 ``openapi_params`` 复用同一份 ``args``，无需 adapter。REST 失败原样上抛。
+    """
     symbols, next_key, pages = [], None, 0
     while pages < 40:  # 页数上限：2000 成分 / 50 每页，兼防服务端游标异常循环
         args = {"symbol": index_symbol, "limit": limit}
         if next_key is not None:
             args["next_key"] = next_key
-        data = fetcher("quote_valuation_index_component_stock_list", args) or {}
+        if fetcher is not None:
+            data = fetcher("quote_valuation_index_component_stock_list", args) or {}
+        else:
+            data, _used = channel.fetch(
+                "quote_valuation_index_component_stock_list", args,
+                method="f10.valuation_index_stocks", mcp_call=_mcp_universe,
+                channel=channel_name, home=home, client=client,
+                credential_path=credential_path)
+            data = data or {}
         page = data.get("stock_list") or []
         symbols.extend(r.get("symbol") for r in page if r.get("symbol"))
         pagination = data.get("pagination") or {}

@@ -219,6 +219,11 @@ class RawChunkTests(unittest.TestCase):
     auto_adjusted），违反规格 §4.2 规则 2「落库一律原始价 + 因子表」——
     这里锁住分块合并、按 t 去重、游标逐块前移与三种终止路径。
     全部离线：假 call_tool 按页发数。
+
+    **``channel_name="mcp"`` 是刻意的钉死**（WP13 A-1 起富途腿会按
+    ``trading-platform.json`` 的 ``futu_channel`` 分派）：开发机自己的配置可能正是
+    ``openapi`` 且有凭据，不钉死就会绕过本文件注入的 ``market.call_tool`` 替身、
+    真去发 REST 请求——离线用例必须在任何机器配置下都走 MCP 替身。
     """
 
     def _patched_pages(self, pages):
@@ -245,7 +250,7 @@ class RawChunkTests(unittest.TestCase):
         ]
         patched, calls = self._patched_pages(pages)
         with patched:
-            bars, source, stale = market.load_raw_bars("600519", "1d", 2000)
+            bars, source, stale = market.load_raw_bars("600519", "1d", 2000, channel_name="mcp")
 
         self.assertEqual(source, "futu/raw_chunk")
         self.assertFalse(stale)
@@ -272,7 +277,7 @@ class RawChunkTests(unittest.TestCase):
                                _futu_daily_row("20260105", 5)]}
         patched, calls = self._patched_pages([page, page, page, page])
         with patched:
-            bars, _source, _stale = market.load_raw_bars("600519", "1d", 2000)
+            bars, _source, _stale = market.load_raw_bars("600519", "1d", 2000, channel_name="mcp")
 
         self.assertEqual(len(calls), 2, "第二批无进展（游标不再前移）就必须停")
         self.assertEqual(len(bars), 3)
@@ -292,7 +297,7 @@ class RawChunkTests(unittest.TestCase):
         patched, calls = self._patched_pages([self._page("2026-01-15", 10),
                                               self._page("2025-12-22", 10)])
         with patched:
-            bars, _source, _stale = market.load_raw_bars("600519", "1d", 20)
+            bars, _source, _stale = market.load_raw_bars("600519", "1d", 20, channel_name="mcp")
         self.assertEqual(len(calls), 2, "10 根 < 20 根才翻第二页；20 根凑满不再翻第三页")
         self.assertEqual(len(bars), 20, "凑满即停：整页合并不截断")
 
@@ -301,14 +306,14 @@ class RawChunkTests(unittest.TestCase):
         with patch.object(market, "call_tool",
                           side_effect=futu_mcp.FutuUnavailable("MCP 请求失败：timeout")):
             with self.assertRaises(RuntimeError) as caught:
-                market.load_raw_bars("600519", "1d", 2000)
+                market.load_raw_bars("600519", "1d", 2000, channel_name="mcp")
         self.assertIn("取数失败", str(caught.exception))
 
     def test_empty_history_on_first_batch_is_an_error_not_empty_success(self):
         """首批即空 K 线：0 行「成功」是假成功，必须报错（宁缺毋假）。"""
         with patch.object(market, "call_tool", return_value={"kline_list": []}):
             with self.assertRaises(RuntimeError):
-                market.load_raw_bars("688888", "1d", 2000)
+                market.load_raw_bars("688888", "1d", 2000, channel_name="mcp")
 
     def test_fetch_futu_without_autype_keeps_legacy_server_default(self):
         """不传 autype 时 fetch_foutu 维持旧行为（不带该键，服务端默认前复权）。
@@ -324,7 +329,7 @@ class RawChunkTests(unittest.TestCase):
                                     "low": 0.5, "close": 1.5, "volume": 10}]}
 
         with patch.object(market, "call_tool", side_effect=fake_call_tool):
-            bars, source = market.fetch_futu("600519", "1d", 5)
+            bars, source = market.fetch_futu("600519", "1d", 5, channel_name="mcp")
         self.assertEqual(source, "futu/quote_history_kline")
         self.assertEqual(captured["end"], date.today().isoformat(), "end 缺省=今天（向后兼容）")
         self.assertNotIn("autype", captured)

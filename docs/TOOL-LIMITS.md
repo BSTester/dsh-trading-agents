@@ -395,6 +395,36 @@ F10 的 26 section + 衍生品 4 项；自选 3 项与模拟交易 9 项不在�
 结论：双兜底的**第一支即真实契约**，`items` 支保留为「data 层为数组 + 信封分页」归一形状
 的防御（经济日历搜索那类，见 §八），实现无需修改。
 
+**5）三条同步腿的硬编码 MCP 残留修复（A-1 审查补记，2026-09-17 真机）**：上述第 4 条修好了
+计划生成与对账，但**同步侧仍有三条腿直连 MCP**——K 线同步（`market.load_raw_bars`/`load_bars`）、
+交易日历（`calendar.sync_calendar`）、指数成分股（`sync.sync_universe`），与「openapi 为完整
+通道」的承诺不符。现三条腿统一经 `trading_datasource.channel.fetch` 分派：
+
+| 腿 | REST 方法（路径） | 形状核对（官方文档 2026-09-17 复核） | 真机 `channel_used` |
+|---|---|---|---|
+| K 线（增量 + 回填） | `market.history_kline`（`GET /quote/{symbol}/history-kline`） | `kline_list[]` 与 MCP 同字段；官方 **`date` 是 int** YYYYMMDD（MCP 是 8 位字符串）→ `str()` 归一同时兼容；**入参 `autype`：MCP 字符串 `"0"/"2"` ↔ REST 枚举 int**（调用点显式转换，不藏进助手） | `openapi`（3 根，最新 2026-09-17） |
+| 交易日历 | `market.trading_days`（`GET /quote/trading-days`） | `trading_days[]{time,trade_date_type,trade_second}` 与 MCP **逐字段一致**（官方文档 `basic-data/trading-days`） | `openapi`（30 天窗口 23 个交易日） |
+| 指数成分股 | `f10.valuation_index_stocks`（`GET /quote/valuation/index-stocks`） | **官方等价端点**（指数成分股估值，锁定表 §C.5）：`stock_list[].symbol` + `pagination{has_more,next_key}`、`limit` 上限同为 50 → 与 MCP 同形，无需 adapter | `openapi`（SH.000300 成分 300 只，6 页游标跑通） |
+
+- `--dataplane` 41 项**已含** `f10.valuation_index_stocks`（本轮复跑 41/41 `ok`）；
+- **不存在「官方无等价端点」的腿**——三腿全部迁移，无保留 MCP 的例外；
+- **未迁移项（如实登记，勿误读为全覆盖）**：①workbench 脚本 `instruments.py`（服务
+  `instrument` 端点：实时快照 + 基础信息）与 `quality.py`（服务 `quality` 端点：财报质量
+  核对）仍走 MCP 容器——两者是脚本路径，不在 A-1 三腿范围，REST 等价端点已存在
+  （`market.stock_quote`/`market.stock_basicinfo`/`f10.statements`），列为后续迁移项；
+  ②`positions.py` 非 sim 工具（live 账户查询）按 `channel.sim_call` 的 7 工具翻译表边界
+  保留 MCP，live 账户的权威 REST 读取在闸门/`OpenApiTrade` 路径；③`load_bars` 的
+  新浪/Yahoo 降级源非富途通道（设计如此，不在分派范围）；
+- `load_bars` 的**数据源降级链**（富途 → 新浪/Yahoo）**不在**通道分派范围内，语义不变；
+  REST 失败一律原样上抛（不静默换通道）；
+- 注入缝保持：`market.fetch_futu`/`load_raw_bars`/`load_bars` 新增 **keyword-only**
+  `channel_name`/`home`/`client`/`credential_path`，未给则读配置且**一个关键字都不下传**
+  （patched 替身的既有离线用例逐字不变）；`calendar.sync_calendar(fetcher=)`、
+  `sync.sync_universe(fetcher=)` 注入语义不变；离线用例一律钉 `channel_name="mcp"`
+  （开发机自身 `trading-platform.json` 可能正是 `openapi`，不钉会绕过替身真发 REST）；
+- 回归：`tests/test_wp13_sync_channel.py::SyncLegsChannelTests`（8 项：三腿 openapi 优先 /
+  回退标注 `mcp(fallback)` / REST 失败不换通道 / 降级链不变 / 显式通道非法值本地拒绝）。
+
 **4）通道分裂的修复与回归钉（本任务的实质产出）**：`planner.plan_auto` 与
 `reconcile.daily` 曾各自硬编码 `futu_mcp.call_tool` 作缺省通道——`futu_channel=openapi`
 下「下单执行走 REST、取持仓/对账走 MCP」，且 REST 失败会**静默落到 MCP**（限频/权限错误

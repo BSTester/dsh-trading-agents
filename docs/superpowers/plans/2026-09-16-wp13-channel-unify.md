@@ -30,7 +30,7 @@
 
 **文件**：修改 `plugins/core/python/trading_core/sync.py`（取数函数加 channel 分派）、`plugins/datasource/python/trading_datasource/futu_openapi.py`（`OpenApiBasicData.rehab` 已在 WP12、补 statements/valuation/dividends 三个 F10 端点方法——WP12 任务 3 已含 statements/dividends/valuation-detail，本任务只做接线）；测试 `tests/test_wp13_sync_channel.py`。
 
-- [ ] **步骤 1：失败测试**（双通道假件等价）：
+- [x] **步骤 1：失败测试**（双通道假件等价）：
 
 ```python
 def test_rehab_equal_shape_both_channels(self):
@@ -43,9 +43,29 @@ def test_statements_announced_at_preserved(self):
     ...
 ```
 
-- [ ] **步骤 2：验证失败** → **步骤 3：实现**：`sync.py` 取数入口统一 `_fetch(home, tool_name, openapi_method, **params)`（读 `futu_channel`；openapi 优先，凭据缺失回退 mcp）；经济日历（events 页的 `futu_economic_calendar`）、估值（`factors.valuation_values`）同样接 `_fetch`。
-- [ ] **步骤 4：通过**；三套绿。
-- [ ] **步骤 5：Commit**：`git commit -m "feat(core): sync 五项通道分派（openapi 优先 mcp 回退，落库口径不变）"`
+- [x] **步骤 2：验证失败** → **步骤 3：实现**：`sync.py` 取数入口统一 `_fetch(home, tool_name, openapi_method, **params)`（读 `futu_channel`；openapi 优先，凭据缺失回退 mcp）；经济日历（events 页的 `futu_economic_calendar`）、估值（`factors.valuation_values`）同样接 `_fetch`。
+- [x] **步骤 4：通过**；三套绿。
+- [x] **步骤 5：Commit**：`git commit -m "feat(core): sync 五项通道分派（openapi 优先 mcp 回退，落库口径不变）"`
+
+> **A-1 补记（2026-09-17，阶段 A 审查修复）**：本任务当时只覆盖了 sync 五项，
+> **三条腿仍硬编码 MCP**（与「openapi 为完整通道」的承诺不符）：K 线同步
+> （`market.load_raw_bars`/`load_bars`）、交易日历（`calendar.sync_calendar`）、
+> 指数成分股（`sync.sync_universe`）。现已补全，全部经 `trading_datasource.channel.fetch`
+> 分派：
+> - K 线 → `market.history_kline`（REST `autype` 枚举 int ↔ MCP 字符串的转换在调用点显式声明；
+>   官方 `date` 为 int YYYYMMDD，`str()` 归一同时兼容）；
+> - 交易日历 → `market.trading_days`（官方文档复核：响应与 MCP 逐字段同形，无需 adapter）；
+> - 指数成分股 → `f10.valuation_index_stocks`（`GET /quote/valuation/index-stocks`，
+>   **官方等价端点**，锁定表 §C.5 与本轮官方文档复核：`stock_list[].symbol` +
+>   `pagination{has_more,next_key}`、limit≤50 同形）——**不存在「无等价端点」的腿**。
+> 真机：三腿 `channel_used=openapi`（K 线 3 根最新 2026-09-17 / 日历 23 个交易日 /
+> SH.000300 成分 300 只 6 页）；回归 `tests/test_wp13_sync_channel.py::SyncLegsChannelTests`
+> 8 项 + 既有 `RawChunkTests` 钉死 `channel_name="mcp"`（开发机自身配置可能正是 openapi）。
+> **范围边界（如实登记）**：本补记只覆盖这三条腿；workbench 脚本
+> `instruments.py`（服务 `instrument` 端点）与 `quality.py`（服务 `quality` 端点）仍走
+> MCP 容器，`positions.py` 非 sim 工具按翻译表边界保留 MCP——详见 TOOL-LIMITS §九之一
+> 第 5 条与 architecture.md 通道表「未 REST 化的读取」。
+> 详见 TOOL-LIMITS §九之一 第 5 条与 architecture.md 通道表。
 
 ### 任务 2：OpenApiSimTrade + core_broker sim 分支
 
@@ -103,3 +123,14 @@ def test_statements_announced_at_preserved(self):
 - **遗留（如实登记）**：①sim 调用路径丢弃 `mcp(fallback)` 回退标记（HANDOVER §七）；
   ②sim REST 原生改单待更多样本（TOOL-LIMITS §九）。
 - 三套测试全绿：Python `OK (skipped=5)` / Node `66 pass` / Web `233 pass`。
+
+### WP13 阶段 A 审查修复（2026-09-17）
+
+- **A-1（核心承诺未闭环）**：三条同步腿（K 线 / 交易日历 / 指数成分股）的硬编码 MCP 残留已修复
+  （见任务 1 的「A-1 补记」）。验收口径自此成立：`futu_channel=openapi` 下**取数全 REST**，
+  唯一非富途通道的取数是 `load_bars` 的新浪/Yahoo 降级源（设计如此，非残留）。
+- **A-2**：本计划任务 1 四步勾选补齐；任务 0（`a7eecd3` 拆包 + 路径常量统一）、任务 2（`444e035`）、
+  任务 3（`8f2a14d`）勾选状态与实际提交一致。
+- **A-3**：`docs/architecture.md` 通道表 openapi 行改为**同一份可核对清单**（逐腿列出），
+  不再用「完整通道」一词带过；未走富途通道的取数单列一行说明。
+- 三套测试全绿：Python `Ran 1742 tests … OK (skipped=5)` / Node `66 pass` / Web `233 pass`。

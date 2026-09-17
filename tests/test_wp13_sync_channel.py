@@ -26,8 +26,9 @@ sys.path.insert(0, str(ROOT / "plugins" / "workbench" / "python"))
 sys.path.insert(0, str(ROOT / "platform"))
 
 from trading_datasource import channel  # noqa: E402
+from trading_datasource import market  # noqa: E402
 from trading_datasource.futu_openapi import OpenApiError, paths  # noqa: E402
-from trading_core import factors, store, sync  # noqa: E402
+from trading_core import calendar, factors, store, sync  # noqa: E402
 
 import events as events_mod  # noqa: E402  （workbench 脚本：分红/经济日历）
 
@@ -378,6 +379,272 @@ class DualChannelEquivalenceTests(unittest.TestCase):
         home = _home(self.root, raw="{not json")
         with self.assertRaises(ValueError):
             events_mod.futu_economic_calendar(home=home)
+
+
+# ---------------------------------------------------------------------------
+# A-1：K 线 / 交易日历 / 指数成分股三条同步腿的通道分派
+# ---------------------------------------------------------------------------
+# 这三条腿是 WP13 收口时漏掉的硬编码 MCP 残留（A-1 审查）。官方文档复核（2026-09-17）：
+#   * history-kline：REST ``data.kline_list[]`` 与 MCP 同字段；``date`` 官方为 **int**
+#     YYYYMMDD（MCP 为 8 位字符串）——market.fetch_futu 的 ``str()`` 归一同时兼容两者；
+#     入参 autype：MCP 是字符串 "0"/"2"，REST 是枚举 int（形状差异由调用点显式转换）。
+#   * trading-days：REST ``data.trading_days[]`` 与 MCP 逐字段一致（time/trade_date_type/
+#     trade_second），无需 adapter。
+#   * 指数成分股：官方等价端点是 ``GET /quote/valuation/index-stocks``（指数成分股估值，
+#     锁定表 §C.5）——``stock_list[].symbol`` + ``pagination{has_more,next_key}``、limit≤50
+#     与 MCP 同形。
+
+KLINE_MCP = {"kline_list": [
+    {"date": "20260107", "open": 6.0, "high": 8.0, "low": 5.0, "close": 7.0, "volume": 1000},
+    {"date": "20260106", "open": 5.0, "high": 7.0, "low": 4.0, "close": 6.0, "volume": 900}]}
+
+#: REST 官方形状：``date`` 为 int（YYYYMMDD）
+KLINE_REST = {"kline_list": [
+    {"date": 20260107, "open": 6.0, "high": 8.0, "low": 5.0, "close": 7.0, "volume": 1000},
+    {"date": 20260106, "open": 5.0, "high": 7.0, "low": 4.0, "close": 6.0, "volume": 900}]}
+
+CALENDAR_PAYLOAD = {"trading_days": [
+    {"time": "2026-09-11", "trade_date_type": "WHOLE", "trade_second": 14400},
+    {"time": "2026-09-12", "trade_date_type": "MORNING", "trade_second": 9000}]}
+
+INDEX_PAGE_1 = {"stock_list": [{"symbol": "SH.600519"}, {"symbol": "SH.601318"}]}
+INDEX_PAGE_2 = {"stock_list": [{"symbol": "SH.600036"}]}
+INDEX_PAGINATIONS = [{"has_more": True, "next_key": "2"}, {"has_more": False, "next_key": "-1"}]
+
+
+class PagingClient(RecordingClient):
+    """分页替身：``request_meta`` 按 ``paginations[path]`` 序列每页弹一个（模拟官方游标）。
+
+    ``responses`` 支持 ``callable(query)``（RecordingClient 既有口径），故可分页回放
+    多份 data —— 这里用闭包弹列表实现。
+    """
+
+    def __init__(self, responses=None, paginations=None, default=None):
+        super().__init__(responses, default)
+        self.paginations = {key: list(value)
+                            for key, value in (paginations or {}).items()}
+
+    def request_meta(self, method, path, query=None, json_body=None):
+        self.calls.append((method, path, query))
+        out = self._reply(path, query)
+        if isinstance(out, Exception):
+            raise out
+        pages = self.paginations.get(path) or []
+        return out, (pages.pop(0) if pages else None)
+
+
+def _kline_rows(count):
+    """构造 count 根连续日线（REST int date 形状），用于分块/凑满 limit 用例。"""
+    base = _dt.date(2026, 1, 20)
+    return [{"date": int((base - _dt.timedelta(days=i)).strftime("%Y%m%d")),
+             "open": 1.0, "high": 2.0, "low": 0.5, "close": 1.5, "volume": 10}
+            for i in range(count)]
+
+
+class SyncLegsChannelTests(unittest.TestCase):
+    """三条腿：openapi 优先 / 无凭据回退标注 / REST 失败原样上抛（绝不静默换通道）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = self.tmp.name
+        api_dir = Path(self.root) / "api"
+        api_dir.mkdir()
+        self.home_api = _home(api_dir, "openapi")
+        self.no_cred = _no_credentials(self.root)
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    # ------------------------------------------------------------ 腿 1：K 线
+
+    def test_kline_leg_rest_when_openapi_and_int_date_normalized(self):
+        """openapi 就绪 → REST 历史 K 线；官方 int 的 date 经 str() 归一为 ISO 日期。"""
+        client = RecordingClient({paths.HISTORY_KLINE_PATH.format(symbol="SH.600519"):
+                                  KLINE_REST})
+        bars, source = market.fetch_futu("600519", "1d", 5, home=self.home_api,
+                                        client=client)
+        self.assertEqual(source, "futu/quote_history_kline")   # 来源字面量不变
+        self.assertEqual([b["t"] for b in bars], ["2026-01-07", "2026-01-06"])
+        method, path, query = client.calls[0]
+        self.assertEqual((method, path), ("GET", paths.HISTORY_KLINE_PATH.format(
+            symbol="SH.600519")))
+        self.assertEqual(query["ktype"], 2)
+        self.assertEqual(query["num"], 5)
+        self.assertEqual(query["autype"], 1)   # 未显式传 autype → REST 服务端默认前复权
+
+    def test_raw_bars_leg_converts_autype_string_to_int(self):
+        """load_raw_bars 显式 autype="0"：MCP 收字符串，REST 必须收到枚举 int 0。"""
+        rows = _kline_rows(20)
+        client = RecordingClient({paths.HISTORY_KLINE_PATH.format(symbol="SH.600519"):
+                                  {"kline_list": rows}}, default={"kline_list": []})
+        bars, source, stale = market.load_raw_bars("600519", "1d", 20, channel_name="openapi",
+                                                   client=client)
+        self.assertEqual((source, stale), ("futu/raw_chunk", False))
+        self.assertEqual(len(bars), 20)
+        first_query = client.calls[0][2]
+        self.assertEqual(first_query["autype"], 0)
+        self.assertIsInstance(first_query["autype"], int)
+
+    def test_kline_leg_falls_back_to_mcp_without_credentials(self):
+        """openapi 配置但凭据未就绪 → 回退 mcp 并标 ``mcp(fallback)``（不静默失效）。"""
+        captured = {}
+
+        def fake_call_tool(name, args, **kwargs):
+            captured["name"], captured["args"] = name, dict(args)
+            return KLINE_MCP
+
+        with patch.object(market, "call_tool", side_effect=fake_call_tool):
+            data, used = channel.fetch("quote_history_kline", {"symbol": "SH.600519"},
+                                       method="market.history_kline", mcp_call=fake_call_tool,
+                                       home=self.home_api, credential_path=self.no_cred)
+        self.assertEqual(used, "mcp(fallback)")
+        self.assertEqual(data, KLINE_MCP)
+        self.assertEqual(captured["name"], "quote_history_kline")
+
+    def test_kline_leg_rest_failure_is_not_switched_to_mcp(self):
+        """REST 失败**原样上抛**：不得静默换通道（否则限频/权限错误伪装成 MCP 行为）。"""
+        from trading_datasource.futu_openapi import TransportError
+
+        client = RecordingClient({paths.HISTORY_KLINE_PATH.format(symbol="SH.600519"):
+                                  TransportError("429")})
+        calls = []
+        with patch.object(market, "call_tool",
+                          side_effect=lambda name, args, **kw: calls.append(name) or KLINE_MCP):
+            with self.assertRaises(TransportError):
+                market.fetch_futu("600519", "1d", 5, home=self.home_api, client=client)
+            with self.assertRaises(RuntimeError):   # load_raw_bars 按既有风格包装
+                market.load_raw_bars("600519", "1d", 20, channel_name="openapi", client=client)
+        self.assertEqual(calls, [], "REST 失败后不得回退 MCP")
+
+    def test_load_bars_degradation_chain_unchanged(self):
+        """通道分派不改变**数据源降级链**：富途失败仍回退新浪/雅虎（规格既有行为）。"""
+        row = {"t": "2026-01-05", "o": 1.0, "h": 2.0, "l": 0.5, "c": 1.5, "v": 10.0}
+        with patch.object(market, "fetch_futu", side_effect=RuntimeError("futu down")), \
+                patch.object(market, "fetch_a_share",
+                             return_value=([row], "akshare/sina")):
+            bars, source, stale = market.load_bars("600519", "1d", 30)
+        self.assertEqual((source, stale), ("akshare/sina", False))
+        self.assertEqual(len(bars), 1)
+
+    # ------------------------------------------------------- 腿 2：交易日历
+
+    def test_calendar_leg_rest_and_mcp_equal_rows(self):
+        """两通道同一份日历数据 → 落库行逐字段相等，且 REST 收到大写 market。"""
+        conn_api = store.connect(":memory:")
+        store.migrate(conn_api)
+        client = RecordingClient({paths.TRADING_DAYS_PATH: CALENDAR_PAYLOAD})
+        n_api = calendar.sync_calendar(conn_api, "sh", "2026-09-01", "2026-09-30",
+                                       home=self.home_api, client=client)
+
+        conn_mcp = store.connect(":memory:")
+        store.migrate(conn_mcp)
+        with patch.object(calendar, "_mcp_calendar",
+                          side_effect=lambda tool, params: CALENDAR_PAYLOAD):
+            n_mcp = calendar.sync_calendar(conn_mcp, "sh", "2026-09-01", "2026-09-30",
+                                           channel_name="mcp")
+
+        self.assertEqual((n_api, n_mcp), (2, 2))
+        self.assertEqual(store.trading_days(conn_api, "SH", "2026-09-01", "2026-09-30"),
+                         store.trading_days(conn_mcp, "SH", "2026-09-01", "2026-09-30"))
+        self.assertTrue(store.is_trading_day(conn_api, "SH", "2026-09-11"))
+        method, path, query = client.calls[0]
+        self.assertEqual((method, path), ("GET", paths.TRADING_DAYS_PATH))
+        self.assertEqual(query["market"], "SH")
+        conn_api.close()
+        conn_mcp.close()
+
+    def test_calendar_leg_falls_back_and_rest_failure_propagates(self):
+        """无凭据回退 mcp；REST 失败原样上抛且不触达 MCP。"""
+        from trading_datasource.futu_openapi import TransportError
+
+        seen = []
+
+        def fake_mcp(tool, params):
+            seen.append(tool)
+            return CALENDAR_PAYLOAD
+
+        conn = store.connect(":memory:")
+        store.migrate(conn)
+        with patch.object(calendar, "_mcp_calendar", side_effect=fake_mcp):
+            n = calendar.sync_calendar(conn, "SH", "2026-09-01", "2026-09-30",
+                                       home=self.home_api, credential_path=self.no_cred)
+            self.assertEqual(n, 2)
+            self.assertEqual(seen, ["quote_trading_days"])
+            seen.clear()
+            client = RecordingClient({paths.TRADING_DAYS_PATH: TransportError("down")})
+            with self.assertRaises(TransportError):
+                calendar.sync_calendar(conn, "SH", "2026-09-01", "2026-09-30",
+                                       home=self.home_api, client=client)
+            self.assertEqual(seen, [], "REST 失败后不得回退 MCP")
+        conn.close()
+
+    # ----------------------------------------------------- 腿 3：指数成分股
+
+    def _index_pages(self, pages):
+        queue = list(pages)
+        return lambda query: queue.pop(0) if queue else {"stock_list": []}
+
+    def test_universe_leg_rest_paging_uses_documented_equivalent_endpoint(self):
+        """成分股走官方等价端点 ``valuation/index-stocks``，分页游标语义与 MCP 一致。"""
+        client = PagingClient(
+            {paths.F10_VALUATION_INDEX_STOCKS_PATH:
+             self._index_pages([INDEX_PAGE_1, INDEX_PAGE_2])},
+            {paths.F10_VALUATION_INDEX_STOCKS_PATH: INDEX_PAGINATIONS})
+        conn = store.connect(":memory:")
+        store.migrate(conn)
+        n = sync.sync_universe(conn, "SH.000300", "2026-09-17", home=self.home_api,
+                               client=client)
+        self.assertEqual(n, 3)
+        self.assertEqual(store.read_universe(conn, "2026-09-17", "SH.000300")["symbols"],
+                         sorted(["600519", "601318", "600036"]))
+        self.assertEqual(len(client.calls), 2, "两页：has_more=True 后继续，False 停止")
+        self.assertEqual([c[1] for c in client.calls],
+                         [paths.F10_VALUATION_INDEX_STOCKS_PATH] * 2)
+        self.assertEqual(client.calls[0][2]["limit"], 50)
+        self.assertNotIn("next_key", client.calls[0][2])   # 首页不带游标
+        self.assertEqual(client.calls[1][2]["next_key"], "2")
+        conn.close()
+
+    def test_universe_leg_mcp_equivalence_and_failure_paths(self):
+        """MCP 注入路径与 REST 路径落库相等；REST 失败原样上抛不换通道。"""
+        conn_api = store.connect(":memory:")
+        store.migrate(conn_api)
+        client = PagingClient(
+            {paths.F10_VALUATION_INDEX_STOCKS_PATH:
+             self._index_pages([INDEX_PAGE_1, INDEX_PAGE_2])},
+            {paths.F10_VALUATION_INDEX_STOCKS_PATH: INDEX_PAGINATIONS})
+        sync.sync_universe(conn_api, "SH.000300", "2026-09-17", home=self.home_api,
+                           client=client)
+
+        conn_mcp = store.connect(":memory:")
+        store.migrate(conn_mcp)
+        # MCP 形状：分页游标在**同一份响应体**里（与 REST 的信封 pagination 语义等价）
+        queue = [{**INDEX_PAGE_1, "pagination": INDEX_PAGINATIONS[0]},
+                 {**INDEX_PAGE_2, "pagination": INDEX_PAGINATIONS[1]}]
+        sync.sync_universe(conn_mcp, "SH.000300", "2026-09-17",
+                           fetcher=lambda name, args: queue.pop(0) if queue
+                           else {"stock_list": []})
+        self.assertEqual(store.read_universe(conn_api, "2026-09-17", "SH.000300")["symbols"],
+                         store.read_universe(conn_mcp, "2026-09-17", "SH.000300")["symbols"])
+
+        from trading_datasource.futu_openapi import TransportError
+        raised = []
+        with patch.object(sync, "_mcp_universe",
+                          side_effect=lambda tool, params: raised.append(tool) or {}):
+            bad = RecordingClient({paths.F10_VALUATION_INDEX_STOCKS_PATH:
+                                   TransportError("down")})
+            with self.assertRaises(TransportError):
+                sync.sync_universe(conn_api, "SH.000300", "2026-09-17", home=self.home_api,
+                                   client=bad)
+            self.assertEqual(raised, [], "REST 失败后不得回退 MCP")
+        conn_api.close()
+        conn_mcp.close()
+
+    def test_explicit_channel_override_rejects_illegal_value(self):
+        """``channel`` 显式覆盖只接受 mcp/openapi：非法值本地拒绝（零网络往返）。"""
+        with self.assertRaises(ValueError):
+            channel.fetch("quote_trading_days", {}, method="market.trading_days",
+                          channel="OPENAPI")
 
 
 class _NoAkshare:

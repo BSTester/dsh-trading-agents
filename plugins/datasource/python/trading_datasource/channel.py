@@ -127,12 +127,13 @@ def _group_classes():
     global _GROUP_CLASSES
     if _GROUP_CLASSES is None:
         from .futu_openapi import (  # noqa: PLC0415
-            OpenApiBasicData, OpenApiDerivatives, OpenApiF10, OpenApiIpo, OpenApiPlate,
-            OpenApiScreen, OpenApiShort, OpenApiSimTrade, OpenApiWatchlist)
+            OpenApiBasicData, OpenApiDerivatives, OpenApiF10, OpenApiIpo, OpenApiMarket,
+            OpenApiPlate, OpenApiScreen, OpenApiShort, OpenApiSimTrade, OpenApiWatchlist)
         _GROUP_CLASSES = {"basic": OpenApiBasicData, "derivatives": OpenApiDerivatives,
-                          "f10": OpenApiF10, "ipo": OpenApiIpo, "plate": OpenApiPlate,
-                          "screen": OpenApiScreen, "short": OpenApiShort,
-                          "simtrade": OpenApiSimTrade, "watchlist": OpenApiWatchlist}
+                          "f10": OpenApiF10, "ipo": OpenApiIpo, "market": OpenApiMarket,
+                          "plate": OpenApiPlate, "screen": OpenApiScreen,
+                          "short": OpenApiShort, "simtrade": OpenApiSimTrade,
+                          "watchlist": OpenApiWatchlist}
     return _GROUP_CLASSES
 
 
@@ -155,7 +156,7 @@ def call_openapi(client, method, params):
 
 
 def fetch(tool, params, *, method, openapi_params=None, adapter=None, home=None,
-          client=None, credential_path=None, mcp_call=None):
+          client=None, credential_path=None, mcp_call=None, channel=None):
     """按通道取一次数，返回 ``(data, channel_used)``。
 
     ``tool``/``params``       —— MCP 工具名与 MCP 侧参数（原样透传 ``call_tool``）
@@ -166,19 +167,28 @@ def fetch(tool, params, *, method, openapi_params=None, adapter=None, home=None,
     ``client``                —— 注入即可钉住 openapi 通道（测试确定性；与 server
                                  ``FutuData`` 的「注入替身视为可用」同口径）
     ``mcp_call``              —— 注入 MCP 替身（缺省 ``futu_mcp.call_tool``）
+    ``channel``               —— **显式通道覆盖**（``"openapi"|"mcp"``）；``None``=读配置。
+                                 为什么需要：①调用方已知通道时免每标的重读配置文件
+                                 （批量同步逐标的调用）；②离线测试必须能钉住通道——
+                                 开发机自己的 ``trading-platform.json`` 可能正是 openapi，
+                                 不钉住的话「patch 掉 MCP 替身」的用例会静默走到 REST。
+                                 非法值本地拒绝（零网络往返），不猜、不静默降级。
 
     回退语义：``channel=openapi`` 且 ``client`` 未注入且凭据未就绪 → 走 mcp 并标
     ``"mcp(fallback)"``；此时**不尝试** REST（避免明知无凭据还发一次注定失败的请求）。
     """
-    channel = channel_of(home)
-    if channel == CHANNEL_OPENAPI and (client is not None or openapi_ready(credential_path)):
+    if channel is not None and channel not in (CHANNEL_MCP, CHANNEL_OPENAPI):
+        raise ValueError(f"channel 取值非法：{channel!r}（允许：mcp/openapi）")
+    used_channel = channel if channel is not None else channel_of(home)
+    if used_channel == CHANNEL_OPENAPI and (client is not None
+                                            or openapi_ready(credential_path)):
         used_client = client if client is not None else openapi_client(credential_path)
         kwargs = dict(openapi_params if openapi_params is not None else params)
         data = call_openapi(used_client, method, kwargs)
         return (_apply(adapter, data), CHANNEL_OPENAPI)
     call = mcp_call if mcp_call is not None else _mcp_call()
     data = call(tool, params)
-    used = CHANNEL_MCP_FALLBACK if channel == CHANNEL_OPENAPI else CHANNEL_MCP
+    used = CHANNEL_MCP_FALLBACK if used_channel == CHANNEL_OPENAPI else CHANNEL_MCP
     return (_apply(adapter, data), used)
 
 

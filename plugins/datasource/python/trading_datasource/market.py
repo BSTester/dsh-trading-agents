@@ -19,6 +19,7 @@ import re
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
+from . import channel
 from .futu_mcp import FutuUnavailable, call_tool
 
 DSH_HOME = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
@@ -124,13 +125,33 @@ class FutuEmptyKline(FutuUnavailable):
     对 load_raw_bars 是「历史翻尽」的正常终止信号——两者语义不同，须可区分。"""
 
 
-def fetch_futu(ticker, period, limit, end=None, autype=None):
+def _mcp_kline(tool, params):
+    """K 线的 MCP 取数（``client_name`` 归因字面量保持既有值）。
+
+    ``call_tool`` 在**调用时**从模块全局解析——``patch.object(market, "call_tool")``
+    的离线注入缝因此继续生效（本函数只是把同一调用交给 ``channel.fetch`` 分派）。
+    """
+    return call_tool(tool, params, client_name="trading-datasource/market")
+
+
+def fetch_futu(ticker, period, limit, end=None, autype=None, *, channel_name=None,
+               home=None, client=None, credential_path=None):
     """富途历史 K 线（全市场、分钟/日线）。end 缺省=今天（向后兼容）。
 
     autype：None=不带该键（服务端默认 1=前复权，load_bars 历史口径不变）；
     "0"=不复权（原始价，落库口径，见 load_raw_bars）；"2"=后复权。
     实测（2026-09-15，tools/list schema）：不传 autype 拿到的是前复权价——
     这正是 K1 的根因，「走富途」不等于「拿到原始价」。
+
+    取数通道（WP13 A-1）：经 ``trading_datasource.channel.fetch`` 分派——
+    ``futu_channel=openapi`` 且有凭据走 REST（``market.history_kline``，
+    ``GET /quote/{symbol}/history-kline``），否则 mcp（无凭据时标注回退）。
+    **两边响应同形**（``kline_list[]``，官方文档与 MCP 同一后端；``date`` 在官方文档里
+    是 int YYYYMMDD，本函数的 ``str()`` 归一同时兼容 int 与 8 位字符串），故无需 adapter。
+    形状差异只在**入参**：MCP 的 ``autype`` 是字符串（"0"/"2"），REST 是枚举 int，
+    由 ``openapi_params`` 显式转换（不藏进助手——调用点看得见差异）。
+    REST 失败**原样上抛**，绝不静默换通道（换通道会让限频/权限错误伪装成 MCP 行为）；
+    ``load_bars`` 的**数据源降级链**（富途 → 新浪/Yahoo）不受影响，仍在 route 层。
     """
     arguments = {"symbol": to_futu_symbol(ticker),
                  "ktype": PERIOD_TO_FUTU_KTYPE[period],
@@ -138,8 +159,14 @@ def fetch_futu(ticker, period, limit, end=None, autype=None):
                  "end": end or date.today().isoformat()}
     if autype is not None:
         arguments["autype"] = autype
-    data = call_tool("quote_history_kline", arguments,
-                     client_name="trading-datasource/market")
+    rest_arguments = dict(arguments)
+    if "autype" in rest_arguments:
+        rest_arguments["autype"] = int(rest_arguments["autype"])  # 形状差异：str → 枚举 int
+    data, _used = channel.fetch("quote_history_kline", arguments,
+                               method="market.history_kline",
+                               openapi_params=rest_arguments, mcp_call=_mcp_kline,
+                               channel=channel_name, home=home, client=client,
+                               credential_path=credential_path)
     rows = (data or {}).get("kline_list") or []
     if not rows:
         raise FutuEmptyKline("富途返回空 K 线")
@@ -216,34 +243,54 @@ def fetch_yahoo(ticker, period, limit):
     return bars, "yahoo/auto_adjusted"
 
 
-def route(ticker, period, limit):
-    """返回 [(标签, 取数函数), ...] —— 渠道优先级只在这里定义一次。"""
+def route(ticker, period, limit, **dispatch):
+    """返回 [(标签, 取数函数), ...] —— 渠道优先级只在这里定义一次。
+
+    ``**dispatch``（``channel_name``/``home``/``client``/``credential_path``）只在调用方
+    显式给出时透传给 ``fetch_futu``：不给就一个关键字都不传——patched ``fetch_futu``
+    替身（三参假件）的既有离线用例因此逐字不变。
+    """
+    futu = lambda: fetch_futu(ticker, period, limit, **dispatch)  # noqa: E731
     # 富途单次上限 370 根：请求更长历史时，富途根本无法满足，
     # 因此长历史源排在前面（A 股新浪 / 港美股 Yahoo），富途作后备。
     if period == "1d" and limit > FUTU_MAX_BARS:
         if is_a_share(ticker):
             return [("sina", lambda: fetch_a_share(ticker, period, limit)),
-                    ("futu", lambda: fetch_futu(ticker, period, limit))]
+                    ("futu", futu)]
         return [("yahoo", lambda: fetch_yahoo(ticker, period, limit)),
-                ("futu", lambda: fetch_futu(ticker, period, limit))]
+                ("futu", futu)]
     if is_a_share(ticker):
-        return [("futu", lambda: fetch_futu(ticker, period, limit)),
+        return [("futu", futu),
                 ("sina", lambda: fetch_a_share(ticker, period, limit))]
     # 港美股：Yahoo 只有日线，分钟级不得挂一个必然失败的通道
     if period == "1d":
-        return [("futu", lambda: fetch_futu(ticker, period, limit)),
+        return [("futu", futu),
                 ("yahoo", lambda: fetch_yahoo(ticker, period, limit))]
-    return [("futu", lambda: fetch_futu(ticker, period, limit))]
+    return [("futu", futu)]
 
 
-def load_bars(ticker, period="1d", limit=300, cached=None):
-    """统一行情入口：富途优先，A 股长历史走新浪。返回 (bars, source, stale)。"""
+def _dispatch_kwargs(channel_name, home, client, credential_path):
+    """只保留显式给出的分派参数（None 一律不下传——见 ``route`` docstring）。"""
+    pairs = (("channel_name", channel_name), ("home", home), ("client", client),
+             ("credential_path", credential_path))
+    return {name: value for name, value in pairs if value is not None}
+
+
+def load_bars(ticker, period="1d", limit=300, cached=None, *, channel_name=None,
+              home=None, client=None, credential_path=None):
+    """统一行情入口：富途优先，A 股长历史走新浪。返回 (bars, source, stale)。
+
+    ``channel_name``/``home``/``client``/``credential_path``：富途腿的取数通道分派参数
+    （见 ``fetch_futu``）；不给则读 ``trading-platform.json`` 的 ``futu_channel``。
+    数据源降级链（富途 → 新浪/Yahoo）与返回结构不受通道影响。
+    """
     if period not in PERIOD_TO_FUTU_KTYPE:
         raise ValueError(f"不支持的周期：{period}")
     limit = normalize_limit(limit)
+    dispatch = _dispatch_kwargs(channel_name, home, client, credential_path)
 
     failure = None
-    for _label, producer in route(ticker, period, limit):
+    for _label, producer in route(ticker, period, limit, **dispatch):
         try:
             bars, source = producer()
             if bars:
@@ -255,7 +302,8 @@ def load_bars(ticker, period="1d", limit=300, cached=None):
     raise RuntimeError(f"取数失败：{str(failure)[:160]}")
 
 
-def load_raw_bars(ticker, period="1d", limit=2000):
+def load_raw_bars(ticker, period="1d", limit=2000, *, channel_name=None, home=None,
+                  client=None, credential_path=None):
     """富途**原始价**分块：≤FUTU_MAX_BARS 根/页、以 end 游标向后翻页、按 t 合并去重。
 
     回填专用（K1 方案 A）：富途单次上限 370 根给不了长历史，而长历史路由
@@ -264,16 +312,18 @@ def load_raw_bars(ticker, period="1d", limit=2000):
     终止条件：凑满 limit 根 / 历史翻尽（空页）/ 游标不再前移（防死循环）。
     首批即失败或为空按 load_bars 风格抛 RuntimeError；返回 (bars, "futu/raw_chunk", False)。
     必须显式 autype="0"：富途服务端默认 1=前复权，不传则整场修复形同虚设。
+    取数通道见 ``fetch_futu``（openapi 就绪走 REST，否则 mcp；本函数逐页调用同一分派）。
     """
     if period not in PERIOD_TO_FUTU_KTYPE:
         raise ValueError(f"不支持的周期：{period}")
     limit = normalize_limit(limit)
+    dispatch = _dispatch_kwargs(channel_name, home, client, credential_path)
     cursor = date.today().isoformat()
     merged = {}
     while len(merged) < limit:
         try:
             bars, _source = fetch_futu(ticker, period, FUTU_MAX_BARS, end=cursor,
-                                       autype="0")
+                                       autype="0", **dispatch)
         except FutuEmptyKline as error:
             if not merged:
                 raise RuntimeError(f"取数失败：{error}") from error

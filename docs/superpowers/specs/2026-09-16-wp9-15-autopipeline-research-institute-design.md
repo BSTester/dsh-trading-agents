@@ -493,6 +493,26 @@ MCP（`trading_datasource.futu_mcp`），`futu_channel: openapi` 未闭环。
 **行为等价由同一批清洗/落库函数保证**（通道只换取数实现，不改落库口径）。迁移后
 `futu_channel: openapi` 为完整通道（行情/交易/同步/推送全 REST）。
 
+> **实现期补记（2026-09-17，阶段 A 审查）**：本节的「5 项」只覆盖 sync 的显式取数，
+> 实际闭环还必须包含**三条同步腿**——K 线同步（`market.load_raw_bars`/`load_bars`
+> 富途腿）、交易日历（`calendar.sync_calendar`）、指数成分股（`sync.sync_universe`）；
+> 三者当时仍硬编码 MCP，「完整通道」的承诺并未成立。现三腿统一经
+> `trading_datasource.channel.fetch` 分派：
+> - K 线 → `market.history_kline`（入参 `autype`：MCP 字符串 ↔ REST 枚举 int，调用点显式
+>   转换；官方 `date` 为 int YYYYMMDD，`str()` 归一兼容）；
+> - 交易日历 → `market.trading_days`（官方文档复核：响应与 MCP 逐字段同形）；
+> - 指数成分股 → `f10.valuation_index_stocks`（`GET /quote/valuation/index-stocks`）——
+>   **这是官方等价端点**（指数成分股估值，锁定表 §C.5 + 2026-09-17 官方文档复核）；
+>   **不存在「官方无等价端点」而必须保留 MCP 的腿**。
+>
+> 真机抽样三腿 `channel_used=openapi`（K 线 3 根 / 日历 23 个交易日 / SH.000300 成分
+> 300 只 6 页）；`load_bars` 的新浪/Yahoo 降级源不属富途通道（设计如此）。
+> **范围边界（如实登记）**：本补记只覆盖这三条腿；workbench 脚本 `instruments.py`
+> （服务 `instrument` 端点）与 `quality.py`（服务 `quality` 端点）仍走 MCP 容器，
+> `positions.py` 非 sim 工具按 `channel.sim_call` 翻译表边界保留 MCP——均已在
+> `docs/architecture.md` 通道表「未 REST 化的读取」逐条登记。完整清单与
+> 回归见 `docs/architecture.md` 通道表与 `docs/TOOL-LIMITS.md` §九之一 第 5 条。
+
 ### 8.2 模拟交易 REST 化（9 端点）
 
 现状：sim 下单/查单经托管 MCP `sim_trade_*` 工具（TOOL-LIMITS 记录
