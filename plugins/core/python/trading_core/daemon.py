@@ -129,17 +129,71 @@ WATCHLIST_EMPTY_ALERT_TITLE = "关注池未配置"
 SELF_ALERTING_SKIP_JOBS = frozenset(
     {"sentiment_snapshot", "research_snapshot", "enqueue_research"})
 
+#: 作业**失败**的告警标题（F-a，2026-09-17）：非零退出码此前被 `_run_job` 完全忽略
+#: （只认 `{"skipped": …}`），tick 又无条件写 ran 标记 → 流程页把「整批都没同步」显示成
+#: 绿色「已完成」。三条标题同样是**字面量契约**（`pipeline._CONTENT_OUTCOMES` 按它归因）：
+#:   * `JOB_FAILED_ALERT_TITLE`   非零退出 → 阶段 failed
+#:   * `JOB_PARTIAL_ALERT_TITLE`  零退出但摘要含失败标的 → 阶段仍 ok、摘要写明部分失败
+#:   * `JOB_ERROR_ALERT_TITLE`    fn 形式抛异常（或 runner 返回 `{"error": …}`）→ 阶段 failed
+JOB_FAILED_ALERT_TITLE = "作业失败"
+JOB_PARTIAL_ALERT_TITLE = "作业部分失败"
+JOB_ERROR_ALERT_TITLE = "作业异常"
+#: 失败告警里保留的输出尾部行数（免去翻服务日志即可看到原因）
+OUTPUT_TAIL_LINES = 5
+
+
+def _last_json_object(text):
+    """stdout 里最后一个可解析的 JSON 对象（作业的结构化摘要）；取不到返回 None。
+
+    CLI 用 ``json.dumps(..., indent=1)`` 打印**多行** JSON，故不能按行解析：从后往前
+    逐个 ``{`` 起尝试解析到串尾，第一个成功的对象即为摘要（限 50 次尝试，避免长输出下
+    的平方级开销）。
+    """
+    text = (text or "").strip()
+    if not text:
+        return None
+    starts = [i for i, ch in enumerate(text) if ch == "{"]
+    for i in reversed(starts[-50:]):
+        try:
+            obj = json.loads(text[i:])
+        except ValueError:
+            continue
+        if isinstance(obj, dict):
+            return obj
+    return None
+
+
 def _subprocess_runner(cmd):
-    """cmd 形式作业的默认执行体：venv 同解释器跑 CLI 子进程（单作业 15 分钟超时）。"""
+    """cmd 形式作业的默认执行体：venv 同解释器跑 CLI 子进程（单作业 15 分钟超时）。
+
+    **返回结构化结果**（F-a）：``{"exit_code", "summary", "tail"}``——exit_code 供失败
+    判定；summary 是子进程 stdout 里最后一个 JSON 对象（如批量同步的 ``failed`` 明细），
+    取不到为 None；tail 是输出末 ``OUTPUT_TAIL_LINES`` 行，进失败告警 detail。
+
+    **日志去向**：子进程输出**捕获后转写**回本进程 stdout/stderr——内容不丢（仍在服务
+    日志里），代价是失去实时性。作业输出都是收尾的结构化摘要（量级很小），故可接受；
+    若将来有长输出作业需要实时性，改 Popen 流式即可（此处不做，避免引入线程）。
+    """
     home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
     resolved = resolve_command(cmd, home)
     if resolved is None:
         return {"skipped": "关注池为空"}
-    return subprocess.run([sys.executable, "-m", "trading_core", *resolved],
-                          timeout=900).returncode
+    proc = subprocess.run([sys.executable, "-m", "trading_core", *resolved],
+                          timeout=900, capture_output=True, text=True)
+    if proc.stdout:
+        sys.stdout.write(proc.stdout)
+        sys.stdout.flush()
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+        sys.stderr.flush()
+    lines = [line for line in (proc.stdout or "").splitlines() if line.strip()]
+    return {"exit_code": proc.returncode,
+            "summary": _last_json_object(proc.stdout),
+            "tail": lines[-OUTPUT_TAIL_LINES:]}
 
 
-def tick(conn, home, jobs=None, now=None):
+
+def tick(conn, home, jobs=None, now=None, runner=None):
     """一轮调度：对每个市场判断「今日为交易日 且 当前时间 ≥ at 且 今日未跑」，
     满足则执行并记录。now 注入便于假时钟测试。
 
@@ -148,11 +202,18 @@ def tick(conn, home, jobs=None, now=None):
     规格 §4.4），只受时点与当日 ran 标记约束。
 
     时钟口径：``now=`` 显式注入 > ``DSH_FAKE_NOW`` > 真实时间（``now_fn`` 采样一次）。
+    ``runner=`` 透传给 ``_run_job``：注入假执行体即可**离线**跑整轮（否则 cmd 形式作业会
+    真的起 CLI 子进程——测试不该联网，演练/单测都要确定性）。
+
+    **失败语义**（F-a）：作业失败（非零退出 / fn 抛异常）既发 warn 告警（流程页据此显示
+    ``failed``），又在**整轮结束、标记落盘后**以 ``RuntimeError`` 上抛——错的一方不被吞掉
+    （``/healthz`` 的 ``scheduler.last_error`` 与 ``daemon --once`` 摘要）
     """
     now = now or now_fn()
     warn_fake_now(conn, home)
     jobs = jobs or build_jobs(home, conn)
     state = store.kv_get(conn, "daemon:state", default={"ran": {}})
+    failures = []
     stamp = now()
     for market, chain in jobs.items():
         if market != GLOBAL_CHAIN:
@@ -168,13 +229,24 @@ def tick(conn, home, jobs=None, now=None):
             key = f"{market}:{job['name']}:{stamp[:10]}"
             if state["ran"].get(key) or stamp[11:16] < job["at"]:
                 continue
-            _run_job(conn, job, home, market=market)
+            try:
+                failure = _run_job(conn, job, home, runner=runner, market=market)
+            except Exception as error:  # noqa: BLE001 —— 记账/告警自身出错也不得中断整轮
+                failure = f"job={job['name']} market={market or '-'} {type(error).__name__}: {error}"
+                alerts.emit(conn, home=str(home), level="warn", title=JOB_ERROR_ALERT_TITLE,
+                            detail=failure[:300])
+            if failure:
+                failures.append(f"{market} {job['name']}: {failure}")
             state["ran"][key] = stamp
     store.kv_set(conn, "daemon:state", state)
     _warn_empty_watchlist(conn, home, stamp[:10])
     write_heartbeat(home, {"heartbeat": stamp,
                            "last_job": store.kv_get(conn, "daemon:last_job", ""),
                            "next": "见 trading-platform.json"})
+    if failures:
+        # **整轮跑完、标记与心跳都已落盘之后**才上抛：作业失败对调度器/healthz/`--once`
+        # 摘要保持可见（吞掉会让 healthz 谎报无错），但不影响本轮其它作业与记账。
+        raise RuntimeError("作业失败：" + "；".join(failures)[:500])
     return state
 
 
@@ -208,19 +280,72 @@ def _run_job(conn, job, home, runner=None, market=None):
     返回值被丢弃，而 tick 仍写 ran 标记，流程页于是把「什么都没做」显示成「已完成」。
     这里把它转成 warn 告警（标题为 ``SKIP_ALERT_TITLE``、detail 带 job/market），
     pipeline 再按标题把阶段降为 ``skipped`` 并附原因。
+
+    **失败必须留痕**（F-a，2026-09-17）：消费 cmd 形式作业的**退出码**（旧实现只认
+    ``{"skipped": …}``，整数 returncode 被完全忽略）——非零 → ``JOB_FAILED_ALERT_TITLE``；
+    零退出但摘要含失败标的 → ``JOB_PARTIAL_ALERT_TITLE``；fn 形式抛异常 →
+    ``JOB_ERROR_ALERT_TITLE``。pipeline 据此把阶段显示为 ``failed`` 或把部分失败写进摘要。
+
+    **本函数不抛**：一个作业失败不得拖垮整轮 tick——否则 tick 提前返回，同轮**已跑成功**
+    作业的 ran 标记会随 ``kv_set(daemon:state)`` 一起丢失，下一轮重复执行。
+    **返回值**：失败摘要字符串（无失败为 ``None``），由 ``tick`` 汇总后**在整轮跑完、标记
+    落盘之后再上抛**——既不让一个作业拖垮整轮，也不吞掉故障（healthz 的
+    ``scheduler.last_error`` 与 ``/healthz`` 依赖它保持「最近一次出错」可见）。
     """
-    if "fn" in job:
-        job["fn"]({"conn": conn, "home": home})
-        result = None
-    else:
-        result = (runner or _subprocess_runner)(job["cmd"])
-    if (isinstance(result, dict) and result.get("skipped")
-            and conn is not None and job["name"] not in SELF_ALERTING_SKIP_JOBS):
-        alerts.emit(conn, home=str(home), level="warn", title=SKIP_ALERT_TITLE,
-                    detail=f"job={job['name']} market={market or '-'} "
-                           f"{result.get('skipped')}")
+    try:
+        if "fn" in job:
+            job["fn"]({"conn": conn, "home": home})
+            result = None
+        else:
+            result = (runner or _subprocess_runner)(job["cmd"])
+    except Exception as error:  # noqa: BLE001 —— 单作业失败不得拖垮整轮
+        result = {"error": f"{type(error).__name__}: {error}"}
+    failure = _report_job_outcome(conn, job, home, result, market)
     if conn is not None:
         store.kv_set(conn, "daemon:last_job", job["name"])
+    return failure
+
+
+def _report_job_outcome(conn, job, home, result, market):
+    """把一次作业执行的结果转成告警（跳过/失败/部分失败/异常），供 pipeline 归因。
+
+    runner 的返回形态按**宽容**解析：新式 ``{"exit_code", "summary", "tail"}``、旧式整数
+    returncode（既有测试的注入风格）、``{"skipped": …}``、``{"error": …}``、``None``
+    （``runner=lambda cmd: seen.append(cmd)`` 这类只记调用的替身）。
+    """
+    if conn is None:
+        return
+    name = job["name"]
+    where = f"job={name} market={market or '-'}"
+    if isinstance(result, dict) and result.get("error") and "exit_code" not in result:
+        alerts.emit(conn, home=str(home), level="warn", title=JOB_ERROR_ALERT_TITLE,
+                    detail=f"{where} {result['error']}"[:300])
+        return f"{where} {result['error']}"
+    if isinstance(result, dict) and result.get("skipped"):
+        if name not in SELF_ALERTING_SKIP_JOBS:
+            alerts.emit(conn, home=str(home), level="warn", title=SKIP_ALERT_TITLE,
+                        detail=f"{where} {result.get('skipped')}")
+        return None  # 跳过不是失败（阶段由 pipeline 降为 skipped）
+    code = result.get("exit_code") if isinstance(result, dict) else result
+    if isinstance(code, int) and not isinstance(code, bool) and code != 0:
+        tail = " | ".join(result.get("tail") or []) if isinstance(result, dict) else ""
+        text = f"{where} exit={code}" + (f" {tail}" if tail else "")
+        alerts.emit(conn, home=str(home), level="warn", title=JOB_FAILED_ALERT_TITLE,
+                    detail=text[:300])
+        return text
+    summary = result.get("summary") if isinstance(result, dict) else None
+    failed = summary.get("failed") if isinstance(summary, dict) else None
+    if isinstance(failed, dict) and failed:
+        head = list(failed.items())[:3]
+        detail = "; ".join(f"{symbol}:{reason}" for symbol, reason in head)
+        more = f" 等 {len(failed)} 只" if len(failed) > len(head) else ""
+        text = f"{where} 失败 {len(failed)} 只：{detail}{more}"
+        alerts.emit(conn, home=str(home), level="warn", title=JOB_PARTIAL_ALERT_TITLE,
+                    detail=text[:300])
+        # 部分失败**不**作为作业失败上抛（作业确实跑了），只在摘要与告警里可见
+        return None
+    return None
+
 
 
 def handle_command(conn, home, cmd, executor=None, runner=None):

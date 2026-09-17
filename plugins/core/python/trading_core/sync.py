@@ -50,6 +50,32 @@ def sync_bars_incremental(conn, ticker, period="1d", loader=None):
             "last": store.last_bar_date(conn, symbol, period)}
 
 
+def sync_bars_batch(conn, tickers, period="1d", loader=None, sleep_seconds=None):
+    """逐标的增量同步（F-b，2026-09-17）：单标的失败记入 ``failed`` 并**继续**其余标的。
+
+    E2E 证据：``sync-bars --tickers <20 只>`` 曾因**单只**标的瞬时网络超时抛
+    ``RuntimeError`` → 裸 traceback、非零退出，且其余 19 只完全不被处理（无逐标的隔离）。
+    批量入口把故障隔离到单标的，返回结构化摘要供上层决定退出码与告警：
+
+        {"ok": [逐标的成功结果…], "failed": {ticker: 原因}, "ok_count", "failed_count",
+         "total"}
+
+    退出码语义由 CLI 决定（见 ``cli.main`` 的 sync-bars/backfill 分支）：全部成功或
+    部分失败 → 0；零成功（全部失败）→ 1。
+    """
+    tickers = [t for t in (tickers or []) if t]
+    sleep_seconds = SLEEP_SECONDS if sleep_seconds is None else sleep_seconds
+    ok, failed = [], {}
+    for ticker in tickers:
+        try:
+            ok.append(sync_bars_incremental(conn, ticker, period=period, loader=loader))
+        except Exception as error:  # noqa: BLE001 —— 单标的失败不中断批量
+            failed[ticker] = str(error)[:160]
+        _sleep(sleep_seconds)
+    return {"ok": ok, "failed": failed, "ok_count": len(ok),
+            "failed_count": len(failed), "total": len(tickers)}
+
+
 def backfill_bars(conn, tickers, period="1d", limit=BACKFILL_LIMIT,
                   loader=None, sleep_seconds=None, progress_key=PROGRESS_KEY_BACKFILL):
     """全量回填：每标的一次 load_raw_bars——富途原始价分块（≤370 根/页向后翻页），
@@ -76,8 +102,9 @@ def backfill_bars(conn, tickers, period="1d", limit=BACKFILL_LIMIT,
             failed[ticker] = str(error)[:160]
         store.kv_set(conn, progress_key, {"done": done, "failed": failed})
         _sleep(sleep_seconds)
-    return {"ok": ok, "failed": failed,
-            "done_total": len(done), "pending": [t for t in tickers if t not in done]}
+    return {"ok": ok, "failed": failed, "ok_count": len(ok),
+            "failed_count": len(failed), "done_total": len(done),
+            "pending": [t for t in tickers if t not in done]}
 
 
 # 富途科目名按市场不同（实测口径沿用 workbench/python/quality.py 的 alias 表，只取 4 键）。

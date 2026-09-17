@@ -44,8 +44,12 @@ class SkipIsObservableTests(_Case):
         daemon._run_job(self.conn, job, str(self.home), runner=runner, market=market)
 
     def test_watchlist_empty_skip_emits_warn_alert(self):
+        # runner 注入「关注池为空」的跳过标记：默认 runner 会读**真实** `$DSH_HOME` 的
+        # 关注池配置（2026-09-17：配置好后本用例会真起子进程联网，既慢又依赖环境）——
+        # 被测语义是「跳过必须留痕」，与关注池实际内容无关，故注入假件保持离线确定性。
         self._run({"name": "sync_bars", "at": "16:00",
-                   "cmd": ["sync-bars", "--tickers", "@watchlist"]})
+                   "cmd": ["sync-bars", "--tickers", "@watchlist"]},
+                  runner=lambda cmd: {"skipped": "关注池为空"})
         rows = core_alerts.list_recent(self.conn, limit=10)
         self.assertTrue(rows, "跳过必须告警——否则流程页只能看到「已完成」")
         titles = [r["title"] for r in rows]
@@ -55,14 +59,19 @@ class SkipIsObservableTests(_Case):
         self.assertIn("SH", detail)
 
     def test_self_alerting_jobs_do_not_double_alert(self):
-        """情绪/研究/入队作业自己会告警（带更具体的原因）——跳过路径不得重复告警。"""
+        """情绪/研究/入队作业自己会告警（带更具体的原因）——跳过路径不得重复告警。
+
+        runner 必须注入：默认 runner 会读**真实** `$DSH_HOME`（关注池配置好后会真起子进程
+        跑情绪采集——20 标的实测 >7 分钟静默，本用例曾因此挂死）。被测语义与关注池内容无关。
+        """
         for name in ("sentiment_snapshot", "research_snapshot", "enqueue_research"):
             with self.subTest(job=name):
                 conn = store.connect(store.db_path(str(self.home)))
                 self.addCleanup(conn.close)
                 daemon._run_job(conn, {"name": name, "at": "16:25",
                                        "cmd": ["sentiment-snapshot", "--market", "SH"]},
-                                str(self.home), market="SH")
+                                str(self.home), market="SH",
+                                runner=lambda cmd: {"skipped": "关注池为空"})
                 rows = [r for r in core_alerts.list_recent(conn, limit=10)
                         if r["title"] == daemon.SKIP_ALERT_TITLE]
                 self.assertEqual(rows, [], f"{name} 不应产生重复跳过告警")

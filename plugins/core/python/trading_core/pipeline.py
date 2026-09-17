@@ -152,6 +152,16 @@ _CONTENT_OUTCOMES = {
     "研究快照源不可用": ("research_snapshot", None, "部分源不可用"),
     "研究快照全部失败": ("research_snapshot", "failed", "当日全部失败"),
     "研究任务入队跳过": ("enqueue_research", "skipped", "当日未入队"),
+    # F-a（2026-09-17）：**作业失败**此前完全不可见——`_subprocess_runner` 的整数 returncode
+    # 被 `_run_job` 忽略、tick 仍写 ran 标记 → 触发了 content 路径（ran 已存在）。三条标题
+    # 由 daemon 发出，归属看 detail 里的 ``job=<name>``：
+    #   * 作业失败   → 阶段 failed（跑了但非零退出，绝不能再显示「已完成」）
+    #   * 作业异常   → 阶段 failed（fn 形式抛异常）
+    #   * 作业部分失败 → 只补摘要不改状态：作业确实跑了（部分标的成功），降级会说谎，
+    #                    但「19 成功 1 失败」必须在页面上看得见
+    "作业失败": (None, "failed", "当日失败"),
+    "作业异常": (None, "failed", "作业异常"),
+    "作业部分失败": (None, None, "部分失败"),
 }
 
 #: 状态优先级（内容结局与既有归因同时命中时取更强的一个）
@@ -274,7 +284,7 @@ def _content_outcome(job_name, market, alerts, chain):
         # detail 里的 job=/market= 是归属信息，对上页面是噪声（原因已由 text 表达）
         detail = " ".join(piece for piece in detail.split()
                           if not piece.startswith(("job=", "market=")))
-        label = f"{text}：{detail}" if detail else text
+        label = _merge_reason(text, detail)
         if label not in parts:
             parts.append(label)
     return status, "；".join(parts)
@@ -344,6 +354,28 @@ def _digest_stage(conn, date):
     summary = ", ".join(f"{key} {orders[key]}" for key in sorted(orders))
     return {"label": _labels("digest"), "status": "ok", "at": digest.get("at"),
             "scheduled": None, "summary": summary}
+
+
+def _merge_reason(text, detail):
+    """把告警 detail 合并进摘要文本，**避免同一原因重复**（F-c，2026-09-17）。
+
+    实机证据：`sync_bars` 的摘要曾显示「当日未执行：关注池为空：关注池为空」——告警标题与
+    detail 各说了一遍同样的原因。规则：
+      * detail 为空 → 只用 text；
+      * detail 已被 text 包含 → 只用 text（不重复）；
+      * detail 以 text 里的原因开头（如 text=「当日未执行：关注池为空」、
+        detail=「关注池为空（或全部停牌）」）→ 只补增量部分（「（或全部停牌）」）；
+      * 其余情况 → 正常拼接（去重不得吃掉 detail 里 text 未表达的事实）。
+    """
+    if not detail:
+        return text
+    if detail in text:
+        return text
+    reason = text.split("：", 1)[1] if "：" in text else text
+    if reason and detail.startswith(reason):
+        rest = detail[len(reason):]
+        return f"{text}{rest}" if rest else text
+    return f"{text}：{detail}"
 
 
 def _strip_market_prefix(detail, market):

@@ -27,11 +27,11 @@ def build_parser():
     s.add_argument("--end", required=True)
     _add_db(s)
 
-    s = sub.add_parser("sync-bars", help="增量同步日线（--tickers 逗号分隔）")
+    s = sub.add_parser("sync-bars", help="增量同步日线（--tickers 逗号分隔）；逐标的容错：退出码 0=全成功或部分失败（明细见 failed）、1=零成功")
     s.add_argument("--tickers", required=True, help="逗号分隔")
     _add_db(s)
 
-    s = sub.add_parser("backfill", help="全量回填日线（断点续传）")
+    s = sub.add_parser("backfill", help="全量回填日线（断点续传）；退出码 0=全成功或部分失败（明细见 failed）、1=零成功")
     s.add_argument("--tickers", required=True, help="逗号分隔")
     s.add_argument("--limit", type=int, default=sync.BACKFILL_LIMIT)
     _add_db(s)
@@ -592,6 +592,18 @@ def _rules_validate(conn, args):
     return {"ok": True, "rule_id": rule_id, "status": status, "validation": validation}
 
 
+def _batch_exit_code(result):
+    """批量同步（sync-bars/backfill）的**退出码语义**（F-b，2026-09-17）。
+
+    0 = 全部成功，**或**部分失败（失败明细在 ``summary.failed``，由调度层发 warn 告警、
+    流程页摘要写明——部分失败不是整批失败）；
+    1 = 零成功（全部失败）或参数/致命错误——调度层据此把该作业判为失败。
+    """
+    if result.get("failed_count", 0) == 0:
+        return 0
+    return 0 if result.get("ok_count", 0) > 0 else 1
+
+
 def main(argv=None):
     args = build_parser().parse_args(argv)
     conn = store.connect(args.db)
@@ -599,11 +611,33 @@ def main(argv=None):
         if args.cmd == "calendar":
             result = {"days": cal.sync_calendar(conn, args.market, args.start, args.end)}
         elif args.cmd == "sync-bars":
-            result = {"symbols": [sync.sync_bars_incremental(conn, t.strip())
-                                  for t in args.tickers.split(",") if t.strip()]}
+            tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
+            if not tickers:
+                print(json.dumps({"ok": False, "error": "缺少 --tickers"},
+                                 ensure_ascii=False, indent=1))
+                return 1
+            try:
+                result = sync.sync_bars_batch(conn, tickers)
+            except Exception as error:  # noqa: BLE001 —— 可读错误替代裸 traceback（F-b）
+                print(json.dumps({"ok": False, "error": f"同步失败：{error}"},
+                                 ensure_ascii=False, indent=1))
+                return 1
+            print(json.dumps(result, ensure_ascii=False, indent=1))
+            return _batch_exit_code(result)
         elif args.cmd == "backfill":
-            result = sync.backfill_bars(conn, [t.strip() for t in args.tickers.split(",") if t.strip()],
-                                        limit=args.limit)
+            tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
+            if not tickers:
+                print(json.dumps({"ok": False, "error": "缺少 --tickers"},
+                                 ensure_ascii=False, indent=1))
+                return 1
+            try:
+                result = sync.backfill_bars(conn, tickers, limit=args.limit)
+            except Exception as error:  # noqa: BLE001 —— 可读错误替代裸 traceback（F-b）
+                print(json.dumps({"ok": False, "error": f"回填失败：{error}"},
+                                 ensure_ascii=False, indent=1))
+                return 1
+            print(json.dumps(result, ensure_ascii=False, indent=1))
+            return _batch_exit_code(result)
         elif args.cmd == "adjustments":
             result = {t: sync.sync_adjustments(conn, t.strip())
                       for t in args.tickers.split(",") if t.strip()}
