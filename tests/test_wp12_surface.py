@@ -181,8 +181,17 @@ class DataPlaneEndpointSurfaceTests(unittest.TestCase):
         bad_f10 = data._envelope("f10_detail", {"code": "HK.00700", "section": "nope"})
         self.assertFalse(bad_f10["ok"])
         self.assertEqual(bad_f10["error"]["code"], futu_data.PARAM_CODE)
+        required = futu_data.section_required_params()["f10"]
+        samples = {"days_before": 30, "leader_name": "张三"}
         for section in sorted(OpenApiF10.SECTIONS):
-            envelope = data._envelope("f10_detail", {"code": "HK.00700", "section": section})
+            payload = {"code": "HK.00700", "section": section}
+            # 有必填参数的 section（top_brokers_history / company_executive_background）
+            # 必须给足——E2E 实测的 I1 缺陷正是「缺必填被报成通道不可用」，因此这里按
+            # 内省结果补齐，而不是让替身吞掉（替身吞掉会让用例失去契约意义）。
+            params = {name: samples[name] for name in required[section]}
+            if params:
+                payload["params"] = params
+            envelope = data._envelope("f10_detail", payload)
             self.assertTrue(envelope["ok"], f"{section}: {envelope}")
 
     def test_required_fields_are_enforced_locally(self):
@@ -225,8 +234,22 @@ class _StrictF10:
     def __init__(self, calls):
         self._calls = calls
 
-    def analyst_consensus(self, symbol, lang=None, limit=None):
-        self._calls.append(("analyst_consensus", symbol, {"lang": lang, "limit": limit}))
+    def analyst_consensus(self, symbol):
+        # 真实签名（OpenApiF10.analyst_consensus(self, symbol)）——替身必须一致，否则
+        # 「键契约」测的是替身而不是传输层（2026-09-17 修复：校验已改以**类方法**为事实源）
+        self._calls.append(("analyst_consensus", {"symbol": symbol}))
+        return {"ok": 1}
+
+    def statements(self, symbol, statement_type=None, financial_type=None,
+                   currency_code=None, next_key=None, limit=None):
+        """真实签名的多参数 section（透传用例改用它——analyst_consensus 本就不收 limit）。"""
+        self._calls.append(("statements", {key: value for key, value in
+                                           (("symbol", symbol),
+                                            ("statement_type", statement_type),
+                                            ("financial_type", financial_type),
+                                            ("currency_code", currency_code),
+                                            ("next_key", next_key),
+                                            ("limit", limit)) if value is not None}))
         return {"ok": 1}
 
 
@@ -295,20 +318,23 @@ class DataPlaneAggregateParamTests(unittest.TestCase):
 
     def test_valid_aggregate_params_are_passed_through(self):
         groups = _StrictGroups()
+        # statements 是真实签名里接受附加参数的 section（analyst_consensus 只收 symbol——
+        # 旧用例的 limit 之所以"通过"，是因为当时校验的是替身签名，属测试与契约脱节）。
         envelope = self._data(groups)._envelope(
-            "f10_detail", {"code": "HK.00700", "section": "analyst_consensus",
-                           "params": {"limit": 5}})
+            "f10_detail", {"code": "HK.00700", "section": "statements",
+                           "params": {"statement_type": 1, "limit": 5}})
         self.assertTrue(envelope["ok"], envelope)
+        # 装配为**关键字传参**（E2E 缺陷 1/I1 修复），且只透传调用方给的键
         self.assertEqual(groups.calls,
-                         [("analyst_consensus", "HK.00700", {"lang": None, "limit": 5})])
+                         [("statements", {"symbol": "HK.00700", "statement_type": 1,
+                                          "limit": 5})])
 
     def test_channel_really_unavailable_stays_unavailable(self):
         """反证：真正不可用（无凭据）仍归 openapi-unavailable，不被参数校验吞掉。"""
         data = futu_data.FutuData(home=self.home, channel=futu_data.CHANNEL_OPENAPI,
                                   credential_path=str(ROOT / "tests" / "_no_creds.json"))
         envelope = data._envelope("f10_detail", {"code": "HK.00700",
-                                                 "section": "analyst_consensus",
-                                                 "params": {"limit": 5}})
+                                                 "section": "analyst_consensus"})
         self.assertFalse(envelope["ok"])
         self.assertEqual(envelope["error"]["code"], futu_data.OPENAPI_UNAVAILABLE_CODE)
 

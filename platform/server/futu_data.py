@@ -214,6 +214,9 @@ DERIVATIVE_SECTIONS = {
     "option_exercise_probability": "option_exercise_probability",
 }
 
+# ``derivative_detail`` 的方法名集合（供内省/描述复用；与上方映射同源，不另写一份）。
+DERIVATIVE_SECTIONS_VALUES = frozenset(DERIVATIVE_SECTIONS.values())
+
 # ``f10_detail`` 的 section 白名单以传输层 ``OpenApiF10.SECTIONS`` 为**单一事实源**
 # （锁定表 §C.5 的 26 项），此处不复制名单——复制一份迟早漂移（与 _market_class 同口径）。
 
@@ -222,6 +225,73 @@ def _f10_class():
     """``trading_datasource.futu_openapi.OpenApiF10``（惰性导入，section 名单单一源）。"""
     from trading_datasource.futu_openapi import OpenApiF10 as cls  # noqa: PLC0415
     return cls
+
+
+def _derivative_class():
+    """``trading_datasource.futu_openapi.OpenApiDerivatives``（同上，签名内省用）。"""
+    from trading_datasource.futu_openapi import OpenApiDerivatives as cls  # noqa: PLC0415
+    return cls
+
+
+def _section_signature_params(method):
+    """section 方法的**位置参数清单**（去掉 self；含 var-* 项，由调用方过滤）。"""
+    return [p for p in inspect.signature(method).parameters.values() if p.name != "self"]
+
+
+def section_required_params():
+    """逐 section 的**必填附加参数**（签名内省的单一实现；工具描述与测试共用）。
+
+    返回 ``{"f10": {section: (names...)}, "derivatives": {section: (names...)}}``。
+    **第一个位置参数（标的）不计入**——它由载荷 ``code`` 承载。手写死表会与传输层签名
+    漂移（E2E 实测：``top_brokers_history`` 缺 ``days_before``、``company_executive_background``
+    缺 ``leader_name`` 时报成了「通道不可用」），故一律从 ``inspect.signature`` 推导。
+    """
+    def _required(cls, names):
+        out = {}
+        for name in names:
+            params = _section_signature_params(getattr(cls, name))
+            out[name] = tuple(p.name for p in params[1:]
+                              if p.default is inspect.Parameter.empty
+                              and p.kind is not p.VAR_KEYWORD)
+        return out
+    f10 = _f10_class()
+    return {"f10": _required(f10, sorted(f10.SECTIONS)),
+            "derivatives": _required(_derivative_class(),
+                                     sorted(DERIVATIVE_SECTIONS.values()))}
+
+
+def _section_call(cls, method_name, instance_method, code, params):
+    """聚合端点的 section 调用装配（唯一实现；E2E 缺陷 1 / I1 修复）。
+
+    **签名从传输层类内省**（``cls``），不从注入的实例内省——与 ``SECTIONS`` 取类常量
+    同一条理由：载荷契约的事实源是传输层，替身无需复刻签名也能走通校验。
+
+    两件事：
+      * **第一个位置参数承载标的**：名字是 ``code_list`` 的批量方法（``future_info``）
+        包成 ``[code]``；其余单标的 section 原样传 code。适配层此前一律按位置传裸 code，
+        ``future_info`` 因此**永远**被上游拒（「code_list 必须是 1..400 个标的代码的列表」）。
+      * **必填附加参数前置校验**：签名中无默认值的参数必须在 ``params`` 给出，否则报
+        ``invalid-operation`` 并点名缺失者——此前这类载荷错误会变成 ``TypeError``，被
+        兜底归类成「OpenAPI 通道不可用」，把用户引去配置凭据（与 ``params`` 未知键同类
+        的误报，只是方向相反）。
+    """
+    params_list = _section_signature_params(getattr(cls, method_name))
+    if not params_list:
+        raise _param_error(f"{method_name} 没有可传参数（服务端配置异常）")
+    first = params_list[0].name
+    required = [p.name for p in params_list[1:]
+                if p.default is inspect.Parameter.empty and p.kind is not p.VAR_KEYWORD]
+    supplied = params if isinstance(params, dict) else {}
+    missing = [name for name in required if name not in supplied]
+    if missing:
+        allowed = [p.name for p in params_list[1:] if p.kind is not p.VAR_KEYWORD]
+        raise _param_error(f"缺少必填参数：{missing}"
+                           f"（{method_name} 允许的参数：{allowed}）")
+    # 未知键校验同样以**类方法**为契约事实源：注入替身常是 (*args, **kwargs) 形状，
+    # 拿实例内省会命中「无键契约」旁路，把未知键放行（这正是假件下漏检的成因）。
+    clean = _spread_params(getattr(cls, method_name), params, supplied=(first,))
+    value = [code] if first == "code_list" else code
+    return instance_method(**{first: value, **clean})
 
 
 def _spread_params(method, params, supplied=()):
@@ -262,7 +332,7 @@ def _spread_params(method, params, supplied=()):
 
 
 def _oa_f10_detail(groups, arguments):
-    """``f10_detail``：section 白名单 → OpenApiF10 专用方法（params 按签名校验）。"""
+    """``f10_detail``：section 白名单 → OpenApiF10 专用方法（装配见 ``_section_call``）。"""
     section = arguments["section"]
     # section 名单以传输层常量为单一事实源（不复制名单，避免漂移）；校验用类常量而非
     # 注入实例的同名属性——替身无需复刻 SECTIONS 也能走通校验。
@@ -270,21 +340,20 @@ def _oa_f10_detail(groups, arguments):
     if section not in sections:
         raise _param_error(f"section 取值非法：{section!r}"
                            f"（允许：{sorted(sections)}）")
-    method = getattr(groups.f10, section)
-    params = _spread_params(method, arguments.get("params"), supplied=("symbol",))
-    return method(arguments["symbol"], **params)
+    return _section_call(_f10_class(), section, getattr(groups.f10, section),
+                         arguments["symbol"], arguments.get("params"))
 
 
 def _oa_derivative_detail(groups, arguments):
-    """``derivative_detail``：section 白名单 → OpenApiDerivatives 专用方法（params 同上）。"""
+    """``derivative_detail``：section 白名单 → OpenApiDerivatives 专用方法（装配同上）。"""
     section = arguments["section"]
     method_name = DERIVATIVE_SECTIONS.get(section)
     if method_name is None:
         raise _param_error(f"section 取值非法：{section!r}"
                            f"（允许：{sorted(DERIVATIVE_SECTIONS)}）")
-    method = getattr(groups.derivatives, method_name)
-    params = _spread_params(method, arguments.get("params"), supplied=("symbol",))
-    return method(arguments["symbol"], **params)
+    return _section_call(_derivative_class(), method_name,
+                         getattr(groups.derivatives, method_name),
+                         arguments["symbol"], arguments.get("params"))
 
 
 # 数据面方法组的公开方法清单（**锁定绑定的单一事实源**）：反射不变式测试逐组比对

@@ -1084,7 +1084,10 @@ TOOLS = (
         "holding_changes/holder_detail/institutional/insider_holders/insider_trades）、"
         "公司信息（company_profile/company_executives/company_executive_background/"
         "company_operational_efficiency）、十大经纪商（top_brokers/top_brokers_history）。"
-        "section 参数经 params 对象下传（如 statements 的 statement_type）。",
+        "section 参数经 params 对象下传。**两个 section 有必填参数**："
+        "top_brokers_history 必填 days_before（天数，1..365）、"
+        "company_executive_background 必填 leader_name（高管姓名）；"
+        "其余 section 的 params 可省略或按需给（如 statements 的 statement_type）。",
         "f10_detail",
         (
             req("code", "str", "标的代码，如 HK.00700 / US.AAPL"),
@@ -1095,10 +1098,10 @@ TOOLS = (
     ),
     ToolDefinition(
         "derivative_detail",
-        "衍生品数据（服务端经富途获取，聚合 4 个 section）：future_info（期货合约信息，"
-        "需 params.code_list）、reference_future（标的关联期货）、option_volatility"
-        "（期权隐含/历史波动率）、option_exercise_probability（期权行权概率）。"
-        "后两者需传**期权合约**代码。",
+        "衍生品数据（服务端经富途获取，聚合 4 个 section）：future_info（期货合约信息）、"
+        "reference_future（标的关联期货）、option_volatility（期权隐含/历史波动率）、"
+        "option_exercise_probability（期权行权概率）。**四个 section 都只需 code**"
+        "（future_info 由服务端按单标的装配批量参数）；后两者需传**期权合约**代码。",
         "derivative_detail",
         (
             req("code", "str", "标的或期权合约代码"),
