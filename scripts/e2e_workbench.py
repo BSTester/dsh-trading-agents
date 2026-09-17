@@ -155,6 +155,24 @@ SYM_HK = "HK.00700"
 SYM_US = "US.AAPL"
 SYM_A = "SH.601988"        # 中国银行：A 股 sim 账户可提交、lot=100、名义小（远低于规则 4 预算）
 OPTION_SYMBOL = "HK.TCH260918C325000"  # 由 option_chain 现场发现，此处为兜底默认
+#: option_screen 的最小**合法**载荷 —— **镜像** `platform/server/futu_data.OPTION_SCREEN_EXAMPLE`
+#: （真机验证过的最小示例）。漂移由 `tests/test_wp12_surface.py` 的锁断言拦截（两处必须一致）。
+#: 为什么不用 `{"field_filter": {"filter_list": []}}`：空数组/空对象/0 是上游 **-3** 的
+#: 形状（服务端已按 proto 占位规则前置拒绝），那是「期望被拒」的载荷，不是能力探针——
+#: 能力探针必须发真实可用值，否则每条都会红（E2E 2026-09-17 的分诊结论）。
+OPTION_SCREEN_PROBE = {
+    "filter": {
+        "strategy": {"market_category_list": [0], "filter_group_list": [
+            {"option_list": [{"indicator_type": 1003,
+                              "indicator_value": {"value_list": [1]}}]}]},
+        "field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1},
+        "limit": 3,
+    }
+}
+#: 欠指定载荷（空数组占位）——**期望被本地前置拒绝**（`invalid-operation` 且零上游调用）。
+#: 与服务端 `_is_field_filter_placeholder` 同依据（proto 占位规则）。
+OPTION_SCREEN_UNDERSPECIFIED = {"filter": {"field_filter": {"filter_list": []},
+                                           "strategy": {"market_category_list": [1]}}}
 # A 股下单锚定价（**A 股无实时权限且该标的本地无 bars**，故只能用锚定值 + 价格网格）。
 # 券商对越出当日 ±10% 价格带的限价单直接拒（`backend business error`），因此网格在
 # 锚定价 ±10% 内逐档试：第一个被接受的价自然落在带内。**锚定价漂移时请按当日收盘更新**
@@ -1052,10 +1070,15 @@ def scan_writes(client, results, findings, baseline_state):
     q = client.call("research-tasks-list", {})
     tasks = ((q.get("body") or {}).get("value") or {}).get("tasks") or []
     if tasks:
-        findings.append(finding("important", "扫描时队列非空（claim 测试跳过以免吞掉任务）",
-                                "research-tasks-list", {}, q,
-                                "扫描应在空队列下探 claim 语义",
-                                "队列有积压：说明定时器/会话兜底未消费"))
+        # **信息类观察项：不计缺陷、不计阻断**（2026-09-17 分诊）。
+        # 队列非空的正当来源是服务 tick-first 补跑当日 GLOBAL 链的 `enqueue_research`
+        # （关注池已配置 → 正常入队）；claim 语义测试跳过，因为 harness 是**只读验收工具**，
+        # 领取会真的把任务置 running（吞掉人/定时器该消费的工作）。
+        record("research-tasks-list(队列状态)", q,
+               f"队列 {len(tasks)} 条（信息类：不判缺陷；claim 测试跳过以免吞任务）")
+        kinds = sorted({str(t.get("kind")) for t in tasks if isinstance(t, dict)})
+        print(f"  ℹ 队列积压 {len(tasks)} 条（kind={kinds}）：建议按 AGENTS.md 值班纪律"
+              "消费或等待 install/research-duty.timer；harness 不代替消费")
     else:
         claim = client.call("research-tasks-claim", {})
         body = claim.get("body") or {}
@@ -1078,20 +1101,58 @@ def scan_writes(client, results, findings, baseline_state):
     record("push_unsubscribe(quote HK.00700)", unsub, "移除订阅意图")
 
     # --- 2.8 自选修改：**只用非法 op 探拒绝路径**（绝不动用户真实自选）
-    # 期望 `invalid-operation`（调用方参数错）；若服务把它归成上游业务错
-    # （futu-error/-3），属「载荷错→通道/业务错」同一族（并行修复任务的缺陷 4），
-    # 记**条件性**发现而非阻断（修复落地后应消失）。
+    # 期望 `invalid-operation`（调用方参数错）**且零上游调用**：`op` 的取值集合来自真机
+    # -3 原文（`allowed: [ADD, DEL, MOVE_OUT]`），服务/传输层据此本地前置拒绝。
+    # 「零上游」的可观测判据：错误码必须是本地参数码，且 `details.errcode` **不存在**
+    # （信封带富途业务码 ⇒ 调用真的发出去了——2026-09-17 前正是这种状态）。
+    #
+    # 分类口径：命中上游业务错（且 detail 带 errcode）时**计条件性**而非阻断——因为观察到
+    # 的两种成因在外观上相同：① 服务进程仍是改动前的代码（进程内模块缓存，改文件不生效，
+    # 需重启）；② 本地守卫被回归。判据留给 `tests/test_wp12_surface.py` 的
+    # ``DataPlaneLocalRejectionTests``（注入真方法组 + 记录客户端，直接在代码层断言
+    # 零上游调用）——它才是这条不变式的阻断级守卫；harness 负责指出「跑着的服务没这行为」。
     mod = client.call("modify_user_security", {"op": "NOT_A_REAL_OP", "code_list": [SYM_HK]})
-    mod_code = ((mod.get("body") or {}).get("error") or {}).get("code")
+    mod_err = (mod.get("body") or {}).get("error") or {}
+    mod_code = mod_err.get("code")
+    mod_message = str(mod_err.get("message") or "")
+    mod_upstream = (mod_err.get("details") or {}).get("errcode")
     record("modify_user_security(非法 op，仅探拒绝)", mod,
-           "invalid-operation（不触发真实写入）", expected_code="trading/invalid-operation")
-    if mod_code != "trading/invalid-operation":
-        item = finding("important", f"非法 op 未归为参数错（实际 {mod_code}）：modify_user_security",
-                       "modify_user_security", {"op": "NOT_A_REAL_OP"}, mod,
-                       "调用方参数非法应回 trading/invalid-operation（不是上游业务错）",
-                       "同「载荷错→通道/业务错」族（缺陷 4），会把参数问题误导成上游故障；"
-                       "另注：本次已真实发起一次上游调用（本地白名单未拦住）——"
-                       "**条件性**：修复落地后本条应消失")
+           "invalid-operation（本地白名单前置拒绝，零上游调用）",
+           expected_code="trading/invalid-operation")
+    if mod_code != "trading/invalid-operation" or mod_upstream is not None:
+        item = finding(
+            "important",
+            f"非法 op 未被本地拦住（code={mod_code} upstream_errcode={mod_upstream}）",
+            "modify_user_security", {"op": "NOT_A_REAL_OP"}, mod,
+            "非法 op 应回 trading/invalid-operation 且**零上游调用**"
+            "（判据：无 details.errcode）",
+            "参数拼错会被误导成上游业务错，且白白消耗一次上游调用额度；"
+            "**若刚修好本地白名单，本条多为服务进程仍是旧代码**——进程内模块缓存，"
+            "改文件不生效，重启服务后复跑应消失（见 docs/RUNBOOK.md「服务启停」）；"
+            "代码层阻断级守卫见 tests/test_wp12_surface.py::DataPlaneLocalRejectionTests")
+        item["category"] = "conditional"
+        findings.append(item)
+        print("  ⚠ 非法 op 打到了上游：本地白名单未在**运行中的服务**里生效"
+              "（重启服务加载新代码后复跑本条应消失）")
+
+    # --- 2.9 期权筛选的**欠指定**载荷：期望本地前置拒绝（proto 占位规则：
+    # 空数组/空对象/0 会被上游 -3，服务端据此前置拦截）。这是「期望被拒」探针——
+    # 正确拒绝即 ok、不计阻断；若它真的打到上游（带 errcode 的非参数码），记条件性发现
+    # （阻断判据留给 tests/test_wp12_surface.py 的本地守卫断言）。
+    bad_screen = client.call("option_screen", OPTION_SCREEN_UNDERSPECIFIED)
+    bad_err = (bad_screen.get("body") or {}).get("error") or {}
+    bad_code = bad_err.get("code")
+    bad_upstream = (bad_err.get("details") or {}).get("errcode")
+    record("option_screen(欠指定 field_filter，仅探拒绝)", bad_screen,
+           "invalid-operation（proto 占位规则前置拒绝，零上游调用）",
+           expected_code="trading/invalid-operation")
+    if bad_code != "trading/invalid-operation" or bad_upstream is not None:
+        item = finding(
+            "important",
+            f"欠指定 field_filter 未本地拒绝（code={bad_code} upstream_errcode={bad_upstream}）",
+            "option_screen", OPTION_SCREEN_UNDERSPECIFIED, bad_screen,
+            "空数组/空对象占位应回 trading/invalid-operation 且零上游调用",
+            "缺形状守卫 ⇒ 调用方对着上游 -3 猜原因（本地守卫断言见 test_wp12_surface.py）")
         item["category"] = "conditional"
         findings.append(item)
 
@@ -1318,9 +1379,7 @@ def read_probes(discovered):
         ("option_chain", {"code": SYM_HK}, "期权链"),
         # option_screen 的 filter 必须含**非空 field_filter + 非空 strategy**（TOOL-LIMITS 实测
         # 陷阱：省略 field_filter 时上游只回 4 个默认字段、其余全 null，会被误判成数据缺失）
-        ("option_screen", {"filter": {"field_filter": {"filter_list": []},
-                                      "strategy": {"market_category_list": [1]},
-                                      "limit": 3}}, "期权筛选（field_filter 必填）"),
+        ("option_screen", OPTION_SCREEN_PROBE, "期权筛选（field_filter 必填，真机最小示例）"),
         ("market_snapshot", {"codes": [SYM_HK]}, "市场快照"),
         ("cur_kline", {"code": SYM_HK, "num": 10}, "当前 K 线"),
         ("rt_data", {"code": SYM_HK}, "分时数据"),

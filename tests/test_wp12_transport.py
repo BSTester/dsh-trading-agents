@@ -385,6 +385,41 @@ class WatchlistTransportTests(unittest.TestCase):
                     OpenApiWatchlist(client).modify_user_security(**kwargs)
                 self.assertEqual(client.calls, [])
 
+    def test_modify_user_security_op_whitelist(self):
+        """``op`` 白名单来自真机 -3 原文（``allowed: [ADD, DEL, MOVE_OUT]``）。
+
+        官方文档只写「op 非法 → -3」不列枚举，因此取值依据是上游错误原文（E2E 2026-09-17）。
+        非法值必须**本地拒绝且零网络往返**——此前非空字符串直通，调用方会拿到上游
+        ``futu-error``，被误导去查通道而不是查自己的载荷。
+        """
+        # 合法值（含常见小写写法）→ 归一到官方大写 token 后发一次
+        for given, sent in (("ADD", "ADD"), ("add", "ADD"), ("Add", "ADD"),
+                            ("DEL", "DEL"), ("MOVE_OUT", "MOVE_OUT"), ("del", "DEL")):
+            with self.subTest(op=given):
+                client = RecordingClient(d={"result_code": 0})
+                OpenApiWatchlist(client).modify_user_security(given, ["HK.00700"])
+                self.assertEqual(client.calls[-1][4]["op"], sent)
+
+        # 非法值 → ValueError（消息含允许值）、零调用
+        for op in ("NOT_A_REAL_OP", "MOVE", "ADDS", "DELETE", "add x"):
+            with self.subTest(op=op):
+                client = RecordingClient()
+                with self.assertRaises(ValueError) as ctx:
+                    OpenApiWatchlist(client).modify_user_security(op, ["HK.00700"])
+                self.assertIn("ADD", str(ctx.exception))
+                self.assertIn("MOVE_OUT", str(ctx.exception))
+                self.assertEqual(client.calls, [], "非法 op 不得发起任何上游调用")
+
+        # 空白值走「必填」分支（`_text` 的非空判定），同样是本地拒绝 + 零调用
+        for op in ("", "   "):
+            with self.subTest(op=op):
+                client = RecordingClient()
+                with self.assertRaises(ValueError):
+                    OpenApiWatchlist(client).modify_user_security(op, ["HK.00700"])
+                self.assertEqual(client.calls, [])
+        self.assertIn("ADD", OpenApiWatchlist.MODIFY_OPS)
+        self.assertEqual(OpenApiWatchlist.MODIFY_OPS, ("ADD", "DEL", "MOVE_OUT"))
+
 
 class DerivativesTransportTests(unittest.TestCase):
     """§C.7 衍生品：future-info（批量）/ reference-future / 波动率 / 行权概率。"""

@@ -345,6 +345,10 @@ class OpenApiWatchlist(_RestValidators):
     GROUP_NAME_MAX = 100
     #: code_list 官方上限（修改自选）
     MODIFY_CODES_MAX = 200
+    #: ``op`` 允许值 —— 锁定表只记「op 非法 → -3」而官方**未列枚举**；取值来自真机 -3
+    #: 原文（E2E 2026-09-17：``parameter 'op' has invalid value 'NOT_A_REAL_OP',
+    #: allowed: [ADD, DEL, MOVE_OUT]``）。上游原文是这里的唯一依据，不自行增删成员。
+    MODIFY_OPS = ("ADD", "DEL", "MOVE_OUT")
     #: -9 的可读说明（锁定表 §C.8：用户身份缺失或无效）
     IDENTITY_NOTE = "用户身份缺失或无效（官方 errcode=-9）"
 
@@ -372,10 +376,20 @@ class OpenApiWatchlist(_RestValidators):
     def modify_user_security(self, op, code_list, group_name=None):
         """POST /api/v1.0/quote/modify-user-security —— 修改自选（锁定表 §C.8）。
 
-        ``op`` 官方未列枚举（只说明非法值 -3）→ 非空字符串直通，不发明取值集合。
+        ``op`` 按 :attr:`MODIFY_OPS` **本地前置白名单**：官方只写「op 非法 → -3」不列枚举，
+        取值取自真机 -3 原文。非法值在此抛 ``ValueError``（零网络往返）——服务层据既有
+        ``ValueError → trading/invalid-operation`` 分流，把「参数拼错」与「上游业务错」
+        分开（E2E 2026-09-17 实证：此前非法 op 会真的发起一次上游调用并回 ``futu-error``，
+        调用方据此会去查通道而不是查自己的载荷）。
+
+        输入按**大小写不敏感归一到官方大写 token**：``add``/``Add`` 与 ``ADD`` 是同一操作，
+        归一后既不会把常见写法误拒，也绝不会把白名单外的值发到上游。
         """
+        canonical_op = self._text(op, "op").strip().upper()
+        if canonical_op not in self.MODIFY_OPS:
+            raise ValueError(f"op 取值非法：{op!r}（允许：{list(self.MODIFY_OPS)}）")
         body = self._body({
-            "op": self._text(op, "op"),
+            "op": canonical_op,
             "code_list": self._codes(code_list, self.MODIFY_CODES_MAX),
             "group_name": self._text_max(group_name, "group_name", self.GROUP_NAME_MAX,
                                          required=False),

@@ -280,7 +280,7 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
 | `info_owner_plate` | `GET …/{symbol}/owner-plate` | 行业中性化的前提；按 `plate_type` 过滤行业类、剔除概念板块 |
 | `info_rehab` | `GET …/{symbol}/rehab` | 复权因子：**上下文炸弹**（单次返回极大、无分页）→ 必须按市场分批增量；HTTP-only（同步作业内部取数） |
 | `watchlist_list` / `watchlist_groups` | `GET …/watchlist/*` | 读用户富途自选，用于关注池导入 |
-| `modify_user_security` | `POST …/watchlist/modify` | **写用户富途侧自选**（非交易写）：仅 Web 端点可达、不进 MCP 工具面、不进 TTL 缓存 |
+| `modify_user_security` | `POST …/watchlist/modify` | **写用户富途侧自选**（非交易写）：仅 Web 端点可达、不进 MCP 工具面、不进 TTL 缓存。`op` **本地前置白名单** = `ADD/DEL/MOVE_OUT`（取值来自真机 `-3` 原文 `allowed: [ADD, DEL, MOVE_OUT]`——官方文档只写「op 非法 → -3」不列枚举）；非法值回 `trading/invalid-operation` 且**零上游调用**，输入按大小写不敏感归一到官方大写 token（`add`→`ADD`）。**进程内模块缓存：改文件后须重启服务才生效** |
 | `f10_detail`（聚合 26 section） | 见锁定表 §C.5 | `analyst_consensus`：**无覆盖时 `data={}`**（合法空，前端显示「无分析师覆盖」）；`buy`/`underperform` 仅部分市场返回（缺失档位**不显示为 0**）；`rating_summary`：**仅 US/CA 有数据**，且其 `rating` 是 **3 档**（1=Sell/2=Hold/3=Buy），与 `analyst_consensus` 的 5 档**不是同一枚举**（前端两套标签分开，`tests/f10.test.mjs` 有防合并断言） |
 | `derivative_detail`（聚合 4 section） | 见锁定表 §C.7 | `option_volatility`/`option_exercise_probability` 的 `symbol` **必须是期权合约**（传正股官方 `-3`）；行权概率 **`-9` = 用户无期权数据查询权限**（与标的无关）；`future_info` **所有 code 被静默丢弃时也返回空数组**（空≠错）；`strike_probability` 内部键名未核对 → 前端按上游原样键展示，不编字段名 |
 

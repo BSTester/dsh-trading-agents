@@ -423,5 +423,82 @@ class DataPlaneToolSurfaceTests(unittest.TestCase):
             self.assertIn(section, description["derivative_detail"], section)
 
 
+class DataPlaneLocalRejectionTests(unittest.TestCase):
+    """本地前置拒绝必须在**方法组之前**拦下：错误码是参数码，且**零上游调用**。
+
+    与 `DataPlaneEndpointSurfaceTests` 的替身用例互补：那里的假方法组吞掉一切，看不出
+    「参数根本没到上游」；这里注入**真方法组 + 记录客户端**，因此 `client.calls == []`
+    是「零上游调用」的直接证据（E2E 2026-09-17 的两个探针——非法 `op`、欠指定
+    `field_filter`——都属这一族）。
+    """
+
+    def setUp(self):
+        self.home = str(ROOT / "tests" / "_tmp_wp12_local_reject")
+
+    def _data_with_real_watchlist(self):
+        """真 `OpenApiWatchlist` 挂在假 `DataPlaneGroups` 上（其余组保持替身）。
+
+        ``market=object()`` 只为让 `_openapi_ready()` 走「注入替身即视为凭据可用」的既有
+        分支——否则用例会依赖本机真凭据（环境耦合）。
+        """
+        from test_wp8_market import RecordingClient  # noqa: PLC0415
+        from trading_datasource.futu_openapi import OpenApiWatchlist  # noqa: PLC0415
+        watch = OpenApiWatchlist(RecordingClient(d={"result_code": 0}))
+        groups = _Groups()
+        groups.watchlist = watch
+        data = futu_data.FutuData(home=self.home, channel=futu_data.CHANNEL_OPENAPI,
+                                  market=object(), dataplane=groups)
+        return data, watch
+
+    def test_modify_user_security_unknown_op_is_rejected_before_upstream(self):
+        data, watch = self._data_with_real_watchlist()
+        envelope = data._envelope("modify_user_security",
+                                  {"op": "NOT_A_REAL_OP", "code_list": ["HK.00700"]})
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], futu_data.PARAM_CODE)
+        self.assertIn("ADD", envelope["error"]["message"])
+        self.assertEqual(watch.client.calls, [], "非法 op 不得触达上游")
+
+        # 反向：合法（小写归一）→ 真的发一次，且 op 是官方大写 token
+        ok = data._envelope("modify_user_security",
+                            {"op": "add", "code_list": ["HK.00700"]})
+        self.assertTrue(ok["ok"], ok)
+        self.assertEqual(watch.client.calls[-1][4]["op"], "ADD")
+
+    def test_option_screen_underspecified_field_filter_is_rejected_locally(self):
+        data, _ = self._data_with_real_watchlist()
+        groups = data._dataplane_override
+        envelope = data._envelope("option_screen",
+                                  {"filter": {"field_filter": {"filter_list": []},
+                                              "strategy": {"market_category_list": [1]}}})
+        self.assertFalse(envelope["ok"])
+        self.assertEqual(envelope["error"]["code"], futu_data.PARAM_CODE)
+        self.assertEqual(groups.calls, [], "形状非法的 field_filter 不得触达方法组")
+
+
+class HarnessProbeLockTests(unittest.TestCase):
+    """e2e harness 的能力探针载荷必须与**真机验证过的示例**一致（防漂移）。
+
+    harness 是独立脚本（只经 HTTP），无法 import 服务端常量，因此只能镜像；
+    镜像漂移由本锁拦截（同 `tests/test_labels.py` 的跨文件比对手法）。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        import importlib.util  # noqa: PLC0415
+        spec = importlib.util.spec_from_file_location(
+            "e2e_workbench", ROOT / "scripts" / "e2e_workbench.py")
+        cls.harness = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(cls.harness)
+
+    def test_option_screen_probe_mirrors_server_example(self):
+        import json  # noqa: PLC0415
+        self.assertEqual(self.harness.OPTION_SCREEN_PROBE,
+                         json.loads(futu_data.OPTION_SCREEN_EXAMPLE))
+        # 欠指定探针保持「空数组占位」——正是本地守卫要拦的形状
+        bad = self.harness.OPTION_SCREEN_UNDERSPECIFIED
+        self.assertEqual(bad["filter"]["field_filter"], {"filter_list": []})
+
+
 if __name__ == "__main__":
     unittest.main()
