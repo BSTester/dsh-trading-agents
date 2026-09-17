@@ -22,7 +22,8 @@
 
 **状态与内容分开说**（情绪阶段，WP11 质量修复）：``sentiment.run`` 的软失败（池空/全源
 失败/会话未收盘）**返回 ok 且退出 0**，tick 照常写 ran 标记——作业确实跑完了，状态仍是
-``ok``；「今天什么都没采到」并进 ``summary``（``_SENTIMENT_OUTCOMES``），页面因此看得见
+``skipped``（不是 ``ok``——「今天什么都没做」不该显示成完成），原因进 ``summary``
+（``_CONTENT_OUTCOMES``），页面因此看得见
 内容结局而不牺牲状态语义。同理，情绪阶段的积累数字（已积累天数/连续交易日/最近日期）
 **一律按市场**取，不把全市场累计混进单市场行。
 
@@ -134,11 +135,27 @@ _ALERT_STATUS = {
 #: 状态不改（作业确实跑完了，改状态会让流程页说谎），结局并进 **summary**，否则页面上
 #: 「今天什么都没采到」毫无痕迹。与 _ALERT_STATUS 的三条同源同标题，但路径不同：
 #: 那三条管「没跑完」，这里管「跑完了但内容失败」，两者不重复也不冲突。
-_SENTIMENT_OUTCOMES = {
-    "情绪快照跳过": "当日未采集",
-    "情绪源不可用": "当日源不可用",
-    "情绪快照全部失败": "当日全部失败",
+#: **作业跑完后的内容结局**（E2E 缺陷 6 泛化，2026-09-17）：``标题 → (作业名或 None,
+#: 状态覆盖或 None, 摘要片段)``。作业名 ``None`` 表示归属看 detail 里的 ``job=<name>``。
+#: 状态覆盖 ``None`` = 只补摘要不改状态（部分源缺失时作业确实采到了东西，降级会说谎）；
+#: ``skipped`` = 跑完了但什么都没做（关注池为空/会话未收盘/数据面未配置）——**此前这类
+#: 结局只在摘要里出现、状态恒为绿色「已完成」**，与「闭环是否正常」相悖。
+#: （标题一律用**字面量**：pipeline 为断环而惰性 import daemon，模块级取不到其常量。
+#: 字面量与 emit 点的漂移由 `tests/test_e2e_pipeline_honesty.py` 的标题锁兜住。）
+_CONTENT_OUTCOMES = {
+    "作业跳过：关注池为空": (None, "skipped", "当日未执行：关注池为空"),
+    "情绪快照跳过": ("sentiment_snapshot", "skipped", "当日未采集"),
+    "情绪源不可用": ("sentiment_snapshot", None, "部分源不可用"),
+    "情绪快照全部失败": ("sentiment_snapshot", "failed", "当日全部失败"),
+    "研究快照跳过": ("research_snapshot", "skipped", "当日未采集"),
+    "研究数据面未配置": ("research_snapshot", "skipped", "数据面未配置"),
+    "研究快照源不可用": ("research_snapshot", None, "部分源不可用"),
+    "研究快照全部失败": ("research_snapshot", "failed", "当日全部失败"),
+    "研究任务入队跳过": ("enqueue_research", "skipped", "当日未入队"),
 }
+
+#: 状态优先级（内容结局与既有归因同时命中时取更强的一个）
+_STATUS_RANK = {"ok": 0, "skipped": 1, "pending": 1, "failed": 2}
 
 #: 市场链层告警（daemon.tick 在整条链层面发出）→ 作用于该市场所有数据作业
 _CHAIN_ALERT_STATUS = {"日历未同步": "skipped"}
@@ -201,8 +218,9 @@ def _stage(market, job_name, state, alerts, date, chain="market"):
     """
     ran = _ran_at(state, market, job_name, date)
     if ran:
-        return {"label": _labels(job_name), "status": "ok",
-                "at": ran, "scheduled": None, "summary": ""}
+        status, summary = _content_outcome(job_name, market, alerts, chain)
+        return {"label": _labels(job_name), "status": status or "ok",
+                "at": ran, "scheduled": None, "summary": summary}
     for alert in alerts:
         title = str(alert.get("title") or "")
         owner = _ALERT_STATUS.get(title)
@@ -223,6 +241,43 @@ def _stage(market, job_name, state, alerts, date, chain="market"):
                     "at": None, "scheduled": None, "summary": "auto_pipeline 配置非法"}
     return {"label": _labels(job_name), "status": "pending",
             "at": None, "scheduled": None, "summary": ""}
+
+
+def _content_outcome(job_name, market, alerts, chain):
+    """作业**跑完了**之后的内容结局 → ``(状态覆盖或 None, 摘要)``。
+
+    与 ``_ALERT_STATUS`` 的分工：那张表管「没跑完」（无 ran 标记时的归因），这张表管
+    「跑完了但没产出」。归属规则：
+      * 表里显式给了作业名 → 必须相等；
+      * 作业名为 ``None``（如 daemon 的通用跳过告警）→ 看 detail 里的 ``job=<name>``，
+        避免一条告警污染同市场其它作业的阶段；
+      * 市场消歧沿用 ``_applies``；GLOBAL 链不做消歧（与 ``_stage`` 同口径）。
+    多条命中取**最强状态**（failed > skipped > ok），摘要按出现顺序去重拼接。
+    """
+    status, parts = None, []
+    for alert in alerts:
+        title = str(alert.get("title") or "")
+        entry = _CONTENT_OUTCOMES.get(title)
+        if entry is None:
+            continue
+        owner, override, text = entry
+        if owner is not None:
+            if owner != job_name:
+                continue
+        elif f"job={job_name}" not in str(alert.get("detail") or ""):
+            continue
+        if chain != "global" and not _applies(alert, market):
+            continue
+        if override and _STATUS_RANK.get(override, 0) > _STATUS_RANK.get(status or "ok", 0):
+            status = override
+        detail = _strip_market_prefix(alert.get("detail"), market)
+        # detail 里的 job=/market= 是归属信息，对上页面是噪声（原因已由 text 表达）
+        detail = " ".join(piece for piece in detail.split()
+                          if not piece.startswith(("job=", "market=")))
+        label = f"{text}：{detail}" if detail else text
+        if label not in parts:
+            parts.append(label)
+    return status, "；".join(parts)
 
 
 def _is_failure(alert, fallback):
@@ -331,10 +386,6 @@ def _sentiment_stage(conn, market, date, stage, alerts=()):
     无任何内容结局且无任何记录时原样返回（空库不产生噪声）。
     """
     parts = []
-    if stage.get("at"):
-        outcome = _sentiment_outcome(alerts, market)
-        if outcome:
-            parts.append(outcome)
     days = store.sentiment_days(conn, market=market)
     if days:
         latest = store.sentiment_latest(conn, market=market)
@@ -398,6 +449,24 @@ def _global_stages(conn, jobs, state, alerts, date):
     return _ordered(stages)
 
 
+#: 首启必须知道的配置缺口（E2E 缺陷 7）：只读、如实，不替用户改配置。
+def _config_warnings(home):
+    warnings = []
+    try:
+        from . import watchlist as watchlist_mod
+        if not watchlist_mod.watchlist_symbols(home):
+            warnings.append({
+                "code": "watchlist_empty",
+                "message": "关注池未配置：数据作业不会采集、研究队列不会入队",
+                "hint": "初始化：trading_core watchlist-init --from-index SH.000300"
+                        "（或在 trading-platform.json 配置 watchlist）",
+            })
+    except Exception as error:  # noqa: BLE001 —— 读不到配置不能拖垮快照
+        warnings.append({"code": "watchlist_unreadable",
+                         "message": f"关注池读取失败：{str(error)[:160]}", "hint": ""})
+    return warnings
+
+
 def _config_unparsable(home):
     """``trading-platform.json`` 存在但 JSON 不可解析（I3）。
 
@@ -449,6 +518,8 @@ def pipeline_snapshot(conn, home, date=None, alert_limit=10):
     return {"date": date, "markets": markets,
             "global": {"stages": _global_stages(conn, jobs, state, today_alerts, date)},
             "auto_pipeline": _auto_pipeline_summary(home),
+            # 首启配置缺口（关注池未配置等）：只读如实提示，前端流程页显眼展示
+            "config_warnings": _config_warnings(home),
             "kill": daemon.kill_path(home).exists(),
             "halt": store.halt_summary(conn),
             "alerts": core_alerts.list_recent(conn, limit=alert_limit)}

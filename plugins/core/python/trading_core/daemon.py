@@ -117,6 +117,18 @@ def resolve_command(cmd, home):
     return cmd
 
 
+#: 作业「跳过」的告警标题（E2E 缺陷 6）：关注池为空时 `_subprocess_runner` 会直接返回
+#: 跳过标记——此前该标记被 `_run_job` 丢弃，tick 照写 ran 标记，流程页因此把「什么都没做」
+#: 显示成绿色「已完成」。标题是**字面量契约**（`pipeline._CONTENT_OUTCOMES` 按它归因）。
+SKIP_ALERT_TITLE = "作业跳过：关注池为空"
+#: 首启告警标题（E2E 缺陷 7）：关注池未配置 → 数据链整体空转，当日只发一次（避免每 tick 刷屏）。
+WATCHLIST_EMPTY_ALERT_TITLE = "关注池未配置"
+
+#: 自带更具体告警的作业：跳过路径不得再发通用跳过告警（否则同一原因两条告警）。
+#: sentiment/research 采集与入队作业在作业体内部已按源报「跳过 + 原因」。
+SELF_ALERTING_SKIP_JOBS = frozenset(
+    {"sentiment_snapshot", "research_snapshot", "enqueue_research"})
+
 def _subprocess_runner(cmd):
     """cmd 形式作业的默认执行体：venv 同解释器跑 CLI 子进程（单作业 15 分钟超时）。"""
     home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
@@ -156,22 +168,57 @@ def tick(conn, home, jobs=None, now=None):
             key = f"{market}:{job['name']}:{stamp[:10]}"
             if state["ran"].get(key) or stamp[11:16] < job["at"]:
                 continue
-            _run_job(conn, job, home)
+            _run_job(conn, job, home, market=market)
             state["ran"][key] = stamp
     store.kv_set(conn, "daemon:state", state)
+    _warn_empty_watchlist(conn, home, stamp[:10])
     write_heartbeat(home, {"heartbeat": stamp,
                            "last_job": store.kv_get(conn, "daemon:last_job", ""),
                            "next": "见 trading-platform.json"})
     return state
 
 
-def _run_job(conn, job, home, runner=None):
+def _warn_empty_watchlist(conn, home, date):
+    """关注池为空 → 当日**一次** warn 告警（首启可见性，E2E 缺陷 7）。
+
+    每 tick 重复告警会刷屏，故用 kv 标记按日去重；`enqueue_research`/采集作业各自的
+    跳过告警讨论的是「某作业今天没做事」，这条讨论的是「配置根本没配」——两条互补，
+    不重复。
+    """
+    from . import watchlist as watchlist_mod
+    if watchlist_mod.watchlist_symbols(home):
+        return False
+    key = f"alert:watchlist_empty:{date}"
+    if store.kv_get(conn, key, default=False):
+        return False
+    alerts.emit(conn, home=str(home), level="warn", title=WATCHLIST_EMPTY_ALERT_TITLE,
+                detail="trading-platform.json 未配置 watchlist：数据作业不会采集、"
+                       "研究队列不会入队（初始化：trading_core watchlist-init "
+                       "--from-index SH.000300）")
+    store.kv_set(conn, key, True)
+    return True
+
+
+def _run_job(conn, job, home, runner=None, market=None):
     """fn 形式直接调用（测试注入）；cmd 形式经 runner 跑 CLI 子进程。
-    conn 允许为 None（纯 runner 注入的探测式调用），此时跳过 kv 记账。"""
+
+    conn 允许为 None（纯 runner 注入的探测式调用），此时跳过 kv 记账。
+
+    **跳过必须留痕**（E2E 缺陷 6）：关注池为空时 runner 返回 ``{"skipped": …}``——此前该
+    返回值被丢弃，而 tick 仍写 ran 标记，流程页于是把「什么都没做」显示成「已完成」。
+    这里把它转成 warn 告警（标题为 ``SKIP_ALERT_TITLE``、detail 带 job/market），
+    pipeline 再按标题把阶段降为 ``skipped`` 并附原因。
+    """
     if "fn" in job:
         job["fn"]({"conn": conn, "home": home})
+        result = None
     else:
-        (runner or _subprocess_runner)(job["cmd"])
+        result = (runner or _subprocess_runner)(job["cmd"])
+    if (isinstance(result, dict) and result.get("skipped")
+            and conn is not None and job["name"] not in SELF_ALERTING_SKIP_JOBS):
+        alerts.emit(conn, home=str(home), level="warn", title=SKIP_ALERT_TITLE,
+                    detail=f"job={job['name']} market={market or '-'} "
+                           f"{result.get('skipped')}")
     if conn is not None:
         store.kv_set(conn, "daemon:last_job", job["name"])
 

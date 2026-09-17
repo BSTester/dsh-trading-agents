@@ -133,7 +133,7 @@ class BuildJobsTest(unittest.TestCase):
                                                  "trade_second": 14400}])
         seen = []
         original = daemon._run_job
-        daemon._run_job = lambda conn, job, home, runner=None: seen.append(job["name"])
+        daemon._run_job = lambda conn, job, home, runner=None, market=None: seen.append(job["name"])
         self.addCleanup(setattr, daemon, "_run_job", original)
 
         daemon.tick(self.conn, home=str(self.home), now=lambda: "2026-09-14 16:20:30")

@@ -185,6 +185,17 @@ def build_parser():
     s.add_argument("--limit", type=int, default=10, help="告警条数（默认 10）")
     _add_db(s)
 
+    # ── 首启配置（E2E 缺陷 7）：从 universe 的指数成分快照生成关注池 ──
+    s = sub.add_parser("watchlist-init",
+                       help="从指数成分快照初始化关注池（首启必做：否则数据作业不采集）")
+    s.add_argument("--from-index", required=True,
+                   help="指数代码，如 SH.000300（需 universe 表已有该指数快照）")
+    s.add_argument("--limit", type=int, default=None, help="只取前 N 个标的（默认全部）")
+    s.add_argument("--force", action="store_true",
+                   help="覆盖已有非空关注池（默认拒绝覆盖）")
+    s.add_argument("--home", default=None, help="DSH_HOME 覆盖（默认 $DSH_HOME 或 ~/.dsh）")
+    _add_db(s)
+
     # ── WP7：因子快照（收盘作业链定时收集 + 历史查询；只动本地库）──
     s = sub.add_parser("factors-snapshot", help="横截面因子快照（factors.REGISTRY 全量，落 factor_snapshots）")
     s.add_argument("--tickers", required=True, help="逗号分隔")
@@ -739,6 +750,16 @@ def main(argv=None):
         elif args.cmd == "snapshot-reconcile":
             from . import snapshots
             result = snapshots.reconcile_snapshot(conn, chain_limit=args.limit)
+        elif args.cmd == "watchlist-init":
+            import os
+            from . import watchlist
+            home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+            result = watchlist.init_from_index(home, args.from_index, limit=args.limit,
+                                               force=args.force, conn=conn)
+            if not result.get("ok"):
+                # 初始化失败必须非零退出（脚本/CI 可判），原因在 JSON 里
+                print(json.dumps(result, ensure_ascii=False))
+                return 1
         elif args.cmd == "snapshot-pipeline":
             import os
             from . import pipeline

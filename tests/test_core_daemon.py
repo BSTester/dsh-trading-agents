@@ -54,8 +54,11 @@ class DaemonTest(unittest.TestCase):
                     now=lambda: "2026-09-14 16:00:30")
         self.assertEqual(ran, [])
         rows = __import__("trading_core.alerts", fromlist=["x"]).list_recent(conn)
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["level"], "warn")
+        # 按标题过滤：同一次 tick 还可能发「关注池未配置」的首启告警（空 home 必然触发），
+        # 那是另一件事（配置缺口），本用例只断言日历缺失告警。
+        calendar_rows = [r for r in rows if r["title"] == "日历未同步"]
+        self.assertEqual(len(calendar_rows), 1, rows)
+        self.assertEqual(calendar_rows[0]["level"], "warn")
 
 
 class RunJobTest(unittest.TestCase):

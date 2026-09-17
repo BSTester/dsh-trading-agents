@@ -494,12 +494,16 @@ class SentimentStageTests(PipelineBase):
     def seed_sentiment(self, date, symbol, source="fin_sentiment"):
         store.insert_sentiment(self.conn, date, symbol, source, "{}", date + " 16:20:00")
 
-    def test_content_failure_is_visible_while_status_stays_ok(self):
-        """ran 标记在 → 状态 ok（事实：作业跑完），但池空结局必须进摘要。"""
+    def test_content_skip_is_shown_as_skipped_with_reason(self):
+        """契约更新（E2E 缺陷 6，2026-09-17）：作业跑了但**什么都没做** → ``skipped``。
+
+        此前状态恒为 ok（只在摘要里写「当日未采集」），页面把空转显示成绿色「已完成」，
+        与「闭环是否正常」相悖。``at`` 仍如实保留执行时刻（作业确实被调度过）。
+        """
         self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
         self.emit_alert("情绪快照跳过", "market=SH 关注池为空")
         stage = self.stages(self.snapshot())["sentiment_snapshot"]
-        self.assertEqual(stage["status"], "ok")
+        self.assertEqual(stage["status"], "skipped")
         self.assertEqual(stage["at"], "2026-09-16 16:25:04")
         self.assertEqual(stage["summary"], "当日未采集：关注池为空")
 
@@ -508,7 +512,8 @@ class SentimentStageTests(PipelineBase):
         self.mark_ran("SH", "sentiment_snapshot", at="2026-09-16 16:25:04")
         self.emit_alert("情绪快照全部失败", "market=SH 2026-09-16：12 次调用无一成功")
         stage = self.stages(self.snapshot())["sentiment_snapshot"]
-        self.assertEqual(stage["status"], "ok")
+        # 全部失败 = 内容层故障 → failed（与「跳过、什么都没做」区分开）
+        self.assertEqual(stage["status"], "failed")
         self.assertEqual(stage["summary"], "当日全部失败：2026-09-16：12 次调用无一成功")
 
     def test_source_absent_and_accumulation_are_both_shown(self):
@@ -517,8 +522,11 @@ class SentimentStageTests(PipelineBase):
         self.emit_alert("情绪源不可用", "market=SH 源 last30days：3 个标的全部失败：未安装")
         self.seed_sentiment("2026-09-15", "SH.600519")
         self.seed_sentiment("2026-09-16", "SH.600519")
-        summary = self.stages(self.snapshot())["sentiment_snapshot"]["summary"]
-        self.assertIn("当日源不可用：源 last30days：3 个标的全部失败：未安装", summary)
+        stage = self.stages(self.snapshot())["sentiment_snapshot"]
+        # 部分源缺席：作业确实采到了东西（其它源），状态不降级，只在摘要里如实说明
+        self.assertEqual(stage["status"], "ok")
+        summary = stage["summary"]
+        self.assertIn("部分源不可用：源 last30days：3 个标的全部失败：未安装", summary)
         self.assertIn("已积累 2 天", summary)
         self.assertIn("最近 2026-09-16", summary)
 
