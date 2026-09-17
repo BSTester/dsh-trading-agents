@@ -250,7 +250,19 @@ cmd_stop() {
 }
 
 # ---------------------------------------------------------------- 状态
+# `status` 的输出是**尽力而为**的（运维常写 `status | head`，消费者提前关闭管道会让
+# echo/tail 报 EPIPE）：先把整段输出攒进变量、再一次性 printf（stderr 丢弃），
+# 判定完全靠**显式 return**。否则 `status | head -5` 会因写管道失败而误报非零/刷噪音。
 cmd_status() {
+  set +e +o pipefail
+  local out rc
+  out="$(_status_body)"
+  rc=$?
+  printf '%s\n' "$out" 2>/dev/null
+  return $rc
+}
+
+_status_body() {
   local pid body
   pid="$(listening_pid)"
   body="$(health_json)"
