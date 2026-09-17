@@ -80,6 +80,12 @@ CREATE TABLE IF NOT EXISTS plate_snapshots(
 CREATE TABLE IF NOT EXISTS rules(
   rule_id TEXT PRIMARY KEY, spec TEXT NOT NULL, status TEXT NOT NULL,
   validation TEXT, created_at TEXT NOT NULL, approved_at TEXT, approved_by TEXT);
+CREATE TABLE IF NOT EXISTS research_tasks(
+  task_id TEXT PRIMARY KEY, kind TEXT NOT NULL, as_of TEXT NOT NULL,
+  market TEXT NOT NULL, payload TEXT NOT NULL, status TEXT NOT NULL,
+  attempts INTEGER NOT NULL DEFAULT 0, created_at TEXT NOT NULL,
+  started_at TEXT, finished_at TEXT, result_ref TEXT, err TEXT,
+  UNIQUE(kind, as_of, market));
 """
 
 # ---------------------------------------------------------------------------
@@ -948,3 +954,170 @@ def research_stats(conn):
             "short": {"rows": int(short["rows"] or 0),
                       "symbols": int(short["symbols"] or 0), "latest": short["latest"]},
             "plate": {"rows": int(plate["rows"] or 0), "latest": plate["latest"]}}
+
+
+# ---------------------------------------------------------------------------
+# WP15：值班研究员任务队列（规格 §10.2–§10.3）。
+#
+# 本层是**纯状态机**：不 import 告警/网络/子进程，也不发任何 LLM 调用；升级为 failed
+# 的告警由带 home 的业务层（``research_queue.reclaim``）发出——与 sentiment/
+# research_sync（业务层发告警）和 store（纯数据层）同一分工。
+#
+# 队列即攻击面（规格 §十一.13）：kind 与 payload 键都是**白名单**，自由文本一律在入队
+# 侧当场 ValueError（而不是等到执行侧才发现队列里躺着一句 prompt）。
+# ---------------------------------------------------------------------------
+
+#: 任务种类白名单（规格 §10.3）。新增种类必须同时更新此处与研究院技能的执行手册。
+TASK_KINDS = ("daily_brief", "factor_patrol", "mining_round")
+#: 任务载荷允许键——**只有结构化引用**，没有自由文本位置。
+TASK_PAYLOAD_KEYS = ("as_of", "market", "refs", "digest_ref", "symbols",
+                     "factor_list", "window")
+#: 失败重试上限：attempts 达到即转 failed（不再重试，避免坏任务无限占用队列）。
+TASK_MAX_ATTEMPTS = 3
+#: running 超过该分钟数视为执行体已死（headless 超限退出/会话崩溃），回收重试。
+TASK_TIMEOUT_MINUTES = 30
+
+
+def _task_row(row):
+    task = dict(row)
+    task["payload"] = json.loads(task["payload"])
+    return task
+
+
+def _validate_task(kind, as_of, market, payload):
+    """入队侧校验（fail-closed）——非法即 ValueError，**零落库**。"""
+    if kind not in TASK_KINDS:
+        raise ValueError(f"未知任务种类：{kind!r}（白名单 {'/'.join(TASK_KINDS)}）")
+    if not payload or not isinstance(payload, dict):
+        raise ValueError(f"任务载荷必须是对象，收到 {type(payload).__name__}")
+    unknown = sorted(set(payload) - set(TASK_PAYLOAD_KEYS))
+    if unknown:
+        raise ValueError(f"任务载荷含白名单外的键：{unknown}（只接受结构化引用 "
+                         f"{'/'.join(TASK_PAYLOAD_KEYS)}）")
+    if not as_of or not str(as_of).strip():
+        raise ValueError("任务缺少 as_of（观测日）")
+    if not market or not str(market).strip():
+        raise ValueError("任务缺少 market")
+
+
+def enqueue_task(conn, kind, as_of, market, payload, created_at=None):
+    """入队（当日幂等）→ ``task_id``。
+
+    幂等键 ``(kind, as_of, market)``：同一交易日同一种类同一市场**只入队一次**——
+    定时器重复唤醒、headless 与会话两条路径并发都不会重复研究。重复入队返回**已有**
+    task_id 且不改动其状态/载荷（已领取/已完成的任务不会因重跑入队被打回 pending）。
+    """
+    _validate_task(kind, as_of, market, payload)
+    as_of = str(as_of).strip()
+    market = str(market).strip().upper()
+    existing = conn.execute(
+        "SELECT task_id FROM research_tasks WHERE kind=? AND as_of=? AND market=?",
+        (kind, as_of, market)).fetchone()
+    if existing is not None:
+        return existing["task_id"]
+    task_id = f"RT-{as_of.replace('-', '')}-{market}-{kind}-{_uuid_token()}"
+    conn.execute(
+        "INSERT INTO research_tasks(task_id,kind,as_of,market,payload,status,attempts,"
+        "created_at) VALUES(?,?,?,?,?,'pending',0,?)",
+        (task_id, kind, as_of, market, json.dumps(payload, ensure_ascii=False),
+         created_at or _now()))
+    conn.commit()
+    return task_id
+
+
+def _uuid_token():
+    import uuid
+    return uuid.uuid4().hex[:6].upper()
+
+
+def claim_task(conn, now):
+    """领取最早 pending → running（``started_at=now``）；无 pending 返回 None。
+
+    「最早」按 ``created_at, task_id`` 稳定排序——同秒入队的多条任务顺序确定，不靠
+    数据库物理行序（换库/重建后仍可复现）。
+    """
+    row = conn.execute(
+        "SELECT * FROM research_tasks WHERE status='pending'"
+        " ORDER BY created_at, task_id LIMIT 1").fetchone()
+    if row is None:
+        return None
+    conn.execute("UPDATE research_tasks SET status='running', started_at=?"
+                 " WHERE task_id=?", (now, row["task_id"]))
+    conn.commit()
+    return _task_row(conn.execute("SELECT * FROM research_tasks WHERE task_id=?",
+                                  (row["task_id"],)).fetchone())
+
+
+def finish_task(conn, task_id, ok, result_ref=None, err=None):
+    """回报结果：``ok=True`` → done；``ok=False`` → attempts+1，<上限回 pending，达上限 failed。
+
+    回 pending 时清 ``started_at``（任务确实不在执行中），但**保留 err**——下一次领取者
+    需要看到上一次为什么失败，否则重试等于盲试。
+    """
+    row = conn.execute("SELECT * FROM research_tasks WHERE task_id=?",
+                       (task_id,)).fetchone()
+    if row is None:
+        raise ValueError(f"未知任务：{task_id}")
+    attempts = int(row["attempts"])
+    if ok:
+        conn.execute("UPDATE research_tasks SET status='done', finished_at=?,"
+                     " result_ref=?, err=NULL WHERE task_id=?",
+                     (_now(), result_ref, task_id))
+    else:
+        attempts += 1
+        status = "failed" if attempts >= TASK_MAX_ATTEMPTS else "pending"
+        conn.execute("UPDATE research_tasks SET status=?, attempts=?, started_at=NULL,"
+                     " finished_at=?, err=? WHERE task_id=?",
+                     (status, attempts, _now() if status == "failed" else None,
+                      (str(err)[:300] if err else None), task_id))
+    conn.commit()
+    return _task_row(conn.execute("SELECT * FROM research_tasks WHERE task_id=?",
+                                  (task_id,)).fetchone())
+
+
+def reclaim_tasks(conn, now, timeout_minutes=TASK_TIMEOUT_MINUTES):
+    """回收超时 running 任务 → ``{"requeued": [id], "failed": [task], "kept": [id]}``。
+
+    执行体死掉时任务会永远停在 running（headless 被杀、会话中断）——回收是队列不卡死的
+    唯一保障。``attempts`` 达上限的**不回收而是判 failed**：坏任务不能无限循环烧额度。
+    """
+    import datetime as _dt
+    cutoff = (_dt.datetime.strptime(str(now), "%Y-%m-%d %H:%M:%S")
+              - _dt.timedelta(minutes=int(timeout_minutes))).strftime("%Y-%m-%d %H:%M:%S")
+    rows = conn.execute(
+        "SELECT * FROM research_tasks WHERE status='running' AND started_at IS NOT NULL"
+        " AND started_at < ? ORDER BY started_at, task_id", (cutoff,)).fetchall()
+    stale = {r["task_id"] for r in rows}
+    requeued, failed = [], []
+    for row in rows:
+        attempts = int(row["attempts"]) + 1
+        if attempts >= TASK_MAX_ATTEMPTS:
+            conn.execute("UPDATE research_tasks SET status='failed', attempts=?,"
+                         " finished_at=?, err=? WHERE task_id=?",
+                         (attempts, now, f"执行超时（>{timeout_minutes} 分钟）且已达重试上限",
+                          row["task_id"]))
+            failed.append(_task_row(conn.execute(
+                "SELECT * FROM research_tasks WHERE task_id=?", (row["task_id"],)).fetchone()))
+        else:
+            conn.execute("UPDATE research_tasks SET status='pending', attempts=?,"
+                         " started_at=NULL, err=? WHERE task_id=?",
+                         (attempts, f"执行超时（>{timeout_minutes} 分钟），已回收重试",
+                          row["task_id"]))
+            requeued.append(row["task_id"])
+    conn.commit()
+    kept = [r["task_id"] for r in conn.execute(
+        "SELECT task_id FROM research_tasks WHERE status='running'"
+        " ORDER BY created_at, task_id").fetchall() if r["task_id"] not in stale]
+    return {"requeued": requeued, "failed": failed, "kept": kept}
+
+
+def get_tasks(conn, status=None, limit=50):
+    """任务列表（可按状态过滤），按 ``created_at, task_id`` 稳定排序。"""
+    sql = "SELECT * FROM research_tasks"
+    params = ()
+    if status is not None:
+        sql += " WHERE status=?"
+        params = (status,)
+    sql += " ORDER BY created_at, task_id LIMIT ?"
+    rows = conn.execute(sql, (*params, int(limit))).fetchall()
+    return [_task_row(row) for row in rows]
