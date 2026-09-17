@@ -25,8 +25,11 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
+sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 
 from trading_core import cli, daemon, pipeline, research_sync, store  # noqa: E402
+from trading_datasource.futu_openapi import (  # noqa: E402
+    WP12_TRANSPORT_ENDPOINTS, OpenApiF10, OpenApiPlate, OpenApiShort)
 
 TODAY = "2026-09-16"
 F10_ALLOWED = ("f10", "short_daily_volume", "short_interest", "plate_list")
@@ -431,6 +434,40 @@ class ChainIntegrationTests(_Base):
         self.assertEqual(pipeline._JOB_LABELS["research_snapshot"], "研究数据快照")
         for title in ("研究快照跳过", "研究数据面未配置", "研究快照全部失败"):
             self.assertIn(title, pipeline._ALERT_STATUS, title)
+
+
+class SubsetInvariantTests(unittest.TestCase):
+    """手写 section 名单必须是传输层枚举的**子集**（代码质量审查「重要 2」）。
+
+    作业按名字调传输层：F10 走 ``f10(symbol, section)`` 的枚举校验，做空走
+    ``getattr(client.short, section)``，板块走 ``plate_class`` 枚举。拼错一个名字
+    **不会让任何既有测试变红**（假替身对任意 section 都返回），只会在生产每日作业里
+    静默失败——这三条 ``⊆`` 断言把「拼错」挡在测试期。
+    """
+
+    def test_f10_sections_subset_of_transport(self):
+        missing = set(research_sync.F10_SECTIONS) - OpenApiF10.SECTIONS
+        self.assertEqual(
+            missing, set(),
+            f"research_sync.F10_SECTIONS 含传输层不认的名字：{sorted(missing)}")
+
+    def test_short_sections_subset_of_transport(self):
+        adapters = {method for (cls, method) in WP12_TRANSPORT_ENDPOINTS
+                    if cls == "OpenApiShort"}
+        missing = set(research_sync.SHORT_SECTIONS) - adapters
+        self.assertEqual(
+            missing, set(),
+            f"SHORT_SECTIONS 含传输层未适配的名字：{sorted(missing)}")
+        # 调用路径是 getattr(client.short, section)——注册表有条目但方法不存在同样会炸
+        for section in research_sync.SHORT_SECTIONS:
+            self.assertTrue(hasattr(OpenApiShort, section),
+                            f"OpenApiShort 缺方法 {section}")
+
+    def test_plate_classes_subset_of_transport(self):
+        missing = set(research_sync.PLATE_CLASSES) - OpenApiPlate.PLATE_CLASSES
+        self.assertEqual(
+            missing, set(),
+            f"PLATE_CLASSES 含传输层不认的分类：{sorted(missing)}")
 
 
 if __name__ == "__main__":
