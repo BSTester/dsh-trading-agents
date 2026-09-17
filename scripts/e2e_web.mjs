@@ -79,7 +79,9 @@ const OPTS = parseArgs(process.argv.slice(2));
  * 标题，只能以卡片标题为锚点）。optional = 依赖当前数据的锚点，缺失只作信息记录。
  */
 const ROUTES = [
-  { key: "overview", name: "概览", required: ["运行状态"], optional: ["今日成交（OpenAPI）", "因子快照"] },
+  // 「今日成交」标题随模式变（sim=「模拟盘派生」/ live=「OpenAPI」，WP16 起 deals_today
+  // 按模式取数）——锚点取共同前缀，避免模式一变就假红。
+  { key: "overview", name: "概览", required: ["运行状态"], optional: ["今日成交", "因子快照"] },
   { key: "market", name: "行情", required: ["行情"], optional: ["实时报价（rt_quote"] },
   { key: "capital", name: "资金", required: ["资金流向"], optional: ["资金分布（超大"] },
   { key: "options", name: "期权", required: ["期权分析"], optional: ["期权波动率", "到期日列表"] },

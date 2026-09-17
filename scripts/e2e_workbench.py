@@ -994,6 +994,7 @@ def scan_writes(client, results, findings, baseline_state):
                     new_price = round(price * 1.01, 2)
                     mod_out = client.call("trade_modify", {"order_id": str(second_id),
                                                            "symbol": probe_symbol,
+                                                           "side": "BUY",
                                                            "qty": 100, "price": new_price})
                     record(f"trade_modify(改价 →{new_price})", mod_out,
                            "ok:true + submitted（改单=撤旧重下）")
@@ -1191,8 +1192,17 @@ def consistency(client, declared, results, findings, read_map):
             ran = {}
     today = date.today().isoformat()
     mismatch = []
+    # 阶段名 → 作业名并非一一对应：``plan``/``execute`` 是**表驱动派生阶段**
+    # （pipeline._market_stages 在 build_plan/auto_execute 之后插入，分别由 plans/orders
+    # 表事实得出）。它们没有同名作业，也就不该期待 ``SH:plan:<date>`` 这类 ran 标记——
+    # 拿它们去比对 ran 标记，会在「有人手工跑 plan-auto 生成了计划」时误报「没跑却显示完成」
+    # （2026-09-17 实机：手工 plan-auto 后本检查报 1 项阻断，实为检查口径错）。
+    # 派生阶段的诚实性由 _plan_stage/_execute_stage 的事实来源保证，这里只核对作业阶段。
+    DERIVED_STAGES = {"plan", "execute"}
     for market, info in (value.get("markets") or {}).items():
         for stage, detail in (info.get("stages") or {}).items():
+            if stage in DERIVED_STAGES:
+                continue
             key = f"{market}:{stage}:{today}"
             has_mark = key in ran
             status = detail.get("status")
@@ -1217,7 +1227,7 @@ def consistency(client, declared, results, findings, read_map):
                     "category": "ok" if not mismatch else "important", "code": None,
                     "message": f"不一致 {len(mismatch)} 项", "http": pipe.get("http"),
                     "ms": pipe.get("ms"), "snippet": json.dumps(mismatch, ensure_ascii=False)[:300],
-                    "expect": "阶段状态与实际 ran 标记一致"})
+                    "expect": "作业阶段状态与实际 ran 标记一致（plan/execute 为表驱动派生阶段，不在此列）"})
     print(f"  pipeline vs kv ran 标记不一致: {len(mismatch)} 项 {mismatch[:3]}")
     if mismatch:
         findings.append(finding("important", "流程页阶段状态与 kv ran 标记不一致", "pipeline",
