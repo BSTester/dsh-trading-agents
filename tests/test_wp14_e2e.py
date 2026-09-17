@@ -18,6 +18,7 @@
 """
 import io
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -158,12 +159,24 @@ class ChainBase(unittest.TestCase):
         return self.handler()("rules-decide", {"rule_id": rule_id, "decision": "enable"})
 
     def plan_auto(self, today=D1):
-        return self.run_json(["plan-auto", "--market", "SH", "--home", str(self.home),
-                              "--today", today])
+        """走真实 CLI 接线，但**券商通道必须假件**（与 ``poll`` 同一纪律）。
+
+        2026-09-18 修复（WP17 现金封顶暴露）：此前这两条 CLI 路径没有包 mock，于是
+        ``plan-auto`` 实际查了**本机真实模拟账户**——计划内容（现金、持仓、单数）随本机
+        状态漂移，只在「只断言单数」时侥幸通过；本机现金 5.5 万时立刻炸出 ``1 != 3``。
+        测试不许依赖真机账户状态：这里把 ``core_broker.sim_call`` 换成假件（plan_auto 的
+        券商通道入口，比 patch 通道内部更稳，不受 openapi/mcp 分派影响）。
+        """
+        call, _ = self._broker()
+        with mock.patch("trading_core.broker.sim_call", lambda home=None, **kw: call):
+            return self.run_json(["plan-auto", "--market", "SH", "--home", str(self.home),
+                                  "--today", today])
 
     def auto_execute(self, now=f"{D2} 09:36:00", today=D2):
-        return self.run_json(["auto-execute", "--market", "SH", "--home", str(self.home),
-                              "--today", today, "--now", now])
+        call, _ = self._broker()
+        with mock.patch("trading_core.broker.sim_call", lambda home=None, **kw: call):
+            return self.run_json(["auto-execute", "--market", "SH", "--home", str(self.home),
+                                  "--today", today, "--now", now])
 
     # ---- 券商假件（唯一假的外部通道） ----
 
@@ -188,7 +201,15 @@ class ChainBase(unittest.TestCase):
         return call, calls
 
     def poll(self, call):
-        with mock.patch("trading_datasource.futu_mcp.call_tool", call):
+        """轮询并执行指令；**时钟走 ``DSH_FAKE_NOW``**（与被测时间线一致，见下）。
+
+        2026-09-18 修复：此前 poll 用**真实墙钟**取 ``day`` 判交易日——测试只在「真实日期
+        恰好是 D0/D1/D2」时通过，日期一过就红（真实今天不在测试日历里 → 规则 3
+        「非交易日/非连续竞价时段」拒单，订单全 cancelled）。测试不许依赖运行时刻，
+        沿用 ``test_wp9_e2e`` 的假时钟口径。
+        """
+        with mock.patch.dict(os.environ, {daemon.FAKE_NOW_ENV: f"{D2} 09:36:00"}), \
+                mock.patch("trading_datasource.futu_mcp.call_tool", call):
             return daemon.poll_commands(self.conn, str(self.home))
 
     # ---- 观测 ----
