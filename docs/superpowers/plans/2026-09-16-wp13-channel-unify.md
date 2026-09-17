@@ -10,6 +10,22 @@
 
 ---
 
+### 任务 0：`futu_openapi` 拆包 + 路径常量统一（WP12 质量审查遗留，紧跟的机械重构）
+
+**触发**：WP12 后该文件约 2500 行（客户端核心 + 校验基类 + 9 个方法组）；且 **WP12 前的方法组
+（OpenApiMarket 18 处、OpenApiTrade 15 处）仍内联字面量路径**，锁定测试只能核对命名常量——
+内联路径绕过「禁止未核对路径落地」的不变式。WP13 再加 `OpenApiSimTrade` 会出现第三种写法。
+
+**做法（对调用方零改动）**：改包 `trading_datasource/futu_openapi/`，`__init__.py` **原样再导出**
+现有全部公开名（`OpenApiClient`/`CredentialStore`/`AppKeySigner`/`Pkce`/四个异常/
+`parse_envelope*`/九个方法组类/`default_credential_path`），所有既有 `from ... import X` 不动。
+模块切分建议：`errors.py`/`auth.py`/`envelope.py`/`client.py`/`validators.py`/`paths.py`（常量）/
+`groups/{market,trade,dataplane,f10}.py`。同时把旧组 33 处内联路径提升为 `paths.py` 常量。
+
+**护栏**：① 断言 `__init__` 再导出历史公开名集合的测试（防拆分静默破坏导入）；② 路径常量统一后，
+把旧组也纳入锁定表绑定测试；③ 三套测试全绿 + `scripts/futu_openapi_check.py --dataplane` 复跑。
+**零行为变化**是硬约束（纯移动 + 引用替换）。
+
 ### 任务 1：sync 五项迁 REST
 
 **文件**：修改 `plugins/core/python/trading_core/sync.py`（取数函数加 channel 分派）、`plugins/datasource/python/trading_datasource/futu_openapi.py`（`OpenApiBasicData.rehab` 已在 WP12、补 statements/valuation/dividends 三个 F10 端点方法——WP12 任务 3 已含 statements/dividends/valuation-detail，本任务只做接线）；测试 `tests/test_wp13_sync_channel.py`。
