@@ -368,3 +368,38 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
 实测响应键均为 `positions`（`_sim_positions_and_equity` 早已双键兼容）——该函数在真实响应
 下恒返回空列表，平台组合页 sim 持仓会因此为空。WP13 任务 2 按既有双键口径修正，
 新增用例 `tests/test_wp13_simtrade.py::SimCallBrokerIntegrationTests`。
+
+### 九之一、通道统一收口复核（WP13 任务 3，2026-09-17 真机）
+
+**1）`scripts/futu_openapi_check.py --dataplane` 复跑：41/41 `ok`**（覆盖 11 单方法端点 +
+F10 的 26 section + 衍生品 4 项；自选 3 项与模拟交易 9 项不在内，理由见 §八）。
+
+**2）sim 只读路径经生产分派抽样**（`channel.sim_call` + `futu_channel=openapi`，非直调传输层）：
+
+| 调用 | 实测结果 |
+|---|---|
+| `sim_trade_account_list` | 9 个模拟账户（港股 `market_id=1` / A 股 `3` / 美股 `100` + 期权/期货/日股） |
+| `sim_trade_position_list(acc, market)` | A 股账户 8 条持仓，响应键 `positions` |
+| `sim_trade_cash_info(acc)` | `total_asset=817931.816`、`balance=55257.816`（无 s 口径与 §九一致） |
+| `sim_trade_history_order_list(acc, 当日窗口)` | 1 条历史订单，响应键 `orders`；字段含 `avg_fill_price`/`cum_qty`/`order_type` 等 |
+
+**3）`statements`/`dividends` REST 容器键实测**（任务 1 实现时锁定表未点名，用「MCP 名 →
+`items`」双兜底；本任务真机复核以确认第一支就是真实契约）：
+
+| 端点 | REST 实测 `d` 顶层键 | 与 MCP 形状 |
+|---|---|---|
+| `f10.statements` | `report_list` + `pagination`（10 期；行内含 `date_time`/`item_list`） | **同名**（`quote_financials_statements` 的 `report_list`） |
+| `f10.dividends` | `dividend_list` + `total_dividend_count`/`total_dividend_money`（30 条） | **同名**（`dividend_list`） |
+| `f10.valuation_detail` | 非数组（`valuation_type`/`trend`/`*_distribution` 等） | 与既有估值字段路径一致 |
+
+结论：双兜底的**第一支即真实契约**，`items` 支保留为「data 层为数组 + 信封分页」归一形状
+的防御（经济日历搜索那类，见 §八），实现无需修改。
+
+**4）通道分裂的修复与回归钉（本任务的实质产出）**：`planner.plan_auto` 与
+`reconcile.daily` 曾各自硬编码 `futu_mcp.call_tool` 作缺省通道——`futu_channel=openapi`
+下「下单执行走 REST、取持仓/对账走 MCP」，且 REST 失败会**静默落到 MCP**（限频/权限错误
+伪装成 MCP 行为）。现两处统一经 `core_broker.sim_call(home)`；回归用例
+`tests/test_wp13_e2e.py`（6 项）在同一份种子数据上跑完两交易日时间线，断言两通道可观测
+结果逐字段等价、openapi 下五类腿全走 REST 且 `sim_trade_*` 零调用、凭据缺失整链回退、
+REST 失败不换通道、两通道皆不可用零占位。回退标记在 sim 路径被丢弃属遗留项（见
+HANDOVER §七）。

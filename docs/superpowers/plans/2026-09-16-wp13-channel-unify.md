@@ -70,12 +70,36 @@ def test_statements_announced_at_preserved(self):
 
 **文件**：测试 `tests/test_wp13_e2e.py`；文档。
 
-- [ ] **步骤 1：等价性测试**：rehab/statements/估值/分红/经济日历五项 × 两通道 = 10 个用例（假件喂同源数据 → 落库行逐字段相等）；sim 链路：`futu_channel=openapi`（假 client）下复用 `tests/test_wp9_e2e.py` 的两日时间线跑通（计划→执行→成交→台账一致）。
-- [ ] **步骤 2：回退语义测试**：openapi 凭据缺失 → 五项与 sim 全部回退 mcp 且结果标 `channel` 字段；两通道皆不可用 → 如实报错零占位。
-- [ ] **步骤 3：三套绿 + 文档**：`docs/architecture.md`「富途通道决策」表更新（openapi=完整通道，mcp=回退）；`docs/TOOL-LIMITS.md` sim REST 实测口径与改单待办登记。
-- [ ] **步骤 4：Commit**：`git commit -m "test(platform): 双通道等价与 sim 全链路回归（WP13 收口）"`
+- [x] **步骤 1：等价性测试**：rehab/statements/估值/分红/经济日历五项 × 两通道 = 10 个用例（假件喂同源数据 → 落库行逐字段相等）；sim 链路：`futu_channel=openapi`（假 client）下复用 `tests/test_wp9_e2e.py` 的两日时间线跑通（计划→执行→成交→台账一致）。
+- [x] **步骤 2：回退语义测试**：openapi 凭据缺失 → 五项与 sim 全部回退 mcp 且结果标 `channel` 字段；两通道皆不可用 → 如实报错零占位。
+- [x] **步骤 3：三套绿 + 文档**：`docs/architecture.md`「富途通道决策」表更新（openapi=完整通道，mcp=回退）；`docs/TOOL-LIMITS.md` sim REST 实测口径与改单待办登记。
+- [x] **步骤 4：Commit**：`git commit -m "test(platform): 双通道等价与 sim 全链路回归（WP13 收口）"`
 
 ### WP13 验收（对照规格 §8.3）
 
-- [ ] `futu_channel: openapi` 下行情/交易/同步/推送全 REST；mcp 回退完整；
-- [ ] sim 计划→执行→成交→台账一致（openapi 通道）；三套全绿。
+- [x] `futu_channel: openapi` 下行情/交易/同步/推送全 REST；mcp 回退完整；
+- [x] sim 计划→执行→成交→台账一致（openapi 通道）；三套全绿。
+
+### WP13 任务 3 验收记录（2026-09-17）
+
+- **等价性**：`tests/test_wp13_e2e.py` 6 项全绿——同一份种子数据在两通道跑完两交易日时间线，
+  `plans`/`orders`/`risk_checks` 逐字段相等（uuid/时间戳等非确定性字段排除），且断言基线
+  非空（避免空真）。
+- **REST 全链路**：openapi 通道下五类腿（accounts/positions/cash/history/place）全部走 REST，
+  `sim_trade_*` 的 MCP 调用为 **0**；反向 mcp 通道 REST 零调用（回退不是「两边都发」）。
+- **回退**：openapi 配置 + 凭据缺失 → **整链**回退 MCP 且与基线等价（REST 零尝试）。
+- **不换通道**：REST 失败 → 如实跳过/失败 + 告警 + `tick_errors` 可见，MCP 零调用、零占位；
+  两通道皆不可用 → 零计划/零订单/零预检行。
+- **真机（2026-09-17）**：`scripts/futu_openapi_check.py --dataplane` **41/41 ok**；sim 只读
+  四路经生产分派抽样可用（9 账户 / 8 持仓 / `total_asset` 权益 / 历史 1 单）；
+  `f10.statements`→`report_list`、`f10.dividends`→`dividend_list` 与 MCP **同名**——
+  双兜底第一支即真实契约，实现无需修改（TOOL-LIMITS §九之一）。
+- **修复（本任务实质产出）**：`planner.plan_auto` 与 `reconcile.daily` 的缺省券商通道由硬编码
+  `trading_datasource.futu_mcp.call_tool` 改为 `core_broker.sim_call(home)`（与
+  `daemon._default_executor` 同口径）——消除「下单执行走 REST、取持仓与对账走 MCP」的通道分裂
+  以及 REST 失败**静默换通道**（会把限频/权限错误伪装成 MCP 行为）。
+  回归钉已验证有效：仅回退该修复，`test_rest_failure_does_not_switch_to_mcp` 与
+  `test_openapi_snapshot_equals_mcp_snapshot` 转红（MCP 收到了 `sim_trade_*` 调用）。
+- **遗留（如实登记）**：①sim 调用路径丢弃 `mcp(fallback)` 回退标记（HANDOVER §七）；
+  ②sim REST 原生改单待更多样本（TOOL-LIMITS §九）。
+- 三套测试全绿：Python `OK (skipped=5)` / Node `66 pass` / Web `233 pass`。

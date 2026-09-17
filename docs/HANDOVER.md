@@ -255,6 +255,19 @@ DOM 抓取保留为降级路径（约 40-50s）。Reddit 走同源 `/search.json
   `futu_channel: openapi|mcp` 切通道（默认 mcp=WP7 行为零变化）；openapi 无凭据 →
   `trading/openapi-unavailable`（如实拒绝，不回落）。连通性自检
   `python3 scripts/futu_openapi_check.py --app-key <ID>`。
+- **通道分派与回退（WP13 任务 3）**：`futu_channel=openapi` 自 WP13 是**完整通道**——
+  sim 全链路（计划生成取持仓/权益、执行下单、对账读券商事实）与 sync 五项统一经
+  `trading_datasource.channel`（`sim_call` / `fetch`）分派，实现唯一；此前
+  `planner.plan_auto`/`reconcile.daily` 硬编码 MCP 造成的通道分裂已修复。分层语义要分清：
+  **服务取数端点**（`server/futu_data.py`）在 openapi 无凭据时**如实拒绝**
+  （`trading/openapi-unavailable`）；**core/datasource 的通道分派**在 openapi 已配置但凭据
+  缺失时**回退 MCP**（`fetch` 返回第二元素 `"mcp(fallback)"` 供调用方告警）。
+  排查顺序：①`futu_channel` 是什么；②凭据是否就绪（`channel.openapi_ready()`）；
+  ③REST 调用是否报错——**REST 失败不会静默换 MCP**（换通道会把限频/权限错误伪装成 MCP
+  行为），失败原因原样出现在作业告警与 `scheduler.last_error` 里。
+  **遗留（如实登记）**：`sim_call` 出来的 callable 只返回数据，**sim 路径丢弃回退标记**
+  （只有 `fetch` 携带），因此无法从返回值判断「本该 REST 却回退」；当前只能靠「凭据是否
+  配置」判断，若要更强可观测性需改 `sim_call` 的返回契约（涉及全部调用点，未做）。
 - **`trade_*` 新字段与确认卡片（WP8 任务 6）**：`trade_place/trade_modify` 暴露官方全字段
   （8 种 order_type/GTC/时段/触发价/港股手数/多腿），字段校验在风控与确认**之前**；
   live 下单服务端确认 TTL 120s，确认卡片披露「风控基准价」（市价类订单取本地日线最近收盘，

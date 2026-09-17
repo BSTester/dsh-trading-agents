@@ -122,12 +122,38 @@ REST（否则原样回退 MCP，默认通道行为逐字不变）。通道选择
 「登录态 header」风险不成立），写路径全链路（挂单→改单→撤单）真机验证通过；四条官方
 页面与实测不一致及待办见 [TOOL-LIMITS.md](TOOL-LIMITS.md) §九。
 
-| 通道 | WP8 后定位 |
-|---|---|
-| 工作台 OpenAPI（`mcp__quantwb__*` + Web） | **唯一权威通道**：行情/交易/推送/账户全链路，写路径唯一（闸门链 + 业务确认） |
-| Harness 直连富途（`mcp__futu__*`） | **只读研究**（不变）：写类仍被 policy 拒绝并指引工作台 |
-| 托管 MCP（`futu-mcp` preset 行，91 工具） | **可选只读研究通道**（preset 默认 disabled——用户可自行启用做自由研究）；写通道唯一在工作台 |
-| SkillHub | 仅作能力对照，不作为集成通道（其 OpenD 形态与单进程服务冲突） |
+**WP13 任务 3 补记（通道统一收口，2026-09-17）**：`futu_channel=openapi` 自本任务起是
+**完整通道**——此前只有「下单执行」经通道分派，`planner.plan_auto`（取持仓/权益算权重）
+与 `reconcile.daily`（读券商事实对账）各自硬编码 `trading_datasource.futu_mcp.call_tool`，
+形成「执行走 REST、取数与对账走 MCP」的**通道分裂**（且 REST 失败会静默落到 MCP，把
+限频/权限错误伪装成 MCP 行为）。现两处与 `daemon._default_executor` 统一经
+`core_broker.sim_call(home)`，即全链五类腿（账户/持仓/资金/历史/下单）同一通道分派：
+
+| 环节 | 入口 | 分派实现 |
+|---|---|---|
+| 计划生成（持仓/权益） | `planner.plan_auto` | `core_broker.sim_call(home)` → `trading_datasource.channel.sim_call` |
+| 执行上下文（持仓） | `daemon._positions_ctx` | 同上（`_default_executor` 注入的 callable） |
+| 下单/撤单 | `execute.run` → `core_broker.place` | 同上 |
+| 对账（订单/持仓） | `reconcile.daily` | 同上 |
+| sync 五项（rehab/statements/估值/分红/经济日历） | `trading_core.sync` / `events` / `factors` | `trading_datasource.channel.fetch` |
+
+**回退可观测性（如实披露）**：`channel.fetch`（sync 五项）返回第二元素 `"mcp(fallback)"`，
+调用方可据此告警；`channel.sim_call` 出来的 callable 只返回数据，**回退标记在 sim 调用
+路径被丢弃**（遗留项，运维侧目前靠「凭据是否配置」判断，见
+[HANDOVER.md](HANDOVER.md) §七）。两条路径的共同语义：REST 调用失败**原样上抛、不静默
+换通道**（`tests/test_wp13_e2e.py` 的 `test_rest_failure_does_not_switch_to_mcp` 钉住）。
+
+**真机复核（2026-09-17）**：`scripts/futu_openapi_check.py --dataplane` **41/41 ok**；
+sim 只读路径经生产分派抽样（9 账户 / 8 持仓 / `total_asset` 权益 / 历史订单可读）；
+`f10.statements` 与 `f10.dividends` 的 REST 容器键实测为 `report_list` / `dividend_list`
+（与 MCP 同名，双键兜底的第一支即真实契约，见 TOOL-LIMITS §九）。
+
+| 通道 | WP8 后定位 | WP13 后事实 |
+|---|---|---|
+| 工作台 OpenAPI（`mcp__quantwb__*` + Web） | **唯一权威通道**：行情/交易/推送/账户全链路，写路径唯一（闸门链 + 业务确认） | `futu_channel=openapi` 为**完整通道**：行情/交易/推送/**sync 五项**/**计划生成与对账的券商取数**/**模拟交易九端点**全 REST；默认 `mcp` 行为逐字不变 |
+| Harness 直连富途（`mcp__futu__*`） | **只读研究**（不变）：写类仍被 policy 拒绝并指引工作台 | 不变 |
+| 托管 MCP（`futu-mcp` preset 行，91 工具） | **可选只读研究通道**（preset 默认 disabled——用户可自行启用做自由研究）；写通道唯一在工作台 | 在服务侧降为 **`futu_channel=mcp`（默认）与 openapi 凭据缺失时的回退通道**；分派实现唯一在 `trading_datasource.channel` |
+| SkillHub | 仅作能力对照，不作为集成通道（其 OpenD 形态与单进程服务冲突） | 不变 |
 
 ## 组件职责
 
