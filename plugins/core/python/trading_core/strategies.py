@@ -26,6 +26,56 @@ def strategy(sid):
     return deco
 
 
+def register_rule(spec, registry=None):
+    """把规则 spec 校验后注册进 REGISTRY（``plan_auto`` 可按 rule_id 直接消费）。
+
+    协议校验与实例构造都在 ``rule_engine``（规则协议的**唯一实现**）；本函数只负责
+    「注册进策略注册表」这一 strategies 侧职责。反向 import 放在函数内：rule_engine
+    的实例要回调本模块的 ``risk_capped_weights``，模块级互相 import 会成环。
+    """
+    from . import rule_engine
+    instance = rule_engine.load_rule(spec, registry=registry)
+    REGISTRY[spec["rule_id"]] = instance
+    return instance
+
+
+def risk_capped_weights(selected, home=None):
+    """按风控上限折算等权目标权重（组合策略共用的**唯一实现**，规格 §4.2 第 5 点）。
+
+    策略不得生成风控规则 5/6 注定拒绝的目标：单票权重上限取 ``risk_config`` 的
+    ``max_position_pct``（默认 0.25）、标的数上限取 ``max_positions``（默认 5），
+    超出部分留现金。定量口径（全部确定性、不依赖 dict 顺序）::
+
+        基数 = 1 / len(selected)                        # 截断前计数：先算等权基准
+        单票权重 = floor4(min(基数, max_position_pct))   # **向下**取整到 4 位小数
+        入选 = list(selected)[:max_positions]            # 截断优先级 = 传入顺序
+        其余标的与未用满的权重 → 现金
+
+    向下取整的理由：向上取整会让目标名义略超 ``max_position_pct``，在规则 5 的
+    严格大于判定下沦为「必被拒的目标」（差额虽小，但结构性拒绝不该由策略制造）。
+
+    ``selected`` 的**顺序即截断优先级**，确定性由调用方负责：``watchlist_rsi`` 传
+    标的代码升序（无打分可依），规则解释器传打分降序（截断时保留最优标的）。
+
+    ``cap``/``limit`` 退化（≤0）时返回 ``{}``（fail-safe）：cap≤0 会产出**负权重**
+    （经 planner diff 变成非预期卖出）；limit≤0 时列表切片会静默变成「除末位全选」。
+    两者都不该被静默解释成某种目标持仓，故不产生任何目标（等价全现金、不下单）。
+    配置本身的合法性由 ``risk_config`` 的未知键校验与部署审查把关。
+    """
+    names = list(selected)
+    if not names:
+        return {}
+    from .daemon import risk_config
+    cfg = risk_config(_home(home))
+    cap = float(cfg["max_position_pct"])
+    limit = int(cfg["max_positions"])
+    if cap <= 0 or limit <= 0:
+        return {}
+    base = 1.0 / len(names)
+    per_name = math.floor(min(base, cap) * 10000) / 10000  # 向下取整，不超上限
+    return {name: per_name for name in names[:limit]}
+
+
 def _signals():
     from trading_datasource.backtest import ma_cross_signal, rsi_signal
     return ma_cross_signal, rsi_signal
@@ -83,18 +133,10 @@ class WatchlistRsiStrategy(SingleTicker):
     不生成 SELL（自动流水线只买不退）——该缺口已于 2026-09-16 由 managed 修复，
     plan_auto 传 managed = 本市场关注池 ∩ universe。
 
-    **风控上限（规格 §4.2 第 5 点，2026-09-16 修订）**：策略不得生成风控规则 5/6
-    注定拒绝的目标——单票权重上限取 ``risk_config`` 的 ``max_position_pct``
-    （默认 0.25）、标的数上限取 ``max_positions``（默认 5），超出部分留现金。
-    定量口径（全部确定性、不依赖 dict 顺序）::
-
-        基数 = 1 / len(BUY 标的)                    # 截断前计数：先算等权基准
-        单票权重 = floor4(min(基数, max_position_pct))   # **向下**取整到 4 位小数
-        入选 = sorted(BUY 标的)[:max_positions]      # 按标的代码升序，确定性截断
-        其余标的与未用满的权重 → 现金
-
-    向下取整的理由：向上取整会让目标名义略超 ``max_position_pct``，在规则 5 的
-    严格大于判定下沦为「必被拒的目标」（差额虽小，但结构性拒绝不该由策略制造）。
+    **风控上限（规格 §4.2 第 5 点）**：策略不得生成风控规则 5/6 注定拒绝的目标——
+    单票权重上限取 ``risk_config`` 的 ``max_position_pct``（默认 0.25）、标的数上限取
+    ``max_positions``（默认 5），超出部分留现金。定量口径与向下取整的理由见
+    ``risk_capped_weights``（组合策略共用的唯一实现，本类不再自持一份）。
 
     **市场维度（2026-09-16 修订 K1）**：``market`` 给定时 universe 只取该市场链
     （``SH`` 链含 SZ/BJ，口径见 ``planner.CALENDAR_MARKET``），且**分母与
@@ -134,26 +176,13 @@ class WatchlistRsiStrategy(SingleTicker):
             strict=key != watchlist_mod.DEFAULT_POOL_KEY)
 
     def target_weights(self, conn, as_of, home=None, market=None, watchlist=None):
-        from .daemon import risk_config
-        cfg = risk_config(_home(home))
-        cap = float(cfg["max_position_pct"])
-        limit = int(cfg["max_positions"])
         # 市场过滤先行（K1）：分母与截断都只看本市场链的 BUY，跨市场不互相挤占名额
         buys = sorted(s for s in self.universe(conn, as_of, home=home, market=market,
                                                watchlist=watchlist)
                       if self.signal(conn, s, as_of) == "BUY")
-        if not buys:
-            return {}
-        if cap <= 0 or limit <= 0:
-            # 退化配置 fail-safe：cap≤0 会产出**负权重**（经 planner diff 变成非预期
-            # 卖出）；limit≤0 时 buys[:limit] 在 Python 切片下会静默变成「除末位全选」。
-            # 两者都不该被静默解释成某种目标持仓，故不产生任何目标（等价全现金、不下单）。
-            # 配置本身的合法性由 risk_config 的未知键校验与部署审查把关。
-            return {}
-        base = 1.0 / len(buys)
-        per_name = min(base, cap)
-        per_name = math.floor(per_name * 10000) / 10000  # 向下取整，不超上限
-        return {s: per_name for s in buys[:limit]}
+        # 风控上限折算的唯一实现在 risk_capped_weights（规则解释器共用同一份）；
+        # 代码升序即本策略的截断优先级（无打分可依）——见该函数 docstring。
+        return risk_capped_weights(buys, home=home)
 
 
 @strategy("momentum_value_top5")
