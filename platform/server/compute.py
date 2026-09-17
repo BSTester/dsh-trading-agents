@@ -73,7 +73,17 @@ INNER_CACHE_TTL_MS = 30_000
 
 
 class ComputeError(RuntimeError):
-    """取数失败（子进程无 JSON / error 键 / 参数非法）；消息即可读原因。"""
+    """取数失败（子进程超时/无法启动/无 JSON/error 键）；消息即可读原因。"""
+
+
+class PayloadError(ComputeError):
+    """**调用方载荷**非法（参数取值/区间/形状）——与「引擎不可用」严格区分。
+
+    E2E 缺陷 4（2026-09-17）：此前两者共用 ``ComputeError``，web 层把参数拼错也报成
+    ``trading/analytics-unavailable``（引擎不可用），用户被引去查服务而不是改参数。
+    归类以**异常类型**为准（``caches.cached(payload_error_types=…)``），不做消息文本匹配。
+    子类关系保证既有 ``except ComputeError`` 的调用方行为不变。
+    """
 
 
 # analytics.js:10-16 的常量集合
@@ -100,7 +110,7 @@ def _mode_of(value):
     """
     mode = "sim" if value is None else value
     if not isinstance(mode, str) or mode not in MODES:
-        raise ComputeError("Invalid mode")
+        raise PayloadError("Invalid mode")
     return mode
 
 
@@ -108,23 +118,23 @@ def _int_in_range(value, fallback, minimum, maximum, label):
     """analytics.js:29-35 intInRange：缺省回落，越界/非整数报 ``Invalid <label> (min..max)``。"""
     number = fallback if value is None else value
     if not _is_int(number) or number < minimum or number > maximum:
-        raise ComputeError(f"Invalid {label} ({minimum}..{maximum})")
+        raise PayloadError(f"Invalid {label} ({minimum}..{maximum})")
     return number
 
 
 def _ticker_of(value):
     """analytics.js:98/103/128/166 的单标的校验（TICKER 正则 + 字符串）。"""
     if not isinstance(value, str) or TICKER.match(value) is None:
-        raise ComputeError("Invalid ticker")
+        raise PayloadError("Invalid ticker")
     return value
 
 
 def _ticker_list(value, minimum, message):
     """analytics.js:134-138/145-148/188-191 的标的列表校验。"""
     if not isinstance(value, list) or len(value) < minimum or len(value) > 8:
-        raise ComputeError(message)
+        raise PayloadError(message)
     if any(not isinstance(item, str) or TICKER.match(item) is None for item in value):
-        raise ComputeError("Invalid ticker in list")
+        raise PayloadError("Invalid ticker in list")
     return value
 
 
@@ -227,27 +237,27 @@ def _sensitivity_args(payload, force):
     if strategy is None:
         strategy = "ma_cross"
     if not isinstance(strategy, str) or strategy not in STRATEGIES:
-        raise ComputeError("Invalid strategy")
+        raise PayloadError("Invalid strategy")
     metric = payload.get("metric")
     if metric is None:
         metric = "total_return"
     if not isinstance(metric, str) or metric not in METRICS:
-        raise ComputeError("Invalid metric")
+        raise PayloadError("Invalid metric")
     for field in ("fast_grid", "slow_grid", "buy_grid", "sell_grid"):
         if field not in payload:
             continue
         value = payload[field]
         if not isinstance(value, str) or GRID.match(value) is None:
-            raise ComputeError(f"Invalid {field}")
+            raise PayloadError(f"Invalid {field}")
         for part in value.split(","):
             number = int(part)
             if number < 1 or number > 500:
-                raise ComputeError(f"Invalid {field} value")
+                raise PayloadError(f"Invalid {field} value")
     start = payload.get("start")
     if start is None:
         start = "2023-01-01"
     if not isinstance(start, str) or re.match(r"^\d{4}-\d{2}-\d{2}$", start) is None:
-        raise ComputeError("Invalid start date")
+        raise PayloadError("Invalid start date")
     args = ["--ticker", ticker, "--strategy", strategy, "--metric", metric, "--start", start]
     for field, flag in (("fast_grid", "--fast-grid"), ("slow_grid", "--slow-grid"),
                         ("buy_grid", "--buy-grid"), ("sell_grid", "--sell-grid")):
@@ -281,7 +291,7 @@ def _ic_args(payload, force):
     if factor is None:
         factor = "mom_20"
     if not isinstance(factor, str) or factor not in FACTORS:
-        raise ComputeError("Invalid factor")
+        raise PayloadError("Invalid factor")
     forward = _int_in_range(payload.get("forward"), 5, 1, 60, "forward")
     window = _int_in_range(payload.get("window"), 250, 80, 1000, "window")
     return ["ic", "--tickers", ",".join(tickers), "--factor", factor,
@@ -304,7 +314,7 @@ def _sources_args(payload, force):
     """analytics.js:157-163：``sources [--no-probe]``（no_probe 必须严格为 true）。"""
     extra = [key for key in payload if key != "no_probe"]
     if extra:
-        raise ComputeError("Unexpected sources field")
+        raise PayloadError("Unexpected sources field")
     return ["--no-probe"] if payload.get("no_probe") is True else []
 
 
@@ -380,7 +390,7 @@ def analytics(endpoint, payload=None, force=False):
     """按端点表取数：``analytics.js`` 各 provider 方法的等价物（``force`` = options.refresh）。"""
     provider = DEFAULT_ANALYTICS.get(endpoint)
     if provider is None:
-        raise ComputeError(f"Unknown analytics endpoint {endpoint}")
+        raise PayloadError(f"Unknown analytics endpoint {endpoint}")
     return provider(payload or {}, force)
 
 
@@ -395,9 +405,9 @@ def series(ticker, period="5m", limit=300, runner=None):
     if not isinstance(ticker, str) or TICKER.match(ticker) is None:
         raise ComputeError("Invalid ticker")
     if not isinstance(period, str) or period not in PERIODS:
-        raise ComputeError("Invalid period")
+        raise PayloadError("Invalid period")
     if not _is_int(limit) or limit < 20 or limit > 2000:
-        raise ComputeError("Invalid limit (20..2000)")
+        raise PayloadError("Invalid limit (20..2000)")
     return run_script("bars.py", ["--ticker", ticker, "--period", period, "--limit", str(limit)],
                       timeout=120_000, runner=runner)  # series.js:37 timeout 120s
 
@@ -409,7 +419,7 @@ SNAPSHOT_COMMANDS = ("snapshot-plan", "snapshot-schedule", "snapshot-reconcile",
 def snapshot_cli(name, timeout=SNAPSHOT_TIMEOUT, runner=None):
     """``pycore.js:18-26`` + ``corebridge.js:6-18``：``python -m trading_core <name>``。"""
     if name not in SNAPSHOT_COMMANDS:
-        raise ComputeError(f"Unknown snapshot command {name}")
+        raise PayloadError(f"Unknown snapshot command {name}")
     command = [PYTHON, "-m", "trading_core", name]
     spawn = _spawn if runner is None else runner
     completed = spawn(command, timeout)
@@ -489,9 +499,9 @@ def rules_decide(rule_id, decision, home=None):
     ``ComputeError`` 回，app 侧落 ``trading/invalid-operation``，绝不当成功。
     """
     if not isinstance(rule_id, str) or not rule_id.strip():
-        raise ComputeError("Invalid rule_id")
+        raise PayloadError("Invalid rule_id")
     if decision not in ("enable", "disable"):
-        raise ComputeError(f"Invalid decision {decision!r} (enable/disable)")
+        raise PayloadError(f"Invalid decision {decision!r} (enable/disable)")
     store = _core_module("store")
     rule_engine = _core_module("rule_engine")
     conn = store.connect(store.db_path(str(command_home(home))))
@@ -574,12 +584,12 @@ def research_tasks_report(task_id, ok, result_ref=None, err=None, home=None):
     不变、不重复告警——工具调用重试与网络重放不会把已完成的任务拉回队列。
     """
     if not isinstance(task_id, str) or not task_id.strip():
-        raise ComputeError("Invalid task_id")
+        raise PayloadError("Invalid task_id")
     if not isinstance(ok, bool):
-        raise ComputeError(f"Invalid ok (boolean required), got {type(ok).__name__}")
+        raise PayloadError(f"Invalid ok (boolean required), got {type(ok).__name__}")
     for label, value in (("result_ref", result_ref), ("err", err)):
         if value is not None and not isinstance(value, str):
-            raise ComputeError(f"Invalid {label} (string required), got {type(value).__name__}")
+            raise PayloadError(f"Invalid {label} (string required), got {type(value).__name__}")
     store, conn = _task_conn(home)
     research_queue = _core_module("research_queue")
     try:
@@ -600,7 +610,7 @@ def research_tasks_list(status=None, limit=50, home=None):
     空列表——空列表会被读成「没有任务」）；``limit`` 走既有 ``_int_in_range`` 口径。
     """
     if status is not None and status not in TASK_STATUSES:
-        raise ComputeError(f"Invalid status {status!r} ({'/'.join(sorted(TASK_STATUSES))})")
+        raise PayloadError(f"Invalid status {status!r} ({'/'.join(sorted(TASK_STATUSES))})")
     number = _int_in_range(limit, 50, 1, TASK_LIST_MAX, "limit")
     store, conn = _task_conn(home)
     try:

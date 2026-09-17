@@ -259,7 +259,8 @@ class AnalyticsErrorClassificationTests(unittest.TestCase):
 
     def test_payload_error_maps_to_invalid_operation(self):
         def provider(payload, force=False):
-            raise compute.ComputeError("tickers must list 2..8 symbols")
+            # 载荷错误用 PayloadError（引擎失败用 ComputeError，见 compute.PayloadError 说明）
+            raise compute.PayloadError("tickers must list 2..8 symbols")
 
         handle = app_module.create_handler(self.home, analytics={"correlation": provider})
         envelope = handle("correlation", {"tickers": []})

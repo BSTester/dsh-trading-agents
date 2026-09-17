@@ -162,19 +162,21 @@ class ChannelPassthroughTest(unittest.TestCase):
 
     def test_option_screen_requires_strategy_and_whitelists_inner_keys(self):
         futu = make_futu()
+        # field_filter 占位一律用官方口径的 1（E2E I4 起服务端按 proto 占位规则校验形状，
+        # True/0/[] 都会被本地拒绝——此前的 True 不是文档形式）
         out = futu.handle("option_screen",
-                          {"filter": {"field_filter": {"last_price": True}}})
+                          {"filter": {"field_filter": {"last_price": 1}}})
         self.assertFalse(out["ok"])
         self.assertIn("strategy", out["error"]["message"])
         self.assertEqual(futu._call.count(), 0)
         out = futu.handle("option_screen", {"filter": {
-            "strategy": {"market_category_list": [1]}, "field_filter": {"last_price": True},
+            "strategy": {"market_category_list": [1]}, "field_filter": {"last_price": 1},
             "bogus_key": 1}})
         self.assertFalse(out["ok"])
         self.assertIn("bogus_key", out["error"]["message"])
         self.assertEqual(futu._call.count(), 0)
         screen = {"strategy": {"market_category_list": [1], "filter_group_list": []},
-                  "field_filter": {"last_price": True, "volume": True},
+                  "field_filter": {"last_price": 1, "volume": 1},
                   "limit": 50, "sort_obj": {"sort_field": "volume", "is_asc": False}}
         out = futu.handle("option_screen", {"filter": screen})
         self.assertTrue(out["ok"], out)
@@ -195,7 +197,7 @@ class ChannelPassthroughTest(unittest.TestCase):
         # futu_mcp 把它抛成 FutuUnavailable——直通层必须识别成业务错误，不冒充成功也不算不可用。
         futu = make_futu(error=FutuUnavailable(
             "quote_option_screen: ret=-3 strategy.market_category_list[0]: must be an integer"))
-        out = futu.handle("option_screen", {"filter": {"field_filter": {"last_price": True},
+        out = futu.handle("option_screen", {"filter": {"field_filter": {"last_price": 1},
                                                        "strategy": {"market_category_list": ["US"]}}})
         self.assertFalse(out["ok"])
         error = out["error"]

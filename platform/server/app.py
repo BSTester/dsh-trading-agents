@@ -450,7 +450,7 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 return caches.cached(endpoint, payload, force,
                                      lambda: provider(payload, force),
                                      "trading/analytics-unavailable",
-                                     payload_error_types=(compute.ComputeError,))
+                                     payload_error_types=(compute.PayloadError,))
             if endpoint == "audit":
                 # rpc.js:132-145：空载荷；trades 取不到时仍给出信号/响应链路
                 _takes_no_payload(endpoint, payload)
