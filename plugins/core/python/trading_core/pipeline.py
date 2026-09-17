@@ -163,6 +163,15 @@ _CONTENT_OUTCOMES = {
     "计划预警：现金不可得": ("build_plan", None, "现金不可得：本次未生成买单"),
     "计划预警：现金封顶": ("build_plan", None, "买入量按可用现金封顶"),
     "计划预警：持仓数超限": ("build_plan", None, "持仓数已达上限：新建仓会被规则 6 拦"),
+    # 目标外持仓清出（规格 §4.2 第 6 点修订，2026-09-17）：清出是作业正常产出（状态 ok），
+    # 但「清了哪几只、价格来源、哪几只没清成」必须进摘要——否则「目标外清出」在页面上
+    # 与「策略今天正好没动作」无法区分。target 为空时**清出被硬守卫拦下**，也要可见。
+    "计划预警：目标外持仓清出": ("build_plan", None, "清出目标外持仓"),
+    "计划预警：目标为空未清出": ("build_plan", None, "目标为空：未执行目标外清出"),
+    # 开关值非法：fail-closed 软跳过（当日不生成计划）——状态按 skipped，与「跑了但没做成」
+    # 的其他 build_plan 结局同口径；配置写错不能显示成绿色「已完成」。
+    "exit_outside_target 配置非法": (
+        "build_plan", "skipped", "exit_outside_target 配置非法：当日未生成计划"),
     "计划跳过：无可执行订单": ("build_plan", "skipped", "当日无可执行订单"),
     # F-a（2026-09-17）：**作业失败**此前完全不可见——`_subprocess_runner` 的整数 returncode
     # 被 `_run_job` 忽略、tick 仍写 ran 标记 → 触发了 content 路径（ran 已存在）。三条标题

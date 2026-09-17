@@ -29,6 +29,20 @@ READINESS_LOOKBACK_DAYS = 40
 SESSION_CLOSE_BEIJING = {"SH": (0, "15:00"), "SZ": (0, "15:00"), "BJ": (0, "15:00"),
                          "HK": (0, "16:00"), "US": (1, "05:00")}
 
+#: 目标外持仓自动清出的开关键（``~/.dsh/trading-platform.json`` **顶层**，与
+#: ``futu_channel``/``watchlist``/``sentiment_budget_seconds`` 同级；命名与读取范式照
+#: ``sentiment.BUDGET_CONFIG_KEY``：模块级常量命名键 + 从平台配置读）。**默认 False**：
+#: 键缺失即关闭，任何既有行为不受影响。
+EXIT_OUTSIDE_TARGET_CONFIG_KEY = "exit_outside_target"
+#: 三条新告警标题都是**稳定字面量**（变量信息只进 detail）：``pipeline`` 的
+#: ``_CONTENT_OUTCOMES`` 按标题精确匹配归因，标题里掺变量等于让归因悄悄失效。
+EXIT_ALERT_TITLE = "计划预警：目标外持仓清出"
+EXIT_EMPTY_TARGET_ALERT_TITLE = "计划预警：目标为空未清出"
+EXIT_CONFIG_ALERT_TITLE = "exit_outside_target 配置非法"
+#: 清出标的的 skipped 后缀（``build_and_freeze`` 的 ``skipped`` 与告警 detail 共用字面量）
+EXIT_NO_PRICE_REASON = "(无价,无法清出)"
+EXIT_UNSELLABLE_REASON = "(T+N不可卖)"
+
 
 def _now():
     return datetime.now(_TZ8).strftime("%Y-%m-%d %H:%M:%S")
@@ -42,7 +56,7 @@ def _risk_defaults():
 
 def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
                      as_of, lot=100, origin="manual", market=None, risk_config=None,
-                     managed=None, broker_cash=None):
+                     managed=None, broker_cash=None, exit_symbols=None):
     """冻结一份计划。``origin``/``market`` 是**来源与归属元数据**（规格 §4.6）：
 
     * ``origin="auto"`` 的计划供自动执行链识别（``store.get_latest_auto_plan`` /
@@ -87,6 +101,28 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
       序），且 ``managed=None`` 时与既有顺序完全一致；
     * 清仓量不受风险预算约束（减少敞口不是新增风险，与减仓同口径）。
 
+    **目标外清出（规格 §4.2 第 6 点修订，2026-09-17）**：``exit_symbols`` 是调用方显式给出
+    的**清出集合**，语义 = 「这些标的的目标权重按 0 处理」。它与 ``managed`` 的区别是来源：
+    ``managed`` 是「策略负责范围」的**自动**推导（关注池 ∩ 策略 universe），而
+    ``exit_symbols`` 是 ``plan_auto`` 在开关 ``exit_outside_target`` 打开时算出的
+    「券商持仓 − 当日 target 键」——**能清掉 ``managed`` 之外的存量持仓**，正是受管集合
+    机制刻意不碰、又会让账户与策略组合长期不收敛的那部分::
+
+        diff 符号集 = list(target) + [s for s in sorted(set(managed or ()) | set(exit_symbols or ()))
+                                      if s not in target]
+
+    * ``exit_symbols=None``（缺省）与既有行为**逐字一致**：返回体**无** ``exits`` 键、
+      符号集与顺序不变（``set() | set()`` 为空）；
+    * 传了该参数时返回体带 ``exits``（**排序去重后的清出集合**）供审计——它是调用方的
+      请求，不等于最终产单（无价/不可卖的标的会进 ``skipped``）；
+    * **无价即跳过并如实记账**：清出标的取不到价格时记 ``"SYM(无价,无法清出)"``（既有
+      ``target`` 路径的无价静默行为不变——那里由调用方的 ``no_price`` 清单负责）；
+    * **可卖数量封顶**：持仓条目带 ``available`` 时（``with_marks=True`` 的券商快照），
+      卖出量取 ``min(需卖量, available)``；``available=0`` 记 ``"SYM(T+N不可卖)"``，
+      **不生成注定被券商拒绝的单**；字段缺失（``None``）按既有口径用全部 qty；
+    * 清出标的一旦进入 diff，与 ``managed`` 缺席者同权：目标权重 0、全额卖出、不受风险
+      预算与现金约束。
+
     ``risk_config`` 缺省用 ``daemon.RISK_DEFAULTS``；``plan_auto`` 传
     ``daemon.risk_config(home)``（含 ``~/.dsh/trading-risk.json`` 覆盖）。部分字段的
     覆盖字典按「缺省补默认」合并——**不重写配置读取实现**。
@@ -128,14 +164,22 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
             cash_unavailable = True
         else:
             cash_remaining = max(0.0, float(cash_available))
-    # target 原序在前、managed 缺席者按代码升序在后：managed=None 时与既有顺序逐字一致
-    symbols = list(target) + [s for s in sorted(set(managed or ())) if s not in target]
+    # target 原序在前、managed 缺席者按代码升序在后：managed=None 时与既有顺序逐字一致；
+    # exit_symbols 只在**显式给出**时参与并集（缺省 = 空集，符号集与顺序不变）。
+    exit_set = set(exit_symbols or ())
+    symbols = list(target) + [s for s in sorted(set(managed or ()) | exit_set)
+                              if s not in target]
     for symbol in symbols:
         px = prices.get(symbol)
         if not px:
+            if symbol in exit_set:
+                # 清出标的无价：**记 skipped**（宁缺毋假，不猜价、不生成假单）。既有 target
+                # 路径的无价静默行为刻意不动——那里由调用方的 no_price 清单如实承接。
+                skipped.append(f"{symbol}{EXIT_NO_PRICE_REASON}")
             continue  # 无价（停牌/无行情）：跳过并在审计可见，不猜价
         want_qty = int(equity * target[symbol] / px // lot * lot) if symbol in target else 0
-        have_qty = positions.get(symbol, {}).get("qty", 0)
+        have = positions.get(symbol) or {}
+        have_qty = have.get("qty", 0)
         delta = want_qty - have_qty
         if delta == 0:
             continue
@@ -162,6 +206,16 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
                     skipped.append(f"{symbol}(现金不足一手)")
                     continue
                 cash_remaining -= delta * px
+        else:
+            # 减仓/清仓：券商给了可卖数量就按它封顶（T+N：当日买入的股份不可卖），
+            # 否则生成的是**注定被拒**的单。字段缺失（None）→ 既有口径：卖全部 qty。
+            available = have.get("available")
+            if available is not None:
+                sellable = int(available)
+                if sellable <= 0:
+                    skipped.append(f"{symbol}{EXIT_UNSELLABLE_REASON}")
+                    continue
+                delta = -min(-delta, sellable)
         orders.append({"symbol": symbol, "market": symbol.split(".")[0],
                        "side": "BUY" if delta > 0 else "SELL", "qty": abs(delta),
                        "price": px})
@@ -186,6 +240,9 @@ def build_and_freeze(conn, mode, strategy_id, target, broker_positions, prices,
         result["cash"] = {"available": cash_available, "remaining": cash_remaining,
                           "unavailable": cash_unavailable,
                           "capped": sorted(cash_capped)}
+    if exit_symbols is not None:
+        # 同上：缺省路径返回字典逐字不变；显式给出清出集合时如实回报（审计用）
+        result["exits"] = sorted(exit_set)
     return result
 
 
@@ -199,6 +256,28 @@ def read_mode(home):
     value = text.strip().lower()
     if value not in ("sim", "live"):
         raise ValueError(f"账户模式非法：{value!r}")
+    return value
+
+
+def exit_outside_target_enabled(platform_cfg):
+    """读「目标外持仓自动清出」开关（``~/.dsh/trading-platform.json`` 顶层键）。
+
+    取值口径（fail-closed，与本仓库既有配置纪律一致——配置写错**宁可拒绝**，不静默降级）：
+
+    * 键**缺失** → ``False``：默认关闭，不改变任何既有行为（默认态不是异常）；
+    * 键为**真布尔**（``True``/``False``）→ 原样返回；
+    * 其余（字符串 ``"true"``/数字 ``1``/``None``/容器/……）→ ``ValueError``：把 ``"true"``
+      静默当假会让「配置写了但没生效」伪装成「功能没开」；``1`` 则相反地可能被当成开，
+      两种误读都不可接受。**调用方（``plan_auto``）按软跳过处理**，绝不把异常抛给作业层
+      （作业契约「永不抛」）。
+
+    ``bool`` 判定必须用 ``isinstance(value, bool)``：Python 里 ``True`` 也是 ``int``，
+    ``isinstance(1, bool)`` 为假而 ``isinstance(True, int)`` 为真——顺序写反就漏掉数字。
+    """
+    value = (platform_cfg or {}).get(EXIT_OUTSIDE_TARGET_CONFIG_KEY, False)
+    if not isinstance(value, bool):
+        raise ValueError(f"{EXIT_OUTSIDE_TARGET_CONFIG_KEY} 需为布尔值（true/false），"
+                         f"收到 {value!r}")
     return value
 
 
@@ -353,10 +432,37 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
       {"ok": True,  "skipped": <原因>}                    软跳过，不产生计划
       {"ok": False, "error": <原因>}                      配置/模式非法（fail-closed）
       {"ok": True,  "plan": {...}, "expired": [...],
-       "no_price": [...], "no_atr": [...], "equity": <float>}   成功冻结
+       "no_price": [...], "no_atr": [...], "equity": <float>,
+       "converge": {...}}                                 成功冻结
 
     ``no_atr`` = 因算不出 ATR（止损距离）而未定量的标的（planner 的 ``skipped`` 原样
     透出）——它们既不产单也不静默：运维据此判断是数据缺口还是标的本身不可用。
+
+    **目标外清出（规格 §4.2 第 6 点修订，2026-09-17）**：``~/.dsh/trading-platform.json``
+    顶层开关 ``exit_outside_target``（默认 False）打开时，本次计划把「券商持仓 − 当日
+    ``target`` 的键」一并按目标权重 0 处理（清出），让账户收敛到策略组合。``converge``
+    如实回告这次收敛的四个事实::
+
+        {"enabled": bool,            # 开关值（缺失=false）
+         "symbols": [...],           # 收敛集合（排序；target 为空时为空）
+         "prices": {sym: {"price": <float>, "source": "close"|"broker_mark",
+                          "field": <券商字段名|None>}},
+         "skipped": [...],           # "SYM(无价,无法清出)" / "SYM(T+N不可卖)"
+         "empty_target": bool}       # 因 target 为空而被硬守卫拦下
+
+    口径与边界（详见 ``build_and_freeze`` 的 ``exit_symbols`` 段）：
+
+    * **只在自动路径生效**：手工 ``plan-build`` 不经本函数，语义不变；
+    * **target 为空一律不收敛**（硬守卫）并发 warn「目标为空，未执行目标外清出」——
+      「策略今日选不出标的」绝不能变成「清空全部持仓」；
+    * 价格：本地最近收盘优先；拿不到则用券商持仓**标记价**（sim ``cur_price`` / live
+      ``nominal_price``），来源在 ``converge.prices`` 里如实标注（**绝不伪装成本地收盘**）；
+      两处都拿不到 → 记 ``skipped`` 且**不生成订单**（不猜价）；
+    * 可卖数量：券商给了可用数量（sim ``qty_avbl`` / live ``can_sell_qty``，缺字段时按
+      既有口径用全部 qty）→ 卖出量取 ``min(qty, available)``；``available=0`` 记
+      ``skipped``，**不生成注定被拒的单**（T+N 持仓当日不可卖）；
+    * 开关值不是真布尔 → **fail-closed 软跳过** + warn（作业契约「永不抛」）；关闭/缺失时
+      除多读一次平台配置外逐字不改变既有行为。
 
     软跳过的告警分级：关闭功能=静默（默认态不是异常）；其余原因=info/warn
     （warn 用于「本可运行但条件不满足」：数据未就绪/日历缺失/券商不可用）。
@@ -486,6 +592,16 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     universe_set = {str(s).strip().upper() for s in (universe or []) if str(s).strip()}
     managed = [s for s in symbols if s in universe_set] if universe_set else None
 
+    # 目标外持仓自动清出开关（规格 §4.2 第 6 点修订，2026-09-17）：默认关闭。读取放在这里
+    # （策略已解析、券商查询之前）——关闭态下除了多读一次平台配置，逐字不改变任何行为；
+    # 非法值 fail-closed 软跳过 + 告警（与上面 risk_config 的 ValueError 同一分级：
+    # 配置非法时宁可当日不生成计划，也绝不静默按默认值跑）。
+    try:
+        exit_enabled = exit_outside_target_enabled(daemon.platform_config(home))
+    except ValueError as error:
+        return skip(f"{EXIT_OUTSIDE_TARGET_CONFIG_KEY} 配置非法：{error}", "warn",
+                    EXIT_CONFIG_ALERT_TITLE)
+
     if broker_call is None:
         # WP13 任务 3：默认通道走 channel 分派（``futu_channel: openapi`` 且凭据就绪 →
         # REST；否则回退 mcp）——与执行链 ``daemon._default_executor`` **同一口径**。
@@ -508,7 +624,7 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
 
     try:
         positions, equity, cash = core_broker.positions_equity_cash(
-            broker_call, mode=mode, market=market)
+            broker_call, mode=mode, market=market, with_marks=exit_enabled)
     except core_broker.EquityUnavailable as error:
         # 权益口径问题（官方字段缺失/非正）与通道故障分列：告警文案不得互相冒名
         return skip(f"券商权益不可用（缺失或非正）：{str(error)[:120]}", "warn", "权益不可用")
@@ -550,11 +666,53 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
         else:
             no_price.append(symbol)
 
+    # ---- 目标外清出（规格 §4.2 第 6 点修订，2026-09-17）----
+    # 收敛集合 = {券商持仓} − {当日策略 target 的键}：受管集合**之外**的存量持仓只有这条
+    # 路径能进 diff（managed 机制刻意不碰它们），不修就永远是「策略不买也不卖」的死锁。
+    # **硬守卫：target 为空一律不收敛**——「策略今日选不出标的」与「清空全部持仓」是两件
+    # 事，后者不是任何人的意图；此时发 warn 说明「目标为空，未执行目标外清出」。
+    exits, exit_price_meta, empty_target = [], {}, False
+    if exit_enabled:
+        if not target:
+            empty_target = True
+            alerts.emit(conn, home=home, level="warn", title=EXIT_EMPTY_TARGET_ALERT_TITLE,
+                        detail=f"{market} 策略目标为空：未执行目标外清出（券商持仓 "
+                               f"{len(positions)} 只保持不变）")
+        else:
+            exits = sorted(s for s, row in positions.items()
+                           if (row.get("qty") or 0) > 0 and s not in target)
+            for symbol in exits:
+                if symbol in prices:
+                    # 受管集合补价时已经取到本地收盘（exit ∩ managed 的重叠标的）：复用，
+                    # 不重复查库、也不让它二次进 no_price 清单。
+                    exit_price_meta[symbol] = {"price": prices[symbol], "source": "close",
+                                               "field": None}
+                    continue
+                # 价格：本地最近收盘优先（与 target 同一 PIT 口径）→ 券商标记价回退。
+                # 来源**如实标注**，绝不把券商标记价伪装成本地收盘价。
+                px = daemon._last_close(conn, symbol, data_date)
+                if px:
+                    exit_price_meta[symbol] = {"price": px, "source": "close", "field": None}
+                    prices[symbol] = px
+                    continue
+                row = positions.get(symbol) or {}
+                mark = row.get("price")
+                if mark:
+                    exit_price_meta[symbol] = {"price": mark, "source": "broker_mark",
+                                               "field": row.get("mark_field")}
+                    prices[symbol] = mark
+                    continue
+                # 两处都拿不到 → 真价格缺口（如实进 no_price），清出集合仍下传，由
+                # build_and_freeze 统一记 skipped（"SYM(无价,无法清出)"）——不猜价、不生成假单
+                if symbol not in no_price:  # 去重：managed 补价失败时可能已记过一次
+                    no_price.append(symbol)
+
     plan = build_and_freeze(conn, mode=mode, strategy_id=entry["strategy"], target=target,
                             broker_positions=lambda _mode: (positions, equity),
                             prices=prices, as_of=data_date, origin="auto", market=market,
                             risk_config=daemon.risk_config(home), managed=managed,
-                            broker_cash=lambda _mode: cash)
+                            broker_cash=lambda _mode: cash,
+                            exit_symbols=exits if exit_enabled else None)
     # 计划期现金结局如实回告（买了多少、被现金压低哪些）
     cash_info = plan.get("cash") or {}
     if cash_info.get("capped"):
@@ -563,6 +721,30 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
         alerts.emit(conn, home=home, level="warn", title="计划预警：现金封顶",
                     detail=f"{market} 可用现金 {cash}：{','.join(cash_info['capped'])[:120]}"
                            " 的买入量按现金封顶")
+
+    # 清出结局如实回告：清出集合、价格来源（本地收盘 / 券商标记价分别几只）、以及**没有**
+    # 变成订单的标的与原因（无价 / T+N 不可卖）。一条 warn，标题是稳定字面量，变量只进 detail
+    # ——页面与运维据此分辨「真的清了」与「想清但清不动」。
+    converge = {"enabled": bool(exit_enabled), "symbols": list(exits), "prices": exit_price_meta,
+                "skipped": [], "empty_target": empty_target}
+    if exit_enabled and exits:
+        exit_set = set(exits)
+        exit_skips = [row for row in (plan.get("skipped") or [])
+                      if str(row).split("(", 1)[0] in exit_set]
+        converge["skipped"] = exit_skips
+        marked = sorted(s for s, meta in exit_price_meta.items()
+                        if meta["source"] == "broker_mark")
+        warnings.append(f"目标外清出 {len(exits)} 只（券商标记价 {len(marked)} 只、"
+                        f"跳过 {len(exit_skips)} 只）")
+        detail = (f"{market} 目标外持仓 {len(exits)} 只清出；价格来源：本地收盘 "
+                  f"{len(exit_price_meta) - len(marked)} 只、券商持仓标记价 {len(marked)} 只")
+        if marked:
+            detail += "（" + "、".join(
+                f"{s}@{exit_price_meta[s]['field'] or 'mark'}" for s in marked[:5]) + "）"
+        if exit_skips:
+            detail += "；未生成订单：" + "、".join(exit_skips[:5])
+        alerts.emit(conn, home=home, level="warn", title=EXIT_ALERT_TITLE,
+                    detail=detail[:300])
     if not plan["orders"]:
         # 「没做成」不能显示成「已完成」：零订单计划在流程页按跳过口径呈现
         alerts.emit(conn, home=home, level="warn", title="计划跳过：无可执行订单",
@@ -572,4 +754,5 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
             "no_atr": list(plan.get("skipped") or []), "equity": equity,
             "cash": cash, "warnings": warnings,
             "watchlist": len(symbols),
-            "managed": len(managed) if managed is not None else "target-only"}
+            "managed": len(managed) if managed is not None else "target-only",
+            "converge": converge}

@@ -216,6 +216,39 @@
    修法：引入**受管集合**（managed set）= 该市场关注池 ∩ 策略 universe；计划对
    `managed ∪ target` 求 diff，`managed` 中缺席者视为目标权重 0（清仓），
    **受管集合之外的持仓一律不动**（不清理用户手工持有的标的）；
+   **目标外清出修订（2026-09-17，实现期补记）**：上一条的「不动受管集合之外的持仓」与
+   `max_positions` 合起来会形成**结构性死锁**——实机 A 股模拟账户持 8 只（多在关注池
+   之外）、`max_positions=5`，策略既不买（新增建仓被风控规则 6 拦）也不卖（8 只全在
+   `managed` 之外），账户与策略组合永远不收敛。本修订加一个**默认关闭**的顶层开关
+   `exit_outside_target`（同文件顶层，与 `futu_channel`/`watchlist` 同级）：
+   - **只在自动计划路径生效**（`planner.plan_auto`）；手工 `plan-build` 语义不变；
+   - 关闭（键缺失=false）时逐字不改变任何既有行为；键存在必须是真布尔，字符串/数字/`null`
+     一律 `ValueError`，`plan_auto` 按 fail-closed **软跳过当日计划 + warn**
+     （作业契约「永不抛」，与 `risk_config` 非法的既有处理同分级）；
+   - **收敛集合** = `{券商持仓} − {当日 target 的键}`，作为显式 `exit_symbols` 传给
+     `build_and_freeze`（"这些标的目标权重按 0 处理"）——它是 `managed` 的**补集**：
+     `managed` 管「策略负责范围内掉出 target 的」，`exit_symbols` 管「策略根本不负责、
+     但券商账上有的」；
+   - **硬守卫**：`target` 为空时一律不收敛 + warn「目标为空，未执行目标外清出」——
+     「策略今日选不出标的」绝不能变成「清空全部持仓」；
+   - **无本地 K 线时的价格回退**（实机：这 8 只在本地 `bars` 表 0 行，`_last_close`
+     返回 None，而 `build_and_freeze` 遇无价会跳过 → 不补价就一张清仓单都没有）：优先本地
+     最近收盘，其次券商持仓**标记价**（sim `cur_price` / live `nominal_price`，与
+     `plugins/workbench/python/positions.py` 同一字段口径），来源在返回值
+     `converge.prices[sym].source` 与告警 detail 里如实标注（`close` / `broker_mark`），
+     **绝不把券商标记价伪装成本地收盘价**；两处都拿不到 → `skipped`（`SYM(无价,无法清出)`）
+     且不生成订单；`cost_price`/`mv` 不作价格用（成本基准与市值都不是标记价）；
+   - **可卖数量**：券商给了可用数量（sim `qty_avbl` / live `can_sell_qty`；设计初稿写的
+     `available` 作为次级候选一并接受）时卖出量取 `min(qty, available)`；`available=0`
+     记 `skipped`（`SYM(T+N不可卖)`），**不生成注定被拒的单**；字段缺失按既有口径用全部 qty；
+   - **形状兼容**：`broker.positions_equity_cash(..., with_marks=False)` 缺省仍是
+     `{symbol: {"qty": n}}`（既有调用方与 153 处断言逐字不变），`with_marks=True` 才附带
+     `price`/`mark_field`/`available`；`build_and_freeze(exit_symbols=None)` 缺省时返回体
+     **无** `exits` 键、diff 符号集与顺序不变；
+   - **两步生效的现实**：执行侧 `ctx` 是**静态持仓快照**（`execute.run` 不逐单重查），
+     所以「同一份计划里卖出 8 只 + 买入新股」时买入仍会被规则 6 拒——这是**预期行为**
+     （不为绕过规则 6 伪造持仓数）。当日计划把账户清到策略组合，**下个交易日**快照回落
+     后新计划自然能建仓。
 7. **执行侧 ctx 用真实持仓（实现期补记，2026-09-16）**：`_execute_plan` 的 ctx 原为
    离线保守默认（`positions_value={}`、`positions_count=0`），导致规则 5 对 SELL 把
    `after` 算成 `0 + qty×price` → **退出单被判成新建大仓位而拒**（自动流水线能加仓、

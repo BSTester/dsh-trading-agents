@@ -452,6 +452,47 @@ URL（`/sim-trade/SIM/orders`），**每一张自动执行单都被券商 `-3 in
 
 排障与演练（假时钟、窗口超时、熔断拦截）见 [docs/RUNBOOK.md](docs/RUNBOOK.md)「自动流水线（WP9）」。
 
+### 目标外持仓自动清出（`exit_outside_target`，默认关闭）
+
+**问题**：受管集合（关注池 ∩ 策略 universe）之外的持仓刻意不进 diff（不清理用户手工持仓），
+而 `max_positions`（默认 5）又拦住新建仓。实机 A 股模拟账户持 8 只、多在关注池之外时，
+策略**既不买也不卖**，账户与策略组合永远不收敛。
+
+**开关**：`trading-platform.json` **顶层**键 `exit_outside_target`（与 `watchlist` 同级），
+**默认 `false`（键缺失即关闭，不改变任何既有行为）**；只接受真布尔，写 `"true"`/`1` 会
+fail-closed：当日计划软跳过并发 warn（配置写错不静默降级）。
+
+```json
+{
+  "watchlist": ["SH.600519", "..."],
+  "auto_pipeline": {"enabled": true, "strategies": ["..."]},
+  "exit_outside_target": true
+}
+```
+
+打开后**只在自动计划路径**（`plan_auto` / `build_plan` 作业）生效，手工 `plan-build` 不受影响：
+
+- **收敛集合** = 券商持仓 − 当日策略 `target` 的键（含 `managed` 之外的存量持仓）→ 目标
+  权重按 0 处理、全额卖出；
+- **硬守卫**：策略当日 `target` 为空（选不出标的）时**一律不清出**并发 warn
+  「计划预警：目标为空未清出」——「选不出标的」不等于「清空全部持仓」；
+- **价格**：本地最近收盘优先；本地无 K 线（实机那 8 只确实 0 行）时回退**券商持仓标记价**
+  （sim `cur_price` / live `nominal_price`），来源在 `converge.prices` 与告警里标注
+  `close`/`broker_mark`（**绝不把券商标记价说成本地收盘价**）；两处都拿不到 → 进
+  `skipped`（`SYM(无价,无法清出)`）且**不生成订单**（不猜价）；
+- **可卖数量**：券商给了可用数量（sim `qty_avbl` / live `can_sell_qty`）时卖
+  `min(qty, available)`；`available=0`（T+N 当日买入未解禁）→ `skipped`
+  （`SYM(T+N不可卖)`），**不生成注定被券商拒的单**；
+- 每次清出都会发一条 warn「计划预警：目标外持仓清出」，detail 写明清出只数、价格来源
+  各几只、哪些没清成（页面/摘要里同样可见）。
+
+**两步生效（预期行为，不要当故障排查）**：执行侧 `ctx` 用的是**静态持仓快照**（不逐单
+重查），所以**同一份计划里「卖出 8 只 + 买入新股」时买入仍会被风控规则 6 拒**。当日计划
+先把账户清到策略组合，**下个交易日**快照回落（持仓数 ≤ `max_positions`）后，新计划才能
+建仓。绝不为绕过规则 6 去伪造持仓数。
+
+排障口径见 [docs/RUNBOOK.md](docs/RUNBOOK.md)「目标外持仓清出没生效 / 清了但买不进」。
+
 ### 情绪采集的两个预算键（最慢的基础链作业）
 
 `sentiment_snapshot` 是**全仓库最慢的作业**（实测 20 标的 × 三源 >7 分钟：每源都要起

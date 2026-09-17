@@ -444,7 +444,43 @@ failed，err 还误报「已达重试上限」**——运维据此排查会被�
 - R9②（`_ALERT_STATUS` 无锁）**部分收敛**：WP17 的四条标题已加字面量锁；其余标题与 emit
   点的一一对应仍靠人工核对。
 
-### 8.4 遗留项（按现状接受，未实现）
+### 8.4 目标外持仓自动清出（2026-09-17 实现 / 2026-09-17 真机只读复验）
+
+**背景**：WP17 的现金封顶让「计划不再下出买不动的量」，但**账户与策略组合仍不收敛**——
+受管集合（关注池 ∩ 策略 universe）之外的存量持仓刻意不进 diff，而 `max_positions=5` 拦住
+新建仓：实机 A 股模拟账户持 8 只（`SH.601179 SZ.002475 SH.601899 SH.600089 SH.601138
+SZ.002716 SH.603993 SZ.002131`，全在 20 只 `SH.600xxx` 关注池之外，且本地 `bars` 表
+**0 行**）时，策略既不买也不卖 = **结构性死锁**。
+
+| 修订 | 不变量 | 锁定测试 |
+|---|---|---|
+| 顶层开关 `exit_outside_target` | `~/.dsh/trading-platform.json` **顶层**键（与 `watchlist`/`futu_channel` 同级）；**默认缺失=false**；非真布尔一律 `ValueError`，`plan_auto` fail-closed **软跳过当日计划 + warn**（作业契约「永不抛」）；**只在自动计划路径生效**，`plan-build` 不变 | `tests/test_exit_outside_target.py::ExitSwitchConfigTest`、`PlanAutoExitTest` |
+| 收敛集合 | = 券商持仓 − 当日 `target` 的键；**硬守卫：`target` 为空一律不收敛** + warn「目标为空，未执行目标外清出」；无价/不可卖的标的进 `skipped` 且**不产单** | 同上（`test_empty_target_does_not_clear_anything` 等） |
+| 无本地 K 线的价格回退 | 本地最近收盘优先 → 券商标记价（sim `cur_price` / live `nominal_price`，与 `workbench/python/positions.py` 同口径）；来源如实标注 `close`/`broker_mark`（**绝不伪装成本地收盘**）；两处都无 → `SYM(无价,无法清出)`；`cost_price`/`mv` **不作价格用** | 同上；`BrokerMarksSnapshotTest` |
+| 可卖数量封顶 | sim `qty_avbl` / live `can_sell_qty`（设计初稿写的 `available` 作次级候选，**实测无此键**）→ 卖 `min(qty, available)`；`available=0` → `SYM(T+N不可卖)` | 同上；`BuildAndFreezeExitSymbolsTest` |
+| 形状与返回体兼容 | `positions_equity_cash(..., with_marks=False)` 缺省仍是 `{symbol:{"qty":n}}`；`build_and_freeze(exit_symbols=None)` 缺省返回体**无** `exits` 键、diff 逐字不变 | 同上（逐字断言）+ 既有持仓形状断言 |
+
+**真机只读复验（2026-09-18，不改 `~/.dsh`、不下单）**：真实配置**无**该键
+（`exit_outside_target_enabled(platform_config(真实 home)) → False`，配置 md5 仍为 WP17 记录的
+`776a71d4…`）；把真实 DB **副本** + 真实配置 + 真实券商只读通道按 WP17 同一重放参数
+（`today="2026-09-17 16:20:00"`）跑 `plan_auto`，产出与 WP17 记录**逐字一致**：
+`SH.600010 BUY 26100 @2.11`、warnings = 持仓 8≥5 + 现金封顶、**0 张 SELL**、
+`converge={"enabled":false,…}`、无新标题告警。同一副本把开关打开 → 8 张 SELL
+（`SH.600089 5200@17.91 … SZ.002716 7000@9.54`，**全部 `broker_mark`/`cur_price`**，
+8 只本地 K 线均为 0 行）+ 原买入单，warn「计划预警：目标外持仓清出」——
+证明缺口确实由此闭合（真实库未被写入：新标题告警 0 条、最新计划与 draft 单数不变）。
+
+**诚实登记（未决/边界）**：
+
+- **两步生效**：执行侧 `ctx` 是**静态持仓快照**（`execute.run` 不逐单重查），所以同一份
+  计划里「卖出 8 只 + 买入新股」时买入仍被规则 6 拒——**预期行为，不得为绕过规则 6 伪造
+  持仓数**；下个交易日快照回落后新计划才能建仓；
+- live 通道的 `nominal_price`/`can_sell_qty` 口径来自 `workbench/python/positions.py` 的
+  既有归一，**本机无 live 账户，未真机核对**（sim 侧已实测：行字段含 `qty_avbl`/`cur_price`/
+  `mv`，且**无** `available` 键）；
+- 是否真的开启开关属**交易决策**，未由本任务决定（默认关闭，账户不会自己清仓）。
+
+### 8.5 遗留项（按现状接受，未实现）
 
 | # | 遗留 | 现状与影响 |
 |---|---|---|

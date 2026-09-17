@@ -57,9 +57,28 @@ LIVE_EQUITY_FIELD = "total_assets"
 SIM_CASH_FIELDS = ("max_power_long", "balance")
 LIVE_CASH_FIELDS = ("power", "available_funds", "cash")
 
+#: 券商持仓行的**标记价**字段（2026-09-17 目标外清出修订）：模拟盘 ``cur_price``、
+#: 实盘 ``nominal_price``——与 ``plugins/workbench/python/positions.py`` 的归一**同一口径**
+#: （那里的 ``price`` 正是这两个字段）。**不拿别的字段冒充标记价**：``cost_price`` 是成本
+#: 基准（拿它当卖单限价会生成不成交的单）、``mv``/``market_val`` 是市值不是价（除以数量
+#: 得到的是推算值，宁缺毋假）。
+SIM_MARK_FIELDS = ("cur_price",)
+LIVE_MARK_FIELDS = ("nominal_price",)
+#: 可用（可卖）数量字段：模拟盘实测 ``qty_avbl``、实盘实测 ``can_sell_qty``（workbench 同
+#: 口径，REST 文档 ``docs``/``simtrade.py`` 亦为 ``qty_avbl``）。设计文稿里写的
+#: ``available`` **不是实测键名**，作为次级候选一并接受——键名分歧不该让「不生成注定被拒
+#: 的单」这条守卫静默失效。字段全缺 → ``None`` = 调用方按既有口径不限制（用全部 qty）。
+SIM_AVAILABLE_FIELDS = ("qty_avbl", "available")
+LIVE_AVAILABLE_FIELDS = ("can_sell_qty", "available")
 
-def _positive_number(mapping, fields):
-    """按优先级取第一个可解析的非负数值；全缺/不可解析 → ``None``（不猜）。"""
+
+def _first_number(mapping, fields):
+    """按优先级取第一个可解析数值 → ``(值, 命中字段)``；全缺/不可解析 → ``(None, None)``。
+
+    ``_positive_number`` 的带字段版：解析口径一致（bool/NaN/不可解析跳过），只额外回告命中
+    的字段名——计划侧要把「价格来自哪个券商字段」如实写进审计与告警。**不做正负过滤**：
+    可用数量 0 是有效事实（今天不可卖），由调用方按语义判定（价格 ≤0 = 无价）。
+    """
     for field in fields:
         raw = (mapping or {}).get(field)
         if raw is None or isinstance(raw, bool):
@@ -70,8 +89,38 @@ def _positive_number(mapping, fields):
             continue
         if value != value:  # NaN
             continue
-        return max(0.0, value)
-    return None
+        return value, field
+    return None, None
+
+
+def _positive_number(mapping, fields):
+    """按优先级取第一个可解析的非负数值；全缺/不可解析 → ``None``（不猜）。"""
+    value, _field = _first_number(mapping, fields)
+    return None if value is None else max(0.0, value)
+
+
+def _position_entry(row, qty, mark_fields, available_fields, with_marks):
+    """券商持仓行 → 计划侧的持仓条目。
+
+    **缺省只给 ``{"qty": n}``**：这是既有形状，被 153 处测试断言与多处消费方钉着，
+    **不能无条件改**（多一个键就够炸掉逐字断言）。``with_marks=True`` 时才附带
+
+      * ``price`` / ``mark_field``：券商标记价与命中字段（无价时 ``None``/``None``）；
+      * ``available``：可卖数量（缺字段 ``None`` = 不限制；``0`` = 明确不可卖）。
+
+    这两个事实只有计划侧「目标外清出」需要，调用方（``planner.plan_auto``）按需索取。
+    """
+    entry = {"qty": int(qty)}
+    if not with_marks:
+        return entry
+    price, mark_field = _first_number(row, mark_fields)
+    if price is None or price <= 0:  # 0/负价不是有效标记价（拿它下单 = 不可能成交的单）
+        price, mark_field = None, None
+    available, _field = _first_number(row, available_fields)
+    entry["price"] = price
+    entry["mark_field"] = mark_field
+    entry["available"] = None if available is None else int(max(0.0, available))
+    return entry
 
 
 def available_cash(call, mode, market, timeout=30):
@@ -228,12 +277,17 @@ class EquityUnavailable(RuntimeError):
     """
 
 
-def positions_equity_cash(call, mode, market, timeout=30):
+def positions_equity_cash(call, mode, market, timeout=30, with_marks=False):
     """一次账户查询同时给出 ``(持仓, 权益, 可用现金)``——**单次账户列表查询**。
 
     为什么要合并（2026-09-17 现金封顶修订）：现金与权益来自**同一个资金响应**
     （sim 的 ``sim_trade_cash_info``、live 的 ``account_funds``），分两次调用会重复查账户
     列表——既有测试明确钉着「账户列表只查一次」的不变量，且线上多一次往返没有收益。
+
+    ``with_marks``（2026-09-17 目标外清出修订）：缺省 False 时持仓条目**逐字**仍是
+    ``{symbol: {"qty": n}}``（既有形状与调用方零改动）；True 时额外附带券商标记价与可用
+    数量（见 ``_position_entry``）——目标外清出需要它们来决定「用什么价、卖多少股」，
+    而券商持仓行是这两个事实的唯一来源。多账户聚合、市场过滤等既有语义不变。
 
     现金字段全缺 → ``cash=None``（**绝不用权益冒充现金**）。
 
@@ -247,9 +301,9 @@ def positions_equity_cash(call, mode, market, timeout=30):
     调用方必须显式处理两种结局（``planner.plan_auto`` 两者都按「跳过当日计划」处理）。
     """
     if mode == "sim":
-        return _sim_snapshot(call, market, timeout)
+        return _sim_snapshot(call, market, timeout, with_marks)
     if mode == "live":
-        return _live_snapshot(call, market, timeout)
+        return _live_snapshot(call, market, timeout, with_marks)
     raise RuntimeError(f"未接入的账户模式：{mode}")
 
 
@@ -276,7 +330,7 @@ def positions_and_equity(call, mode, market, timeout=30):
     return positions, equity
 
 
-def _sim_snapshot(call, market, timeout):
+def _sim_snapshot(call, market, timeout, with_marks=False):
     market_id = MARKET_IDS.get(market)
     if market_id is None:
         raise RuntimeError(f"未知市场：{market}")
@@ -296,7 +350,8 @@ def _sim_snapshot(call, market, timeout):
             qty = row.get("qty")
             if not symbol or qty is None:
                 continue
-            positions[symbol] = {"qty": int(qty)}
+            positions[symbol] = _position_entry(row, qty, SIM_MARK_FIELDS,
+                                                SIM_AVAILABLE_FIELDS, with_marks)
         info = call(TOOLS["cash"], {"acc_id": acc_id}, timeout=timeout) or {}
         total = info.get("total_asset", info.get("balance"))
         if total is None:
@@ -310,7 +365,7 @@ def _sim_snapshot(call, market, timeout):
     return positions, (None if missing else equity), (cash_total if cash_found else None)
 
 
-def _live_snapshot(call, market, timeout):
+def _live_snapshot(call, market, timeout, with_marks=False):
     """live 分支（官方口径 2026-09-16/17 实抓 get-accounts.md / get-funds.md）：
 
     * ``account_authorized_trd_accs`` → ``{accounts:[{account_id, enable_market:[int]}]}``
@@ -318,6 +373,8 @@ def _live_snapshot(call, market, timeout):
     * ``account_positions {acc_id}`` → 该账户**全部**持仓（接口不接受 market 参数），
       行字段 ``code``/``qty``（实测见 plugins/workbench/python/positions.py）；
       因此按 ``code`` 前缀过滤到目标市场链（跨市场持仓不进本市场计划）；
+      ``with_marks=True`` 时另取该行的 ``nominal_price``（标记价）与 ``can_sell_qty``
+      （可卖数量）——目标外清出在无本地 K 线时靠它们，缺字段如实为 ``None``（不猜）；
     * ``account_funds {acc_id}`` → ``total_assets``（总净资产）+ ``LIVE_CASH_FIELDS``
       （``power``/``available_funds``/``cash``，现金封顶修订新增读取）。任一命中账户取不到
       权益字段、或汇总权益非正 → 抛错（**绝不编造权益**：当成 0 会凭空生成清仓单）。
@@ -350,7 +407,8 @@ def _live_snapshot(call, market, timeout):
                 continue
             if symbol.split(".", 1)[0] not in prefixes:
                 continue  # 跨市场持仓不进本市场计划（目标权重本就已按市场切片）
-            positions[symbol] = {"qty": int(qty)}
+            positions[symbol] = _position_entry(row, qty, LIVE_MARK_FIELDS,
+                                                LIVE_AVAILABLE_FIELDS, with_marks)
         funds = call(LIVE_TOOLS["funds"], {"acc_id": acc_id}, timeout=timeout) or {}
         total = funds.get(LIVE_EQUITY_FIELD)
         if total is None:
