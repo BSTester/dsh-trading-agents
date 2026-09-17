@@ -13,6 +13,9 @@
 
 ---
 
+
+> **首启必做（否则平台在跑但什么都没发生）**：配置关注池——`~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300`（需 universe 表已有该指数成分快照；缺它是全部数据作业静默跳过的原因，流程页会显示「关注池未配置」提示）。
+
 ## ① 提示词（整段粘贴给 Harness）
 
 ```text

@@ -1,6 +1,7 @@
 # dsh-trading-agents
 
 > 📐 [专业量化工作台方案](docs/QUANT-WORKBENCH-PLAN.md) · 📋 [交接与复审文档](docs/HANDOVER.md)：已完成总结、验证结论、未验证项、下一份计划、复审清单。
+> ✅ [E2E 验收工具链](docs/E2E-ACCEPTANCE.md)：后端/前端两个 harness 的用法、退出码、缺陷清单与复验判据；服务启停见 [RUNBOOK](docs/RUNBOOK.md)。
 
 DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://github.com/TauricResearch/TradingAgents) 多角色投研流水线装进 Harness，数据与交易能力来自[富途远程 MCP](https://github.com/FutunnOpen/futu-agent-plugin)（免 OpenD、OAuth 授权）。
 
@@ -16,6 +17,9 @@ DeepSeek Harness 对话模式与插件组合：把 [TradingAgents](https://githu
 基本面分析 ┘
         ↓ 决策写入记忆，下次分析同标的自动注入历史教训
 ```
+
+
+> **首启必做（否则平台在跑但什么都没发生）**：配置关注池——`~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300`（需 universe 表已有该指数成分快照；缺它是全部数据作业静默跳过的原因，流程页会显示「关注池未配置」提示）。
 
 ## 一键安装
 

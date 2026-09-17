@@ -339,7 +339,9 @@ class F10SemanticsTests(unittest.TestCase):
                 with self.assertRaises(OpenApiError) as ctx:
                     call(f10, "company_profile", "HK.00700")
                 self.assertEqual(ctx.exception.errcode, errcode)
-                self.assertEqual(str(ctx.exception), "official message", "不改写官方原文")
+                # 缺陷 2（E2E 2026-09-17）：文本前缀上游错误码，**官方原文逐字保留**。
+                self.assertEqual(str(ctx.exception), f"[errcode={errcode}] official message")
+                self.assertIn("official message", str(ctx.exception))
                 self.assertEqual(len(f10.client.calls), 1, "不重试")
 
 

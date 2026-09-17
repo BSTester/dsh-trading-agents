@@ -769,14 +769,18 @@ TOOLS = (
     ),
     ToolDefinition(
         "option_screen",
-        "期权筛选器（服务端经富途实时获取）：filter 对象**必须**含非空 field_filter"
-        "（省略时上游只返回 4 个默认字段、其余全 null，见 docs/TOOL-LIMITS.md）与非空"
-        " strategy（如 {\"market_category_list\": [1]}；类别码是整数）；可选 limit/next_key/"
-        "sort_obj。",
+        "期权筛选器（服务端经富途实时获取）：filter 对象必须含**形状正确**的 field_filter"
+        "（int 字段用 1 占位、string 字段用非空串、嵌套字段用非空对象；空数组会被上游 -3"
+        "拒绝）与非空 strategy；可选 limit/next_key/sort_obj。**真机验证过的最小示例**："
+        '{"filter": {"strategy": {"market_category_list": [0], "filter_group_list": '
+        '[{"option_list": [{"indicator_type": 1003, "indicator_value": {"value_list": [1]}}]}]}, '
+        '"field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1}, "limit": 3}}'
+        "（market_category_list 0=US_STOCK/1=US_INDEX/3=HK_STOCK；filter_group_list 每组内"
+        "underlying/option/chain/combo 只能一个非空）。",
         "option_screen",
         (req("filter", "object",
-             "筛选对象：必须含非空 field_filter 与非空 strategy；可选 limit/next_key/"
-             "request_exact_data/sort_obj/strategy_param"),),
+             "筛选对象：必须含形状正确的非空 field_filter 与非空 strategy；可选 limit/"
+             "next_key/request_exact_data/sort_obj/strategy_param"),),
     ),
     # ---- WP8 任务 2：OpenAPI 行情接入（9 个；取数与通道路由在 server/futu_data.py，
     # futu_channel=openapi 时走 OpenAPI REST 后端，默认 mcp 直通）。实时四类 TTL 0；

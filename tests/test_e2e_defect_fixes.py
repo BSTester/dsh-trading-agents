@@ -313,5 +313,102 @@ class EmptyBodyReadEndpointTests(unittest.TestCase):
         self.assertEqual(resp.status_code, 415, resp.text)
 
 
+# ---------------------------------------------------------------------------
+# 追加 I4：option_screen 的最小可用载荷必须可发现（真机验证过）
+# ---------------------------------------------------------------------------
+class OptionScreenDiscoverabilityTests(unittest.TestCase):
+    """`option_screen` 是 WP8 行情类端点（走 OpenApiMarket，不在数据面组里），
+    因此替身注入在 `market=` 这一层（与 tests/test_wp8_market.py 的 RecordingMarket 同口径）。"""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = str(self.tmp.name)
+
+    def _data(self):
+        from server import futu_data
+
+        class _Market:
+            def __init__(self):
+                self.calls = []
+
+            def __getattr__(self, name):
+                def method(*args, **kwargs):
+                    self.calls.append((name, kwargs))
+                    return {"option_list": []}
+                return method
+
+        market = _Market()
+        data = futu_data.FutuData(call=None, home=self.home,
+                                  channel=futu_data.CHANNEL_OPENAPI, market=market)
+        return data, market.calls
+
+    def test_documented_minimal_example_is_accepted(self):
+        data, calls = self._data()
+        example = {
+            "filter": {
+                "strategy": {"market_category_list": [0],
+                             "filter_group_list": [{"option_list": [
+                                 {"indicator_type": 1003,
+                                  "indicator_value": {"value_list": [1]}}]}]},
+                "field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1},
+                "limit": 3,
+            }
+        }
+        envelope = data._envelope("option_screen", example)
+        self.assertTrue(envelope["ok"], envelope)
+        name, kwargs = calls[-1]
+        self.assertEqual(name, "option_screen")
+        self.assertEqual(kwargs["field_filter"],
+                         {"option_type": 1, "volume": 1, "implied_volatility": 1})
+        self.assertEqual(kwargs["strategy"]["market_category_list"], [0])
+        self.assertEqual(kwargs["limit"], 3)
+
+    def test_empty_list_field_filter_is_rejected_locally(self):
+        """E2E I4 原始证据：field_filter={"option_type": []} 被原样透传 → 上游 -3。"""
+        data, calls = self._data()
+        envelope = data._envelope("option_screen", {"filter": {
+            "strategy": {"market_category_list": [0]},
+            "field_filter": {"option_type": []}}})
+        self.assertFalse(envelope["ok"], envelope)
+        self.assertEqual(envelope["error"]["code"], "trading/invalid-operation")
+        self.assertEqual(calls, [], "坏载荷必须零通道调用")
+        self.assertIn("option_type", envelope["error"]["message"])
+
+    def test_zero_and_empty_object_placeholders_are_rejected(self):
+        for bad in (0, {}, None, "", []):
+            with self.subTest(value=bad):
+                data, calls = self._data()
+                envelope = data._envelope("option_screen", {"filter": {
+                    "strategy": {"market_category_list": [0]},
+                    "field_filter": {"volume": bad}}})
+                self.assertFalse(envelope["ok"], (bad, envelope))
+                self.assertEqual(calls, [])
+
+    def test_nested_placeholder_is_accepted(self):
+        """官方口径：嵌套字段按 proto 字段名声明（非空对象）。"""
+        data, calls = self._data()
+        envelope = data._envelope("option_screen", {"filter": {
+            "strategy": {"market_category_list": [1]},
+            "field_filter": {"underlying_info": {"iv": 1, "hv": 1}}}})
+        self.assertTrue(envelope["ok"], envelope)
+        self.assertEqual(calls[-1][1]["field_filter"],
+                         {"underlying_info": {"iv": 1, "hv": 1}})
+
+    def test_error_message_carries_a_working_example(self):
+        data, _ = self._data()
+        envelope = data._envelope("option_screen", {"filter": {
+            "strategy": {"market_category_list": [0]},
+            "field_filter": {"option_type": 0}}})
+        self.assertFalse(envelope["ok"])
+        self.assertIn("filter_group_list", envelope["error"]["message"])
+
+    def test_tool_description_contains_the_example(self):
+        from server import mcp_tools
+        description = next(t.description for t in mcp_tools.TOOLS
+                           if t.name == "option_screen")
+        self.assertIn("market_category_list", description)
+        self.assertIn("indicator_type", description)
+
 if __name__ == "__main__":
     unittest.main()

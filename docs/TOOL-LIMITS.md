@@ -303,8 +303,14 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
 
 **覆盖**：41 项 = 11 个单方法端点（锁定表 §C.1–§C.4、§C.6 加 HTTP-only 的
 `info_rehab`/`warrant_screen`）+ F10 的 26 个 section + 衍生品 4 项。
-**不在内**：自选 3 项（`watchlist_list`/`watchlist_groups`/`modify_user_security`——
-需 OAuth 用户登录态，AppKey 模式未验证）与模拟交易 9 项（WP13）。
+**不在内**：自选 3 项（`watchlist_list`/`watchlist_groups`/`modify_user_security`）与
+模拟交易 9 项（WP13）。
+
+> **实测纠正（2026-09-17，AppKey 凭据）**：自选**读**端点并不需要 OAuth 用户登录态——
+> 后端 E2E 实测 `watchlist_groups {group_type:"ALL"}` 与 `watchlist_list {group_name:"全部"}`
+> 在当前 AppKey 凭据下**返回真实数据**（分组 5+，含 `HK.00005` 等标的）。此前「需 OAuth
+> 用户登录态、AppKey 未验证」的记录是 WP13 时点的**未验证推断**，现更正。`modify_user_security`
+> 是写用户富途侧数据，仍只在 Web 端点可达（不进 MCP 工具面），本次未实测。
 
 **实测结果（2026-09-16，AppKey 凭据）**：**41/41 `ok`**。
 
@@ -449,3 +455,28 @@ F10 的 26 section + 衍生品 4 项；自选 3 项与模拟交易 9 项不在�
 结果逐字段等价、openapi 下五类腿全走 REST 且 `sim_trade_*` 零调用、凭据缺失整链回退、
 REST 失败不换通道、两通道皆不可用零占位。回退标记在 sim 路径被丢弃属遗留项（见
 HANDOVER §七）。
+
+### 期权筛选（`option_screen`）的最小可用载荷（2026-09-17 真机验证）
+
+调用方此前只能靠试错（空 `field_filter` 值会被上游 `-3 invalid parameter`）。**可用最小载荷**：
+
+```json
+{"filter": {
+  "strategy": {"market_category_list": [0],
+               "filter_group_list": [{"option_list": [
+                   {"indicator_type": 1003, "indicator_value": {"value_list": [1]}}]}]},
+  "field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1},
+  "limit": 3}}
+```
+
+- `market_category_list`：`0`=US_STOCK / `1`=US_INDEX / `2`=US_FUTURE / `3`=HK_STOCK /
+  `4`=HK_INDEX / `5`=JP_STOCK / `6`=JP_INDEX；非支持值被后端**静默忽略**（回空列表 + total=0）。
+- `filter_group_list`：每组内 `underlying_list`/`option_list`/`chain_list`/`combo_list`
+  **只能一个非空**（官方文档口径）。
+- `field_filter` 占位规则：int 字段用 `1`、string 字段用**非空**字符串、嵌套字段用**非空**对象；
+  **空数组/空对象/0 会被上游拒绝**——服务端现在在本地就拦下并给出上面的示例（`-3` 不再外泄）。
+- 官方文档把 `field_filter` 标为可选（省略只返 4 个默认字段 + option_id）；服务端要求非空是
+  「避免调用方拿到一堆 null」的有意加严，已在错误消息与工具描述里写明。
+- **实测**：上述载荷经 AppKey 凭据真机返回 3 条 US.AAPL 期权合约；省略 `field_filter` 亦可用
+  （返 2 条默认字段）。
+

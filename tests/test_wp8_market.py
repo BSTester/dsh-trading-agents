@@ -744,8 +744,10 @@ MIN_PAYLOAD_EXISTING = {
     "capital_distribution": {"code": "HK.00700"},
     "option_expiration": {"code": "HK.00700"},
     "option_chain": {"code": "HK.00700"},
+    # field_filter 占位用官方口径的 1（E2E I4 起服务端按 proto 占位规则校验值形状：
+    # int 字段用 1、string 字段用非空串、嵌套字段用非空对象；True/0/[] 都会被拒）
     "option_screen": {"filter": {"strategy": {"market_category_list": [1]},
-                                 "field_filter": {"last_price": True}}},
+                                 "field_filter": {"last_price": 1}}},
 }
 
 MIN_PAYLOAD_NEW = {

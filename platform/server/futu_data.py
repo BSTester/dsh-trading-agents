@@ -187,6 +187,35 @@ OPENAPI_ADAPTERS = {
 _SCREEN_KEYS = ("strategy", "field_filter", "limit", "next_key", "request_exact_data",
                 "sort_obj", "strategy_param")
 
+
+#: 期权筛选的**真机验证过的最小可用载荷**（2026-09-17，官方文档示例的最小化版本；
+#: 实测返回 3 条 US.AAPL 期权合约）。写进错误消息与工具描述，让契约可发现（E2E I4）。
+OPTION_SCREEN_EXAMPLE = (
+    '{"filter": {"strategy": {"market_category_list": [0], "filter_group_list": '
+    '[{"option_list": [{"indicator_type": 1003, "indicator_value": {"value_list": [1]}}]}]}, '
+    '"field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1}, "limit": 3}}')
+
+
+def _is_field_filter_placeholder(value):
+    """field_filter 的 proto 占位规则：``1`` / 非空字符串 / 非空容器（官方文档口径）。
+
+    官方：「int 字段用 1 占位，string 字段用字符串占位（如 "x"）」；嵌套字段按 proto 字段名
+    声明。**空数组/空对象/0/None** 都会被上游当非法参数拒绝（E2E I4 原始证据：
+    ``{"option_type": []}`` → ``-3 invalid parameter``）——在本地拦住并给出示例，比让调用方
+    对着 -3 猜要诚实得多。
+    """
+    if isinstance(value, bool):
+        return False
+    if isinstance(value, int):
+        return value == 1
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list)):
+        return bool(value) and all(_is_field_filter_placeholder(item)
+                                   for item in (value.values() if isinstance(value, dict)
+                                                else value))
+    return False
+
 # ---------------------------------------------------------------------------
 # WP12 任务 4：富途数据面端点（锁定表 docs/superpowers/plans/wp12-endpoint-lock.md §C）
 # ---------------------------------------------------------------------------
@@ -930,17 +959,35 @@ class FutuData:
         return self._fetch("option_chain", arguments)
 
     def option_screen(self, payload):
-        """期权筛选：filter 必须带非空 field_filter（上游陷阱，见 TOOL-LIMITS）与非空 strategy。"""
+        """期权筛选：filter 必须带**形状正确**的 field_filter 与非空 strategy。
+
+        I4（E2E 取证，2026-09-17）：此前只校验「非空 dict」，``field_filter={"option_type": []}``
+        被原样透传 → 上游 ``-3 invalid parameter``，调用方既拿不到可用示例、也不知道错在哪。
+        现按 proto 占位规则前置校验值形状，并在消息里给出真机验证过的最小示例。
+        """
         screen = payload.get("filter")
         screen = _require_dict(screen, "option_screen 需要 filter 对象（必须含非空 field_filter）")
         unknown = sorted(set(screen) - set(_SCREEN_KEYS))
         if unknown:
             raise _param_error(f"option_screen filter 含不支持的字段：{unknown}")
-        _require_dict(screen.get("field_filter"),
-                      "option_screen 必须带非空 field_filter（省略时上游只返回 4 个默认字段、"
-                      "其余全 null，见 docs/TOOL-LIMITS.md）")
+        field_filter = _require_dict(
+            screen.get("field_filter"),
+            "option_screen 必须带非空 field_filter（省略时上游只返回 4 个默认字段、其余全 null）。"
+            f"可用最小示例：{OPTION_SCREEN_EXAMPLE}")
+        bad = sorted(key for key, value in field_filter.items()
+                     if not _is_field_filter_placeholder(value))
+        if bad:
+            raise _param_error(
+                f"option_screen 的 field_filter 值形状非法：{bad}"
+                "（int 字段用 1 占位、string 字段用非空字符串、嵌套字段用非空对象；"
+                "空数组/空对象/0 会被上游 -3 拒绝）。"
+                f"可用最小示例：{OPTION_SCREEN_EXAMPLE}")
         _require_dict(screen.get("strategy"),
-                      'option_screen 必须带非空 strategy（上游必填，如 {"market_category_list": [1]}）')
+                      "option_screen 必须带非空 strategy（上游必填；形如 "
+                      '{"market_category_list": [1], "filter_group_list": '
+                      '[{"option_list": [{"indicator_type": 1003, "indicator_value": '
+                      '{"value_list": [1]}}]}]}；类别码 0=US_STOCK/1=US_INDEX/3=HK_STOCK，'
+                      "每个 filter_group 内 underlying/option/chain/combo 只能一个非空）")
         limit = screen.get("limit")
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
                                   or not 0 <= limit <= 1000):

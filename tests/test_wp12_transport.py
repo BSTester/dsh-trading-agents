@@ -472,7 +472,10 @@ class PermissionSemanticsTests(unittest.TestCase):
                 with self.assertRaises(OpenApiError) as ctx:
                     plate.plate_list("HK", "ALL")
                 self.assertEqual(ctx.exception.errcode, errcode)
-                self.assertEqual(str(ctx.exception), "e", "非 -9 不改写消息")
+                # 缺陷 2（E2E 2026-09-17）：错误文本现在**带上游错误码**，原文逐字保留。
+                # 此前只有 "e"，写进 OMS/日志后无法判断是权限、限频还是参数问题。
+                self.assertEqual(str(ctx.exception), f"[errcode={errcode}] e")
+                self.assertIn("e", str(ctx.exception), "原文必须保留")
 
 
 class LockTableBindingTests(unittest.TestCase):

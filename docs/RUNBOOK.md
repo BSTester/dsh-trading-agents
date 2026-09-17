@@ -8,6 +8,9 @@
 
 恢复原则（规格 §8.4，P4 延续）：daemon 崩溃 systemd 重启；执行中断订单留 `unknown` 由对账兜底；**先查券商再动手，不自动清除未知在途状态，不自动平仓**。
 
+
+> **首启必做（否则平台在跑但什么都没发生）**：配置关注池——`~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300`（需 universe 表已有该指数成分快照；缺它是全部数据作业静默跳过的原因，流程页会显示「关注池未配置」提示）。
+
 ## 0. 前置与路径速查
 
 前置：`~/.dsh/trading-venv` 存在，且执行过 `install_plugins.py link` 把 `trading_core`/`trading_datasource` 同步进 `~/.dsh/trading-python/`（**每次合并 WP 分支后重新 link 一次**，否则 venv 里的 core 是旧副本）。
@@ -56,6 +59,33 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
   不一致时向 stderr 打一行告警 JSON（不硬失败）。
 - 启动成功打印**单行 JSON**：`{"ok": true, "service": "quant-platform", "url": ...,
   "mcp": ".../mcp", "tools": 33, "auth": "loopback-only"}`。
+
+### 服务启停（推荐方式：`scripts/platform_service.sh`）
+
+上面的前台命令**只适合临时排障**：前台进程随终端结束而死；`setsid nohup ... &` 在部分
+环境下也会被回收（本仓库实测：会话结束时进程消失、端口释放）。**长期运行请用脚本**——
+它用与 `platform-autostart` 插件**完全相同的语义**拉起（node `spawn({detached:true,
+stdio:[ignore,log,log]}) + unref()`，node 不可用时退回 `setsid` 兜底），因此进程随会话结束
+仍存活。
+
+```bash
+scripts/platform_service.sh start      # 未运行才拉起（已在运行则打印现状，不重复拉起）
+scripts/platform_service.sh stop       # 优雅 TERM → 等端口释放 → 超时才 KILL
+scripts/platform_service.sh status     # 端口/健康/PID/日志尾部/端点与工具面计数
+scripts/platform_service.sh restart    # stop + start
+```
+
+- **地址来自配置**：`<home>/trading-platform.json` 的 `service.host` / `service.port`
+  （脚本不硬编码 8397；坏 JSON 回落默认）。
+- **与 autostart 的关系**：插件在**会话开始时**探活并按需拉起，脚本是**显式**入口
+  （运维/演练/CI）。二者共享日志文件与仓库定位规则（`DSH_TRADING_REPO` > 标记文件
+  `~/.dsh/trading-platform-repo` > 脚本上一级目录）；重复拉起会被「已在运行」拦下，
+  端口绑定本身也保证最终只有一个监听者。
+- **日志**：`~/.dsh/trading-platform-service.log`（与插件同文件，append）。
+- **退出码**：`0` 成功；`1` 未就绪/未停止；`2` 前置缺失（仓库/venv/入口），且
+  `2` 会打印创建 venv 的完整命令。
+- **端口被非本服务占用**时脚本**不会强杀**，只报告占用 PID 并建议改端口——避免误杀
+  别人的进程。
 
 ### 会话自动拉起（platform-autostart 插件）
 
@@ -439,6 +469,10 @@ sqlite3 ~/.dsh/trading-data/trading.sqlite \
 ```
 
 ## 演练记录（待 WP4 daemon 合并后执行）
+
+> **可重复的端到端验收**（两个 harness + 缺陷清单 + 闭环判据）见
+> [E2E-ACCEPTANCE.md](E2E-ACCEPTANCE.md)：后端 `scripts/e2e_workbench.py`（含 `--read-only`）、
+> 前端 `node scripts/e2e_web.mjs`（含 `--routes/--no-screenshot/--fail-on-soft`）。
 
 > 以下四场景须在 WP4 daemon 合并、`install_plugins.py link` 同步后按上文步骤实际执行，输出原文（JSON/命令回显）粘贴到对应条目，并回填至 `docs/superpowers/plans/2026-09-14-wp5-ops-acceptance.md` 的 WP5 验收记录。
 
