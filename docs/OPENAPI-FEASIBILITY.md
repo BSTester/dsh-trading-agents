@@ -77,7 +77,7 @@
 
 ## 三、对平台三个增量的落地评估
 
-接入点统一为 `trading_datasource` 新源 **`futu_openapi`**（`plugins/datasource/python/trading_datasource/futu_openapi.py`，与现有 `futu_mcp.py` 并列），行情路由仍收敛在 `market.load_bars` 一处，符号转换/复权口径/失败上报沿用「唯一实现」原则。
+接入点统一为 `trading_datasource` 新源 **`futu_openapi`**（`plugins/datasource/python/trading_datasource/futu_openapi.py`，与现有 `futu_mcp.py` 并列；**WP13 任务 0 起拆为同名包 `futu_openapi/`**，对外导入路径不变——护栏见 `tests/test_wp12_openapi_package.py` 的历史命名空间与「禁止内联路径字面量」断言），行情路由仍收敛在 `market.load_bars` 一处，符号转换/复权口径/失败上报沿用「唯一实现」原则。
 
 ### 1. K1 原始价回填
 
