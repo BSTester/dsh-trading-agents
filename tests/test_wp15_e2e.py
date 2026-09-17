@@ -135,7 +135,8 @@ class DutyQueueEndToEndTest(unittest.TestCase):
         self.assertEqual(claimed["reclaimed"]["requeued"], [first["task_id"]])
         task = claimed["task"]
         self.assertEqual(task["task_id"], first["task_id"], "回收后仍是同一条任务")
-        self.assertEqual(task["attempts"], 1, "回收计入一次尝试，但不判 failed（<3）")
+        self.assertEqual(task["timeouts"], 1, "回收计 timeouts，但不判 failed（<3）")
+        self.assertEqual(task["attempts"], 0, "回收**不**消耗 attempts（R2：headless 被杀≠尝试失败）")
         self.assertIn("超时", task["err"] or "")
 
         self._report(task["task_id"], ok=True, result_ref="research:brief:recovered")

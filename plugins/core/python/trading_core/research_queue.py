@@ -172,15 +172,22 @@ def report(conn, home, task_id, ok, result_ref=None, err=None):
     """回报任务结果（业务层：状态机在 store，**升级为 failed 的告警在此发**）。
 
     与 ``reclaim`` 同一分工：``store.finish_task`` 只管状态迁移，告警需要 ``home``，
-    因此留在业务层。failed 是**结局**（attempts 到上限，不再重试），与 reclaim 的
-    超时判 failed 一样必须留痕——否则一条任务默默消失，没人知道它为什么没产出。
+    因此留在业务层。failed 是**结局**（真正尝试过的失败达 attempts 上限，不再重试），与
+    reclaim 的「执行体未回报」是两种不同事实——告警同时带 ``attempts`` 与 ``timeouts``，
+    运维据此区分「任务本身失败」与「执行体没回来」（R2，2026-09-16 审查）。
+    终态任务是**幂等回报**（R1）：先查终态直接返回，**不重复发告警**；``store.finish_task``
+    自带同一守卫（防御直连 store 的调用方）。
     """
+    existing = store.get_task(conn, task_id)
+    if existing is not None and existing["status"] in ("done", "failed"):
+        return existing
     task = store.finish_task(conn, task_id, ok, result_ref=result_ref, err=err)
     if task["status"] == "failed":
         alerts.emit(
             conn, home=str(home), level="warn", title="研究任务失败",
             detail=(f"task={task['task_id']} kind={task['kind']} market={task['market']} "
                     f"as_of={task['as_of']} attempts={task['attempts']} "
+                    f"timeouts={task.get('timeouts', 0)} "
                     f"err={task.get('err') or ''}")[:300])
     return task
 
@@ -188,8 +195,9 @@ def report(conn, home, task_id, ok, result_ref=None, err=None):
 def reclaim(conn, home, now, timeout_minutes=store.TASK_TIMEOUT_MINUTES):
     """回收超时任务；升级为 failed 的逐个发 warn 告警。返回状态机结果。
 
-    告警逐条发（不是汇总一条）：任务是独立的研究单元，汇总会让「哪条失败了、重试过几次」
-    淹没在摘要里——而这两个数字正是运维判断执行体是否健康所必需的。
+    告警逐条发（不是汇总一条）：任务是独立的研究单元，汇总会让「哪条失败了、超时过几次」
+    淹没在摘要里——而这两个数字正是运维判断执行体是否健康所必需的。告警带
+    ``attempts``（真实尝试失败次数）与 ``timeouts``（领取后未回报次数）两个计数。
     """
     result = store.reclaim_tasks(conn, now, timeout_minutes=timeout_minutes)
     for task in result["failed"]:
@@ -197,5 +205,6 @@ def reclaim(conn, home, now, timeout_minutes=store.TASK_TIMEOUT_MINUTES):
             conn, home=str(home), level="warn", title="研究任务失败",
             detail=(f"task={task['task_id']} kind={task['kind']} market={task['market']} "
                     f"as_of={task['as_of']} attempts={task['attempts']} "
+                    f"timeouts={task.get('timeouts', 0)} "
                     f"err={task.get('err') or ''}")[:300])
     return result

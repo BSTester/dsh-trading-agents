@@ -217,9 +217,14 @@ def build_jobs(home, conn=None):
       * ``GLOBAL_CHAIN``：reconcile（= ``auto_pipeline.reconcile_at``），其后是
         enqueue_research（= ``reconcile_at`` + ``ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES``，
         **入队时刻跟随配置**，保证严格晚于当日 digest 落库——审查 A-2）。两者都**不查
-        交易日历**（见 tick），只受时点与当日 ran 标记约束。整条 GLOBAL 链按 ``at``
-        升序排列——tick-first 补跑时同一轮里可能同时到期多个作业，**顺序必须与时间
-        顺序一致**：digest 先落库，研究任务入队才拿得到当日 digest。
+        交易日历**（见 tick），只受时点与当日 ran 标记约束。
+
+    **全链时间序不变式（R3，2026-09-16 审查）**：每条链（市场链与 GLOBAL 链）都按 ``at``
+    升序排列。理由不是好看，而是 tick-first 补跑时**同一轮里可能同时到期多个作业，
+    执行顺序就是链内顺序**——链若不按时间序，补跑那一刻的顺序就与真实的因果顺序不一致
+    （最要命的一例：build_plan 排在 factors_snapshot 之前，计划会吃到旧快照）。
+    关闭态直接返回 JOBS_DEFAULT（其各链本就时间有序），因此该不变式对两种状态都成立。
+    相等时点由稳定排序保持插入顺序（如同刻的 sync_bars 与 sync_fundamentals）。
 
     作业体自身的软跳过（未启用/无匹配策略/数据未就绪/守卫拦截）由 ``plan-auto`` 与
     ``auto-execute`` 实现并留痕；这里不重复做关注池或策略门槛——避免两处判定漂移，
@@ -250,6 +255,9 @@ def build_jobs(home, conn=None):
                           "cmd": ["plan-auto", "--market", market]})
         chain.append({"name": "auto_execute", "at": cfg["exec_at"][market],
                       "cmd": ["auto-execute", "--market", market]})
+        # R3：追加完按 at 升序重排（稳定排序，同刻保持插入顺序）——补跑同轮多作业时，
+        # 链内顺序就是执行顺序，必须与时间顺序一致（见 docstring 的不变式）。
+        jobs[market] = sorted(chain, key=lambda job: job["at"])
     # GLOBAL 链：reconcile（对账 → 写 digest）在前，enqueue_research（基础链作业）**按
     # reconcile_at 派生**紧随其后——开启态下入队时刻跟随配置，保证严格晚于当日 digest；
     # 关闭态则保持 JOBS_DEFAULT 的固定点（ENQUEUE_RESEARCH_BASE_AT，无 reconcile 作业）。

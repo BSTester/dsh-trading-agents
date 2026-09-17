@@ -524,7 +524,10 @@ def research_tasks_claim(home=None, now=None):
 
     1. **先回收**（``research_queue.reclaim``，幂等且便宜）：执行体崩溃留下的 running 若不
        回收会永久卡住队列；领取本身是「执行体还活着」的唯一证据，顺手回收比另挂一个 tick
-       作业更省（规格 §10.2）。回收判 failed 的告警由业务层发出。
+       作业更省（规格 §10.2）。回收判 failed 的告警由业务层发出。**超时不计 attempts**：
+       回收累加的是 ``timeouts``（连续超时 ``TASK_MAX_TIMEOUTS`` 次才 failed，err 写
+       「执行体未回报」），``attempts`` 只由执行体回报 ``ok=false`` 累加——两种失败不可混同
+       （R2，2026-09-16 审查）。
     2. **再校验队首载荷**（队列即攻击面，规格 §10.3/§十一.13）：直改库塞进来的自由文本键
        在领取这一刻被拒——任务**不被领走**（状态保持 pending）+ critical 告警等人介入。
        拒绝而不是猜测执行，代价是被拒任务会占据队首（队列暂停在这一点上）——这是刻意的
@@ -567,6 +570,8 @@ def research_tasks_report(task_id, ok, result_ref=None, err=None, home=None):
     参数在**接触 core（因此也接触 DB）之前**校验：``ok`` 必须是真布尔——用真值判断会让
     ``"false"``/``1``/``""`` 这类载荷悄悄改变任务结局（把 failed 记成 done），这是队列
     里最不该含糊的一个字段。失败达上限转 failed 的告警由业务层（``research_queue``）发。
+    **终态幂等**（R1，2026-09-16 审查）：``done``/``failed`` 再回报原样返回、状态与计数
+    不变、不重复告警——工具调用重试与网络重放不会把已完成的任务拉回队列。
     """
     if not isinstance(task_id, str) or not task_id.strip():
         raise ComputeError("Invalid task_id")

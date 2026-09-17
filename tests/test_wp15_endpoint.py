@@ -117,16 +117,17 @@ class ClaimTests(QueueEndpointBase):
         value = compute.research_tasks_claim(home=str(self.home), now=NOW)
         self.assertEqual(value["reclaimed"]["requeued"], [stale])
         self.assertEqual(value["task"]["task_id"], stale)      # 回收后仍是它（最早）
-        attempts = self.conn.execute("SELECT attempts FROM research_tasks WHERE task_id=?",
-                                     (stale,)).fetchone()["attempts"]
-        self.assertEqual(attempts, 1)
+        row = self.conn.execute("SELECT attempts,timeouts FROM research_tasks WHERE task_id=?",
+                                (stale,)).fetchone()
+        self.assertEqual(row["timeouts"], 1, "回收计 timeouts")
+        self.assertEqual(row["attempts"], 0, "回收**不**计 attempts（R2：从未真正尝试过）")
 
     def test_claim_reclaim_exhausted_becomes_failed_with_alert(self):
-        """attempts 已到上限的超时任务被判 failed（不再重试）并发 warn 告警。"""
+        """超时达上限的任务被判 failed（不再重试）并发 warn 告警，err 标明「执行体未回报」。"""
         doomed = self.enqueue(kind="mining_round", created_at="2026-09-16 15:00:00")
         self.conn.execute("UPDATE research_tasks SET status='running', started_at=?,"
-                          " attempts=? WHERE task_id=?",
-                          (STALE, store.TASK_MAX_ATTEMPTS - 1, doomed))
+                          " timeouts=? WHERE task_id=?",
+                          (STALE, store.TASK_MAX_TIMEOUTS - 1, doomed))
         self.conn.commit()
         following = self.enqueue(kind="factor_patrol", created_at="2026-09-16 16:35:01")
 
@@ -135,6 +136,9 @@ class ClaimTests(QueueEndpointBase):
         self.assertEqual(self.status_of(doomed), "failed")
         self.assertEqual(value["task"]["task_id"], following)
         self.assertIn("研究任务失败", [a["title"] for a in self.alerts("warn")])
+        detail = self.alerts("warn")[0]["detail"]
+        self.assertIn("执行体未回报", detail, "失败原因如实：是没回来，不是重试上限")
+        self.assertIn("timeouts=", detail)
 
 
 # ---------------------------------------------------------------------------
@@ -163,6 +167,19 @@ class ReportTests(QueueEndpointBase):
         self.assertEqual(value["task"]["status"], "failed")
         self.assertIn("研究任务失败", [a["title"] for a in self.alerts("warn")])
         self.assertIn("boom-3", self.alerts("warn")[0]["detail"])
+
+    def test_report_terminal_task_is_idempotent_no_duplicate_alert(self):
+        """R1：终态任务再回报 → 状态/计数不变，且**不产生第二条告警**（重放不该刷告警）。"""
+        task_id = self.enqueue()
+        compute.research_tasks_claim(home=str(self.home), now=NOW)
+        compute.research_tasks_report(task_id, True, "report:R-1", home=str(self.home))
+        before = len(self.alerts("warn"))
+        replayed = compute.research_tasks_report(task_id, False, err="重放",
+                                                 home=str(self.home))
+        self.assertEqual(replayed["task"]["status"], "done")
+        self.assertEqual(replayed["task"]["attempts"], 0)
+        self.assertEqual(self.status_of(task_id), "done")
+        self.assertEqual(len(self.alerts("warn")), before, "幂等回报不重复发告警")
 
     def test_report_unknown_task_is_error(self):
         with self.assertRaises(compute.ComputeError) as caught:

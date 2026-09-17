@@ -45,7 +45,7 @@ class BuildJobsTest(unittest.TestCase):
         self.assertEqual(daemon.build_jobs(str(self.home), self.conn), daemon.JOBS_DEFAULT)
         self.assertFalse(self._titles())  # 关闭是默认态，不留告警
 
-    # ② 开启态：链尾追加，既有链前缀不变，自动作业用配置时刻（含覆盖）
+    # ② 开启态：追加两个自动作业，用配置时刻（含覆盖），且全链按时间序（R3）
     def test_enabled_appends_auto_jobs(self):
         self._write_cfg({"enabled": True, "strategies": [STRATEGY_SH],
                          "exec_at": {"SH": "09:40"}, "reconcile_at": "19:30"})
@@ -53,18 +53,22 @@ class BuildJobsTest(unittest.TestCase):
 
         sh = jobs["SH"]
         self.assertEqual(len(sh), len(daemon.JOBS_DEFAULT["SH"]) + 2)
-        self.assertEqual(sh[:len(daemon.JOBS_DEFAULT["SH"])], daemon.JOBS_DEFAULT["SH"])
-        self.assertEqual(sh[-2]["name"], "build_plan")
-        self.assertEqual(sh[-2]["at"], "16:20")  # SH factors_snapshot 16:15 + 5
-        self.assertEqual(sh[-2]["cmd"], ["plan-auto", "--market", "SH"])
-        self.assertEqual(sh[-1]["name"], "auto_execute")
-        self.assertEqual(sh[-1]["at"], "09:40")  # 配置覆盖默认 09:35
-        self.assertEqual(sh[-1]["cmd"], ["auto-execute", "--market", "SH"])
+        # 既有作业一个不少（顺序由时间序决定，不再是「尾部追加」的位置断言）
+        self.assertEqual({j["name"] for j in sh},
+                         {j["name"] for j in daemon.JOBS_DEFAULT["SH"]}
+                         | {"build_plan", "auto_execute"})
+        by_name = {j["name"]: j for j in sh}
+        self.assertEqual(by_name["build_plan"]["at"], "16:20")  # SH factors_snapshot 16:15 + 5
+        self.assertEqual(by_name["build_plan"]["cmd"], ["plan-auto", "--market", "SH"])
+        self.assertEqual(by_name["auto_execute"]["at"], "09:40")  # 配置覆盖默认 09:35
+        self.assertEqual(by_name["auto_execute"]["cmd"], ["auto-execute", "--market", "SH"])
 
         # 未覆盖的市场用默认时刻：HK 16:35→16:40 / 09:45；US 05:35→05:40 / 22:35
-        self.assertEqual([j["at"] for j in jobs["HK"][-2:]], ["16:40", "09:45"])
-        self.assertEqual(jobs["HK"][-1]["cmd"], ["auto-execute", "--market", "HK"])
-        self.assertEqual([j["at"] for j in jobs["US"][-2:]], ["05:40", "22:35"])
+        for market, plan_at, exec_at in (("HK", "16:40", "09:45"), ("US", "05:40", "22:35")):
+            named = {j["name"]: j for j in jobs[market]}
+            self.assertEqual(named["build_plan"]["at"], plan_at)
+            self.assertEqual(named["auto_execute"]["at"], exec_at)
+            self.assertEqual(named["auto_execute"]["cmd"], ["auto-execute", "--market", market])
 
         # GLOBAL 链：reconcile 在前，enqueue_research **按 reconcile_at 派生**紧随其后
         # （19:30 + 5 = 19:35）——开启态入队时刻跟随配置，严格晚于当日 digest（审查 A-2）
@@ -81,6 +85,28 @@ class BuildJobsTest(unittest.TestCase):
         self.assertEqual(daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN][0]["at"], "19:05")
         self.assertEqual(len(daemon.JOBS_DEFAULT["SH"]), 7)
         # 基础链：WP11 sentiment + WP12 research 快照（入队自审查 A-2 起移入 GLOBAL 链）
+
+    # ②之二 R3：每条链（市场链与 GLOBAL 链）都按 at 升序——补跑同轮多作业时链序即执行序
+    def test_all_chains_sorted_by_at(self):
+        """不变式对**所有**链成立（此前只有 GLOBAL 有测试），且构建计划在全量链与
+        仅启用配置下都排在 factors_snapshot 之后。"""
+        self._write_cfg({"enabled": True, "strategies": [STRATEGY_SH],
+                         "exec_at": {"SH": "09:40"}, "reconcile_at": "19:30"})
+        jobs = daemon.build_jobs(str(self.home), self.conn)
+        for market, chain in jobs.items():
+            times = [j["at"] for j in chain]
+            self.assertEqual(times, sorted(times), f"{market} 链未按时间升序：{times}")
+
+        for market in ("SH", "HK", "US"):
+            names = [j["name"] for j in jobs[market]]
+            self.assertLess(names.index("factors_snapshot"), names.index("build_plan"),
+                            "计划生成必须晚于因子快照（否则会吃到旧快照）")
+
+    # ②之三 R3：关闭态的 JOBS_DEFAULT 同样时间有序（不变式不因开关而失效）
+    def test_default_chains_sorted_by_at(self):
+        for market, chain in daemon.JOBS_DEFAULT.items():
+            times = [j["at"] for j in chain]
+            self.assertEqual(times, sorted(times), f"{market} 默认链未按时间升序：{times}")
 
     # ③ GLOBAL 链不查市场日历：日历缺失时市场链跳过并告警，全局链照常执行
     def test_global_chain_ignores_calendar(self):

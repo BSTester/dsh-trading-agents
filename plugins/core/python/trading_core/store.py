@@ -96,6 +96,9 @@ CREATE TABLE IF NOT EXISTS research_tasks(
 #     （build_plan 作业写 'auto'；既有 planner/手工路径不传 → 默认 manual，行为不变）；
 #   market TEXT —— auto 计划一计划一市场（匹配 per-market 作业链与 exec_at）；
 #     手工计划 NULL，兼容现状。
+# v4（WP15 R2 修订，2026-09-16 审查）：research_tasks 幂等追加 timeouts 列——超时回收
+#   与「执行体真的试过并失败」是两种不同事实，必须分开计数（见 reclaim_tasks docstring）：
+#   attempts 只由 finish_task(ok=False) 累加，timeouts 只由 reclaim_tasks 累加。
 # ---------------------------------------------------------------------------
 
 
@@ -128,6 +131,7 @@ def migrate(conn):
     conn.executescript(_SCHEMA)
     _add_columns(conn, "plans", [("origin", "TEXT NOT NULL DEFAULT 'manual'"),
                                  ("market", "TEXT")])
+    _add_columns(conn, "research_tasks", [("timeouts", "INTEGER NOT NULL DEFAULT 0")])
     row = conn.execute("PRAGMA user_version").fetchone()[0]
     if row < SCHEMA_VERSION:
         conn.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -974,6 +978,9 @@ TASK_PAYLOAD_KEYS = ("as_of", "market", "refs", "digest_ref", "symbols",
                      "factor_list", "window")
 #: 失败重试上限：attempts 达到即转 failed（不再重试，避免坏任务无限占用队列）。
 TASK_MAX_ATTEMPTS = 3
+#: 超时回收上限（R2 修订）：**与 attempts 分开计**——执行体领取后未回报（会话被打断、
+#: headless 被杀、短会话）不是「尝试过并失败」，占用的是这个计数与这个上限。
+TASK_MAX_TIMEOUTS = 3
 #: running 超过该分钟数视为执行体已死（headless 超限退出/会话崩溃），回收重试。
 TASK_TIMEOUT_MINUTES = 30
 
@@ -1076,11 +1083,19 @@ def finish_task(conn, task_id, ok, result_ref=None, err=None):
 
     回 pending 时清 ``started_at``（任务确实不在执行中），但**保留 err**——下一次领取者
     需要看到上一次为什么失败，否则重试等于盲试。
+
+    **终态幂等（R1，2026-09-16 审查）**：``done``/``failed`` 已是结局，再次回报
+    **原样返回该行、不改任何字段、不报错**。没有这道守卫时，模型重试工具调用或 HTTP
+    重放第二次回报就能把一条已完成的任务拉回 pending（`ok=False` 路径）/ 把 failed
+    重算一遍——终态是可被外部重放推翻的，队列就不再可信。选择返回而非抛错：重试方
+    需要拿到终态才能收敛，报错只会诱使它继续重试。
     """
     row = conn.execute("SELECT * FROM research_tasks WHERE task_id=?",
                        (task_id,)).fetchone()
     if row is None:
         raise ValueError(f"未知任务：{task_id}")
+    if row["status"] in ("done", "failed"):
+        return _task_row(row)
     attempts = int(row["attempts"])
     if ok:
         conn.execute("UPDATE research_tasks SET status='done', finished_at=?,"
@@ -1102,7 +1117,14 @@ def reclaim_tasks(conn, now, timeout_minutes=TASK_TIMEOUT_MINUTES):
     """回收超时 running 任务 → ``{"requeued": [id], "failed": [task], "kept": [id]}``。
 
     执行体死掉时任务会永远停在 running（headless 被杀、会话中断）——回收是队列不卡死的
-    唯一保障。``attempts`` 达上限的**不回收而是判 failed**：坏任务不能无限循环烧额度。
+    唯一保障。
+
+    **超时不计入 attempts（R2，2026-09-16 审查）**：``attempts`` 度量的是「执行体真的
+    试过并失败了几次」；而领取后未回报（会话被打断、短会话、headless 超时退出）意味着
+    任务**从未被真正尝试过**。旧口径把它算进 attempts，于是三次打断就把一条好任务判
+    failed，err 还误报「已达重试上限」——失败原因与事实不符，运维据此排查会被带偏。
+    现在超时走独立的 ``timeouts`` 计数与 ``TASK_MAX_TIMEOUTS`` 上限，err 如实写
+    「执行体未回报（超时）」；真正的失败（执行体回报 ``ok=False``）仍按 attempts 规则计。
     """
     import datetime as _dt
     cutoff = (_dt.datetime.strptime(str(now), "%Y-%m-%d %H:%M:%S")
@@ -1113,25 +1135,37 @@ def reclaim_tasks(conn, now, timeout_minutes=TASK_TIMEOUT_MINUTES):
     stale = {r["task_id"] for r in rows}
     requeued, failed = [], []
     for row in rows:
-        attempts = int(row["attempts"]) + 1
-        if attempts >= TASK_MAX_ATTEMPTS:
-            conn.execute("UPDATE research_tasks SET status='failed', attempts=?,"
+        timeouts = int(row["timeouts"] or 0) + 1
+        if timeouts >= TASK_MAX_TIMEOUTS:
+            conn.execute("UPDATE research_tasks SET status='failed', timeouts=?,"
                          " finished_at=?, err=? WHERE task_id=?",
-                         (attempts, now, f"执行超时（>{timeout_minutes} 分钟）且已达重试上限",
-                          row["task_id"]))
+                         (timeouts, now,
+                          f"执行体未回报（连续 {timeouts} 次超时，单次 >"
+                          f"{timeout_minutes} 分钟）", row["task_id"]))
             failed.append(_task_row(conn.execute(
                 "SELECT * FROM research_tasks WHERE task_id=?", (row["task_id"],)).fetchone()))
         else:
-            conn.execute("UPDATE research_tasks SET status='pending', attempts=?,"
+            conn.execute("UPDATE research_tasks SET status='pending', timeouts=?,"
                          " started_at=NULL, err=? WHERE task_id=?",
-                         (attempts, f"执行超时（>{timeout_minutes} 分钟），已回收重试",
-                          row["task_id"]))
+                         (timeouts, f"执行超时（>{timeout_minutes} 分钟），已回收重试"
+                          f"（第 {timeouts} 次）", row["task_id"]))
             requeued.append(row["task_id"])
     conn.commit()
     kept = [r["task_id"] for r in conn.execute(
         "SELECT task_id FROM research_tasks WHERE status='running'"
         " ORDER BY created_at, task_id").fetchall() if r["task_id"] not in stale]
     return {"requeued": requeued, "failed": failed, "kept": kept}
+
+
+def get_task(conn, task_id):
+    """单条任务（反序列化 payload）；不存在返回 None。
+
+    供业务层在**回报前**判终态：``report`` 若先看到 done/failed 就直接返回，
+    不重复发「研究任务失败」告警（R1 幂等 + 告警去重）。
+    """
+    row = conn.execute("SELECT * FROM research_tasks WHERE task_id=?",
+                       (task_id,)).fetchone()
+    return None if row is None else _task_row(row)
 
 
 def get_tasks(conn, status=None, limit=50):

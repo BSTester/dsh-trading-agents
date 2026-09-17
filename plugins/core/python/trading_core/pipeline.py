@@ -73,6 +73,14 @@ _JOB_LABELS = {
     "digest": "摘要",
 }
 
+#: 流程页阶段**展示顺序** = 逻辑闭环序（与链内执行序解耦，见 ``_ordered``）。
+#: 市场链按 at 升序后 auto_execute 在链首（09:35，执行昨天冻结的计划）——那是执行序；
+#: 人读流程页要的是「同步→质量→因子→…→计划→执行→对账→摘要」的因果序。
+STAGE_ORDER = ("sync_bars", "sync_fundamentals", "merge_announcements", "quality",
+               "factors_snapshot", "sentiment_snapshot", "research_snapshot",
+               "build_plan", "plan", "auto_execute", "execute", "reconcile",
+               "enqueue_research", "digest")
+
 #: 告警标题 → 阶段状态（标题字面量与 emit 点一一对应，grep 可核）
 _ALERT_STATUS = {
     # planner.plan_auto（build_plan 作业）
@@ -340,8 +348,22 @@ def _sentiment_stage(conn, market, date, stage, alerts=()):
     return enriched
 
 
+def _ordered(stages):
+    """按**逻辑闭环顺序**排阶段（R3 修订，2026-09-16 审查）。
+
+    展示顺序与链内执行顺序是两件事：市场链按 ``at`` 升序后 ``auto_execute``（09:35）排在
+    当日链首——那是**执行序**（补跑时先执行昨天冻结的计划），而流程页要呈现的是
+    「同步 → 质量 → 因子 → … → 计划 → 执行」的**因果序**。此前展示序直接沿用链序，因此
+    链序一变页面就跟着变；现在展示序由本常量固定，链序怎么排都不影响读数。
+    未知作业名（上游新增而此处未登记）追加在末尾——不丢阶段，也不打乱已知顺序。
+    """
+    known = [name for name in STAGE_ORDER if name in stages]
+    extra = [name for name in stages if name not in STAGE_ORDER]
+    return {name: stages[name] for name in known + extra}
+
+
 def _market_stages(conn, market, jobs, state, alerts, date):
-    """该市场阶段表：真实作业链顺序 + 在 build_plan/auto_execute 之后插入派生阶段。"""
+    """该市场阶段表：真实作业链**发现**阶段 + 在 build_plan/auto_execute 之后插入派生阶段。"""
     stages = {}
     inserted = set()
     chain = jobs.get(market) or []
@@ -362,7 +384,7 @@ def _market_stages(conn, market, jobs, state, alerts, date):
         stages["plan"] = _plan_stage(conn, market)
     if "execute" not in inserted:
         stages["execute"] = _execute_stage(conn, market)
-    return stages
+    return _ordered(stages)
 
 
 def _global_stages(conn, jobs, state, alerts, date):
@@ -373,7 +395,7 @@ def _global_stages(conn, jobs, state, alerts, date):
         stage["scheduled"] = job.get("at")
         stages[job["name"]] = stage
     stages["digest"] = _digest_stage(conn, date)
-    return stages
+    return _ordered(stages)
 
 
 def _config_unparsable(home):

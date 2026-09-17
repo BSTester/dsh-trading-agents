@@ -408,7 +408,12 @@ journalctl --user -u research-duty.service -n 50     # 单次运行记录（与�
 **首次交互**里由 Harness 按 `AGENTS.md` 的启动纪律消费积压（**非自动**：没有任何 turn 的
 会话不会消费队列，任务只延迟不丢）。互斥靠状态迁移（`claim_task` 只把 `pending` 迁
 `running`），不会重复执行。定时器没装、机器关机、headless 被杀，都只是**延后**：超时的
-`running` 在下次领取时被回收（`reclaim_tasks`，幂等），`attempts` 达 3 次才判 `failed`。
+`running` 在下次领取时被回收（`reclaim_tasks`，幂等）。
+
+**两种失败分开计数（R2，2026-09-16 审查）**：`attempts` = 执行体真的试过并回报
+`ok=false` 的次数（达 3 次 failed）；`timeouts` = 领取后没回来的次数（连续 3 次才 failed，
+`err` 写「执行体未回报」）。因此「被打断三次」不会把一条从未尝试过的任务判失败——
+排查时按 `err` 文案区分两者，别把超时当成任务本身的失败。
 
 ### 排查表
 
@@ -421,14 +426,16 @@ journalctl --user -u research-duty.service -n 50     # 单次运行记录（与�
 | 队列一直 `pending` | 定时器没跑或服务没起 | 查 `systemctl --user list-timers research-duty.timer` 与 `~/.dsh/logs/research-duty-*.log` |
 | 任务长期 `running` | 执行体死在半路（headless 被杀/会话中断） | 下次 `claim` 自动回收；急用可手工触发一次唤醒让 `reclaim` 生效 |
 | 任务被拒领 + critical 告警 | 载荷被直改库塞进了自由文本（队列即攻击面） | **队列暂停在队首**（fail-closed）。人工核对 `research_tasks.payload`，修正或删除该行后才继续 |
-| `attempts=3` 转 `failed` | 坏任务不无限重试（防烧额度） | 看 `err` 字段定位；确认是任务本身问题再人工重新入队 |
+| `attempts=3` 转 `failed` | 真失败不无限重试（防烧额度） | 看 `err` 字段定位（执行体自报原因）；确认是任务本身问题再人工重新入队 |
+| `timeouts=3` 转 `failed` | 执行体**连续三次没回报**（≠ 任务本身失败） | 先修执行体（定时器/会话/超时上限），再重新入队；`err` 文案为「执行体未回报（连续 N 次超时…）」 |
+| 重复回报后状态不变 | 终态幂等（R1）：`done`/`failed` 不被后到的回报推翻 | 属预期，不是故障；重试回报不必先查状态 |
 | 日志为空但退出码 0 | 队列本来为空（非交易日/已消费完） | 属预期；要验证链路就手工 `enqueue-research` 再来一次 |
 
 排查入口：
 
 ```bash
 sqlite3 ~/.dsh/trading-data/trading.sqlite \
-  "SELECT task_id,kind,status,attempts,created_at,err FROM research_tasks ORDER BY created_at DESC LIMIT 10;"
+  "SELECT task_id,kind,status,attempts,timeouts,created_at,err FROM research_tasks ORDER BY created_at DESC LIMIT 10;"
 ```
 
 ## 演练记录（待 WP4 daemon 合并后执行）
