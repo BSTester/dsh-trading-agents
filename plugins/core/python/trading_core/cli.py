@@ -117,6 +117,16 @@ def build_parser():
                    help="观测日覆盖 YYYY-MM-DD 或完整时刻（测试/补跑用）")
     s.add_argument("--now", default=None,
                    help="当前时刻覆盖 YYYY-MM-DD HH:MM:SS（测试用）")
+    # S-1/S-3（2026-09-17 实机加固）：20 标的 × 三源实机 >7 分钟、对外无进度、且逼近
+    # daemon 的 900s 作业上限。总预算/逐标的超时缺省从 trading-platform.json 读
+    # （sentiment_budget_seconds / sentiment_symbol_timeout_seconds）；
+    # --symbols/--limit 是**运维分批跑**的覆盖。
+    s.add_argument("--budget", type=int, default=None,
+                   help="本轮总预算秒（覆盖配置；耗尽=停止剩余标的、退出 0 + warn 告警）")
+    s.add_argument("--symbols", default=None,
+                   help="只采这些标的（逗号分隔，覆盖关注池；运维分批跑用）")
+    s.add_argument("--limit", type=int, default=None,
+                   help="只采关注池前 N 个标的（运维分批跑用）")
     _add_db(s)
 
     s = sub.add_parser("research-snapshot",
@@ -704,13 +714,15 @@ def main(argv=None):
                 return 1
         elif args.cmd == "sentiment-snapshot":
             # 情绪/资讯 PIT 采集作业体（WP11）。软跳过（会话未收盘/池空/通道缺席）=
-            # 退出 0：采集是攒历史，不是当日依赖，缺源不阻塞调度链；市场链/时钟非法
-            # =fail-closed 非零退出（与 plan-auto 同一分级）。
+            # 退出 0：采集是攒历史，不是当日依赖，缺源不阻塞调度链；市场链/时钟/配置
+            # 非法=fail-closed 非零退出（与 plan-auto 同一分级）。**预算耗尽同样是退出 0**
+            # （作业确实跑了，只是没采完；见 sentiment.run 的 S-1 说明与 warn 告警）。
             import os
             from . import sentiment
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
             result = sentiment.run(home, args.market, conn=conn, today=args.today,
-                                   now=args.now)
+                                   now=args.now, budget_seconds=args.budget,
+                                   symbols=args.symbols, limit=args.limit)
             if not result.get("ok"):
                 print(json.dumps(result, ensure_ascii=False, indent=1, default=str))
                 return 1
