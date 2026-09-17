@@ -1000,6 +1000,16 @@ def _validate_task(kind, as_of, market, payload):
         raise ValueError("任务缺少 market")
 
 
+def validate_task(kind, as_of, market, payload):
+    """公开校验入口（fail-closed）——与入队侧**同一实现**，供领取侧二次校验调用。
+
+    规格 §10.3「队列即攻击面」：入队校验挡的是正常写入路径，而直改库（或将来任何绕过
+    ``enqueue_task`` 的写入）能把自由文本塞进 payload。领取这一刻再校验一次，队列里
+    躺着的可疑载荷才不会被执行（拒绝比猜测安全）。
+    """
+    _validate_task(kind, as_of, market, payload)
+
+
 def enqueue_task(conn, kind, as_of, market, payload, created_at=None):
     """入队（当日幂等）→ ``task_id``。
 
@@ -1028,6 +1038,19 @@ def enqueue_task(conn, kind, as_of, market, payload, created_at=None):
 def _uuid_token():
     import uuid
     return uuid.uuid4().hex[:6].upper()
+
+
+def peek_task(conn):
+    """查看队首 pending（**不改状态**）；无 pending 返回 None。
+
+    与 ``claim_task`` 同一排序口径（``created_at, task_id``）。存在的理由是领取侧二次
+    校验：先看、验、再领——若载荷可疑就当场拒绝，任务状态保持 pending（而不是先领成
+    running 再回滚，那会留下一个「刚刚被判不可信却动过状态」的中间态）。
+    """
+    row = conn.execute(
+        "SELECT * FROM research_tasks WHERE status='pending'"
+        " ORDER BY created_at, task_id LIMIT 1").fetchone()
+    return None if row is None else _task_row(row)
 
 
 def claim_task(conn, now):

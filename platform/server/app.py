@@ -116,6 +116,19 @@ RULES_DECIDE_FIELDS = ("rule_id", "decision")
 # 服务端不复制一份枚举——非法值经 core 桥的 ComputeError 带原因回到调用方）。
 RULES_FIELDS = ("status",)
 
+# WP15 任务 3：值班研究员队列三端点的字段白名单。三个动作**拆成三个端点**而不是一个
+# ``{action: ...}`` 动作端点，是被两条硬约束逼出来的（原设计写的是一个 action 端点）：
+#   ① ``list`` 必须 HTTP-only（只看队列，不是执行体的动作），而一个端点要么整体进工具面、
+#      要么整体排除——HTTP 与 MCP 共用同一批处理函数，无法「半个端点」排除；
+#   ② 工具面锁定不变式是「端点工具集 ≡ 端点清单 − 排除集」，拆开后 claim/report 各自
+#      对应一个端点，``research-tasks-list`` 单独进排除集，账目仍然平（工具 77 / 端点 82）。
+# claim 一个字段都不给：领取 = 取队首，任何参数只可能被用来越权指定任务（与
+# confirm-decide 只有「编号+结论」同一思路）。report 只有结果三件套。
+RESEARCH_TASKS_CLAIM_FIELDS = ()
+RESEARCH_TASKS_REPORT_FIELDS = ("task_id", "ok", "result_ref", "err")
+# list 是只读面板：状态过滤 + 单页上限（两者都在 compute.research_tasks_list 校验）。
+RESEARCH_TASKS_LIST_FIELDS = ("status", "limit")
+
 # rpc.js:69-70 的动作 → 指令类型映射（规格 §8.2 的 5 种里服务面可达的 4 种）
 EXECUTE_ACTIONS = {
     "execute": "execute_plan",
@@ -312,6 +325,15 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
         core["rules"] = lambda status=None: compute.rules_list(status)
         core["rules-decide"] = lambda rule_id, decision: compute.rules_decide(
             rule_id, decision, home=home)
+        # WP15 任务 3：值班研究员队列（L3）——领取/回报是**服务进程内动作**（compute 直连
+        # trading_core：research_queue 业务层 + store 状态机）。进程内的理由与规则审批同源：
+        # 队列是本地 SQLite，而回收/失败告警必须与状态迁移同进程写入 alerts 表；这两个动作
+        # 也不是人拍板的动作，没有「离线等价入口 = 自批通道」的顾虑。
+        core["research-tasks-claim"] = lambda: compute.research_tasks_claim(home=home)
+        core["research-tasks-report"] = lambda task_id, ok, result_ref=None, err=None: (
+            compute.research_tasks_report(task_id, ok, result_ref, err, home=home))
+        core["research-tasks-list"] = lambda status=None, limit=50: (
+            compute.research_tasks_list(status, limit, home=home))
     if trade is None:
         trade = trading.TradeGate(home)
     if futu is None:
@@ -373,6 +395,49 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                     raise WorkbenchError("Core bridge unavailable")
                 try:
                     value = provider(payload.get("rule_id"), payload.get("decision"))
+                except compute.ComputeError as error:
+                    return {"ok": False, "error": {"code": "trading/invalid-operation",
+                                                   "message": str(error), "details": {}}}
+                return {"ok": True, "value": value}
+            if endpoint == "research-tasks-claim":
+                # WP15 任务 3：L3 领取（队首 pending → running）。空载荷：领取不接受任何
+                # 参数，任务由队列顺序决定，参数只可能被用来越权挑任务。业务拒绝（队首载荷
+                # 未通过领取侧校验）以 trading/invalid-operation 如实回，并经 core 落
+                # critical 告警——**拒绝而不是跳过**（规格 §10.3：队列即攻击面）。
+                _takes_no_payload(endpoint, payload)
+                provider = core.get("research-tasks-claim")
+                if provider is None:
+                    raise WorkbenchError("Core bridge unavailable")
+                try:
+                    value = provider()
+                except compute.ComputeError as error:
+                    return {"ok": False, "error": {"code": "trading/invalid-operation",
+                                                   "message": str(error), "details": {}}}
+                return {"ok": True, "value": value}
+            if endpoint == "research-tasks-report":
+                # WP15 任务 3：L3 回报（成功 → done；失败 → attempts+1，达上限 failed + 告警）。
+                # 载荷只有结果三件套，没有「改任务」「换载荷」的位置；``ok`` 的真布尔校验在
+                # compute（真值判断会把 "false" 记成 done，队列里最不该含糊的字段）。
+                _check_fields(endpoint, payload, RESEARCH_TASKS_REPORT_FIELDS)
+                provider = core.get("research-tasks-report")
+                if provider is None:
+                    raise WorkbenchError("Core bridge unavailable")
+                try:
+                    value = provider(payload.get("task_id"), payload.get("ok"),
+                                     payload.get("result_ref"), payload.get("err"))
+                except compute.ComputeError as error:
+                    return {"ok": False, "error": {"code": "trading/invalid-operation",
+                                                   "message": str(error), "details": {}}}
+                return {"ok": True, "value": value}
+            if endpoint == "research-tasks-list":
+                # WP15 任务 3：队列只读列表（**有意不进 MCP 工具面**：执行体不需要「看清单」
+                # 这个动作，而人要看队列有 Web；排除后端点工具集仍与端点清单对平）。
+                _check_fields(endpoint, payload, RESEARCH_TASKS_LIST_FIELDS)
+                provider = core.get("research-tasks-list")
+                if provider is None:
+                    raise WorkbenchError("Core bridge unavailable")
+                try:
+                    value = provider(payload.get("status"), payload.get("limit", 50))
                 except compute.ComputeError as error:
                     return {"ok": False, "error": {"code": "trading/invalid-operation",
                                                    "message": str(error), "details": {}}}

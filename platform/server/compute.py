@@ -505,6 +505,105 @@ def rules_decide(rule_id, decision, home=None):
     return {"rule_id": rule_id, "status": status}
 
 
+#: 值班研究员队列的合法状态（store 状态机的全部取值，规格 §10.2）。
+TASK_STATUSES = frozenset(("pending", "running", "done", "failed"))
+#: 队列列表单页上限（防一次拉全表）。
+TASK_LIST_MAX = 200
+
+
+def _task_conn(home):
+    """打开队列所在库（list/claim/report 共用的（store, conn）组装）。"""
+    store = _core_module("store")
+    return store, store.connect(store.db_path(str(command_home(home))))
+
+
+def research_tasks_claim(home=None, now=None):
+    """值班研究员领取一条任务 → ``{"task": {...}|None, "reclaimed": {...}}``。
+
+    三件事的顺序是刻意的：
+
+    1. **先回收**（``research_queue.reclaim``，幂等且便宜）：执行体崩溃留下的 running 若不
+       回收会永久卡住队列；领取本身是「执行体还活着」的唯一证据，顺手回收比另挂一个 tick
+       作业更省（规格 §10.2）。回收判 failed 的告警由业务层发出。
+    2. **再校验队首载荷**（队列即攻击面，规格 §10.3/§十一.13）：直改库塞进来的自由文本键
+       在领取这一刻被拒——任务**不被领走**（状态保持 pending）+ critical 告警等人介入。
+       拒绝而不是猜测执行，代价是被拒任务会占据队首（队列暂停在这一点上）——这是刻意的
+       fail-closed：坏载荷宁可整队停下等人看，也不放一条来历不明的指令进研究侧。
+    3. **最后领取**（``store.claim_task``）：状态迁移的唯一入口，服务进程不另写一份。
+    """
+    store, conn = _task_conn(home)
+    research_queue = _core_module("research_queue")
+    clock = _core_module("clock")
+    alerts = _core_module("alerts")
+    root = str(command_home(home))
+    try:
+        try:
+            stamp = clock.now_stamp(now)
+        except ValueError as error:
+            raise ComputeError(str(error)) from error
+        reclaimed = research_queue.reclaim(conn, root, stamp)
+        pending = store.peek_task(conn)
+        if pending is None:
+            return {"task": None, "reclaimed": reclaimed}
+        try:
+            store.validate_task(pending["kind"], pending["as_of"], pending["market"],
+                                pending["payload"])
+        except ValueError as error:
+            alerts.emit(conn, home=root, level="critical", title="研究任务载荷未通过领取校验",
+                        detail=(f"task={pending['task_id']} kind={pending['kind']} "
+                                f"market={pending['market']} as_of={pending['as_of']} "
+                                f"{error}")[:300])
+            raise ComputeError(
+                f"队列载荷未通过领取侧校验，任务未领取：task={pending['task_id']} {error}"
+            ) from error
+        return {"task": store.claim_task(conn, stamp), "reclaimed": reclaimed}
+    finally:
+        conn.close()
+
+
+def research_tasks_report(task_id, ok, result_ref=None, err=None, home=None):
+    """回报一条任务的结果 → ``{"task": {...}}``（状态机在 ``store.finish_task``）。
+
+    参数在**接触 core（因此也接触 DB）之前**校验：``ok`` 必须是真布尔——用真值判断会让
+    ``"false"``/``1``/``""`` 这类载荷悄悄改变任务结局（把 failed 记成 done），这是队列
+    里最不该含糊的一个字段。失败达上限转 failed 的告警由业务层（``research_queue``）发。
+    """
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise ComputeError("Invalid task_id")
+    if not isinstance(ok, bool):
+        raise ComputeError(f"Invalid ok (boolean required), got {type(ok).__name__}")
+    for label, value in (("result_ref", result_ref), ("err", err)):
+        if value is not None and not isinstance(value, str):
+            raise ComputeError(f"Invalid {label} (string required), got {type(value).__name__}")
+    store, conn = _task_conn(home)
+    research_queue = _core_module("research_queue")
+    try:
+        try:
+            task = research_queue.report(conn, str(command_home(home)), task_id.strip(), ok,
+                                         result_ref=result_ref, err=err)
+        except ValueError as error:
+            raise ComputeError(str(error)) from error
+        return {"task": task}
+    finally:
+        conn.close()
+
+
+def research_tasks_list(status=None, limit=50, home=None):
+    """队列列表（可按状态过滤）→ ``{"tasks": [...]}``。
+
+    ``status`` 的状态枚举校验在这里（列表端点是只读面板，拼错状态应当报错而不是静默返回
+    空列表——空列表会被读成「没有任务」）；``limit`` 走既有 ``_int_in_range`` 口径。
+    """
+    if status is not None and status not in TASK_STATUSES:
+        raise ComputeError(f"Invalid status {status!r} ({'/'.join(sorted(TASK_STATUSES))})")
+    number = _int_in_range(limit, 50, 1, TASK_LIST_MAX, "limit")
+    store, conn = _task_conn(home)
+    try:
+        return {"tasks": store.get_tasks(conn, status=status, limit=number)}
+    finally:
+        conn.close()
+
+
 def command_home(home):
     """指令目录根：``$DSH_HOME``（pycore.js:9-11 pythonHome）。"""
     return Path(home if home is not None else os.environ.get("DSH_HOME") or Path.home() / ".dsh")

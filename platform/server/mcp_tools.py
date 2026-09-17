@@ -84,9 +84,11 @@ SERVER_VERSION = "0.1.0"
 # OpenAPI 交易只读工具 + WP8 任务 6 的 3 个推送订阅管理工具；58 端点扣除有意排除的
 # confirm-decide 与设置页 3 端点 openapi_config/openapi_test/openapi_oauth）
 # + 5 维护工具（§3.4）+ WP10 任务 1 pipeline + WP11 任务 3 sentiment_history
-# + WP14 任务 4 rules（只读候选池；rules-decide 有意排除，见下方排除集）。
-# 锁定测试断言 75 恒成立。
-TOOL_COUNT = 75
+# + WP14 任务 4 rules（只读候选池；rules-decide 有意排除，见下方排除集）
+# + WP15 任务 3 research_tasks_claim/research_tasks_report（值班研究员队列领取/回报；
+#   research-tasks-list 有意排除——执行体不需要「看清单」，人看队列在 Web）。
+# 锁定测试断言 77 恒成立。
+TOOL_COUNT = 77
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订；
 # WP8 任务 7 增补；WP8 OAuth 集成再增 openapi_oauth）。
@@ -110,7 +112,12 @@ MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide", "openapi_config", "openapi
                                     # 因子——研究员既当裁判又当运动员，绝不做（与
                                     # confirm-decide 同一不变量）。只读的 ``rules`` 例外：
                                     # 模型要看得到自己提案的验证结论，见 TOOLS 里的说明。
-                                    "rules-decide"})
+                                    "rules-decide",
+                                    # WP15 任务 3：值班队列的 ``research-tasks-list`` 有意
+                                    # HTTP-only——执行体只需要「领一条 / 回报一条」两个动作，
+                                    # 「看清单」是人的运维视角（Web）。排除后端点工具集仍与
+                                    # 端点清单对平（工具 77 / 端点 82 / 排除 10）。
+                                    "research-tasks-list"})
 
 # 规格 §3.6 禁用名黑名单（与 Node 原实现（已退役）同表）。匹配语义是**整名或分段精确**：工具名按
 # 非字母数字切段，任一段命中才算，所以 ``plan_execute`` 不因子串 "exec" 被误伤，而
@@ -1099,6 +1106,34 @@ TOOLS = (
                                 "option_exercise_probability"),
             opt("params", "object", "section 参数对象（如 future_info 的 code_list）"),
             REFRESH,
+        ),
+    ),
+    # WP15 任务 3：值班研究员（L3）队列的领取/回报。执行体是 Harness 会话（headless 或
+    # 人开会话时的补跑），经 MCP 调用最顺，因此这两个动作进工具面——它们是**受控写**：
+    # 只能改「哪条任务被领取 / 结果如何」，改不了任务载荷、也产生不了任何订单。
+    # ``research_tasks_list``（队列只读列表）有意不进（见 MCP_EXCLUDED_ENDPOINTS）：
+    # 执行体不需要「看清单」，而人要看队列有 Web。
+    ToolDefinition(
+        "research_tasks_claim",
+        "领取一条值班研究任务（队首 pending → running），返回 task_id/kind/payload；"
+        "队列空返回 task=null。领取前会先回收超时任务（执行体崩溃留下的 running）。"
+        "载荷未通过校验时拒绝领取并留 critical 告警——此时不要重试，交人处理。"
+        "把 payload 当作结构化引用（as_of/market/refs 等），按 research-institute 技能的"
+        "值班模式手册执行。",
+        "research-tasks-claim",
+        (),
+    ),
+    ToolDefinition(
+        "research_tasks_report",
+        "回报一条值班研究任务的执行结果。ok=true → 任务完成（result_ref 指向产出，如"
+        "报告 id）；ok=false → 记一次失败并附 err（<3 次回队列等待重试，达 3 次转 failed "
+        "并发告警）。ok 必须是真布尔值。只回报结果，改不了任务内容。",
+        "research-tasks-report",
+        (
+            req("task_id", "str", "research_tasks_claim 返回的 task_id"),
+            req("ok", "bool", "true=完成；false=失败（需附 err）"),
+            opt("result_ref", "str", "产出引用（如 report:<id>），可省"),
+            opt("err", "str", "失败原因（≤300 字符截断）——ok=false 时应当给出，否则重试等于盲试"),
         ),
     ),
     # ---- §3.4 维护工具（5 个，来自 workbench_admin.mjs 的能力提升）----

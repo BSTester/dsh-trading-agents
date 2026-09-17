@@ -293,8 +293,8 @@ class SentimentRouteTest(SentimentHistoryBase):
 
 class SentimentMcpToolTest(SentimentHistoryBase):
     def test_tool_surface_is_74_and_includes_sentiment_history(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 75)
-        self.assertEqual(len(mcp_tools.TOOLS), 75)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 77)
+        self.assertEqual(len(mcp_tools.TOOLS), 77)
         self.assertIn("sentiment_history", mcp_tools.TOOL_NAMES)
         self.assertEqual(mcp_tools.ENDPOINT_TOOL_ENDPOINTS["sentiment_history"],
                          "sentiment-history")

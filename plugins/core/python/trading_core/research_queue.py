@@ -142,6 +142,23 @@ def _put(conn, kind, date, market, payload):
     return {"kind": kind, "task_id": task_id, "created": not existed}
 
 
+def report(conn, home, task_id, ok, result_ref=None, err=None):
+    """回报任务结果（业务层：状态机在 store，**升级为 failed 的告警在此发**）。
+
+    与 ``reclaim`` 同一分工：``store.finish_task`` 只管状态迁移，告警需要 ``home``，
+    因此留在业务层。failed 是**结局**（attempts 到上限，不再重试），与 reclaim 的
+    超时判 failed 一样必须留痕——否则一条任务默默消失，没人知道它为什么没产出。
+    """
+    task = store.finish_task(conn, task_id, ok, result_ref=result_ref, err=err)
+    if task["status"] == "failed":
+        alerts.emit(
+            conn, home=str(home), level="warn", title="研究任务失败",
+            detail=(f"task={task['task_id']} kind={task['kind']} market={task['market']} "
+                    f"as_of={task['as_of']} attempts={task['attempts']} "
+                    f"err={task.get('err') or ''}")[:300])
+    return task
+
+
 def reclaim(conn, home, now, timeout_minutes=store.TASK_TIMEOUT_MINUTES):
     """回收超时任务；升级为 failed 的逐个发 warn 告警。返回状态机结果。
 

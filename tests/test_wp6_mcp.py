@@ -167,7 +167,7 @@ class McpProtocolSmoke(unittest.TestCase):
         init, listing = asyncio.run(runner())
         self.assertEqual(init.server_info.name, mcp_tools.SERVER_NAME)
         names = [tool.name for tool in listing.tools]
-        self.assertEqual(len(names), 75)
+        self.assertEqual(len(names), 77)
         self.assertEqual(len(names), mcp_tools.TOOL_COUNT)
         self.assertEqual(names, [definition.name for definition in mcp_tools.TOOLS])
         # 不变式 1：唯一能批准实盘操作的通道绝不进工具面（两种写法都不允许出现）

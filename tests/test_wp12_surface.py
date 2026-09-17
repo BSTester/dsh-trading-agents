@@ -123,8 +123,12 @@ class DataPlaneEndpointSurfaceTests(unittest.TestCase):
         declared = store_access.endpoints()
         for name in futu_data.DATAPLANE_ENDPOINTS:
             self.assertIn(name, declared, name)
-        # 端点清单尾部就是 WP12 段（顺序与常量一致）
-        self.assertEqual(declared[-18:-2], list(store_access.WP12_ENDPOINTS))
+        # WP12 段在端点清单里的位置（顺序与常量一致）；其后还有 WP14（规则 2）与
+        # WP15（值班队列 3）两段，因此切片右端按后两段长度收（写死索引是脆的，
+        # 这里只钉本段的存在与顺序）。
+        tail = len(store_access.WP14_ENDPOINTS) + len(store_access.WP15_ENDPOINTS)
+        self.assertEqual(declared[-len(store_access.WP12_ENDPOINTS) - tail:-tail],
+                         list(store_access.WP12_ENDPOINTS))
 
     def test_http_field_whitelist_covers_every_endpoint(self):
         for name in futu_data.DATAPLANE_ENDPOINTS:
@@ -361,8 +365,8 @@ class DataPlaneCacheTests(unittest.TestCase):
 
 class DataPlaneToolSurfaceTests(unittest.TestCase):
     def test_three_tiers_and_budget(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 75)
-        self.assertEqual(len(mcp_tools.TOOLS), 75)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 77)
+        self.assertEqual(len(mcp_tools.TOOLS), 77)
         names = set(mcp_tools.TOOL_NAMES)
         for name in DIRECT_TOOLS + AGGREGATE_TOOLS:
             self.assertIn(name, names, name)

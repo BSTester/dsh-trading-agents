@@ -130,6 +130,8 @@ WP12_ENDPOINTS = ["economic_calendar_hot", "economic_calendar_search", "info_own
                   "f10_detail", "derivative_detail"]
 # WP14 任务 4：规则候选池（rules 只读 + rules-decide 人工批准）
 WP14_ENDPOINTS = ["rules", "rules-decide"]
+# WP15 任务 3：值班研究员队列三端点（领取/回报/只读列表；与 store_access 逐项同序）。
+WP15_ENDPOINTS = ["research-tasks-claim", "research-tasks-report", "research-tasks-list"]
 WP12_TTL = {
     "economic_calendar_hot": 30 * 60_000,
     "economic_calendar_search": 30 * 60_000,
@@ -159,13 +161,15 @@ class EndpointListLockTests(unittest.TestCase):
     def test_endpoints_is_frozen_79_item_list(self):
         """``store_access.endpoints()`` ≡ 22 基础 + 7 WP7 + 8 WP8 直通 + 9 WP8 行情
         + 6 WP8 交易 + 3 WP8 推送 + 3 WP8 设置 + 2 WP10（流程页 + 自动流水线设置）
-        + 1 WP11（情绪快照）+ 16 WP12（富途数据面）+ 2 WP14（规则候选池）= 79 项，同序。"""
+        + 1 WP11（情绪快照）+ 16 WP12（富途数据面）+ 2 WP14（规则候选池）
+        + 3 WP15（值班研究员队列）= 82 项，同序。"""
         self.assertEqual(store_access.endpoints(),
                          BASE_ENDPOINTS + WP7_ENDPOINTS + FUTU_ENDPOINTS
                          + WP8_MARKET_ENDPOINTS + WP8_TRADE_ENDPOINTS
                          + WP8_PUSH_ENDPOINTS + WP8_SETTINGS_ENDPOINTS + WP10_ENDPOINTS
-                         + WP11_ENDPOINTS + WP12_ENDPOINTS + WP14_ENDPOINTS)
-        self.assertEqual(len(store_access.endpoints()), 79)
+                         + WP11_ENDPOINTS + WP12_ENDPOINTS + WP14_ENDPOINTS
+                         + WP15_ENDPOINTS)
+        self.assertEqual(len(store_access.endpoints()), 82)
         self.assertEqual(len(store_access._BASE_ENDPOINTS), 22)
         self.assertEqual(list(store_access.WP7_ENDPOINTS), WP7_ENDPOINTS)
         self.assertEqual(list(store_access.FUTU_ENDPOINTS), FUTU_ENDPOINTS)
@@ -177,9 +181,10 @@ class EndpointListLockTests(unittest.TestCase):
         self.assertEqual(list(store_access.WP11_ENDPOINTS), WP11_ENDPOINTS)
         self.assertEqual(list(store_access.WP12_ENDPOINTS), WP12_ENDPOINTS)
         self.assertEqual(list(store_access.WP14_ENDPOINTS), WP14_ENDPOINTS)
+        self.assertEqual(list(store_access.WP15_ENDPOINTS), WP15_ENDPOINTS)
         # 尾部锚点：从尾部按期望增量**逐段倒推**（不再写死负索引——增量段一变，
         # 写死的切片就要重算，是脆的；倒推与期望清单同源，改清单即自动对齐）。
-        tail = (WP14_ENDPOINTS, WP12_ENDPOINTS, WP11_ENDPOINTS, WP10_ENDPOINTS,
+        tail = (WP15_ENDPOINTS, WP14_ENDPOINTS, WP12_ENDPOINTS, WP11_ENDPOINTS, WP10_ENDPOINTS,
                 WP8_SETTINGS_ENDPOINTS, WP8_PUSH_ENDPOINTS, WP8_TRADE_ENDPOINTS,
                 WP8_MARKET_ENDPOINTS, FUTU_ENDPOINTS, WP7_ENDPOINTS,
                 ["confirmation", "confirm-decide"])
@@ -190,10 +195,10 @@ class EndpointListLockTests(unittest.TestCase):
         self.assertEqual(pos, len(BASE_ENDPOINTS) - 2)  # 尾部两段收尾（confirmation/confirm-decide 已扣）
         self.assertEqual(store_access.endpoints()[0], "snapshot")
         # 无重复；重复调用返回等值副本（调用方改动不污染后续结果）
-        self.assertEqual(len(set(store_access.endpoints())), 79)
+        self.assertEqual(len(set(store_access.endpoints())), 82)
         sample = store_access.endpoints()
         sample.append("bogus")
-        self.assertEqual(len(store_access.endpoints()), 79)
+        self.assertEqual(len(store_access.endpoints()), 82)
 
     def test_analytics_endpoints_are_declared(self):
         self.assertTrue(set(app_module.ANALYTICS_ENDPOINTS) <= set(store_access.endpoints()))

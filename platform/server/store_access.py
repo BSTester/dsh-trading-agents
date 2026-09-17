@@ -419,23 +419,37 @@ WP12_ENDPOINTS = ("economic_calendar_hot", "economic_calendar_search", "info_own
 # 同 confirm-decide——模型不得自批自己挖的因子）。
 WP14_ENDPOINTS = ("rules", "rules-decide")
 
+# WP15 任务 3：值班研究员（L3）队列三端点——**三个动作拆成三个端点**（原计划写的是一个
+# ``{action}`` 动作端点，被两条硬约束改成现在这样）：
+#   * ``research-tasks-list`` 必须 HTTP-only（人看队列在 Web；执行体不需要「看清单」动作），
+#     而端点要么整体进工具面要么整体排除（HTTP/MCP 共用同一批处理函数），半个端点排除做不到；
+#   * 工具面锁定不变式是「端点工具集 ≡ 端点清单 − 排除集」——拆开后账目仍平。
+# 缓存口径：**三端点都不进 CACHE_TTL_MS/ENDPOINT_SHAPE**（动作端点与队列状态都必须即时反映，
+# 缓存住会把「刚被领走的任务」继续显示成 pending）。
+# 工具面：claim/report **进**（L3 执行体是 Harness 会话，经 MCP 调用最顺——受控写但非交易写）；
+# ``list`` **不进**（MCP_EXCLUDED_ENDPOINTS）。
+WP15_ENDPOINTS = ("research-tasks-claim", "research-tasks-report", "research-tasks-list")
+
 
 def endpoints():
-    """服务端点清单（79 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
+    """服务端点清单（82 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
     + 9 项 WP8 OpenAPI 行情 + 6 项 WP8 OpenAPI 交易只读 + 3 项 WP8 推送订阅管理
     + 3 项 WP8 设置页（openapi_config/openapi_test/openapi_oauth）+ 2 项 WP10
     （流程页 pipeline + 自动流水线设置 auto_pipeline）+ 1 项 WP11
     （情绪快照 sentiment-history）+ 16 项 WP12 数据面 + 2 项 WP14 规则候选池
-    （rules 只读 + rules-decide 人工批准）。
+    （rules 只读 + rules-decide 人工批准）+ 3 项 WP15 值班研究员队列
+    （claim 领取 / report 回报 / list 只读列表）。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
     基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），
-    WP7/WP8/WP10/WP11/WP12/WP14 增量按交付顺序登记在各自常量里；锁定测试把 79 项整体钉死。
+    WP7/WP8/WP10/WP11/WP12/WP14/WP15 增量按交付顺序登记在各自常量里；锁定测试把 82 项
+    整体钉死。
     """
     return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS) \
         + list(WP8_MARKET_ENDPOINTS) + list(WP8_TRADE_ENDPOINTS) \
         + list(WP8_PUSH_ENDPOINTS) + list(WP8_SETTINGS_ENDPOINTS) + list(WP10_ENDPOINTS) \
-        + list(WP11_ENDPOINTS) + list(WP12_ENDPOINTS) + list(WP14_ENDPOINTS)
+        + list(WP11_ENDPOINTS) + list(WP12_ENDPOINTS) + list(WP14_ENDPOINTS) \
+        + list(WP15_ENDPOINTS)
 
 
 def read_mode(home):

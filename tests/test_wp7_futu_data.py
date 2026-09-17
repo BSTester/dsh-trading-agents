@@ -340,8 +340,8 @@ class ToolSurfaceTest(unittest.TestCase):
     """MCP 工具面 61（WP11 任务 3 起）：8 工具进面、字段同形、描述注明实时直通与 A 股受限。"""
 
     def test_tool_surface_is_74(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 75)
-        self.assertEqual(len(mcp_tools.TOOLS), 75)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 77)
+        self.assertEqual(len(mcp_tools.TOOLS), 77)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(FUTU_ENDPOINTS), names)
         self.assertNotIn("confirm_decide", names)

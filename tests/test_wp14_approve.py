@@ -15,7 +15,7 @@
   * 端点：``rules`` 只读（空载荷白名单、不进缓存、库零变化）；``rules-decide`` 动作端点
     （字段白名单挡死 spec 字段与 by、业务拒绝落 trading/invalid-operation、真的写库）；
   * 工具面：``rules`` 进面、``rules-decide`` **不进**（模型不得自批）；
-    端点 79 / 工具 75 / 端点工具集 ≡ 端点清单 − 排除集。
+    端点 82 / 工具 77 / 端点工具集 ≡ 端点清单 − 排除集。
 """
 import io
 import inspect
@@ -729,10 +729,10 @@ class RulesListFilterTest(ApproveBase):
 
 class RulesSurfaceTest(ApproveBase):
     def test_tool_and_endpoint_counts(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 75)
-        self.assertEqual(len(mcp_tools.TOOLS), 75)
-        self.assertEqual(len(store_access.endpoints()), 79)
-        self.assertEqual(len(set(store_access.endpoints())), 79)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 77)
+        self.assertEqual(len(mcp_tools.TOOLS), 77)
+        self.assertEqual(len(store_access.endpoints()), 82)
+        self.assertEqual(len(set(store_access.endpoints())), 82)
 
     def test_rules_tool_is_visible_and_decide_is_not(self):
         self.assertIn("rules", mcp_tools.TOOL_NAMES)

@@ -255,8 +255,8 @@ class AutoPipelineSurfaceTests(SettingsBase):
         self.assertIn("auto_pipeline", mcp_tools.MCP_EXCLUDED_ENDPOINTS)
         self.assertNotIn("auto_pipeline", names)
         # 本任务不新增工具（新端点是排除项）；总数随 WP11 任务 3 的 sentiment_history 增至 61
-        self.assertEqual(mcp_tools.TOOL_COUNT, 75)
-        self.assertEqual(len(mcp_tools.TOOLS), 75)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 77)
+        self.assertEqual(len(mcp_tools.TOOLS), 77)
         # 流程页（读类）仍在工具面——边界只排除「拨开关」
         self.assertIn("pipeline", names)
 

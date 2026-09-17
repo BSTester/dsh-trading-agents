@@ -17,8 +17,14 @@
 > 规格 WP9）、流程页签（`pipeline` 端点，WP10）、资讯 PIT 地基
 > （`sentiment_snapshots` 三源采集，WP11）、**富途 OpenAPI 数据面补全**（F10 26 section /
 > 筛选 / 板块 / 做空 / IPO / 经济日历 / 自选，16 端点；WP12）。
-> **当前计数：quantwb 工具面 74（69 端点工具 + 5 维护）、服务端点 77**——工具面按
-> **三档**治理（见「富途数据面」节）：直通 11 / 聚合 2 / HTTP-only 3（数据面内）。
+> **当前计数：quantwb 工具面 77（72 端点工具 + 5 维护）、服务端点 82**——工具面按
+> **三档**治理（见「富途数据面」节）：直通 11 / 聚合 2 / HTTP-only 3（数据面内），
+> 另有值班队列 `research-tasks-list` 整体排除（WP15）。
+> **WP15（部分交付，2026-09-16）：值班研究员（L3）队列面**——`research_tasks` 状态机
+> （WP15 任务 1）、`enqueue-research` 入链（任务 2）、领取/回报/列表三端点 + 工具面两条
+> （`research_tasks_claim`/`research_tasks_report`）+ 技能值班模式手册（任务 3）已落地；
+> **外部定时器与 headless 唤醒（任务 4/5）待交付**，在此之前 L3 由「会话打开时补跑」
+> 路径可用。
 > 规格见 `docs/superpowers/specs/2026-09-16-wp9-15-autopipeline-research-institute-design.md`，
 > 端点锁定表见 `docs/superpowers/plans/wp12-endpoint-lock.md`，逐端点口径见
 > `docs/TOOL-LIMITS.md` §十。
@@ -176,8 +182,10 @@ SH.000300 成分 300 只 6 页游标跑通）；
 
 ## 三层任务模型（L1 机械 / L2 即时 / L3 定时）
 
-> 状态：**L1 + L2 已实现**（WP9–WP14）；L3（值班研究员）由 **WP15 交付**，下表 L3 一栏
-> 是设计而非现状，落地时本节同步更新。
+> 状态：**L1 + L2 已实现**（WP9–WP14）；**L3（值班研究员）队列面已交付**（WP15 任务 1–3：
+> `research_tasks` 状态机 / `enqueue-research` 入链 / 领取·回报·列表三端点 / 技能值班模式），
+> **外部定时器与 headless 唤醒待交付**（WP15 任务 4–5）——在那之前 L3 走「会话打开时补跑」
+> 路径，本节表格即为现状。
 
 平台的任务按「谁触发、谁执行、有没有 LLM」分三层，**层间只经文件/API 交换数据，不相互调用**：
 
@@ -447,6 +455,9 @@ Client 用 `ctx.connection.rpc.call` 调用并继承 Connection 信任——该 
 | `rules`（WP14，TTL 0） | `{}` 或 `{status?}`（candidate/validating/passed/failed/enabled/disabled） | 规则候选池只读列表：`rule_id`/假设/因子/状态/验证报告摘要/批准人；**只读即最新，不进缓存** |
 | `rules-decide`（WP14，**进程内动作端点**） | `{rule_id*, decision*: "enable"\|"disable"}`（字段白名单只有这两项——**没有 spec 字段**，批准通道不得变成改协议通道；也**没有 `by`**，批准来源由服务端固定 `web`） | **人工批准/停用的唯一入口**（独立 Web 研究页候选池按钮）：`enable` 仅对 `passed` 放行 → `enabled` + 记录 `approved_by`/`approved_at`；`disable` 对 candidate/failed/passed/enabled 放行（终态留档）。业务拒绝 → `trading/invalid-operation`。**不进 MCP 工具面**，且**没有 CLI 子命令**——本端点在服务进程内直调 `rule_engine.decide_rule`（`compute.rules_decide`），不存在可脚本化的等价批准路径：批准入口一旦能被离线复现，「批准只在 Web」就不成立，而那正是模型自批的入口（规格 §9.4/§9.5，「无 CLI 批准入口」是有意设计） |
 | 富途数据面 16 端点（WP12） | 直通 11（`stock_screen`/`plate_list`/`plate_stock`/`short_daily_volume`/`short_interest`/`ipo_list`/`economic_calendar_hot`/`economic_calendar_search`/`info_owner_plate`/`watchlist_list`/`watchlist_groups`）+ 聚合 2（`f10_detail`/`derivative_detail`，载荷 `{code*, section*, params?}`）+ HTTP-only 3（`warrant_screen`/`modify_user_security`/`info_rehab`） | 逐端点路径/参数/错误码见 `docs/superpowers/plans/wp12-endpoint-lock.md`（2026-09-16 官方文档核对），实测口径见 `docs/TOOL-LIMITS.md` §十 |
+| `research-tasks-claim`（WP15，**进程内动作端点**，TTL 0） | `{}`（**空载荷**：领取=取队首，任何参数只可能被用来越权指定任务） | L3 值班研究员领取一条任务：先回收超时 running（`research_queue.reclaim`，幂等且便宜），再对队首载荷做**领取侧二次校验**（队列即攻击面：直改库塞进来的自由文本键在领取这一刻被拒——任务**不被领走**、状态保持 pending、留 **critical 告警**等人介入，拒绝而非猜测执行）；通过后 `store.claim_task` 置 running 并返回 `{task: {task_id, kind, as_of, market, payload, status, attempts, …}, reclaimed: {requeued, failed, kept}}`；空队列 → `{task: null}`。**进 MCP 工具面**（`research_tasks_claim`） |
+| `research-tasks-report`（WP15，**进程内动作端点**，TTL 0） | `{task_id*, ok*: bool, result_ref?, err?}`（字段白名单只有结果三件套——**没有改任务载荷的位置**；`ok` 必须是真布尔，真值判断会把 `"false"` 记成 done） | L3 回报结果：`ok=true` → `done` + `result_ref`；`ok=false` → `attempts+1`，< 3 次回 pending（保留 err 供下次领取者判断，重试不等于盲试）、达 3 次转 `failed` + **warn 告警**（`research_queue.report` 发）。未知 task_id / 非法参数 → `trading/invalid-operation`。**进 MCP 工具面**（`research_tasks_report`） |
+| `research-tasks-list`（WP15，TTL 0） | `{}` 或 `{status?, limit?}`（1..200） | 队列只读列表（按 `created_at, task_id` 稳定排序）；状态枚举与单页上限在 `compute.research_tasks_list` 校验（拼错状态报错而非静默空列表）。**有意不进 MCP 工具面**（执行体只需「领一条/回报一条」，看清单是人的运维视角）：拆成独立端点正是为了让它整体进排除集——一个动作端点无法「半个」排除（HTTP 与 MCP 共用同一批处理函数） |
 
 ### 富途数据面：三档治理与通道边界（WP12，2026-09-16）
 
