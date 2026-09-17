@@ -375,9 +375,14 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
     managed = [s for s in symbols if s in universe_set] if universe_set else None
 
     if broker_call is None:
+        # WP13 任务 3：默认通道走 channel 分派（``futu_channel: openapi`` 且凭据就绪 →
+        # REST；否则回退 mcp）——与执行链 ``daemon._default_executor`` **同一口径**。
+        # 曾经此处硬编码 ``futu_mcp.call_tool``：openapi 通道下「下单执行走 REST、
+        # 取持仓算权重走 MCP」的通道分裂由本任务实测暴露，在此收口。
+        # ``core_broker.sim_call`` 只接管模拟交易 7 个工具，live 工具（account_*/
+        # trading_*）原样交给 MCP，故 live 行为逐字不变。
         try:
-            from trading_datasource.futu_mcp import call_tool
-            broker_call = call_tool
+            broker_call = core_broker.sim_call(home)
         except Exception as error:  # noqa: BLE001 —— 导入失败即通道不可用
             return skip(f"券商通道不可用：{str(error)[:120]}", "warn", "券商通道不可用")
 

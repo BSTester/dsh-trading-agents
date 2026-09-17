@@ -435,17 +435,21 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
         alerts.emit(conn, home=home, level="info", title="对账跳过", detail=reason[:160])
         return {"ok": True, "skipped": reason}
 
+    from . import broker as core_broker
+
     if broker_call is None:
+        # WP13 任务 3：默认通道走 channel 分派（``futu_channel: openapi`` 且凭据就绪 →
+        # REST；否则回退 mcp）——与 ``planner.plan_auto`` / ``daemon._default_executor``
+        # 同一口径。曾经这里是裸 ``futu_mcp.call_tool``：openapi 通道下「下单执行走
+        # REST、对账读券商事实走 MCP」的通道分裂由本任务实测暴露，在此收口。
+        # sim_call 只接管模拟交易 7 个工具（本作业 mode=sim），live 不在本作业范围。
         try:
-            from trading_datasource.futu_mcp import call_tool
-            broker_call = call_tool
+            broker_call = core_broker.sim_call(home)
         except Exception as error:  # noqa: BLE001 —— 导入失败即通道不可用
             reason = f"券商通道不可用：{str(error)[:120]}"
             alerts.emit(conn, home=home, level="warn", title="对账通道不可用",
                         detail=reason[:160])
             return {"ok": False, "error": reason}
-
-    from . import broker as core_broker
 
     try:
         orders_raw, broker_positions = _sim_broker_state(broker_call, today)
