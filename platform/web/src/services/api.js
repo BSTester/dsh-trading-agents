@@ -18,6 +18,9 @@ const TTL_MS = {
   // WP11 任务 3：情绪快照历史/摘要同为按日采集，对齐服务端 5 分钟缓存
   // （caches.CACHE_TTL_MS["sentiment-history"]）。
   "sentiment-history": 300_000,
+  // WP14 任务 4：规则候选池读/批准与服务端同口径实时直通（不进 CACHE_TTL_MS）——
+  // 批准状态刚变过就必须立刻反映，客户端缓存会把「刚停用的规则」继续显示成已启用。
+  rules: 0, "rules-decide": 0,
   // WP8 富途实时直通 + OpenAPI 交易只读 + 推送状态：服务端一律 TTL 0（实时直通，
   // futu_data.py 文件头与 store_access.WP8_*_ENDPOINTS 同口径），客户端同样不缓存。
   rt_quote: 0, rt_order_book: 0,

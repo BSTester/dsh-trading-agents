@@ -1022,8 +1022,8 @@ class ToolSurfaceTest(unittest.TestCase):
     """工具面 50 锁定（WP8 任务 3 起 56）+ 9 新工具契约。"""
 
     def test_tool_surface_is_56(self):
-        self.assertEqual(mcp_tools.TOOL_COUNT, 74)
-        self.assertEqual(len(mcp_tools.TOOLS), 74)
+        self.assertEqual(mcp_tools.TOOL_COUNT, 75)
+        self.assertEqual(len(mcp_tools.TOOLS), 75)
         names = {tool.name for tool in mcp_tools.TOOLS}
         self.assertLessEqual(set(WP8_MARKET_ENDPOINTS), names)
         self.assertNotIn("confirm-decide", names)
@@ -1084,13 +1084,13 @@ class ToolSurfaceTest(unittest.TestCase):
 
     def test_endpoint_registry_is_77(self):
         endpoints = store_access.endpoints()
-        self.assertEqual(len(endpoints), 77)
+        self.assertEqual(len(endpoints), 79)
         self.assertEqual(tuple(store_access.WP8_MARKET_ENDPOINTS), WP8_MARKET_ENDPOINTS)
         # WP8 任务 3 起尾部再追加 6 个 OpenAPI 交易只读端点、任务 6 追加 3 个推送端点、
         # 任务 7 追加设置页端点（openapi_config/openapi_test；OAuth 集成再增 openapi_oauth，
         # 行情 9 项落在它们之前）
-        self.assertEqual(endpoints[-40:-31], list(WP8_MARKET_ENDPOINTS))
-        self.assertEqual(len(set(endpoints)), 77)
+        self.assertEqual(endpoints[-42:-33], list(WP8_MARKET_ENDPOINTS))
+        self.assertEqual(len(set(endpoints)), 79)
 
 
 class RealChannelComparisonTest(unittest.TestCase):

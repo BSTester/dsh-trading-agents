@@ -235,6 +235,35 @@ def recent_trading_days(conn, market, today, window=1):
     return list(reversed(days[-window:]))
 
 
+def _resolve_strategy(conn, name):
+    """按名字取策略实例，返回 ``(instance | None, error | None)``。
+
+    两条来源，**顺序即优先级**：
+
+    1. ``strategies.REGISTRY``——内置策略（``watchlist_rsi`` 等）与已显式注册的规则；
+    2. **规则表里的 ``enabled`` 规则**（WP14 任务 4）：规则提案不预注册，改由本函数在
+       计划时按 DB 状态加载——这就是「人工批准 = 启用」的机械落地：
+       ``candidate``/``passed``/``failed``/``disabled`` 的规则一律**不得被消费**，
+       由第二条分支如实报「规则未启用」；只有 ``enabled``（经 ``decide_rule`` 记录
+       批准人）才注册进注册表。
+
+    规则加载失败（spec 被改坏/因子被摘）按 fail-closed 返回 error，不做静默回退。
+    """
+    from . import strategies  # 模块级 import 在 plan_auto 内是惰性的，这里自带一份
+    instance = strategies.REGISTRY.get(name)
+    if instance is not None:
+        return instance, None
+    row = store.find_rule(conn, name)
+    if row is None:
+        return None, None  # 不是规则名：交由调用方按「策略未注册」处理
+    if row["status"] != "enabled":
+        return None, f"规则未启用：{name}（当前 {row['status']}，需人工批准后启用）"
+    try:
+        return strategies.register_rule(row["spec"]), None
+    except ValueError as error:
+        return None, f"规则加载失败：{name}（{str(error)[:100]}）"
+
+
 def plan_auto(conn, home, market, today=None, broker_call=None):
     """build_plan 作业体（规格 §4.2）：数据就绪 → 策略权重 → 冻结 auto 计划。
 
@@ -329,8 +358,10 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
         return skip(f"数据未就绪（应有最后交易日 {data_date}）：{','.join(stale)}",
                     "warn", "数据未就绪")
 
-    strategy = strategies.REGISTRY.get(entry["strategy"])
+    strategy, error = _resolve_strategy(conn, entry["strategy"])
     if strategy is None:
+        if error:
+            return skip(error, "info", "规则未启用")
         return skip(f"策略未注册：{entry['strategy']}", "warn", "策略未注册")
 
     # 过期语义：先作废跨日的 auto 计划，再生成当日计划（只动 auto，手工计划不碰）

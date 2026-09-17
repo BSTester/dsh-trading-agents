@@ -81,6 +81,8 @@ _ALERT_STATUS = {
     "关注池为空": ("build_plan", "skipped"),
     "数据未就绪": ("build_plan", "skipped"),
     "策略未注册": ("build_plan", "skipped"),
+    # planner._resolve_strategy（WP14 任务 4）：规则存在但未人工批准 → 不消费
+    "规则未启用": ("build_plan", "skipped"),
     "策略权重失败": ("build_plan", "failed"),
     "策略 universe 失败": ("build_plan", "failed"),
     "券商通道不可用": ("build_plan", "failed"),

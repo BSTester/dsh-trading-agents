@@ -428,6 +428,18 @@ def get_rule(conn, rule_id):
     return _rule_row(row)
 
 
+def find_rule(conn, rule_id):
+    """按 id 查规则，**不存在返回 None**（非抛错口径）。
+
+    与 ``get_rule`` 的分工：``get_rule`` 用于「按 id 操作」（缺失即错误，抛 ValueError），
+    ``find_rule`` 用于**分流判定**——「规则不存在 / 存在但未启用 / 已通过」三种情形
+    调用方要区别对待，不该用异常做流程控制（WP14 任务 4 的 plan_auto 加载器与
+    rules-validate 的提案入口都属这一口径）。
+    """
+    row = conn.execute("SELECT * FROM rules WHERE rule_id=?", (rule_id,)).fetchone()
+    return None if row is None else _rule_row(row)
+
+
 def get_rules(conn, status=None):
     """规则列表（可按状态过滤），按创建时间与 rule_id 稳定排序。"""
     sql = "SELECT * FROM rules"

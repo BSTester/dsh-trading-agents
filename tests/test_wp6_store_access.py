@@ -278,24 +278,24 @@ class SnapshotTest(StoreAccessBase):
                     + len(sa.WP8_MARKET_ENDPOINTS) + len(sa.WP8_TRADE_ENDPOINTS)
                     + len(sa.WP8_PUSH_ENDPOINTS) + len(sa.WP8_SETTINGS_ENDPOINTS)
                     + len(sa.WP10_ENDPOINTS) + len(sa.WP11_ENDPOINTS)
-                    + len(sa.WP12_ENDPOINTS))
+                    + len(sa.WP12_ENDPOINTS) + len(sa.WP14_ENDPOINTS))
         self.assertEqual(len(endpoints), expected)
-        self.assertEqual(expected, 77)
+        self.assertEqual(expected, 79)
         self.assertEqual(endpoints[0], "snapshot")
-        self.assertEqual(endpoints[-55], "factors-history")
-        self.assertEqual(endpoints[-54:-48],
+        self.assertEqual(endpoints[-57], "factors-history")
+        self.assertEqual(endpoints[-56:-50],
                          ["trade_place", "trade_modify", "trade_cancel",
                           "account_positions", "account_orders", "account_funds"])
-        self.assertEqual(endpoints[-48:-40], list(sa.FUTU_ENDPOINTS))
-        self.assertEqual(endpoints[-40:-31], list(sa.WP8_MARKET_ENDPOINTS))
-        self.assertEqual(endpoints[-31:-25], list(sa.WP8_TRADE_ENDPOINTS))
-        self.assertEqual(endpoints[-25:-22], list(sa.WP8_PUSH_ENDPOINTS))
-        self.assertEqual(endpoints[-22:-19], list(sa.WP8_SETTINGS_ENDPOINTS))
-        self.assertEqual(endpoints[-19:-17], list(sa.WP10_ENDPOINTS))
-        self.assertEqual(endpoints[-17:-16], list(sa.WP11_ENDPOINTS))
-        self.assertEqual(endpoints[-16:], list(sa.WP12_ENDPOINTS))
+        self.assertEqual(endpoints[-50:-42], list(sa.FUTU_ENDPOINTS))
+        self.assertEqual(endpoints[-42:-33], list(sa.WP8_MARKET_ENDPOINTS))
+        self.assertEqual(endpoints[-33:-27], list(sa.WP8_TRADE_ENDPOINTS))
+        self.assertEqual(endpoints[-27:-24], list(sa.WP8_PUSH_ENDPOINTS))
+        self.assertEqual(endpoints[-24:-21], list(sa.WP8_SETTINGS_ENDPOINTS))
+        self.assertEqual(endpoints[-21:-19], list(sa.WP10_ENDPOINTS))
+        self.assertEqual(endpoints[-19:-18], list(sa.WP11_ENDPOINTS))
+        self.assertEqual(endpoints[-18:-2], list(sa.WP12_ENDPOINTS))
         # 业务确认两端点必须在白名单里（HTTP 面据此注册路由）
-        self.assertEqual(endpoints[-57:-55], ["confirmation", "confirm-decide"])
+        self.assertEqual(endpoints[-59:-57], ["confirmation", "confirm-decide"])
         self.assertEqual(len(set(endpoints)), expected)
         self.assertEqual(endpoints, sa.endpoints())
         # 缓存返回副本：调用方改动不会污染下一次
@@ -347,7 +347,7 @@ class SnapshotTest(StoreAccessBase):
                          + len(sa.WP8_MARKET_ENDPOINTS) + len(sa.WP8_TRADE_ENDPOINTS)
                          + len(sa.WP8_PUSH_ENDPOINTS) + len(sa.WP8_SETTINGS_ENDPOINTS)
                          + len(sa.WP10_ENDPOINTS) + len(sa.WP11_ENDPOINTS)
-                         + len(sa.WP12_ENDPOINTS))
+                         + len(sa.WP12_ENDPOINTS) + len(sa.WP14_ENDPOINTS))
         self.assertIsNone(snap["confirmation"])
         self.assertFalse(sa.store_file(self.home).exists())  # 只读：连空 store 都不落盘
 

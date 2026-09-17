@@ -408,22 +408,34 @@ WP12_ENDPOINTS = ("economic_calendar_hot", "economic_calendar_search", "info_own
                   "watchlist_list", "watchlist_groups", "modify_user_security",
                   "f10_detail", "derivative_detail")
 
+# WP14 任务 4：规则候选池端点（2 个；取数与写入在 trading_core cli 的 rules-list/
+# rules-decide，经 app.py 的 core 桥——与调度侧同一实现，服务进程不直连 rules 表）。
+#   * ``rules``        只读候选池列表（rule_id/假设/因子/状态/验证报告/批准人）；
+#   * ``rules-decide`` 动作端点：人工批准（只在 passed 放行）与停用。
+# 缓存口径：**两端点都不进 CACHE_TTL_MS/ENDPOINT_SHAPE**（与 auto_pipeline 同口径）——
+# 批准状态必须即时反映，缓存住会把「刚停用的规则」继续显示成 enabled。
+# 工具面：``rules`` 是只读观测（模型据此看自己提案有没有过门），**进** MCP 工具面
+# （同 ``confirmation`` 只读先例）；``rules-decide`` **不进**（审批权只在 Web，
+# 同 confirm-decide——模型不得自批自己挖的因子）。
+WP14_ENDPOINTS = ("rules", "rules-decide")
+
 
 def endpoints():
-    """服务端点清单（77 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
+    """服务端点清单（79 项）：22 项 legacy 基础清单 + 7 项 WP7 + 8 项 WP8 富途直通
     + 9 项 WP8 OpenAPI 行情 + 6 项 WP8 OpenAPI 交易只读 + 3 项 WP8 推送订阅管理
     + 3 项 WP8 设置页（openapi_config/openapi_test/openapi_oauth）+ 2 项 WP10
     （流程页 pipeline + 自动流水线设置 auto_pipeline）+ 1 项 WP11
-    （情绪快照 sentiment-history）+ 16 项 WP12 数据面。
+    （情绪快照 sentiment-history）+ 16 项 WP12 数据面 + 2 项 WP14 规则候选池
+    （rules 只读 + rules-decide 人工批准）。
 
     WP7 起清单为**服务自有**（legacy 面板已退役，原「解析 endpoints.js 文本」的实现删除）：
-    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），WP7/WP8/WP10/WP11/WP12
-    增量按交付顺序登记在各自常量里；锁定测试把 77 项整体钉死。
+    基础 22 项冻结在 ``_BASE_ENDPOINTS``（与已删 JS 文件的原序一致），
+    WP7/WP8/WP10/WP11/WP12/WP14 增量按交付顺序登记在各自常量里；锁定测试把 79 项整体钉死。
     """
     return list(_BASE_ENDPOINTS) + list(WP7_ENDPOINTS) + list(FUTU_ENDPOINTS) \
         + list(WP8_MARKET_ENDPOINTS) + list(WP8_TRADE_ENDPOINTS) \
         + list(WP8_PUSH_ENDPOINTS) + list(WP8_SETTINGS_ENDPOINTS) + list(WP10_ENDPOINTS) \
-        + list(WP11_ENDPOINTS) + list(WP12_ENDPOINTS)
+        + list(WP11_ENDPOINTS) + list(WP12_ENDPOINTS) + list(WP14_ENDPOINTS)
 
 
 def read_mode(home):

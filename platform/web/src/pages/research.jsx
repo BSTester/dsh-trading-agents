@@ -18,13 +18,19 @@
 // 字段名与枚举依据、空结果语义、通道不可用的下一步指引全部在 services/f10.js 文件头登记，
 // 映射逻辑是可直测纯函数（tests/f10.test.mjs），本文件只做接线与渲染。
 import React from "react";
-import { Alert, Button, Card, Input, Space, Table, Tag, Typography } from "antd";
+import { Alert, Button, Card, Input, Popconfirm, Space, Table, Tag, Typography,
+         message } from "antd";
+import { callApi } from "../services/api.js";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { Markdown } from "../lib/markdown.jsx";
 import { RawCollapse } from "../lib/raw-collapse.jsx";
 import {
   analystConsensusSummary, dataplaneHint, institutionalSummary, ratingSummarySummary,
 } from "../services/f10.js";
+import {
+  decideDisabledReason, ruleRows, ruleRowsForTable, statusColor, statusLabel,
+  validationSummary,
+} from "../services/rules.js";
 
 // status 枚举值全部来自 store.js 字面量；中文为展示标签（依据 store.js 各自注释语义）。
 const RUN_STATUS = {
@@ -195,6 +201,94 @@ function DeepData() {
     </Card>);
 }
 
+/**
+ * 规则候选池（WP14 任务 4）：研究院产出的规则提案 + 验证结论 + **人工批准**。
+ *
+ * 数据来自只读端点 ``rules``；批准/停用调 ``rules-decide``（服务端唯一放行条件是
+ * ``passed → enabled``，页面侧按钮禁用只是不把用户引向必然失败的操作，服务端仍独立复核）。
+ * 这里只做接线与渲染：状态标签/摘要/可用性判定在 services/rules.js（可直测纯函数）。
+ */
+function RulePool() {
+  const query = useEndpoint("rules", {}, []);
+  const [busy, setBusy] = React.useState(false);
+  const decide = async (rule, decision) => {
+    setBusy(true);
+    try {
+      await callApi("rules-decide", { rule_id: rule.rule_id, decision });
+      message.success(decision === "enable" ? "已启用该规则" : "已停用该规则");
+      query.refresh();
+    } catch (error) {
+      message.error(`操作失败：${error.message || error}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+  const rules = ruleRowsForTable(query.value?.rules);
+  return (
+    <Card type="inner" title="规则候选池"
+      extra={(
+        <Space>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            验证通过后仍需在此批准才会进入自动计划
+          </Typography.Text>
+          <Button size="small" onClick={query.refresh}>刷新</Button>
+        </Space>)}>
+      {query.error && (
+        <Alert type="error" showIcon message={`候选池读取失败：${query.error}`} />)}
+      <Table size="small"
+        rowKey="key"
+        dataSource={rules}
+        pagination={{ pageSize: 5, hideOnSinglePage: true, showSizeChanger: false }}
+        locale={{ emptyText: query.loading
+          ? "候选池加载中…"
+          : "暂无规则提案；研究院产出提案并跑 rules-validate 后会显示在这里。" }}
+        expandable={{
+          expandedRowRender: (rule) => (
+            <Space direction="vertical" size={2}>
+              {ruleRows(rule).map((row) => (
+                <Space key={row.label} size={8} align="start">
+                  <Typography.Text type="secondary"
+                    style={{ minWidth: 120, display: "inline-block" }}>
+                    {row.label}
+                  </Typography.Text>
+                  <Typography.Text>{row.value}</Typography.Text>
+                </Space>))}
+            </Space>),
+        }}
+        columns={[
+          { title: "规则", key: "rule_id", render: (_f, rule) => rule.rule_id ?? "—" },
+          { title: "状态", key: "status",
+            render: (_f, rule) => (
+              <Tag color={statusColor(rule.status)}>{statusLabel(rule.status)}</Tag>) },
+          { title: "验证结论", key: "validation",
+            render: (_f, rule) => (
+              <Typography.Text style={{ fontSize: 12 }}>
+                {validationSummary(rule)}
+              </Typography.Text>) },
+          { title: "操作", key: "decide", width: 200,
+            render: (_f, rule) => {
+              const enableBlocked = decideDisabledReason(rule, "enable");
+              const disableBlocked = decideDisabledReason(rule, "disable");
+              return (
+                <Space>
+                  <Popconfirm title={`批准启用「${rule.rule_id}」？启用后自动计划将采用该规则。`}
+                    okText="批准启用" cancelText="取消" disabled={busy || !!enableBlocked}
+                    onConfirm={() => decide(rule, "enable")}>
+                    <Button size="small" type="primary" disabled={busy || !!enableBlocked}
+                      title={enableBlocked ?? undefined}>批准启用</Button>
+                  </Popconfirm>
+                  <Popconfirm title={`停用「${rule.rule_id}」？停用后不再被自动计划采用。`}
+                    okText="停用" cancelText="取消" disabled={busy || !!disableBlocked}
+                    onConfirm={() => decide(rule, "disable")}>
+                    <Button size="small" disabled={busy || !!disableBlocked}
+                      title={disableBlocked ?? undefined}>停用</Button>
+                  </Popconfirm>
+                </Space>);
+            } },
+        ]} />
+    </Card>);
+}
+
 export default function ResearchPage() {
   const snapshot = useSnapshotPoll();
   const reports = snapshot.value?.reports ?? [];
@@ -237,6 +331,7 @@ export default function ResearchPage() {
                       <Button size="small" onClick={() => setSelectedId(row.id)}>查看</Button>) },
                 ]} />
             </Card>
+            <RulePool />
             <DeepData />
           </>
         )}

@@ -258,6 +258,25 @@ def _ic_factor_weights(conn, factor_names, horizon=IC_HORIZON_DAYS, window=IC_WI
     return {name: value / total for name, value in ics.items()}
 
 
+def resolve_universe(spec, home=None, market=None):
+    """规则 ``universe`` → 标的列表（**公开入口**，解释器与验证门共用）。
+
+    ``RuleStrategy.universe`` 与 ``rules-validate`` 的样本解析都走这里，避免
+    池键/市场片段的解析与 watchlist 读取出现第二份实现。``market`` 给定时校验与
+    spec 的市场片段一致（fail-closed，见 ``RuleStrategy.universe`` 的说明）。
+    """
+    from . import watchlist as watchlist_mod
+    pool, spec_market = _parse_universe(spec["universe"])
+    if market is not None and spec_market is not None and str(market).upper() != spec_market:
+        raise ValueError(
+            f"规则 universe 市场与作业市场不一致：{spec_market} vs {str(market).upper()}"
+            "（fail-closed，不拿错市场的标的下单）")
+    target_market = spec_market if market is None else str(market).upper()
+    return watchlist_mod.watchlist_symbols(
+        home, key=pool, market=target_market,
+        strict=pool != watchlist_mod.DEFAULT_POOL_KEY)
+
+
 class RuleStrategy:
     """声明式规则的 Strategy 协议适配器（规格 §9.2/§9.3）。
 
@@ -292,16 +311,7 @@ class RuleStrategy:
         return f"rule:{self.id}:last_weights"
 
     def universe(self, conn, as_of, home=None, market=None):
-        from . import watchlist as watchlist_mod
-        pool, spec_market = _parse_universe(self.spec["universe"])
-        if market is not None and spec_market is not None and str(market).upper() != spec_market:
-            raise ValueError(
-                f"规则 universe 市场与作业市场不一致：{spec_market} vs {str(market).upper()}"
-                "（fail-closed，不拿错市场的标的下单）")
-        target_market = spec_market if market is None else str(market).upper()
-        return watchlist_mod.watchlist_symbols(
-            home, key=pool, market=target_market,
-            strict=pool != watchlist_mod.DEFAULT_POOL_KEY)
+        return resolve_universe(self.spec, home=home, market=market)
 
     def target_weights(self, conn, as_of, home=None, market=None):
         from . import strategies as strategies_mod

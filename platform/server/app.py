@@ -107,6 +107,15 @@ EMPTY_PAYLOAD_ENDPOINTS = ("snapshot", "audit", "confirmation", "plan", "schedul
 # 确认通道不能变成下单通道。这也是唯一能批准实盘操作的入口（模型侧不进 MCP 工具面）。
 CONFIRM_DECIDE_FIELDS = ("id", "decision")
 
+# WP14 任务 4：rules-decide 的字段白名单——只有「哪条规则」与「批准还是停用」，
+# **没有 spec/因子/权重字段**：审批通道不得变成改规则的通道（改规则只能重新提案走
+# rules-validate）。与 confirm-decide 同构：动作端点、不进缓存、不进 MCP 工具面。
+RULES_DECIDE_FIELDS = ("rule_id", "decision")
+
+# rules 只读端点的字段白名单：只有可选的 status 过滤（取值域由 CLI/rule_engine 校验，
+# 服务端不复制一份枚举——非法值经 core 桥的 ComputeError 带原因回到调用方）。
+RULES_FIELDS = ("status",)
+
 # rpc.js:69-70 的动作 → 指令类型映射（规格 §8.2 的 5 种里服务面可达的 4 种）
 EXECUTE_ACTIONS = {
     "execute": "execute_plan",
@@ -295,6 +304,10 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
         # WP11 任务 3：情绪快照历史/摘要同走 core 桥（symbol/limit 透传，compute 侧校验）
         core["sentiment-history"] = lambda symbol=None, limit=30: compute.sentiment_history(
             symbol, limit)
+        # WP14 任务 4：规则候选池读/批准同走 core 桥（读取与状态流转的**唯一实现**在
+        # trading_core：rule_engine 状态机 + rules 表；服务进程不直连该表）。
+        core["rules"] = lambda status=None: compute.rules_list(status)
+        core["rules-decide"] = lambda rule_id, decision: compute.rules_decide(rule_id, decision)
     if trade is None:
         trade = trading.TradeGate(home)
     if futu is None:
@@ -331,6 +344,32 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                 _check_fields(endpoint, payload, CONFIRM_DECIDE_FIELDS)
                 return {"ok": True, "value": store_access.decide_confirmation(
                     home, confirmation_id=payload.get("id"), decision=payload.get("decision"))}
+            if endpoint == "rules":
+                # WP14 任务 4：规则候选池只读列表（可选 status 过滤）。**不进缓存**：
+                # 批准状态刚变过就必须立刻反映（与 auto_pipeline/openapi_config 同口径）。
+                _check_fields(endpoint, payload, RULES_FIELDS)
+                provider = core.get("rules")
+                if provider is None:
+                    raise WorkbenchError("Core bridge unavailable")
+                try:
+                    value = provider(payload.get("status"))
+                except compute.ComputeError as error:
+                    raise WorkbenchError(str(error)) from error
+                return {"ok": True, "value": value}
+            if endpoint == "rules-decide":
+                # WP14 任务 4：规则上岗的唯一通道（passed → enabled 只在 rule_engine 放行）。
+                # 载荷白名单挡死 spec 字段——审批不是改规则。业务拒绝（未过门就启用/规则
+                # 不存在）以 ``trading/invalid-operation`` 如实回，绝不当成功。
+                _check_fields(endpoint, payload, RULES_DECIDE_FIELDS)
+                provider = core.get("rules-decide")
+                if provider is None:
+                    raise WorkbenchError("Core bridge unavailable")
+                try:
+                    value = provider(payload.get("rule_id"), payload.get("decision"))
+                except compute.ComputeError as error:
+                    return {"ok": False, "error": {"code": "trading/invalid-operation",
+                                                   "message": str(error), "details": {}}}
+                return {"ok": True, "value": value}
             if endpoint in ANALYTICS_ENDPOINTS:
                 _check_fields(endpoint, payload, ANALYTICS_ENDPOINTS[endpoint])
                 provider = analytics.get(endpoint)

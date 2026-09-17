@@ -83,9 +83,10 @@ SERVER_VERSION = "0.1.0"
 # 工具 + WP8 富途实时直通 8 个 + WP8 任务 2 的 9 个行情工具 + WP8 任务 3 的 6 个
 # OpenAPI 交易只读工具 + WP8 任务 6 的 3 个推送订阅管理工具；58 端点扣除有意排除的
 # confirm-decide 与设置页 3 端点 openapi_config/openapi_test/openapi_oauth）
-# + 5 维护工具（§3.4）+ WP10 任务 1 pipeline + WP11 任务 3 sentiment_history。
-# 锁定测试断言 61 恒成立。
-TOOL_COUNT = 74
+# + 5 维护工具（§3.4）+ WP10 任务 1 pipeline + WP11 任务 3 sentiment_history
+# + WP14 任务 4 rules（只读候选池；rules-decide 有意排除，见下方排除集）。
+# 锁定测试断言 75 恒成立。
+TOOL_COUNT = 75
 
 # 有意排除在工具面之外的 HTTP 端点（规格 §5.1 A7，2026-09-15 业务确认修订；
 # WP8 任务 7 增补；WP8 OAuth 集成再增 openapi_oauth）。
@@ -103,7 +104,13 @@ MCP_EXCLUDED_ENDPOINTS = frozenset({"confirm-decide", "openapi_config", "openapi
                                     # warrant_screen（窝轮数据保持 API 面完整，平台不策略化）、
                                     # modify_user_security（**写用户富途侧自选**，仅 Web 用户
                                     # 操作可达）、info_rehab（复权因子，同步作业内部取数用）。
-                                    "warrant_screen", "modify_user_security", "info_rehab"})
+                                    "warrant_screen", "modify_user_security", "info_rehab",
+                                    # WP14 任务 4：``rules-decide`` 是「规则上岗」的批准通道
+                                    # （passed → enabled）。做成工具就等于让模型批准自己挖的
+                                    # 因子——研究员既当裁判又当运动员，绝不做（与
+                                    # confirm-decide 同一不变量）。只读的 ``rules`` 例外：
+                                    # 模型要看得到自己提案的验证结论，见 TOOLS 里的说明。
+                                    "rules-decide"})
 
 # 规格 §3.6 禁用名黑名单（与 Node 原实现（已退役）同表）。匹配语义是**整名或分段精确**：工具名按
 # 非字母数字切段，任一段命中才算，所以 ``plan_execute`` 不因子串 "exec" 被误伤，而
@@ -165,6 +172,9 @@ _TYPES = {
     "int_list": list[int],
     "number_list": list[float],
     "mode": Literal["sim", "live"],
+    # WP14 任务 4：规则状态（取值与 rule_engine.RULE_STATUSES 逐项一致，锁定测试比对）
+    "rule_status": Literal["candidate", "validating", "passed", "failed", "enabled",
+                           "disabled"],
     "period": Literal["1m", "5m", "15m", "30m", "60m", "1d"],
     "action": Literal["execute", "cancel", "kill", "unkill"],
     # WP7 任务 3：交易方向（broker.py place 的 side 口径，1=BUY 2=SELL 由闸门映射）
@@ -412,6 +422,19 @@ TOOLS = (
         "另注意跨进程边界：该列表只看得到本服务进程发起的确认，Harness 会话内的确认请在 Harness 面板作答。",
         "confirmation",
         (REFRESH,),
+    ),
+    ToolDefinition(
+        "rules",
+        "读取规则候选池：每条含 rule_id、研究假设、引用的因子、universe、top_n、状态"
+        "（candidate/validating/passed/failed/enabled/disabled）、最近一次验证报告"
+        "（IC t 检验/分层单调/半衰期/换手）与批准人。**只读**：批准与停用只能由用户在独立 Web "
+        "上点击（rules-decide 不在工具面内），模型不得自批自己挖的因子——本工具只用于查看"
+        "提案是否过门、被拒原因是什么。可按状态过滤。",
+        "rules",
+        (
+            opt("status", "rule_status", "按状态过滤（缺省全部）"),
+            REFRESH,
+        ),
     ),
     ToolDefinition(
         "plan_execute",

@@ -58,6 +58,8 @@ ENDPOINTS = [
     *store_access.WP11_ENDPOINTS,
     # WP12 任务 4：富途数据面 16 端点，与 store_access.WP12_ENDPOINTS 同步
     *store_access.WP12_ENDPOINTS,
+    # WP14 任务 4：规则候选池（rules 只读 + rules-decide 人工批准），同步
+    *store_access.WP14_ENDPOINTS,
 ]
 
 
@@ -180,7 +182,8 @@ class ContractTests(Base):
                         + len(store_access.WP8_SETTINGS_ENDPOINTS)
                         + len(store_access.WP10_ENDPOINTS)
                         + len(store_access.WP11_ENDPOINTS)
-                        + len(store_access.WP12_ENDPOINTS))
+                        + len(store_access.WP12_ENDPOINTS)
+                        + len(store_access.WP14_ENDPOINTS))
         self.assertEqual(body["value"]["mode"], "sim")
         self.assertIn("generated_at", body["value"])
 
@@ -743,7 +746,8 @@ class ConfirmationRoutesTests(Base):
                         + len(store_access.WP8_SETTINGS_ENDPOINTS)
                         + len(store_access.WP10_ENDPOINTS)
                         + len(store_access.WP11_ENDPOINTS)
-                        + len(store_access.WP12_ENDPOINTS))
+                        + len(store_access.WP12_ENDPOINTS)
+                        + len(store_access.WP14_ENDPOINTS))
         self.assertIn("confirmation", store_access.endpoints())
         self.assertIn("confirm-decide", store_access.endpoints())
         declared = self.post(self.client, "snapshot").json()["value"]["endpoints"]
@@ -896,7 +900,7 @@ class StaticTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": f"http://127.0.0.1:{port}",
                                 "mcp": f"http://127.0.0.1:{port}/mcp",
-                                "tools": 74, "auth": "loopback-only"})
+                                "tools": 75, "auth": "loopback-only"})
 
     def test_bad_encoding_is_400(self):
         dist = self.make_dist()
@@ -1462,7 +1466,7 @@ class RunEntryTests(Base):
         self.assertEqual(line, {"ok": True, "service": "quant-platform",
                                 "url": "http://127.0.0.1:41234",
                                 "mcp": "http://127.0.0.1:41234/mcp",
-                                "tools": 74, "auth": "loopback-only"})
+                                "tools": 75, "auth": "loopback-only"})
         line = run_module.ready_line(("127.0.0.1", 8397),
                                      {"port": 8397, "host": "127.0.0.1", "token": "t"})
         self.assertEqual(line["auth"], "token")

@@ -444,6 +444,45 @@ def sentiment_history(symbol=None, limit=30, timeout=SNAPSHOT_TIMEOUT, runner=No
                         completed.returncode, completed.stderr)
 
 
+def rules_list(status=None, timeout=SNAPSHOT_TIMEOUT, runner=None):
+    """WP14 任务 4：``python -m trading_core rules-list [--status S]``（候选池只读列表）。
+
+    与 ``factors_history`` 同一出口（parse_stdout：CLI 的 ``{ok:false,error}`` 信封
+    → ComputeError）。**app 侧不走 caches.cached**：候选池状态会随人工批准即时变化，
+    缓存住的「待批准」会让界面拿旧结论（与 auto_pipeline/openapi_config 同一口径）。
+    ``status`` 的状态枚举校验在 CLI（``rule_engine.RULE_STATUSES`` 的唯一事实源），
+    本层只做参数拼装——非法状态经 CLI 失败信封 → ComputeError，调用方如实回错。
+    """
+    command = [PYTHON, "-m", "trading_core", "rules-list"]
+    if status:
+        command += ["--status", str(status)]
+    spawn = _spawn if runner is None else runner
+    completed = spawn(command, timeout)
+    return parse_stdout("trading_core rules-list", completed.stdout,
+                        completed.returncode, completed.stderr)
+
+
+def rules_decide(rule_id, decision, by="web", timeout=SNAPSHOT_TIMEOUT, runner=None):
+    """WP14 任务 4：``python -m trading_core rules-decide --rule-id X --decision Y``。
+
+    写路径（enabled/disabled 落库）**经 CLI 子进程**——与读侧同一实现（``rule_engine``
+    的状态机是唯一入口），服务进程不直连 rules 表。参数在**起子进程前**校验：
+    非法 decision/空 rule_id 走 ComputeError，零进程开销。
+    CLI 的业务拒绝（未通过就启用等）以 ``{ok:false,error}`` 信封返回 →
+    parse_stdout 抛 ComputeError，app 侧落成 ``trading/invalid-operation``（携带原因）。
+    """
+    if not isinstance(rule_id, str) or not rule_id.strip():
+        raise ComputeError("Invalid rule_id")
+    if decision not in ("enable", "disable"):
+        raise ComputeError(f"Invalid decision {decision!r} (enable/disable)")
+    command = [PYTHON, "-m", "trading_core", "rules-decide",
+               "--rule-id", rule_id, "--decision", decision, "--by", str(by)]
+    spawn = _spawn if runner is None else runner
+    completed = spawn(command, timeout)
+    return parse_stdout("trading_core rules-decide", completed.stdout,
+                        completed.returncode, completed.stderr)
+
+
 def command_home(home):
     """指令目录根：``$DSH_HOME``（pycore.js:9-11 pythonHome）。"""
     return Path(home if home is not None else os.environ.get("DSH_HOME") or Path.home() / ".dsh")

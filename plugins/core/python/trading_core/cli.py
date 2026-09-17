@@ -185,6 +185,38 @@ def build_parser():
     s.add_argument("--symbol", default=None, help="标的代码；缺省返回最近一日采集摘要")
     s.add_argument("--limit", type=int, default=30, help="记录条数 1..120（默认 30）")
     _add_db(s)
+
+    # ── WP14 任务 4：规则候选池（读/提案验证/人工批准）──
+    s = sub.add_parser("rules-list", help="规则候选池列表（只读，可按状态过滤）")
+    s.add_argument("--status", default=None,
+                   help="按状态过滤（candidate/validating/passed/failed/enabled/disabled）")
+    _add_db(s)
+
+    s = sub.add_parser("rules-validate",
+                       help="规则提案验证（协议校验 + 验证门：IC t 检验/分层单调 → passed/failed）")
+    s.add_argument("--spec", required=True, help="spec JSON 文件路径；``-`` 表示从 stdin 读")
+    s.add_argument("--symbols", default=None,
+                   help="逗号分隔样本标的；缺省按规则 universe 解析关注池")
+    s.add_argument("--as-of", default=None, help="评估日（默认取库内样本标的最新行情日）")
+    s.add_argument("--horizon", type=int, default=20, help="前向收益窗口（默认 20）")
+    s.add_argument("--lookback", type=int, default=60, help="IC 观测期数（默认 60）")
+    s.add_argument("--step", type=int, default=0, help="取样步长（0=按 horizon 非重叠）")
+    s.add_argument("--walkforward", action="store_true",
+                   help="附跑 walk-forward OOS 摘要（补充证据；需同时给 --start/--end）")
+    s.add_argument("--start", default=None, help="walk-forward 起点（--walkforward 时必填）")
+    s.add_argument("--end", default=None, help="walk-forward 终点（--walkforward 时必填）")
+    s.add_argument("--train", type=int, default=504, help="walk-forward 训练窗（默认 504）")
+    s.add_argument("--test", type=int, default=63, help="walk-forward 测试窗（默认 63）")
+    s.add_argument("--walk-step", type=int, default=63, help="walk-forward 步长（默认 63）")
+    s.add_argument("--home", default=None,
+                   help="DSH_HOME（读关注池/风控配置；默认 $DSH_HOME 或 ~/.dsh）")
+    _add_db(s)
+
+    s = sub.add_parser("rules-decide", help="人工批准/停用规则（Web 端点唯一入口）")
+    s.add_argument("--rule-id", required=True)
+    s.add_argument("--decision", required=True, choices=("enable", "disable"))
+    s.add_argument("--by", default="web", help="操作来源（审计字段，默认 web）")
+    _add_db(s)
     return p
 
 
@@ -306,6 +338,236 @@ def _ic_result(conn, args):
             "samples": len(vals), **report,
             "passes_gate": ok, "gate_reasons": reasons,
             "lookback": lookback, "step": step, "horizon": args.horizon}
+
+
+# ---------------------------------------------------------------------------
+# WP14 任务 4：规则候选池 CLI（列表 / 提案验证 / 人工批准）
+# ---------------------------------------------------------------------------
+# 三条子命令的分工与退出码口径：
+#   * rules-list     只读列表（候选池 UI 与运维查看同一出口）；
+#   * rules-validate 提案入口 + 验证门：**协议非法 = 非零退出**（提案写错了，是操作
+#     错误）；**验证门不通过 = 退出 0 + status="failed"**（研究结论，不是故障——
+#     与 plan-auto 的软跳过同一分级，脚本据 status 字段分流而不是据退出码）；
+#   * rules-decide   人工批准/停用：非法流转（未通过就启用等）= 非零退出。
+# 验证门统计一律复用 ``factors.ic_report``/``passes_gate``（阈值唯一实现在 factors），
+# 本模块**不重写任何阈值**；取样口径与 ``ic`` 子命令逐字一致（``_ic_sample_dates`` +
+# ``_forward_return``），保证验证报告能被 ``ic`` 手工复核。
+
+
+def _home_of(args):
+    """``--home`` > ``$DSH_HOME`` > ``~/.dsh``（与 daemon/watchlist 同一口径）。"""
+    import os
+    return args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+
+
+def _rule_public(row):
+    """rules 表行 → 候选池公开形状（spec 摊平 + provenance 保留，不重复塞原文）。"""
+    spec = row["spec"] or {}
+    return {"rule_id": row["rule_id"], "hypothesis": spec.get("hypothesis"),
+            "factors": spec.get("factors"), "combine": spec.get("combine"),
+            "universe": spec.get("universe"), "top_n": spec.get("top_n"),
+            "rebalance": spec.get("rebalance"), "provenance": spec.get("provenance"),
+            "status": row["status"], "validation": row["validation"],
+            "approved_by": row["approved_by"], "approved_at": row["approved_at"],
+            "created_at": row["created_at"]}
+
+
+def _rules_list(conn, args):
+    """候选池列表（可按状态过滤）。未知状态 fail-closed——不静默返回全量冒充「过滤后」。"""
+    from . import rule_engine
+    status = args.status
+    if status is not None and status not in rule_engine.RULE_STATUSES:
+        return {"ok": False,
+                "error": (f"未知规则状态 {status!r}"
+                          f"（允许：{'/'.join(rule_engine.RULE_STATUSES)}）")}
+    return {"ok": True,
+            "rules": [_rule_public(row) for row in store.get_rules(conn, status=status)]}
+
+
+def _latest_bar_date(conn, symbols):
+    """样本标的里最新的日线日期（评估日缺省值）；全无行情返回 None。"""
+    dates = [store.last_bar_date(conn, symbol, "1d") for symbol in symbols]
+    dates = [d for d in dates if d]
+    return max(dates) if dates else None
+
+
+def _rule_panels(conn, spec, symbols, as_of, horizon, lookback, step, registry=None):
+    """多期因子面板 + 共享前向收益面板（口径 = ``ic`` 子命令的取样实现）。
+
+    返回 ``(factor_panel, forward_panel)``：``factor_panel`` 形如
+    ``{因子名: {日期: {标的: 值}}}``，``forward_panel`` 形如 ``{日期: {标的: 前向收益}}``
+    ——与 ``factors.ic_report`` 的入参形状逐项一致。因子函数异常按缺值处理
+    （单因子失败不中止整轮，宁缺毋假）。
+    """
+    from . import factors
+    registry = factors.REGISTRY if registry is None else registry
+    step = step if step and step > 0 else max(horizon, 1)
+    names = list(spec["factors"])
+    factor_panel = {name: {} for name in names}
+    forward_panel = {}
+    for day in _ic_sample_dates(conn, symbols, as_of, lookback, step):
+        forward = {}
+        for symbol in symbols:
+            value = _forward_return(conn, symbol, day, horizon)
+            if value is not None:
+                forward[symbol] = value
+        if not forward:
+            continue
+        forward_panel[day] = forward
+        for name in names:
+            values = {}
+            for symbol in symbols:
+                try:
+                    value = registry[name](conn, symbol, day)
+                except Exception:  # noqa: BLE001 —— 单因子异常按缺值处理
+                    value = None
+                if value is not None:
+                    values[symbol] = value
+            if values:
+                factor_panel[name][day] = values
+    return factor_panel, forward_panel
+
+
+def _walkforward_summary(conn, spec, args):
+    """walk-forward OOS 摘要（**补充证据**，不参与 ``passes_gate`` 门槛）。
+
+    口径：把规则按固定参数（``top_n`` 取 spec 值 → 单组合网格，无参数搜索）注册成
+    策略后复用既有 ``walkforward.run``；``--walkforward`` 需同时给 ``--start/--end``
+    （与 ``backtest`` 子命令同口径，不凭空造时间窗）。任何跑不起来的情形都如实记录
+    ``status``/``reason``——**绝不假装跑过**（规格 §9.3 的诚实要求）。
+    """
+    from . import strategies, walkforward
+    if not args.start or not args.end:
+        return {"status": "not_run",
+                "reason": "--walkforward 需同时给 --start 与 --end（与 backtest 同口径）"}
+    try:
+        strategies.register_rule(spec)  # 回测按 strategy_id 取实例
+    except ValueError as error:
+        return {"status": "failed", "reason": f"规则注册失败：{str(error)[:120]}"}
+    try:
+        result = walkforward.run(conn, spec["rule_id"], train=args.train, test=args.test,
+                                 step=args.walk_step,
+                                 grid={"top_n": [int(spec["top_n"])]},
+                                 start=args.start, end=args.end)
+    except Exception as error:  # noqa: BLE001 —— 数据/日历缺口即「跑不了」，如实记录
+        return {"status": "failed", "reason": f"walk-forward 未跑通：{str(error)[:120]}"}
+    folds = result.get("folds") or []
+    if not folds:
+        return {"status": "no_folds",
+                "reason": "数据窗口不足，未产出 OOS 折（未参与门槛判定）",
+                "param_groups": result.get("summary", {}).get("param_groups")}
+    return {"status": "ok", "summary": result.get("summary"), "folds": len(folds)}
+
+
+def _rule_gate(conn, spec, symbols=None, as_of=None, horizon=20, lookback=60, step=0,
+               home=None, registry=None, walkforward_args=None):
+    """验证门：逐因子产出 IC 报告 + 门槛结论，落成可入 ``rules.validation`` 的报告。
+
+    判定口径（**不重写阈值**）：
+      * 机械门槛 = ``factors.passes_gate(ic_report(...))`` **逐因子**全过才算通过
+        （规则由多个因子合成，任一因子没有可验证的预测力就不该上岗）；
+      * ``half_life``/``turnover`` 是**补充证据**：半衰期取各期 RankIC 序列的 lag-1
+        自相关估计（单位=采样间隔），换手率取该因子 Top-N（N=规则 ``top_n``）成员
+        的新进比例均值——两者都**不参与**门槛判定，报告里显式标注；
+      * 样本不足（关注池为空 / 库内无行情 / 无可取样日期）→ 直接 ``failed`` 并给出
+        原因，**不伪造通过**。
+    """
+    from . import factors, rule_engine
+    validation = {"checked_at": _dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                  "universe": spec.get("universe"), "top_n": spec.get("top_n"),
+                  "horizon": horizon, "lookback": lookback,
+                  "step": step if step and step > 0 else max(horizon, 1),
+                  "factors": {}, "passed": False, "gate_reasons": [],
+                  "note": "半衰期/换手率为补充证据，不参与 passes_gate 门槛"}
+    try:
+        if symbols is None:
+            symbols = rule_engine.resolve_universe(spec, home=home)
+    except ValueError as error:
+        validation["gate_reasons"] = [f"关注池不可用：{error}"]
+        return validation
+    symbols = sorted({str(s).strip().upper() for s in symbols if str(s).strip()})
+    validation["symbols"] = len(symbols)
+    if not symbols:
+        validation["gate_reasons"] = ["样本不足：关注池为空（无标的可验证）"]
+        return validation
+    as_of = as_of or _latest_bar_date(conn, symbols)
+    if as_of is None:
+        validation["gate_reasons"] = ["样本不足：库内无该批标的的日线（先跑 sync-bars）"]
+        return validation
+    validation["as_of"] = as_of
+    factor_panel, forward_panel = _rule_panels(conn, spec, symbols, as_of, horizon,
+                                               lookback, step, registry=registry)
+    if not forward_panel:
+        validation["gate_reasons"] = [
+            f"样本不足：{as_of} 起的取样窗口内算不出前向收益（历史长度不够）"]
+        return validation
+    top_n = int(spec.get("top_n") or 1)
+    for name in spec["factors"]:
+        panel = factor_panel.get(name) or {}
+        report = factors.ic_report(panel, forward_panel)
+        passed, reasons = factors.passes_gate(report)
+        ic_series = [factors.rank_ic(panel[day], forward_panel[day])
+                     for day in sorted(set(panel) & set(forward_panel))]
+        top_sets = [set(sorted(panel[day], key=panel[day].get, reverse=True)[:top_n])
+                    for day in sorted(panel)]
+        validation["factors"][name] = {
+            **report,
+            "half_life": factors.factor_half_life([x for x in ic_series if x is not None]),
+            "turnover": factors.turnover(top_sets),
+            "passes_gate": passed, "gate_reasons": reasons}
+        if not passed:
+            validation["gate_reasons"].append(f"{name}：" + "；".join(reasons))
+    validation["passed"] = not validation["gate_reasons"]
+    validation["walkforward"] = (_walkforward_summary(conn, spec, walkforward_args)
+                                if walkforward_args is not None
+                                else {"status": "not_run", "reason": "未请求（--walkforward 启用）"})
+    return validation
+
+
+def _rules_validate(conn, args):
+    """提案入口 + 验证门（见本节顶部退出码口径）。"""
+    import sys as _sys
+    from . import rule_engine
+    try:
+        text = (_sys.stdin.read() if args.spec == "-"
+                else Path(args.spec).read_text(encoding="utf-8"))
+        spec = json.loads(text)
+    except (OSError, ValueError) as error:
+        return {"ok": False, "error": f"spec 读取失败：{error}"}
+    ok, errors = rule_engine.validate_spec(spec)
+    if not ok:
+        return {"ok": False, "error": "规则协议校验失败", "errors": errors}
+    rule_id = spec["rule_id"]
+    existing = store.find_rule(conn, rule_id)
+    if existing is None:
+        store.upsert_rule(conn, rule_id, spec, status="candidate")  # 提案入库
+        current = "candidate"
+    else:
+        current = existing["status"]
+        if current not in ("candidate", "validating"):
+            return {"ok": False,
+                    "error": (f"规则已存在且状态为 {current}：重新验证需修改 rule_id 后"
+                              "重新提案（不静默重置已通过/已启用的规则）")}
+    if current == "candidate":
+        rule_engine.set_rule_status(conn, rule_id, "validating")
+    symbols = ([s.strip() for s in args.symbols.split(",") if s.strip()]
+               if args.symbols else None)
+    validation = _rule_gate(conn, spec, symbols=symbols, as_of=args.as_of,
+                            horizon=args.horizon, lookback=args.lookback, step=args.step,
+                            home=_home_of(args), walkforward_args=args if args.walkforward
+                            else None)
+    status = "passed" if validation["passed"] else "failed"
+    rule_engine.set_rule_status(conn, rule_id, status, validation=validation)
+    return {"ok": True, "rule_id": rule_id, "status": status, "validation": validation}
+
+
+def _rules_decide(conn, args):
+    from . import rule_engine
+    try:
+        status = rule_engine.decide_rule(conn, args.rule_id, args.decision, by=args.by)
+    except ValueError as error:
+        return {"ok": False, "error": str(error)}
+    return {"ok": True, "rule_id": args.rule_id, "status": status}
 
 
 def main(argv=None):
@@ -478,6 +740,21 @@ def main(argv=None):
             else:
                 result = {"ok": True, "symbol": None, "records": [],
                           "summary": store.sentiment_summary(conn)}
+        elif args.cmd == "rules-list":
+            result = _rules_list(conn, args)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False, indent=1))
+                return 1
+        elif args.cmd == "rules-validate":
+            result = _rules_validate(conn, args)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False, indent=1))
+                return 1
+        elif args.cmd == "rules-decide":
+            result = _rules_decide(conn, args)
+            if not result.get("ok"):
+                print(json.dumps(result, ensure_ascii=False, indent=1))
+                return 1
         elif args.cmd == "daemon":
             import os
             home = args.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
