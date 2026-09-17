@@ -9,12 +9,12 @@ sim_trade_modify_order 间歇性 -5 → 改单一律撤单 + 重下（TOOL-LIMIT
 # ``trading_datasource/__init__.py`` 刻意不做 eager 导入，因此模块级导入不会拉起
 # futu_mcp 会话（与 ``quality.py`` 顶层导入 ``trading_datasource.market`` 同一惯例）。
 from trading_datasource.market_ids import (  # noqa: E402
-    OPENAPI_ENABLE_MARKET, SIM_MARKET_IDS)
+    OPENAPI_ENABLE_MARKET, SIM_MARKET_IDS, sim_market_id)
 
 TOOLS = {"place": "sim_trade_input_order", "cancel": "sim_trade_cancel_order",
          "positions": "sim_trade_position_list", "accounts": "sim_trade_account_list",
-         "history": "sim_trade_history_order_list", "cash": "sim_trade_cash_info",
-         "max_buy_sell": "sim_trade_max_buy_sell"}
+         "orders": "sim_trade_order_list", "history": "sim_trade_history_order_list",
+         "cash": "sim_trade_cash_info", "max_buy_sell": "sim_trade_max_buy_sell"}
 PLACE_REQUIRED = ("acc_id", "market", "symbol", "order_type", "order_side", "qty")
 
 #: 市场链 → 模拟账户 market_id。名字保留给既有调用方；对象即规范常量（同对象别名）。

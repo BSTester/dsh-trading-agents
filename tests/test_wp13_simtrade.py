@@ -535,8 +535,10 @@ class LockTableBindingTests(unittest.TestCase):
         self.assertEqual(set(channel.SIM_TOOL_ROUTES),
                          {"sim_trade_account_list", "sim_trade_position_list",
                           "sim_trade_cash_info", "sim_trade_input_order",
-                          "sim_trade_cancel_order", "sim_trade_history_order_list",
-                          "sim_trade_max_buy_sell"})
+                          "sim_trade_cancel_order", "sim_trade_order_list",
+                          "sim_trade_history_order_list",
+                          "sim_trade_max_buy_sell"},
+                         "WP16 起新增「当日订单」路由（sim 读闭环缺的那一环）")
 
     def test_to_micros_rejects_unparsable(self):
         with self.assertRaises(ValueError):

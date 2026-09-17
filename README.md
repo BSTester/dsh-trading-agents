@@ -269,6 +269,13 @@ WP6 把工作台装进了独立服务进程；WP7 让这个进程成为**独立�
 **实盘永远等人工**：live 模式也会自动生成计划，但 `auto_execute` 只对 sim 生效——
 实盘仍是在工作台点「执行」+ 口令「确认执行」。**关掉开关即回到全人工**。
 
+**执行链的下单账户（WP16 实机修复，2026-09-17）**：执行侧（`execute.run`）过去用占位符
+`acc_id="SIM"` 下单——MCP 通道下上游忽略它，切到 `futu_channel=openapi` 后 REST 把它拼进
+URL（`/sim-trade/SIM/orders`），**每一张自动执行单都被券商 `-3 invalid parameter` 拒绝**。
+现按市场从 `sim_trade_account_list` 解析真实模拟账户（与持仓查询同一份账户事实）。该修复
+在 `trading_core`，生效需 `scripts/platform_service.sh refresh && restart`。实机证据与
+未决项见 `docs/TOOL-LIMITS.md`「模拟盘读能力与自动执行下单账户」。
+
 **熔断（halt）不会自动恢复**：对账差异或日内熔断触发后，自动执行以 warn 级跳过并在
 `daily:digest` 记录原因；恢复必须人工查明原因后清 halt（工作台调度页/`clear_halt`）。
 零差异的一次对账**不会**清除已有 halt。

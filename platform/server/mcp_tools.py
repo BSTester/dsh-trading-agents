@@ -609,46 +609,58 @@ TOOLS = (
     ),
     # ---- WP8 任务 3：OpenAPI 交易只读端点（6 个；字段与 app.py 的
     # OPENAPI_TRADE_FIELDS 白名单逐键同形）----
-    # 全部**实时直通**（TTL 0，不进缓存）、受模式约束（mode 缺省读模式文件）。通道要求：
+    # 全部**实时直通**（TTL 0，不进缓存）、受模式约束（mode 缺省读模式文件）。WP16 起按
+    # **模式分派**：mode=sim 走官方模拟盘等价端点（sim_trade_order_list /
+    # sim_trade_history_order_list / sim_trade_max_buy_sell），模拟账户
+    # 9393(HK)/3182575(SH)/11587526(US) 均可读；mode=live 要求
     # trading-platform.json 的 futu_channel=openapi 且已配置凭据（scripts/futu_auth.py
-    # --openapi）；mcp 通道下这些工具返回 trading/openapi-unavailable 并给出替代路径——
-    # 描述里如实写明，免得模型在 mcp 部署下反复试错。sim 模式没有对应 REST 面（OpenAPI
-    # 交易接口只覆盖实盘业务账户），sim 请用 account_orders/account_positions/account_funds。
+    # --openapi），mcp 通道下的 live 读取返回 trading/openapi-unavailable 并给出替代
+    # 路径——描述里如实写明，免得模型在 mcp 部署下反复试错。模拟盘**没有**官方成交流水
+    # 端点：deals_* 由模拟订单（cum_qty>0）派生，响应标 derived=true 并在 note 里说明，
+    # 不冒充实盘成交。
     ToolDefinition(
         "trade_max_qty",
-        "最大可交易量（OpenAPI 交易链，需 futu_channel=openapi）：按授权账户列出 "
+        "最大可交易量：sim → 官方模拟盘 sim_trade_max_buy_sell（按模拟账户逐户列出）；"
+        "live → OpenAPI 交易链（需 futu_channel=openapi），按授权账户列出 "
         "max_cash_buy/max_cash_and_margin_buy/max_position_sell/max_sell_short/max_buy_back "
-        "等原始字段；order_type 必填（LIMIT/MARKET/…），带 order_id 时查该订单的最大可改"
-        "数量。mcp 通道下返回 openapi-unavailable（可用 account_* 替代）。",
+        "等原始字段。order_type 必填：live 用官方字符串枚举，sim **只支持 LIMIT/MARKET**"
+        "（官方模拟枚举 1=限价/3=市价，其余如实拒绝），且 sim 下 price 必填——缺 price 时"
+        "模拟盘回全 0（实测 2026-09-17），服务端据此拒绝而不是把 0 当答案。带 order_id 时"
+        "查该订单的最大可改数量。mcp 通道下的 live 读取返回 openapi-unavailable（可用 "
+        "account_* 替代）。",
         "trade_max_qty",
         (
             req("code", "str", "标的代码，如 US.AAPL / HK.00700 / SH.600519"),
             req("order_type", "order_type", "订单类型（LIMIT/MARKET/AUCTION/AUCTION_LIMIT/"
-                                            "STOP/STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED）"),
-            opt("price", "number", "非市价单的价格（3 位小数，超出截断）"),
+                                            "STOP/STOP_LIMIT/MARKET_IF_TOUCHED/LIMIT_IF_TOUCHED）；"
+                                            "sim 仅支持 LIMIT/MARKET"),
+            opt("price", "number", "价格（3 位小数，超出截断）；sim 下必填（缺价模拟盘回全 0）"),
             opt("order_id", "str", "要查最大可改数量的券商订单号（省略=查新单）"),
-            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（sim=模拟盘等价端点，live=实盘）"),
         ),
     ),
     ToolDefinition(
         "orders_open",
-        "未完成订单（OpenAPI 交易链，需 futu_channel=openapi）：含最近 24 小时已成交/"
-        "已撤单；分页用 page_flag，返回 completed=true 表示本批已取尽。"
-        "mcp 通道下返回 openapi-unavailable（可用 account_orders 替代）。",
+        "未完成订单：sim → 模拟盘当日订单按在途状态码 2/3 过滤（响应含 filter 标注）；"
+        "live → OpenAPI 交易链（需 futu_channel=openapi），含最近 24 小时已成交/已撤单，"
+        "分页用 page_flag，返回 completed=true 表示本批已取尽。"
+        "mcp 通道下的 live 读取返回 openapi-unavailable（可用 account_orders 替代）。",
         "orders_open",
         (
             req("market", "trd_market", "交易市场：HK/US/SG/HKCC/CA/FUTURES/JP/KR"),
             opt("page_flag", "str", "分页游标，空串=从头开始（用响应里的 page_flag 续页）"),
             opt("page_size", "int", "每页条数 10..100（缺省 50）", minimum=10,
                 maximum=100),
-            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（sim=模拟盘等价端点，live=实盘）"),
         ),
     ),
     ToolDefinition(
         "orders_history",
-        "历史订单（OpenAPI 交易链，需 futu_channel=openapi）：start/end 是创建时间的"
+        "历史订单：sim → 官方 sim_trade_history_order_list（默认最近 30 天窗口；该工具不带"
+        "时间范围会静默返回 no data，响应含 window 标注）；live → OpenAPI 交易链（需 "
+        "futu_channel=openapi），start/end 是创建时间的"
         "**微秒**时间戳（都省略=官方 0/0 组合语义，近 90 天）；分页用 page_flag。"
-        "mcp 通道下返回 openapi-unavailable（可用 account_orders 替代）。",
+        "mcp 通道下的 live 读取返回 openapi-unavailable（可用 account_orders 替代）。",
         "orders_history",
         (
             req("market", "trd_market", "交易市场：HK/US/SG/HKCC/CA/FUTURES/JP/KR"),
@@ -658,27 +670,31 @@ TOOLS = (
             opt("page_flag", "str", "分页游标，空串=从头开始"),
             opt("page_size", "int", "每页条数 10..100（缺省 50）", minimum=10,
                 maximum=100),
-            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（sim=模拟盘等价端点，live=实盘）"),
         ),
     ),
     ToolDefinition(
         "orders_detail",
-        "订单详情（OpenAPI 交易链，需 futu_channel=openapi）：同一批 order_ids 必须属于"
+        "订单详情：sim → 在模拟盘当日 + 历史订单里按 order_id 查找，查不到的 order_id 列在 "
+        "missing 里（不伪造）；live → OpenAPI 交易链（需 futu_channel=openapi），同一批 "
+        "order_ids 必须属于"
         "同一个 exchange（最多 49 个）；服务端对每个授权账户各查一次，订单出现在持有它的"
-        "账户分组里。mcp 通道下返回 openapi-unavailable（可用 account_orders 替代）。",
+        "账户分组里。mcp 通道下的 live 读取返回 openapi-unavailable（可用 account_orders 替代）。",
         "orders_detail",
         (
             req("exchange", "exchange", "交易所：US/SEHK/SGX/SSE/SZSE/JP/CA/CME/CBOT/"
                                         "NYMEX/COMEX/CBOE/HKFE/KR"),
             req("order_ids", "str_list", "订单号列表，1..49 个（同一 exchange）"),
-            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（sim=模拟盘等价端点，live=实盘）"),
         ),
     ),
     ToolDefinition(
         "deals_today",
-        "当日成交（OpenAPI 交易链，需 futu_channel=openapi）：order_fills 原始字段"
+        "当日成交：sim → **由当日模拟订单派生**（cum_qty>0 才算成交；官方模拟盘没有独立"
+        "成交流水端点），响应标 derived=true 并在 note 里说明，非券商成交流水；"
+        "live → OpenAPI 交易链（需 futu_channel=openapi），order_fills 原始字段"
         "（trd_side/deal_id/order_id/qty/price/成交对手方等）；分页用 page_flag。"
-        "mcp 通道下返回 openapi-unavailable（成交历史可用 account_orders 的订单状态"
+        "mcp 通道下的 live 读取返回 openapi-unavailable（成交可用 account_orders 的订单状态"
         "间接核对）。",
         "deals_today",
         (
@@ -686,14 +702,16 @@ TOOLS = (
             opt("page_flag", "str", "分页游标，空串=从头开始"),
             opt("page_size", "int", "每页条数 10..100（缺省 50）", minimum=10,
                 maximum=100),
-            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（sim=模拟盘等价端点，live=实盘）"),
         ),
     ),
     ToolDefinition(
         "deals_history",
-        "历史成交（OpenAPI 交易链，需 futu_channel=openapi）：start/end 是**更新**时间的"
+        "历史成交：sim → **由历史模拟订单派生**（默认最近 30 天窗口，响应标 derived=true，"
+        "非券商成交流水）；live → OpenAPI 交易链（需 futu_channel=openapi），start/end 是"
+        "**更新**时间的"
         "微秒时间戳（都省略=近 90 天）；page_size 上界 50（与订单页的 100 不同）。"
-        "mcp 通道下返回 openapi-unavailable（成交历史可用 account_orders 的订单状态"
+        "mcp 通道下的 live 读取返回 openapi-unavailable（成交可用 account_orders 的订单状态"
         "间接核对）。",
         "deals_history",
         (
@@ -704,7 +722,7 @@ TOOLS = (
             opt("page_flag", "str", "分页游标，空串=从头开始"),
             opt("page_size", "int", "每页条数 10..50（缺省 50）", minimum=10,
                 maximum=50),
-            opt("mode", "mode", "账户模式，缺省读模式文件（OpenAPI 只回实盘 live）"),
+            opt("mode", "mode", "账户模式，缺省读模式文件（sim=模拟盘等价端点，live=实盘）"),
         ),
     ),
     # ---- WP8：富途实时数据直通（8 个；取数在 server/futu_data.py，实时零缓存）----

@@ -20,6 +20,8 @@ callable，openapi 就绪则走 REST，否则原样交给 MCP。
                                                               qty/price MCP 收数值、REST 收字符串
   sim_trade_cancel_order         → simtrade.cancel_order      market 实测必须放 body（官方页面
                                                               未列、示例无请求体）；参数原样翻译
+  sim_trade_order_list           → simtrade.order_list        当日订单；market 实测必填
+                                                              （缺参报 missing required parameter）
   sim_trade_history_order_list   → simtrade.history_order_list MCP 传 start/end 日期串；
                                                               REST 要 market + 微秒 int
   sim_trade_max_buy_sell         → simtrade.max_buy_sell      REST 实测必填 market → 由账户缓存解析
@@ -36,6 +38,7 @@ SIM_TOOL_ROUTES = {
     "sim_trade_cash_info": "simtrade.cash_info",
     "sim_trade_input_order": "simtrade.input_order",
     "sim_trade_cancel_order": "simtrade.cancel_order",
+    "sim_trade_order_list": "simtrade.order_list",
     "sim_trade_history_order_list": "simtrade.history_order_list",
     "sim_trade_max_buy_sell": "simtrade.max_buy_sell",
 }
@@ -164,6 +167,12 @@ def sim_call(home=None, *, client=None, mcp_call=None, credential_path=None):
                                 {"acc_id": acc_id, "order_id": p.get("order_id"),
                                  "market": _market_of(acc_id, p.get("market"))},
                                 timeout=timeout)
+        if tool == "sim_trade_order_list":
+            # 当日订单：market 实测必填（缺参后端报 missing required parameter）——
+            # 显式解析（链名 → market_id，或按 acc_id 查账户缓存），不猜。
+            return call_openapi(rest_client, "simtrade.order_list", {
+                "acc_id": acc_id,
+                "market": _market_of(acc_id, p.get("market"))}, timeout=timeout)
         if tool == "sim_trade_history_order_list":
             return call_openapi(rest_client, "simtrade.history_order_list", {
                 "acc_id": acc_id,

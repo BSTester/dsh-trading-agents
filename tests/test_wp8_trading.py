@@ -823,22 +823,51 @@ class OpenApiBrokerReadTest(unittest.TestCase):
         self.assertEqual(funds["source"], "futu/openapi:funds")
         self.assertEqual(funds["groups"][0]["cash"], {"total_assets": "25000.00"})
 
+    @staticmethod
+    def _read_payload(name):
+        if name == "trade_max_qty":
+            return {"code": "US.AAPL", "order_type": "LIMIT"}
+        if name == "orders_detail":
+            return {"exchange": "US", "order_ids": ["O-1"]}
+        return {"market": "US"}
+
     def test_read_tools_require_openapi_live_channel(self):
-        cases = [
-            (trading.OpenApiBroker(channel="mcp", trade=self.backend), "openapi:openapi-unavailable"),
-            (trading.OpenApiBroker(trade=self.backend), "sim"),
-        ]
-        for broker, label in cases:
-            for name in trading.OPENAPI_TRADE_ENDPOINTS:
-                with self.subTest(broker=label, name=name):
-                    payload = {"code": "US.AAPL", "order_type": "LIMIT"} \
-                        if name == "trade_max_qty" else {"market": "US"}
-                    if name == "orders_detail":
-                        payload = {"exchange": "US", "order_ids": ["O-1"]}
-                    mode = "live" if label.startswith("openapi") else "sim"
-                    with self.assertRaises(trading.OpenApiUnavailable) as caught:
-                        getattr(broker, name)(payload, mode)
-                    self.assertTrue(str(caught.exception))
+        """live 只读必须挂在 openapi 通道上：mcp 通道照旧拒绝，且零网络往返。"""
+        broker = trading.OpenApiBroker(channel="mcp", trade=self.backend)
+        for name in trading.OPENAPI_TRADE_ENDPOINTS:
+            with self.subTest(name=name):
+                with self.assertRaises(trading.OpenApiUnavailable) as caught:
+                    getattr(broker, name)(self._read_payload(name), "live")
+                self.assertTrue(str(caught.exception))
+        self.assertEqual(self.backend.names(), [], "拒绝请求不得触碰 REST 后端")
+
+    def test_sim_read_tools_delegate_to_sim_equivalents(self):
+        """sim 模式的六个只读端点改走 sim_trade_* 等价实现，不再是 openapi-unavailable 死路。
+
+        WP16 修正：模拟盘是官方另一套 sim-trade 端点，通道切到 openapi 不应连带把
+        sim 读取判死。此断言在修正前必然失败（旧实现直接抛 OpenApiUnavailable）。
+        """
+        class RecordingSimLegacy:
+            def __init__(self):
+                self.calls = []
+
+            def __getattr__(self, name):
+                def _call(payload, mode):
+                    self.calls.append((name, payload, mode))
+                    return {"mode": mode, "source": f"futu/sim:{name}",
+                            "groups": [], "errors": []}
+                return _call
+
+        legacy = RecordingSimLegacy()
+        broker = trading.OpenApiBroker(trade=self.backend, legacy=legacy)
+        for name in trading.OPENAPI_TRADE_ENDPOINTS:
+            with self.subTest(name=name):
+                out = getattr(broker, name)(self._read_payload(name), "sim")
+                self.assertEqual(out["mode"], "sim")
+                self.assertEqual(out["source"], f"futu/sim:{name}")
+        self.assertEqual([call[0] for call in legacy.calls],
+                         list(trading.OPENAPI_TRADE_ENDPOINTS))
+        self.assertEqual(self.backend.names(), [], "sim 读取不得触碰 OpenAPI 通道")
 
 
 # ---------------------------------------------------------------------------
@@ -1154,14 +1183,36 @@ class HttpRoutingTest(unittest.TestCase):
                 self.assertEqual(out["error"]["code"], "trading/openapi-unavailable")
                 self.assertIn("futu_auth.py", out["error"]["message"])
 
-    def test_sim_mode_read_tool_points_to_account_alternatives(self):
+    def test_sim_mode_read_tool_uses_sim_equivalent(self):
+        """sim 模式读取走 sim_trade_* 等价实现：ok=true、mode=sim，且不触碰 OpenAPI REST。
+
+        WP16 修正：旧实现把 sim 判成 openapi-unavailable 并指引改调 account_* 端点；
+        模拟盘本身在官方 sim-trade 面里是可读的，这里即该死路的反向证明。
+        """
+        class SimLegacy:
+            def __init__(self):
+                self.calls = []
+
+            def orders_open(self, payload, mode):
+                self.calls.append((payload, mode))
+                return {"mode": mode, "source": "futu/sim:orders_open",
+                        "as_of": "2026-09-18T09:30:00+08:00",
+                        "groups": [{"acc_id": "9393", "market": "HK",
+                                    "rows": [{"order_id": "S-1",
+                                              "status_label": "已提交"}]}],
+                        "errors": [], "filter": "status in {2,3}"}
+
+        legacy = SimLegacy()
+        backend = FakeTradeBackend()
         (self.home / "trading-account-mode").write_text("sim\n")
         gate = trading.TradeGate(str(self.home), broker=trading.OpenApiBroker(
-            trade=FakeTradeBackend()), ctx_builder=fixed_ctx())
-        out = gate.orders_open({"market": "US"})
-        self.assertFalse(out["ok"])
-        self.assertEqual(out["error"]["code"], "trading/openapi-unavailable")
-        self.assertIn("account_orders", out["error"]["message"])
+            trade=backend, legacy=legacy), ctx_builder=fixed_ctx())
+        out = gate.orders_open({"market": "HK"})
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["value"]["mode"], "sim")
+        self.assertEqual(out["value"]["groups"][0]["rows"][0]["order_id"], "S-1")
+        self.assertEqual(legacy.calls, [({"market": "HK"}, "sim")])
+        self.assertEqual(backend.names(), [], "sim 读取不得触碰 OpenAPI 通道")
 
     def test_invalid_parameter_and_mode_map_to_invalid_operation(self):
         gate = trading.TradeGate(str(self.home), broker=trading.OpenApiBroker(

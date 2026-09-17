@@ -164,14 +164,18 @@ function ConfirmationCard() {
 
 // ---------------------------------------------------------------------------
 // OpenAPI 订单与成交（WP8 任务 3 的 6 个只读端点里页面消费 5 个；orders_detail 不进页）。
-// 字段依据：trading.py OpenApiBroker._read_envelope → {mode, source, as_of, groups,
-// errors, note}；行数据是 OpenAPI REST 原始 JSON（trading.py 不过字段映射），页面按
-// 官方字段名候选键防御式读取（orders: order_id/code/side/order_type/qty/price/
-// fill_qty/fill_avg_price/status…；deals: deal_id/order_id/code/trd_side/qty/price…），
-// 缺失一律 —，行内可展开原始 JSON 核对——形状与文档不符时界面不编造。
-// 通道事实（trading.py _read_route）：这 6 个端点只在 futu_channel=openapi 且 live 模式
-// 可用；sim / mcp 通道服务端如实拒绝（消息含「sim 模式请用 account_*」指引），页面
-// 原样展示，不静默降级、不伪造空表。
+// 字段依据：trading.py OpenApiBroker._read_envelope / FutuBroker._sim_read_* →
+// {mode, source, as_of, groups, errors, note[, derived, filter, window, missing]}；行数据
+// 是券商原始 JSON（trading.py 不过字段映射），页面按官方字段名候选键防御式读取
+// （orders: order_id/code/side/order_type/qty/price/fill_qty/fill_avg_price/status…；
+// deals: deal_id/order_id/code/trd_side/qty/price…），缺失一律 —，行内可展开原始 JSON
+// 核对——形状与文档不符时界面不编造。
+// 通道事实（WP16 起，trading.py FutuBroker._mode + OpenApiBroker 逐方法分流）：这 6 个
+// 端点**按模式**取数——sim 走官方 sim_trade_* 等价端点（模拟盘可读，账户 9393/3182575/
+// 11587526），live 才要求 futu_channel=openapi；mcp 通道的 live 读取服务端如实拒绝
+// （trading/openapi-unavailable，指引 scripts/futu_auth.py），页面原样展示，不静默降级、
+// 不伪造空表。sim 成交流水由委托派生（无官方模拟成交端点）：value.derived=true，
+// 页面显式标注「派生」并展示服务端 note，不冒充实盘成交流水。
 // trade_max_qty 的 max 对象键名取自服务端 note 原文（max_cash_buy/max_position_sell
 // 等原始字段）——那是仓库内唯一的权威线索。
 // ---------------------------------------------------------------------------
@@ -208,8 +212,8 @@ const OPENAPI_DEAL_COLUMNS = [
   { title: "市场", key: "market", render: (_f, row) => row.marketTag ?? "—" },
   { title: "标的", key: "code", render: (_f, row) => pickField(row, ["code", "symbol"]) ?? "—" },
   { title: "方向", key: "side", render: (_f, row) => pickField(row, ["trd_side", "side"]) ?? "—" },
-  { title: "数量", key: "qty", align: "right", render: (_f, row) => rawCell(pickField(row, ["qty"])) },
-  { title: "成交价", key: "price", align: "right", render: (_f, row) => rawCell(pickField(row, ["price"])) },
+  { title: "数量", key: "qty", align: "right", render: (_f, row) => rawCell(pickField(row, ["qty", "filled_qty"])) },
+  { title: "成交价", key: "price", align: "right", render: (_f, row) => rawCell(pickField(row, ["price", "avg_price"])) },
   { title: "成交额", key: "turnover", align: "right", render: (_f, row) => rawCell(pickField(row, ["turnover", "amount"])) },
   { title: "成交编号", key: "deal_id", render: (_f, row) => pickField(row, ["deal_id", "fill_id"]) ?? "—" },
   { title: "订单号", key: "order_id", render: (_f, row) => pickField(row, ["order_id"]) ?? "—" },
@@ -319,8 +323,9 @@ function OpenApiOrdersBlock({ mode }) {
   const history = useEndpoint("orders_history", mode ? { mode, page_size: pageSize } : null, [mode, pageSize]);
   const today = useEndpoint("deals_today", mode ? { mode } : null, [mode]);
   const dealsHistory = useEndpoint("deals_history", mode ? { mode, page_size: pageSize } : null, [mode, pageSize]);
-  // sim / mcp 通道下四个端点被同一原因拒绝：合并成一条提示，避免四条重复告警刷屏；
-  // 除此之外的单端点失败仍在各自小节如实展示。
+  // 同一原因导致四个端点全失败（如 mcp 通道下的 live、或 openapi 凭据缺失）时合并成
+  // 一条提示，避免四条重复告警刷屏；除此之外的单端点失败仍在各自小节如实展示。
+  // sim 模式不再落进这里：模拟盘读取由 sim_trade_* 等价端点承担（WP16）。
   const errors = [open, history, today, dealsHistory].map((query) => query.error);
   const allUnavailable = errors.every(Boolean);
   return (
@@ -328,7 +333,8 @@ function OpenApiOrdersBlock({ mode }) {
       extra={(
         <Space size="small">
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            需要 futu_channel=openapi 且实盘模式；实时直通（TTL 0）
+            实时直通（TTL 0）；{mode === "sim" ? "模拟盘走 sim_trade_* 等价端点，成交由委托派生"
+              : "实盘需 futu_channel=openapi 与有效凭据"}
           </Typography.Text>
           <Select value={pageSize} onChange={setPageSize} style={{ width: 130 }}
             aria-label="历史流水条数"
@@ -337,7 +343,7 @@ function OpenApiOrdersBlock({ mode }) {
       {allUnavailable ? (
         <Alert type="info" showIcon
           message={`OpenAPI 交易通道不可用：${errors[0]}`}
-          description="以下小节在通道可用后展示未完成订单、历史流水与当日成交；sim 模式的订单与成交请用上方「券商订单」与「本地台账成交」。" />
+          description="实盘读取需要 futu_channel=openapi 与有效凭据（scripts/futu_auth.py）；模拟盘读取走 sim_trade_* 等价端点，若此处同时失败请看各小节错误原文。" />
       ) : (
         <Space direction="vertical" size="small" style={{ width: "100%" }}>
           <Typography.Text strong>未完成订单（orders_open，含最近 24 小时已成交/已撤）</Typography.Text>
@@ -349,8 +355,12 @@ function OpenApiOrdersBlock({ mode }) {
           {history.value?.note && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>{history.value.note}</Typography.Text>)}
           <Typography.Text strong>当日成交（deals_today）</Typography.Text>
+          {today.value?.derived ? <Tag color="orange">由委托派生（非券商成交流水）</Tag> : null}
           <OpenApiTable query={today} columns={OPENAPI_DEAL_COLUMNS} emptyText="今日暂无成交。" />
+          {today.value?.note && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>{today.value.note}</Typography.Text>)}
           <Typography.Text strong>历史成交（deals_history，取 {pageSize} 条）</Typography.Text>
+          {dealsHistory.value?.derived ? <Tag color="orange">由委托派生（非券商成交流水）</Tag> : null}
           <OpenApiTable query={dealsHistory} columns={OPENAPI_DEAL_COLUMNS} emptyText="暂无历史成交。" />
           {dealsHistory.value?.note && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>{dealsHistory.value.note}</Typography.Text>)}

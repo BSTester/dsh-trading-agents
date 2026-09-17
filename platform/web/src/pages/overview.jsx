@@ -4,8 +4,9 @@
 //   positions → plugins/workbench/python/positions.py collect → counts{positions,
 //     accounts_checked, accounts_with_positions}；group.positions[]（symbol/name/qty/
 //     market_value/pl_val，币种混排——Top5 按市值数值排序仅作展示，不做跨币种合并）。
-//   deals_today → trading.py OpenAPI 只读端点 → {groups:[{acc_id, market, rows}], errors}；
-//     sim / mcp 通道下服务端如实拒绝（trading/openapi-unavailable），页面照实展示不可用。
+//   deals_today → trading.py 只读端点 → {mode, source, groups:[{acc_id, market, rows}], errors,
+//     derived?}；WP16 起按模式取数：sim 走 sim_trade_order_list 并由委托派生成交
+//     （derived=true，页面显式标注「派生」），live 需 futu_channel=openapi。
 //   reconcile → trading_core/snapshots.py reconcile_snapshot → alerts[{level,title,detail,
 //     created_at}]（告警级别色表复用调度页 ALERT_LEVEL_COLOR）。
 //   equity → analytics.py equity_curve → points[{t, equity, dd}]（迷你图取近 60 点）。
@@ -143,11 +144,14 @@ export default function OverviewPage() {
           </Col>
           <Col xs={12} md={6}>
             <Card size="small">
-              <Statistic title="今日成交（OpenAPI）" value={deals.loading ? "…" : (todayDeals ?? "—")} />
+              <Statistic title={`今日成交（${mode === "sim" ? "模拟盘派生" : "OpenAPI"}）`}
+                value={deals.loading ? "…" : (todayDeals ?? "—")} />
               {deals.error && (
                 <Tooltip title={deals.error}>
-                  <Typography.Text type="warning" style={{ fontSize: 12 }}>实盘 OpenAPI 通道不可用</Typography.Text>
+                  <Typography.Text type="warning" style={{ fontSize: 12 }}>成交读取失败</Typography.Text>
                 </Tooltip>)}
+              {deals.value?.derived && (
+                <Typography.Text type="secondary" style={{ fontSize: 12 }}>由委托派生</Typography.Text>)}
             </Card>
           </Col>
           <Col xs={12} md={6}>

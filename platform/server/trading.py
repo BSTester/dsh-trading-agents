@@ -39,6 +39,7 @@
 #                              条件必填/互斥/结构，WP8 任务 6 起）与查询模式非法
 # 所有失败一律 {ok:false, error:{code, message≤300, details:{}}}，绝不抛到 500。
 import json
+import os
 import re
 import sys
 import threading
@@ -72,7 +73,7 @@ from server import store_access
 from server.store_access import WorkbenchError
 # 市场口径常量：规范模块唯一实现（WP13 审查 M1）——本模块与 trading_core.broker 都从这里取，
 # 不再各存镜像。``market_ids`` 是零依赖纯常量模块（不拉起 futu_mcp 会话）。
-from trading_datasource.market_ids import OPENAPI_ENABLE_MARKET, SIM_MARKET_IDS
+from trading_datasource.market_ids import OPENAPI_ENABLE_MARKET, SIM_MARKET_IDS, sim_market_id
 
 # ---------------------------------------------------------------------------
 # 常量（对照源码，不猜）
@@ -99,6 +100,95 @@ CALENDAR_MARKET = {"SH": "SH", "SZ": "SH", "BJ": "SH", "HK": "HK", "US": "US"}
 # 名字保留给既有使用点，对象即规范常量。数字口径来自实测（港股 1 / A股 3 / 美股 100，
 # sim_trade_account_list 实测返回）；SH./SZ./BJ. 是 A 股、HK. 是港股、US. 是美股。
 PREFIX_MARKET_ID = SIM_MARKET_IDS
+
+# 模拟订单 status 整数码：官方 ``sim-trade/order-list.md`` **逐值发布**
+# （2=已提交 3=部分成交 4=全部成交 5=已撤 6=拒绝）——解释它是读契约而非猜标签
+# （与 ``trading_core/reconcile.py`` 的 ``SIM_ORDER_STATUS`` 同一份官方口径）。
+# 只有前两个码是「在途」，``orders_open`` 据此过滤；表外的码不解释（如实透传原始码）。
+SIM_OPEN_STATUS = frozenset({2, 3})
+SIM_STATUS_LABEL = {2: "submitted", 3: "partial", 4: "filled", 5: "cancelled", 6: "rejected"}
+
+#: 模拟账户 market_id → 市场链名（展示用；``SIM_MARKET_IDS`` 的逆映射）。
+#: 未登记的市场（期权/期货/日股等实测存在但本仓库不接入）如实回落为字符串 id，不猜名字。
+SIM_MARKET_CHAIN = {1: "HK", 3: "SH", 100: "US"}
+
+#: ``trade_max_qty`` 的 order_type：**工具面契约是 OpenAPI 字符串枚举**（LIMIT/MARKET/…，
+#: 见 mcp_tools 的 ``order_type`` 类型与官方 trade 组），而模拟交易的 max-buy-sell 只认
+#: 官方模拟枚举 ``1=限价 / 3=市价``（simtrade.ORDER_TYPES 实测 {1,3}）。两侧在此收口：
+#: 文档面给字符串，sim 分支翻成 int；表外的类型**如实拒绝**，不猜也不透传。
+SIM_MAX_QTY_ORDER_TYPES = {"LIMIT": 1, "MARKET": 3}
+
+
+def _sim_max_qty_order_type(value):
+    """``trade_max_qty`` 的 order_type → 模拟枚举（1/3）；不支持的类型抛 ``ValueError``。
+
+    实测（2026-09-17 真机）：模拟盘 max-buy-sell 传 ``"LIMIT"`` 会被 REST 校验层拒
+    （``order_type 取值非法：'LIMIT'（允许：[1, 3]）``），传 int 才通——字符串枚举是
+    工具面契约，翻译必须在适配层完成。int 1/3 原样放行（内部调用点已用模拟口径）。
+    """
+    if isinstance(value, bool) or value is None:
+        raise ValueError("order_type 必填（模拟盘仅 LIMIT/MARKET）")
+    if isinstance(value, int):
+        if value not in SIM_MAX_QTY_ORDER_TYPES.values():
+            raise ValueError(f"order_type 取值非法：{value!r}（模拟盘仅 1=限价 / 3=市价）")
+        return value
+    mapped = SIM_MAX_QTY_ORDER_TYPES.get(str(value).strip().upper())
+    if mapped is None:
+        raise ValueError(f"order_type 取值非法：{value!r}（模拟盘仅 LIMIT/MARKET；"
+                         "官方模拟交易 max-buy-sell 只发布 1=限价 / 3=市价）")
+    return mapped
+
+
+def _sim_market_chain(market_id):
+    return SIM_MARKET_CHAIN.get(market_id, str(market_id))
+
+
+def _sim_rows_of(data):
+    """模拟交易的列表响应取行：``{orders|positions: [...]}`` 或裸列表（缺一不伪造）。"""
+    if isinstance(data, dict):
+        for key in ("orders", "position_list", "positions"):
+            rows = data.get(key)
+            if isinstance(rows, list):
+                return rows
+        return []
+    return data if isinstance(data, list) else []
+
+
+def _sim_status_int(row):
+    """订单行的整数码；取不到/非整数 → None（**不猜**，调用方按「未知」处理）。"""
+    value = row.get("status") if isinstance(row, dict) else None
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        return value
+    text = str(value).strip() if value is not None else ""
+    return int(text) if text.lstrip("-").isdigit() else None
+
+
+def _sim_fill_of(row):
+    """由模拟订单派生成交明细（``cum_qty > 0`` 才算成交）。
+
+    sim 侧**没有独立成交流水**（官方模拟交易只有订单接口），成交只能从订单的
+    ``cum_qty``/``avg_fill_price``（官方文档标注为**字符串**）派生——派生结果在响应里
+    以 ``derived: true`` + ``note`` 如实标注，绝不冒充券商成交流水。
+    """
+    if not isinstance(row, dict):
+        return None
+    try:
+        filled = int(str(row.get("cum_qty") or "0").strip() or 0)
+    except (TypeError, ValueError):
+        return None
+    if filled <= 0:
+        return None
+    status = _sim_status_int(row)
+    return {"order_id": str(row.get("order_id") or ""),
+            "symbol": str(row.get("symbol") or ""),
+            "side": str(row.get("side") or ""),
+            "filled_qty": filled,
+            "avg_price": row.get("avg_fill_price"),
+            "status": SIM_STATUS_LABEL.get(status, row.get("status")),
+            "status_code": status,
+            "update_time": row.get("update_time") or row.get("create_time")}
 
 _SYMBOL_RE = re.compile(r"^([A-Z]+)\.\S+$")
 
@@ -723,8 +813,9 @@ class FutuBroker:
     # 接入了 live 写的适配器必须显式声明 True，才会走完整确认流到达 broker。
     supports_live_write = False
 
-    def __init__(self, call=None):
+    def __init__(self, call=None, home=None):
         self._call = call  # None → 首次调用时经通道适配器惰性构造（见 _tool）
+        self.home = home   # 只读端点的默认模式来源（None → $DSH_HOME 或 ~/.dsh）
 
     def _tool(self):
         if self._call is None:
@@ -932,32 +1023,273 @@ class FutuBroker:
         return {"mode": mode, "source": f"futu/{tool}", "as_of": _iso_now(),
                 "groups": groups, "errors": errors}
 
-    # ---- WP8 任务 3：OpenAPI 交易只读端点（mcp 通道没有对应数据面 → 如实拒绝）----
-    # 这 6 个方法只在 OpenApiBroker（channel=openapi）里有真实实现；这里保留同名方法，
-    # 使「未配置 OpenAPI 的默认部署」拿到 trading/openapi-unavailable 的**可执行指引**，
-    # 而不是 AttributeError 被信封化成一句含糊的通道异常。
+    # ---- WP8 任务 3 / WP16：6 个交易只读端点的**模式感知**实现 ----
+    # 用户诉求（2026-09-17）：「api 不能模拟盘吗，工作台需要支持模拟盘，模拟盘是全自动交易的」。
+    # 这 6 个端点原先是 OpenAPI 独有（channel=openapi 且 mode=live 才可用，sim 一律如实
+    # 拒绝并指引 account_*）。现改为**模式感知**：
+    #   * ``mode == sim`` → 由 sim 侧等价实现提供（本类；底层是 sim_trade_* 工具）；
+    #   * ``mode == live``（mcp 通道）→ 仍如实拒绝「需要 OpenAPI 交易通道」（live 读只有
+    #     OpenAPI 面有真实现，不静默换通道）；
+    #   * ``mode == live``（openapi 通道）→ OpenApiBroker 自己走 REST（委托不到这里）。
+    # 等价关系（逐项与 OpenApiBroker 的 REST 实现同形，便于前端同一套渲染）：
+    #   orders_open   ← sim_trade_order_list（当日订单，按在途码 2/3 过滤）
+    #   orders_history← sim_trade_history_order_list（沿用既有 30 天窗口口径）
+    #   orders_detail ← 当日 + 历史里按 order_id 查找（查不到如实「未知订单」）
+    #   deals_today/history ← 由模拟订单**派生**（cum_qty>0），响应标 derived=true
+    #   trade_max_qty ← sim_trade_max_buy_sell
+    def _mode(self, mode):
+        """只读端点的模式来源：显式值优先（校验合法值），否则读模式文件（缺省 sim）。
+
+        闸门（``TradeGate._read``）总会先解析并校验 mode 再下传；本方法是**直调适配器**
+        （测试/脚本）的兜底，口径与 ``store_access.read_mode`` 一致（缺失=sim、非法抛错）。
+        """
+        if mode:
+            return store_access.mode_value(mode)
+        home = self.home or os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
+        return store_access.read_mode(home)
+
+    def _sim_read_accounts(self, call, market=None):
+        """模拟账户列表（可按市场链名或 market_id 过滤）；acc_id 一律字符串。"""
+        want = sim_market_id(market)
+        accounts = (core_broker.accounts(call) or {}).get("accounts") or []
+        out = []
+        for account in accounts:
+            acc_id = str(account.get("account_id") or "")
+            if not acc_id:
+                continue
+            market_id = account.get("market_id")
+            if want is not None and str(market_id) != str(want):
+                continue
+            out.append({"acc_id": acc_id, "market_id": market_id})
+        return out
+
+    def _sim_today_rows(self, call, acc_id, market_id):
+        """当日订单行（模拟盘 side：「今日订单」接口）。"""
+        data = call(core_broker.TOOLS["orders"],
+                    {"acc_id": acc_id, "market": market_id}, timeout=30)
+        return _sim_rows_of(data)
+
+    def _sim_history_rows(self, call, acc_id, market_id, start, end):
+        """历史订单行（沿用既有 30 天窗口口径：不带时间范围会静默返回 no data）。"""
+        data = call(core_broker.TOOLS["history"],
+                    {"acc_id": acc_id, "market": market_id,
+                     "start": start, "end": end}, timeout=30)
+        return _sim_rows_of(data)
+
+    def _sim_read_fanout(self, payload, mode, worker, require_market=False, market_key=None):
+        """逐模拟账户扇出（与 OpenApiBroker 的 _per_market 同形：单账户失败进 errors）。
+
+        ``worker(acc, market_id) -> rows``；``require_market`` 为真时 payload 必须给出可
+        归一的市场（缺参本地拒绝，不猜——与 OpenApiBroker 同口径）。
+        """
+        if mode != "sim":
+            return None
+        call = self._tool()
+        market = payload.get(market_key or "market")
+        if require_market and sim_market_id(market) is None:
+            raise ValueError("market 必填（SH/HK/US 或 market_id）")
+        groups, errors = [], []
+        for account in self._sim_read_accounts(call, market):
+            try:
+                rows = worker(account, call)
+            except ValueError:
+                raise
+            except Exception as error:  # noqa: BLE001 —— 单账户失败不掩盖
+                errors.append({"acc_id": account["acc_id"], "reason": str(error)[:160]})
+                continue
+            groups.append({"acc_id": account["acc_id"],
+                           "market": _sim_market_chain(account["market_id"]),
+                           "rows": rows})
+        if not groups and not errors:
+            errors.append({"acc_id": None,
+                           "reason": f"模拟账户中没有 {market or '匹配市场'} 的账户"})
+        return groups, errors
+
+    def _read_window(self, payload, days=30):
+        """读窗口：显式 start/end 优先，否则最近 ``days`` 天（与 orders() 同口径）。"""
+        end = payload.get("end") or date.today().isoformat()
+        start = payload.get("start")
+        if not start:
+            start = (date.fromisoformat(end) - timedelta(days=days)).isoformat()
+        return start, end
+
+    def _sim_read_note(self, name):
+        return {
+            "orders_open": ("模拟盘当日订单（sim_trade_order_list）按在途状态码 2/3 过滤；"
+                            "当日已成交/已撤/被拒的单不在本列表（见 orders_history/deals_today）"),
+            "orders_history": ("模拟盘历史订单（sim_trade_history_order_list，默认最近 30 天；"
+                               "该工具不带时间范围会静默返回 no data，见 TOOL-LIMITS）"),
+            "orders_detail": "模拟盘订单详情（在当日 + 历史订单里按 order_id 查找）",
+            "trade_max_qty": ("模拟盘最大可买可卖（sim_trade_max_buy_sell；"
+                              "max_cash_buy_qty_round_lot/max_sell_qty_round_lot 等原始字段）"),
+        }.get(name, f"模拟盘只读查询（{name}）")
+
     def trade_max_qty(self, payload, mode=None):
-        """见 OpenApiBroker.trade_max_qty（需要 futu_channel=openapi）。"""
+        """最大可交易量：sim → sim_trade_max_buy_sell；live(mcp) → 如实拒绝。"""
+        mode = self._mode(mode)
+        if mode == "sim":
+            symbol = payload.get("code")
+            if not symbol:
+                raise ValueError("code 必填")
+            code = str(symbol).strip().upper()
+            # 工具面契约是字符串枚举，模拟盘只认 1/3 → 在此翻译并拒绝表外类型（不猜）
+            order_type = _sim_max_qty_order_type(payload.get("order_type"))
+            # 实测（2026-09-17 真机）：max-buy-sell **缺 price 会返回全 0**
+            # （限价/市价都一样：ot=1 无价 → max_cash_buy=0，带 2.11 → 26100）——
+            # 全 0 是「没问对」而不是「买不了」，如实拒绝，不把一个假数字当答案。
+            if payload.get("price") is None:
+                raise ValueError("price 必填：模拟盘 max-buy-sell 缺 price 会返回全 0，"
+                                 "不能据此回答最大可买卖量（官方页面标选填，实测必填）")
+            # 标的要**裸代码**（实测 "SH.600010" → -5 backend business error；"600010" → 正常）
+            bare = code.split(".", 1)[-1]
+            want = PREFIX_MARKET_ID.get(code.split(".", 1)[0])
+            if want is None:
+                # 未登记的市场前缀：**不扇出到全部模拟账户**（否则会拿别的市场的账户去答
+                # 一个未知市场的最大可买卖量）。如实报「无对应市场」，不猜。
+                return {"mode": mode, "source": "futu/sim_trade_max_buy_sell",
+                        "as_of": _iso_now(), "groups": [],
+                        "errors": [{"acc_id": None,
+                                    "reason": f"未知市场前缀：{code}（未登记模拟账户口径）"}],
+                        "note": self._sim_read_note("trade_max_qty")}
+            call = self._tool()
+            groups, errors = [], []
+            for account in self._sim_read_accounts(call, want):
+                try:
+                    data = call(core_broker.TOOLS["max_buy_sell"],
+                                {"acc_id": account["acc_id"], "market": account["market_id"],
+                                 "symbol": bare, "order_type": order_type,
+                                 "price": payload.get("price"),
+                                 "order_id": payload.get("order_id")}, timeout=30)
+                except ValueError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    errors.append({"acc_id": account["acc_id"], "reason": str(error)[:160]})
+                    continue
+                groups.append({"acc_id": account["acc_id"],
+                               "market": _sim_market_chain(account["market_id"]),
+                               "code": code, "max": data or {}})
+            if not groups and not errors:
+                errors.append({"acc_id": None,
+                               "reason": f"没有可交易 {code.split('.', 1)[0]} 市场的模拟账户"})
+            return {"mode": mode, "source": "futu/sim_trade_max_buy_sell", "as_of": _iso_now(),
+                    "groups": groups, "errors": errors,
+                    "note": self._sim_read_note("trade_max_qty")}
         raise OpenApiUnavailable(f"trade_max_qty 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
 
     def orders_open(self, payload, mode=None):
-        """见 OpenApiBroker.orders_open（需要 futu_channel=openapi）。"""
+        """未完成订单：sim → 当日订单按在途码过滤；live(mcp) → 如实拒绝。"""
+        mode = self._mode(mode)
+        if mode == "sim":
+            fan = self._sim_read_fanout(
+                payload, mode,
+                lambda account, call: [
+                    row for row in self._sim_today_rows(call, account["acc_id"],
+                                                        account["market_id"])
+                    if _sim_status_int(row) in SIM_OPEN_STATUS])
+            groups, errors = fan
+            return {"mode": mode, "source": "futu/sim_trade_order_list", "as_of": _iso_now(),
+                    "groups": groups, "errors": errors, "filter": "status in {2,3}",
+                    "note": self._sim_read_note("orders_open")}
         raise OpenApiUnavailable(f"orders_open 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
 
     def orders_history(self, payload, mode=None):
-        """见 OpenApiBroker.orders_history（需要 futu_channel=openapi）。"""
+        """历史订单：sim → sim_trade_history_order_list（30 天窗口）；live(mcp) → 如实拒绝。"""
+        mode = self._mode(mode)
+        if mode == "sim":
+            start, end = self._read_window(payload)
+            fan = self._sim_read_fanout(
+                payload, mode,
+                lambda account, call: self._sim_history_rows(call, account["acc_id"],
+                                                             account["market_id"], start, end))
+            groups, errors = fan
+            return {"mode": mode, "source": "futu/sim_trade_history_order_list",
+                    "as_of": _iso_now(), "window": {"start": start, "end": end},
+                    "groups": groups, "errors": errors,
+                    "note": self._sim_read_note("orders_history")}
         raise OpenApiUnavailable(f"orders_history 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
 
     def orders_detail(self, payload, mode=None):
-        """见 OpenApiBroker.orders_detail（需要 futu_channel=openapi）。"""
+        """订单详情：sim → 当日 + 历史里按 order_id 查找；查不到如实「未知订单」。"""
+        mode = self._mode(mode)
+        if mode == "sim":
+            wanted = payload.get("order_ids")
+            if isinstance(wanted, str):
+                wanted = [wanted]
+            wanted = {str(item) for item in (wanted or []) if item}
+            if not wanted:
+                raise ValueError("order_ids 必填（一个或多个订单号）")
+            start, end = self._read_window(payload)
+            call = self._tool()
+            groups, errors, found = [], [], set()
+            for account in self._sim_read_accounts(call, payload.get("market")):
+                try:
+                    rows = (self._sim_today_rows(call, account["acc_id"], account["market_id"])
+                            + self._sim_history_rows(call, account["acc_id"],
+                                                     account["market_id"], start, end))
+                except ValueError:
+                    raise
+                except Exception as error:  # noqa: BLE001
+                    errors.append({"acc_id": account["acc_id"], "reason": str(error)[:160]})
+                    continue
+                hits, seen = [], set()
+                # 当日列表与历史窗口**重叠**（官方两套接口都覆盖当日订单）：按订单号去重，
+                # 否则同一张单在详情里出现两次（2026-09-17 真机：7149712 两行）。
+                for row in rows:
+                    order_id = str((row or {}).get("order_id") or "")
+                    if order_id in wanted and order_id not in seen:
+                        seen.add(order_id)
+                        hits.append(row)
+                found |= seen
+                if hits:
+                    groups.append({"acc_id": account["acc_id"],
+                                   "market": _sim_market_chain(account["market_id"]),
+                                   "rows": hits})
+            missing = sorted(wanted - found)
+            note = self._sim_read_note("orders_detail")
+            if missing:
+                note += f"；未在模拟账本中找到（未知订单）：{','.join(missing)}"
+            return {"mode": mode, "source": "futu/sim_trade_order_list+history",
+                    "as_of": _iso_now(), "window": {"start": start, "end": end},
+                    "groups": groups, "errors": errors, "missing": missing, "note": note}
         raise OpenApiUnavailable(f"orders_detail 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
 
     def deals_today(self, payload, mode=None):
-        """见 OpenApiBroker.deals_today（需要 futu_channel=openapi）。"""
+        """当日成交：sim → 由当日模拟订单**派生**（标 derived）；live(mcp) → 如实拒绝。"""
+        mode = self._mode(mode)
+        if mode == "sim":
+            fan = self._sim_read_fanout(
+                payload, mode,
+                lambda account, call: [
+                    fill for fill in (
+                        _sim_fill_of(row) for row in
+                        self._sim_today_rows(call, account["acc_id"], account["market_id"]))
+                    if fill])
+            groups, errors = fan
+            return {"mode": mode, "source": "futu/sim_trade_order_list(derived)",
+                    "as_of": _iso_now(), "groups": groups, "errors": errors, "derived": True,
+                    "note": "由模拟订单派生，非券商成交流水（sim 无独立成交接口；"
+                            "只列 cum_qty>0 的订单）"}
         raise OpenApiUnavailable(f"deals_today 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
 
     def deals_history(self, payload, mode=None):
-        """见 OpenApiBroker.deals_history（需要 futu_channel=openapi）。"""
+        """历史成交：sim → 由历史模拟订单**派生**（标 derived）；live(mcp) → 如实拒绝。"""
+        mode = self._mode(mode)
+        if mode == "sim":
+            start, end = self._read_window(payload)
+            fan = self._sim_read_fanout(
+                payload, mode,
+                lambda account, call: [
+                    fill for fill in (
+                        _sim_fill_of(row) for row in
+                        self._sim_history_rows(call, account["acc_id"],
+                                               account["market_id"], start, end))
+                    if fill])
+            groups, errors = fan
+            return {"mode": mode, "source": "futu/sim_trade_history_order_list(derived)",
+                    "as_of": _iso_now(), "window": {"start": start, "end": end},
+                    "groups": groups, "errors": errors, "derived": True,
+                    "note": "由模拟订单派生，非券商成交流水（sim 无独立成交接口；"
+                            "只列 cum_qty>0 的订单）"}
         raise OpenApiUnavailable(f"deals_history 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
 
 
@@ -1054,7 +1386,8 @@ class OpenApiBroker:
         self.home = home
         self._trade_override = trade
         self._credential_path = credential_path
-        self._legacy = legacy if legacy is not None else FutuBroker(call=call)
+        self._legacy = (legacy if legacy is not None
+                        else FutuBroker(call=call, home=home))
         self._trade_built = None
         # 通道钉死口径与 futu_data.FutuData 一致：注入 trade 替身 → openapi，
         # 注入 call 替身（MCP）→ mcp，二者都没有才惰性读 futu_channel 配置。
@@ -1107,13 +1440,18 @@ class OpenApiBroker:
         return "openapi"
 
     def _read_route(self, name, mode):
-        """6 个只读新工具的通道判定（mcp/sim/无凭据 → 如实拒绝，不静默回退 MCP）。"""
+        """6 个只读新工具的 **live** 通道判定（mcp/无凭据 → 如实拒绝，不静默回退 MCP）。
+
+        WP16（2026-09-17）：原先这里对 ``mode != "live"`` 一律拒绝（「只覆盖实盘业务账户…
+        sim 模式请用 account_*」）——那是**死路**，用户明确要求工作台支持模拟盘。现在
+        ``mode == sim`` 由**调用方**（每个只读方法的首行）分支到 sim 等价实现，本方法只
+        负责 live 的通道与凭据判定；因此 ``mode`` 参数仅用于断言调用方分流正确。
+        """
+        if mode != "live":  # pragma: no cover —— 调用方已分流；留作分流失守的显式信号
+            raise OpenApiUnavailable(
+                f"{name} 的内部路由错误：sim 应由 FutuBroker 的 sim 等价实现处理")
         if self.channel != futu_data.CHANNEL_OPENAPI:
             raise OpenApiUnavailable(f"{name} 需要 OpenAPI 交易通道；{OPENAPI_ONLY_HINT}")
-        if mode != "live":
-            raise OpenApiUnavailable(
-                f"{name} 只覆盖实盘业务账户（OpenAPI 交易接口不含模拟账户）；"
-                "sim 模式请用 account_positions/account_orders/account_funds")
         if not self._openapi_ready():
             raise OpenApiUnavailable(
                 f"OpenAPI 凭据缺失（~/.dsh/futu-openapi.json）{OPENAPI_AUTH_HINT}")
@@ -1391,6 +1729,10 @@ class OpenApiBroker:
 
     def trade_max_qty(self, payload, mode):
         """GET /accounts/{acc_id}/acctradinginfo —— 最大可交易量（逐账户列出）。"""
+        if mode == "sim":
+            # WP16：模拟盘读能力——sim 走 FutuBroker 的等价实现（sim_trade_*），
+            # live 才走 OpenAPI REST（原先 sim 一律拒绝，是死路）。
+            return self._legacy.trade_max_qty(payload, mode)
         self._read_route("trade_max_qty", mode)
         symbol = payload.get("code")
         prefix, want = self._enable_of_symbol(symbol)
@@ -1421,6 +1763,10 @@ class OpenApiBroker:
 
     def orders_open(self, payload, mode):
         """GET /accounts/{acc_id}/orders —— 未完成订单（含最近 24h 已成交/已撤）。"""
+        if mode == "sim":
+            # WP16：模拟盘读能力——sim 走 FutuBroker 的等价实现（sim_trade_*），
+            # live 才走 OpenAPI REST（原先 sim 一律拒绝，是死路）。
+            return self._legacy.orders_open(payload, mode)
         self._read_route("orders_open", mode)
         groups, errors = self._per_market(
             payload, "orders_open",
@@ -1433,6 +1779,10 @@ class OpenApiBroker:
 
     def orders_history(self, payload, mode):
         """GET /accounts/{acc_id}/orders_history —— 历史订单（start/end 微秒）。"""
+        if mode == "sim":
+            # WP16：模拟盘读能力——sim 走 FutuBroker 的等价实现（sim_trade_*），
+            # live 才走 OpenAPI REST（原先 sim 一律拒绝，是死路）。
+            return self._legacy.orders_history(payload, mode)
         self._read_route("orders_history", mode)
         groups, errors = self._per_market(
             payload, "orders_history",
@@ -1446,6 +1796,10 @@ class OpenApiBroker:
 
     def orders_detail(self, payload, mode):
         """POST /accounts/{acc_id}/orders/detail —— 订单详情（逐账户问同一批订单号）。"""
+        if mode == "sim":
+            # WP16：模拟盘读能力——sim 走 FutuBroker 的等价实现（sim_trade_*），
+            # live 才走 OpenAPI REST（原先 sim 一律拒绝，是死路）。
+            return self._legacy.orders_detail(payload, mode)
         self._read_route("orders_detail", mode)
         groups, errors = self._per_account(
             lambda acc_id, account: {
@@ -1458,6 +1812,10 @@ class OpenApiBroker:
 
     def deals_today(self, payload, mode):
         """GET /accounts/{acc_id}/order_fills —— 当日成交。"""
+        if mode == "sim":
+            # WP16：模拟盘读能力——sim 走 FutuBroker 的等价实现（sim_trade_*），
+            # live 才走 OpenAPI REST（原先 sim 一律拒绝，是死路）。
+            return self._legacy.deals_today(payload, mode)
         self._read_route("deals_today", mode)
         groups, errors = self._per_market(
             payload, "deals_today",
@@ -1469,6 +1827,10 @@ class OpenApiBroker:
 
     def deals_history(self, payload, mode):
         """GET /accounts/{acc_id}/fills_history —— 历史成交（page_size 上界 50）。"""
+        if mode == "sim":
+            # WP16：模拟盘读能力——sim 走 FutuBroker 的等价实现（sim_trade_*），
+            # live 才走 OpenAPI REST（原先 sim 一律拒绝，是死路）。
+            return self._legacy.deals_history(payload, mode)
         self._read_route("deals_history", mode)
         groups, errors = self._per_market(
             payload, "deals_history",

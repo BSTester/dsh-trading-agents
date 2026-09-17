@@ -477,8 +477,76 @@ qty / cum_qty / price / avg_fill_price 均为**字符串**
 - 若某天上游改了编码，症状是「对账不再自动收敛」→ 用下面的 `oms-align` 人工留痕兜底，
   并把新码补进 `SIM_ORDER_STATUS`（单一事实源在 `trading_core/reconcile.py`）。
 
-### 期权筛选（`option_screen`）的最小可用载荷（2026-09-17 真机验证）
+### 模拟盘读能力与自动执行下单账户（WP16，2026-09-17 实机）
 
+**背景**：`orders_open` / `orders_history` / `orders_detail` / `deals_today` /
+`deals_history` / `trade_max_qty` 六个只读端点过去只在 `futu_channel=openapi` 且
+`mode=live` 可用；sim 一律 `trading/openapi-unavailable` +「sim 模式请用 account_*」——
+对模拟盘是**死路**。用户明确要求工作台支持模拟盘（模拟盘是全自动交易的），现已按
+**模式分派**：sim 走官方 `sim_trade_*` 等价端点，live 行为逐字不变。
+
+| 端点 | `mode=sim`（模拟盘） | `mode=live`（openapi） | `mode=live`（mcp 通道） |
+|---|---|---|---|
+| `orders_open` | `sim_trade_order_list`，按在途码 2/3 过滤（响应 `filter` 标注） | REST `/orders` | `openapi-unavailable` |
+| `orders_history` | `sim_trade_history_order_list`（默认近 30 天，`window` 标注；该工具不带时间范围会静默 no data） | REST `/history-orders` | 同上 |
+| `orders_detail` | 当日 + 历史按 `order_id` 查找，查不到进 `missing`（并集去重） | REST 逐账户 | 同上 |
+| `deals_today` | **由当日订单派生**（`cum_qty>0`），`derived=true` | REST `/order_fills` | 同上 |
+| `deals_history` | **由历史订单派生**，`derived=true` | REST `/fills_history` | 同上 |
+| `trade_max_qty` | `sim_trade_max_buy_sell` | REST `/acctradinginfo` | 同上 |
+
+**模拟盘这四条实测口径**（2026-09-17 真机，缺一条就答错）：
+
+1. `trade_max_qty` 的 `symbol` 必须**裸代码**——`SH.600010` 报
+   `[errcode=-5] backend business error`，`600010` 正常返回；
+2. `order_type`：工具面契约是 OpenAPI **字符串枚举**，模拟盘只发布 `1=限价 / 3=市价`
+   （`simtrade.ORDER_TYPES={1,3}`）→ 适配层翻译 `LIMIT→1 / MARKET→3`，表外类型
+   （STOP/AUCTION…）如实拒绝为 `trading/invalid-operation`；
+3. `price` 对模拟盘**实测必填**：缺 price 时回全 0（`max_cash_buy_qty_round_lot=0`，
+   限价/市价都一样；带 `2.11` → `26100`）。全 0 是「没问对」而不是「买不了」——服务端
+   据此拒绝，不把 0 当答案（官方页面把 `price` 标选填，实测不是）；
+4. `deals_*` **没有**官方模拟成交流水端点，只能由订单派生；响应恒带 `derived=true` +
+   note，界面标「橙色 · 由委托派生」，绝不冒充实盘成交流水。
+
+**实机缺陷（本次验证发现并已修复）：模拟盘自动执行的下单腿从未到达模拟账户**
+
+证据链（2026-09-17 22:45–23:10，本机真实模拟盘 + `futu_channel=openapi`）：
+
+- 服务内调度器（60s tick）**无人触发**地自动生成冻结计划 `PLN-20260917-sim-EB90`
+  （`origin=auto/market=SH/mode=sim`，content_hash `df525f82d32a986e`）；同轮
+  `auto_execute` 被**日内熔断**（对账差异 halt）正确拦下（warn 告警「熔断生效」）；
+- 按 RUNBOOK 场景 3 查明并清 halt 后补跑：九守卫放行 → 写下 `execute_plan` 指令 →
+  服务内指令轮询消费 → 风控**规则 6** 拦下（`成交后持仓数 > 5`：A 股模拟账户实持 8 只，
+  默认 `max_positions=5`）；
+- 把单笔风险预算临时调小（定量 9,400 股 ≈ 19,834 元，落在账户可用资金内）后重跑：
+  订单走到券商，被 `[errcode=-3] invalid parameter` 拒绝；
+- **根因（零网络复现）**：`execute.run` 一直用占位符 `acc_id="SIM"` 下单，REST 把它拼进
+  URL —— 出站是 `POST /api/v1.0/sim-trade/SIM/orders`，而工作台闸门路径出站
+  `POST /api/v1.0/sim-trade/3182575/orders`。MCP 通道下上游忽略该占位符（所以历史测试
+  没暴露），切到 openapi 后**每一张自动执行单都被券商拒绝**：计划、守卫、指令、风控
+  全部正常，单子从未到达模拟账户；
+- **修复**：`broker.sim_account_for_market`（市场 → 真实模拟账户，口径与
+  `_sim_positions_and_equity` 同一张 `sim_trade_account_list`）+ `execute.run` 逐市场解析
+  （按市场缓存；解析不到/账户表不可用保留占位符，由券商如实报错，不静默丢单）；
+- **修复后实机**（同一生产执行体：`auto_execute` → `poll_commands` →
+  `_execute_plan`）：订单 `7149712` / `7149716` 状态 `submitted`（broker_order_id 已回写
+  OMS，随后人工撤单置 `cancelled`），`risk_checks` 规则 0 `allowed=1`；sim 的
+  `orders_open` 能看到在途单（`status=2`、`side=1`、`filter="status in {2,3}"`）；
+- **上线前提**：修复在 `trading_core`，常驻服务进程仍是旧代码——需
+  `scripts/platform_service.sh refresh && scripts/platform_service.sh restart`
+  才在生产进程生效（本次验证按约定**未重启**服务）。
+
+**未解决 / 需人工决定的两项**（如实登记，未擅自改配置）：
+
+- **本机模拟盘结构性拒单**：A 股模拟账户实持 8 只 > 默认 `max_positions=5`，且可用资金
+  仅 `55,257.816`（权益 `812,231.816` 中 `756,974` 是持仓市值）。按权益 25% 权重定量的
+  自动计划在本机会生成**买不动/被风控拦下**的量（本次靠临时调小 `risk_per_trade` 才走通
+  下单腿）。是否调 `max_positions`/`risk_per_trade`、还是减仓，属交易决策。
+- **`missing_in_oms` 差异没有收敛入口**：券商有单、本地 OMS 无对应行（如 09:35 的
+  `SH.603993` / `7147945`，已撤、无成交），`oms-align` 要求本地已存在该
+  `broker_order_id` → **拒绝**。本次只能按 RUNBOOK 场景 3 人工 `clear_halt`；差异次日
+  对账仍会重现（critical 告警保留，未 ack）。
+
+### 期权筛选（`option_screen`）的最小可用载荷（2026-09-17 真机验证）
 调用方此前只能靠试错（空 `field_filter` 值会被上游 `-3 invalid parameter`）。**可用最小载荷**：
 
 ```json
