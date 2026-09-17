@@ -350,25 +350,33 @@ class ProcessCleanupTest(_Base):
             "open(ready,'w').write('1')\n"
             "time.sleep(60)\n"
         )
-        parent = subprocess.Popen([sys.executable, "-c", program],
-                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        try:
-            self.assertTrue(_wait_for_file(ready_file, timeout=10), "子进程应就绪")
-            grandpid = _wait_for_file(sleeper_pid_file, timeout=10)
-            self.assertTrue(grandpid, "孙进程应先写出自己的 pid")
-            parent.send_signal(signal.SIGTERM)
-            self.assertIsNotNone(parent.wait(timeout=10), "父进程应被 SIGTERM 终止")
-            deadline = time.time() + 5
-            while time.time() < deadline and _alive(grandpid):
-                time.sleep(0.1)
-            self.assertFalse(_alive(grandpid), f"孙进程 {grandpid} 必须被一起回收")
-        finally:
-            if parent.poll() is None:
-                parent.kill()
-                parent.wait()
-            if _alive(_wait_for_file(sleeper_pid_file, timeout=0.5) or "0"):
-                with contextlib.suppress(ProcessLookupError, ValueError):
-                    os.kill(int(_wait_for_file(sleeper_pid_file, timeout=0.5)), signal.SIGKILL)
+        # 就绪余量刻意放宽：全量套件满载（2100+ 用例）时，子进程「导入 trading_core →
+        # 装守卫 → 起线程 → 起孙进程」实测可超过 10s（曾因此在全量跑里假红一次）。
+        # stderr 落文件而非 DEVNULL：失败时能把子进程的真实报错贴进断言消息。
+        log_path = self.home / "sigterm_child.log"
+        with log_path.open("w", encoding="utf-8") as log:
+            parent = subprocess.Popen([sys.executable, "-c", program],
+                                      stdout=log, stderr=subprocess.STDOUT)
+            try:
+                self.assertTrue(
+                    _wait_for_file(ready_file, timeout=30),
+                    f"子进程应就绪（30s 内）；child 输出：{log_path.read_text()[:400]!r}")
+                grandpid = _wait_for_file(sleeper_pid_file, timeout=30)
+                self.assertTrue(grandpid, "孙进程应先写出自己的 pid")
+                parent.send_signal(signal.SIGTERM)
+                self.assertIsNotNone(parent.wait(timeout=15), "父进程应被 SIGTERM 终止")
+                deadline = time.time() + 10
+                while time.time() < deadline and _alive(grandpid):
+                    time.sleep(0.1)
+                self.assertFalse(_alive(grandpid), f"孙进程 {grandpid} 必须被一起回收")
+            finally:
+                if parent.poll() is None:
+                    parent.kill()
+                    parent.wait()
+                stale = _wait_for_file(sleeper_pid_file, timeout=0.5)
+                if stale and _alive(stale):
+                    with contextlib.suppress(ProcessLookupError, ValueError):
+                        os.kill(int(stale), signal.SIGKILL)
 
 
 # ---------------------------------------------------------------------------
