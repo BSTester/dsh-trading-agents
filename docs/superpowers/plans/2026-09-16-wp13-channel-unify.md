@@ -57,14 +57,14 @@ def test_statements_announced_at_preserved(self):
 
 **文件**：修改 `futu_openapi.py`（`OpenApiSimTrade`：account_list/cash_info/position_list/input_order/modify_order/cancel_order/order_list/history_order_list/max_buy_sell 九方法）、`plugins/core/python/trading_core/broker.py`（sim 分支接通道分派）；测试 `tests/test_wp13_simtrade.py`。
 
-- [ ] **步骤 1：失败测试**（mock 传输）：
+- [x] **步骤 1：失败测试**（mock 传输）：
   ① 九方法路径/参数与锁定表（WP12 任务 1 已核对 sim-trade 族）一致；input_order 限价当日单参数锁定（order_type=1 对应口径照 TOOL-LIMITS）；
   ② `broker.place` 在 openapi 通道下走 `input_order`，mcp 通道零变化（既有 test_core_broker 回归）；
   ③ 改单策略：sim 下 modify → **撤旧重下**（沿用现状，注释注明官方模拟改单可靠性待实测，实测通过再切原生——登记 TOOL-LIMITS 待办）；
   ④ 超时/传输异常 → unknown（先查不重放，既有铁律在 sim REST 路径同样成立）。
-- [ ] **步骤 2：验证失败** → **步骤 3：实现**：`broker.py` 的 sim 调用统一经 `_sim_call(home, method, **params)` 通道分派（与 sync 的 `_fetch` 同构，放 `trading_core/channel.py` 单一实现，两处共用）。
-- [ ] **步骤 4：通过**；三套绿。
-- [ ] **步骤 5：Commit**：`git commit -m "feat(core): 模拟交易九端点 REST 化（channel 分派共用，先查不重放不变）"`
+- [x] **步骤 2：验证失败** → **步骤 3：实现**：`broker.py` 的 sim 调用统一经 `_sim_call(home, method, **params)` 通道分派（与 sync 的 `_fetch` 同构，放 `trading_core/channel.py` 单一实现，两处共用）。
+- [x] **步骤 4：通过**；三套绿。
+- [x] **步骤 5：Commit**：`git commit -m "feat(core): 模拟交易九端点 REST 化（channel 分派共用，先查不重放不变）"`
 
 ### 任务 3：双通道等价 + sim 全链路回归
 

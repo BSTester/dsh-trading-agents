@@ -34,6 +34,28 @@ DSH = Path(os.environ.get("DSH_HOME") or Path.home() / ".dsh").expanduser()
 CACHE_TTL_SECONDS = 300  # 5 分钟：面板是查看用途，不必每次进页面都问券商
 EQUITY_MARKS_KEPT = 400  # 约一年半的交易日
 
+#: 通道分派的 call_tool（WP13 任务 2）：模拟交易工具在 ``futu_channel=openapi`` 且凭据
+#: 就绪时走 REST，其余工具（live 账户/行情）原样走 MCP——与 core/broker 和平台闸门用
+#: 同一个适配器（``trading_datasource.channel.sim_call``），翻译表只有一份。
+#: 默认通道（mcp）下行为与改造前逐字一致；惰性构造，避免只为读 MCP 就加载 OpenAPI 私钥。
+_CHANNEL_CALL = None
+
+
+def channel_call(name, arguments, timeout=30):
+    global _CHANNEL_CALL
+    if _CHANNEL_CALL is None:
+        try:
+            from trading_datasource.channel import sim_call  # noqa: PLC0415
+            # MCP 侧仍经**本模块的 call_tool 名字**转发（不直接绑 futu_mcp.call_tool）：
+            # 测试与运维都用 ``patch.object(positions, "call_tool")`` 注入替身，
+            # 直接绑死会把那个注入点悄悄掐掉。
+            _CHANNEL_CALL = sim_call(
+                mcp_call=lambda tool, params, timeout=30:
+                call_tool(tool, params, timeout=timeout))
+        except Exception:  # noqa: BLE001 —— 适配器不可用：如实回退 MCP（既有行为）
+            _CHANNEL_CALL = call_tool
+    return _CHANNEL_CALL(name, arguments, timeout=timeout)
+
 
 def equity_path(mode):
     return DSH / f"trading-equity-{mode}.json"
@@ -119,13 +141,13 @@ def sim_groups(errors):
     串行读 9 个账户需要约 36 秒（每次往返约 3.5 秒）。共享客户端已做线程安全，
     因此用线程池并发，耗时降到 ≈ 一轮往返。
     """
-    accounts = [a for a in ((call_tool("sim_trade_account_list", {}) or {}).get("accounts") or [])
+    accounts = [a for a in ((channel_call("sim_trade_account_list", {}) or {}).get("accounts") or [])
                 if a.get("account_id")]
     groups = []
 
     def fetch(account):
         try:
-            return account, call_tool("sim_trade_position_list",
+            return account, channel_call("sim_trade_position_list",
                                       {"acc_id": str(account["account_id"]),
                                        "market": account.get("market_id")}, timeout=30) or {}
         except FutuUnavailable as error:
@@ -140,7 +162,7 @@ def sim_groups(errors):
 
     def fetch_cash(acc_id):
         try:
-            return acc_id, call_tool("sim_trade_cash_info", {"acc_id": acc_id}, timeout=30) or {}
+            return acc_id, channel_call("sim_trade_cash_info", {"acc_id": acc_id}, timeout=30) or {}
         except FutuUnavailable:
             return acc_id, {}
 
@@ -197,7 +219,7 @@ def sim_groups(errors):
 # ---- 实盘 ----
 
 def live_groups(errors):
-    accounts = (call_tool("account_authorized_trd_accs", {}) or {}).get("accounts") or []
+    accounts = (channel_call("account_authorized_trd_accs", {}) or {}).get("accounts") or []
     groups = []
     for account in accounts:
         acc_id = str(account.get("account_id") or "")
@@ -205,7 +227,7 @@ def live_groups(errors):
             continue
         reset_session()
         try:
-            rows = call_tool("account_positions", {"acc_id": acc_id}, timeout=30)
+            rows = channel_call("account_positions", {"acc_id": acc_id}, timeout=30)
         except FutuUnavailable as error:
             errors.append({"account": f"账户 …{acc_id[-4:]}", "acc_id": acc_id,
                            "reason": str(error)[:160]})

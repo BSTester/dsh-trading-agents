@@ -165,11 +165,13 @@
 
 ### C.9 模拟交易（9）⚠️
 
-> **⚠️ 鉴权模型注意事项（WP13 前置）**：官方模拟交易文档明确 **`uid` 由登录态 header 自动透传**
-> （见 account-list「请求参数：无入参。uid 由登录态 header 自动透传」）。仓库现有 OpenAPI 凭据
-> 是 **AppKey 签名 / OAuth 服务端凭据**，**是否携带用户登录态未验证**。因此：
-> ① 本表 9 行路径/参数**已核对**；② **凭据模型兼容性属「待实测」**——WP13 任务 2 必须先用
-> 真实凭据实测，实测不通过则**保留托管 MCP `sim_trade_*` 通道**（本表不构成迁移承诺）；
+> **✅ 鉴权模型已实测（WP13 任务 2，2026-09-16）**：官方文档称 `uid` 由**登录态 header**
+> 自动透传，本仓库 AppKey（Ed25519 签名）凭据**实测兼容**——`GET /api/v1.0/sim-trade/accounts`
+> 返回 9 个模拟账户，写路径（挂单→改单→撤单）全链路真机通过，故 sim 链路已按本表迁移到
+> REST（`futu_channel=openapi`）。**追加实测差异**：`orders`/`history-orders`/`max-buy-sell`
+> 的 `market` 必填（页面未列）；`history-orders` 时间窗需微秒 int；`cancel_order`/
+> `modify_order` 需 body 携带 `market`（cancel 页写「无请求体」）。四条差异与证据见
+> `docs/TOOL-LIMITS.md` §九。
 > ③ 官方模拟交易文档**未提供错误码表**（下表「错误码」列如实标「文档未列」）。
 
 | 端点 | 方法 + 路径 | 关键参数 | 响应关键字段 | 状态 | 文档 |

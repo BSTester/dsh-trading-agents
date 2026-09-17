@@ -113,6 +113,15 @@ WP8 起服务进程的行情取数与交易执行统一经 `trading_datasource.f
 （`trading-platform.json` 顶层 `futu_channel: openapi|mcp` 切换，默认 mcp 保持零变化；
 openapi 已配置凭据时行情与交易都走 REST，交易事件走 WS 推送）。据此：
 
+**WP13 任务 2 补记（模拟交易 REST 化）**：`OpenApiSimTrade` 九端点已接入，sim 链路的
+下单/改单/撤单/持仓/资金/订单/历史/最大买卖量在 `futu_channel=openapi` 且凭据就绪时走
+REST（否则原样回退 MCP，默认通道行为逐字不变）。通道选择集中在
+`trading_datasource.channel.sim_call`（与 `futu_mcp.call_tool` 同签名，调用方零改动），
+`trading_core.broker`、平台闸门与 `workbench/positions.py` 共用同一份翻译表。
+**前置实测（2026-09-16）**：AppKey 凭据可直接访问模拟交易端点（锁定表事前登记的
+「登录态 header」风险不成立），写路径全链路（挂单→改单→撤单）真机验证通过；四条官方
+页面与实测不一致及待办见 [TOOL-LIMITS.md](TOOL-LIMITS.md) §九。
+
 | 通道 | WP8 后定位 |
 |---|---|
 | 工作台 OpenAPI（`mcp__quantwb__*` + Web） | **唯一权威通道**：行情/交易/推送/账户全链路，写路径唯一（闸门链 + 业务确认） |

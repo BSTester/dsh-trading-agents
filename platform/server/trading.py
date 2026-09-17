@@ -721,12 +721,15 @@ class FutuBroker:
     supports_live_write = False
 
     def __init__(self, call=None):
-        self._call = call  # None → 首次调用时惰性导入 futu_mcp.call_tool
+        self._call = call  # None → 首次调用时经通道适配器惰性构造（见 _tool）
 
     def _tool(self):
         if self._call is None:
-            from trading_datasource.futu_mcp import call_tool  # noqa: PLC0415
-            self._call = call_tool
+            # WP13 任务 2：sim 链路经通道适配器（futu_channel=openapi 且凭据就绪走 REST，
+            # 否则原样交给 MCP）；live 工具名不在翻译表内 → 适配器原样转 MCP，
+            # 行为与改造前逐字一致（live 写仍走 OpenApiTrade 的既有分支）。
+            from trading_datasource.channel import sim_call  # noqa: PLC0415
+            self._call = sim_call()
         return self._call
 
     # ---- sim 账户解析 ----

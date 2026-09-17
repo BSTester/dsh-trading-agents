@@ -13,9 +13,24 @@ TOOLS = {"place": "sim_trade_input_order", "cancel": "sim_trade_cancel_order",
 PLACE_REQUIRED = ("acc_id", "market", "symbol", "order_type", "order_side", "qty")
 
 # 市场链 → 模拟账户 market_id（数字口径来自 platform/server/store_access.MARKET_HINT
-# 的实测：港股 1 / A股 3 / 美股 100）。core 不能 import server 包，这里是镜像，
-# 漂移由 tests/test_wp9_plan_auto.py 的锁定用例炸掉。
+# 的实测：港股 1 / A股 3 / 美股 100）。**唯一实现在
+# ``trading_datasource.market_ids.SIM_MARKET_IDS``**（WP13 任务 2 起：通道适配器也要
+# 用它翻译 REST 参数）；这里是镜像常量，漂移由 tests/test_wp13_simtrade.py 的锁定用例
+# 与 tests/test_wp9_plan_auto.py 的既有用例一起炸掉。core 不在模块级导入
+# trading_datasource（避免导入期拉起 futu_mcp 会话），故保留镜像而非 import。
 MARKET_IDS = {"SH": 3, "SZ": 3, "BJ": 3, "HK": 1, "US": 100}
+
+
+def sim_call(home=None, **kwargs):
+    """模拟交易通道 callable（与 ``futu_mcp.call_tool`` 同签名）——sim 链路的唯一入口。
+
+    WP13 任务 2：``futu_channel: openapi`` 且凭据就绪 → REST（``OpenApiSimTrade``）；
+    否则原样交给托管 MCP。翻译表与解析逻辑只有一份，在
+    ``trading_datasource.channel.sim_call``；本函数是 **core 侧的稳定入口**，让
+    daemon 执行链/平台闸门不必知道 datasource 的分派细节（也避免它们各自 import）。
+    """
+    from trading_datasource.channel import sim_call as _sim_call  # noqa: PLC0415
+    return _sim_call(home, **kwargs)
 
 # live 账户查询工具名（MCP 通道实名，与 platform/server/trading.py 的实测调用一致）。
 LIVE_TOOLS = {"accounts": "account_authorized_trd_accs", "positions": "account_positions",
@@ -59,9 +74,17 @@ def cancel(call, acc_id, market, order_id, timeout=30):
 
 
 def positions(call, acc_id, market_id, timeout=30):
+    """模拟持仓行（键名二义，两键取到即用）。
+
+    **实测（2026-09-16）**：REST ``/sim-trade/{acc_id}/positions`` 返回 ``{"positions": [...]}``，
+    与 MCP 通道实测键一致；``position_list`` 是 core 早期口径。原实现只读
+    ``position_list``，在真实响应下会静默返回空列表（平台组合页 sim 持仓因此恒为空）——
+    WP13 任务 2 的端到端测试暴露该缺陷，此处按 ``_sim_positions_and_equity`` 的既有
+    双键口径修正（不新增第三份判定）。
+    """
     data = call(TOOLS["positions"], {"acc_id": acc_id, "market": market_id},
                 timeout=timeout) or {}
-    return data.get("position_list") or []
+    return data.get("positions") or data.get("position_list") or []
 
 
 def accounts(call, timeout=30):

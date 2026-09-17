@@ -100,23 +100,30 @@ class FakeNowTest(unittest.TestCase):
 
 
 class DefaultExecutorBrokerTest(unittest.TestCase):
-    """``_default_executor`` 必须注入券商通道（否则自动执行永远停在「未接入」拒绝态）。"""
+    """``_default_executor`` 必须注入券商通道（否则自动执行永远停在「未接入」拒绝态）。
+
+    WP13 任务 2 起通道 callable 由 ``trading_datasource.channel.sim_call(home)`` 构造
+    （openapi 就绪走 REST，否则原样交 MCP）——本测试随之钉住新接线契约，
+    fail-closed 语义（导入失败 → None）保持不变。
+    """
 
     def test_broker_call_injected(self):
         seen = {}
+        sentinel = object()
 
         def fake_execute_plan(conn, home, cmd, **kwargs):
             seen.update(kwargs)
             return {"ok": True}
 
-        fake_module = mock.Mock()
-        fake_module.call_tool = mock.Mock(name="call_tool")
+        fake_channel = mock.Mock()
+        fake_channel.sim_call = mock.Mock(name="sim_call", return_value=sentinel)
         with mock.patch.object(daemon, "_execute_plan", fake_execute_plan), \
                 mock.patch.dict("sys.modules",
-                                {"trading_datasource.futu_mcp": fake_module}):
+                                {"trading_datasource.channel": fake_channel}):
             daemon._default_executor(None, "/tmp/home", {"plan_hash": "H"})
 
-        self.assertIs(seen.get("broker_call"), fake_module.call_tool)
+        self.assertIs(seen.get("broker_call"), sentinel)
+        fake_channel.sim_call.assert_called_once_with("/tmp/home")
 
     def test_import_failure_keeps_none(self):
         seen = {}
@@ -128,7 +135,7 @@ class DefaultExecutorBrokerTest(unittest.TestCase):
         real_import = __import__
 
         def failing_import(name, *args, **kwargs):
-            if name == "trading_datasource.futu_mcp":
+            if name == "trading_datasource.channel":
                 raise ImportError("no channel")
             return real_import(name, *args, **kwargs)
 

@@ -53,6 +53,20 @@ F10_TOP_BROKERS_PATH = "/api/v1.0/quote/{symbol}/top-brokers"
 F10_TOP_BROKERS_HISTORY_PATH = "/api/v1.0/quote/{symbol}/top-brokers-history"
 
 
+# ── WP13 任务 2 模拟交易（锁定表 §C.9）────────────────────────────────────
+# 实测（2026-09-16，本机 AppKey 凭据）：九个路径全部可用。追加实测结论见
+# docs/TOOL-LIMITS.md「模拟交易 REST」——orders/history-orders/max-buy-sell 官方页面
+# 未列 market，但**实测必填**（缺参报 missing required parameter: market）。
+SIM_TRADE_ACCOUNTS_PATH = "/api/v1.0/sim-trade/accounts"
+SIM_TRADE_CASH_INFO_PATH = "/api/v1.0/sim-trade/{acc_id}/cash-info"
+SIM_TRADE_POSITIONS_PATH = "/api/v1.0/sim-trade/{acc_id}/positions"
+SIM_TRADE_ORDERS_PATH = "/api/v1.0/sim-trade/{acc_id}/orders"
+SIM_TRADE_HISTORY_ORDERS_PATH = "/api/v1.0/sim-trade/{acc_id}/history-orders"
+SIM_TRADE_MAX_BUY_SELL_PATH = "/api/v1.0/sim-trade/{acc_id}/max-buy-sell"
+SIM_TRADE_ORDER_MODIFY_PATH = "/api/v1.0/sim-trade/{acc_id}/orders/{order_id}/modify"
+SIM_TRADE_ORDER_CANCEL_PATH = "/api/v1.0/sim-trade/{acc_id}/orders/{order_id}/cancel"
+
+
 # ── WP8 任务 2 行情（WP13 任务 0 从内联字面量提升为常量）──────────────────
 QUOTE_SNAPSHOT_PATH = "/api/v1.0/quote/snapshot"
 STOCK_QUOTE_PATH = "/api/v1.0/quote/stock-quote"

@@ -328,3 +328,42 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
   既有 `option_expiration` → `option_chain` 取最近到期日首个合约再调用；
 - **`-9` 与标的无关**：行权概率在无期权数据权限时回 `-9`（见 §10.2），不是标的错误；
 - 上述三条同样适用于人工排查：**看到 `-7` 先怀疑参数取值是否已过期/变动，不要先怀疑通道**。
+
+## 九、模拟交易 REST（WP13 任务 2，2026-09-16 真机实测）
+
+**前置结论：鉴权可用。** 锁定表 §C.9 事前登记的「官方模拟交易要求登录态 header
+（`uid` 自动透传），本仓库 AppKey/OAuth 服务端凭据是否兼容未验证」——实测**兼容**：
+`GET /api/v1.0/sim-trade/accounts` 用本机 AppKey（Ed25519 签名）凭据返回 9 个模拟账户。
+因此 sim 链路在 `futu_channel=openapi` 下走 REST（`OpenApiSimTrade`），默认通道（mcp）
+行为不变。
+
+实测样本（`2026-09-17 09:35 CST`，A 股模拟账户 `3182575`）：
+
+- **账户列表**：`9393` 港股 `market_id=1`、`3182575` A 股 `market_id=3`、`11587526`
+  美股融资融券 `market_id=100`，另有港股期权 `9`、期货 `10/11/12/13`、日股 `16`。
+  **官方文档未给 market_id 枚举表**；仓库只登记实测三市场口径
+  （`trading_datasource/market_ids.py`），未知 id 交后端判定。
+- **资金**：`total_asset`（**无 s**）/`balance`/`mv`/`max_power_long` 等；与 live
+  `get-funds` 的 `total_assets` 是两个端点的两个字段，**不互相换算**。
+- **写路径全链路**：`input_order` 挂单 100 股 `603993` @16.90 → `order_id=7147945`
+  （当日订单列表可见，`status=2`）→ `modify_order` 改价 16.85 → `cancel_order` 撤单
+  → 终态 `status=5`。撤单后当日订单仍在列表中（状态标记），与 live 语义一致。
+
+**四条官方页面与实测不一致（以实测为准，均已写入代码注释与锁定面）**：
+
+| # | 端点 | 官方页面 | 实测 |
+|---|---|---|---|
+| 1 | `orders`（今日订单）、`history-orders`、`max-buy-sell` | 参数表未列 `market` | **必填**，缺参 `missing required parameter: market` |
+| 2 | `history-orders` 时间窗 | `time_begin`/`time_end` int（微秒） | 传 `YYYY-MM-DD` 字符串被拒：`parameter 'time_begin' must be an integer`；响应 `create_time` 亦为微秒 |
+| 3 | `input_order` 数量/价格 | `qty`/`price` 类型 string | 一致（示例 `"100"`/`"400"`）；MCP 通道传数值 → 适配器统一转字符串 |
+| 4 | `cancel_order` / `modify_order` | cancel 页写「无请求体」 | **body 必带 `market`**，缺参 `missing required field in body: market` |
+
+**待办（本任务未改策略）**：`sim_trade_modify_order`（MCP）历史记录有间歇性 `-5`，仓库
+因此一律「撤旧重下」；本次 REST `modify_order` 实测成功一次（含 `market`+`new_qty`+
+`new_price`）。是否把 sim 改单切换为 REST 原生改单，需更多样本（含失败路径）后再定，
+结论落本文档；在此之前 `core_broker` 与 `FutuBroker` 的「撤旧重下」不变。
+
+**顺带修正的缺陷**：`core_broker.positions()` 原先只读 `position_list` 键，而 REST 与 MCP
+实测响应键均为 `positions`（`_sim_positions_and_equity` 早已双键兼容）——该函数在真实响应
+下恒返回空列表，平台组合页 sim 持仓会因此为空。WP13 任务 2 按既有双键口径修正，
+新增用例 `tests/test_wp13_simtrade.py::SimCallBrokerIntegrationTests`。

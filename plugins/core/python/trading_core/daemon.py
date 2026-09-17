@@ -197,13 +197,17 @@ def _default_executor(conn, home, cmd):
 
     WP9 e2e 暴露的接线缺口：本函数原先不注入 ``broker_call``，``_execute_plan`` 因
     「未接入券商通道」fail-closed 拒绝——自动执行写下的指令永远停在拒绝态。默认口径
-    与 planner/reconcile 一致（惰性导入 futu_mcp.call_tool）；导入失败保持 None，
+    与 planner/reconcile 一致（惰性导入）；导入失败保持 None，
     由 ``_execute_plan`` 如实拒绝（绝不在无券商事实的情况下下单）。
+
+    WP13 任务 2：通道 callable 改由 ``core_broker.sim_call(home)`` 构造——
+    ``futu_channel: openapi`` 且凭据就绪时 sim 链路走 REST，否则原样交给 MCP
+    （行为与改造前逐字一致）；调用方签名/``TOOLS`` 映射零改动。
     """
     broker_call = None
     try:
-        from trading_datasource.futu_mcp import call_tool
-        broker_call = call_tool
+        from trading_datasource.channel import sim_call
+        broker_call = sim_call(home)
     except Exception:  # noqa: BLE001 —— 通道不可用：交给 _execute_plan 拒绝并留痕
         broker_call = None
     return _execute_plan(conn, home, cmd, broker_call=broker_call)

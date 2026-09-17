@@ -64,3 +64,20 @@ WP12_TRANSPORT_ENDPOINTS = {
     ("OpenApiDerivatives", "option_exercise_probability"): (
         "GET", paths.OPTION_EXERCISE_PROBABILITY_PATH),
 }
+
+
+#: WP13 任务 2 模拟交易端点绑定面（锁定表 §C.9，9 项）：(类名, 方法名) → (HTTP 方法, 路径模板)。
+#: 锁定测试 ``tests/test_wp13_simtrade.py`` 逐条比对锁定表；**新增/改路径必须先改锁定表**。
+#: 前置实测结论（AppKey 凭据可用）与三条文档差异见 ``groups/simtrade.py`` 文件头。
+WP13_SIM_TRADE_ENDPOINTS = {
+    ("OpenApiSimTrade", "account_list"): ("GET", paths.SIM_TRADE_ACCOUNTS_PATH),
+    ("OpenApiSimTrade", "cash_info"): ("GET", paths.SIM_TRADE_CASH_INFO_PATH),
+    ("OpenApiSimTrade", "position_list"): ("GET", paths.SIM_TRADE_POSITIONS_PATH),
+    ("OpenApiSimTrade", "order_list"): ("GET", paths.SIM_TRADE_ORDERS_PATH),
+    ("OpenApiSimTrade", "history_order_list"): ("GET",
+                                                paths.SIM_TRADE_HISTORY_ORDERS_PATH),
+    ("OpenApiSimTrade", "max_buy_sell"): ("GET", paths.SIM_TRADE_MAX_BUY_SELL_PATH),
+    ("OpenApiSimTrade", "input_order"): ("POST", paths.SIM_TRADE_ORDERS_PATH),
+    ("OpenApiSimTrade", "modify_order"): ("POST", paths.SIM_TRADE_ORDER_MODIFY_PATH),
+    ("OpenApiSimTrade", "cancel_order"): ("POST", paths.SIM_TRADE_ORDER_CANCEL_PATH),
+}

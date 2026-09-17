@@ -58,4 +58,6 @@ from .groups.dataplane import (OpenApiBasicData, OpenApiDerivatives,  # noqa: F4
                                OpenApiIpo, OpenApiPlate, OpenApiScreen,
                                OpenApiShort, OpenApiWatchlist)
 from .groups.f10 import OpenApiF10  # noqa: F401
-from .surface import WP12_F10_ENDPOINTS, WP12_TRANSPORT_ENDPOINTS  # noqa: F401
+from .groups.simtrade import OpenApiSimTrade  # noqa: F401
+from .surface import (WP12_F10_ENDPOINTS, WP12_TRANSPORT_ENDPOINTS,  # noqa: F401
+                      WP13_SIM_TRADE_ENDPOINTS)

@@ -3,8 +3,16 @@
 重点不是「能读到数字」，而是**读不到时不许编**、**不许跨账户/币种合并**：
 面板展示的是券商真实持仓，一旦悄悄拼凑或求和，用户会拿它当账户事实做决策。
 全部离线：不访问网络，mock 掉共享 MCP 客户端。
+
+注入缝（WP13 任务 2 起）：调用经 ``positions.channel_call`` 分派（``futu_channel=openapi``
+且凭据就绪走 REST，否则原样走 MCP）。本文件测的是**采集逻辑**（读哪些账户、怎么汇总、
+失败怎么披露），故直接注入 ``channel_call``；通道分派本身由 ``tests/test_wp13_simtrade.py``
+（适配器翻译表 + 回退语义）与 ``ChannelDispatchTests``（本文件末尾：注入的 MCP 缝确实生效）
+覆盖——测试不再依赖本机 ``~/.dsh/trading-platform.json`` 的真实通道配置。
 """
 import importlib.util
+import os
+import tempfile
 import json
 import sys
 import unittest
@@ -71,7 +79,7 @@ class SimPositionsTests(unittest.TestCase):
 
     def test_reads_positions_per_account(self):
         call, calls = self._fake_call()
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             payload = self.module.collect("sim")
         self.assertEqual(payload["counts"]["positions"], 2)
         self.assertEqual(payload["counts"]["accounts_checked"], 2)
@@ -81,7 +89,7 @@ class SimPositionsTests(unittest.TestCase):
     def test_market_parameter_is_sent(self):
         """缺 market 会报 ret=-5，因此必须带上。"""
         call, calls = self._fake_call()
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             self.module.collect("sim")
         position_calls = [args for name, args in calls if name == "sim_trade_position_list"]
         self.assertEqual(len(position_calls), 2)
@@ -91,7 +99,7 @@ class SimPositionsTests(unittest.TestCase):
     def test_no_currency_is_invented(self):
         """模拟盘响应没有币种字段 —— 不许推断。"""
         call, _ = self._fake_call()
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             payload = self.module.collect("sim")
         for group in payload["groups"]:
             for row in group["positions"]:
@@ -100,7 +108,7 @@ class SimPositionsTests(unittest.TestCase):
     def test_subtotals_are_per_account_never_summed(self):
         """不同账户可能不同币种，只做按账户小计，绝不出现跨账户合计。"""
         call, _ = self._fake_call()
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             payload = self.module.collect("sim")
         self.assertNotIn("total", payload)
         self.assertNotIn("market_value", payload)
@@ -110,7 +118,7 @@ class SimPositionsTests(unittest.TestCase):
 
     def test_one_account_failure_does_not_hide_the_others(self):
         call, _ = self._fake_call(fail_on="9393")
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             payload = self.module.collect("sim")
         self.assertEqual(payload["counts"]["positions"], 1, "失败账户不影响其他账户")
         self.assertEqual(len(payload["errors"]), 1)
@@ -126,7 +134,7 @@ class SimPositionsTests(unittest.TestCase):
                 return {"positions": []}
             return SIM_POSITIONS[str(arguments["acc_id"])]
 
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             payload = self.module.collect("sim")
         self.assertEqual(payload["counts"]["accounts_checked"], 3)
         self.assertEqual(payload["counts"]["accounts_with_positions"], 2)
@@ -141,7 +149,7 @@ class LivePositionsTests(unittest.TestCase):
         def call(name, arguments, **kwargs):
             return REAL_ACCOUNTS if name == "account_authorized_trd_accs" else REAL_POSITIONS
 
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             payload = self.module.collect("live")
         group = payload["groups"][0]
         self.assertIsNone(group["market_value"], "跨币种不产生单一市值")
@@ -156,7 +164,7 @@ class LivePositionsTests(unittest.TestCase):
         def call(name, arguments, **kwargs):
             return REAL_ACCOUNTS if name == "account_authorized_trd_accs" else REAL_POSITIONS
 
-        with patch.object(self.module, "call_tool", side_effect=call):
+        with patch.object(self.module, "channel_call", side_effect=call):
             payload = self.module.collect("live")
         acc_id = str(REAL_ACCOUNTS["accounts"][0]["account_id"])
         self.assertNotIn(acc_id, payload["groups"][0]["account"])
@@ -227,7 +235,7 @@ class AccountRiskTests(unittest.TestCase):
                 return {"balance": "100", "total_asset": "2000"}
             return SIM_POSITIONS[str(arguments["acc_id"])]
 
-        with patch.object(self.module, "call_tool", side_effect=call), \
+        with patch.object(self.module, "channel_call", side_effect=call), \
              patch.object(self.module, "append_mark", return_value=[]):
             payload = self.module.collect("sim")
         for group in payload["groups"]:
@@ -275,7 +283,7 @@ class EquityMarkTests(unittest.TestCase):
         self.assertEqual(self.module.read_marks("sim"), [])
 
     def test_collect_records_a_mark_and_returns_it(self):
-        with patch.object(self.module, "call_tool", side_effect=self._fake_call()), \
+        with patch.object(self.module, "channel_call", side_effect=self._fake_call()), \
              patch.object(self.module, "append_mark", wraps=self.module.append_mark):
             payload = self.module.collect("sim")
         self.assertIn("equity_marks", payload)
@@ -362,6 +370,32 @@ class CacheTests(unittest.TestCase):
         with self._patch_paths():
             (self.scratch / "positions-sim.json").write_text("{not json")
             self.assertIsNone(self.module.read_cache("sim"))
+
+
+class ChannelDispatchTests(unittest.TestCase):
+    """``channel_call`` 的分派缝：默认通道下走注入的 MCP ``call_tool``。
+
+    WP13 任务 2 起 positions 经 ``channel_call`` 分发；本用例钉住两件事：
+    ① 通道配置为默认（临时 home 无 ``trading-platform.json``）时**不**去 REST；
+    ② 注入的 ``call_tool`` 替身确实被转发到（name/arguments/timeout 原样），
+    使 test_positions 的其他用例的注入缝成立。
+    """
+
+    def test_default_channel_forwards_to_injected_mcp(self):
+        module = load_positions()
+        seen = []
+
+        def fake(name, arguments, timeout=30):
+            seen.append((name, arguments, timeout))
+            return {"accounts": []}
+
+        with tempfile.TemporaryDirectory() as home, \
+                patch.dict(os.environ, {"DSH_HOME": home}), \
+                patch.object(module, "_CHANNEL_CALL", None), \
+                patch.object(module, "call_tool", side_effect=fake):
+            self.assertEqual(module.channel_call("sim_trade_account_list", {}),
+                             {"accounts": []})
+        self.assertEqual(seen, [("sim_trade_account_list", {}, 30)])
 
 
 if __name__ == "__main__":

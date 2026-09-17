@@ -72,27 +72,8 @@ class OpenApiTrade(_RestValidators):
         return self._path_token(value, "acc_id")
 
     # _path_token / _symbol / _text 由 _RestValidators 提供（WP12 任务 2 起共用一份实现）
-
-    def _micros(self, value, name):
-        """微秒时间戳：非负整数（官方单位微秒，本层不换算）。"""
-        if value is None:
-            return None
-        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-            raise ValueError(f"{name} 必须是非负整数（微秒时间戳）")
-        return value
-
-    def _page_flag(self, value):
-        """page_flag 必填但可为空串（空串=从头开始，官方原文）。"""
-        if value is None:
-            return ""
-        if not isinstance(value, str):
-            raise ValueError("page_flag 必须是字符串（空串=从头开始）")
-        return value
-
-    def _page_size(self, value, bounds):
-        if value is None:
-            return None
-        return self._int_in(value, bounds[0], bounds[1], "page_size")
+    # _micros / _page_flag / _page_size 亦已提升到基类（WP13 任务 2：模拟交易历史订单
+    # 同口径使用，两处各写一份迟早会错位）。
 
     def _remark(self, value):
         if value is None:

@@ -126,6 +126,34 @@ class _RestValidators:
             raise ValueError(f"{name} 长度不得超过 {max_len}：{text[:40]!r}")
         return text
 
+    def _micros(self, value, name):
+        """微秒时间戳：非负整数（官方单位微秒，本层不换算）。
+
+        WP13 任务 2 从 ``OpenApiTrade`` 提升到基类（模拟交易历史订单同口径使用）。
+        实测（2026-09-16）：``/sim-trade/{acc_id}/history-orders`` 的 ``time_begin``
+        必须为整数，传 ``YYYY-MM-DD`` 字符串报 ``parameter 'time_begin' must be an
+        integer``；响应 ``create_time`` 亦为微秒（``1789351326000000``）。
+        """
+        if value is None:
+            return None
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            raise ValueError(f"{name} 必须是非负整数（微秒时间戳）")
+        return value
+
+    def _page_flag(self, value):
+        """page_flag 必填但可为空串（空串=从头开始，官方原文）。"""
+        if value is None:
+            return ""
+        if not isinstance(value, str):
+            raise ValueError("page_flag 必须是字符串（空串=从头开始）")
+        return value
+
+    def _page_size(self, value, bounds):
+        """分页大小：``bounds`` 由各端点给出（官方各页上界不同，各自钉死）。"""
+        if value is None:
+            return None
+        return self._int_in(value, bounds[0], bounds[1], "page_size")
+
     def _scalar(self, value, name, required=False, default=None):
         """标量直通（str/int/float，排除 bool/对象/数组）。
 
