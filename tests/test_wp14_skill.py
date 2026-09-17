@@ -195,11 +195,9 @@ class SpecExampleTest(unittest.TestCase):
 
     def test_example_rule_loads_as_strategy(self):
         """样例不只是能校验，还要真能构造出策略实例（可被 plan_auto 消费）。"""
-        from trading_core import strategies
         instance = rule_engine.load_rule(self.spec)
-        self.assertTrue(hasattr(instance, "universe"))
-        self.assertTrue(hasattr(instance, "target_weights"))
-        del strategies  # 仅为说明加载路径经 strategies.register_rule 同一实现
+        self.assertTrue(callable(getattr(instance, "universe", None)))
+        self.assertTrue(callable(getattr(instance, "target_weights", None)))
 
 
 if __name__ == "__main__":
