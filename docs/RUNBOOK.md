@@ -333,13 +333,19 @@ WantedBy=default.target
    ```
 2. 处置原则：**先查券商再动手**；平台只告警 + 暂停，**不自动平仓**，差异处置永远由人决定。
 3. 人工核对券商持仓 vs 本地台账（场景 2 的 `reconcile-diff` 或券商 App），定位差异原因（常见：在途 unknown 未迁移、成交回写缺失、重复记账）。
-4. 修正本地台账、迁移完在途单后，清 halt：
+4. **先让对账收敛，再清 halt**（差异没消除就清 halt，下一轮对账会原地再置位）：
+   * `missing_in_oms`（券商有单、本地无档）→ 重跑对账即自动**收编**（见「`missing_in_oms`
+     差异已能自动收敛」小节；历史日期的遗留单要带 `--today <对账日>`），跑完确认
+     `diffs: []`；
+   * 券商已撤而本地仍在途 → `reconcile-daily` 按官方状态码自动收敛；对账覆盖不到的
+     历史行才用 `oms-align` 人工留痕（见本文开头「订单终态人工对齐」）。
+5. 修正本地台账、迁移完在途单后，清 halt：
    ```bash
    ~/.dsh/trading-venv/bin/python -B -c "from trading_core import store; \
      store.clear_halt(store.connect())"
    ```
-5. 若当时上了 kill switch：人工确认后 `unkill`（删除 `~/.dsh/trading-kill`）。
-6. 次日恢复验证：daemon 到点正常 `build_plan` 产出冻结计划；工作台红点消失；`is_halted` 为 `False`。
+6. 若当时上了 kill switch：人工确认后 `unkill`（删除 `~/.dsh/trading-kill`）。
+7. 次日恢复验证：daemon 到点正常 `build_plan` 产出冻结计划；工作台红点消失；`is_halted` 为 `False`。
 
 **预期：** 差异 → critical + halt 暂停执行；人工核对修正后恢复；次日计划照常生成。
 
@@ -401,6 +407,48 @@ unset DSH_FAKE_NOW                              # 演练结束必须清理
 | `已超执行窗口` | 当前时刻超出 `exec_at + exec_window_minutes`（如服务在收盘后才启动补跑） | 属预期：计划留待人工在工作台执行；要当日自动执行就调整 `exec_at`/窗口或重启服务在窗口内 |
 | `kill switch 生效` | `~/.dsh/trading-kill` 存在 | 确认是否人为放的总闸；恢复即删除该文件（工作台一键清除） |
 | `熔断生效` | 对账差异或日内亏损触发 halt（**差异只暂停不平仓**） | 先按「场景 3」人工核对券商事实，再 `clear_halt` 恢复 |
+
+### 计划「生成了但买不动 / 一笔单都没有」怎么读（WP17）
+
+自动计划的**买入量按可用现金封顶**（现金取券商事实：sim `max_power_long` → `balance`；
+live `power` → `available_funds` → `cash`；**绝不用权益冒充现金**）：
+
+| 告警标题（warn） | 含义 | 处置 |
+|---|---|---|
+| `计划预警：现金不可得` | 券商资金响应无现金字段 → 本次**不生成买单**（卖单照常），`plan.cash.unavailable=true` | 查券商资金接口/通道；字段口径见 `docs/TOOL-LIMITS.md` §九 |
+| `计划预警：现金封顶` | 买入量被可用现金压低（`plan.cash.capped` 列出标的；多买单按计划顺序**共享**一笔现金） | 正常约束，不是故障；想多买先减仓/加资金——属交易决策 |
+| `计划预警：持仓数超限` | 持仓数 ≥ `max_positions` 且计划含新建仓 → 执行时会被风控规则 6 拦 | 调整 `max_positions` 或先减仓（交易决策） |
+| `计划跳过：无可执行订单` | 计划已冻结但零订单（目标与持仓一致 / 全被现金或风控约束） | 流程页按 `skipped` 显示，**不是「已完成」**；看上面几条预警定位 |
+
+计划返回体（`snapshot-plan`）带 `warnings` 与 `cash`，页面与 CLI 口径一致。**警告不改作业
+状态**：作业确实跑完并冻结了计划，只是数字没买到「想买的量」。
+
+### `missing_in_oms` 差异已能自动收敛（WP17）
+
+券商有单、本地 OMS 无对应行（历史遗留 / 收编前下的单 / 探针单）过去**没有收敛入口**
+（`oms-align` 要求本地已存在该 `broker_order_id` → 拒绝），只能人工 `clear_halt`，次日
+对账再次 critical + halt。
+
+现在 `reconcile-daily` 在差异判定前**收编**这类订单：`plan_id=reconcile-import`、`err`
+前缀 `reconcile-import:` 带券商单号与原始状态码，warn 告警 `订单导入：券商独有`。
+纪律：只认**已发布**状态枚举，表外码/无单号的券商行**不导入**、照旧暴露为差异（不猜、
+不静默吞）；`client_order_id` 由券商单号派生 → 幂等；**只读券商**。
+
+**重放历史日期**（收敛昨天的遗留单——订单匹配按对账日取窗，必须显式给日期）：
+
+```bash
+cd <repo>   # 仓库在场时务必显式前置数据层，否则跑的是 ~/.dsh/trading-python 的副本
+PYTHONPATH=plugins/core/python:plugins/datasource/python \
+  ~/.dsh/trading-venv/bin/python -B -m trading_core reconcile-daily --today <对账日 YYYY-MM-DD>
+```
+
+**判定收敛成功的三条**：输出 `digest.orders_imported ≥ 1` 且 `diffs: []`、`halted: false`；
+OMS 里 `SELECT plan_id,err FROM orders WHERE plan_id='reconcile-import'` 能对上券商单号；
+`reconcile:latest` 的 `diffs` 为空。**收敛 ≠ 抹掉事实**：券商持仓里没有成交足迹的历史存量
+仍如实列在 `untracked`（不计差异），有成交的收编单会回填 fills 并照常比对持仓。
+
+收敛确认后按场景 3 第 4 步 `clear_halt`；留存的历史 critical 告警是**记录**（平台没有 ack
+入口），随对账不再重现而自然过期。
 
 排查入口：`snapshot-schedule`（ran 标记/心跳/告警）、`snapshot-reconcile`（差异/TCA/
 链路）、`snapshot-plan`（计划→订单→风控预检）。

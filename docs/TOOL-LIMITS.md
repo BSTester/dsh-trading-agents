@@ -350,7 +350,9 @@ shareholders/company/top-brokers` 七个命名空间（并漏列 2 个估值端�
   **官方文档未给 market_id 枚举表**；仓库只登记实测三市场口径
   （`trading_datasource/market_ids.py`），未知 id 交后端判定。
 - **资金**：`total_asset`（**无 s**）/`balance`/`mv`/`max_power_long` 等；与 live
-  `get-funds` 的 `total_assets` 是两个端点的两个字段，**不互相换算**。
+  `get-funds` 的 `total_assets` 是两个端点的两个字段，**不互相换算**。自动计划的
+  **可用现金**取 `max_power_long`（回退 `balance`）——它不是权益，也不能用权益顶替
+  （见「模拟盘全自动闭环」小节）。
 - **写路径全链路**：`input_order` 挂单 100 股 `603993` @16.90 → `order_id=7147945`
   （当日订单列表可见，`status=2`）→ `modify_order` 改价 16.85 → `cancel_order` 撤单
   → 终态 `status=5`。撤单后当日订单仍在列表中（状态标记），与 live 语义一致。
@@ -535,16 +537,42 @@ qty / cum_qty / price / avg_fill_price 均为**字符串**
   `scripts/platform_service.sh refresh && scripts/platform_service.sh restart`
   才在生产进程生效（本次验证按约定**未重启**服务）。
 
-**未解决 / 需人工决定的两项**（如实登记，未擅自改配置）：
+### 模拟盘全自动闭环：现金封顶 + 券商独有订单收编（WP17，2026-09-17/18 实机）
 
-- **本机模拟盘结构性拒单**：A 股模拟账户实持 8 只 > 默认 `max_positions=5`，且可用资金
-  仅 `55,257.816`（权益 `812,231.816` 中 `756,974` 是持仓市值）。按权益 25% 权重定量的
-  自动计划在本机会生成**买不动/被风控拦下**的量（本次靠临时调小 `risk_per_trade` 才走通
-  下单腿）。是否调 `max_positions`/`risk_per_trade`、还是减仓，属交易决策。
-- **`missing_in_oms` 差异没有收敛入口**：券商有单、本地 OMS 无对应行（如 09:35 的
-  `SH.603993` / `7147945`，已撤、无成交），`oms-align` 要求本地已存在该
-  `broker_order_id` → **拒绝**。本次只能按 RUNBOOK 场景 3 人工 `clear_halt`；差异次日
-  对账仍会重现（critical 告警保留，未 ack）。
+**背景（WP16 遗留的两项结构性阻塞）**：① 计划定量只看权益、不看可用现金 → 本机
+「权益 81 万 / 现金 5.5 万 / 已持 8 只」时买单必被券商以资金不足拒；② 券商有单、本地
+OMS 无档 → 每日对账 critical + `set_halt` → 自动链天天被自己的历史差异锁死。两项均已修复。
+
+**已解决（WP17，2026-09-17 实现 / 2026-09-18 真机复验）**：
+
+- **本机模拟盘结构性拒单** → 计划定量新增**可用现金封顶**（`planner.build_and_freeze`
+  / `plan_auto`）：买入量 = `min(权重定量, 风险预算, 剩余现金买得起的整手数)`；多买单按
+  计划顺序**共享同一笔现金**逐单扣减（顺序分配保留策略优先级，且可逐单复算）；现金字段
+  全缺 → **一笔买单都不生成**，卖单与清仓照常，**绝不用权益冒充现金**；卖单不受现金
+  约束、**卖出所得不计入可买现金**（成交与到账时点不保证先于买单）。计划期还会对
+  「现金封顶 / 现金不可得 / 持仓数超限 / 零订单」发 warn 并写进 `plan_auto` 返回的
+  `warnings`——「没做成」在流程页不再显示成「已完成」。
+- **`missing_in_oms` 差异没有收敛入口** → 对账新增**收编**（`reconcile._import_broker_only_orders`）：
+  券商独有订单在差异判定**之前**导入 OMS 台账（`plan_id=reconcile-import`；`err` 前缀
+  `reconcile-import:` 带券商单号与原始状态码，审计可答「这行从哪来」），随后**重新匹配**
+  → 不再计为差异、不再 critical/`set_halt`。只认已发布枚举（`SIM_ORDER_STATUS` /
+  `BROKER_TERMINAL_STATUS`）：表外状态码与无单号的券商行**一律不导入**、保留为差异
+  （不猜、不静默吞）；`client_order_id` 由券商单号派生 → 重复运行不产生重复行；**只读
+  券商、零写类调用**。OMS 是「与券商往来的真实订单状态」的权威台账，因此收编是**记账**
+  而非下单。
+- 两条配套口径（缺一条就无法真正收敛）：收编行按**对账日期**落 `created_at`（不是墙钟）
+  ——订单匹配按 `created_at LIKE <本次对账日>%` 取台账，按墙钟落日期会让「重放历史日期」
+  刚收编的行落在窗口外（critical + halt 原样复现，且污染今天的订单窗口）；收编行
+  **不建立持仓知识**（`footprint_symbols` 排除 `IMPORT_PLAN_ID`）——零成交的收编单不会把
+  历史存量持仓从 `untracked`（如实列出、不计差异）升级成 `missing_side`（critical +
+  halt），确有成交的收编单经 fills 回填后照常进足迹。
+- 实机复验（2026-09-18，`reconcile-daily --today 2026-09-17` 重放）：`orders_imported=1`、
+  `diffs=[]`、`halted=false`，`SH.603993` 仍如实列在 `untracked`（券商持 2100 股、本地
+  无任何成交足迹）。上方 09:35 探针单 `7147945` 的 critical 告警是**历史记录**，成因即
+  本节记录的写路径探针（`input_order` 100 股 `603993` @16.90 → 撤单）；收敛后不再重现，
+  因此 `clear_halt` 有据（差异已消除，而**不是**为了让告警闭嘴）。
+- 仍未由本任务决定的一项：是否调 `max_positions` / `risk_per_trade`、还是减仓——属交易
+  决策。现金封顶只保证「计划不再下出买不动的量」，不等于策略在本机会盈利。
 
 ### 期权筛选（`option_screen`）的最小可用载荷（2026-09-17 真机验证）
 调用方此前只能靠试错（空 `field_filter` 值会被上游 `-3 invalid parameter`）。**可用最小载荷**：
