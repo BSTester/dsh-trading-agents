@@ -390,8 +390,12 @@ class FutuClientTests(unittest.TestCase):
         self.assertIn("网络", detail)
 
     def test_probe_succeeds_on_real_tool_call(self):
+        # 必须同时钉住 seconds_until_expiry：probe 在工具调用成功后会复查凭证有效期，
+        # 不钉住就变成读这台机器上真实 token 文件的到期时间 —— token 一过期测试就变红，
+        # 而红的原因与 probe 逻辑无关。这是依赖外部状态的测试隔离缺陷（2026-09-16 修复）。
         with patch.object(futu_mcp, "has_token", return_value=True), \
-             patch.object(futu_mcp, "call_tool", return_value={"trading_days": []}):
+             patch.object(futu_mcp, "call_tool", return_value={"trading_days": []}), \
+             patch.object(futu_mcp, "seconds_until_expiry", return_value=3600):
             ok, _detail = futu_mcp.probe()
         self.assertTrue(ok)
 

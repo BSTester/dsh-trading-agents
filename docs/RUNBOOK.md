@@ -30,7 +30,14 @@ from→to、原因、操作者）；**绝不触达券商**。用一个受约束�
 
 ## 0. 前置与路径速查
 
-前置：`~/.dsh/trading-venv` 存在，且执行过 `install_plugins.py link` 把 `trading_core`/`trading_datasource` 同步进 `~/.dsh/trading-python/`（**每次合并 WP 分支后重新 link 一次**，否则 venv 里的 core 是旧副本）。
+前置：`~/.dsh/trading-venv` 存在，且执行过 `install_plugins.py install` 把 `trading_core`/`trading_datasource` 解出到 `~/.dsh/trading-python/`（`link` 写 venv 的 `.pth` 指向这些副本）。
+
+**改了量化侧代码之后跑 `refresh`，不是 `link`**（2026-09-17 实机部署缺口）：`link` 只重写
+`.pth`，副本内容不动 —— 无仓库的生产机上子进程读的仍是旧副本。`refresh` 重新解出
+core/datasource/fin-data 三个副本并顺带重写 `.pth`，且**不碰 profile / preset / pnpm**，
+比 `install` 快且无 Web 副作用，可反复重跑。有仓库的开发机上子进程会优先仓库代码
+（`trading_datasource.repo_paths`），所以本地开发不刷新也能跑；**生产必须刷新**。
+升级/部署的完整五层流程见 `README.md`「更新到最新版本」。
 
 | 对象 | 路径 / 键 | 说明 |
 |---|---|---|
@@ -46,7 +53,8 @@ from→to、原因、操作者）；**绝不触达券商**。用一个受约束�
 ## 平台服务（FastAPI 单进程，WP6；WP7 独立量化平台）
 
 工作台独立服务：**一个进程**承载 HTTP API（`POST /api/wb/<endpoint>`）、MCP
-（`/mcp`，streamable-http，33 工具，Harness 侧工具名 `mcp__quantwb__*`）与前端静态托管
+（`/mcp`，streamable-http，**77 工具** = 82 端点中转发 72 + 5 个维护工具，Harness 侧
+工具名 `mcp__quantwb__*`）与前端静态托管
 （`platform/web/dist`）。默认 `127.0.0.1:8397`，loopback 绑定，可选静态 token。
 
 ### 依赖安装（一次性，需联网）
@@ -75,7 +83,9 @@ cd platform && ~/.dsh/trading-venv/bin/python -m server.run
   用系统 Python 启动会让分析/核心子进程改用系统解释器；`run.py` 在解释器与 venv
   不一致时向 stderr 打一行告警 JSON（不硬失败）。
 - 启动成功打印**单行 JSON**：`{"ok": true, "service": "quant-platform", "url": ...,
-  "mcp": ".../mcp", "tools": 33, "auth": "loopback-only"}`。
+  "mcp": ".../mcp", "tools": 77, "auth": "loopback-only"}`。
+  工具数不是常量直觉：它是 `82 端点 − 10 排除 + 5 维护` 的推导结果，改了端点表要同步
+  `platform/server/mcp_tools.py` 的 `TOOL_COUNT` 与本节（不变式：`forwarded == endpoints − excluded`）。
 
 ### 服务启停（推荐方式：`scripts/platform_service.sh`）
 

@@ -35,8 +35,9 @@ sim 时相反。完整安装的引擎才提供这层工具守卫；仅克隆 pre
 7. daemon 执行链路演练通过（崩溃重启、指令去重、unknown 在途兜底，见 RUNBOOK 场景 1/2）；
 8. kill switch 演练通过（`scripts/drills.sh` 风控联动 + 熔断/恢复处置，见 RUNBOOK 场景 3）；
 9. 对账零差异连续 3 个交易日（sim）；
-10. 独立 Web + MCP 入口审批回归通过（规格 §5.3 人工清单 5 步：33 工具出现 / MCP
-    拒绝切 live / Web 口令切 live / live 写操作在**独立 Web 确认卡片**出现待确认
+10. 独立 Web + MCP 入口审批回归通过（规格 §5.3 人工清单 5 步：**77 工具**出现（WP6 验收时
+    为 33，此后随端点扩展增长；权威值取 `platform/server/mcp_tools.py` 的 `TOOL_COUNT`）/
+    MCP 拒绝切 live / Web 口令切 live / live 写操作在**独立 Web 确认卡片**出现待确认
     （**业务确认**，不是原生审批卡）/ 计划执行窄门 + kill 联动），
     证据留档于 `docs/superpowers/plans/2026-09-15-wp6-standalone-service.md` 末节。
     **WP7 起确认通道在服务进程内闭环**：live 写待确认走**独立 Web 确认卡片**
