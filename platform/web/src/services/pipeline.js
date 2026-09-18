@@ -12,6 +12,10 @@
 //   阶段 key = 真实作业名或表驱动阶段（plan/execute/digest）；**顺序即作业链顺序**
 //   （Python dict 保序 → JSON → Object.entries 对字符串键保序），本模块不排序。
 // 状态到 antd Steps 的映射与下钻目标在此单点定义，供 node --test 直测。
+//
+// 设置页的自动流水线接线只做渲染：策略的取值域在 ``services/strategies.js``，池键与
+// 时刻（字符串 ↔ dayjs）转换在本文件（WP22，均为纯函数、node --test 直测）。
+import dayjs from "dayjs";
 
 /** 与 pipeline.MARKETS 同一集合（服务端只返回这三个市场键）。 */
 export const MARKETS = ["SH", "HK", "US"];
@@ -134,4 +138,62 @@ export function autoPipelinePayload(draft) {
 /** 新增策略行的初值（与 watchlist_rsi 订阅口径一致：市场 + 策略 + 池键）。 */
 export function newStrategyRow() {
   return { market: "SH", strategy: "watchlist_rsi", watchlist: "watchlist" };
+}
+
+// ---------------------------------------------------------------------------
+// 关注池键与时刻字段（WP22：从自由文本改成选择器）
+// ---------------------------------------------------------------------------
+
+/** 缺省池键，镜像 ``trading_core.watchlist.DEFAULT_POOL_KEY``（由
+ *  tests/test_wp22_settings_options.py 解析比对，不靠「记得同步」）。
+ *
+ *  池键 = ``trading-platform.json`` 顶层的**列表型键**（既有扁平口径）；键不存在时
+ *  ``watchlist_symbols`` 对非缺省池 fail-closed（当日跳过 + 告警），缺省池不存在视为空池。 */
+export const POOL_KEY_DEFAULT = "watchlist";
+
+/** 池键下拉选项：缺省池恒在，其余取当前策略行用到的键（去重保序）。
+ *
+ * 池键没有专门端点（它是配置文件里的顶层列表键），所以「可选项」只能来自：
+ * 缺省池 + 本次草稿里已经用到的键。下拉允许自由输入新键（antd Select 的 tags 模式），
+ * 因此这里给的是**建议集合**而不是白名单。
+ * @param {{strategies?: Array<{watchlist?: unknown}>}|null|undefined} draft 草稿或有效配置
+ * @returns {Array<{value: string, label: string}>}
+ */
+export function poolKeyOptions(draft) {
+  const keys = [POOL_KEY_DEFAULT];
+  for (const row of draft?.strategies ?? []) {
+    const key = typeof row?.watchlist === "string" ? row.watchlist.trim() : "";
+    if (key && !keys.includes(key)) keys.push(key);
+  }
+  return keys.map((key) => ({
+    value: key,
+    label: key === POOL_KEY_DEFAULT ? `${key}（默认池）` : key,
+  }));
+}
+
+/** ``"HH:MM"`` → dayjs（TimePicker 的 value）；不可解析 → null（**不猜时刻**）。
+ *
+ * 只认服务端校验口径（``autopipeline._hhmm``：``^\d{2}:\d{2}$`` 且 00-23/00-59；
+ * 这里额外容忍 ``"9:05"`` 这种历史写法，格式化时会补零）。返回 null 时 picker 显示
+ * 占位符，页面同时给出「当前值不是 HH:MM」提示——不把坏值伪装成合法值。
+ *
+ * 不用 ``dayjs(str, "HH:mm")``：那需要 customParseFormat 插件；这里自行拆解小时/分钟，
+ * 依赖面更小（日期部分取当天，TimePicker 只显示时刻）。 */
+export function hhmmToTime(value) {
+  if (typeof value !== "string") return null;
+  const match = /^(\d{1,2}):(\d{2})$/.exec(value.trim());
+  if (!match) return null;
+  const hour = Number(match[1]);
+  const minute = Number(match[2]);
+  if (hour > 23 || minute > 59) return null;
+  return dayjs().hour(hour).minute(minute).second(0).millisecond(0);
+}
+
+/** dayjs（TimePicker 的 onChange 值）→ ``"HH:MM"``；非 dayjs（null/undefined/字符串）→ ``""``。
+ *
+ * **保存写回字符串**：dayjs 对象进不了 JSON 载荷（会变成 ISO 串，被服务端
+ * ``_hhmm`` 拒绝）。``""`` 一律不可保存（服务端会如实拒绝），因此页面不得把它当合法值。 */
+export function timeToHhmm(value) {
+  if (!value || typeof value.format !== "function") return "";
+  return value.format("HH:mm");
 }

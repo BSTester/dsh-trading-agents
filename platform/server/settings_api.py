@@ -209,13 +209,83 @@ def get_auto_pipeline(home):
     return autopipeline.auto_pipeline_config(str(home))
 
 
+def _builtin_strategy_ids():
+    """内置策略 id（``strategies.REGISTRY`` 里**非**规则的那部分）。
+
+    ``REGISTRY`` 同时装着内置策略与 ``register_rule`` 动态注册的规则（``RULE_NAMES``），
+    两者待遇不同（规则每次回查 DB 状态，见 ``planner._resolve_strategy``），因此必须
+    排除规则名——否则一个「本进程内注册过但已被停用」的规则会被当成静态内置策略放行。
+    """
+    from trading_core import strategies  # noqa: PLC0415
+    return sorted(name for name in strategies.REGISTRY if not strategies.is_rule(name))
+
+
+def _enabled_rule_ids(home):
+    """``rules`` 表里 ``status='enabled'`` 的 rule_id（经既有 store 实现读，不写裸 SQL）。"""
+    from trading_core import store  # noqa: PLC0415
+    conn = store.connect(store.db_path(str(home)))
+    try:
+        return sorted(row["rule_id"] for row in store.get_rules(conn, status="enabled"))
+    finally:
+        conn.close()
+
+
+def _validate_strategy_names(home, payload):
+    """策略名取值域校验（**写入侧** fail-closed，2026-09-18 实机反馈）。
+
+    合法取值 = 内置策略 id ∪ ``status='enabled'`` 的规则 id——这正是
+    ``planner._resolve_strategy`` 能消费的两个来源。旧实现只要求「非空字符串」，于是
+    ``watchlist_rsi`` 打错一个字母也能保存成功，此后每天 ``plan_auto`` 软跳过
+    「策略未注册」，页面上只是「没动静」（本轮用户抱怨的根源）。
+
+    fail-closed 的两条边界：
+
+      * **规则库不可读**（DB 打不开/表查询失败）时无法确认「已批准」→ 拒绝非内置名
+        （内置名不碰 DB，因此「配置写坏了要救回来」这条路径永远可用）；
+      * **合法取值一律逐个列出**（含错误信息里），让人一眼能改对。
+
+    只做**名字**判定，不做能力判定（例如单标的策略缺 ``target_weights``、自动路径跑不起来）：
+    能力是另一条轴，判定留在 core 与设置页下拉的提示里——写入侧再登记一份「哪些策略能在
+    自动路径跑」的表，两处迟早漂移。调度侧读取行为**不变**：历史配置里的坏名字仍由
+    ``plan_auto`` 的「策略未注册」软跳过 + 告警兜住。
+    """
+    rows = payload.get("strategies")
+    if not isinstance(rows, list):
+        return  # 结构错已由 apply_overlay 报出（这里不重复报错）
+    names = [row["strategy"] for row in rows
+             if isinstance(row, dict) and isinstance(row.get("strategy"), str)]
+    builtin = _builtin_strategy_ids()
+    unknown = sorted({name for name in names if name not in builtin})
+    if not unknown:
+        return
+    try:
+        enabled = _enabled_rule_ids(home)
+    except Exception as error:  # noqa: BLE001 —— DB 故障一律收敛成业务失败（fail-closed）
+        raise WorkbenchError(
+            f"auto_pipeline.strategies 策略名无法校验：规则库不可读（{error}）。"
+            f"内置策略：{' / '.join(builtin)}；规则 id 需规则库可读才能确认「已批准」"
+            f"状态，因此本次保存被拒绝（不改数据库、不写配置文件）") from error
+    bad = [name for name in unknown if name not in enabled]
+    if not bad:
+        return
+    legal = builtin + enabled
+    raise WorkbenchError(
+        f"auto_pipeline.strategies 策略名不可用：{'、'.join(repr(name) for name in bad)}"
+        f"（合法取值：{' / '.join(legal)}；策略名须为内置策略 id，或研究页「已批准」"
+        f"（status=enabled）的规则 id——其它状态的规则不会被消费）")
+
+
 def save_auto_pipeline(home, payload):
     """校验并原子写 trading-platform.json 的 ``auto_pipeline`` 键，返回有效配置快照。
 
     纪律与 ``save_config`` 一致（**先校验后落盘**）：
 
-      * 校验复用 ``trading_core.autopipeline.apply_overlay``——与调度侧同一实现，
+      * 结构/取值校验复用 ``trading_core.autopipeline.apply_overlay``——与调度侧同一实现，
         服务层不重新定义「什么算合法配置」；
+      * **策略名取值域校验**（``_validate_strategy_names``）叠加在结构校验之后：内置策略
+        id 或 ``status='enabled'`` 的 rule_id，其它一律拒绝并列出合法取值。这是**写入侧**
+        才有的防呆（Web 设置页是唯一写入入口）；调度侧读取保持软跳过，历史坏配置不会被
+        本校验追溯拒绝；
       * 非法载荷抛 ``WorkbenchError`` → ``trading/invalid-operation`` 业务失败信封，
         **文件零改动**（含 JSON 损坏、权限失败：一条都不写半截）；
       * 落盘的是**提交的 overlay 本身**（不是补全后的完整配置）：该文件是覆盖层，
@@ -230,6 +300,7 @@ def save_auto_pipeline(home, payload):
         autopipeline.apply_overlay(autopipeline.AUTO_PIPELINE_DEFAULTS, payload)
     except ValueError as error:
         raise WorkbenchError(str(error)) from error
+    _validate_strategy_names(home, payload)
     try:
         save_platform_auto_pipeline(home, dict(payload))
     except (OSError, ValueError) as error:

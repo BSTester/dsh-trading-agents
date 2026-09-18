@@ -647,3 +647,46 @@ SH 503 行 / HK 507 / US 511，边界全部 `2027-12-31`；`2026-10-12`（周一
   但需要先确认各自日历已同步，登记为遗留。
 
 
+### 8.9 WP22：设置页配置字段选项化 + 写入侧策略名校验（2026-09-18 实机反馈 / 已修）
+
+**用户原话**：「开启自动流水，选择策略是只有这两种是吧，那把页面中的配置改成选项，记不住
+也无法输入正确，其他配置也是一样，全面检查一下」。
+
+**成因（可复核）**：设置页「自动流水线」卡片里 4 个字段是自由文本——`strategy`（策略名）、
+`watchlist`（池键）、`exec_at[market]` 与 `reconcile_at`（HH:MM）。其中 `strategy` 靠记忆
+填写的代价最大：`autopipeline.apply_overlay` 只校验「非空字符串」，**打错一个字母能保存成功**，
+此后每天 `plan_auto` 软跳过「策略未注册」，页面上只表现为「没动静」。
+
+| 修订 | 不变量 / 口径 | 锁定测试 |
+|---|---|---|
+| 新增 `platform/web/src/services/strategies.js` | 策略下拉的取值域 = 内置策略（4 个，core `strategies.REGISTRY` 的镜像）∪ `rules` 端点里 `status==='enabled'` 的 `rule_id`；`candidate/validating/passed/failed/disabled` **一律不进下拉**（`_resolve_strategy` 不会消费它们）。当前值不可用时给「补位项」（如「已停用：xxx」「未知策略名」）——**不因选择器没有该项而静默改配置** | `platform/web/tests/strategies.test.mjs`（6 例）+ 漂移锁 `tests/test_wp22_settings_options.py::FrontendStrategyMirrorTests` |
+| 内置策略清单 = REGISTRY 镜像 | id 集合逐字相等（正则解析 JS + Python 常量比对，沿用 `test_wp10_locks` 手法）；标签/说明必须中文非空 | `FrontendStrategyMirrorTests.test_ids_match_core_registry` |
+| `selectable: false` = 缺 `target_weights` | ⚠ **本轮实测的新缺陷**：`rsi` 与 `ma_cross`（`SingleTicker` 子类）**没有 `target_weights`**，`plan_auto` 走到 `strategy.target_weights(...)` 会抛 `AttributeError: 'RsiStrategy' object has no attribute 'target_weights'`（复现：临时 home + 单日日历 + 一根 bar + `strategy=rsi`）。它违反 `plan_auto` 自己的「永不抛」契约 → 当日 build_plan 作业失败。写入侧**仍按「内置策略 id 一律合法」放行**（否则要多出第二份「哪些策略能在自动路径跑」的登记表，两处迟早漂移）；设置页把这两项**显示为「自动流水线不支持」并禁止选择**，配置里已有的值原样回显 + 黄条说明 | `test_selectable_matches_core_capability`（能力事实 ↔ JS 标志的漂移锁） |
+| 4 个字段改控件 | 策略/池键 → `Select`（策略带分组：内置策略 / 已批准规则 / 配置里的当前值；池键 `mode="tags"` 默认 `watchlist` 且允许自定义键名）；`exec_at`/`reconcile_at` → `TimePicker`（`HH:mm`） | `tests/test_wp22_settings_options.py::SettingsPageControlTests`（结构锁：不得退回自由文本框） |
+| dayjs ↔ `"HH:MM"` 纯转换 | `hhmmToTime`/`timeToHhmm` 在 `services/pipeline.js`（页面只接线）；**保存仍写回字符串**，dayjs 对象不入 payload（ISO 串会被服务端 `_hhmm` 拒绝）。不可解析 → `null`/`""`，页面给红字「当前值不是 HH:MM」而不是假装有值 | `platform/web/tests/pipeline.test.mjs` 3 例 |
+| 池键缺省镜像 | `POOL_KEY_DEFAULT = "watchlist"`（`services/pipeline.js`）== `watchlist.DEFAULT_POOL_KEY` | `FrontendStrategyMirrorTests.test_pool_key_default_mirrors_core` |
+| 写入侧策略名校验（fail-closed） | `settings_api._validate_strategy_names`：结构校验（`apply_overlay`）之后、写盘之前，取值域 = 内置策略 id ∪ `status='enabled'` 的 `rule_id`（经 `store.get_rules(conn, status="enabled")` 读，不写裸 SQL）；非法 → `WorkbenchError`，**错误信息逐个列出合法取值**；**规则库不可读 → 拒绝非内置策略名**（内置名不碰 DB，「配置写坏了要救回来」这条路径永远可用）；文件零改动 | `tests/test_wp22_settings_options.py::StrategyNameValidationTests`（8 例，含 HTTP 信封与逐字节反证） |
+| **口径反转**：旧测试 `test_unknown_strategy_name_is_accepted` | 旧取舍（「WP14 规则 id 不在静态 REGISTRY 里，写入侧不校验」）被**动态取值域**解决（查 DB 的 enabled 规则），故反转为 `..._is_rejected` 并写明推翻理由。调度侧读取**不变**：历史坏配置仍由 `plan_auto` 软跳过 + warn 告警兜住 | `tests/test_wp10_settings.py`（改名后的用例） |
+| `labels.py` 的 `STRATEGY` 表**未改** | 它只是 `labels.js` 的镜像（`tests/test_wp6_summary_audit.py` 逐表比对），且设置页的中文标签是**另一件事**（`services/strategies.js` 的选股口径说明）。两类策略（`watchlist_rsi`/`momentum_value_top5`）仍会原样回显英文 id，登记为遗留（见下） | — |
+
+**本轮未修 / 未决（如实登记）**：
+
+- **单标的策略的自动路径缺口本身没修**：`plan_auto` 对缺 `target_weights` 的策略抛
+  `AttributeError`（违反「永不抛」契约）——本轮只把事实暴露在设置页（禁用 + 说明）与
+  README/漂移锁里，**没有**改 `planner.plan_auto`，也没有给单标的策略补 `target_weights`
+  （那要定义「单标的策略在组合上下文里选哪只标的」，属策略语义决定，不能顺手编）。
+- **`labels.py` / `labels.js` 的 `STRATEGY` 表仍缺 `watchlist_rsi` 与 `momentum_value_top5`**：
+  它在记录里把策略 id 翻成中文（历史记录展示），三份镜像表由既有测试钉死；本轮新增的设置页
+  标签表是另一份职责（选股口径说明），两者未合并——合并需要先决定「选股口径说明」是否也进
+  记录展示层。
+- **池键下拉没有服务端端点**：可选项 = 缺省池 + 当前草稿里用到的键（其余靠 tags 自由输入）。
+  没有新增「列出全部池键」的端点（`trading-platform.json` 顶层列表键目前只有 `watchlist` 一个）；
+  多池场景下建议的完整性依赖用户输入，不是白名单。
+- **`exec_window_minutes` 仍是 `InputNumber`**（本就有 `min`/`max` 且与 core 上界同源），
+  未改成选择器：它是连续整数区间而非有限枚举。
+- **设置页只覆盖 Web 入口**：直接改 `trading-platform.json` 仍可写入非法策略名（写入侧校验
+  只在 `settings_api.save_auto_pipeline`）；这是有意的——配置文件是运维通道，校验落在人能
+  改错的那个入口上，调度侧继续 fail-closed 软跳过。
+
+
+

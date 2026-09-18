@@ -19,13 +19,15 @@
 import React from "react";
 import {
   Alert, App, Button, Card, Descriptions, Form, Input, InputNumber, Radio, Select, Space,
-  Switch, Tabs, Tag, Typography,
+  Switch, Tabs, Tag, TimePicker, Typography,
 } from "antd";
 import { callApi, clearCache, getToken, setToken } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
 import {
-  EXEC_WINDOW_MAX_MINUTES, MARKETS, autoPipelineDraft, autoPipelinePayload, newStrategyRow,
+  EXEC_WINDOW_MAX_MINUTES, MARKETS, POOL_KEY_DEFAULT, autoPipelineDraft,
+  autoPipelinePayload, hhmmToTime, newStrategyRow, poolKeyOptions, timeToHhmm,
 } from "../services/pipeline.js";
+import { strategyFallbackOption, strategyOptions } from "../services/strategies.js";
 
 const { TextArea } = Input;
 
@@ -179,16 +181,33 @@ function ServiceTokenSection() {
   );
 }
 
+/** 时刻字段的脏值提示：配置里存着不是 HH:MM 的历史值时，picker 只能显示占位符——
+ *  这里如实说明「当前值是什么、为什么显示不出来」，不让它看起来像「本来就没配」。 */
+function HhmmHint({ value }) {
+  if (!value || hhmmToTime(value)) return null;
+  return (
+    <Typography.Text type="danger" style={{ fontSize: 12 }}>
+      当前值 {value} 不是 HH:MM，请重新选择
+    </Typography.Text>);
+}
+
 /** 自动流水线：总开关 + 策略行 + 各市场执行时刻 + 执行窗口 + 晚间对账时刻。
  *  端点：auto_pipeline —— 空载荷=读有效配置（与 GET /api/wb/auto_pipeline 同一实现）；
- *  带载荷=校验（复用 trading_core.autopipeline.apply_overlay，与调度侧同一实现）后原子写，
- *  失败文件零改动。草稿与载荷的键集恒等于服务端白名单（services/pipeline.js 的
- *  AUTO_PIPELINE_KEYS）——只读字段（error/date）不会经本页回写。
+ *  带载荷=校验（复用 trading_core.autopipeline.apply_overlay，与调度侧同一实现，写入侧
+ *  另加策略名取值域校验）后原子写，失败文件零改动。
+ *  rules —— 只读规则清单：策略下拉的「已批准规则」组只能来自它（**只有 status='enabled'
+ *  的规则可被消费**，见 services/strategies.js）。读取失败只降级为「只列内置策略」并提示。
+ *  草稿与载荷的键集恒等于服务端白名单（services/pipeline.js 的 AUTO_PIPELINE_KEYS）——
+ *  只读字段（error/date）不会经本页回写。
+ *  字段形状（WP22，2026-09-18 实机反馈「配置字段记不住也输不对」）：策略/关注池键是
+ *  Select（策略项来自内置策略 + 已批准规则；池键默认 watchlist 且允许自定义键名），
+ *  两个时刻是 TimePicker（HH:mm，字符串与 dayjs 的互转在 services/pipeline.js）。
  *  语义：开关作用于流水线的**自动执行**环节；实盘（live）的计划照常生成但永不自动执行，
  *  仍走计划页人工确认。 */
 function AutoPipelineSection() {
   const { message } = App.useApp();
   const config = useEndpoint("auto_pipeline", {}, []);
+  const rules = useEndpoint("rules", {}, []);
   const [draft, setDraft] = React.useState(null);
   const [busy, setBusy] = React.useState(false);
 
@@ -225,6 +244,13 @@ function AutoPipelineSection() {
 
   const loading = config.loading && !config.value;
   const enabled = base().enabled === true;
+  const ruleList = rules.value?.rules;
+  // 配置里存着「不可消费」的策略名（已停用规则/未知名字/自动路径跑不起来的单标的策略）：
+  // 下拉仍会显示它（补位项，不被静默替换），这里再给一条说明——保存会被服务端拒绝或当日
+  // build_plan 会失败，用户需要知道为什么。
+  const blocked = base().strategies
+    .map((row) => strategyFallbackOption(row.strategy, ruleList))
+    .filter((option) => option !== null);
   return (
     <Card size="small" title="自动流水线"
       extra={enabled ? <Tag color="green">自动执行已开启</Tag> : <Tag>自动执行关闭</Tag>}>
@@ -245,8 +271,16 @@ function AutoPipelineSection() {
         </Space>
 
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          策略（市场 + 策略名 + 关注池键名）：每个市场每天按策略生成目标权重并冻结计划
+          策略（市场 + 策略 + 关注池键名）：每个市场每天按策略生成目标权重并冻结计划。
+          策略从下拉里选「内置策略」或研究页「已批准（已启用）的规则」——每项的说明写的是它怎么选股；
+          关注池键选配置文件顶层的列表键（默认 watchlist），也可直接输入新的键名。
         </Typography.Text>
+        {rules.error && (
+          <Alert type="warning" showIcon message={`规则清单读取失败：${rules.error}`}
+            description="策略下拉暂时只列内置策略（已批准规则在服务恢复前选不到）；不影响保存既有配置。" />)}
+        {blocked.length > 0 && (
+          <Alert type="warning" showIcon message="当前配置里的策略无法被自动流水线消费"
+            description={`${blocked.map((option) => option.label).join("；")}——保存后当日 build_plan 会软跳过或失败，建议改用组合策略或重新批准规则。`} />)}
         {base().strategies.length === 0 && (
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             未配置策略：开启后流水线只跑数据与对账，不会生成计划
@@ -258,12 +292,20 @@ function AutoPipelineSection() {
               placeholder="市场"
               onChange={(value) => patchStrategy(index, { market: value })}
               options={MARKETS.map((market) => ({ value: market, label: market }))} />
-            <Input value={row.strategy} style={{ width: 200 }} disabled={busy}
-              aria-label={`策略 ${index + 1} 名称`} placeholder="策略名，如 watchlist_rsi"
-              onChange={(event) => patchStrategy(index, { strategy: event.target.value })} />
-            <Input value={row.watchlist} style={{ width: 160 }} disabled={busy}
-              aria-label={`策略 ${index + 1} 关注池键`} placeholder="池键，如 watchlist"
-              onChange={(event) => patchStrategy(index, { watchlist: event.target.value })} />
+            <Select value={row.strategy || undefined} style={{ width: 360 }} showSearch
+              optionFilterProp="label" disabled={busy}
+              aria-label={`策略 ${index + 1} 名称`} placeholder="选择策略（内置策略或已批准规则）"
+              onChange={(value) => patchStrategy(index, { strategy: value })}
+              options={strategyOptions(ruleList, row.strategy)} />
+            <Select value={row.watchlist ? [row.watchlist] : []} mode="tags"
+              style={{ width: 220 }} disabled={busy}
+              aria-label={`策略 ${index + 1} 关注池键`} placeholder="关注池键（默认 watchlist）"
+              options={poolKeyOptions(base())}
+              onChange={(values) => patchStrategy(index, {
+                // tags 模式允许自由输入新键；取**最后输入的一个**（多贴一个也不越界），
+                // 清空则回落到缺省池键（core 的同一缺省；留空会被服务端拒绝）。
+                watchlist: String(values[values.length - 1] ?? POOL_KEY_DEFAULT),
+              })} />
             <Button size="small" disabled={busy} onClick={() => removeStrategy(index)}>删除</Button>
           </Space>))}
         <Button size="small" disabled={busy} onClick={addStrategy}>添加策略</Button>
@@ -273,9 +315,11 @@ function AutoPipelineSection() {
           {MARKETS.map((market) => (
             <Space key={market} size={4}>
               <Typography.Text>{market}</Typography.Text>
-              <Input value={base().exec_at[market] ?? ""} style={{ width: 80 }} disabled={busy}
-                aria-label={`${market} 执行时刻`} placeholder="HH:MM"
-                onChange={(event) => patchExecAt(market, event.target.value)} />
+              <TimePicker value={hhmmToTime(base().exec_at[market])} format="HH:mm"
+                minuteStep={1} allowClear={false} disabled={busy} style={{ width: 100 }}
+                aria-label={`${market} 执行时刻`}
+                onChange={(value) => patchExecAt(market, timeToHhmm(value))} />
+              <HhmmHint value={base().exec_at[market]} />
             </Space>))}
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             窗口
@@ -289,9 +333,11 @@ function AutoPipelineSection() {
 
         <Space size="small" wrap>
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>晚间对账时刻</Typography.Text>
-          <Input value={base().reconcile_at} style={{ width: 80 }} disabled={busy}
-            aria-label="晚间对账时刻" placeholder="HH:MM"
-            onChange={(event) => patch({ reconcile_at: event.target.value })} />
+          <TimePicker value={hhmmToTime(base().reconcile_at)} format="HH:mm" minuteStep={1}
+            allowClear={false} disabled={busy} style={{ width: 100 }}
+            aria-label="晚间对账时刻"
+            onChange={(value) => patch({ reconcile_at: timeToHhmm(value) })} />
+          <HhmmHint value={base().reconcile_at} />
         </Space>
 
         <Space size="small" wrap>

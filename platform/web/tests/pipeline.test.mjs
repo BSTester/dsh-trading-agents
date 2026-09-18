@@ -6,9 +6,9 @@
 import test from "node:test";
 import assert from "node:assert/strict";
 import {
-  AUTO_PIPELINE_KEYS, MARKETS, autoPipelineBadge, autoPipelineDraft, autoPipelinePayload,
-  marketLabel, newStrategyRow, stageDrill, stageEntries,
-  stageStatus, stageStatusText, stageTagColor, stageTimeText,
+  AUTO_PIPELINE_KEYS, MARKETS, POOL_KEY_DEFAULT, autoPipelineBadge, autoPipelineDraft,
+  autoPipelinePayload, hhmmToTime, marketLabel, newStrategyRow, poolKeyOptions, stageDrill,
+  stageEntries, stageStatus, stageStatusText, stageTagColor, stageTimeText, timeToHhmm,
 } from "../src/services/pipeline.js";
 
 test("stageStatus：四种服务端状态各归各位；未知/缺失回落 wait（不猜成功）", () => {
@@ -138,4 +138,55 @@ test("autoPipelinePayload：键集恒等于白名单（草稿多余字段不漏�
 test("newStrategyRow：市场 + 策略 + 池键三字段", () => {
   assert.deepEqual(newStrategyRow(), {
     market: "SH", strategy: "watchlist_rsi", watchlist: "watchlist" });
+});
+
+// 2026-09-18 实机反馈：设置页的时刻字段是自由文本（HH:MM 靠手输），与「策略名靠手输」
+// 同一个毛病。改成 TimePicker 后需要 dayjs ↔ 字符串的纯转换：页面只接线，转换在此直测。
+// 口径与服务端 _hhmm 一致：HH:MM、00-23/00-59；**保存写回字符串**，dayjs 对象不入 payload。
+test("hhmmToTime/timeToHhmm：HH:MM 往返稳定；非法值给 null/空串（不编造时刻）", () => {
+  for (const text of ["00:00", "09:35", "09:45", "22:35", "19:00", "23:59"]) {
+    assert.equal(timeToHhmm(hhmmToTime(text)), text);
+  }
+  // 补零口径：dayjs 格式化恒为两位（服务端要求 ^\d{2}:\d{2}$）
+  assert.equal(timeToHhmm(hhmmToTime("9:05")), "09:05");
+  // 非法/不可解析：null（TimePicker 显示占位，不假装有值）
+  assert.equal(hhmmToTime("25:00"), null);
+  assert.equal(hhmmToTime("09:60"), null);
+  assert.equal(hhmmToTime("09:5"), null);
+  assert.equal(hhmmToTime(""), null);
+  assert.equal(hhmmToTime(null), null);
+  assert.equal(hhmmToTime("nope"), null);
+  // 非 dayjs 值：空串（不把 undefined/字符串塞进配置）
+  assert.equal(timeToHhmm(null), "");
+  assert.equal(timeToHhmm(undefined), "");
+  assert.equal(timeToHhmm("09:35"), "");
+});
+
+test("poolKeyOptions：默认池恒在，其余取当前策略行用到的键（去重保序）", () => {
+  assert.deepEqual(POOL_KEY_DEFAULT, "watchlist");
+  assert.deepEqual(poolKeyOptions(undefined),
+    [{ value: "watchlist", label: "watchlist（默认池）" }]);
+  const options = poolKeyOptions({ strategies: [
+    { watchlist: "watchlist" }, { watchlist: "hk_pool" },
+    { watchlist: "hk_pool" }, { watchlist: "" }, { watchlist: 42 }, {},
+  ] });
+  assert.deepEqual(options.map((option) => option.value), ["watchlist", "hk_pool"]);
+  assert.equal(options[1].label, "hk_pool");
+});
+
+test("autoPipelinePayload：时刻字段仍是 HH:MM 字符串（dayjs 对象不进载荷）", () => {
+  const draft = autoPipelineDraft({
+    enabled: true,
+    exec_at: { SH: "09:35", HK: "09:45", US: "22:35" }, reconcile_at: "19:00",
+  });
+  // 模拟页面接线：draft 里是字符串 → TimePicker 取 dayjs → onChange 再转回字符串
+  draft.exec_at.SH = timeToHhmm(hhmmToTime(draft.exec_at.SH));
+  draft.reconcile_at = timeToHhmm(hhmmToTime(draft.reconcile_at));
+  const payload = autoPipelinePayload(draft);
+  assert.equal(payload.exec_at.SH, "09:35");
+  assert.equal(payload.reconcile_at, "19:00");
+  for (const value of [...Object.values(payload.exec_at), payload.reconcile_at]) {
+    assert.equal(typeof value, "string");
+    assert.match(value, /^\d{2}:\d{2}$/);
+  }
 });

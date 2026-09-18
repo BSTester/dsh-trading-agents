@@ -10,7 +10,9 @@
     （不是补全后的完整配置）；
   * 校验面：未知字段 / enabled 非 bool / exec_at 非 HH:MM 或未知市场 / strategies
     结构错 / exec_window_minutes 非正整数 / 空载荷 → ``trading/invalid-operation``
-    业务失败信封，且**文件零改动**（逐字节反证）；
+    业务失败信封，且**文件零改动**（逐字节反证）；此外 WP22 起叠加**策略名取值域**
+    校验（内置策略 id ∪ ``status='enabled'`` 的规则 id，见
+    ``tests/test_wp22_settings_options.py``）；
   * 单一实现：校验复用 ``trading_core.autopipeline.apply_overlay``——同一非法载荷在
     两侧报**完全相同的消息**（证明没有第二套规则）；载荷白名单与 core 默认值键集一致；
   * 声明面：``auto_pipeline`` 进 ``store_access.endpoints()``（snapshot 向前端声明）与
@@ -171,17 +173,27 @@ class AutoPipelineSettingsTests(SettingsBase):
             settings_api.save_auto_pipeline(self.home, {"enabled": True})
         self.assertEqual(self.platform_path().read_bytes(), before)
 
-    def test_unknown_strategy_name_is_accepted(self):
-        """策略名不做注册表校验（有意）：core 只校验非空串。
+    def test_unknown_strategy_name_is_rejected(self):
+        """策略名写入侧 fail-closed（WP22 口径反转，2026-09-18 实机反馈）。
 
-        理由：WP14 的规则 id 不在静态 REGISTRY 里，静态白名单会把合法配置拒掉；
-        真正跑不起来时由策略层 fail-closed 软跳过并告警（作业入口），不在写入侧
-        假装能判定。本用例把这个取舍钉住，避免后人「顺手加校验」。
+        **历史取舍已推翻**：旧实现（本用例原名 ``test_unknown_strategy_name_is_accepted``）
+        只校验「非空字符串」，理由是「WP14 规则 id 不在静态 REGISTRY 里，静态白名单会误拒」。
+        该理由现在由**动态取值域**解决——写入侧查 ``rules`` 表，取值域 = 内置策略 id ∪
+        ``status='enabled'`` 的规则 id（``planner._resolve_strategy`` 能消费的两个来源，
+        见 ``tests/test_wp22_settings_options.py``）。不校验的真实代价已被实测：策略名打错
+        一个字母也能保存成功，此后每天 ``plan_auto`` 软跳过「策略未注册」，页面上只是
+        「没动静」——没有任何线索指向真正的原因。
+
+        调度侧读取行为不变：历史配置里的坏名字仍由「策略未注册」软跳过 + 告警兜住。
         """
-        out = settings_api.save_auto_pipeline(
-            self.home, {"enabled": True,
-                        "strategies": [{"market": "US", "strategy": "rule_alpha_v9"}]})
-        self.assertEqual(out["strategies"][0]["strategy"], "rule_alpha_v9")
+        with self.assertRaises(WorkbenchError) as caught:
+            settings_api.save_auto_pipeline(
+                self.home, {"enabled": True,
+                            "strategies": [{"market": "US", "strategy": "rule_alpha_v9"}]})
+        message = str(caught.exception)
+        self.assertIn("rule_alpha_v9", message)
+        self.assertIn("合法取值", message)
+        self.assertFalse(self.platform_path().exists())  # 先校验后落盘：零部分写入
 
     def test_field_whitelist_matches_core_keys(self):
         self.assertEqual(set(settings_api.AUTO_PIPELINE_FIELDS), set(DEFAULTS))

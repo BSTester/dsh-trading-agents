@@ -445,6 +445,28 @@ WantedBy=default.target
 > 前提：`trading-platform.json` 已开 `auto_pipeline.enabled=true`（配置样例见 README
 > 「WP9：自动流水线」）。关掉开关即回到全人工，任何演练都不需要改代码。
 
+### 设置页保存被拒：先看错误信息里的「合法取值」（WP22，2026-09-18）
+
+设置页（`#/settings` → 「自动流水线」）保存时，服务端会校验**策略名**；非法值一律
+拒绝并**逐个列出合法取值**，例如：
+
+```
+auto_pipeline.strategies 策略名不可用：'wathclist_rsi'
+（合法取值：ma_cross / momentum_value_top5 / rsi / watchlist_rsi；
+策略名须为内置策略 id，或研究页「已批准」（status=enabled）的规则 id——其它状态的规则不会被消费）
+```
+
+| 报错片段 | 原因 | 处置 |
+|---|---|---|
+| `策略名不可用：'xxx'` | 名字既不是内置策略 id，也不是 `status='enabled'` 的 `rule_id`（拼错、或规则尚未批准/已停用） | 按错误信息里的合法取值改；规则要先在研究页「批准」（`passed` → `enabled`） |
+| `规则库不可读` | `rules` 表打不开（DB 文件损坏/权限），无法确认「已批准」→ fail-closed 拒绝保存**非内置**策略名 | 修复 `~/.dsh/trading-data/trading.sqlite` 后重试；内置策略名不受影响（不读 DB，随时可保存） |
+| 保存成功但卡片里有黄条「当前配置里的策略无法被自动流水线消费」 | 历史配置里已有坏名字（写入侧校验是本轮新加的，不追溯拒绝旧配置），或选中的是单标的策略（`rsi`/`ma_cross`，缺 `target_weights`） | 换成组合策略（`watchlist_rsi`/`momentum_value_top5`）或重新批准规则后保存 |
+| `规则清单读取失败：…` | `rules` 端点不可达（服务陈旧/未起） | 下拉暂时只列内置策略；服务恢复后刷新页面 |
+
+**分工**（为什么保存被拒但作业只是「没动静」）：写入侧（Web 设置页）fail-closed 拦新错误；
+调度侧读取保持原样——历史配置里的坏策略名仍由 `plan_auto` 软跳过，并在告警表留一条
+warn「策略未注册」（`snapshot-schedule` 可见），不会因为本轮校验而追着旧配置报错。
+
 ### 假时钟演练（`DSH_FAKE_NOW`，测试/演练专用）
 
 ```bash
