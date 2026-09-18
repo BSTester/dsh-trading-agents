@@ -18,6 +18,14 @@
 //   push_status → futu_push 运行时门面：enabled/quote.connected/quote.authenticated，
 //     文案只有三类白名单（已连接/连接中/未启用），读取失败不猜状态。
 // 所有取数走 useEndpoint/useSnapshotPoll（callApi），无直连；缺失端点被声明预检拦截。
+//
+// 图表（WP26 第二批，两张）：
+//   * 「各市场持仓市值占比」环图 —— **始终为全部市场口径**（跨市场对比才有意义），
+//     不随页头市场筛选变化，图题与图下都写明这一点；中心显示总市值。
+//   * 「持仓 Top5」条形图 —— 跟随市场筛选，与既有 Top5 表格吃**同一份**
+//     `positionView.groups`（同一个 filterGroups 结果），故图与表逐行一致；表格保留
+//     （它是精确数值与数量/币种/市场列的出处，图只做排序的可视化）。
+//   派生全在 services/portfolioCharts.js（纯函数、node --test 直测），页面只接线渲染。
 import React from "react";
 import { Card, Col, Row, Space, Statistic, Table, Tag, Tooltip, Typography } from "antd";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
@@ -28,6 +36,12 @@ import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
 import { LineChart } from "../charts/line.jsx";
+import { HBarChart } from "../charts/bars.jsx";
+import { DonutChart } from "../charts/donut.jsx";
+import { compactNumber } from "../charts/geometry.js";
+import {
+  chartEmptyText, marketShareSlices, skipNoteText, topHoldings,
+} from "../services/portfolioCharts.js";
 import { ALERT_LEVEL_COLOR, parseHeartbeat } from "./schedule.jsx";
 
 /** 心跳距今分钟数（向下取整）；无法解析返回 null。 */
@@ -98,6 +112,17 @@ export default function OverviewPage() {
   const equityPoints = (equity.value?.points ?? []).map((point) => ({ t: point.t, v: point.equity }));
   const latestSnapshot = factorsHistory.value?.snapshots?.[0] ?? null;
   const pushStatus = pushStatusText(push.value);
+  // 两张图的派生（纯函数）：
+  //   * 市场占比吃**未过滤**的 groups（全部市场口径，与页头筛选无关）；
+  //   * Top5 吃与表格同一份 positionView.groups（跟随筛选，图与表逐行一致）。
+  const share = marketShareSlices(positions.value?.groups);
+  const topChart = topHoldings(positionView.groups, 5);
+  const topNote = skipNoteText({
+    skipped: topChart.skipped, reason: "market_value 缺失、为 0 或为负",
+  });
+  const shareNote = skipNoteText({
+    skipped: share.skipped, reason: "账户的 market_value 与持仓市值都缺失，无法计入",
+  });
 
   // 调度器健康摘要：心跳新鲜度 + kill/halt 原样事实（字段缺失一律 —，不推断）
   const heartbeat = schedule.value?.heartbeat ?? null;
@@ -144,8 +169,9 @@ export default function OverviewPage() {
         {/* 市场筛选口径：说清哪些卡片跟着筛选走、哪些本来就没有市场维度（不按市场藏数据） */}
         {filtered && (
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            市场筛选：{marketLabelOf(market)} —— 持仓 Top5 与今日成交按该市场统计；
-            权益曲线、告警、调度器与数据源状态没有市场维度，仍为全局口径。
+            市场筛选：{marketLabelOf(market)} —— 持仓 Top5（图与表）与今日成交按该市场统计；
+            权益曲线、告警、调度器与数据源状态没有市场维度；「各市场持仓市值占比」图则始终为
+            全部市场口径（跨市场对比才有意义）。后两类不随筛选变化。
           </Typography.Text>)}
         {/* 今日成交没有表格，空态原因只能在这里说；持仓的原因交给 Top5 表格的空态（就近显示） */}
         {dealView.emptyReason && (
@@ -210,47 +236,88 @@ export default function OverviewPage() {
         <Row gutter={[16, 16]}>
           <Col xs={24} lg={14}>
             <Card size="small" title={`持仓 Top5（按市值${filtered ? `，${marketLabelOf(market)}` : ""}）`}>
-              <Table size="small"
-                rowKey={(row) => `${row.accId}-${row.symbol}`}
-                dataSource={topPositions(positionView.groups)}
-                pagination={false}
-                loading={positions.loading}
-                locale={{ emptyText: positionView.emptyReason
-                  ?? (positions.loading ? "持仓加载中…" : "暂无持仓。") }}
-                columns={[
-                  { title: "标的", key: "symbol", render: (_f, row) => (
-                    <Space size={4}>
-                      <span>{row.symbol || "—"}</span>
-                      {row.name ? <Typography.Text type="secondary">{row.name}</Typography.Text> : null}
-                    </Space>) },
-                  // 「全部市场」下跨市场混排：补市场列，显示值与筛选口径同源（数字 market_id 也归一）
-                  ...(filtered ? [] : [{ title: "市场", key: "market",
-                    render: (_f, row) => marketDisplay(row.groupMarket) }]),
-                  { title: "数量", key: "qty", align: "right", render: (_f, row) => num(row.qty, 0) },
-                  { title: "市值", key: "market_value", align: "right", render: (_f, row) => num(row.market_value) },
-                  { title: "盈亏", key: "pl_val", align: "right", render: (_f, row) => num(row.pl_val) },
-                  { title: "币种", key: "currency", render: (_f, row) => row.currency ?? "—" },
-                ]} />
+              <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                {/* 图与下面的表同一份数据（同一个 positionView.groups）；图给排序，表给精确值 */}
+                <HBarChart items={topChart.items}
+                  emptyText={chartEmptyText({
+                    reason: positionView.emptyReason, loading: positions.loading,
+                    loadingText: "持仓加载中…", count: positionView.rows.length,
+                    emptyText: "暂无持仓。",
+                    missingText: "持仓的 market_value 全部缺失或为 0/负，无法绘制市值条。",
+                  })} />
+                {topNote && (
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>{topNote}</Typography.Text>)}
+                <Table size="small"
+                  rowKey={(row) => `${row.accId}-${row.symbol}`}
+                  dataSource={topPositions(positionView.groups)}
+                  pagination={false}
+                  loading={positions.loading}
+                  locale={{ emptyText: positionView.emptyReason
+                    ?? (positions.loading ? "持仓加载中…" : "暂无持仓。") }}
+                  columns={[
+                    { title: "标的", key: "symbol", render: (_f, row) => (
+                      <Space size={4}>
+                        <span>{row.symbol || "—"}</span>
+                        {row.name ? <Typography.Text type="secondary">{row.name}</Typography.Text> : null}
+                      </Space>) },
+                    // 「全部市场」下跨市场混排：补市场列，显示值与筛选口径同源（数字 market_id 也归一）
+                    ...(filtered ? [] : [{ title: "市场", key: "market",
+                      render: (_f, row) => marketDisplay(row.groupMarket) }]),
+                    { title: "数量", key: "qty", align: "right", render: (_f, row) => num(row.qty, 0) },
+                    { title: "市值", key: "market_value", align: "right", render: (_f, row) => num(row.market_value) },
+                    { title: "盈亏", key: "pl_val", align: "right", render: (_f, row) => num(row.pl_val) },
+                    { title: "币种", key: "currency", render: (_f, row) => row.currency ?? "—" },
+                  ]} />
+              </Space>
             </Card>
           </Col>
           <Col xs={24} lg={10}>
-            <Card size="small" title="因子快照">
-              <Space size="large" wrap>
-                <Statistic title="最新快照日期" value={latestSnapshot?.date ?? "—"} />
-                <Statistic title="因子数"
-                  value={latestSnapshot?.payload?.factors?.length ?? "—"} />
-                <Statistic title="覆盖标的"
-                  value={latestSnapshot?.payload?.tickers?.length ?? "—"} />
-              </Space>
-              {factorsHistory.error && (
-                <Typography.Text type="warning" style={{ fontSize: 12 }}>
-                  因子历史读取失败：{factorsHistory.error}
-                </Typography.Text>)}
-              {latestSnapshot && (
-                <Typography.Text type="secondary" style={{ fontSize: 12, display: "block" }}>
-                  本地保留 {factorsHistory.value?.snapshots?.length ?? 0} 份快照（按日收集，倒序取最新）。
-                </Typography.Text>)}
-            </Card>
+            <Space direction="vertical" size={16} style={{ width: "100%" }}>
+              <Card size="small" title="各市场持仓市值占比（全部市场口径）">
+                <Space direction="vertical" size="small" style={{ width: "100%" }}>
+                  <DonutChart slices={share.slices} height={170}
+                    centerText={`总 ${compactNumber(share.total)}`}
+                    emptyText={chartEmptyText({
+                      loading: positions.loading, loadingText: "持仓加载中…",
+                      count: (positions.value?.groups ?? []).length,
+                      emptyText: "暂无持仓账户，无可聚合的市场占比。",
+                      missingText: "没有可画的市值：各账户的 market_value 与持仓市值都缺失或为 0。",
+                    })} />
+                  {shareNote && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>{shareNote}</Typography.Text>)}
+                  {share.emptyChains > 0 && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {`另有 ${share.emptyChains} 个市场聚合后为 0 或负，未产出扇区（不画整圆冒充 100%）。`}
+                    </Typography.Text>)}
+                  {share.derivedAccounts > 0 && (
+                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                      {`其中 ${share.derivedAccounts} 个账户没有账户级市值（实盘账户该字段恒为空），`
+                        + "已按其持仓市值之和聚合。"}
+                    </Typography.Text>)}
+                  <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                    本图始终为全部市场口径，不随页头市场筛选变化；各市场市值为各账户本币数值
+                    直接相加、未做汇率换算，占比只反映各市场账户的数值规模。
+                  </Typography.Text>
+                </Space>
+              </Card>
+              <Card size="small" title="因子快照">
+                <Space size="large" wrap>
+                  <Statistic title="最新快照日期" value={latestSnapshot?.date ?? "—"} />
+                  <Statistic title="因子数"
+                    value={latestSnapshot?.payload?.factors?.length ?? "—"} />
+                  <Statistic title="覆盖标的"
+                    value={latestSnapshot?.payload?.tickers?.length ?? "—"} />
+                </Space>
+                {factorsHistory.error && (
+                  <Typography.Text type="warning" style={{ fontSize: 12 }}>
+                    因子历史读取失败：{factorsHistory.error}
+                  </Typography.Text>)}
+                {latestSnapshot && (
+                  <Typography.Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                    本地保留 {factorsHistory.value?.snapshots?.length ?? 0} 份快照（按日收集，倒序取最新）。
+                  </Typography.Text>)}
+              </Card>
+            </Space>
           </Col>
         </Row>
 

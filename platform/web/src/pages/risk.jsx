@@ -10,13 +10,22 @@
 //       top[{symbol, name, market_value, share_of_positions, share_of_assets, pl_ratio}],
 //       max_share_of_positions, max_share_symbol, winners{count, pl_val}, losers{count, pl_val}, note}
 // 页面只透出端点已有字段，不自算指标。
+//
+// 图表（WP26 第二批）：组合风险卡片里加「集中度」与「盈亏分布」两张图。派生全在
+// services/portfolioCharts.js（纯函数、node --test 直测）；集中度**优先用端点
+// group.risk.top[].share_of_positions**（字段缺失才退回自身聚合，并在图下写明），
+// 与下方「占本账户持仓市值」表格同源；市场筛选与空态与既有表格同一口径。
 import React from "react";
-import { Alert, Card, Descriptions, Space, Table, Typography } from "antd";
+import { Alert, Card, Descriptions, Divider, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num, pctOf, maskedAccount } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
+import { HBarChart, VBarChart } from "../charts/bars.jsx";
+import {
+  chartEmptyText, concentrationItems, holdingPnlItems, skipNoteText,
+} from "../services/portfolioCharts.js";
 
 const RISK_FIELDS = [
   { key: "risk_per_trade", label: "单笔风险占权益比例", format: "pct" },
@@ -58,6 +67,21 @@ function PortfolioRisk({ positions, market }) {
       ...item, account: group.account, accId: group.acc_id, groupMarket: group.market,
     })));
   const riskNote = (value?.groups ?? []).find((group) => group.risk?.note)?.risk?.note;
+  // 图表派生（纯函数）：入参就是两张表那份 view.groups——图与表必然同源。
+  const concentration = concentrationItems(view.groups);
+  const pnlChart = holdingPnlItems(view.groups);
+  const concentrationNote = skipNoteText({
+    skipped: concentration.skipped, reason: "该账户持仓市值合计为 0 或市值缺失，算不出占比",
+  });
+  const pnlNote = skipNoteText({
+    skipped: pnlChart.skipped, reason: "pl_val 缺失或非数字",
+  });
+  // 图的空态（与既有表格同一优先级；纯函数在 services/portfolioCharts.js）。本页的「行」
+  // 就是一个账户（viewGroups 的 rowsOf 给 [group]），故 count 用账户数。
+  const emptyState = {
+    reason: view.emptyReason, loading: positions.loading,
+    loadingText: "持仓加载中…", count: view.groups.length, emptyText: "暂无账户持仓风险数据。",
+  };
   const shownPositions = filtered
     ? accountRows.reduce((sum, row) => sum + (Number(row.risk.positions) || 0), 0)
     : value?.counts?.positions;
@@ -67,7 +91,7 @@ function PortfolioRisk({ positions, market }) {
         <Alert type="error" showIcon message={`持仓读取失败：${positions.error}`} />)}
       {filtered && (
         <Typography.Text type="secondary">
-          市场筛选：{marketLabelOf(market)} —— 下列两张表只含该市场账户；
+          市场筛选：{marketLabelOf(market)} —— 下列两张表与两张图只含该市场账户；
           风控配置是全局配置，没有市场维度，不随筛选变化。
         </Typography.Text>)}
       {view.emptyReason && (
@@ -122,6 +146,42 @@ function PortfolioRisk({ positions, market }) {
               || row.share_of_assets === undefined ? "—"
               : `${Number(row.share_of_assets).toFixed(2)}%`) },
         ]} />
+      <Card type="inner" title="图表：集中度与盈亏分布">
+        <Space direction="vertical" size="small" style={{ width: "100%" }}>
+          <Typography.Text strong style={{ fontSize: 12 }}>
+            集中度（各持仓占本账户持仓市值 %，与上表同源）
+          </Typography.Text>
+          <HBarChart items={concentration.items}
+            valueFormat={(item) => `${item.toFixed(2)}%`}
+            emptyText={chartEmptyText({ ...emptyState,
+              missingText: "本页账户都没有集中度明细（端点 group.risk.top 为空或占比字段缺失）。" })} />
+          {concentrationNote && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {concentrationNote}
+            </Typography.Text>)}
+          {concentration.fallbackAccounts > 0 && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {`其中 ${concentration.fallbackAccounts} 个账户的 share_of_positions 缺失，`
+                + "已退回按该账户持仓市值自行聚合（占比 = 该持仓市值 / 本账户持仓市值）。"}
+            </Typography.Text>)}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            数据来自端点 group.risk.top（上游每账户只给前 3 名，见 positions.py account_risk），
+            与上方「占本账户持仓市值」列同一字段；完整持仓看组合页。
+          </Typography.Text>
+          <Divider style={{ margin: "4px 0" }} />
+          <Typography.Text strong style={{ fontSize: 12 }}>
+            盈亏分布（按 pl_val 降序，红涨绿跌，标签为代码）
+          </Typography.Text>
+          <VBarChart items={pnlChart.items}
+            emptyText={chartEmptyText({ ...emptyState,
+              missingText: "本页账户的持仓都没有 pl_val，无法绘制盈亏柱。" })} />
+          {pnlNote && (
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>{pnlNote}</Typography.Text>)}
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            盈亏是各账户本币数值，不跨币种相加；精确数值看上方两张表。
+          </Typography.Text>
+        </Space>
+      </Card>
       {riskNote && <Typography.Text type="secondary">{riskNote}</Typography.Text>}
     </Space>);
 }

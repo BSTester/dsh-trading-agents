@@ -11,14 +11,24 @@
 //     points[{t, equity, dd}], tickers, strategies, initial, current, total_return, max_drawdown,
 //     sharpe, trades, note}
 // 模式切换只是查看视角（本地 state），不调 switch-mode；模式切换永不授权下单。
+//
+// 图表（WP26 第二批）：持仓市值 / 持仓盈亏两张分布图，派生全在
+// services/portfolioCharts.js（纯函数、node --test 直测），页面只接线与渲染。
+// **图与表同源**：三处都吃同一份 `viewGroups(...)`（同一个 filterGroups 结果），
+// 图不会与表格出现两个不一致的数字；跳过条数由 skipNoteText 如实标注。
 import React from "react";
-import { Alert, Card, Col, Row, Space, Statistic, Table, Tag, Typography } from "antd";
+import { Alert, Card, Col, Divider, Row, Space, Statistic, Table, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num, pctOf, maskedAccount } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
 import { LineChart } from "../charts/line.jsx";
+import { HBarChart, VBarChart } from "../charts/bars.jsx";
+import { compactNumber } from "../charts/geometry.js";
+import {
+  chartEmptyText, holdingPnlItems, holdingValueItems, skipNoteText,
+} from "../services/portfolioCharts.js";
 
 const MODES = [
   { value: "sim", label: "模拟 sim" },
@@ -40,6 +50,27 @@ export default function PortfolioPage() {
     })));
   const equityPoints = (equity.value?.points ?? []).map((point) => ({ t: point.t, v: point.equity }));
   const counts = positions.value?.counts;
+  // 图表派生（纯函数）：入参就是上表那份 view.groups——图与表必然同源；跨账户不合并
+  // （与表格逐行对应），跨币种按数值直接相加、不做汇率换算（页面既有口径）。
+  const valueChart = holdingValueItems(view.groups);
+  const pnlChart = holdingPnlItems(view.groups);
+  // 条形右侧的「市值 · 占比」：占比分母就是图内画入项合计（valueChart.total），
+  // 分子分母同一份数据，扇区/条形自洽。
+  const valueText = (value) => (valueChart.total > 0
+    ? `${compactNumber(value)} · ${((value / valueChart.total) * 100).toFixed(1)}%`
+    : compactNumber(value));
+  const valueNote = skipNoteText({
+    skipped: valueChart.skipped, reason: "market_value 缺失、为 0 或为负",
+  });
+  const pnlNote = skipNoteText({
+    skipped: pnlChart.skipped, reason: "pl_val 缺失或非数字",
+  });
+  // 图的空态（口径与既有表格同一优先级，纯函数在 services/portfolioCharts.js）：
+  // 筛选原因 > 加载中 > 无持仓 > 字段整列缺失。
+  const emptyState = {
+    reason: view.emptyReason, loading: positions.loading,
+    loadingText: "持仓加载中…", count: rows.length, emptyText: "暂无持仓。",
+  };
   return (
     <Card title="组合" extra={(
       <Space size="small">
@@ -64,7 +95,7 @@ export default function PortfolioPage() {
             message={`账户读取失败：${row.account ?? "—"}：${row.reason ?? "—"}`} />))}
         {filtered && (
           <Typography.Text type="secondary">
-            市场筛选：{marketLabelOf(market)} —— 上表只列该市场账户的持仓
+            市场筛选：{marketLabelOf(market)} —— 上表与下方两张图只列该市场账户的持仓
             （账户列悬停可见完整账户名）；权益曲线是本地模拟台账，没有市场维度，仍为全局口径。
           </Typography.Text>)}
         {view.emptyReason && (
@@ -96,6 +127,35 @@ export default function PortfolioPage() {
             { title: "盈亏", key: "pl_val", align: "right", render: (_field, row) => num(row.pl_val) },
             { title: "币种", key: "currency", render: (_field, row) => row.currency ?? "—" },
           ]} />
+        <Card type="inner" title="持仓分布（图）">
+          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+            <Typography.Text strong style={{ fontSize: 12 }}>
+              持仓市值（按市值降序，条形右侧为市值 · 占比）
+            </Typography.Text>
+            <HBarChart items={valueChart.items} valueFormat={valueText}
+              emptyText={chartEmptyText({ ...emptyState,
+                missingText: "这些持仓的 market_value 全部缺失或为 0/负，无法绘制市值条。" })} />
+            {valueNote && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>{valueNote}</Typography.Text>)}
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              占比分母是本图画入项的市值合计 {compactNumber(valueChart.total)}
+               （缺失/为 0 的持仓不进分母）；跨账户、跨币种按数值直接相加，不做汇率换算，
+               故占比只反映数值规模。
+            </Typography.Text>
+            <Divider style={{ margin: "4px 0" }} />
+            <Typography.Text strong style={{ fontSize: 12 }}>
+              持仓盈亏（按 pl_val 降序，红涨绿跌，标签为代码）
+            </Typography.Text>
+            <VBarChart items={pnlChart.items}
+              emptyText={chartEmptyText({ ...emptyState,
+                missingText: "这些持仓的 pl_val 全部缺失，无法绘制盈亏柱。" })} />
+            {pnlNote && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>{pnlNote}</Typography.Text>)}
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              盈亏是各账户本币数值，不跨币种相加；精确数值看上方表格（两图与表格同一份数据）。
+            </Typography.Text>
+          </Space>
+        </Card>
         <Card type="inner" title="权益曲线（本地模拟台账）">
           {equity.error && (
             <Typography.Text type="danger">权益读取失败：{equity.error}</Typography.Text>)}
