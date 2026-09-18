@@ -9,6 +9,11 @@ from . import alerts, store
 from .autopipeline import auto_pipeline_config
 from .clock import now_fn
 
+#: 交易日守卫的告警标题（**稳定字面量**：``pipeline._ALERT_STATUS`` 按标题精确匹配，
+#: 变量只进 detail）。分级 **info**：真实休市不是故障——与 ``planner.plan_auto`` 的非
+#: 交易日软跳过同一语义（那里同样不写 warn）。
+TRADING_DAY_ALERT_TITLE = "非交易日"
+
 
 def _minutes_of_day(hhmm):
     """HH:MM → 当日分钟数（0..1439）。格式非法抛 ValueError（调用方 fail-closed）。"""
@@ -43,6 +48,14 @@ def auto_execute(conn, home, market, today=None, now=None):
     守卫 9 = **执行窗口**（规格 §4.3 第 9 条）：调度器 tick-first——启动即补跑当日已到期
     作业，没有窗口就会在收盘后补执行 09:35 的计划（风控规则 3 逐单拒单 + 当日计划被消耗）。
     窗口外一律不执行、留待人工（info 告警）。
+
+    守卫 4b = **交易日**（WP18 新增的**纵深防御**）：规格 §4.3 的九守卫里没有交易日判定，
+    因为线上调度器在链外已挡（``daemon.tick`` 非交易日不跑市场链）。但 CLI / MCP / E2E
+    **直接调用**本函数时没有这道闸——实测 2026-05-01（法定假日）09:35 直调照样写出了
+    ``execute_plan`` 指令，只靠下游 ``risk.pre_trade_checks`` 的规则 3 逐单拒单兜底。
+    纵深防御要求同一道闸在作业体内也存在：日历未同步 → warn（与守卫 5+6 同分级）；
+    非交易日 → info（真实休市不是故障，与 ``plan_auto`` 一致）。编号用 4b 而非重排，
+    是为了不打乱规格 §4.3 已登记编号（5/6/7/8/9 与文档一一对应）。
 
     返回契约（**永不抛**——作业失败不拖垮调度链）::
 
@@ -105,6 +118,18 @@ def auto_execute(conn, home, market, today=None, now=None):
         reason = halt.get("reason") or "未标注原因"
         return skip(f"熔断生效（{reason}，{halt.get('set_at') or '时间未知'}）："
                     f"先查明原因并人工 clear_halt 后再执行", "warn", "熔断生效")
+
+    # 守卫 4b：交易日（**纵深防御**，见 docstring 与 wp18 用例）。
+    # 线上调度器已在链外挡（非交易日不跑市场链），但 CLI/MCP/E2E 直调没有这道闸：
+    # 实测法定假日 2026-05-01 09:35 直调本函数照样写出了 execute_plan 指令。
+    # 分级与 plan_auto 一致：真实休市不是故障 → info；日历未同步 → warn（守卫 5+6 同款）。
+    try:
+        trading_day = store.is_trading_day(conn, market, today)
+    except RuntimeError as error:
+        return skip(f"日历未同步：{error}", "warn", "日历未同步")
+    if not trading_day:
+        return skip(f"{today} 非 {market} 交易日：不自动执行", "info",
+                    TRADING_DAY_ALERT_TITLE)
 
     # 守卫 5+6：计划存在（auto+frozen，最近窗口内）且计划自身 mode=sim、market 一致
     # 窗口 2 的依据见 planner.recent_trading_days（跨市场日期空间容差）

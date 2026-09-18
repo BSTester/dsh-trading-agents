@@ -112,6 +112,9 @@ _ALERT_STATUS = {
     "exec_at 缺市场": ("auto_execute", "failed"),
     "时刻非法": ("auto_execute", "failed"),
     "已超执行窗口": ("auto_execute", "skipped"),
+    # 交易日守卫（WP18 守卫 4b，纵深防御）：真实休市 → skipped（不是故障；分级 info 由
+    # autopilot 决定，这里只登记阶段归因——作业没跑完时页面要能看到是「休市」所致）
+    "非交易日": ("auto_execute", "skipped"),
     # reconcile.daily（reconcile 作业）
     "对账跳过": ("reconcile", "skipped"),
     "对账通道不可用": ("reconcile", "failed"),
