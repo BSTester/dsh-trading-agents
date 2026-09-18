@@ -53,7 +53,7 @@ git clone https://github.com/BSTester/dsh-trading-agents "$HOME/.dsh/.agent-pres
 git clone https://github.com/BSTester/dsh-trading-agents "$env:USERPROFILE\.dsh\.agent-presets\dsh-trading-agents"
 ```
 
-**方式 B · 完整安装脚本**（preset + Python 依赖 + 富途授权向导 + 五个插件）
+**方式 B · 完整安装脚本**（preset + Python 依赖 + 富途授权向导 + 五个插件 + 平台服务依赖与前端 + 自检）
 
 ```bash
 # Linux / macOS
@@ -68,7 +68,7 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 **方式 C · 让 AI 帮你装**——把下面这段话直接发给你正在使用的 DeepSeek Harness 会话。
 
 > 实测：按下面的步骤走完，会装出 **2 个 skill + 5 个插件 + 统一 Python 层
-> （数据层 datasource + 量化核心 core）+ Python 依赖**，
+> （数据层 datasource + 量化核心 core）+ Python 依赖 + 平台服务依赖与前端构建**，
 > 并以自检「✅ 安装完整」为准。`install.sh` 会自行把 preset 克隆到用户 preset 目录，
 > 因此**不需要你手动克隆**。装完后的对话模式会话会**自动检测并拉起工作台服务**
 > （preset 行 `platform-autostart`；未安装平台时仅日志提示，不影响会话）。
@@ -84,8 +84,9 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
    它会：把 preset 装到 $HOME/.dsh/.agent-presets/dsh-trading-agents（Windows 为
    %USERPROFILE%\.dsh\...）、安装 workbench / fin-data / trading-engine / futu-keepalive /
    platform-autostart 五个插件、解出统一 Python 层（datasource + core 两个库）并注入交易 venv、
-   创建 venv 并安装 akshare 与 playwright。
-   预期最后一行为「重启 dsh web → 新建会话 → 选择「交易智囊模式」…」。
+   创建 venv 并安装 akshare 与 playwright（含 Chromium 浏览器二进制）、装平台服务依赖
+   （platform/requirements.txt：fastapi/uvicorn/mcp…）并构建前端 dist、最后跑一遍安装自检。
+   预期能看到「自检通过（✅ 安装完整）」与「重启 dsh web → 新建会话 → 选择「交易智囊模式」…」。
    ⚠️ 过程中会弹出富途授权页（OAuth）等你确认。此刻不想授权就让它跳过，
      之后随时可以补：python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py
 
@@ -111,7 +112,9 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
 
 ## 装完之后：服务启停与验收（WP9–WP17）
 
-安装脚本会把 preset 与统一 Python 层装好；**日常运维用仓库里的一个脚本**，不要用前台
+安装脚本会把 preset、统一 Python 层、**平台服务依赖与前端 dist** 都装好（方式 B 的第 3.6 步；
+它用 `install_platform.py --skip-service`，只装依赖不拉起常驻进程），并在结尾跑一遍自检。
+因此装完你只需要**决定何时拉起服务**——**日常运维用仓库里的一个脚本**，不要用前台
 进程方式长期跑服务（服务是**常驻件**不是可选件——调度链、Web 工作台、规则批准与计划
 执行都在它进程内；定位见下文「服务不是可选项」）：
 
@@ -132,11 +135,26 @@ scripts/platform_service.sh refresh   # 把仓库 python 层重新解到 ~/.dsh/
 > 前端改动另需重建：`npm --prefix platform/web run build`。
 > 五层的完整更新顺序与各层判据见下文「[更新到最新版本](#更新到最新版本)」。
 
-**首启必做**：配置关注池，否则平台在跑但什么都没发生（流程页会给「关注池未配置」提示）：
+**首启必做：三步自举数据**（否则平台在跑但什么都没发生——流程页会给「关注池未配置」提示）。
+2026-09-18 实测补正：此前这里只写了 `watchlist-init` 一条，但在**全新机器**上它必然失败，
+因为它依赖 `universe` 表里的指数成分快照；而**交易日历**缺失时市场链会被判定为
+「日历未同步 / 非交易日」而整天跳过：
 
 ```bash
+# ① 指数成分快照（watchlist-init 的数据来源；缺它 → 「universe 表没有 SH.000300 的成分快照」）
+~/.dsh/trading-venv/bin/python -m trading_core universe --index SH.000300
+# ② 关注池（取成分股前 20 只；`--limit` 可按需调整）
 ~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300 --limit 20
+# ③ 交易日历（三市场都要，覆盖到明年年底；含法定假日与半日市）
+for m in SH HK US; do
+  ~/.dsh/trading-venv/bin/python -m trading_core calendar --market "$m" --start 2026-01-01 --end 2027-12-31
+done
 ```
+
+> ③ 之后可以交给平台自己维护：服务内 GLOBAL 链的 `sync_calendar`（每天 18:50，自节流——
+> 覆盖充足时零网络跳过）会自动补齐，日历快到期还会发「日历覆盖不足 / 已用尽」告警。
+> 但它最早在**当天 18:50** 才生效，所以**首启当天请手工跑一次**，否则白天的市场作业仍会被跳过。
+> ① ② 是人的选股决策，安装器不会替你决定，因此**没有**任何自动步骤会建关注池。
 
 **验收工具**（交付即可跑，详见 [docs/E2E-ACCEPTANCE.md](docs/E2E-ACCEPTANCE.md)）：
 

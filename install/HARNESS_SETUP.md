@@ -14,7 +14,17 @@
 ---
 
 
-> **首启必做（否则平台在跑但什么都没发生）**：配置关注池——`~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300`（需 universe 表已有该指数成分快照；缺它是全部数据作业静默跳过的原因，流程页会显示「关注池未配置」提示）。
+> **首启必做：三步自举数据（否则平台在跑但什么都没发生）**——2026-09-18 实测补正：
+> 只跑 `watchlist-init` 在全新机器上**必然失败**（它依赖 `universe` 成分快照），且缺交易日历时
+> 市场链会被判定「日历未同步 / 非交易日」整天跳过：
+> ```bash
+> ~/.dsh/trading-venv/bin/python -m trading_core universe --index SH.000300          # ① 成分快照
+> ~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300 --limit 20   # ② 关注池
+> for m in SH HK US; do ~/.dsh/trading-venv/bin/python -m trading_core calendar --market "$m" \
+>   --start 2026-01-01 --end 2027-12-31; done                                       # ③ 交易日历
+> ```
+> ③ 之后由服务内 `sync_calendar` 作业（18:50，自节流）自动维护，但它当天 18:50 才生效，
+> 首启当天仍需手工跑一次。缺关注池时流程页显示「关注池未配置」提示。
 
 ## ① 提示词（整段粘贴给 Harness）
 

@@ -61,6 +61,11 @@ if ($py) {
         & $venvPython -m pip install -q akshare playwright
         if ($LASTEXITCODE -eq 0) { Say "依赖安装完成（$venv）" }
         else { Warn "依赖安装失败：会话内使用时 AI 会提示重试，不影响其他功能" }
+        # 浏览器二进制（2026-09-18 补）：pip 只装库、不下载 Chromium，而情绪/资讯采集与
+        # 前端真浏览器 E2E 都要它。幂等：已存在时秒回。
+        & $venvPython -m playwright install chromium 2>$null
+        if ($LASTEXITCODE -eq 0) { Say "Playwright Chromium 就绪" }
+        else { Warn "Playwright Chromium 未就绪：情绪/资讯采集将降级（可手动运行 $venv\Scripts\playwright install chromium）" }
     }
 } else {
     Warn "未找到 python：AKShare（A股新闻舆情）与 X 渠道不可用，其余功能正常。"
@@ -71,6 +76,17 @@ if (Test-Path $venvPython) {
     & $python (Join-Path $presetDst "scripts\install_plugins.py") link --repo $presetDst --dsh-home $dshHome
     if ($LASTEXITCODE -ne 0) { Warn "数据层链接失败：行情与回测工具可能不可用，可重跑 install.ps1" }
 }
+
+# 平台服务依赖 + 前端构建（2026-09-18 补）：工作台服务是常驻件不是可选件，而它的依赖
+# （platform/requirements.txt）与前端 dist 都不在上面几步里。--skip-service 只装依赖与
+# 构建、不拉起常驻进程——起不起服务仍由用户决定。
+$platformInstaller = Join-Path $presetDst "scripts\install_platform.py"
+if ((Test-Path $venvPython) -and (Test-Path $platformInstaller)) {
+    Say "安装平台服务依赖与前端（fastapi/uvicorn/mcp + npm build，约1-3分钟）…"
+    & $venvPython $platformInstaller --home $dshHome --skip-service
+    if ($LASTEXITCODE -ne 0) { Warn "平台依赖/前端未装完：工作台服务可能起不来，可重跑 .\install.ps1" }
+}
+
 
 # 富途授权（token 已存在则跳过；过期时可用 --refresh 续期）
 $tokenFile = Join-Path $dshHome "futu-token"
@@ -85,11 +101,15 @@ if (Test-Path $tokenFile) {
 
 # 缺少模式文件时运行时默认 sim；安装器不覆盖模式或修复非法状态。
 
+# 自检（2026-09-18 补）：装完必须能自己回答「装全了没有」。
+Say "安装自检…"
+& $python (Join-Path $presetDst "scripts\install_plugins.py") check --repo $presetDst --dsh-home $dshHome
+if ($LASTEXITCODE -eq 0) { Say "自检通过（✅ 安装完整）" }
+else { Warn "自检未通过：按上面的问题与修复建议处理后重跑 .\install.ps1" }
+
 Say "重启 dsh web → 新建会话 → 选择「交易智囊模式」→ 说「分析一下 00700.HK」"
 
-# 可选：量化平台独立服务（工作台 Web + quantwb MCP 工具面）。
-# 有意不自动执行：涉及常驻进程与端口，交给用户决定时机；一键安装提示词
-# 与完整手册见 install\HARNESS_SETUP.md。
-Say "可选：安装量化平台独立服务（本脚本不自动执行）"
-Warn "手动运行：python scripts\install_platform.py --home $dshHome（幂等，--dry-run 可先看计划）"
-Warn "或把 install\HARNESS_SETUP.md ① 的提示词整段粘贴给新的 Harness 会话，由安装协调员自动完成"
+# 量化平台独立服务（工作台 Web + quantwb MCP 工具面）：依赖已由上面的 install_platform.py
+# 装好；这里只把「何时拉起常驻进程」交给用户。
+Say "启动工作台服务（常驻进程，时机由你决定）"
+Warn "脚本方式：scripts\platform_service.sh start（或 install\HARNESS_SETUP.md ① 的提示词）"
