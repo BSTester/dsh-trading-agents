@@ -77,6 +77,20 @@ class StoreTest(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             store.is_trading_day(self.conn, "HK", "2026-09-11")
 
+    def test_calendar_row_reads_one_day(self):
+        """单日只读助手（唯一实现）：调用方拿 ``trade_second`` 不再写裸 SQL。"""
+        store.upsert_calendar(self.conn, "HK", [
+            {"day": "2026-09-16", "trade_date_type": "WHOLE", "trade_second": 9000},
+            {"day": "2026-09-17", "trade_date_type": "WHOLE", "trade_second": None}])
+        row = store.calendar_row(self.conn, "hk", "2026-09-16")
+        self.assertEqual(row["day"], "2026-09-16")
+        self.assertEqual(row["trade_date_type"], "WHOLE")
+        self.assertEqual(row["trade_second"], 9000)
+        # 该列为 NULL 时如实返回 None（调用方按「全天口径」回落），不编造数字
+        self.assertIsNone(store.calendar_row(self.conn, "HK", "2026-09-17")["trade_second"])
+        # 无该行 → None（休市日/超出覆盖上界都从这里区分）
+        self.assertIsNone(store.calendar_row(self.conn, "HK", "2026-09-18"))
+
     def test_kv_roundtrip(self):
         store.kv_set(self.conn, "backfill:daily", {"done": ["600519"], "failed": {}})
         self.assertEqual(store.kv_get(self.conn, "backfill:daily")["done"], ["600519"])

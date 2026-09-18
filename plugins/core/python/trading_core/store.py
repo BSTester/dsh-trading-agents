@@ -300,6 +300,20 @@ def is_trading_day(conn, market, day):
     return row is not None
 
 
+def calendar_row(conn, market, day):
+    """某市场某日的日历行（只读小助手，唯一实现——调用方不写裸 SQL）；无该行 → ``None``。
+
+    与 ``is_trading_day``/``trading_days`` 同表同口径，额外给出 ``trade_second``：数据
+    就绪门（``planner.data_date_for``）据此算**真实收盘**（半日市 = 开盘 + trade_second，
+    见 ``sessions`` 模块）。``trade_second`` 为 NULL 时键存在但值为 ``None``（调用方按
+    「全天口径」回落，不编造数字）；该列为 CLOSE 的行同样返回——调用方已由
+    ``trading_days`` 过滤，本助手不做二次判定（只读，不改变白名单语义）。
+    """
+    row = conn.execute("SELECT day, trade_date_type, trade_second FROM calendar"
+                       " WHERE market=? AND day=?", (market.upper(), day)).fetchone()
+    return dict(row) if row is not None else None
+
+
 def trading_days(conn, market, start, end):
     _require_calendar(conn, market)
     rows = conn.execute("SELECT day FROM calendar WHERE market=? AND day>=? AND day<=?"

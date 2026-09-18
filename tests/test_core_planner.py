@@ -12,7 +12,7 @@ from datetime import date, timedelta
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "plugins" / "core" / "python"))
-from trading_core import execute, planner, store  # noqa: E402
+from trading_core import execute, planner, sessions, store  # noqa: E402
 
 #: execute.run 的风控 ctx（与 test_core_execute 同口径的最小通过集）
 RISK_CTX = {"mode": "sim", "kill_path": "/nonexistent", "equity": 1_000_000.0,
@@ -167,8 +167,11 @@ class DataDateForTest(unittest.TestCase):
         self.addCleanup(self.conn.close)
 
     def _calendar(self, market, days):
+        # 各市场写**自己的**全天秒数：把 14400 当成所有市场的全天值会让美股行被
+        # 读成「提前收盘」（14400 < 23400），那是夹具造出来的假数据而非真实日历。
+        seconds = sessions.FULL_DAY_SECONDS[market]
         store.upsert_calendar(self.conn, market, [
-            {"day": d, "trade_date_type": "WHOLE", "trade_second": 14400} for d in days])
+            {"day": d, "trade_date_type": "WHOLE", "trade_second": seconds} for d in days])
 
     def test_sh_hk_same_day_close(self):
         """沪深/港股：收盘落在北京当日（15:00 / 16:00）——收盘前不给会话日。"""
@@ -243,6 +246,84 @@ class DataDateForTest(unittest.TestCase):
         self._calendar("SH", ["2026-09-16"])
         with self.assertRaises(ValueError):
             planner.data_date_for(self.conn, "SH", "2026/09/16 16:20")
+
+
+class HalfDayCloseTest(unittest.TestCase):
+    """半日市纳入「会话已收盘」判定（该组要修的差别：旧口径只认全天收盘）。
+
+    半日市按**单段**（只有上午）算收盘：HK``trade_second=9000``（2.5h）→ 本地 12:00、
+    US``trade_second=12600``（3.5h）→ 本地 13:00。旧实现按 ``SESSION_CLOSE_BEIJING``
+    的全天界（HK 16:00 / US 北京次日 05:00）判定，因此在「真实收盘之后、全天收盘之前」
+    会误判为「尚未收盘」而不产出计划。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = store.connect(str(Path(self.tmp.name) / "t.sqlite"))
+        self.addCleanup(self.conn.close)
+
+    def _calendar(self, market, rows):
+        """``rows`` = ``[(day, trade_second | None)]``（None = 库里该列为 NULL）。"""
+        store.upsert_calendar(self.conn, market, [
+            {"day": day, "trade_date_type": "WHOLE", "trade_second": seconds}
+            for day, seconds in rows])
+
+    def test_hk_half_day_is_closed_after_real_close(self):
+        self._calendar("HK", [("2026-09-15", 19800), ("2026-09-16", 9000)])
+
+        # 北京 13:00 = 半日市真实收盘（本地 12:00）之后 → 本场已收盘（旧代码返回 None）
+        self.assertEqual(planner.data_date_for(self.conn, "HK", "2026-09-16 13:00:00"),
+                         "2026-09-16")
+        # 真实收盘之前（北京 11:30）→ 尚未收盘，宁可不生成计划
+        self.assertIsNone(planner.data_date_for(self.conn, "HK", "2026-09-16 11:30:00"))
+
+    def test_hk_half_day_close_is_1200_not_1300(self):
+        """午休不适用于半日市：真实收盘 12:00——13:00 判已收盘只能由 12:00 口径推出。"""
+        self._calendar("HK", [("2026-09-15", 19800), ("2026-09-16", 9000)])
+        self.assertEqual(planner.data_date_for(self.conn, "HK", "2026-09-16 12:30:00"),
+                         "2026-09-16")
+        self.assertIsNone(planner.data_date_for(self.conn, "HK", "2026-09-16 11:59:00"))
+
+    def test_us_half_day_is_closed_after_real_close(self):
+        """美股半日（12600 = 09:30–13:00 ET）→ 北京次日 01:00（EDT）已收盘。"""
+        self._calendar("US", [("2026-09-14", 23400), ("2026-09-15", 12600)])
+
+        self.assertEqual(planner.data_date_for(self.conn, "US", "2026-09-16 02:00:00"),
+                         "2026-09-15")
+        # 真实收盘（北京次日 01:00）之前 → 尚未收盘；旧口径 05:00 之前一律 None
+        self.assertIsNone(planner.data_date_for(self.conn, "US", "2026-09-16 00:30:00"))
+
+    def test_full_day_rows_keep_legacy_behaviour(self):
+        """全天行（trade_second = 全天秒数）逐字走既有 ``SESSION_CLOSE_BEIJING`` 表。"""
+        self._calendar("SH", [("2026-09-15", 14400), ("2026-09-16", 14400)])
+        self._calendar("HK", [("2026-09-15", 19800), ("2026-09-16", 19800)])
+        self._calendar("US", [("2026-09-14", 23400), ("2026-09-15", 23400)])
+
+        self.assertEqual(planner.data_date_for(self.conn, "SH", "2026-09-16 16:20:00"),
+                         "2026-09-16")
+        self.assertIsNone(planner.data_date_for(self.conn, "SH", "2026-09-16 10:00:00"))
+        self.assertIsNone(planner.data_date_for(self.conn, "HK", "2026-09-16 15:30:00"))
+        self.assertEqual(planner.data_date_for(self.conn, "HK", "2026-09-16 16:40:00"),
+                         "2026-09-16")
+        # US 的 1 小时保守余量（EST 界 05:00）不变：04:30 仍判「尚未收盘」
+        self.assertIsNone(planner.data_date_for(self.conn, "US", "2026-09-16 04:30:00"))
+        self.assertEqual(planner.data_date_for(self.conn, "US", "2026-09-16 05:40:00"),
+                         "2026-09-15")
+
+    def test_missing_trade_second_keeps_legacy_behaviour(self):
+        """``trade_second`` 为 NULL（库现状允许）→ 与全天行逐字一致。"""
+        self._calendar("HK", [("2026-09-15", None), ("2026-09-16", None)])
+        self.assertIsNone(planner.data_date_for(self.conn, "HK", "2026-09-16 15:30:00"))
+        self.assertEqual(planner.data_date_for(self.conn, "HK", "2026-09-16 16:40:00"),
+                         "2026-09-16")
+
+    def test_half_day_after_holiday_falls_back_to_resolved_day(self):
+        """半日行的判定用**回落后的交易日**（会话日先解析，再判是否已收盘）。"""
+        # 2026-09-19/20 是周末：北京周一 2026-09-21 05:40 负责的 US 会话是周五 09-18
+        self._calendar("US", [("2026-09-17", 23400), ("2026-09-18", 12600)])
+        self.assertEqual(planner.data_date_for(self.conn, "US", "2026-09-21 05:40:00"),
+                         "2026-09-18")
 
 
 if __name__ == "__main__":

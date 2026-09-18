@@ -23,7 +23,7 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 sys.path.insert(0, str(ROOT / "plugins" / "datasource" / "python"))
 
 from server import trading as server_trading  # noqa: E402
-from trading_core import broker, cli, planner, strategies, store  # noqa: E402
+from trading_core import broker, cli, planner, sessions, strategies, store  # noqa: E402
 from trading_datasource.market_ids import (  # noqa: E402
     OPENAPI_ENABLE_MARKET as CANON_OPENAPI_ENABLE_MARKET,
     SIM_MARKET_IDS)
@@ -74,8 +74,11 @@ class PlanAutoTest(unittest.TestCase):
             json.dumps(cfg, ensure_ascii=False), encoding="utf-8")
 
     def _calendar(self, market="SH", days=(PREV, TODAY)):
+        # 各市场写**自己的**全天秒数（WP19）：把 14400 写进美股日历会让该行被读成
+        # 「提前收盘 13:30 ET」——那是夹具造出来的假数据，不是真实日历。
+        seconds = sessions.FULL_DAY_SECONDS[market]
         store.upsert_calendar(self.conn, market, [
-            {"day": d, "trade_date_type": "WHOLE", "trade_second": 14400} for d in days])
+            {"day": d, "trade_date_type": "WHOLE", "trade_second": seconds} for d in days])
 
     def _bars(self, symbol, days=None, close=100.0):
         """铺日线：默认最后 20 个自然日（末日 = TODAY，过数据就绪门）。

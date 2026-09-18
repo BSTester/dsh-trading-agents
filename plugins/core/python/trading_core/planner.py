@@ -10,7 +10,7 @@ import uuid
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
-from . import indicators, oms, store
+from . import indicators, oms, sessions, store
 
 _TZ8 = timezone(timedelta(hours=8))
 
@@ -319,14 +319,25 @@ def data_date_for(conn, market, stamp):
     「应有最后交易日」永远超前一天，数据就绪门每天静默跳过（实现期发现，2026-09-16）。
     本函数把北京时刻折算到该市场本次作业负责的会话本地日：
 
-    1. 时刻早于该会话收盘（``SESSION_CLOSE_BEIJING`` 的北京时间）→ 返回 ``None``：
-       本次负责的会话尚未收盘，宁可不生成计划，也不把上一场的收盘当本场；
-    2. 候选本地日 = 北京日 − 天数偏移；
-    3. 取日历中 ≤ 候选日的**最近交易日**（周末/节假日回落到上一场——北京周一早上的
-       补跑因此落到上周五，正是美股链需要的语义）。
+    1. **先解析会话本地日**：候选本地日 = 北京日 − 天数偏移，取日历中 ≤ 候选日的
+       **最近交易日**（周末/节假日回落到上一场——北京周一早上的补跑因此落到上周五，
+       正是美股链需要的语义）；日历未同步 → ``RuntimeError``；
+    2. **再用该日（回落后的交易日）的真实收盘判「是否已收盘」**：尚未收盘 → 返回
+       ``None``（调用方软跳过，宁可不生成计划，也不把上一场的收盘当本场）。
 
-    DST 无关：只依赖「收盘落在北京次日」这一事实（US 界 05:00 在 EDT/EST 两制下
-    都已收盘），不做制度换算。日历未同步 → ``RuntimeError``（调用方按「宁可不跑」处理）。
+    第 2 步的收盘口径分两路（半日市纳入判定，实现期修订 2026-09-18）：
+
+    * **全天行**（``trade_second`` 缺失 / 等于该市场全天秒数）→ **逐字沿用**
+      ``SESSION_CLOSE_BEIJING`` 表。该表对美股取 EST 最晚界 05:00（EDT 实为 04:00），
+      是**刻意偏保守**的 DST 无关口径；换成按 zoneinfo 精算的真实收盘会让 EDT 期间
+      04:00–05:00 的补跑提前放行，属行为变更，故不动；
+    * **半日/提前收盘行**（``trade_second`` 小于全天秒数）→ 由 ``sessions`` 算出的
+      **真实收盘**（开盘 + trade_second，单段口径：HK 半日 12:00、US 半日 13:00）折算成
+      北京时间后比较。旧口径按全天界判定，会把已收盘的半日市误判成「尚未收盘」而
+      整天不产出计划。
+
+    DST 无关性对全天行依旧成立（只依赖「收盘落在北京次日」这一事实，不做制度换算）；
+    ``trade_second`` 的非正整数按缺失处理（回落全天口径，见 ``sessions.is_short_day``）。
     """
     market = str(market).upper()
     close = SESSION_CLOSE_BEIJING.get(market)
@@ -334,11 +345,8 @@ def data_date_for(conn, market, stamp):
         raise KeyError(f"未知市场链：{market}")
     offset, hhmm = close
     when = _stamp_parts(stamp)
-    hour, minute = (int(part) for part in hhmm.split(":"))
-    # close_at 落在 stamp 当日：表的天数偏移已把「会话本地日 → 北京日」折算进去
-    # （US：候选日 + 1 = 北京日），因此这里只替换时刻、不挪日期。
-    if when < when.replace(hour=hour, minute=minute, second=0, microsecond=0):
-        return None
+    # 会话日先解析（回落最近交易日），再判是否已收盘——顺序是修订要点：判定要用
+    # **该日**的 trade_second，而不是「北京日」的。
     candidate = (when.date() - timedelta(days=offset)).isoformat()
     calendar_market = CALENDAR_MARKET.get(market, market)  # SZ/BJ 用 SH 日历
     start = (date.fromisoformat(candidate)
@@ -346,7 +354,19 @@ def data_date_for(conn, market, stamp):
     days = store.trading_days(conn, calendar_market, start, candidate)
     if not days:
         raise RuntimeError(f"日历无交易日：{calendar_market} {start}..{candidate}")
-    return days[-1]
+    local_day = days[-1]
+    row = store.calendar_row(conn, calendar_market, local_day) or {}
+    trade_second = row.get("trade_second")
+    if sessions.is_short_day(market, trade_second):
+        if when < sessions.session_close_beijing(market, local_day, trade_second):
+            return None
+        return local_day
+    hour, minute = (int(part) for part in hhmm.split(":"))
+    # close_at 落在 stamp 当日：表的天数偏移已把「会话本地日 → 北京日」折算进去
+    # （US：候选日 + 1 = 北京日），因此这里只替换时刻、不挪日期。
+    if when < when.replace(hour=hour, minute=minute, second=0, microsecond=0):
+        return None
+    return local_day
 
 
 def observation_date(conn, market, stamp):
