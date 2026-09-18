@@ -5,7 +5,7 @@
 import React from "react";
 import { useCanvasChart } from "./line.jsx";
 import { CHART_STYLE } from "./theme.js";
-import { barIndexAt, tooltipLeft, compactNumber } from "./geometry.js";
+import { barIndexAt, tooltipLeft, compactNumber, priceTagRect } from "./geometry.js";
 
 /** K 线图的绘制留白：命中判定与绘制共用同一套，避免两处各写一份而错位。 */
 const KLINE_PAD = { padL: 54, padR: 12, padT: 10, padB: 18 };
@@ -22,15 +22,18 @@ function drawKLineHover(ctx, width, height, color, bar, index, geometry, bars) {
   ctx.beginPath(); ctx.moveTo(centerX, padT); ctx.lineTo(centerX, height - padB); ctx.stroke();
   ctx.setLineDash([]);
 
-  // 右侧价格标签（对齐收盘价）
+  // 右侧价格标签（对齐收盘价）：**右边缘贴住绘图区右边、向左展开**（priceTagRect）。
+  // 早期实现从 `width - padR` 向右画，标签比 padR 宽得多 → 右半截被画布裁掉，实机表现为
+  // 「悬停某日后右侧收盘价只显示一位」（2026-09-18 修）。
   const priceY = y(bar.c);
   const priceText = bar.c.toFixed(2);
   ctx.font = "10px sans-serif";
-  const tagW = ctx.measureText(priceText).width + 8;
+  const tag = priceTagRect(width, height, padR, priceY, ctx.measureText(priceText).width + 8);
   ctx.fillStyle = bar.c >= bar.o ? color.up : color.down;
-  ctx.fillRect(width - padR, priceY - 7, tagW, 14);
+  ctx.fillRect(tag.x, tag.y, tag.w, tag.h);
   ctx.fillStyle = "#fff";
-  ctx.fillText(priceText, width - padR + 4, priceY + 3);
+  // 基线沿用原口径：标签顶 + 10（10px 字体在 14px 标签里垂直居中）
+  ctx.fillText(priceText, tag.x + 4, tag.y + 10);
 
   // 信息框：日期 + 开高低收 + 涨跌 + 量
   const previous = index > 0 ? bars[index - 1] : null;
