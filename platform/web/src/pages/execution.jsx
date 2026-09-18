@@ -22,13 +22,14 @@
 // 「只归纳、不推测」：缺字段一律 —，不补默认值；状态码原样展示，不猜标签；
 // 台账模式取 snapshot.value.mode（当前账户模式），切换模式不授权下单。
 import React from "react";
-import { Alert, App, Button, Card, Collapse, Input, Select, Space, Statistic, Table, Tag, Typography } from "antd";
+import { Alert, App, Button, Card, Collapse, Select, Space, Statistic, Table, Tag, Typography } from "antd";
 import { callApi } from "../services/api.js";
 import { decideDisabled, remainingSeconds, summaryLines } from "../services/confirm.js";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, symbolMarketDisplay, viewBySymbol, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
+import { SymbolInput } from "../components/SymbolInput.jsx";
 
 /** ISO 时间 → 展示（分钟精度）；缺失显示「时间未知」（与旧客户端一致，不编造）。 */
 function timeOf(iso) {
@@ -265,8 +266,9 @@ function MaxQtyPanel({ mode }) {
   const [orderType, setOrderType] = React.useState("LIMIT");
   const [busy, setBusy] = React.useState(false);
   const [result, setResult] = React.useState(null);   // { value } | { error }
-  const run = async () => {
-    const symbol = code.trim().toUpperCase();
+  const run = async (text) => {
+    // `text` 来自标的输入框（Enter 提交/候选选中）；按钮点击时传的是 MouseEvent，忽略之。
+    const symbol = (typeof text === "string" ? text : code).trim().toUpperCase();
     if (!symbol) { setResult({ error: "请先输入标的代码（如 HK.00700）" }); return; }
     setBusy(true);
     setResult(null);
@@ -282,14 +284,14 @@ function MaxQtyPanel({ mode }) {
   return (
     <>
       <Space size="small" style={{ marginBottom: 8 }} wrap>
-        <Input placeholder="标的代码，如 HK.00700" style={{ width: 200 }} value={code}
-          onChange={(event) => setCode(event.target.value)}
-          onPressEnter={run} aria-label="最大可买卖标的代码" />
+        <SymbolInput placeholder="标的代码，如 HK.00700" style={{ width: 200 }} value={code}
+          onChange={setCode}
+          onPressEnter={run} ariaLabel="最大可买卖标的代码" />
         <Select value={orderType} onChange={setOrderType} style={{ width: 190 }}
           aria-label="订单类型（计算口径）"
           options={["LIMIT", "MARKET", "AUCTION", "AUCTION_LIMIT", "STOP", "STOP_LIMIT",
             "MARKET_IF_TOUCHED", "LIMIT_IF_TOUCHED"].map((item) => ({ value: item, label: item }))} />
-        <Button loading={busy} onClick={run}>查询</Button>
+        <Button loading={busy} onClick={() => run()}>查询</Button>
       </Space>
       {result?.error && <Alert type="warning" showIcon message={result.error} />}
       {result?.value && (

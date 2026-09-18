@@ -763,3 +763,90 @@ payload → 过滤后的行 + 空态原因）并把 12 个页面接上选择器�
 **证据**：`platform/web/tests/marketView.test.mjs` 11 例（空态文案含市场名、ALL 不丢行含
 OTHER、数字 market_id、plan/jobs/previews 派生、单标的提示）；`npm test` 281 例全绿；
 Playwright 实机截图（全部市场 vs 只看港股）见本轮回报，5 个页面逐一比对。
+
+### 8.11 WP24：标的输入框的联想候选（关注池 + 当前持仓）（2026-09-18 用户需求 / 实机只读复验）
+
+**用户原话**：「我建议：标的输入框现在是手打代码——如果也觉得『记不住』，可以给它们加上
+从**关注池+当前持仓**来的联想候选（下拉可选，不强制）。」（用户回复「可以」）
+
+**改了什么**
+
+1. **后端只加一个键，不加端点**：`snapshot` 载荷新增 `watchlist`（平台关注池，
+   `["SH.600519", …]`）。来源是**唯一实现** `trading_core.watchlist.watchlist_symbols(home)`
+   （WP9 修订 I4），服务侧经新增的 `compute.watchlist_symbols(home)` 进程内调用；
+   合并点在 `app.py` 的 snapshot 分支——`store_access.snapshot()` 保持「只用标准库」与
+   「与 store.js 逐行对应」两条既有不变式（见下面「与任务假设不符」第 1 条）。
+   关注池缺失/为空/配置损坏 → 空数组；`trading_core` 不可导入 → 同样空数组，**不阻断快照**。
+2. **前端纯函数**：`platform/web/src/services/symbols.js` —— `toFutuSymbol`（逐条镜像
+   `trading_datasource.market.to_futu_symbol`）、`symbolCandidates`、
+   `symbolCandidatesFromPayloads`、`filterSymbolCandidates`、`splitSymbolList` /
+   `joinSymbolList`。跨语言镜像由 `tests/test_wp24_symbol_mirror.py` 锁（正则解析 JS 常量
+   + 同一张输入表比对结果）。
+3. **前端组件**：`platform/web/src/components/SymbolInput.jsx` —— `SymbolInput`
+   （antd `AutoComplete`，自由输入）与 `SymbolListInput`（`Select mode="tags"`，逗号分隔
+   多标的）；候选取数 `useSymbolCandidates()` 在 `services/hooks.js`，**模块级只取一次**
+   （snapshot + positions），多个输入框共享同一份、各自不再发请求。
+4. **接线的 7 个输入点**：`market.jsx`、`capital.jsx`、`events.jsx`、`execution.jsx`
+   （trade_max_qty 手查面板）、`research.jsx`（F10 深度数据）、`options.jsx`（标的代码）、
+   `factors.jsx`（多标的用 `SymbolListInput`）。宽度/占位/受控/`onPressEnter` 语义原样保留，
+   `onPressEnter` 改为**收到要提交的文本**（Enter 选中候选时 props 里的值是旧的，
+   页面据此提交会查错标的——这是接线时必须显式传值的原因）。
+
+**候选口径**
+
+| 事项 | 口径 |
+|---|---|
+| 来源 | `snapshot.watchlist`（关注池，已带前缀）+ `positions`（当前模式持仓，**裸代码**经 `toFutuSymbol` 归一） |
+| 顺序 | 关注池在前、持仓在后（原序）；不加权、不按市场重排 |
+| 去重 | 同值只留一条，**位置保持首次出现处**，名称取「有名称的那条」（关注池只有代码，持仓才有 `stock_name` → 原地升级为 `SH.600519 贵州茅台`） |
+| market | `symbolChain(value)` → `SH`/`HK`/`US`，归不到 `null`（界面上不标标签，不猜） |
+| 过滤 | 大小写不敏感子串，同时看 `value` 与 `label`（`600`→`SH.600519`、`hk.007`→`HK.00700`、`茅台`→中文名命中）；`limit` 默认 20 |
+| 空输入 | **不隐藏**，给前 `limit` 条（关注池原序）——点开输入框就能选 |
+| 不按市场筛选 | 输入框问的是「某一个标的」，与页头全局市场视角无关（既有决定）；市场只作为候选上的标签 |
+| 不改变提交 | 输入框仍接受任意代码；候选里没有的值照常提交（实机自检：输入 `XX.NEWCODE` 后值保留、回车照常查询） |
+| Enter 语义 | `SymbolInput` 用 `activeFirstOption={false}`：回车**不选**第一条候选，按用户敲的代码提交（与旧 `Input` 行为一致）；方向键/鼠标选中候选才填入。`SymbolListInput` 回车把「已提交标签＋光标下未提交文本」合并后提交一次查询 |
+
+**与任务假设不符的地方（逐条实测）**
+
+1. **「grep 过没有测试锁 snapshot 键集」不成立**：`tests/test_wp6_store_access.py:218` 用
+   `set(snap)` 钉死了 `store_access.snapshot()` 的 15 个键。因此 `watchlist` 加在
+   `app.py` 的**载荷合并点**（那里本来就合并 `endpoints`），而不是 `store_access.snapshot()`
+   里——既有锁未被触碰、也没有被放宽；新增的 WP24 锁改为经 `app.create_handler(home)("snapshot", {})`
+   断言**前端真正收到的那份载荷**含 `watchlist`，并与 `watchlist_symbols(home)` 逐值比对。
+2. **`watchlist_symbols` 签名与任务描述一致**（`(home, key=None, market=None, strict=False)`），
+   但「`store_access` 的载荷构造函数签名拿不拿得到 home」这个问题的答案不重要：即便
+   `snapshot(home)` 拿得到 home，也不该在 store 层引入 `trading_core`（模块头写着「只用标准库」，
+   且它是 store.js 的逐行移植）。故落在 `compute.watchlist_symbols` + `app.py` 合并点，
+   沿用 `compute._core_module` 这一处已有的 `trading_core` 解析（其 docstring 已同步登记第三个例外）。
+3. **持仓的 `market` 字段对候选无用**：sim 组的 `market` 是数字 market_id（1/3/100），
+   live 组是 `null`——而候选归一与后端 `to_futu_symbol` 一样**只看代码形状**（不看 market_id），
+   所以没有按账户市场分流，行为与用户手打同一个代码完全一致。
+4. **关注池里没有名称**（配置只有代码），「优先保留有名称的那条」实现为「原地补名称」：
+   位置仍是关注池的位置，标签升级成带名称的版本，不会再多出一条持仓候选。
+5. **实机验证抓到一处接线缺陷（已修）**：`hooks.js` 组装候选时把 snapshot 的关注池装进名为
+   `pool` 的局部变量，拼成 `{pool, positions}` 传给 `symbolCandidates`（它要的是 `watchlist`）
+   → 关注池被静默丢弃、下拉只剩持仓候选。纯函数测不到调用点的键名，故接线收敛为可直测的
+   `symbolCandidatesFromPayloads(snapshot, positions)` 并补回归钉（`platform/web/tests/symbols.test.mjs`）。
+
+**本轮未做 / 边界（如实登记）**
+
+- **候选只在首次取数时定模式**：模式由第一次取到的 `snapshot.mode` 给出（`positions` 缺省
+  是 sim，不带 mode 会在实盘下查到模拟持仓）；切 sim/live 后缓存**不自动重取**（不新增轮询
+  是本次约束），刷新页面即更新。候选只影响下拉里有什么，不影响任何提交语义。
+- **期权合约代码输入框不接候选**（`options.jsx` 的 `US.AAPL260116C00200000`）：合约里嵌了
+  到期日/看跌看涨/行权价，关注池与持仓都不产出它，套标的候选只会给出按下去必被上游拒绝的值。
+- **设置页的「关注池键」不接候选**（`settings.jsx`）：那是池键名，不是标的。
+- **`toFutuSymbol` 是镜像，不是同一份代码**：有意差异只有一处——`null`/`undefined` 归一为
+  `US.`（后端 `str(None)` → `US.NONE`），候选构造会先滤空值，走不到这个分支。
+- **未按市场筛选候选**（既有决定，见上表）；若将来要「按市场只提示本市场候选」，需要先改
+  这条决定，并同步改 `symbolCandidates` 的调用点。
+
+**证据**：`tests/test_wp24_symbol_mirror.py` 11 例（JS 常量/分支存在性、前缀集合行为反查、
+6 位首位分档逐数字比对、港股补零位数、同表比对 + 关键取值冻结、snapshot 键存在/同源/空池/
+不新增端点）；`platform/web/tests/symbols.test.mjs` 16 例（toFutuSymbol 全分支、
+symbolCandidates 去重/优先级、filter 匹配/limit、split/join 往返、载荷接线回归钉）；
+Python 全量 2411 例 `OK (skipped=5)`、根 `node --test tests/*.test.mjs` 66 例、
+`npm test` 297 例全绿；实机（重建 dist + 重启服务后）Playwright 截图 `/tmp/sym-market.png`
+（行情页输入 `600` → 候选 `SH.600000/SH.600009/…` 各带「A股 SH」标签）与
+`/tmp/sym-factors.png`（因子页多标的字段同样的候选），另实测持仓候选
+（`00100` → `HK.00100 MINIMAX-W`）与自由输入 `XX.NEWCODE` 不丢值、回车仍触发查询。

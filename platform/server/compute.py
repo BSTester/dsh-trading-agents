@@ -621,12 +621,16 @@ def command_home(home):
 
 
 def _core_module(name):
-    """进程内导入 ``trading_core`` 子模块（**只服务写路径**：指令写盘 + 规则审批）。
+    """进程内导入 ``trading_core`` 子模块（写路径 + 关注池配置读）。
 
     读路径一律仍走子进程（``_spawn``）——取数/快照不把分析模块拉进服务进程；
-    只有「必须与人工动作同进程、且不能被离线脚本等价复现」的两条写路径例外：
-    ``commands.write_command``（计划执行指令落盘）与 ``rule_engine.decide_rule``
-    （规则批准，来源固定为 ``APPROVER_WEB``）。
+    例外只有三条，各自都有「不能被离线脚本等价复现」或「不值得为一行配置 spawn
+    解释器」的理由：
+
+      * ``commands.write_command``（计划执行指令落盘）；
+      * ``rule_engine.decide_rule``（规则批准，来源固定为 ``APPROVER_WEB``）；
+      * ``watchlist.watchlist_symbols``（WP24 关注池，见 ``watchlist_symbols()``
+        docstring——只读一行配置，且服务进程早已因调度器持有 ``trading_core.daemon``）。
 
     先直接 import（venv 里已 ``pip install -e`` 了 trading_core）；失败时退回
     ``plugins/core/python``（与 tests/test_core_wp6_approval.py 的导入方式一致）。
@@ -638,6 +642,31 @@ def _core_module(name):
         if core_python not in sys.path:
             sys.path.insert(0, core_python)
         return importlib.import_module(f"trading_core.{name}")
+
+
+def watchlist_symbols(home):
+    """平台关注池标的（WP24：前端标的输入框的联想候选来源之一）。
+
+    **读取的唯一实现是 ``trading_core.watchlist.watchlist_symbols``**（WP9 修订 I4）：
+    本函数只解析 home、把那个模块拉进本进程，归一（大写/去空/字符串按逗号切分）与
+    「缺失即空池」的语义一律不在这里重写——重写就是第二份口径，就会漂移。
+
+    为什么这条**读**路径在进程内（其余读路径一律 spawn 子进程）：它是 ``snapshot``
+    载荷的一个字段，而 snapshot 是前端**全局轮询**的端点；每个页面每轮 spawn 一个
+    解释器只为读一行配置，代价与噪声都不划算。同类先例见 ``server/settings_api.py:208``
+    （进程内读 ``trading_core.autopipeline`` 的配置）。这里读的是配置
+    （``trading-platform.json`` 顶层 ``watchlist``），不做任何分析/取数；并且
+    ``trading_core.daemon`` 早已由服务内调度器（``server/scheduler.py:17``）导入同一进程。
+
+    关注池缺失/为空/配置损坏 → 空列表（``daemon.platform_config`` 既有口径，快照整体
+    不失败）；``trading_core`` 插件不在（未安装且仓库路径也缺失）→ 同样退化为空候选，
+    **不阻断快照**——候选是帮忙、不是白名单，前端拿到空数组时只显示持仓候选。
+    """
+    try:
+        module = _core_module("watchlist")
+    except ImportError:
+        return []
+    return list(module.watchlist_symbols(str(command_home(home))))
 
 
 def _load_write_command():

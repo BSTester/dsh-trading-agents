@@ -18,12 +18,13 @@
 // 字段名与枚举依据、空结果语义、通道不可用的下一步指引全部在 services/f10.js 文件头登记，
 // 映射逻辑是可直测纯函数（tests/f10.test.mjs），本文件只做接线与渲染。
 import React from "react";
-import { Alert, Button, Card, Input, Popconfirm, Space, Table, Tag, Typography,
+import { Alert, Button, Card, Popconfirm, Space, Table, Tag, Typography,
          message } from "antd";
 import { callApi } from "../services/api.js";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { Markdown } from "../lib/markdown.jsx";
 import { RawCollapse } from "../lib/raw-collapse.jsx";
+import { SymbolInput } from "../components/SymbolInput.jsx";
 import {
   analystConsensusSummary, dataplaneHint, institutionalSummary, ratingSummarySummary,
 } from "../services/f10.js";
@@ -174,14 +175,14 @@ function DeepDataCard({ title, section, code, summarize, asTable = false }) {
 function DeepData() {
   const [ticker, setTicker] = React.useState("");
   const [code, setCode] = React.useState("");
+  const submit = (text) => setCode((typeof text === "string" ? text : ticker).trim().toUpperCase());
   return (
     <Card type="inner" title="深度数据（F10）"
       extra={(
         <Space>
-          <Input placeholder="标的代码，如 HK.00700 / US.AAPL" style={{ width: 240 }} value={ticker}
-            onChange={(event) => setTicker(event.target.value)}
-            onPressEnter={() => setCode(ticker.trim().toUpperCase())} />
-          <Button onClick={() => setCode(ticker.trim().toUpperCase())}>查询</Button>
+          <SymbolInput placeholder="标的代码，如 HK.00700 / US.AAPL" style={{ width: 240 }} value={ticker}
+            onChange={setTicker} onPressEnter={submit} />
+          <Button onClick={() => submit()}>查询</Button>
         </Space>)}>
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>

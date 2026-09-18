@@ -20,7 +20,7 @@
 // （如 pe_ttm_pct）按原始键名展示，不自造含义；financial_type 原码展示（quality.py
 // 明确说明服务端未给出其枚举含义）。
 import React from "react";
-import { Alert, Card, Col, Descriptions, Input, Row, Select, Space, Statistic, Table, Typography } from "antd";
+import { Alert, Card, Col, Descriptions, Row, Select, Space, Statistic, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
@@ -28,6 +28,8 @@ import {
   marketLabelOf, symbolMarketDisplay, symbolMarketNote, viewBySymbol,
 } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
+import { splitSymbolList } from "../services/symbols.js";
+import { SymbolListInput } from "../components/SymbolInput.jsx";
 import { LineChart } from "../charts/line.jsx";
 import { sentimentHeadline, sentimentRows } from "../services/sentiment.js";
 
@@ -52,9 +54,8 @@ function pctCell(value) {
   return `${Number(value).toFixed(2)}%`;
 }
 
-function parseWatchlist(text) {
-  return String(text).split(/[,，\s]+/).map((part) => part.trim().toUpperCase()).filter(Boolean);
-}
+// 逗号分隔的多标的解析已收敛到 services/symbols.js 的 splitSymbolList（同一口径只有一份：
+// 大小写归一 + 去空 + 去重保序），这里不再留本地 parseWatchlist。
 
 /** 因子打分表：行 = 标的（factors.py composite 已按综合分排序），列 = 各因子原始取值。
  *  全局市场筛选用行自带的 ``ticker``（实测带交易所前缀，可跨市场混排）→ viewBySymbol 过滤。 */
@@ -163,10 +164,11 @@ export default function FactorsPage() {
   return (
     <Card title="因子" extra={(
       <Space>
-        <Input placeholder="关注池，逗号分隔 2..8 个，如 SH.600519,SH.600036" style={{ width: 320 }}
-          value={input} aria-label="关注池（逗号分隔）"
-          onChange={(event) => setInput(event.target.value)}
-          onPressEnter={() => { setWatchlist(parseWatchlist(input)); }} />
+        <SymbolListInput placeholder="关注池，逗号分隔 2..8 个，如 SH.600519,SH.600036"
+          style={{ width: 320 }}
+          value={input} ariaLabel="关注池（逗号分隔）"
+          onChange={setInput}
+          onPressEnter={(text) => setWatchlist(splitSymbolList(text))} />
         <Select value={factor} onChange={setFactor} style={{ width: 130 }}
           options={FACTORS.map((key) => ({ value: key, label: FACTOR_LABELS[key] ?? key }))} />
       </Space>)}>

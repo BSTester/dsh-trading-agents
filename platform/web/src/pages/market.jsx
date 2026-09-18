@@ -14,11 +14,12 @@
 //            [{books:…}]，REST 元素级字段更全），页面按候选键防御式提取买卖档，原始返回
 //            折叠可查——形状不符时界面不编造。
 import React from "react";
-import { Alert, Card, Col, Collapse, Descriptions, Input, Row, Select, Space, Table, Typography } from "antd";
+import { Alert, Card, Col, Collapse, Descriptions, Row, Select, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { symbolMarketNote } from "../services/marketView.js";
+import { SymbolInput } from "../components/SymbolInput.jsx";
 import { KLineChart } from "../charts/kline.jsx";
 
 const PERIODS = [
@@ -257,9 +258,9 @@ export default function MarketPage() {
   return (
     <Card title="行情" extra={(
       <Space>
-        <Input placeholder="标的代码，如 SH.600519" style={{ width: 220 }} value={ticker}
-          onChange={(event) => setTicker(event.target.value)}
-          onPressEnter={() => setQuery(ticker.trim().toUpperCase())} />
+        <SymbolInput placeholder="标的代码，如 SH.600519" style={{ width: 220 }} value={ticker}
+          onChange={setTicker}
+          onPressEnter={(text) => setQuery(text.trim().toUpperCase())} />
         <Select options={PERIODS} value={period} onChange={setPeriod} style={{ width: 90 }} />
       </Space>)}>
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>

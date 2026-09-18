@@ -7,10 +7,11 @@
 //     events 已按日期升序；days_until 为相对今天的自然日差（负数=已过去）。
 // 未输入标的时 payload 为 null：不发请求（服务端对空 ticker 直接报 Invalid ticker）。
 import React from "react";
-import { Alert, Card, Input, Space, Tag, Timeline, Typography } from "antd";
+import { Alert, Card, Space, Tag, Timeline, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { symbolMarketNote } from "../services/marketView.js";
+import { SymbolInput } from "../components/SymbolInput.jsx";
 
 function timelineColor(daysUntil) {
   const days = Number(daysUntil);
@@ -33,9 +34,9 @@ export default function EventsPage() {
   const marketNote = symbolMarketNote(ticker, market);
   return (
     <Card title="事件" extra={(
-      <Input placeholder="标的代码，如 SH.600519" style={{ width: 220 }} value={input}
-        onChange={(event) => setInput(event.target.value)}
-        onPressEnter={() => setTicker(input.trim().toUpperCase())} />)}>
+      <SymbolInput placeholder="标的代码，如 SH.600519" style={{ width: 220 }} value={input}
+        onChange={setInput}
+        onPressEnter={(text) => setTicker(text.trim().toUpperCase())} />)}>
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
         {!ticker && (
           <Typography.Text type="secondary">

@@ -452,6 +452,24 @@ WantedBy=default.target
 
 排查时不必重启服务、不必清缓存：选择器状态在浏览器里，换个市场即可复现/消除。
 
+## 标的输入框下拉没有关注池候选（WP24，2026-09-18）
+
+标的输入框（行情/资金/事件/执行/研究/期权/因子的标的字段）的联想候选来自两处：
+`snapshot` 载荷的 `watchlist`（**平台关注池**，`trading-platform.json` 顶层 `watchlist`）
+与 `positions` 端点（**当前模式的持仓**）。候选是**帮忙，不是白名单**——下拉里没有的代码
+照常可以手打、照常提交。
+
+| 现象 | 原因 | 处置 |
+|---|---|---|
+| 下拉里完全没有候选 | `snapshot` 响应里**没有** `watchlist` 键（服务进程是 WP24 之前的代码） | 重启服务后刷新页面：`scripts/platform_service.sh restart`（后端改了必须重启才换代码） |
+| 只有带名称的持仓候选、没有关注池那批 | `watchlist` 是空数组 | 关注池缺失/为空/配置损坏都按空池（`daemon.platform_config` 既有口径）；查 `trading-platform.json` 顶层 `watchlist`。空池本身是合法状态（数据作业也会跳过） |
+| 只有关注池候选、没有持仓那批 | `positions` 取不到（券商不可达/无权限/该模式无持仓） | 页面自己的持仓视图会如实报错；这里退化为只有关注池，不重复弹错 |
+| 下拉里的东西不随页头「市场筛选」变 | **有意**：输入框问的是「某一个标的」，与页面视角无关 | 预期行为；候选上的「A股 SH / 港股 HK / 美股 US」标签只做标注 |
+| 切了 sim/live 后下拉还是老持仓 | 候选按首次取数时的模式缓存（不新增轮询） | 刷新页面 |
+
+排查用一句：`curl -s -X POST http://127.0.0.1:8397/api/wb/snapshot -H 'Content-Type: application/json' -d '{}'`
+→ 看 `value.watchlist`；同时 `value.endpoints` 仍是 82 项（WP24 没有新增端点）。
+
 ## last30days 社媒研究技能排障（可选组件）
 
 - 行为异常先自检：`~/.dsh/trading-venv/bin/python ~/.dsh/last30days-skill/skills/last30days/scripts/last30days.py --preflight`（不读 Cookie 不写文件）；报「目录/引擎不存在」先跑 `python3 scripts/install_last30days.py`，装完新建会话才会挂载。

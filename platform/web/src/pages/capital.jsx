@@ -12,11 +12,12 @@
 //   业务错误（如 ret_code=-9 的替代路径提示）由服务端错误信封给出，页面原样展示。
 // 占比 = 该档净流入绝对值 / 四档绝对值之和（纯展示换算，非指标计算；总和为 0 或缺失 → —）。
 import React from "react";
-import { Alert, Card, Collapse, Input, Select, Space, Table, Typography } from "antd";
+import { Alert, Card, Collapse, Select, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { symbolMarketNote } from "../services/marketView.js";
+import { SymbolInput } from "../components/SymbolInput.jsx";
 import { MultiLineChart } from "../charts/line.jsx";
 
 const DAYS_OPTIONS = [
@@ -204,9 +205,9 @@ export default function CapitalPage() {
   return (
     <Card title="资金流向" extra={(
       <Space>
-        <Input placeholder="标的代码，如 SH.600519 / HK.00700" style={{ width: 240 }} value={ticker}
-          onChange={(event) => setTicker(event.target.value)}
-          onPressEnter={() => setQuery(ticker.trim().toUpperCase())} />
+        <SymbolInput placeholder="标的代码，如 SH.600519 / HK.00700" style={{ width: 240 }} value={ticker}
+          onChange={setTicker}
+          onPressEnter={(text) => setQuery(text.trim().toUpperCase())} />
         <Select options={DAYS_OPTIONS} value={days} onChange={setDays} style={{ width: 96 }}
           aria-label="历史资金流回看天数" />
       </Space>)}>

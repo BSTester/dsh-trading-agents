@@ -16,6 +16,7 @@ import { callApi } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
 import { RawCollapse } from "../lib/raw-collapse.jsx";
+import { SymbolInput } from "../components/SymbolInput.jsx";
 import {
   dataplaneHint, exerciseProbabilitySummary, optionVolatilitySummary, strikeRows,
 } from "../services/f10.js";
@@ -271,6 +272,9 @@ function DerivativeDetail() {
     <Card type="inner" title="期权波动率与行权概率（derivative_detail）"
       extra={(
         <Space>
+          {/* 期权合约代码（US.AAPL260116C00200000）与标的代码是**两种格式**：合约里嵌了
+              到期日/看跌看涨/行权价，关注池与持仓都不产出它，套标的候选只会给出一堆按下去
+              必被上游拒绝的值——故此处保持普通 Input，不加候选（WP24 明确不接）。 */}
           <Input placeholder="期权合约代码，如 US.AAPL260116C00200000" style={{ width: 300 }}
             value={contract}
             onChange={(event) => setContract(event.target.value)}
@@ -300,9 +304,9 @@ export default function OptionsPage() {
   return (
     <Card title="期权分析" extra={(
       <Space>
-        <Input placeholder="标的代码，如 HK.00700 / US.AAPL" style={{ width: 240 }} value={ticker}
-          onChange={(event) => setTicker(event.target.value)}
-          onPressEnter={() => setQuery(ticker.trim().toUpperCase())} />
+        <SymbolInput placeholder="标的代码，如 HK.00700 / US.AAPL" style={{ width: 240 }} value={ticker}
+          onChange={setTicker}
+          onPressEnter={(text) => setQuery(text.trim().toUpperCase())} />
       </Space>)}>
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
         {!query && (

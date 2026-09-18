@@ -351,8 +351,14 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
 
             if endpoint == "snapshot" and not payload:
                 # rpc.js:104-107：向客户端声明本 Host 实际提供哪些接口（合并点）
+                # WP24：`watchlist`＝平台关注池（唯一实现 trading_core.watchlist，读法见
+                # compute.watchlist_symbols），供前端标的输入框的联想候选；持仓候选另由
+                # `positions` 端点提供。放在这份**全局轮询**的载荷里而不是新增端点：
+                # 端点数 82 与 MCP 工具数 77 是锁定不变式（tests/test_wp6_store_access.py、
+                # tests/test_wp8_tool_locks.py），且前端已经在轮询 snapshot。
                 return {"ok": True, "value": {**store_access.snapshot(home),
-                                              "endpoints": store_access.endpoints()}}
+                                              "endpoints": store_access.endpoints(),
+                                              "watchlist": compute.watchlist_symbols(home)}}
             if endpoint == "switch-mode":
                 _check_fields(endpoint, payload, SWITCH_MODE_FIELDS)
                 return {"ok": True, "value": store_access.switch_mode(
