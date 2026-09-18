@@ -18,7 +18,7 @@
 import React from "react";
 import { Alert, Card, Descriptions, Divider, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
-import { num, pctOf, maskedAccount } from "../services/format.jsx";
+import { num, pctOf, maskedAccount, stampOf } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
@@ -221,7 +221,7 @@ export default function RiskPage() {
         <Card type="inner" title="组合风险">
           <PortfolioRisk positions={positions} market={market} />
           {positions.value?.as_of && (
-            <Typography.Text type="secondary">持仓数据时间：{positions.value.as_of}</Typography.Text>)}
+            <Typography.Text type="secondary">持仓数据时间：{stampOf(positions.value.as_of)}</Typography.Text>)}
           <Typography.Text type="secondary">组合风险按模拟盘（sim）持仓读取。</Typography.Text>
         </Card>
         <Typography.Text type="secondary">

@@ -26,6 +26,7 @@ import { Alert, App, Button, Card, Col, Collapse, Row, Select, Space, Statistic,
 import { HBarChart } from "../charts/bars.jsx";
 import { callApi } from "../services/api.js";
 import { decideDisabled, remainingSeconds, summaryLines } from "../services/confirm.js";
+import { minuteOf } from "../services/format.jsx";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, symbolMarketDisplay, viewBySymbol, viewGroups } from "../services/marketView.js";
@@ -34,9 +35,12 @@ import { chartEmptyText } from "../services/portfolioCharts.js";
 import { orderDistribution } from "../services/runtimeCharts.js";
 import { SymbolInput } from "../components/SymbolInput.jsx";
 
-/** ISO 时间 → 展示（分钟精度）；缺失显示「时间未知」（与旧客户端一致，不编造）。 */
-function timeOf(iso) {
-  return iso ? String(iso).replace("T", " ").slice(0, 16) : "时间未知";
+/** 时间 → 展示（分钟精度）；缺失显示「时间未知」（与旧客户端一致，不编造）。
+ *  2026-09-19：改走 format.jsx 的 minuteOf —— 模拟盘/部分通道的 create_time/update_time 是
+ *  **微秒整数**（实测 "1789363901000000"），原来的 `.slice(0, 16)` 会把它当文本截断，
+ *  「更新时间」列显示 16 位数字。minuteOf 对毫秒/微秒时间戳直接换成可读时刻。 */
+function timeOf(value) {
+  return minuteOf(value) === "—" ? "时间未知" : minuteOf(value);
 }
 
 /** 券商/台账原文数值原样展示：缺字段 —，不重算、不截断位数（num 会四舍五入，事实页不用）。 */

@@ -19,7 +19,7 @@
 import React from "react";
 import { Alert, Card, Col, Divider, Row, Space, Statistic, Table, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
-import { num, pctOf, maskedAccount } from "../services/format.jsx";
+import { num, pctOf, maskedAccount, stampOf } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
@@ -89,7 +89,7 @@ export default function PortfolioPage() {
           <Alert type="error" showIcon message={`持仓读取失败：${positions.error}`} />)}
         {positions.value?.stale && (
           <Alert type="warning" showIcon
-            message={`数据已非实时（stale），以下为 ${positions.value.as_of ?? "上次"} 取得的缓存：${positions.value.error ?? ""}`} />)}
+            message={`数据已非实时（stale），以下为 ${stampOf(positions.value.as_of) === "—" ? "上次" : stampOf(positions.value.as_of)} 取得的缓存：${positions.value.error ?? ""}`} />)}
         {(positions.value?.errors ?? []).map((row, index) => (
           <Alert key={`${row.acc_id ?? row.account ?? "error"}-${index}`} type="warning" showIcon
             message={`账户读取失败：${row.account ?? "—"}：${row.reason ?? "—"}`} />))}
@@ -105,7 +105,7 @@ export default function PortfolioPage() {
             读取账户 {counts.accounts_checked ?? "—"} 个，其中有持仓 {counts.accounts_with_positions ?? "—"} 个、
             持仓 {filtered ? rows.length : (counts.positions ?? "—")} 笔
             {filtered ? `（已按「${marketLabelOf(market)}」筛选）` : ""}
-            （数据时间：{positions.value?.as_of ?? "—"}）
+            （数据时间：{stampOf(positions.value?.as_of)}）
           </Typography.Text>)}
         <Table size="small"
           rowKey={(row) => `${row.accId}-${row.symbol}`}

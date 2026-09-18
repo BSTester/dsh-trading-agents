@@ -14,7 +14,7 @@
 import React from "react";
 import { Alert, Card, Collapse, Select, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
-import { num } from "../services/format.jsx";
+import { clockOf, dayOf, num } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { symbolMarketNote } from "../services/marketView.js";
 import { SymbolInput } from "../components/SymbolInput.jsx";
@@ -25,15 +25,23 @@ const DAYS_OPTIONS = [
 ];
 
 // 四档单的展示名与官方候选键（超大/大/中/小）：*_ratio 为上游自带占比键（有则原样展示）。
+// 2026-09-19 字段面取证（对 127.0.0.1:8397 /api/wb/capital_flow?code=SH.600000 实测）：
+// `flow_list[]` 的四档键是 **`super_in_flow` / `big_in_flow` / `mid_in_flow` / `sml_in_flow`**
+// （下划线在 in 与 flow 之间），而首版只登记了 `super_inflow` 一族候选 → 四档列与折线
+// **全部渲染成 —**（后端明明有值）。故把实测命名与文档命名一并登记（候选键取第一个有值的）。
 const SIZE_BUCKETS = [
-  { label: "超大单", keys: ["super_inflow", "super_net_inflow"],
-    ratioKeys: ["super_inflow_ratio", "super_net_inflow_ratio"] },
-  { label: "大单", keys: ["big_inflow", "large_net_inflow"],
-    ratioKeys: ["big_inflow_ratio", "large_net_inflow_ratio"] },
-  { label: "中单", keys: ["mid_inflow", "medium_net_inflow"],
-    ratioKeys: ["mid_inflow_ratio", "medium_net_inflow_ratio"] },
-  { label: "小单", keys: ["sml_inflow", "small_net_inflow"],
-    ratioKeys: ["sml_inflow_ratio", "small_net_inflow_ratio"] },
+  { label: "超大单", keys: ["super_inflow", "super_in_flow", "super_net_inflow"],
+    ratioKeys: ["super_inflow_ratio", "super_net_inflow_ratio"],
+    inKeys: ["capital_in_super"], outKeys: ["capital_out_super"] },
+  { label: "大单", keys: ["big_inflow", "big_in_flow", "large_net_inflow"],
+    ratioKeys: ["big_inflow_ratio", "large_net_inflow_ratio"],
+    inKeys: ["capital_in_big"], outKeys: ["capital_out_big"] },
+  { label: "中单", keys: ["mid_inflow", "mid_in_flow", "medium_net_inflow"],
+    ratioKeys: ["mid_inflow_ratio", "medium_net_inflow_ratio"],
+    inKeys: ["capital_in_mid"], outKeys: ["capital_out_mid"] },
+  { label: "小单", keys: ["sml_inflow", "sml_in_flow", "small_net_inflow"],
+    ratioKeys: ["sml_inflow_ratio", "small_net_inflow_ratio"],
+    inKeys: ["capital_in_small"], outKeys: ["capital_out_small"] },
 ];
 
 /** 多候选键防御读取：返回第一个非 null/undefined 的值，全部缺失返回 undefined（不补默认值）。 */
@@ -54,6 +62,22 @@ function rowsOf(value, keys) {
       Array.isArray(part) ? part.filter((row) => row && typeof row === "object") : []);
   }
   return [];
+}
+
+/**
+ * 四档「净流入」取值：优先读上游**流入/流出两套键**（实测 capital_distribution 给的是
+ * `capital_in_super` / `capital_out_super`…），净流入 = 流入 − 流出（纯展示换算，
+ * 与本文件的占比换算同层）；只有旧形状（单一净流入键）时才原样读 `keys`。
+ * 两套都取不到返回 undefined（调用方显示 —，不补 0）。
+ */
+function bucketNet(body, bucket) {
+  const inflow = pick(body, bucket.inKeys);
+  const outflow = pick(body, bucket.outKeys);
+  if (inflow === undefined && outflow === undefined) return pick(body, bucket.keys);
+  const inNum = Number(inflow ?? 0);
+  const outNum = Number(outflow ?? 0);
+  if (!Number.isFinite(inNum) || !Number.isFinite(outNum)) return undefined;
+  return inNum - outNum;
 }
 
 /** 净流入值上色：中国习惯红涨绿跌，正值红（antd danger）、负值绿（antd success）。 */
@@ -95,7 +119,7 @@ function IntradayFlow({ flow }) {
         locale={{ emptyText: flow.loading ? "分时资金流加载中…" : "暂无分时资金流数据。" }}
         scroll={{ x: "max-content" }}
         columns={[
-          { title: "时间", key: "t", render: (_f, row) => pick(row, ["capital_flow_item_time", "update_time", "time"]) ?? "—" },
+          { title: "时间", key: "t", render: (_f, row) => clockOf(pick(row, ["capital_flow_item_time", "update_time", "time"])) },
           { title: "净流入", key: "in_flow", align: "right", render: (_f, row) => <FlowText value={pick(row, ["in_flow", "main_inflow"])} /> },
           ...SIZE_BUCKETS.map((bucket) => ({
             title: bucket.label, key: bucket.label, align: "right",
@@ -130,8 +154,8 @@ function FlowHistory({ hist }) {
         locale={{ emptyText: hist.loading ? "历史资金流加载中…" : "暂无历史资金流数据。" }}
         scroll={{ x: "max-content" }}
         columns={[
-          { title: "日期", key: "day", render: (_f, row) => String(pick(row, ["capital_flow_item_time", "day", "date"]) ?? "—").slice(0, 10) },
-          { title: "净流入", key: "in_flow", align: "right", render: (_f, row) => <FlowText value={pick(row, ["in_flow"])} /> },
+          { title: "日期", key: "day", render: (_f, row) => dayOf(pick(row, ["capital_flow_item_time", "day", "date"])) },
+          { title: "净流入", key: "in_flow", align: "right", render: (_f, row) => <FlowText value={pick(row, ["in_flow", "main_inflow"])} /> },
         ]} />
       <RawCollapse value={hist.value} loading={hist.loading} />
     </>);
@@ -145,14 +169,23 @@ function Distribution({ dist }) {
     : {};
   const buckets = SIZE_BUCKETS.map((bucket) => ({
     ...bucket,
-    value: pick(body, bucket.keys),
+    value: bucketNet(body, bucket),
     ratio: pick(body, bucket.ratioKeys),
   }));
   const totalAbs = buckets.reduce((sum, item) => {
     const value = Number(item.value);
     return sum + (Number.isFinite(value) ? Math.abs(value) : 0);
   }, 0);
-  const inFlow = pick(body, ["in_flow", "main_inflow"]);
+  // 整体净流入：上游有 in_flow/main_inflow 就原样用；该形状（流入/流出两套键）没有整体值时，
+  // 用四档净流入之和（与逐档同源，不引入第二套口径）。
+  const netSum = buckets.reduce((sum, item) =>
+    (Number.isFinite(Number(item.value)) ? sum + Number(item.value) : sum), 0);
+  const inFlow = pick(body, ["in_flow", "main_inflow"])
+    ?? (buckets.some((item) => item.value !== undefined) ? netSum : undefined);
+  // 上游给的是「流入/流出」两套键时，本表把两者相减得到净流入（纯展示换算）；
+  // 界面上必须写明，否则用户会把自算值当成上游原值。
+  const netDerived = SIZE_BUCKETS.some((bucket) =>
+    pick(body, bucket.inKeys) !== undefined || pick(body, bucket.outKeys) !== undefined);
   return (
     <>
       {/* Statistic 的 value 只收字符串/数字（ReactNode 会变 [object Object]），
@@ -161,6 +194,11 @@ function Distribution({ dist }) {
         <Typography.Text type="secondary" style={{ fontSize: 14 }}>整体净流入</Typography.Text>
         <FlowText value={inFlow} />
       </Space>
+      {netDerived && (
+        <Typography.Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 4 }}>
+          上游该端点给的是四档「流入 / 流出」金额，本表「净流入」= 流入 − 流出，
+          「占比」= |该档净流入| / Σ|四档净流入|（均为展示换算，原始返回见下）。
+        </Typography.Text>)}
       <Table size="small"
         rowKey={(row) => row.label}
         dataSource={buckets}

@@ -293,7 +293,7 @@ export default function AuditPage() {
 
         <Card type="inner" title="数据源与授权状态" extra={(
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            自检时间 {sources.value?.checked_at ?? "—"} · 正常 {sourceSummary?.ok ?? "—"} /
+            自检时间 {stampOf(sources.value?.checked_at)} · 正常 {sourceSummary?.ok ?? "—"} /
             待配置 {sourceSummary?.warn ?? "—"} / 异常 {sourceSummary?.fail ?? "—"}
           </Typography.Text>)}>
           {sources.error && (

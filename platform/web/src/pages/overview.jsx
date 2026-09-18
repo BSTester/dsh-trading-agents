@@ -43,6 +43,7 @@ import {
   chartEmptyText, marketShareSlices, skipNoteText, topHoldings,
 } from "../services/portfolioCharts.js";
 import { ALERT_LEVEL_COLOR, parseHeartbeat } from "./schedule.jsx";
+import { factorSnapshotStats } from "../services/factorSnapshot.js";
 
 /** 心跳距今分钟数（向下取整）；无法解析返回 null。 */
 function minutesSince(ms) {
@@ -96,7 +97,8 @@ export default function OverviewPage() {
 
   const badge = modeBadge(mode ?? "sim");
   const alerts = reconcile.value?.alerts ?? [];
-  const openAlerts = alerts.length;
+  // 读取失败时**不显示 0**：0 是「确实没有告警」，与「没读到」是两回事（旁边已有失败提示）。
+  const openAlerts = reconcile.error ? null : alerts.length;
   // 全局市场筛选（客户端展示层过滤，**不改任何请求参数**）：positions 与 deals_today 都是
   // 「按账户分组、组上有 market」的信封（positions 给数字 market_id，deals 给 'HK'/'SH'/'US'
   // 与 '9' 这类类型码）→ 按组筛、按行判空态：HK 账户存在但零成交时也要说「无港股数据」。
@@ -104,13 +106,19 @@ export default function OverviewPage() {
   const positionView = viewGroups(positions.value?.groups, market, (group) => group?.positions ?? []);
   const dealView = viewGroups(deals.value?.groups, market, (group) => group?.rows ?? []);
   // 持仓数：全部市场用服务端 counts（跨账户口径），筛选时改用筛后的实际持仓行数
-  const holdings = filtered
-    ? positionView.rows.length
-    : (positions.value?.counts?.positions
-      ?? (positions.value?.groups ?? []).reduce((sum, group) => sum + (group.positions?.length ?? 0), 0));
-  const todayDeals = deals.error ? null : dealView.rows.length;
+  const holdings = positions.error ? null
+    : filtered
+      ? positionView.rows.length
+      : (positions.value?.counts?.positions
+        ?? (positions.value?.groups ?? []).reduce((sum, group) => sum + (group.positions?.length ?? 0), 0));
+  const todayDeals = deals.error || !deals.value ? null : dealView.rows.length;
   const equityPoints = (equity.value?.points ?? []).map((point) => ({ t: point.t, v: point.equity }));
   const latestSnapshot = factorsHistory.value?.snapshots?.[0] ?? null;
+  // 因子快照统计：载荷实测是 {tickers:{标的:{因子:值}}}（无 factors 键、tickers 是对象），
+  // 首版按 payload.factors.length / payload.tickers.length 取数 → 有数据也恒显示 —。
+  // 口径收敛在 services/factorSnapshot.js（纯函数、node --test 直测）。
+  const factorStats = latestSnapshot
+    ? factorSnapshotStats(latestSnapshot.payload) : null;
   const pushStatus = pushStatusText(push.value);
   // 两张图的派生（纯函数）：
   //   * 市场占比吃**未过滤**的 groups（全部市场口径，与页头筛选无关）；
@@ -204,7 +212,7 @@ export default function OverviewPage() {
           </Col>
           <Col xs={12} md={6}>
             <Card size="small">
-              <Statistic title="活跃告警" value={reconcile.loading ? "…" : openAlerts}
+              <Statistic title="活跃告警" value={reconcile.loading ? "…" : (openAlerts ?? "—")}
                 valueStyle={openAlerts > 0 ? { color: "#f5222d" } : undefined} />
               {reconcile.error && <Typography.Text type="warning" style={{ fontSize: 12 }}>告警读取失败</Typography.Text>}
             </Card>
@@ -303,10 +311,8 @@ export default function OverviewPage() {
               <Card size="small" title="因子快照">
                 <Space size="large" wrap>
                   <Statistic title="最新快照日期" value={latestSnapshot?.date ?? "—"} />
-                  <Statistic title="因子数"
-                    value={latestSnapshot?.payload?.factors?.length ?? "—"} />
-                  <Statistic title="覆盖标的"
-                    value={latestSnapshot?.payload?.tickers?.length ?? "—"} />
+                  <Statistic title="因子数" value={factorStats ? factorStats.factors : "—"} />
+                  <Statistic title="覆盖标的" value={factorStats ? factorStats.covered : "—"} />
                 </Space>
                 {factorsHistory.error && (
                   <Typography.Text type="warning" style={{ fontSize: 12 }}>

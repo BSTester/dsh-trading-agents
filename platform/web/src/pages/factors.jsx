@@ -22,7 +22,7 @@
 import React from "react";
 import { Alert, Card, Col, Descriptions, Row, Select, Space, Statistic, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
-import { num } from "../services/format.jsx";
+import { num, pctOf, stampOf } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import {
   marketLabelOf, symbolMarketDisplay, symbolMarketNote, viewBySymbol,
@@ -246,7 +246,7 @@ export default function FactorsPage() {
                 <Col span={4}><Statistic title="均值 IC" value={ic.value.mean_ic ?? "—"} /></Col>
                 <Col span={4}><Statistic title="IC 标准差" value={ic.value.ic_std ?? "—"} /></Col>
                 <Col span={4}><Statistic title="ICIR" value={ic.value.icir ?? "—"} /></Col>
-                <Col span={4}><Statistic title="正 IC 占比" value={ic.value.positive_ratio ?? "—"} /></Col>
+                <Col span={4}><Statistic title="正 IC 占比" value={pctOf(ic.value.positive_ratio)} /></Col>
                 <Col span={4}><Statistic title="样本期数" value={ic.value.count ?? "—"} /></Col>
               </Row>)}
             {ic.value?.note && (
@@ -262,7 +262,7 @@ export default function FactorsPage() {
             {quality.value && <QualityDescriptions quality={quality} />}
             {quality.value?.as_of && (
               <Typography.Text type="secondary">
-                取数时间 {quality.value.as_of}（来源：{quality.value.source ?? "—"}）
+                取数时间 {stampOf(quality.value.as_of)}（来源：{quality.value.source ?? "—"}）
               </Typography.Text>)}
           </Card>)}
       </Space>

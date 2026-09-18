@@ -70,7 +70,11 @@ function expirationCandidates(value) {
 const CHAIN_BASE_COLUMNS = [
   { title: "代码", key: "code", render: (_f, row) => pick(row, ["code", "option_code", "ticker"]) ?? "—" },
   { title: "名称", key: "name", render: (_f, row) => pick(row, ["name", "option_name"]) ?? "—" },
-  { title: "到期日", key: "expiration", render: (_f, row) => pick(row, ["expiration_date", "expire_date", "date"]) ?? "—" },
+  // 2026-09-19 字段面取证：实测 option_chain 行给的到期日键是 **strike_time**
+  // （如 "2026-09-18"），`expiration_date/expire_date/date` 一个都没有 → 首版这里恒渲染 —，
+  // 且下方本地过滤用同一组键、选任何一个到期日都会把整表筛空。候选键与
+  // expirationCandidates（本文件 L65）保持同一份。
+  { title: "到期日", key: "expiration", render: (_f, row) => pick(row, ["expiration_date", "expire_date", "date", "strike_time"]) ?? "—" },
   { title: "行权价", key: "strike", align: "right", render: (_f, row) => num(pick(row, ["strike_price", "strike"])) },
   { title: "买价", key: "bid", align: "right", render: (_f, row) => num(pick(row, ["bid_price", "bid"])) },
   { title: "卖价", key: "ask", align: "right", render: (_f, row) => num(pick(row, ["ask_price", "ask"])) },
@@ -107,7 +111,7 @@ function ChainTable({ chain }) {
   const [expiration, setExpiration] = React.useState("");
   const dates = expirationCandidates(chain.value);
   const rows = expiration ? allRows.filter((row) => {
-    const rowDate = pick(row, ["expiration_date", "expire_date", "date"]);
+    const rowDate = pick(row, ["expiration_date", "expire_date", "date", "strike_time"]);
     return rowDate === expiration || String(rowDate ?? "").startsWith(expiration);
   }) : allRows;
   if (chain.error) {
