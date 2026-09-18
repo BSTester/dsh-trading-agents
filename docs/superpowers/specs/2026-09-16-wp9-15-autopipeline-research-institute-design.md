@@ -149,15 +149,29 @@
   扁平列表）：它**不决定市场范围**，只选择关注池；显式指定的池键不存在 → 该策略当日
   软跳过 + warn 告警（fail-closed，不静默换池子）（2026-09-16 修订 I1）。
 
-**作业分层（实现期补记，2026-09-16）**：调度链作业分两类，`enabled` 只控制后者——
+**作业分层（实现期补记，2026-09-16；WP18 补记 `sync_calendar`）**：调度链作业分两类，
+`enabled` 只控制后者——
 
 | 层 | 作业 | 受 `enabled` 控制 | 理由 |
 |---|---|---|---|
-| **基础链**（常驻） | 既有 `sync_bars`/`fundamentals`/`merge_announcements`/`quality`/`factors_snapshot` + WP11 `sentiment_snapshot` + WP12 `research_snapshot` + WP15 `enqueue_research` | ❌ 不受控 | 数据与研究资产的**积累**与交易无关：资讯/F10/做空因子要攒满 250 交易日才有意义，不能等用户打开交易开关才开始计时；研究任务同样独立于交易开关（§十） |
+| **基础链**（常驻） | 既有 `sync_bars`/`fundamentals`/`merge_announcements`/`quality`/`factors_snapshot` + WP11 `sentiment_snapshot` + WP12 `research_snapshot` + WP15 `enqueue_research` + WP18 `sync_calendar` | ❌ 不受控 | 数据与研究资产的**积累**与交易无关：资讯/F10/做空因子要攒满 250 交易日才有意义，不能等用户打开交易开关才开始计时；研究任务同样独立于交易开关（§十）；**日历是全部市场链的判定依据**（`is_trading_day` 的白名单），必须由调度器自己维护——日历用尽而无人同步会让市场链静默全停 |
 | **交易链**（开关控制） | `build_plan`/`auto_execute`/`reconcile`（含 digest） | ✅ 受控 | 涉及计划生成与真实下单，属交易行为 |
 
 「关闭时行为零变化」的准确含义因此是：**交易行为**零变化；基础链上的数据采集与研究
 工作照常（它们不产生订单、不触达任何交易写路径）。
+
+**`sync_calendar`（WP18，2026-09-18 补记）**：GLOBAL 链链首，时刻 **18:50**（早于
+`reconcile_at` 19:00 与 `enqueue_research` 19:05）——日历必须在**当日**对账/计划之前
+就位，这样「今日刚用尽」也能在**当晚同一轮**补齐。命令
+`calendar-sync --market SH,HK,US`，逐市场自节流（`max(day) ≥ today + 180 天` → 跳过、
+**零网络调用**；否则同步 `[today−30, today+400]` 并幂等 upsert），单市场失败只记
+`failed`、不中断其余市场。GLOBAL 链不查市场日历（§4.4），故该作业在假日/周末/日历
+用尽时照常运行——这正是自愈来源。**同一轮 tick 内 GLOBAL 链必须先于市场链处理**
+（`daemon._chain_order` 显式定序，不靠 dict 插入顺序），否则本轮刚写入的日历对本轮
+市场链不可见。可见性由 `daemon.tick` 的两条告警提供（均 warn、每市场每日至多一条）：
+`日历覆盖不足`（`max(day) < today + 60`，链照常跑）与 `日历已用尽`
+（`today > max(day)`，链被跳过——此前完全静默）；**真实休市**（在覆盖范围内但不在
+白名单）保持静默，与本节 `plan_auto` 的非交易日软跳过同一语义。
 
 ### 4.2 build_plan 作业（各市场链尾追加，factors_snapshot 之后）
 
@@ -290,6 +304,15 @@
 7. 该计划今日未被执行过（kv ran 标记幂等，同 daemon 既有口径）；
 8. `expected_mode` 复核通过（写指令时携带，指令处理侧既有复核兜底）；
 9. **执行窗口**：当前时刻在 `exec_at` 起 `exec_window_minutes`（默认 30）之内。
+
+**守卫 4b（交易日，WP18 纵深防御，2026-09-18 补记）**：上面的九条里**没有**交易日判定
+——原设计假定「非交易日不跑市场链」（`daemon.tick` 的日历门）就足够。但作业体可以被
+**直接调用**（CLI `auto-execute`、MCP、E2E），实测在法定假日 2026-05-01 09:35 直调照样
+写出了 `execute_plan` 指令，只靠下游 `risk.pre_trade_checks` 规则 3 逐单拒单兜底。
+故在守卫 4（halt）之后、守卫 5+6（计划存在性）之前插入一道：`store.is_trading_day`
+为假 → **info** 跳过（稳定标题 `非交易日`，理由 `真实休市不是故障`，与 `plan_auto` 的
+软跳过同语义）+ **零指令**；`RuntimeError`（日历未同步）→ warn（与守卫 5+6 同分级）。
+编号取 `4b` 而非重排 5–9，是为了不打乱本文档已登记的编号与实现注释的一一对应。
 
 守卫 9 的必要性（实现期发现，2026-09-16 补记）：调度器是 **tick-first**——启动时补跑
 当日已到期作业。若服务在 16:20 启动，SH 的 09:35 `auto_execute` 会被补跑：收盘后执行

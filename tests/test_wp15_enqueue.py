@@ -204,10 +204,12 @@ class EnqueueJobTest(unittest.TestCase):
 
     def test_enqueue_research_is_base_global_job_after_reconcile(self):
         """A-2 修订：入队在基础 GLOBAL 链 19:05（对账 19:00 之后），一条作业覆盖三市场；
-        关闭态仍与 JOBS_DEFAULT 逐键相等（研究不受交易开关控制）。"""
+        关闭态仍与 JOBS_DEFAULT 逐键相等（研究不受交易开关控制）。
+        WP18 起链首还有日历同步（18:50）——同为**基础链**作业，理由见 daemon.JOBS_DEFAULT。"""
         chain = daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN]
-        self.assertEqual([job["name"] for job in chain], ["enqueue_research"])
-        job = chain[0]
+        self.assertEqual([job["name"] for job in chain],
+                         ["sync_calendar", "enqueue_research"])
+        job = chain[1]
         self.assertEqual(job["at"], "19:05")
         self.assertEqual(job["cmd"], ["enqueue-research", "--market", "SH,HK,US"])
         # 各市场链不再带 enqueue_research（阶段归属随之移到 GLOBAL 链）
@@ -219,14 +221,14 @@ class EnqueueJobTest(unittest.TestCase):
 
     def test_enabled_global_chain_orders_reconcile_before_enqueue(self):
         """开启态：reconcile 追加进 GLOBAL 链并按时刻排序——补跑同一轮里 digest 先落库，
-        enqueue 才拿得到当日 digest（A-2 的时序保证）。"""
+        enqueue 才拿得到当日 digest（A-2 的时序保证）；日历同步（18:50）仍排在链首。"""
         self._watchlist(auto=True)
         chain = daemon.build_jobs(str(self.home), self.conn)[daemon.GLOBAL_CHAIN]
         self.assertEqual([job["name"] for job in chain],
-                         ["reconcile", "enqueue_research"])
-        self.assertEqual(chain[0]["at"], "19:00")
-        self.assertEqual(chain[1]["at"], "19:05")
-        self.assertLess(chain[0]["at"], chain[1]["at"])
+                         ["sync_calendar", "reconcile", "enqueue_research"])
+        self.assertEqual(chain[1]["at"], "19:00")
+        self.assertEqual(chain[2]["at"], "19:05")
+        self.assertLess(chain[1]["at"], chain[2]["at"])
 
     def test_late_reconcile_at_is_rejected_not_wrapped(self):
         """派生时刻跨日回绕 → 配置非法（fail-closed）：宁可拒绝，也不让入队排到对账之前。"""
@@ -242,7 +244,8 @@ class EnqueueJobTest(unittest.TestCase):
             encoding="utf-8")
         chain = daemon.build_jobs(str(self.home), self.conn)[daemon.GLOBAL_CHAIN]
         self.assertEqual([(job["name"], job["at"]) for job in chain],
-                         [("reconcile", "23:54"), ("enqueue_research", "23:59")])
+                         [("sync_calendar", "18:50"),
+                          ("reconcile", "23:54"), ("enqueue_research", "23:59")])
 
     def test_refs_are_empty_but_task_still_enqueued_without_data(self):
         """当日无任何快照数据 → 任务仍然入队（引用行数为 0），不假装有数据。"""

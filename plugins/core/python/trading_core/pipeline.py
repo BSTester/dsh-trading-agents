@@ -68,6 +68,8 @@ _JOB_LABELS = {
     "build_plan": "计划生成",
     "auto_execute": "自动执行",
     "enqueue_research": "研究任务入队",
+    # WP18：日历同步（基础 GLOBAL 链 18:50）——「日历怎么突然没维护」在页面上有归属
+    "sync_calendar": "日历同步",
     "reconcile": "对账",
     "plan": "计划",
     "execute": "执行",
@@ -77,10 +79,11 @@ _JOB_LABELS = {
 #: 流程页阶段**展示顺序** = 逻辑闭环序（与链内执行序解耦，见 ``_ordered``）。
 #: 市场链按 at 升序后 auto_execute 在链首（09:35，执行昨天冻结的计划）——那是执行序；
 #: 人读流程页要的是「同步→质量→因子→…→计划→执行→对账→摘要」的因果序。
+#: GLOBAL 链同理：sync_calendar（18:50）排在对账/入队之前——日历就位是当日闭环的前置。
 STAGE_ORDER = ("sync_bars", "sync_fundamentals", "merge_announcements", "quality",
                "factors_snapshot", "sentiment_snapshot", "research_snapshot",
-               "build_plan", "plan", "auto_execute", "execute", "reconcile",
-               "enqueue_research", "digest")
+               "build_plan", "plan", "auto_execute", "execute",
+               "sync_calendar", "reconcile", "enqueue_research", "digest")
 
 #: 告警标题 → 阶段状态（标题字面量与 emit 点一一对应，grep 可核）
 _ALERT_STATUS = {
@@ -189,7 +192,14 @@ _CONTENT_OUTCOMES = {
 _STATUS_RANK = {"ok": 0, "skipped": 1, "pending": 1, "failed": 2}
 
 #: 市场链层告警（daemon.tick 在整条链层面发出）→ 作用于该市场所有数据作业
-_CHAIN_ALERT_STATUS = {"日历未同步": "skipped"}
+#: ``日历已用尽``（WP18）：``today > max(day)``，``is_trading_day`` 返回 False 而不报错，
+#: 该市场链整条被跳过——与「日历未同步」同一性质（链没跑，原因在日历），故同表。
+_CHAIN_ALERT_STATUS = {"日历未同步": "skipped", "日历已用尽": "skipped"}
+#: 链层**提示**告警（不改变任何阶段状态）→ 只登记标题，页面侧不消费。
+#: ``日历覆盖不足``（WP18）：覆盖进入 60 天预警区，但**链照常跑**——把它当跳过原因会把
+#: 当日真的跑过的数据作业降级成 skipped（撒谎）。登记进这里只为两件事：①标题字面量锁
+#: （``tests/test_wp10_locks.py`` 的 N3 反查 emit 点）；②把「刻意惰性」写成代码而不是注释。
+_CHAIN_NOTICE_ALERT_TITLES = frozenset({"日历覆盖不足"})
 #: 配置非法会同时阻断 build_plan 与 auto_execute（两处 emit 同名标题）
 _CONFIG_ALERT_STATUS = {"auto_pipeline 配置非法": "skipped"}
 

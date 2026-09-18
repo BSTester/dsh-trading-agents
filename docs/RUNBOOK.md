@@ -417,6 +417,52 @@ unset DSH_FAKE_NOW                              # 演练结束必须清理
 | `已超执行窗口` | 当前时刻超出 `exec_at + exec_window_minutes`（如服务在收盘后才启动补跑） | 属预期：计划留待人工在工作台执行；要当日自动执行就调整 `exec_at`/窗口或重启服务在窗口内 |
 | `kill switch 生效` | `~/.dsh/trading-kill` 存在 | 确认是否人为放的总闸；恢复即删除该文件（工作台一键清除） |
 | `熔断生效` | 对账差异或日内亏损触发 halt（**差异只暂停不平仓**） | 先按「场景 3」人工核对券商事实，再 `clear_halt` 恢复 |
+| `非交易日` | `auto_execute` 的**纵深防御**守卫（守卫 4b）：作业体内判 `is_trading_day` 为假（真实休市） | **正常**，info 级、零指令。线上调度器本就跳过非交易日的市场链；这条只在 CLI/MCP/E2E 直调时出现 |
+
+### 交易日历：`日历覆盖不足` / `日历已用尽`（`sync_calendar` 作业，WP18）
+
+**背景**：`calendar` 表是**交易日白名单**，`store.is_trading_day` 在日期**超出
+`max(day)`** 时返回 **False 而不报错**——日历用尽后市场链被静默跳过，流程页只显示
+「市场天天休市」，**零告警**（实测：日历只到 2026-09-30 时跑 2026-10-12，只有 2 条
+全局作业、0 条市场作业、0 条 warn）。所以 GLOBAL 链（不查市场日历，假日/周末/用尽都
+照常跑）链首新增 `sync_calendar`（18:50，早于对账 19:00 / 入队 19:05）。
+
+| 现象（告警标题，均 warn） | 含义 | 处置 |
+|---|---|---|
+| `日历覆盖不足` | 某市场 `max(day) < today + 60 天`（覆盖进入预警区）。**链照常跑**，只是快到期 | 查 `sync_calendar` 作业是否连续失败（`alerts` 里的 `作业失败` + detail 尾部）；先手工补：`python -m trading_core calendar-sync --market SH` |
+| `日历已用尽` | `today > max(day)`：该市场链**今日整条被跳过**（此前完全静默） | 同上；补齐当日即可恢复（作业在 18:50，当晚同一轮 tick 的市场链就会看到新日历） |
+| `日历未同步` | 该市场**零行**（与上面两条互斥：零行走这条） | 首次部署就该跑一次全量：`python -m trading_core calendar --market SH --start 2026-01-01 --end 2027-12-31` |
+
+两条告警都**每市场每日至多一条**（kv 去重，不随 60 秒 tick 刷屏）；判断口径互斥：
+`today > max(day)` 只发「已用尽」，覆盖范围内但不在白名单（**真实休市**）**保持静默**
+——真实休市不是故障（与 `plan_auto` 的软跳过同一语义）。
+
+只读核对（不改库）：
+
+```bash
+DB=~/.dsh/trading-data/trading.sqlite
+sqlite3 "$DB" "SELECT market, COUNT(*), MIN(day), MAX(day) FROM calendar GROUP BY market;"
+# 或走 CLI（逐市场自节流；覆盖充足时零网络调用、退出 0）：
+~/.dsh/trading-venv/bin/python -m trading_core calendar-sync --market SH,HK,US --db "$DB"
+```
+
+**手工同步的等价命令**（`--market` 单值、start/end 必传，与 `calendar-sync` 的自动窗口
+不同——它是原始抓取口径）：
+
+```bash
+~/.dsh/trading-venv/bin/python -m trading_core calendar --market SH \
+  --start 2026-01-01 --end 2027-12-31 --db "$DB"
+```
+
+> ⚠️ **开发机上手工跑 `calendar-sync` 的两个坑**（2026-09-18 实机实测）：
+> ① 安装副本 `~/.dsh/trading-python/core` 不含新子命令——`python -m trading_core
+> calendar-sync` 会报 `invalid choice: 'calendar-sync'`，先
+> `scripts/platform_service.sh refresh`；只想临时验证可前置仓库层：
+> `PYTHONPATH=<repo>/plugins/datasource/python:<repo>/plugins/core/python python -m trading_core calendar-sync …`。
+> ② 调度器起的作业子进程**自己会前置仓库层**（`daemon._subprocess_runner` →
+> `repo_paths`），所以作业链跑的是仓库代码；但**已在运行的服务进程**在启动时就把
+> `trading_core` 载入内存了，**改完代码必须 `refresh && restart`** 才生效（只 `refresh`
+> 不重启，服务内调度仍是旧作业表）。
 
 ### 计划「生成了但买不动 / 一笔单都没有」怎么读（WP17）
 

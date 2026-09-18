@@ -247,9 +247,12 @@ class GlobalStageTests(PipelineBase):
                      {"as_of": DATE, "orders": {"submitted": 2, "filled": 1}})
         out = self.snapshot()
         stages = out["global"]["stages"]
-        # GLOBAL 链按时刻排序：reconcile 19:00 → enqueue_research 19:05（基础链），
-        # digest 由 reconcile 派生、附在链末（审查 A-2 后入队归 GLOBAL）
-        self.assertEqual(list(stages), ["reconcile", "enqueue_research", "digest"])
+        # GLOBAL 链按时刻排序：日历同步 18:50 → reconcile 19:00 → enqueue_research 19:05
+        # （前两者与后者都是基础链；digest 由 reconcile 派生、附在链末）
+        self.assertEqual(list(stages),
+                         ["sync_calendar", "reconcile", "enqueue_research", "digest"])
+        self.assertEqual(stages["sync_calendar"]["scheduled"], "18:50")
+        self.assertEqual(stages["sync_calendar"]["label"], "日历同步")
         self.assertEqual(stages["reconcile"]["status"], "ok")
         self.assertEqual(stages["reconcile"]["scheduled"], "19:00")
         self.assertEqual(stages["enqueue_research"]["scheduled"], "19:05")
@@ -262,11 +265,11 @@ class GlobalStageTests(PipelineBase):
         self.assertEqual(self.snapshot()["global"]["stages"]["digest"]["status"], "pending")
 
     def test_disabled_config_keeps_base_enqueue_and_digest(self):
-        """关闭态：GLOBAL 链只有基础入队作业 + digest，**没有 reconcile**（对账属
-        auto_pipeline 派生作业；研究入队与交易开关解耦——审查 A-2）。"""
+        """关闭态：GLOBAL 链只有基础作业（日历同步 + 研究入队）+ digest，**没有 reconcile**
+        （对账属 auto_pipeline 派生作业；两者与交易开关解耦——审查 A-2 / WP18）。"""
         out = self.snapshot()
         self.assertEqual(list(out["global"]["stages"]),
-                         ["enqueue_research", "digest"])
+                         ["sync_calendar", "enqueue_research", "digest"])
 
 
 class ConfigAndSafetyTests(PipelineBase):

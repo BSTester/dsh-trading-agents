@@ -27,6 +27,22 @@ def build_parser():
     s.add_argument("--end", required=True)
     _add_db(s)
 
+    s = sub.add_parser(
+        "calendar-sync",
+        help="自动同步交易日历（自节流/幂等，逐市场容错）；退出码 0=全成功或部分成功"
+             "（明细见 failed）、1=零成功",
+        description="调度链的日历维护作业（GLOBAL 链 18:50，早于对账 19:00 与入队 19:05）。"
+                    "逐市场独立：读该市场 max(day)，覆盖 ≥ today+horizon_days 就跳过"
+                    "（零网络调用），否则同步 [today-30, today+400] 天并回报实际落库天数与"
+                    "新边界；某市场通道失败只记入 failed，不影响其余市场。"
+                    "为什么需要它：日历是「交易日白名单」，用尽后 is_trading_day 返回 False "
+                    "而不报错——市场链会被静默跳过（页面只显示「市场天天休市」）。")
+    s.add_argument("--market", required=True, help="逗号分隔，如 SH,HK,US")
+    s.add_argument("--horizon-days", type=int, default=cal.DEFAULT_HORIZON_DAYS,
+                   help=f"覆盖充足判据：max(day) >= today + N 天就跳过（默认 "
+                        f"{cal.DEFAULT_HORIZON_DAYS}）")
+    _add_db(s)
+
     s = sub.add_parser("sync-bars", help="增量同步日线（--tickers 逗号分隔）；逐标的容错：退出码 0=全成功或部分失败（明细见 failed）、1=零成功")
     s.add_argument("--tickers", required=True, help="逗号分隔")
     _add_db(s)
@@ -620,6 +636,30 @@ def main(argv=None):
     try:
         if args.cmd == "calendar":
             result = {"days": cal.sync_calendar(conn, args.market, args.start, args.end)}
+        elif args.cmd == "calendar-sync":
+            # 日历维护作业（WP18）：逐市场独立、逐市场容错（一个市场失败不影响其余），
+            # 退出码与 sync-bars 同一口径（`_batch_exit_code`：0=全成功或部分成功、
+            # 1=零成功）——调度层据此判定该作业是否失败并告警。
+            markets = [part.strip().upper() for part in str(args.market).split(",")
+                       if part.strip()]
+            if not markets:
+                print(json.dumps({"ok": False, "error": "缺少 --market"},
+                                 ensure_ascii=False, indent=1))
+                return 1
+            today = _dt.date.today()
+            results, failed = {}, {}
+            for market in markets:
+                try:
+                    results[market] = cal.ensure_coverage(conn, market, today,
+                                                          horizon_days=args.horizon_days)
+                except Exception as error:  # noqa: BLE001 —— 单市场失败不中断批量
+                    failed[market] = f"{type(error).__name__}: {error}"[:160]
+            result = {"markets": results, "failed": failed,
+                      "ok_count": len(results), "failed_count": len(failed),
+                      "total": len(markets), "today": today.isoformat(),
+                      "horizon_days": args.horizon_days}
+            print(json.dumps(result, ensure_ascii=False, indent=1))
+            return _batch_exit_code(result)
         elif args.cmd == "sync-bars":
             tickers = [t.strip() for t in args.tickers.split(",") if t.strip()]
             if not tickers:

@@ -494,3 +494,50 @@ SZ.002716 SH.603993 SZ.002131`，全在 20 只 `SH.600xxx` 关注池之外，且
 | **R12** | **`option_screen` 最小合法载荷不可发现** | 服务端要求 `filter.field_filter` 为非空 dict；按提示给 `{"option_type": []}` 会被上游 `-3 invalid parameter` 拒绝，省略/空数组也被本地拒绝 → 契约对调用方不可发现。**待办**：确定一个真实可用的最小示例（需对官方文档 + 真机确认）后写进工具描述与本文档；在确定之前**不编造示例**。 |
 | **R10** | **WP8 的 P1/P2 只在 WP8 计划文件里** | 现 surface 到本文档：**P1** 部分成交后撤单的对账永不收敛到终态（数量口径优先于状态文本）→ 需人工核对入口（记 diff 提示，不猜 `cancelled`）；**P2** A 股 live 订单不在推送对账覆盖内（`PUSH_RECONCILE_MARKETS=HK,US`）→ `unknown→终态` 兜底链对 A 股有缺口。两者均为**保守方向的已知缺口**（不误判、不自动改状态），实盘前按 P4 清单人工评估。 |
 
+### 8.6 WP18：交易日历自动维护 + 交易日纵深防御（2026-09-18 实现 / 只读复验）
+
+**背景（两条实测事实）**：
+
+1. `calendar` 表是「交易日白名单」，`store.is_trading_day` 用白名单查；`store._require_calendar`
+   只在**该市场零行**时抛错。因此**日历用尽**（日期超出 `max(day)`）时 `is_trading_day`
+   返回 **False 而不报错** → 市场链被静默跳过（实测：日历只到 2026-09-30 时跑 2026-10-12，
+   只有 2 条全局作业、0 条市场作业、0 条 warn，页面表现为「市场天天休市」）；
+   而此前**没有任何作业会同步日历**——`daemon.JOBS_DEFAULT` 的 GLOBAL 链只有
+   `enqueue_research`，同步只能人工跑 `trading_core calendar`（`--market` 单值、start/end 必传）。
+2. `autopilot.auto_execute` 的九守卫（开关 / sim-only / kill / halt / 计划存在且
+   mode+market 匹配 / 当日幂等 / 执行窗口 / 写指令）**不含交易日判定**——实测在法定假日
+   2026-05-01 09:35 直调照样写出 `execute_plan` 指令，只有下游 `risk.pre_trade_checks`
+   规则 3 逐单拒单兜底（线上调度器挡住市场链，故属**纵深防御**缺口）。
+
+| 修订 | 不变量 | 锁定测试 |
+|---|---|---|
+| `calendar.calendar-sync` / `ensure_coverage` | 逐市场自节流：`max(day) ≥ today + 180` → **跳过、零网络调用**；否则幂等同步 `[today−30, today+400]`；单市场失败只记 `failed` 不中断其余市场；退出码与 `sync-bars` 同口径（0=全成功或部分成功、1=零成功）。取数可注入（离线可测） | `tests/test_wp18_calendar_sync.py` |
+| GLOBAL 链新增 `sync_calendar`（18:50） | **基础链**作业（与交易开关解耦；GLOBAL 链不查市场日历 → 假日/周末/用尽都照常跑 = 自愈来源）。时刻早于对账 19:00 与入队 19:05：日历必须在当日对账/计划之前就位 | `tests/test_wp18_calendar_coverage.py::CalendarJobChainTest`、`tests/test_wp9_build_jobs.py`、`tests/test_wp15_enqueue.py` |
+| 同一轮 tick 内 **GLOBAL 链先于市场链** | `daemon._chain_order` **显式定序**，不靠 dict 插入顺序（`JOBS_DEFAULT` 字面量顺序 + `deepcopy` 保序只是巧合）——否则「本轮刚补齐的日历」对本轮市场链不可见 | 同上（`test_global_chain_is_processed_before_market_chains`、`test_calendar_synced_this_tick_unblocks_market_chain_in_same_tick`） |
+| 告警 `日历覆盖不足`（warn） | `max(day) < today + 60 天`（`daemon.CALENDAR_COVERAGE_WARN_DAYS`；比同步阈值 180 窄 3 倍）。**链照常跑** → 登记在 `pipeline._CHAIN_NOTICE_ALERT_TITLES`（**惰性**，不改阶段状态）。每市场每日至多一条（kv 去重） | 同上（`CoverageWarningTest`、`CalendarAlertTitleLockTest`） |
+| 告警 `日历已用尽`（warn） | `today > max(day)`；与「覆盖不足」**互斥**（用尽时只发前者，避免同义双告警 + 负天数文案）。**真实休市保持静默**（在覆盖范围内但不在白名单——刻意的语义，`plan_auto` 同样不告警） | 同上（`CalendarExhaustedTest`、`test_real_holiday_stays_silent`） |
+| `store.calendar_last_day` | 只读助手（唯一实现）：`tick` 不写裸 SQL；零行市场 → `None`（此时走既有「日历未同步」，不叠加覆盖告警） | 同上 |
+| `auto_execute` 守卫 **4b：交易日** | 纵深防御（线上调度器已挡，CLI/MCP/E2E 直调没有）：`RuntimeError`（日历未同步）→ warn；False（真实休市）→ **info** 跳过 + 稳定标题 `非交易日` + **零指令**。编号用 4b 以免打乱规格 §4.3 已登记编号 | `tests/test_wp18_auto_execute_trading_day.py` |
+
+**字面量契约（标题必须稳定，`pipeline` 按标题精确匹配；变量只进 detail）**：
+`日历覆盖不足`、`日历已用尽`、`非交易日`。三者均已登记（前两者在链层表，`非交易日` 在
+`_ALERT_STATUS` 的 `auto_execute` 行）并纳入 N3 标题锁（`tests/test_wp10_locks.py`）。
+
+**只读复验（2026-09-18，不改 `~/.dsh`）**：真实库 `calendar` 三市场
+SH 503 行 / HK 507 / US 511，边界全部 `2027-12-31`；`2026-10-12`（周一）在 SH 白名单内
+= 交易日、`2026-05-01`（周五）不在 = 假日。当日（2026-09-18）距边界 469 天，
+远大于同步阈值 180 与告警阈值 60 → `calendar-sync` 三市场全部 **skipped（零网络）**、
+两条日历告警都不会发。**未**对真实 `~/.dsh` 写任何文件、未重启服务、未下单。
+
+**诚实登记（未决/边界）**：
+
+- 「覆盖不足」与「已用尽」按上文**互斥**实现（用尽时只发后者）。需求原文对 A3 的描述
+  （`max(day) < today + 60`）在数学上**也覆盖**用尽态，本实现刻意不重复发——若后续要求
+  「两条都发」，改 `_warn_calendar_shortage` 的 `date > last` 早退即可（有一条测试锁住当前口径）；
+- `calendar-sync` 的「今天」取**北京日**（`date.today()`），日历按市场本地日期落库——
+  对 SH/HK 无差异，美股链在极端时点可能差一天；影响被 30 天回看窗口吸收（不构成缺口）；
+- 上游信封异常导致 0 行时 `ensure_coverage` 记 `days=0`、边界不变，**不**判失败
+  （沿用 `sync_calendar` 既有口径）；可见性由覆盖告警兜底，不在同步层硬判；
+- 真实库已同步到 2027-12-31 是**手工**完成的（本轮之前），本轮只是把它接进调度链；
+  实机**未**触发过真实网络同步（`calendar-sync` 取数腿的端到端联网路径本轮未实机验证）。
+

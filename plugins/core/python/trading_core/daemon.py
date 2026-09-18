@@ -4,6 +4,7 @@
 边界（规格 §8.4 恢复原则）：cancel_plan 只本地撤销未提交（draft/frozen）订单，
 在途订单留给对账兜底，绝不自动清除 unknown 状态。
 kill 文件约定 ~/.dsh/trading-kill（WP3 risk.py ctx["kill_path"] 同一事实）。"""
+import datetime as dt
 import json
 import os
 import subprocess
@@ -18,7 +19,8 @@ from . import alerts, commands, execute, indicators, store
 # WP9 拆分（规格 §3.1）：配置/作业装配 → autopipeline；自动执行作业体 → autopilot；
 # 统一时钟 → clock。以下为**向后兼容再导出**——既有调用方（cli/planner/reconcile/
 # server.scheduler/各测试）继续以 ``daemon.X`` 取用，无需改动。
-from .autopipeline import (AUTO_PIPELINE_DEFAULTS, ENQUEUE_RESEARCH_BASE_AT,  # noqa: F401
+from .autopipeline import (AUTO_PIPELINE_DEFAULTS, CALENDAR_SYNC_AT,  # noqa: F401
+                           CALENDAR_SYNC_CMD, ENQUEUE_RESEARCH_BASE_AT,
                            ENQUEUE_RESEARCH_CMD, EXEC_WINDOW_MAX_MINUTES,
                            GLOBAL_CHAIN, auto_pipeline_config, build_jobs)
 from .autopilot import auto_execute
@@ -49,7 +51,18 @@ JOBS_DEFAULT = {
     # 研究任务只进队列，不碰交易；入队本身零 LLM、零子进程，只是「把活记下来」。
     # 时刻/命令取自 autopipeline 常量（单一事实源）：**开启态**由 build_jobs 按 reconcile_at
     # 派生（= 对账 + 5 分钟，严格晚于 digest）；这里的固定点只在关闭态生效。
-    GLOBAL_CHAIN: [{"name": "enqueue_research", "at": ENQUEUE_RESEARCH_BASE_AT,
+    #
+    # WP18（2026-09-18）：GLOBAL 链**链首**再加 `sync_calendar`（18:50，`calendar-sync`）。
+    # 由来：日历表是「交易日白名单」，`is_trading_day` 在日期超出 `max(day)` 时返回 False
+    # 而**不报错**——日历用尽会让市场链被静默跳过（页面只看得到「市场天天休市」，0 告警）；
+    # 而此前**没有任何作业会同步日历**（只能人工跑 CLI 的 calendar 子命令）。
+    # **为什么是 18:50**：早于对账（19:00）与研究入队（19:05）——日历必须在当日对账/计划
+    # 之前就位，这样「今日刚用尽」当晚同一轮就能补齐，次日市场链照常跑；排在更晚的时点
+    # 会让缺口多挂一天。GLOBAL 链不查市场日历（既有设计），所以该作业在假日/周末/日历
+    # 用尽时**照常运行**——这正是自愈的来源。
+    GLOBAL_CHAIN: [{"name": "sync_calendar", "at": CALENDAR_SYNC_AT,
+                    "cmd": list(CALENDAR_SYNC_CMD)},
+                   {"name": "enqueue_research", "at": ENQUEUE_RESEARCH_BASE_AT,
                     "cmd": list(ENQUEUE_RESEARCH_CMD)}],
     "SH": [{"name": "sync_bars", "at": "16:00", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "sync_fundamentals", "at": "16:00", "cmd": ["fundamentals", "--tickers", "@watchlist"]},
@@ -145,6 +158,19 @@ JOB_ERROR_ALERT_TITLE = "作业异常"
 #: 失败告警里保留的输出尾部行数（免去翻服务日志即可看到原因）
 OUTPUT_TAIL_LINES = 5
 
+#: 日历覆盖**预警阈值**（天，WP18）：``max(day) < today + 这个天数`` → warn「日历覆盖不足」。
+#: 比 ``calendar.DEFAULT_HORIZON_DAYS``（180，同步作业的节流阈值）小 3 倍：**同步**与
+#: **告警**是两件事——作业每 180 天补一次，只有补不上（连续失败）才会落入 60 天预警区。
+CALENDAR_COVERAGE_WARN_DAYS = 60
+#: 日历覆盖不足（warn）：链照常跑，只是「快到期了」。标题是**字面量契约**
+#: （``pipeline._CHAIN_NOTICE_ALERT_TITLES`` 登记；变量只进 detail）。
+CALENDAR_SHORT_ALERT_TITLE = "日历覆盖不足"
+#: 日历已用尽（warn）：``today > max(day)``——``is_trading_day`` 返回 False 而**不报错**，
+#: 市场链被静默跳过（实测 2026-10-12 超出当日运行时：只有 2 条全局作业、0 条市场作业、
+#: 0 条 warn，页面上表现为「市场天天休市」）。标题同样是字面量契约，登记进
+#: ``pipeline._CHAIN_ALERT_STATUS``（= 该市场链整条被跳过，与「日历未同步」同表）。
+CALENDAR_EXHAUSTED_ALERT_TITLE = "日历已用尽"
+
 
 def _last_json_object(text):
     """stdout 里最后一个可解析的 JSON 对象（作业的结构化摘要）；取不到返回 None。
@@ -218,6 +244,17 @@ def tick(conn, home, jobs=None, now=None, runner=None):
     派生的自动作业）。``GLOBAL_CHAIN`` 链**不查市场日历**（全局作业与单一市场无关，
     规格 §4.4），只受时点与当日 ran 标记约束。
 
+    **链序（WP18）**：GLOBAL 链**先于所有市场链**处理（``_chain_order`` 显式定序，不靠
+    dict 插入顺序）。原因：GLOBAL 链的 ``sync_calendar``（18:50）补的正是市场链本轮要用的
+    日历——市场链若先跑，本轮刚同步好的日历对它们不可见，「日历刚用尽当晚自愈」就不成立。
+
+    **日历可见性（WP18）**：市场链跑之前做一次覆盖检查（``_warn_calendar_shortage``：
+    覆盖进入 60 天预警区 → warn「日历覆盖不足」，链照常跑）；``is_trading_day`` 为 False 时
+    区分两种情形（``_warn_calendar_exhausted``）——**日期超出覆盖上界**（``today > max(day)``）
+    → warn「日历已用尽」；**真实休市**（在覆盖范围内但不在白名单）→ 保持既有的静默语义
+    （真实休市不是故障，与 ``planner.plan_auto`` 的软跳过一致）。两条告警都是每市场每日
+    至多一条（kv 去重），不随每轮 tick 刷屏。
+
     时钟口径：``now=`` 显式注入 > ``DSH_FAKE_NOW`` > 真实时间（``now_fn`` 采样一次）。
     ``runner=`` 透传给 ``_run_job``：注入假执行体即可**离线**跑整轮（否则 cmd 形式作业会
     真的起 CLI 子进程——测试不该联网，演练/单测都要确定性）。
@@ -232,8 +269,9 @@ def tick(conn, home, jobs=None, now=None, runner=None):
     state = store.kv_get(conn, "daemon:state", default={"ran": {}})
     failures = []
     stamp = now()
-    for market, chain in jobs.items():
+    for market, chain in _chain_order(jobs).items():
         if market != GLOBAL_CHAIN:
+            _warn_calendar_shortage(conn, home, market, stamp[:10])
             try:
                 trading_day = store.is_trading_day(conn, market, stamp[:10])
             except RuntimeError as error:  # 日历未同步：跳过该市场并告警，不拖垮循环
@@ -241,6 +279,8 @@ def tick(conn, home, jobs=None, now=None, runner=None):
                             detail=str(error)[:160])
                 continue
             if not trading_day:
+                # 用尽 vs 真实休市：前者必须让运维看得见（此前完全静默）
+                _warn_calendar_exhausted(conn, home, market, stamp[:10])
                 continue
         for job in chain:
             key = f"{market}:{job['name']}:{stamp[:10]}"
@@ -265,6 +305,74 @@ def tick(conn, home, jobs=None, now=None, runner=None):
         # 摘要保持可见（吞掉会让 healthz 谎报无错），但不影响本轮其它作业与记账。
         raise RuntimeError("作业失败：" + "；".join(failures)[:500])
     return state
+
+
+def _chain_order(jobs):
+    """本轮 tick 的链处理顺序：GLOBAL 链优先，其余保持作业表原顺序（返回新 dict）。
+
+    **为什么显式定序**（WP18）：GLOBAL 链上的 ``sync_calendar``（18:50）补的是市场链**本轮**
+    要用的交易日历；市场链先跑就会按旧日历判定（「日历刚用尽」那一轮的市场作业仍被跳过），
+    「今晚自愈」要推迟到下一轮 tick。``build_jobs`` 的 dict 目前恰好把 GLOBAL 放在首位
+    （JOBS_DEFAULT 的字面量顺序 + deepcopy 保序），但那是巧合不是契约——这里把依赖写成代码。
+    作业表没有 GLOBAL 键时（演练/单测注入的窄表）原样返回。
+    """
+    if GLOBAL_CHAIN not in jobs:
+        return dict(jobs)
+    return {GLOBAL_CHAIN: jobs[GLOBAL_CHAIN],
+            **{market: chain for market, chain in jobs.items() if market != GLOBAL_CHAIN}}
+
+
+def _calendar_alert_once(conn, home, key, title, detail):
+    """当日该市场该标题是否已发过 → 已发返回 False，否则发出并打 kv 标记。
+
+    去重口径与 ``_warn_empty_watchlist`` 同一手法（kv 键含日期）：日历是「慢变量」，
+    每轮 tick（60s）重复告警会把告警表刷满，反而埋掉真正的事件。
+    """
+    if store.kv_get(conn, key, default=False):
+        return False
+    alerts.emit(conn, home=str(home), level="warn", title=title, detail=detail[:300])
+    store.kv_set(conn, key, True)
+    return True
+
+
+def _warn_calendar_shortage(conn, home, market, date):
+    """覆盖进入预警区（``max(day) < today + CALENDAR_COVERAGE_WARN_DAYS``）→ 每市场每日一条 warn。
+
+    **链照常跑**：覆盖不足只是「快到期了」，把当日跑过的数据作业降级成跳过就是撒谎——
+    因此 ``pipeline`` 把它登记在 ``_CHAIN_NOTICE_ALERT_TITLES``（惰性提示），不碰阶段状态。
+
+    与「日历已用尽」**互斥**：``today > max(day)`` 时只发后者（更精确，且此时 ``max(day)``
+    距今天为负数，写成「距今天 -30 天」没法读）。零行市场同理留给既有的「日历未同步」。
+    """
+    last = store.calendar_last_day(conn, market)
+    if last is None or date > last:
+        return False
+    gap = (dt.date.fromisoformat(last) - dt.date.fromisoformat(date)).days
+    if gap >= CALENDAR_COVERAGE_WARN_DAYS:
+        return False
+    return _calendar_alert_once(
+        conn, home, f"alert:calendar_short:{market}:{date}", CALENDAR_SHORT_ALERT_TITLE,
+        f"{market} 最后交易日 {last}，距今天 {gap} 天；请确认 calendar-sync 作业已运行"
+        f"或手工同步（python -m trading_core calendar-sync --market {market}）")
+
+
+def _warn_calendar_exhausted(conn, home, market, date):
+    """``is_trading_day`` 为 False 且 ``today > max(day)``（覆盖用尽）→ 每市场每日一条 warn。
+
+    为什么必须有这条：``is_trading_day`` 对「超出覆盖」与「真实休市」**都**返回 False 而
+    不报错，市场链于是被静默跳过——实测（日历只到 2026-09-30 时跑 2026-10-12）只有 2 条
+    全局作业、0 条市场作业、0 条 warn，运维在页面上只能看到「市场天天休市」。
+    真实休市（在覆盖范围内但不在白名单）**保持静默**：那不是故障。
+    """
+    last = store.calendar_last_day(conn, market)
+    if last is None or date <= last:
+        return False
+    return _calendar_alert_once(
+        conn, home, f"alert:calendar_exhausted:{market}:{date}",
+        CALENDAR_EXHAUSTED_ALERT_TITLE,
+        f"{market} 日历覆盖已用尽：最后交易日 {last}，今天 {date} 不在覆盖范围内，"
+        f"该市场作业链今日被跳过；请确认 calendar-sync 作业已运行或手工同步"
+        f"（python -m trading_core calendar-sync --market {market}）")
 
 
 def _warn_empty_watchlist(conn, home, date):

@@ -70,21 +70,27 @@ class BuildJobsTest(unittest.TestCase):
             self.assertEqual(named["auto_execute"]["at"], exec_at)
             self.assertEqual(named["auto_execute"]["cmd"], ["auto-execute", "--market", market])
 
-        # GLOBAL 链：reconcile 在前，enqueue_research **按 reconcile_at 派生**紧随其后
-        # （19:30 + 5 = 19:35）——开启态入队时刻跟随配置，严格晚于当日 digest（审查 A-2）
+        # GLOBAL 链：日历同步（18:50，基础链）→ reconcile 在其后，enqueue_research
+        # **按 reconcile_at 派生**紧随 reconcile（19:30 + 5 = 19:35）——开启态入队时刻跟随
+        # 配置，严格晚于当日 digest（审查 A-2）；日历先于对账（WP18）
         g = jobs[daemon.GLOBAL_CHAIN]
-        self.assertEqual([j["name"] for j in g], ["reconcile", "enqueue_research"])
-        self.assertEqual(g[0]["at"], "19:30")
-        self.assertEqual(g[0]["cmd"], ["reconcile-daily"])
-        self.assertEqual(g[1]["at"], "19:35")
-        self.assertEqual(g[1]["cmd"], ["enqueue-research", "--market", "SH,HK,US"])
+        self.assertEqual([j["name"] for j in g],
+                         ["sync_calendar", "reconcile", "enqueue_research"])
+        self.assertEqual(g[0]["at"], "18:50")
+        self.assertEqual(g[0]["cmd"], ["calendar-sync", "--market", "SH,HK,US"])
+        self.assertEqual(g[1]["at"], "19:30")
+        self.assertEqual(g[1]["cmd"], ["reconcile-daily"])
+        self.assertEqual(g[2]["at"], "19:35")
+        self.assertEqual(g[2]["cmd"], ["enqueue-research", "--market", "SH,HK,US"])
         self.assertLess(g[0]["at"], g[1]["at"])
+        self.assertLess(g[1]["at"], g[2]["at"])
         # deepcopy：不改动全局常量，也不残留上一次装配的痕迹——基础链的固定点原样保留
         self.assertEqual([j["name"] for j in daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN]],
-                         ["enqueue_research"])
-        self.assertEqual(daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN][0]["at"], "19:05")
+                         ["sync_calendar", "enqueue_research"])
+        self.assertEqual(daemon.JOBS_DEFAULT[daemon.GLOBAL_CHAIN][1]["at"], "19:05")
         self.assertEqual(len(daemon.JOBS_DEFAULT["SH"]), 7)
-        # 基础链：WP11 sentiment + WP12 research 快照（入队自审查 A-2 起移入 GLOBAL 链）
+        # 基础链：WP11 sentiment + WP12 research 快照（入队自审查 A-2 起移入 GLOBAL 链，
+        # WP18 起 GLOBAL 链首另有日历同步）
 
     # ②之二 R3：每条链（市场链与 GLOBAL 链）都按 at 升序——补跑同轮多作业时链序即执行序
     def test_all_chains_sorted_by_at(self):

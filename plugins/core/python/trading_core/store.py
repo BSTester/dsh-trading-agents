@@ -280,6 +280,18 @@ def _require_calendar(conn, market):
         raise RuntimeError(f"日历未同步：{market}（先跑 python -m trading_core calendar）")
 
 
+def calendar_last_day(conn, market):
+    """该市场日历的覆盖上界（``max(day)``）；该市场零行 → ``None``。
+
+    只读小助手（唯一实现，调用方不写裸 SQL）：``is_trading_day`` 对「日期超出覆盖上界」
+    与「真实休市」两种情形**都**返回 False（不报错），只有它能区分二者——``daemon.tick``
+    的「日历已用尽」告警与覆盖检查都靠它，``calendar.ensure_coverage`` 的同步节流也用它。
+    """
+    row = conn.execute("SELECT MAX(day) FROM calendar WHERE market=?",
+                       (market.upper(),)).fetchone()
+    return row[0] if row and row[0] else None
+
+
 def is_trading_day(conn, market, day):
     _require_calendar(conn, market)
     row = conn.execute("SELECT 1 FROM calendar WHERE market=? AND day=?"

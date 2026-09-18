@@ -105,7 +105,7 @@ class AlertTitleLockTests(unittest.TestCase):
     def test_every_stage_alert_title_has_an_emit_site(self):
         sources = self.emit_sources()
         titles = list(pipeline._ALERT_STATUS) + list(pipeline._CHAIN_ALERT_STATUS) \
-            + list(pipeline._CONFIG_ALERT_STATUS)
+            + list(pipeline._CONFIG_ALERT_STATUS) + list(pipeline._CHAIN_NOTICE_ALERT_TITLES)
         missing = [title for title in titles
                    if not any(f'"{title}"' in text for text in sources.values())]
         self.assertEqual(missing, [], f"这些标题在 core 已无 emit 点：{missing}")

@@ -172,6 +172,14 @@ ENQUEUE_RESEARCH_BASE_AT = "19:05"
 ENQUEUE_RESEARCH_AFTER_RECONCILE_MINUTES = 5
 ENQUEUE_RESEARCH_CMD = ["enqueue-research", "--market", "SH,HK,US"]
 
+#: 日历同步作业（基础 GLOBAL 链，WP18）的时刻与命令。**18:50 = 早于对账（19:00）与
+#: 研究入队（19:05）**：日历必须在当日对账/计划之前就位——这样「日历刚用尽」（当日
+#: 市场链因超出覆盖被跳过）也能在**今晚同一轮**自愈，次日市场链照常跑。放在入队之后
+#: 或更晚都不行：那样当日晚些时候的作业仍按旧日历判定，缺口要多挂一天。
+#: 命令与 daemon.JOBS_DEFAULT 共用（单一事实源），避免两处命令/参数漂移。
+CALENDAR_SYNC_AT = "18:50"
+CALENDAR_SYNC_CMD = ["calendar-sync", "--market", "SH,HK,US"]
+
 
 def _plus_minutes(hhmm, minutes):
     """HH:MM + 分钟（跨日回绕）；输入已由 _hhmm/常量保证格式合法。"""
@@ -261,8 +269,11 @@ def build_jobs(home, conn=None):
     # GLOBAL 链：reconcile（对账 → 写 digest）在前，enqueue_research（基础链作业）**按
     # reconcile_at 派生**紧随其后——开启态下入队时刻跟随配置，保证严格晚于当日 digest；
     # 关闭态则保持 JOBS_DEFAULT 的固定点（ENQUEUE_RESEARCH_BASE_AT，无 reconcile 作业）。
+    # **基础链作业原样保留**（sync_calendar 18:50 与关闭态的 enqueue_research）：这里只
+    # 摘掉固定点的 enqueue_research 再按配置时刻重排，日历同步与交易开关无关，不参与重排。
     # 整条链按 at 升序排序：tick-first 补跑时同一轮可能同时到期多个作业，顺序必须与
-    # 时间顺序一致，否则 enqueue 会先于 reconcile 执行（审查 A-2）。
+    # 时间顺序一致，否则 enqueue 会先于 reconcile 执行（审查 A-2），或日历同步被排到
+    # 对账之后（那样「今晚自愈」就不成立）。
     global_chain = [job for job in jobs.setdefault(GLOBAL_CHAIN, [])
                     if job["name"] != "enqueue_research"]
     global_chain.append({"name": "reconcile", "at": cfg["reconcile_at"],
