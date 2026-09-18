@@ -107,10 +107,6 @@ class DrillCoverageTest(unittest.TestCase):
         self.assertIn("export const DRILL_KEYS = Object.keys(DRILL)", source)
 
 
-if __name__ == "__main__":
-    unittest.main()
-
-
 class SingleTickerStrategyInAutoPipelineTest(unittest.TestCase):
     """配置里写单标的策略（rsi/ma_cross）时，``plan_auto`` 必须软跳过而非抛异常。
 
@@ -157,3 +153,7 @@ class SingleTickerStrategyInAutoPipelineTest(unittest.TestCase):
 
     def test_pipeline_attributes_the_new_title_to_build_plan_skipped(self):
         self.assertEqual(pipeline._ALERT_STATUS.get("策略不支持自动计划"), ("build_plan", "skipped"))
+
+
+if __name__ == "__main__":
+    unittest.main()
