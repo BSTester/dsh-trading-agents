@@ -74,7 +74,9 @@ from mcp.types import CallToolResult, TextContent
 from pydantic import Field
 from pydantic.json_schema import PydanticJsonSchemaWarning
 
-from server import store_access
+# futu_data 只提供**事实文本**（如 OPTION_MARKET_CATEGORY_TEXT 的类别码清单），
+# 不在本模块复制任何校验/业务逻辑（工具描述与错误消息同源，见 tests/test_wp25_option_form.py）。
+from server import futu_data, store_access
 
 SERVER_NAME = "quantwb"
 SERVER_VERSION = "0.1.0"
@@ -793,8 +795,9 @@ TOOLS = (
         '{"filter": {"strategy": {"market_category_list": [0], "filter_group_list": '
         '[{"option_list": [{"indicator_type": 1003, "indicator_value": {"value_list": [1]}}]}]}, '
         '"field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1}, "limit": 3}}'
-        "（market_category_list 0=US_STOCK/1=US_INDEX/3=HK_STOCK；filter_group_list 每组内"
-        "underlying/option/chain/combo 只能一个非空）。",
+        f"（market_category_list {futu_data.OPTION_MARKET_CATEGORY_TEXT}——非支持值被上游"
+        "**静默忽略**（回空列表 + total=0，不报错），故工具面只列这 7 个真机验证过的码；"
+        "filter_group_list 每组内 underlying/option/chain/combo 只能一个非空）。",
         "option_screen",
         (req("filter", "object",
              "筛选对象：必须含形状正确的非空 field_filter 与非空 strategy；可选 limit/"

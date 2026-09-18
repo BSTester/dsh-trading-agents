@@ -195,6 +195,27 @@ OPTION_SCREEN_EXAMPLE = (
     '[{"option_list": [{"indicator_type": 1003, "indicator_value": {"value_list": [1]}}]}]}, '
     '"field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1}, "limit": 3}}')
 
+#: 期权筛选 ``strategy.market_category_list`` 的**真机验证**类别码
+#: （2026-09-17，docs/TOOL-LIMITS.md「期权筛选的最小可用载荷」；值 → 上游英文码）。
+#: 非支持值被上游**静默忽略**（回空列表 + total=0，不报错）——所以错误消息、MCP 工具
+#: 描述与 Web 表单只提供这 7 个，不给「自由输入一个看起来成功、其实什么都没筛」的值。
+#: 三处镜像（本常量 ↔ platform/web/src/services/optionScreen.js ↔ docs/TOOL-LIMITS.md）
+#: 由 tests/test_wp25_option_form.py 双向锁定。
+OPTION_MARKET_CATEGORIES = (
+    (0, "US_STOCK"),
+    (1, "US_INDEX"),
+    (2, "US_FUTURE"),
+    (3, "HK_STOCK"),
+    (4, "HK_INDEX"),
+    (5, "JP_STOCK"),
+    (6, "JP_INDEX"),
+)
+
+#: 上面清单的展示文本（``0=US_STOCK/1=US_INDEX/...``）：错误消息与工具描述共用一份，
+#: 不各写一遍（WP25 之前工具描述只列了 3 个，与文档的 7 个不一致）。
+OPTION_MARKET_CATEGORY_TEXT = "/".join(
+    f"{value}={code}" for value, code in OPTION_MARKET_CATEGORIES)
+
 
 def _is_field_filter_placeholder(value):
     """field_filter 的 proto 占位规则：``1`` / 非空字符串 / 非空容器（官方文档口径）。
@@ -986,7 +1007,8 @@ class FutuData:
                       "option_screen 必须带非空 strategy（上游必填；形如 "
                       '{"market_category_list": [1], "filter_group_list": '
                       '[{"option_list": [{"indicator_type": 1003, "indicator_value": '
-                      '{"value_list": [1]}}]}]}；类别码 0=US_STOCK/1=US_INDEX/3=HK_STOCK，'
+                      '{"value_list": [1]}}]}]}；类别码 '
+                      f"{OPTION_MARKET_CATEGORY_TEXT}，"
                       "每个 filter_group 内 underlying/option/chain/combo 只能一个非空）")
         limit = screen.get("limit")
         if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int)
