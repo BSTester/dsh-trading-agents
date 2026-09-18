@@ -1,11 +1,13 @@
 import React from "react";
 import { createRoot } from "react-dom/client";
-import { App as AntApp, ConfigProvider, Input, Modal, Radio, Space, Tag, Typography, theme } from "antd";
+import { App as AntApp, ConfigProvider, Input, Modal, Radio, Select, Space, Tag, Typography, theme } from "antd";
 import { ProLayout } from "@ant-design/pro-components";
 import zhCN from "antd/locale/zh_CN";
 import { callApi } from "./services/api.js";
 import { LIVE_CONFIRMATION, modeBadge, switchModeRequest } from "./services/mode.js";
 import { useEndpoint, useSnapshotPoll } from "./services/hooks.js";
+import { MARKET_CHOICES } from "./services/marketFilter.js";
+import { MarketFilterProvider, useMarketFilter } from "./services/marketContext.jsx";
 import OverviewPage from "./pages/overview.jsx";
 import MarketPage from "./pages/market.jsx";
 import CapitalPage from "./pages/capital.jsx";
@@ -143,6 +145,7 @@ function Shell() {
   }, []);
   const snapshot = useSnapshotPoll();
   const mode = snapshot.value?.mode ?? "sim";
+  const { market, setMarket } = useMarketFilter();
   const page = PAGES.find((item) => item.key === key) ?? PAGES[0];
   return (
     <ProLayout title="量化工作台" layout="mix" fixSiderbar
@@ -152,6 +155,11 @@ function Shell() {
         <a href={`#${item.path}`} onClick={() => setKey(item.path.slice(1))}>{dom}</a>)}
       avatarProps={{ render: () => (
         <Space size="small">
+          {/* 全局市场维度（2026-09-18）：页面按它过滤/分段；选择持久化在 localStorage。
+              放在页头而不是各页卡片里，是为了「切页不丢、一眼看到当前视角」。 */}
+          <Select size="small" style={{ width: 118 }} value={market}
+            aria-label="市场筛选" options={MARKET_CHOICES}
+            onChange={(value) => setMarket(value)} />
           <ModeButton mode={mode} onSwitched={() => snapshot.refresh()} />
           <PushBadge />
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
@@ -167,5 +175,9 @@ createRoot(document.getElementById("root")).render(
   // 暗色主题：算法切 dark；canvas 图表的暗色配色由 charts/theme.js 读
   // <html data-theme="dark">（index.html 声明）分支给出，两处同一事实源。
   <ConfigProvider locale={zhCN} theme={{ algorithm: theme.darkAlgorithm }}>
-    <AntApp><Shell /></AntApp>
+    <AntApp>
+      <MarketFilterProvider>
+        <Shell />
+      </MarketFilterProvider>
+    </AntApp>
   </ConfigProvider>);

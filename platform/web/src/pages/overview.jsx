@@ -24,6 +24,9 @@ import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { num, stampOf } from "../services/format.jsx";
 import { modeBadge } from "../services/mode.js";
 import { fieldState } from "../services/fieldState.js";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 import { LineChart } from "../charts/line.jsx";
 import { ALERT_LEVEL_COLOR, parseHeartbeat } from "./schedule.jsx";
 
@@ -41,18 +44,15 @@ function pushStatusText(push) {
   return { text: "推送连接中", color: "blue" };
 }
 
-/** 今日成交笔数：OpenAPI 分组结果跨账户求和（纯计数，不合并金额）。 */
-function dealsCount(deals) {
-  return (deals?.groups ?? []).reduce((sum, group) => sum + (group.rows?.length ?? 0), 0);
-}
-
-/** 持仓 Top5（按市值数值排序，仅展示；币种混排不做换算）。 */
-function topPositions(positions, limit = 5) {
-  return (positions?.groups ?? [])
+/** 持仓 Top5（按市值数值排序，仅展示；币种混排不做换算）。
+ *  groupMarket 原样带上，供「全部市场」下的市场列展示——与筛选口径同源（marketDisplay）。 */
+function topPositions(groups, limit = 5) {
+  return (groups ?? [])
     .flatMap((group) => (group.positions ?? []).map((position) => ({
       ...position,
       account: group.account,
       accId: group.acc_id,
+      groupMarket: group.market,
     })))
     .sort((a, b) => (Number(b.market_value) || 0) - (Number(a.market_value) || 0))
     .slice(0, limit);
@@ -69,6 +69,7 @@ const ALERT_COLUMNS = [
 
 export default function OverviewPage() {
   const snapshot = useSnapshotPoll();
+  const { market } = useMarketFilter();
   const mode = snapshot.value?.mode ?? null;
   const positions = useEndpoint("positions", mode ? { mode } : null, [mode]);
   const deals = useEndpoint("deals_today", mode ? { mode } : null, [mode]);
@@ -82,9 +83,18 @@ export default function OverviewPage() {
   const badge = modeBadge(mode ?? "sim");
   const alerts = reconcile.value?.alerts ?? [];
   const openAlerts = alerts.length;
-  const holdings = positions.value?.counts?.positions
-    ?? (positions.value?.groups ?? []).reduce((sum, group) => sum + (group.positions?.length ?? 0), 0);
-  const todayDeals = deals.error ? null : dealsCount(deals.value);
+  // 全局市场筛选（客户端展示层过滤，**不改任何请求参数**）：positions 与 deals_today 都是
+  // 「按账户分组、组上有 market」的信封（positions 给数字 market_id，deals 给 'HK'/'SH'/'US'
+  // 与 '9' 这类类型码）→ 按组筛、按行判空态：HK 账户存在但零成交时也要说「无港股数据」。
+  const filtered = !isAllMarkets(market);
+  const positionView = viewGroups(positions.value?.groups, market, (group) => group?.positions ?? []);
+  const dealView = viewGroups(deals.value?.groups, market, (group) => group?.rows ?? []);
+  // 持仓数：全部市场用服务端 counts（跨账户口径），筛选时改用筛后的实际持仓行数
+  const holdings = filtered
+    ? positionView.rows.length
+    : (positions.value?.counts?.positions
+      ?? (positions.value?.groups ?? []).reduce((sum, group) => sum + (group.positions?.length ?? 0), 0));
+  const todayDeals = deals.error ? null : dealView.rows.length;
   const equityPoints = (equity.value?.points ?? []).map((point) => ({ t: point.t, v: point.equity }));
   const latestSnapshot = factorsHistory.value?.snapshots?.[0] ?? null;
   const pushStatus = pushStatusText(push.value);
@@ -131,6 +141,17 @@ export default function OverviewPage() {
           <Typography.Text type="danger">快照读取失败：{snapshot.error}</Typography.Text>)}
         {snapshot.value?.notice && (
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>{snapshot.value.notice}</Typography.Text>)}
+        {/* 市场筛选口径：说清哪些卡片跟着筛选走、哪些本来就没有市场维度（不按市场藏数据） */}
+        {filtered && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            市场筛选：{marketLabelOf(market)} —— 持仓 Top5 与今日成交按该市场统计；
+            权益曲线、告警、调度器与数据源状态没有市场维度，仍为全局口径。
+          </Typography.Text>)}
+        {/* 今日成交没有表格，空态原因只能在这里说；持仓的原因交给 Top5 表格的空态（就近显示） */}
+        {dealView.emptyReason && (
+          <Typography.Text type="warning" style={{ fontSize: 12, display: "block" }}>
+            {dealView.emptyReason}
+          </Typography.Text>)}
 
         <Row gutter={[16, 16]}>
           <Col xs={12} md={6}>
@@ -138,13 +159,14 @@ export default function OverviewPage() {
           </Col>
           <Col xs={12} md={6}>
             <Card size="small">
-              <Statistic title="持仓数" value={positions.loading ? "…" : (holdings ?? "—")} />
+              <Statistic title={`持仓数${filtered ? `（${marketLabelOf(market)}）` : ""}`}
+                value={positions.loading ? "…" : (holdings ?? "—")} />
               {positions.error && <Typography.Text type="warning" style={{ fontSize: 12 }}>持仓读取失败</Typography.Text>}
             </Card>
           </Col>
           <Col xs={12} md={6}>
             <Card size="small">
-              <Statistic title={`今日成交（${mode === "sim" ? "模拟盘派生" : "OpenAPI"}）`}
+              <Statistic title={`今日成交（${mode === "sim" ? "模拟盘派生" : "OpenAPI"}${filtered ? `，${marketLabelOf(market)}` : ""}）`}
                 value={deals.loading ? "…" : (todayDeals ?? "—")} />
               {deals.error && (
                 <Tooltip title={deals.error}>
@@ -187,19 +209,23 @@ export default function OverviewPage() {
 
         <Row gutter={[16, 16]}>
           <Col xs={24} lg={14}>
-            <Card size="small" title="持仓 Top5（按市值）">
+            <Card size="small" title={`持仓 Top5（按市值${filtered ? `，${marketLabelOf(market)}` : ""}）`}>
               <Table size="small"
                 rowKey={(row) => `${row.accId}-${row.symbol}`}
-                dataSource={topPositions(positions.value)}
+                dataSource={topPositions(positionView.groups)}
                 pagination={false}
                 loading={positions.loading}
-                locale={{ emptyText: positions.loading ? "持仓加载中…" : "暂无持仓。" }}
+                locale={{ emptyText: positionView.emptyReason
+                  ?? (positions.loading ? "持仓加载中…" : "暂无持仓。") }}
                 columns={[
                   { title: "标的", key: "symbol", render: (_f, row) => (
                     <Space size={4}>
                       <span>{row.symbol || "—"}</span>
                       {row.name ? <Typography.Text type="secondary">{row.name}</Typography.Text> : null}
                     </Space>) },
+                  // 「全部市场」下跨市场混排：补市场列，显示值与筛选口径同源（数字 market_id 也归一）
+                  ...(filtered ? [] : [{ title: "市场", key: "market",
+                    render: (_f, row) => marketDisplay(row.groupMarket) }]),
                   { title: "数量", key: "qty", align: "right", render: (_f, row) => num(row.qty, 0) },
                   { title: "市值", key: "market_value", align: "right", render: (_f, row) => num(row.market_value) },
                   { title: "盈亏", key: "pl_val", align: "right", render: (_f, row) => num(row.pl_val) },

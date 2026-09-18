@@ -14,6 +14,9 @@ import React from "react";
 import { Alert, Card, Descriptions, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num, pctOf, maskedAccount } from "../services/format.jsx";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 
 const RISK_FIELDS = [
   { key: "risk_per_trade", label: "单笔风险占权益比例", format: "pct" },
@@ -42,21 +45,42 @@ function riskItems(config) {
   return [...known, ...extra];
 }
 
-function PortfolioRisk({ positions }) {
+function PortfolioRisk({ positions, market }) {
   const value = positions.value;
-  const accountRows = (value?.groups ?? []).map((group) => ({ group, risk: group.risk ?? {} }));
-  const concentrationRows = (value?.groups ?? []).flatMap((group) =>
-    (group.risk?.top ?? []).map((item) => ({ ...item, account: group.account, accId: group.acc_id })));
+  const filtered = !isAllMarkets(market);
+  // 全局市场筛选（客户端展示层，**不改请求参数**）：风险数据全部由 positions 的账户组派生，
+  // 组上带 market（实测 sim 为数字 market_id）→ 按组筛；每组的「行」就是该账户（一行），
+  // 故空态就是「筛后一个账户都没有」，与持仓页同一口径。
+  const view = viewGroups(value?.groups, market, (group) => [group]);
+  const accountRows = view.groups.map((group) => ({ group, risk: group.risk ?? {} }));
+  const concentrationRows = view.groups.flatMap((group) =>
+    (group.risk?.top ?? []).map((item) => ({
+      ...item, account: group.account, accId: group.acc_id, groupMarket: group.market,
+    })));
   const riskNote = (value?.groups ?? []).find((group) => group.risk?.note)?.risk?.note;
+  const shownPositions = filtered
+    ? accountRows.reduce((sum, row) => sum + (Number(row.risk.positions) || 0), 0)
+    : value?.counts?.positions;
   return (
     <Space direction="vertical" size="middle" style={{ width: "100%" }}>
       {positions.error && (
         <Alert type="error" showIcon message={`持仓读取失败：${positions.error}`} />)}
+      {filtered && (
+        <Typography.Text type="secondary">
+          市场筛选：{marketLabelOf(market)} —— 下列两张表只含该市场账户；
+          风控配置是全局配置，没有市场维度，不随筛选变化。
+        </Typography.Text>)}
+      {view.emptyReason && (
+        <Typography.Text type="warning">{view.emptyReason}</Typography.Text>)}
       {value && (
         <Descriptions size="small" bordered column={{ xs: 1, sm: 3 }}>
-          <Descriptions.Item label="检查账户数">{value.counts?.accounts_checked ?? "—"}</Descriptions.Item>
+          <Descriptions.Item label={filtered ? `检查账户数（${marketLabelOf(market)}）` : "检查账户数"}>
+            {filtered ? view.groups.length : (value.counts?.accounts_checked ?? "—")}
+          </Descriptions.Item>
           <Descriptions.Item label="有持仓账户数">{value.counts?.accounts_with_positions ?? "—"}</Descriptions.Item>
-          <Descriptions.Item label="持仓笔数">{value.counts?.positions ?? "—"}</Descriptions.Item>
+          <Descriptions.Item label={filtered ? `持仓笔数（${marketLabelOf(market)}）` : "持仓笔数"}>
+            {shownPositions ?? "—"}
+          </Descriptions.Item>
         </Descriptions>)}
       <Table size="small" rowKey={(row) => row.group.acc_id ?? row.group.account ?? "account"}
         dataSource={accountRows} pagination={false}
@@ -64,6 +88,9 @@ function PortfolioRisk({ positions }) {
         columns={[
           { title: "账户", key: "account",
             render: (_field, row) => maskedAccount(row.group.acc_id, row.group.account) },
+          // 「全部市场」下跨市场混排：补市场列，显示值与筛选口径同源
+          ...(filtered ? [] : [{ title: "市场", key: "market",
+            render: (_field, row) => marketDisplay(row.group.market) }]),
           { title: "持仓数", key: "positions", align: "right",
             render: (_field, row) => row.risk.positions ?? "—" },
           { title: "最大集中度", key: "max_share",
@@ -80,6 +107,8 @@ function PortfolioRisk({ positions }) {
         locale={{ emptyText: "暂无集中度明细。" }}
         columns={[
           { title: "账户", key: "account", render: (_field, row) => maskedAccount(row.accId, row.account) },
+          ...(filtered ? [] : [{ title: "市场", key: "market",
+            render: (_field, row) => marketDisplay(row.groupMarket) }]),
           { title: "标的", key: "symbol",
             render: (_field, row) => `${row.symbol ?? "—"}（${row.name ?? "—"}）` },
           { title: "持仓市值", key: "market_value", align: "right",
@@ -98,6 +127,7 @@ function PortfolioRisk({ positions }) {
 }
 
 export default function RiskPage() {
+  const { market } = useMarketFilter();
   const risk = useEndpoint("risk", {}, []);
   // 组合风险按模拟盘持仓读取；实盘视角请到组合页切换查看。
   const positions = useEndpoint("positions", { mode: "sim" }, []);
@@ -129,7 +159,7 @@ export default function RiskPage() {
           )}
         </Card>
         <Card type="inner" title="组合风险">
-          <PortfolioRisk positions={positions} />
+          <PortfolioRisk positions={positions} market={market} />
           {positions.value?.as_of && (
             <Typography.Text type="secondary">持仓数据时间：{positions.value.as_of}</Typography.Text>)}
           <Typography.Text type="secondary">组合风险按模拟盘（sim）持仓读取。</Typography.Text>

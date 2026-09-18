@@ -18,6 +18,9 @@ import { Alert, Button, Card, Space, Steps, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { modeBadge } from "../services/mode.js";
 import { configWarningRows, stageChainEmptyText } from "../services/fieldState.js";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { marketLabelOf } from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 import {
   MARKETS, autoPipelineBadge, marketLabel, stageDrill, stageEntries,
   stageStatus, stageStatusText, stageTagColor, stageTimeText,
@@ -52,6 +55,7 @@ function StageChain({ stages, loading = false }) {
 export default function PipelinePage() {
   const pipeline = useEndpoint("pipeline", {}, []);
   const snapshot = useEndpoint("snapshot", {}, []);
+  const { market } = useMarketFilter();
   const value = pipeline.value ?? {};
   const stagesOf = (chain) => chain?.stages ?? {};
   const autoBadge = autoPipelineBadge(value.auto_pipeline);
@@ -59,6 +63,11 @@ export default function PipelinePage() {
   const badge = modeBadge(mode);
   const killActive = value.kill === true;
   const halted = value.halt?.halted === true;
+  // 全局市场筛选：本页本来就是「每市场一条链」的分段结构，故只决定渲染哪几张卡片
+  // （不隐藏数据以外的东西）：选中具体市场只渲染那一张；「全部市场」渲染全部三张。
+  // 全局（晚间链）与自动执行/kill/halt 状态没有市场维度，保持显示。
+  const filtered = !isAllMarkets(market);
+  const shownMarkets = filtered ? MARKETS.filter((item) => item === market) : MARKETS;
 
   return (
     <Card title="流程" extra={(
@@ -94,9 +103,15 @@ export default function PipelinePage() {
           </Typography.Text>
         </Space>
 
-        {MARKETS.map((market) => (
-          <Card type="inner" key={market} title={marketLabel(market)}>
-            <StageChain stages={stagesOf(value.markets?.[market])} loading={pipeline.loading} />
+        {filtered && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            市场筛选：{marketLabelOf(market)} —— 只显示该市场的作业链；
+            「全局（晚间链）」、自动执行开关与 kill/halt 状态没有市场维度，仍显示。
+          </Typography.Text>)}
+
+        {shownMarkets.map((item) => (
+          <Card type="inner" key={item} title={marketLabel(item)}>
+            <StageChain stages={stagesOf(value.markets?.[item])} loading={pipeline.loading} />
           </Card>))}
 
         <Card type="inner" title="全局（晚间链）">

@@ -24,6 +24,9 @@ import React from "react";
 import { Alert, App, Button, Card, Space, Table, Tag, Typography } from "antd";
 import { callApi } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { marketLabelOf, viewScheduleJobs } from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 import { stampOf } from "../services/format.jsx";
 
 const HEARTBEAT_STALE_MS = 5 * 60_000;
@@ -64,6 +67,7 @@ export default function SchedulePage() {
   const { message, modal } = App.useApp();
   const schedule = useEndpoint("schedule", {}, []);
   const reconcile = useEndpoint("reconcile", {}, []);
+  const { market } = useMarketFilter();
   const [busy, setBusy] = React.useState(false);
 
   const value = schedule.value ?? {};
@@ -76,7 +80,14 @@ export default function SchedulePage() {
   const killActive = value.kill === true;
   const halted = value.halt === true;
   const critical = value.critical === true;
-  const jobs = value.jobs ?? [];
+  // 全局市场筛选（客户端展示层，**不改请求参数**）：作业键形如
+  // ``SH:build_plan:2026-09-18``（市场在字符串前缀里，实测 daemon.py），故选中的市场
+  // 保留自己的作业 + **无市场维度的作业（GLOBAL）**——后者不属于任何单个市场，按市场
+  // 藏掉等于让全局对账/资讯作业消失。daemon 状态、心跳、kill/halt、告警同样无市场维度，
+  // 一律保持显示。
+  const filtered = !isAllMarkets(market);
+  const jobView = viewScheduleJobs(value.jobs ?? [], market, { scope: "作业历史" });
+  const jobs = jobView.rows;
   const alerts = reconcile.value?.alerts ?? [];
   // 告警行没有服务端 id：键在渲染前一次算好（antd 的 rowKey 不再传下标）
   const alertRows = alerts.map((row, index) => ({
@@ -173,14 +184,19 @@ export default function SchedulePage() {
           </Space>
         </Card>
 
-        <Card type="inner" title="作业历史">
+        <Card type="inner" title={`作业历史${filtered ? `（${marketLabelOf(market)} + 全局）` : ""}`}>
+          {filtered && (
+            <Typography.Text type="secondary" style={{ fontSize: 12, display: "block", marginBottom: 8 }}>
+              市场筛选：{marketLabelOf(market)} —— 只列该市场作业与 GLOBAL 作业
+              （后者不属于任何单个市场）；daemon 状态与告警无市场维度，仍全部显示。
+            </Typography.Text>)}
           <Table size="small"
             rowKey={(row) => row.job}
             dataSource={jobs}
             pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
             locale={{ emptyText: schedule.loading
               ? "作业记录加载中…"
-              : "暂无作业记录（daemon 未运行或今日休市）。" }}
+              : (jobView.emptyReason ?? "暂无作业记录（daemon 未运行或今日休市）。") }}
             columns={JOB_COLUMNS} />
         </Card>
 

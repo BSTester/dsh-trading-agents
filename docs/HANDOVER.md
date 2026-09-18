@@ -690,3 +690,76 @@ SH 503 行 / HK 507 / US 511，边界全部 `2027-12-31`；`2026-10-12`（周一
 
 
 
+### 8.10 WP23：全局市场筛选接入各页面（2026-09-18 用户需求 / 实机只读复验）
+
+**用户原话**：「还需要加强一下，各个页面中的信息，需要按市场分类来查看，现在混为一谈不方便。」
+
+**前置（本轮之前已就绪，本轮未改口径）**：`platform/web/src/services/marketFilter.js`
+（市场值/标的 → 市场链的纯函数 + 8 例 node --test）、`services/marketContext.jsx`
+（`MarketFilterProvider` + `useMarketFilter`，选择持久化在 localStorage）、`app.jsx`
+页头选择器（可访问名「市场筛选」）。本轮新增 `services/marketView.js`（页面级纯函数：
+payload → 过滤后的行 + 空态原因）并把 12 个页面接上选择器。
+
+**三条不变量**：①过滤**全在客户端展示层**，不改任何请求参数（`useEndpoint` 的 payload
+一字未动）；②**不猜市场**——归不到市场链的行在「全部市场」下照常显示，选中具体市场时被
+排除，并如实计数/说明；③**空态必须说原因**——「数据存在但筛后为空」时给
+「当前筛选：港股 HK —— 本页无港股数据（共 N 行，均属其他市场）。」，数据本身为空时仍走
+页面既有空态（不把「本来就没数据」说成「被筛掉了」）。
+
+| 页面 | helper | 「全部市场」下如何分辨 | 无市场维度的部分（有意不过滤） |
+|---|---|---|---|
+| 概览 overview | `viewGroups`（positions + deals_today） | 持仓 Top5 加「市场」列（数字 market_id 也归一成「A股 SH」/「港股 HK」） | 权益曲线、告警、调度器、数据源、因子快照 |
+| 执行 execution | `viewGroups`（orders_open/orders_history/deals_today/deals_history）+ `viewBySymbol`（本地台账 `ticker`） | 原有「市场」列改为同一口径文案（`'HK'`→「港股 HK」；`'9'` 这类类型码原样显示） | 快照派生的「券商订单/动作」（**响应里没有市场字段**，symbol 是裸代码）与 trade_max_qty 手查面板 |
+| 组合 portfolio | `viewGroups` | 加「市场」列（账户列是脱敏 ID，光看 `…9393` 分辨不出市场） | 权益曲线 |
+| 风险 risk | `viewGroups` | 两张表都加「市场」列 | 风控配置（全局配置） |
+| 审计 audit | `viewPlans`（链路）+ `viewBySymbol`（时间线 `ticker`、差异 `symbol`） | 链路加「市场」列（由计划 target/订单标的派生）+ 时间线/差异加「市场」列 | 数据源与授权状态、链路统计 |
+| 因子 factors | `viewBySymbol(rows, m, "ticker")` | 打分表加「市场」列 | IC 横截面统计（跨市场一起算）、情绪快照采集 |
+| 事件 events / 资金 capital | 只用 `symbolMarketNote`（**不过滤**，见下） | 不适用（一次只查一个标的） | 全页 |
+| 信号 signal | `viewSignalPreviews`（标的在**嵌套的** `value.ticker`） | 历史预览加「市场」列 | — |
+| 计划 plan | `viewPlans` + `planChainsOf`/`planMarketDisplay`（**plans[] 没有 market 字段**） | 计划列表加「市场」列；当前计划卡片加市场标签 | 执行入口**恒指向最新计划**（不随筛选变） |
+| 流程 pipeline | 直接按市场筛卡片 | 逐市场卡片（本就分段） | 全局（晚间链）、自动执行/kill/halt 状态 |
+| 调度 schedule | `viewScheduleJobs`（`市场:作业名:日期` 取前缀） | 作业键本身带市场前缀，不重复加列 | GLOBAL 作业、daemon 状态/心跳、告警 |
+| 行情 market | 只用 `symbolMarketNote`（任务明确要求不过滤） | 不适用 | 全页 |
+
+**与任务假设不符的六处（逐条实测，均已按实际结构处理）**：
+
+1. **`plan.plans[]` 没有 `market` 字段**（实测载荷只有 `target:{"SH.600031":0.25}`、
+   `orders[].symbol`）——`filterByMarketField(plans, m, "market")` 会把所有计划筛空。
+   改为由 target 键与订单标的的**前缀**派生（与因子/持仓同源口径），混合市场计划如实标
+   「混合（A股 SH、港股 HK）」，且在两个市场下都可见。
+2. **审计页没有 `groups[]` 端点**（消费的是 `audit`/`sources`/`reconcile`）——不能用
+   `filterGroups`。链路走计划派生；时间线走 `entries[].ticker`；差异走 `diffs[].symbol`。
+3. **审计时间线的 ticker 是裸代码**（实测 `'00981'`，无交易所前缀）→ 市场**无法判定**。
+   按 marketFilter 的既定纪律排除，但**在页面上报数**：「另有 1 条时间线记录的标的没有
+   交易所前缀（如 '00981'），无法判定市场，未计入上表——请切到「全部市场」核对。」
+   （审计场景下静默丢行是不可接受的，所以宁可多一行黄字。）
+4. **events / capital 行里没有标的/市场字段**（events 行只有 `date/type/detail/…`；
+   capital 是富途原文透传，只有 `capital_flow_item_time/in_flow/四档单量`），市场只存在于
+   用户输入的那一个标的里。这两页**一次只查一个标的、不存在跨市场混排**，按全局市场把整页
+   藏掉会与用户刚输入的标的直接冲突（任务自己也明确要求行情页不要过滤）→ 只给
+   `symbolMarketNote` 提示（写清两边市场名），数据照常显示。
+5. **`signal` 的标的是嵌套的 `value.ticker`**（`snapshot.previews[].value`），
+   `filterBySymbol` 取不到 → 单独的 `viewSignalPreviews`。
+6. **`schedule.jobs[].job` 的市场是字符串前缀**（`"SH:build_plan:2026-09-18"`），
+   不是字段 → `jobMarketChain` 取前缀；**GLOBAL 作业没有市场维度，保持显示**
+   （按市场藏掉等于让全局对账/资讯作业从页面消失）。
+
+**本轮未做 / 未决（如实登记）**：
+
+- **快照派生的券商订单与动作无法按市场筛选**：`snapshot.trade_summary.orders[].symbol`
+  是裸代码（实测 `'00981'`），响应里也没有 market 字段；按「不猜」纪律原样全部显示，
+  并在选具体市场时用页面文案明示（没有硬凑一个市场列）。
+- **执行页的成交表在 sim 模式下多为派生数据**（`derived=true`，由委托派生），
+  市场维度来自账户分组，不是券商成交流水自带的字段——口径仍是账户市场，未改。
+- **`factors-history` 的 `payload.tickers` 是 dict（键=标的）**，概览页原代码用
+  `?.tickers?.length` 取数量 → 恒为 `undefined`、显示「—」。本轮**未改**（不属于市场筛选，
+  顺手改会动到与筛选无关的显示口径），登记在此。
+- **概览页的「持仓数/今日成交」在筛选中改用筛后行数**（全部市场仍用服务端 `counts`）；
+  两者在实测上相等（15 = 5+8+2），但这是两条推导路径，若将来 `counts` 含未能列出持仓的
+  账户，二者会不一致——届时以服务端 counts 为准的口径需要重新决定。
+- **`market`/`events`/`capital` 三页只提示不过滤**（如上第 4 条），这是有意的口径选择，
+  不是漏做；若将来希望「选市场即隐藏不一致的标的」，需要先决定单标的页面的语义。
+
+**证据**：`platform/web/tests/marketView.test.mjs` 11 例（空态文案含市场名、ALL 不丢行含
+OTHER、数字 market_id、plan/jobs/previews 派生、单标的提示）；`npm test` 281 例全绿；
+Playwright 实机截图（全部市场 vs 只看港股）见本轮回报，5 个页面逐一比对。

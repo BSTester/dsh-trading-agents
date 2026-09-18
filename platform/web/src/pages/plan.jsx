@@ -27,6 +27,9 @@ import React from "react";
 import { Alert, App, Button, Card, Input, Space, Table, Tag, Typography } from "antd";
 import { callApi } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { marketLabelOf, planChainsOf, planMarketDisplay, viewPlans } from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 import { num } from "../services/format.jsx";
 
 const SIDE = { BUY: "买入", SELL: "卖出" };
@@ -59,6 +62,7 @@ const ORDER_COLUMNS = [
 export default function PlanPage() {
   const { message } = App.useApp();
   const plan = useEndpoint("plan", {}, []);
+  const { market } = useMarketFilter();
   const [confirmText, setConfirmText] = React.useState("");
   const [busy, setBusy] = React.useState(false);
 
@@ -73,7 +77,16 @@ export default function PlanPage() {
   const value = plan.value ?? {};
   const plans = value.plans ?? [];
   // 端点口径最新在前（snapshots._plans_newest_first）：首条即当前计划
+  //
+  // **执行入口绑定不允许被市场筛选改变**：current 恒取未过滤的 plans[0]——「执行计划」
+  // 提交的是 current.content_hash，若这里改取「筛后的第一条」，选「只看港股」就会让按钮
+  // 悄悄去执行一个更旧的计划。所以筛选只作用于下方的「计划列表」，当前计划卡片照常显示，
+  // 并在它不属于当前筛选时明确提示。
   const current = plans[0];
+  const filtered = !isAllMarkets(market);
+  const listView = viewPlans(plans, market, { scope: "计划列表" });
+  const currentMarket = planMarketDisplay(current);
+  const currentOutside = filtered && !planChainsOf(current).includes(market);
   const orders = current?.orders ?? [];
   const live = value.mode === "live";
   const frozen = current?.status === "frozen";
@@ -115,11 +128,25 @@ export default function PlanPage() {
         {!current && (
           <Typography.Text type="secondary">暂无计划（daemon 生成后显示）。</Typography.Text>)}
 
+        {filtered && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            市场筛选：{marketLabelOf(market)} —— 只影响下方「计划列表」的展示；
+            「当前计划」与执行入口始终针对端点返回的最新计划（最新在前），不随筛选改变。
+          </Typography.Text>)}
+        {currentOutside && (
+          <Alert type="warning" showIcon
+            message={`当前计划（${current?.plan_id ?? "—"}）属于「${currentMarket}」，不在当前筛选「${marketLabelOf(market)}」内`}
+            description="执行/取消按钮提交的是这个最新计划的内容哈希，与展示筛选无关；要只看别的市场请删除筛选或切市场。" />
+        )}
+
         {current && (
           <Card type="inner" title="当前计划" extra={(
-            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              历史计划共 {plans.length} 个
-            </Typography.Text>)}>
+            <Space size="small">
+              <Tag color="blue">{currentMarket}</Tag>
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                历史计划共 {plans.length} 个
+              </Typography.Text>
+            </Space>)}>
             <Space direction="vertical" size={4} style={{ width: "100%" }}>
               <Space size="small" wrap>
                 <Typography.Text type="secondary">计划</Typography.Text>
@@ -181,18 +208,27 @@ export default function PlanPage() {
              （snapshots.py:_plans_newest_first 翻转 store.py:316 的升序），
              上方「当前计划」取第一条——列出来便于核对是否有更晚的计划。 */}
         {plans.length > 1 && (
-          <Card type="inner" title="计划列表" extra={(
+          <Card type="inner" title={`计划列表${filtered ? `（仅 ${marketLabelOf(market)}）` : ""}`} extra={(
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-              端点按创建时间倒序（最新在前）返回 {plans.length} 条，上方「当前计划」为第一条
+              端点按创建时间倒序（最新在前）返回 {plans.length} 条
+              {filtered ? `，其中 ${listView.rows.length} 条属于当前筛选` : ""}；
+              上方「当前计划」为第一条
             </Typography.Text>)}>
+            {listView.emptyReason && (
+              <Typography.Text type="warning" style={{ display: "block", marginBottom: 8 }}>
+                {listView.emptyReason}
+              </Typography.Text>)}
             <Table size="small"
               rowKey={(row) => row.plan_id}
-              dataSource={plans}
+              dataSource={listView.rows}
               pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
               scroll={{ x: "max-content" }}
               columns={[
                 { title: "计划", key: "plan_id",
                   render: (_field, row) => <Typography.Text code>{row.plan_id ?? "—"}</Typography.Text> },
+                // 「全部市场」下补市场列（由计划自带的 target/订单标的派生；plan 端点无 market 字段）
+                ...(filtered ? [] : [{ title: "市场", key: "market",
+                  render: (_field, row) => planMarketDisplay(row) }]),
                 { title: "状态", key: "status",
                   render: (_field, row) => PLAN_STATUS[row.status] ?? row.status ?? "—" },
                 { title: "内容哈希", key: "content_hash",

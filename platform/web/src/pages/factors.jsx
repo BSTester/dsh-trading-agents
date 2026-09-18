@@ -23,6 +23,11 @@ import React from "react";
 import { Alert, Card, Col, Descriptions, Input, Row, Select, Space, Statistic, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import {
+  marketLabelOf, symbolMarketDisplay, symbolMarketNote, viewBySymbol,
+} from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 import { LineChart } from "../charts/line.jsx";
 import { sentimentHeadline, sentimentRows } from "../services/sentiment.js";
 
@@ -51,15 +56,19 @@ function parseWatchlist(text) {
   return String(text).split(/[,，\s]+/).map((part) => part.trim().toUpperCase()).filter(Boolean);
 }
 
-/** 因子打分表：行 = 标的（factors.py composite 已按综合分排序），列 = 各因子原始取值。 */
-function FactorsTable({ snap }) {
-  const rows = snap.value?.rows ?? [];
+/** 因子打分表：行 = 标的（factors.py composite 已按综合分排序），列 = 各因子原始取值。
+ *  全局市场筛选用行自带的 ``ticker``（实测带交易所前缀，可跨市场混排）→ viewBySymbol 过滤。 */
+function FactorsTable({ snap, view, filtered }) {
+  const rows = view.rows;
   // 列顺序 = 输出侧 factors 键列表（价量 + 估值），估值键无标签时用原始键名；
   // close 不在 factors 键列表里（factors.py factor_values 额外给出），单独追加。
   const keys = [...(snap.value?.factors ?? []), "close"];
   const columns = [
     { title: "排名", key: "rank", width: 64, render: (_f, row) => row.rank ?? "—" },
     { title: "标的", key: "ticker", render: (_f, row) => row.ticker ?? "—" },
+    // 「全部市场」下跨市场混排：补市场列；「—」= 标的无前缀，市场无法判定（不猜）
+    ...(filtered ? [] : [{ title: "市场", key: "market",
+      render: (_f, row) => symbolMarketDisplay(row.ticker) }]),
     { title: "综合分", key: "score", align: "right",
       render: (_f, row) => (row.score === null || row.score === undefined
         ? "—" : `${row.score >= 0 ? "+" : ""}${row.score}`) },
@@ -76,7 +85,8 @@ function FactorsTable({ snap }) {
       rowKey={(row) => row.ticker}
       pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
       scroll={{ x: "max-content" }}
-      locale={{ emptyText: snap.loading ? "因子计算中…（每只标的取 250 日日线）" : "暂无因子数据。" }}
+      locale={{ emptyText: view.emptyReason
+        ?? (snap.loading ? "因子计算中…（每只标的取 250 日日线）" : "暂无因子数据。") }}
       columns={columns} />
   );
 }
@@ -130,6 +140,7 @@ export default function FactorsPage() {
   const [input, setInput] = React.useState("");
   const [watchlist, setWatchlist] = React.useState([]);
   const [factor, setFactor] = React.useState(DEFAULT_FACTOR);
+  const { market } = useMarketFilter();
   const tickers = watchlist;
   // 服务端校验：factors 需 2..8 个标的（analytics.js factors()）；
   // ic 需 3..8（ic()）；quality 单标的。条件不满足时 payload 为 null 跳过请求。
@@ -141,7 +152,14 @@ export default function FactorsPage() {
   const sentiment = useEndpoint("sentiment-history", {}, []);
   const sentimentSummary = sentiment.value?.summary ?? null;
   const icPoints = (ic.value?.points ?? []).map((point) => ({ t: point.t, v: point.ic }));
-  const failures = Object.entries(snap.value?.failures ?? {});
+  // 全局市场筛选（客户端展示层，**不改请求参数**）：打分表按行自带的 ticker 前缀过滤，
+  // 跳过原因（failures，键是标的）同口径过滤——筛掉的行不该再由它的原因解释。
+  const filtered = !isAllMarkets(market);
+  const rowView = viewBySymbol(snap.value?.rows ?? [], market, "ticker", { scope: "本页" });
+  const failures = viewBySymbol(
+    Object.entries(snap.value?.failures ?? {}).map(([ticker, reason]) => ({ ticker, reason })),
+    market, "ticker", { scope: "跳过清单" }).rows;
+  const qualityNote = symbolMarketNote(tickers[0], market);
   return (
     <Card title="因子" extra={(
       <Space>
@@ -184,13 +202,18 @@ export default function FactorsPage() {
           <Card type="inner" title="因子打分与排序"
             extra={snap.value && (
               <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                窗口 {snap.value.window} 个交易日
+                {filtered ? `${marketLabelOf(market)} · ` : ""}窗口 {snap.value.window} 个交易日
               </Typography.Text>)}>
             {snap.error && <Alert type="error" showIcon message={`因子读取失败：${snap.error}`} />}
-            <FactorsTable snap={snap} />
+            {filtered && (
+              <Typography.Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                市场筛选：{marketLabelOf(market)} —— 下表只列该市场的关注池标的
+                （关注池本身不变，改的是展示）。
+              </Typography.Text>)}
+            <FactorsTable snap={snap} view={rowView} filtered={filtered} />
             {failures.length > 0 && (
               <Typography.Text type="secondary">
-                跳过：{failures.map(([key, reason]) => `${key}（${reason}）`).join("；")}
+                跳过：{failures.map((row) => `${row.ticker}（${row.reason}）`).join("；")}
               </Typography.Text>)}
             {snap.value?.sources?.length > 0 && (
               <Typography.Text type="secondary">
@@ -207,6 +230,10 @@ export default function FactorsPage() {
                 forward {ic.value.forward_days} 日 · 样本 {ic.value.count} 期
               </Typography.Text>)}>
             {ic.error && <Alert type="error" showIcon message={`IC 读取失败：${ic.error}`} />}
+            {filtered && (
+              <Typography.Text type="secondary" style={{ fontSize: 12, display: "block" }}>
+                IC 是关注池的横截面统计（跨市场一起算），没有市场维度，不随筛选变化。
+              </Typography.Text>)}
             {ic.loading && !ic.error && (
               <Typography.Text type="secondary">IC 计算中…（逐期横截面相关，标的越多越慢）</Typography.Text>)}
             {icPoints.length >= 2 && <LineChart points={icPoints} label="IC 序列" />}
@@ -226,6 +253,7 @@ export default function FactorsPage() {
 
         {tickers.length === 1 && (
           <Card type="inner" title={`财报质量（${tickers[0]}）`}>
+            {qualityNote && <Alert type="info" showIcon message={qualityNote} />}
             {quality.error && <Alert type="error" showIcon message={`质量读取失败：${quality.error}`} />}
             {quality.loading && !quality.error && (
               <Typography.Text type="secondary">财报质量读取中…（富途财报原文计算）</Typography.Text>)}

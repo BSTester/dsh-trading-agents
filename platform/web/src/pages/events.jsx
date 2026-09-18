@@ -7,8 +7,10 @@
 //     events 已按日期升序；days_until 为相对今天的自然日差（负数=已过去）。
 // 未输入标的时 payload 为 null：不发请求（服务端对空 ticker 直接报 Invalid ticker）。
 import React from "react";
-import { Card, Input, Space, Tag, Timeline, Typography } from "antd";
+import { Alert, Card, Input, Space, Tag, Timeline, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { symbolMarketNote } from "../services/marketView.js";
 
 function timelineColor(daysUntil) {
   const days = Number(daysUntil);
@@ -21,8 +23,14 @@ function timelineColor(daysUntil) {
 export default function EventsPage() {
   const [input, setInput] = React.useState("");
   const [ticker, setTicker] = React.useState("");
+  const { market } = useMarketFilter();
   const events = useEndpoint("events", ticker ? { ticker, days: 400 } : null, [ticker]);
   const rows = events.value?.events ?? [];
+  // 市场维度：本页一次只查一个标的，事件行里**没有** symbol 字段（实测只有
+  // date/type/detail/...，标的在载荷顶层的 ticker 上），不存在跨市场混排。
+  // 所以这里不做过滤（否则「只看港股」会把用户刚输入的 A 股标的整页藏掉，
+  // 与行情页同样的理由），只在两端市场不一致时给一句提示。
+  const marketNote = symbolMarketNote(ticker, market);
   return (
     <Card title="事件" extra={(
       <Input placeholder="标的代码，如 SH.600519" style={{ width: 220 }} value={input}
@@ -33,6 +41,7 @@ export default function EventsPage() {
           <Typography.Text type="secondary">
             输入标的代码后加载前后 400 天内的分红除权、财报披露预约与经济数据事件。
           </Typography.Text>)}
+        {ticker && marketNote && <Alert type="info" showIcon message={marketNote} />}
         {ticker && events.error && (
           <Typography.Text type="danger">事件读取失败：{events.error}</Typography.Text>)}
         {ticker && !events.error && rows.length === 0 && (

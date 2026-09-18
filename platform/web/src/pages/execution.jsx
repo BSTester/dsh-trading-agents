@@ -26,6 +26,9 @@ import { Alert, App, Button, Card, Collapse, Input, Select, Space, Statistic, Ta
 import { callApi } from "../services/api.js";
 import { decideDisabled, remainingSeconds, summaryLines } from "../services/confirm.js";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { marketDisplay, marketLabelOf, symbolMarketDisplay, viewBySymbol, viewGroups } from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 
 /** ISO 时间 → 展示（分钟精度）；缺失显示「时间未知」（与旧客户端一致，不编造）。 */
 function timeOf(iso) {
@@ -187,14 +190,16 @@ function pickField(row, keys) {
 }
 
 /** OpenAPI 分组结果 → 行数组（附 acc_id/market 上下文列）。 */
-function groupRows(envelope) {
-  return (envelope?.groups ?? []).flatMap((group) =>
+function groupRows(groups) {
+  return (groups ?? []).flatMap((group) =>
     (group.rows ?? []).map((row) => ({ ...row, accId: group.acc_id, marketTag: group.market })));
 }
 
 const OPENAPI_ORDER_COLUMNS = [
   { title: "账户", key: "accId", render: (_f, row) => row.accId ?? "—" },
-  { title: "市场", key: "market", render: (_f, row) => row.marketTag ?? "—" },
+  // 市场列：显示值与筛选口径同源（'HK' → 「港股 HK」，数字 market_id 也归一）；
+  // '9'/'10' 这类账户类型码归不到市场链 → 原样显示，不硬塞（它就是「未登记的市场码」）
+  { title: "市场", key: "market", render: (_f, row) => marketDisplay(row.marketTag) },
   { title: "标的", key: "code", render: (_f, row) => pickField(row, ["code", "symbol"]) ?? "—" },
   { title: "方向", key: "side", render: (_f, row) => pickField(row, ["trd_side", "side"]) ?? "—" },
   { title: "类型", key: "order_type", render: (_f, row) => pickField(row, ["order_type"]) ?? "—" },
@@ -209,7 +214,7 @@ const OPENAPI_ORDER_COLUMNS = [
 
 const OPENAPI_DEAL_COLUMNS = [
   { title: "账户", key: "accId", render: (_f, row) => row.accId ?? "—" },
-  { title: "市场", key: "market", render: (_f, row) => row.marketTag ?? "—" },
+  { title: "市场", key: "market", render: (_f, row) => marketDisplay(row.marketTag) },
   { title: "标的", key: "code", render: (_f, row) => pickField(row, ["code", "symbol"]) ?? "—" },
   { title: "方向", key: "side", render: (_f, row) => pickField(row, ["trd_side", "side"]) ?? "—" },
   { title: "数量", key: "qty", align: "right", render: (_f, row) => rawCell(pickField(row, ["qty", "filled_qty"])) },
@@ -231,8 +236,11 @@ function rawRowRender(row) {
     </pre>);
 }
 
-function OpenApiTable({ query, columns, emptyText }) {
-  const rows = groupRows(query.value);
+function OpenApiTable({ query, columns, emptyText, market }) {
+  // 全局市场筛选（客户端展示层，**不改请求参数**）：这四个端点都是
+  // 「按账户分组、组上带 market」的信封 → 按组筛、按行判空态（账户在但零流水也算无数据）。
+  const view = viewGroups(query.value?.groups, market, (group) => group?.rows ?? []);
+  const rows = groupRows(view.groups);
   if (query.error) {
     return <Alert type="warning" showIcon message={query.error} />;
   }
@@ -243,7 +251,8 @@ function OpenApiTable({ query, columns, emptyText }) {
       loading={query.loading}
       pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
       scroll={{ x: "max-content" }}
-      locale={{ emptyText: query.loading ? "加载中…" : emptyText }}
+      locale={{ emptyText: view.emptyReason
+        ?? (query.loading ? "加载中…" : emptyText) }}
       expandable={{ expandedRowRender: rawRowRender, rowExpandable: () => true }}
       columns={columns} />);
 }
@@ -296,7 +305,7 @@ function MaxQtyPanel({ mode }) {
             locale={{ emptyText: "没有可交易该市场的授权账户。" }}
             columns={[
               { title: "账户", key: "acc_id", render: (_f, row) => row.acc_id ?? "—" },
-              { title: "市场", key: "market", render: (_f, row) => row.market ?? "—" },
+              { title: "市场", key: "market", render: (_f, row) => marketDisplay(row.market) },
               { title: "标的", key: "code", render: (_f, row) => row.code ?? "—" },
               { title: "最大可买", key: "max_cash_buy", align: "right", render: (_f, row) => rawCell(row.max?.max_cash_buy) },
               { title: "最大可卖", key: "max_position_sell", align: "right", render: (_f, row) => rawCell(row.max?.max_position_sell) },
@@ -317,7 +326,7 @@ function MaxQtyPanel({ mode }) {
 
 /** 「OpenAPI 订单与成交」区块：全部 useEndpoint，模式取快照（与页面其余区块同口径）。
  *  历史流水条数可调（page_size，官方上界 100——OpenApiMarket.PAGE_SIZE_RANGE）。 */
-function OpenApiOrdersBlock({ mode }) {
+function OpenApiOrdersBlock({ mode, market }) {
   const [pageSize, setPageSize] = React.useState(50);
   const open = useEndpoint("orders_open", mode ? { mode } : null, [mode]);
   const history = useEndpoint("orders_history", mode ? { mode, page_size: pageSize } : null, [mode, pageSize]);
@@ -347,21 +356,21 @@ function OpenApiOrdersBlock({ mode }) {
       ) : (
         <Space direction="vertical" size="small" style={{ width: "100%" }}>
           <Typography.Text strong>未完成订单（orders_open，含最近 24 小时已成交/已撤）</Typography.Text>
-          <OpenApiTable query={open} columns={OPENAPI_ORDER_COLUMNS} emptyText="暂无未完成订单。" />
+          <OpenApiTable query={open} columns={OPENAPI_ORDER_COLUMNS} market={market} emptyText="暂无未完成订单。" />
           {open.value?.note && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>{open.value.note}</Typography.Text>)}
           <Typography.Text strong>历史订单（orders_history，取 {pageSize} 条）</Typography.Text>
-          <OpenApiTable query={history} columns={OPENAPI_ORDER_COLUMNS} emptyText="暂无历史订单。" />
+          <OpenApiTable query={history} columns={OPENAPI_ORDER_COLUMNS} market={market} emptyText="暂无历史订单。" />
           {history.value?.note && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>{history.value.note}</Typography.Text>)}
           <Typography.Text strong>当日成交（deals_today）</Typography.Text>
           {today.value?.derived ? <Tag color="orange">由委托派生（非券商成交流水）</Tag> : null}
-          <OpenApiTable query={today} columns={OPENAPI_DEAL_COLUMNS} emptyText="今日暂无成交。" />
+          <OpenApiTable query={today} columns={OPENAPI_DEAL_COLUMNS} market={market} emptyText="今日暂无成交。" />
           {today.value?.note && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>{today.value.note}</Typography.Text>)}
           <Typography.Text strong>历史成交（deals_history，取 {pageSize} 条）</Typography.Text>
           {dealsHistory.value?.derived ? <Tag color="orange">由委托派生（非券商成交流水）</Tag> : null}
-          <OpenApiTable query={dealsHistory} columns={OPENAPI_DEAL_COLUMNS} emptyText="暂无历史成交。" />
+          <OpenApiTable query={dealsHistory} columns={OPENAPI_DEAL_COLUMNS} market={market} emptyText="暂无历史成交。" />
           {dealsHistory.value?.note && (
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>{dealsHistory.value.note}</Typography.Text>)}
         </Space>)}
@@ -372,6 +381,8 @@ function OpenApiOrdersBlock({ mode }) {
 
 export default function ExecutionPage() {
   const snapshot = useSnapshotPoll();
+  const { market } = useMarketFilter();
+  const filtered = !isAllMarkets(market);
   const summary = snapshot.value?.trade_summary ?? null;
   const activity = snapshot.value?.activity ?? [];
   const orders = summary?.orders ?? [];
@@ -384,7 +395,9 @@ export default function ExecutionPage() {
   // 避免在实盘模式下先闪现一份 sim 台账。
   const mode = snapshot.value?.mode ?? null;
   const trades = useEndpoint("trades", mode ? { mode, limit: 50 } : null, [mode]);
-  const tradeRows = trades.value?.trades ?? [];
+  // 台账行自带带前缀的 ticker（如 SH.600031）→ 可按标的市场过滤
+  const tradeView = viewBySymbol(trades.value?.trades ?? [], market, "ticker", { scope: "本地台账" });
+  const tradeRows = tradeView.rows;
   return (
     <Card title="执行">
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
@@ -392,6 +405,15 @@ export default function ExecutionPage() {
           <Typography.Text type="danger">快照读取失败：{snapshot.error}</Typography.Text>)}
         {snapshot.value?.notice && (
           <Typography.Text type="secondary">{snapshot.value.notice}</Typography.Text>)}
+        {/* 市场口径：OpenAPI 四张表与本地台账跟着筛选走；快照派生的「券商订单/动作」端点上
+            没有市场字段（实测 symbol 是裸代码 '00981'，无交易所前缀）→ 无法判定市场，
+            按「不猜」纪律原样全部显示，并在筛选中明确告知。 */}
+        {filtered && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            市场筛选：{marketLabelOf(market)} —— 下列 OpenAPI 订单/成交与本地台账只列该市场；
+            「券商订单 / 动作」来自快照观察记录，响应里没有市场字段（标的无交易所前缀），
+            无法按市场筛选，仍全部显示。
+          </Typography.Text>)}
         {/* 待确认实盘操作：确认是服务进程内存态——本卡片覆盖 WP7 交易闸门（服务进程
             发起）的待确认；Harness 会话内发起的确认仍只在 Harness 的工作台面板可见。 */}
         <ConfirmationCard />
@@ -456,7 +478,7 @@ export default function ExecutionPage() {
         </Card>
 
         {/* OpenAPI 订单/成交流水：只读端点直通（sim / mcp 通道下服务端如实拒绝并给指引） */}
-        <OpenApiOrdersBlock mode={mode} />
+        <OpenApiOrdersBlock mode={mode} market={market} />
 
         <Card type="inner" title="本地台账成交（模拟撮合，非券商成交）">
           {trades.error && <Alert type="error" showIcon message={`台账读取失败：${trades.error}`} />}
@@ -464,10 +486,13 @@ export default function ExecutionPage() {
             rowKey={(row) => `${row.date}|${row.ticker}|${row.action}|${row.shares}|${row.price}`}
             dataSource={tradeRows}
             pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
-            locale={{ emptyText: trades.loading ? "台账加载中…" : "暂无成交记录。" }}
+            locale={{ emptyText: tradeView.emptyReason
+              ?? (trades.loading ? "台账加载中…" : "暂无成交记录。") }}
             columns={[
               { title: "日期", key: "date", render: (_f, row) => row.date ?? "—" },
               { title: "标的", key: "ticker", render: (_f, row) => row.ticker ?? "—" },
+              ...(filtered ? [] : [{ title: "市场", key: "market",
+                render: (_f, row) => symbolMarketDisplay(row.ticker) }]),
               { title: "方向", key: "action_label", render: (_f, row) => row.action_label ?? row.action ?? "—" },
               { title: "数量", key: "shares", align: "right", render: (_f, row) => rawCell(row.shares) },
               { title: "价格", key: "price", align: "right", render: (_f, row) => rawCell(row.price) },

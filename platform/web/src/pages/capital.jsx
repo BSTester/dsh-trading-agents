@@ -15,6 +15,8 @@ import React from "react";
 import { Alert, Card, Collapse, Input, Select, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { symbolMarketNote } from "../services/marketView.js";
 import { MultiLineChart } from "../charts/line.jsx";
 
 const DAYS_OPTIONS = [
@@ -190,10 +192,15 @@ export default function CapitalPage() {
   const [ticker, setTicker] = React.useState("");
   const [query, setQuery] = React.useState("");
   const [days, setDays] = React.useState(30);
+  const { market } = useMarketFilter();
   // 未输入标的时 payload 为 null：hook 跳过请求（服务端对空 code 直接参数报错）。
   const flow = useEndpoint("capital_flow", query ? { code: query } : null, [query]);
   const hist = useEndpoint("capital_flow_history", query ? { code: query, days } : null, [query, days]);
   const dist = useEndpoint("capital_distribution", query ? { code: query } : null, [query]);
+  // 市场维度：三个端点的返回是富途原文透传，行里**没有**标的/市场字段（实测只有
+  // capital_flow_item_time/in_flow/四档单量），市场只存在于用户输入的 code 上——
+  // 一次只查一个标的，不存在跨市场混排。故不做过滤，只在不一致时提示（与行情页同口径）。
+  const marketNote = symbolMarketNote(query, market);
   return (
     <Card title="资金流向" extra={(
       <Space>
@@ -208,6 +215,7 @@ export default function CapitalPage() {
           <Typography.Text type="secondary">
             输入标的代码后查询；三个端点都是富途实时直通（TTL 0 不缓存）。
           </Typography.Text>)}
+        {query && marketNote && <Alert type="info" showIcon message={marketNote} />}
         {query && (
           <Card type="inner" title="分时资金流（大 / 中 / 小 / 超大单）">
             <IntradayFlow flow={flow} />

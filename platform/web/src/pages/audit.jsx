@@ -30,6 +30,11 @@ import React from "react";
 import { Card, Space, Statistic, Table, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num, stampOf } from "../services/format.jsx";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import {
+  marketLabelOf, planMarketDisplay, symbolMarketDisplay, viewBySymbol, viewPlans,
+} from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 
 const SIDE = { BUY: "买入", SELL: "卖出" };
 
@@ -161,6 +166,7 @@ const DIFF_COLUMNS = [
 ];
 
 export default function AuditPage() {
+  const { market } = useMarketFilter();
   const audit = useEndpoint("audit", {}, []);
   const sources = useEndpoint("sources", {}, []);
   const reconcile = useEndpoint("reconcile", {}, []);
@@ -171,9 +177,26 @@ export default function AuditPage() {
   const sourceRows = sources.value?.sources ?? [];
   const sourceSummary = sources.value?.summary;
   const diffs = reconcile.value?.diffs ?? [];
+  // 全局市场筛选（客户端展示层，**不改请求参数**）。三块数据的市场来源各不相同：
+  //   链路 → 计划的 target 键与订单标的前缀（plan 端点/chain 都**没有** market 字段，实测）；
+  //   时间线 → entries[].ticker（**实测可能是裸代码 '00981'**，无交易所前缀 → 无法判定）；
+  //   对账差异 → diffs[].symbol；
+  // 数据源授权/链路统计没有市场维度，恒为全局（不按市场藏掉）。
+  const filtered = !isAllMarkets(market);
+  const chainView = viewPlans(chain, market, { scope: "链路" });
+  const entryView = viewBySymbol(entries, market, "ticker", { scope: "时间线" });
+  const diffView = viewBySymbol(diffs, market, "symbol", { scope: "对账差异" });
   // 审计行/差异行没有服务端 id：键在渲染前一次算好（antd 的 rowKey 不再传下标）
-  const entryRows = entries.map((row, index) => ({ ...row, _key: `${row.kind ?? ""}-${row.id ?? index}` }));
-  const diffRows = diffs.map((row, index) => ({ ...row, _key: `${row.symbol ?? ""}-${row.kind ?? ""}-${index}` }));
+  const entryRows = entryView.rows.map((row, index) => ({
+    ...row, _key: `${row.kind ?? ""}-${row.id ?? index}` }));
+  const diffRows = diffView.rows.map((row, index) => ({
+    ...row, _key: `${row.symbol ?? ""}-${row.kind ?? ""}-${index}` }));
+  // 无法判定市场的行（裸代码）被排除时要如实报数，不能让它们静默消失
+  const blindEntries = filtered && entryView.unclassified > 0
+    ? `另有 ${entryView.unclassified} 条时间线记录的标的没有交易所前缀（如 '00981'），`
+      + "无法判定市场，未计入上表——请切到「全部市场」核对。" : null;
+  const blindDiffs = filtered && diffView.unclassified > 0
+    ? `另有 ${diffView.unclassified} 条差异行的标的市场无法判定，未计入上表。` : null;
 
   return (
     <Card title="审计">
@@ -182,28 +205,40 @@ export default function AuditPage() {
           <Typography.Text type="danger">对账读取失败：{reconcile.error}</Typography.Text>)}
         {audit.error && (
           <Typography.Text type="danger">审计读取失败：{audit.error}</Typography.Text>)}
+        {filtered && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            市场筛选：{marketLabelOf(market)} —— 链路/时间线/对账差异按该市场过滤；
+            数据源与授权状态、链路统计没有市场维度，仍为全局口径。
+          </Typography.Text>)}
 
         <Card type="inner" title="计划 → 订单 → 成交" extra={(
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            最近 {chain.length} 个计划，逐级展开
+            最近 {chainView.rows.length} 个计划{filtered ? `（${marketLabelOf(market)}）` : ""}，逐级展开
           </Typography.Text>)}>
           <Table size="small"
             rowKey={(row) => row.plan_id}
-            dataSource={chain}
+            dataSource={chainView.rows}
             pagination={false}
             scroll={{ x: "max-content" }}
             locale={{ emptyText: reconcile.loading
               ? "链路加载中…"
-              : "暂无链路数据（冻结计划并产生订单后显示）。" }}
-            columns={CHAIN_COLUMNS}
+              : (chainView.emptyReason ?? "暂无链路数据（冻结计划并产生订单后显示）。") }}
+            columns={[
+              ...CHAIN_COLUMNS,
+              // 「全部市场」下跨市场混排：补市场列（由计划自带的 target/订单标的派生）
+              ...(filtered ? [] : [{ title: "市场", key: "market",
+                render: (_field, row) => planMarketDisplay(row) }]),
+            ]}
             expandable={{
               expandedRowRender: (plan) => (
                 <Table size="small"
                   rowKey={(row) => row.client_order_id}
-                  dataSource={plan.orders ?? []}
+                  dataSource={viewBySymbol(plan.orders ?? [], market, "symbol").rows}
                   pagination={false}
                   scroll={{ x: "max-content" }}
-                  locale={{ emptyText: "该计划没有订单。" }}
+                  locale={{ emptyText: filtered
+                    ? `该计划没有「${marketLabelOf(market)}」的订单。`
+                    : "该计划没有订单。" }}
                   columns={CHAIN_ORDER_COLUMNS}
                   expandable={{
                     // 无成交的订单也允许展开：展开区给出「无成交」事实，不留空白
@@ -243,8 +278,17 @@ export default function AuditPage() {
             scroll={{ x: "max-content" }}
             locale={{ emptyText: audit.loading
               ? "时间线加载中…"
-              : "暂无记录（产生信号并下单/成交后显示）。" }}
-            columns={ENTRY_COLUMNS} />
+              : (entryView.emptyReason ?? "暂无记录（产生信号并下单/成交后显示）。") }}
+            columns={[
+              ...ENTRY_COLUMNS,
+              // 「全部市场」下补市场列；「—」= 标的无交易所前缀，市场无法判定（不猜）
+              ...(filtered ? [] : [{ title: "市场", key: "market",
+                render: (_field, row) => symbolMarketDisplay(row.ticker) }]),
+            ]} />
+          {blindEntries && (
+            <Typography.Text type="warning" style={{ fontSize: 12, display: "block", marginTop: 8 }}>
+              {blindEntries}
+            </Typography.Text>)}
         </Card>
 
         <Card type="inner" title="数据源与授权状态" extra={(
@@ -265,15 +309,25 @@ export default function AuditPage() {
 
         <Card type="inner" title="对账差异" extra={(
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            差异时间 {stampOf(reconcile.value?.diffs_at)}
+            差异时间 {stampOf(reconcile.value?.diffs_at)}{filtered ? ` · ${marketLabelOf(market)}` : ""}
           </Typography.Text>)}>
           <Table size="small"
             rowKey={(row) => row._key}
             dataSource={diffRows}
             pagination={{ pageSize: 10, hideOnSinglePage: true, showSizeChanger: false }}
             scroll={{ x: "max-content" }}
-            locale={{ emptyText: reconcile.loading ? "差异加载中…" : "暂无对账差异。" }}
-            columns={DIFF_COLUMNS} />
+            locale={{ emptyText: reconcile.loading
+              ? "差异加载中…"
+              : (diffView.emptyReason ?? "暂无对账差异。") }}
+            columns={[
+              ...DIFF_COLUMNS,
+              ...(filtered ? [] : [{ title: "市场", key: "market",
+                render: (_field, row) => symbolMarketDisplay(row.symbol) }]),
+            ]} />
+          {blindDiffs && (
+            <Typography.Text type="warning" style={{ fontSize: 12, display: "block", marginTop: 8 }}>
+              {blindDiffs}
+            </Typography.Text>)}
         </Card>
 
         <Typography.Text type="secondary">

@@ -17,6 +17,8 @@ import React from "react";
 import { Alert, Card, Col, Collapse, Descriptions, Input, Row, Select, Space, Table, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { symbolMarketNote } from "../services/marketView.js";
 import { KLineChart } from "../charts/kline.jsx";
 
 const PERIODS = [
@@ -245,9 +247,13 @@ export default function MarketPage() {
   const [ticker, setTicker] = React.useState("");
   const [query, setQuery] = React.useState("");
   const [period, setPeriod] = React.useState("1d");
+  const { market } = useMarketFilter();
   // 未输入标的时 payload 为 null：hook 跳过请求（服务端对空 ticker 会直接报错）。
   const series = useEndpoint("series", query ? { ticker: query, period, limit: 250 } : null, [query, period]);
   const instrument = useEndpoint("instrument", query ? { ticker: query } : null, [query]);
+  // 本页**不按全局市场过滤**（一次只查一个标的，按市场藏掉会与用户输入直接冲突）：
+  // 只用 symbolChain 校验输入前缀与当前筛选是否一致，不一致就说一句，数据照常显示。
+  const marketNote = symbolMarketNote(query, market);
   return (
     <Card title="行情" extra={(
       <Space>
@@ -261,6 +267,7 @@ export default function MarketPage() {
           <Typography.Text type="secondary">
             输入标的代码后加载；K 线与标的按 TTL 本地缓存，实时报价/盘口为富途直通（TTL 0）。
           </Typography.Text>)}
+        {query && marketNote && <Alert type="info" showIcon message={marketNote} />}
         {query && <InstrumentCard instrument={instrument} />}
         {query && instrument.value?.note && (
           <Typography.Text type="warning">{instrument.value.note}</Typography.Text>)}

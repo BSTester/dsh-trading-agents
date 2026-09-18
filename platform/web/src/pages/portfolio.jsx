@@ -15,6 +15,9 @@ import React from "react";
 import { Alert, Card, Col, Row, Space, Statistic, Table, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
 import { num, pctOf, maskedAccount } from "../services/format.jsx";
+import { useMarketFilter } from "../services/marketContext.jsx";
+import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
+import { isAllMarkets } from "../services/marketFilter.js";
 import { LineChart } from "../charts/line.jsx";
 
 const MODES = [
@@ -24,11 +27,16 @@ const MODES = [
 
 export default function PortfolioPage() {
   const [mode, setMode] = React.useState("sim");
+  const { market } = useMarketFilter();
   const positions = useEndpoint("positions", { mode }, [mode]);
   const equity = useEndpoint("equity", { mode, window: 250 }, [mode]);
-  const rows = (positions.value?.groups ?? []).flatMap((group) =>
+  // 全局市场筛选（客户端展示层，**不改请求参数**）：positions 按账户分组、组上带
+  // market（实测 sim 为数字 market_id 1/3/100）→ 按组筛、按行判空态。
+  const filtered = !isAllMarkets(market);
+  const view = viewGroups(positions.value?.groups, market, (group) => group?.positions ?? []);
+  const rows = view.groups.flatMap((group) =>
     (group.positions ?? []).map((position) => ({
-      ...position, account: group.account, accId: group.acc_id,
+      ...position, account: group.account, accId: group.acc_id, groupMarket: group.market,
     })));
   const equityPoints = (equity.value?.points ?? []).map((point) => ({ t: point.t, v: point.equity }));
   const counts = positions.value?.counts;
@@ -54,10 +62,19 @@ export default function PortfolioPage() {
         {(positions.value?.errors ?? []).map((row, index) => (
           <Alert key={`${row.acc_id ?? row.account ?? "error"}-${index}`} type="warning" showIcon
             message={`账户读取失败：${row.account ?? "—"}：${row.reason ?? "—"}`} />))}
+        {filtered && (
+          <Typography.Text type="secondary">
+            市场筛选：{marketLabelOf(market)} —— 上表只列该市场账户的持仓
+            （账户列悬停可见完整账户名）；权益曲线是本地模拟台账，没有市场维度，仍为全局口径。
+          </Typography.Text>)}
+        {view.emptyReason && (
+          <Typography.Text type="warning">{view.emptyReason}</Typography.Text>)}
         {counts && (
           <Typography.Text type="secondary">
             读取账户 {counts.accounts_checked ?? "—"} 个，其中有持仓 {counts.accounts_with_positions ?? "—"} 个、
-            持仓 {counts.positions ?? "—"} 笔（数据时间：{positions.value?.as_of ?? "—"}）
+            持仓 {filtered ? rows.length : (counts.positions ?? "—")} 笔
+            {filtered ? `（已按「${marketLabelOf(market)}」筛选）` : ""}
+            （数据时间：{positions.value?.as_of ?? "—"}）
           </Typography.Text>)}
         <Table size="small"
           rowKey={(row) => `${row.accId}-${row.symbol}`}
@@ -66,6 +83,9 @@ export default function PortfolioPage() {
           locale={{ emptyText: positions.loading ? "持仓加载中…" : "暂无持仓。" }}
           columns={[
             { title: "账户", key: "account", render: (_field, row) => maskedAccount(row.accId, row.account) },
+            // 「全部市场」下跨市场混排：补市场列（账户名只在悬停提示里，看不出来就还是混为一谈）
+            ...(filtered ? [] : [{ title: "市场", key: "market",
+              render: (_field, row) => marketDisplay(row.groupMarket) }]),
             { title: "标的", key: "symbol", render: (_field, row) => (
               <Space size={4}>
                 <span>{row.symbol || "—"}</span>
