@@ -40,13 +40,30 @@ test("stageStatusText：未知状态原样回显状态码，空值给 —（不�
   assert.equal(stageStatusText(""), "—");
 });
 
-test("stageDrill：表驱动阶段去对应来源页，作业阶段回落调度页", () => {
+// 2026-09-18 实机缺陷：原表只登记 plan/execute/digest/reconcile，其余阶段一律回落
+// `#/schedule` —— 点「行情同步」「因子快照」「研究快照」等节点全部跳到调度页。
+// 跨语言覆盖锁在 tests/test_wp21_drill_lock.py（拿服务端 _JOB_LABELS 双向核对）；
+// 这里锁的是「阶段 → 页面的归属判断」本身。
+test("stageDrill：每个阶段都去自己的事实来源页（不是一律回落调度页）", () => {
+  // 表驱动阶段
   assert.equal(stageDrill("plan"), "#/plan");
+  assert.equal(stageDrill("build_plan"), "#/plan");
   assert.equal(stageDrill("execute"), "#/execution");
+  assert.equal(stageDrill("auto_execute"), "#/execution");
   assert.equal(stageDrill("digest"), "#/audit");
   assert.equal(stageDrill("reconcile"), "#/audit");
-  assert.equal(stageDrill("sync_bars"), "#/schedule");
-  assert.equal(stageDrill("factors_snapshot"), "#/schedule");
+  // 数据作业阶段
+  assert.equal(stageDrill("sync_bars"), "#/market");
+  assert.equal(stageDrill("sync_fundamentals"), "#/research");
+  assert.equal(stageDrill("merge_announcements"), "#/research");
+  assert.equal(stageDrill("research_snapshot"), "#/research");
+  assert.equal(stageDrill("enqueue_research"), "#/research");
+  assert.equal(stageDrill("quality"), "#/factors");
+  assert.equal(stageDrill("factors_snapshot"), "#/factors");
+  assert.equal(stageDrill("sentiment_snapshot"), "#/factors");
+  assert.equal(stageDrill("sync_calendar"), "#/schedule");
+  // 只有「服务端新增了未登记阶段」才会走到回落分支；缺省/空值同样回落（不抛错）
+  assert.equal(stageDrill("brand_new_stage"), "#/schedule");
   assert.equal(stageDrill(undefined), "#/schedule");
 });
 

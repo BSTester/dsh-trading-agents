@@ -45,11 +45,52 @@ export function stageStatusText(status) {
   return STATUS_TEXT[status] ?? String(status);
 }
 
-/** 下钻目标（哈希路由，key 与 app.jsx 的 PAGES 同集合）：阶段 → 该事实的来源页。 */
-const DRILL = { plan: "plan", execute: "execution", digest: "audit", reconcile: "audit" };
+/** 下钻目标（哈希路由，key 与 app.jsx 的 PAGES 同集合）：阶段 → 该事实的来源页。
+ *
+ * **必须覆盖服务端可能给出的全部阶段 key**（2026-09-18 实机缺陷）：原表只登记了 4 个
+ * （plan/execute/digest/reconcile），其余 11 个一律回落 `#/schedule`——于是点「行情同步」
+ * 「因子快照」「研究快照」「日历同步」等节点全部跳到调度页，用户看到的是「点击节点没有
+ * 正确跳转」。回落分支还在，但它现在只服务「服务端新增了未登记阶段」这一种情况，
+ * 而 `tests/test_wp21_drill_lock.py` 会拿服务端 `pipeline._JOB_LABELS` 与 `app.jsx` 的
+ * PAGES 键做双向核对：**新增阶段却没登记下钻目标 → 测试直接失败**，不会再静默跳错页。
+ *
+ * 归属理由（每一条都指到页面上真实存在的卡片）：
+ *   sync_calendar        → 调度（作业表/日历覆盖告警）
+ *   sync_bars            → 行情（K 线序列的取数来源）
+ *   sync_fundamentals    → 研究（深度数据 F10 / 财报）
+ *   merge_announcements  → 研究（F10 公告日）
+ *   quality              → 因子（因子页即消费 quality 端点）
+ *   factors_snapshot     → 因子（因子打分与排序）
+ *   sentiment_snapshot   → 因子（情绪快照采集摘要）
+ *   research_snapshot    → 研究（研报正文/候选池）
+ *   enqueue_research     → 研究（研究任务入队）
+ *   build_plan / plan    → 计划（当前计划/状态时间线）
+ *   auto_execute/execute → 执行（订单与指令结局）
+ *   reconcile / digest   → 审计（对账差异与链路统计；digest 是当日链路摘要）
+ */
+const DRILL = {
+  sync_calendar: "schedule",
+  sync_bars: "market",
+  sync_fundamentals: "research",
+  merge_announcements: "research",
+  quality: "factors",
+  factors_snapshot: "factors",
+  sentiment_snapshot: "factors",
+  research_snapshot: "research",
+  enqueue_research: "research",
+  build_plan: "plan",
+  plan: "plan",
+  auto_execute: "execution",
+  execute: "execution",
+  reconcile: "audit",
+  digest: "audit",
+};
 export function stageDrill(key) {
   return `#/${DRILL[key] ?? "schedule"}`;
 }
+
+/** 已登记下钻目标的阶段 key（供跨语言漂移锁测试读取；不要在前端逻辑里当契约用）。 */
+export const DRILL_KEYS = Object.keys(DRILL);
 
 /** 阶段时间文案：实际执行时刻优先，其次计划时刻；都没有 → —（不拿当前时间冒充）。 */
 export function stageTimeText(stage) {
