@@ -155,7 +155,7 @@ for the requested market`。
 闭市时段把单送进券商——`trade_place`/`trade_modify` 与工作台 `plan-execute`（人工触发）
 在**平台层**（与字段校验同层、风控之前）先判「该市场当前是否在可委托时段」，不在即拒
 （`trading/order-rejected`，消息以「时段闸门拒绝：」开头；零券商调用、不落 OMS/风控行、
-不写指令文件）。窗口口径与半日市缩短规则见 [README](../README.md)「WP19」与
+不写指令文件）。窗口口径与半日市缩短规则见 [FEATURES.md](FEATURES.md)「WP19」与
 [docs/RUNBOOK.md](RUNBOOK.md)「人工下单时段闸门（WP19）」；**撤单与撤销计划不放闸门**
 （减少敞口不新增风险）。注意这**不覆盖自动执行链**（`auto_execute` 写指令文件 → 指令轮询
 → `execute.run`）：那条链的时段约束是守卫 9 的执行窗口。

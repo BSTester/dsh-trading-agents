@@ -8,7 +8,7 @@
 //       2. 未安装（仓库/venv 缺失）→ 返回安装指引，绝不强行启动；
 //       3. 已安装但未启动 → 以分离进程（detached + unref）拉起，等 ~4s 复测确认。
 //   * 本插件只是"启动服务进程"，不触碰服务自身的认证/闸门（token、模式切换、
-//     交易确认都留在服务侧）——见仓库 README 的安全边界。
+//     交易确认都留在服务侧）——见仓库 README「富途授权」与 docs/FEATURES.md 的安全边界。
 import path from "node:path";
 
 export const DEFAULT_PORT = 8397;

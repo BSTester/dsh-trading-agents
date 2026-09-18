@@ -9,7 +9,7 @@
 恢复原则（规格 §8.4，P4 延续）：daemon 崩溃 systemd 重启；执行中断订单留 `unknown` 由对账兜底；**先查券商再动手，不自动清除未知在途状态，不自动平仓**。
 
 
-> **首启必做（否则平台在跑但什么都没发生）**：配置关注池——`~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300`（需 universe 表已有该指数成分快照；缺它是全部数据作业静默跳过的原因，流程页会显示「关注池未配置」提示）。
+> **首启必做（否则平台在跑但什么都没发生）**：配置关注池——`~/.dsh/trading-venv/bin/python -m trading_core watchlist-init --from-index SH.000300`（需 universe 表已有该指数成分快照；缺它是全部数据作业静默跳过的原因，流程页会显示「关注池未配置」提示）。**完整三步自举（`universe` → `watchlist-init` → 三市场 `calendar`，以及日历由 18:50 `sync_calendar` 自维护、首启当天要手工跑一次）见 [../README.md](../README.md)「装完之后」**。
 
 ### 订单终态人工对齐（`oms-align`，最后手段）
 
@@ -37,7 +37,7 @@ from→to、原因、操作者）；**绝不触达券商**。用一个受约束�
 core/datasource/fin-data 三个副本并顺带重写 `.pth`，且**不碰 profile / preset / pnpm**，
 比 `install` 快且无 Web 副作用，可反复重跑。有仓库的开发机上子进程会优先仓库代码
 （`trading_datasource.repo_paths`），所以本地开发不刷新也能跑；**生产必须刷新**。
-升级/部署的完整五层流程见 `README.md`「更新到最新版本」。
+升级/部署的完整五层流程见 [../README.md](../README.md)「更新到最新版本」。
 
 | 对象 | 路径 / 键 | 说明 |
 |---|---|---|
@@ -477,8 +477,8 @@ WantedBy=default.target
 
 ## 自动流水线（WP9）
 
-> 前提：`trading-platform.json` 已开 `auto_pipeline.enabled=true`（配置样例见 README
-> 「WP9：自动流水线」）。关掉开关即回到全人工，任何演练都不需要改代码。
+> 前提：`trading-platform.json` 已开 `auto_pipeline.enabled=true`（配置样例见
+> [FEATURES.md](FEATURES.md)「WP9：自动流水线」）。关掉开关即回到全人工，任何演练都不需要改代码。
 
 ### 设置页保存被拒：先看错误信息里的「合法取值」（WP22，2026-09-18）
 
@@ -701,7 +701,7 @@ OMS 里 `SELECT plan_id,err FROM orders WHERE plan_id='reconcile-import'` 能对
 浏览器/网络重试；期间**没有输出**（对外像挂死，实际在推进）；而服务对单个作业有 **900s
 上限**，触顶即被外部杀掉 → 一天的数据一行都留不下，且情绪阶段每天显示失败。
 
-**三条保证（已实现，配置见 README）**：
+**三条保证（已实现，配置见 [FEATURES.md](FEATURES.md)「情绪采集的两个预算键」）**：
 
 | 保证 | 语义 | 运维可见信号 |
 |---|---|---|

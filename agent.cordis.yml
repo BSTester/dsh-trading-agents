@@ -157,7 +157,7 @@
 
 # ── 富途远程 MCP（只读研究通道；写类 sim_trade_*/trading_* 被 policy 拒绝并指引
 #    工作台，WP7 收窄——写路径唯一在工作台服务的 trade_place/trade_modify/trade_cancel） ──
-# 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README）。
+# 需要 OAuth 授权富途账号后获得的 Bearer token（见仓库 README「富途授权」，细节见 docs/FEATURES.md）。
 # token 未设置时该行工具不会出现，其余能力不受影响（failOnStartupError: false）。
 
 - id: futu-mcp

@@ -76,6 +76,9 @@ S2 修复生效后新撤单都会回写；历史遗留行需由平台属主按 O
 # 其它开关：--base URL（默认 http://127.0.0.1:8397）｜--timeout S｜--out DIR
 ```
 
+- **冷启动暖机**：刚重启过服务**不用加参数**——脚本自带冷启动暖机（约 10 秒属正常）。
+  跳过它就加 `--no-warmup`，但**脚本类端点会因此误报**。
+
 - **只做 sim；绝不切 live**：启动时若 `mode != sim` 直接退出 2；`switch-mode` 只走
   「无口令被拒」与 sim→sim 幂等两条路径。
 - **退出码**：`0` 无阻断发现且无真泄漏；`1` 有阻断发现（read/section/contract 的 error、
@@ -138,6 +141,9 @@ node scripts/e2e_web.mjs --no-screenshot        # CI 友好（只留 report.json
 node scripts/e2e_web.mjs --fail-on-soft         # 让软断言也计入退出码（判闭环用）
 node scripts/e2e_web.mjs --help
 ```
+
+- **等待预算**：`--route-budget S` 单路由等待预算（秒，默认 90；超预算记缺陷但继续跑其余
+  路由）、`--health-timeout S` 健康门等待上限（秒，默认 60；服务未就绪则不跑页面扫描）。
 
 - **退出码**：`0` 无缺陷（阻断/严重/重要）且（未开 `--fail-on-soft` 或无软断言失败）；
   `1` 有缺陷、运行中断、或开了 `--fail-on-soft` 且软断言失败。
