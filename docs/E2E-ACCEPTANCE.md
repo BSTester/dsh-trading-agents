@@ -9,9 +9,10 @@
 |---|---|---|---|
 | 后端端点全量扫描 | 服务（HTTP + SQLite + 文件系统） | `~/.dsh/trading-venv/bin/python scripts/e2e_workbench.py` | `~/.dsh/logs/e2e-workbench-<ts>.json` |
 | 前端真浏览器 E2E | 浏览器（系统 Chromium + CDP，零依赖） | `node scripts/e2e_web.mjs` | `~/.dsh/logs/e2e-web-<ts>/{report.json,*.png}` |
+| 页面字段级审计 | 端点载荷 × 浏览器渲染文本（零依赖） | `node scripts/audit_page_fields.mjs` | `~/.dsh/logs/page-fields-<ts>/report.json` |
 
-两个 harness 都是**只报告、不修复**：发现缺陷后由人工/代理按 findings 修服务或页面，
-再用同一命令复跑判闭环（判据见 §四）。
+三个 harness 都是**只报告、不修复**：发现缺陷后由人工/代理按 findings 修服务或页面，
+再用同一命令复跑判闭环（判据见 §五）。
 
 ---
 
@@ -155,7 +156,7 @@ node scripts/e2e_web.mjs --help
   请求关联——有失败请求（4xx/5xx/加载失败）时如实展示失败属**诚实**行为，只记观察项；
   **没有**失败请求却显示失败才算说谎（记软断言）。裸串 `读取失败` 曾把 portfolio 页的
   **说明文案**（「实时读取失败时展示缓存并标注 stale」）误判成加载态说谎——那是探针过松，
-  已按此口径收敛（详见 §三）。
+  已按此口径收敛（详见 §四）。
 - **锚点是状态感知的**：`required` 条目可以是字符串（必须出现）或数组（数据态/空态任一
   满足）。例：`plan` = `["当前计划","暂无计划"]`（空库时前者不会渲染，是**正确**状态）；
   `settings` 无页面级标题，以卡片标题为锚（`["富途 OpenAPI 凭据","自动流水线"]`）。
@@ -164,7 +165,148 @@ node scripts/e2e_web.mjs --help
 
 ---
 
-## 三、本轮结果与缺陷清单
+## 三、页面字段级审计 `scripts/audit_page_fields.mjs`
+
+### 与 §二 的分工
+
+`e2e_web.mjs` 问「**页面有没有渲染出来**」（白屏/锚点/console 错误/加载态说谎）；
+本节这个工具问「**每个字段显示得对不对**」——同一个端点值在页面上的呈现是否与格式契约一致。
+两者互补，都要跑。
+
+### 覆盖与判定
+
+16 条路由全覆盖（overview/market/capital/options/signal/portfolio/risk/factors/execution/
+research/events/plan/pipeline/schedule/audit/settings）。每页做两件事：
+
+1. **后端事实**：直接 `POST /api/wb/<endpoint>`（与浏览器同一入口）拿到真实载荷；
+2. **页面事实**：真 Chromium（CDP）加载 `http://127.0.0.1:8397/#/<route>`，抓 antd
+   Statistic / Descriptions / 表格单元格的**标签 → 渲染文本**（含 `—`），以及内容区全文
+   （**排除**「原始返回」折叠块——那是 JSON 逃生口，不该按展示文本判）。
+
+然后按格式契约逐字段比对，判定码：
+
+| 判定 | 含义 | 计入缺陷 |
+|---|---|---|
+| `MISSING_WHEN_DATA` | 后端有非空值，渲染全是 `—` | ✅ 严重 |
+| `FORMAT` | 两端都有值但对不上（无千分位 / 比例没 ×100 / 时间戳带 `T` / 原始毫秒时间戳） | ✅ 重要 |
+| `FABRICATED` | 后端缺失/为空，渲染出 `0`/`0.00`/`NaN`/`[object Object]` | ✅ 重要 |
+| `T_TIMESTAMP` | 内容区出现带 `T` 的 ISO 时间戳（全文扫雷） | ✅ 重要 |
+| `EMPTY` | 两端都空 | ❌ **数据确实没有时显示 `—` 是正确的** |
+| `UNJUDGED` | 端点取数失败（无权限/无凭据/参数不被接受） | ❌ 但要点名端点错误原文 |
+| `NOT_RENDERED` | 标签在 DOM 里没出现（条件渲染/需先输入标的） | ❌ 观察项 |
+
+判定的期望文本由工具**独立实现**（`CONTRACTS`），再由 `tests/audit-page-fields.test.mjs`
+与 `services/formatCore.js` 的真实实现逐值对齐——既不共用一份代码（否则实现有 bug 会被
+工具原样祝福），也不允许两处漂移。
+
+### 用法与退出码
+
+```bash
+node scripts/audit_page_fields.mjs                          # 全量 16 路由
+node scripts/audit_page_fields.mjs --pages capital,market    # 单页/多页复验（未知键报错并列可用键）
+node scripts/audit_page_fields.mjs --pages options --symbol HK.09961   # 标的类页面指定标的
+node scripts/audit_page_fields.mjs --json                    # 额外打印报告路径
+node scripts/audit_page_fields.mjs --help
+```
+
+- **标的**：默认取关注池第一只（与页面候选同源）。期权页声明了 `preferMarket: "HK"`
+  ——实测 `option_chain` 对 A 股标的**直接拒绝**（`option chain only supports HK / US / JP
+  markets`），用 A 股标的跑只会得到 UNJUDGED。行情页的**实时报价/盘口**同理（A 股 `rt_quote`
+  恒 `errcode=-9 realtime quote permission required`），需补一次 HK 标的：
+  `node scripts/audit_page_fields.mjs --pages market --symbol HK.09961`。
+- **退出码**：`0` 无缺陷；`1` 发现缺陷；`2` 服务未就绪或运行中断。
+- **等待预算**：`AUDIT_ROUTE_BUDGET_MS`（单路由预算，默认 90s）、`AUDIT_MAX_WAIT_MS`
+  （网络空闲上限）、`AUDIT_BASE` / `AUDIT_CHROME` 覆盖地址与浏览器。
+- **产物**：`~/.dsh/logs/page-fields-<ts>/report.json`——逐字段明细
+  （`page/label/where/endpoint/path/kind/backend/rendered/judge/note`）、全文扫雷结果、
+  每页抓到的表格清单（诊断「这个值取自哪张表」）与端点错误原文。
+- **只读**：在标的输入框里输入并回车（这是页面的正常查询动作），
+  不点击任何提交类控件、不改服务状态、不装依赖。
+
+---
+
+### 本轮逐字段审计结果（2026-09-19）
+
+| 阶段 | 字段数 | ok | 空态正确 | 缺陷 | 观察项 | 退出码 |
+|---|---|---|---|---|---|---|
+| **基线**（修复前）`node scripts/audit_page_fields.mjs` | 122 | 38 | 18 | **20**（FORMAT 9 / MISSING_WHEN_DATA 8 / T_TIMESTAMP 3） | 53 | **1** |
+| **修复后**（全量 16 页） | 124 | 90 | 20 | **0** | 16 | **0** |
+| 补充：`--pages market --symbol HK.09961`（实时报价/盘口数据面） | 13 | 12 | 1 | **0** | 0 | **0** |
+
+产物：`~/.dsh/logs/page-fields-<ts>/report.json`（基线 `page-fields-2026-09-18T18-34-59-801Z`、
+修复后 `page-fields-2026-09-18T19-02-24-094Z`）。
+
+**逐页结论（修复后）**
+
+| 页面 | 审计字段数 | ok | 缺陷 | 备注 |
+|---|---|---|---|---|
+| overview | 10 | 10 | 0 | 修复前 3 缺陷（因子数/覆盖标的恒 —） |
+| market | 13 | 7 | 0 | A 股标的的实时报价/盘口端点恒 `-9 无权限` → UNJUDGED；用 HK 标的复跑 12/13 ok |
+| capital | 10 | 10 | 0 | 修复前 8 缺陷（四档键名不符 + 毫秒时间戳 + 分布表整列 —） |
+| options | 5 | 4 | 0 | 期权链需 HK/US 标的（`preferMarket: HK`）；需手输期权合约的衍生品卡未覆盖 |
+| signal | 6 | 0 | 0 | `snapshot.previews` 为空（无信号/回测预览）→ 全部空态，**无法判定格式** |
+| portfolio | 7 | 3 | 0 | 权益台账无数据（current/total_return/max_drawdown/trades 全为空）→ 4 项空态 |
+| risk | 14 | 14 | 0 | 修复前 1 条 T 时间戳（positions.as_of） |
+| factors | 16 | 13 | 0 | 需先在关注池输入框填 ≥3 只标的；单标的财报质量卡（恰好 1 只时才渲染）未覆盖 |
+| execution | 14 | 7 | 0 | 本地台账无成交记录（7 项空态）；OpenAPI 四张表按 DOM 序号定位 |
+| research | 3 | 1 | 0 | 运行记录为空；已发布研报为空；规则候选池 1 条 ok |
+| events | 1 | 1 | 0 | 只审计到事件日期（Timeline 非表格结构） |
+| plan | 6 | 4 | 0 | 只有 1 个计划 → 「计划列表」卡片不渲染（`plans.length > 1`） |
+| pipeline | 2 | 2 | 0 | 只审计日期与一个阶段时刻（Steps 结构） |
+| schedule | 4 | 4 | 0 | 作业历史 10 行 / 告警 20 条，字段全部命中 |
+| audit | 9 | 6 | 0 | 对账差异为空（3 项空态）；修复前 1 条 T 时间戳（sources.checked_at） |
+| settings | 4 | 4 | 0 | 凭据/通道/算法/掩码 AppKey 全部命中 |
+
+### 本轮缺陷清单（20 条 → 全部已修）
+
+| # | 页面 / 字段 | 后端值 | 渲染值（修复前） | 为什么是缺陷 | 修复 |
+|---|---|---|---|---|---|
+| 1 | overview 因子数 | `payload.tickers` 的 5 个因子键 | `—` | 落库 payload 是 `{date,tickers:{标的:{因子:值}}}`，**没有 `factors` 键**，`payload.factors.length` 恒 undefined → 有数据也显示 — | `services/factorSnapshot.js` 从 `tickers` 键并集推因子数 |
+| 2 | overview 覆盖标的 | `payload.tickers` 的 20 个标的 | `—` | `tickers` 是**对象**不是数组，`.length` 恒 undefined | 同上（`Object.keys` 计数） |
+| 3 | capital 时间列（分时） | `1789695000000`（毫秒时间戳） | `1789695000000` | 时间列显示 13 位整数，读不出任何时刻 | 新增 `formatCore.clockText`（毫秒 → `HH:mm`） |
+| 4-7 | capital 超大单/大单/中单/小单 | `super_in_flow` / `big_in_flow` / `mid_in_flow` / `sml_in_flow` | 四列**全是 `—`** | 实测字段名是 `*_in_flow`，页面候选键只登记了 `*_inflow` → 四档列与四线折线全空 | `SIZE_BUCKETS.keys` 补实测命名（候选键取第一个有值的） |
+| 8 | capital 日期列（历史） | `1786291200000` | `1786291200`（10 位假日期） | 原实现 `String(v).slice(0,10)` 把毫秒时间戳截成 10 位数字 | 新增 `formatCore.dayText`（毫秒 → `YYYY-MM-DD`） |
+| 9-10 | capital 资金分布 净流入/占比 | `capital_in_*` / `capital_out_*` | 8 格**全是 `—`** | 该端点给的是「流入/流出」两套键，页面只找「净流入」单键 → 整表 — | `bucketNet()`：净流入 = 流入 − 流出（纯展示换算，页面写明口径）；占比 = \|净\|/Σ\|净\| |
+| 11 | portfolio 数据时间 | `2026-09-19T02:31:16` | 原样（带 `T`） | 全站时间戳契约是 `stampOf`（T→空格） | 改走 `stampOf` |
+| 12 | risk 持仓数据时间 | 同上 | 原样（带 `T`） | 同上 | 改走 `stampOf` |
+| 13 | audit 自检时间 | `2026-09-19T02:37:42+08:00` | 原样（带 `T`） | 同页「差异时间」已走 `stampOf`，此处漏了 | 改走 `stampOf` |
+| 14 | factors 取数时间 | `2026-09-19T02:26:13` | 原样（带 `T`） | 同上 | 改走 `stampOf` |
+| 15 | factors 正 IC 占比 | `positive_ratio = 0.472`（比例） | `0.472` | 标签是「占比」，同页累计收益率一类比例都走 `pctOf` → 应显示 `47.20%` | 改走 `pctOf` |
+| 16 | options 到期日列 + 本地过滤 | 行内 `strike_time = "2026-09-18"` | 列全是 `—`；一旦选了某个到期日，**整表被筛空** | 实测期权链行的到期日键是 `strike_time`，而表格列与过滤用的候选键是 `expiration_date/expire_date/date`（同文件 `expirationCandidates` 里却有 `strike_time`——三处不一致） | 三处候选键统一 |
+| 17 | execution 更新时间列 | `1789363905000000`（微秒） | 16 位数字 | 模拟盘/部分通道给微秒整数，`String(v).slice(0,16)` 把它当文本截断 | 新增 `formatCore.minuteText`，`timeOf` 改走 `minuteOf` |
+| 18-20 | execution 更新时间（同页×3 表）/全文扫雷 3 条 | — | 带 `T` 的时间戳 / 原始毫秒 | 与 #11-14 同类 | 同上（`stampOf` / `minuteOf`） |
+
+> 第 16/17 条的「修复前渲染值」由**源码表达式 + 真实载荷**直接推得（`pick(row,[...])` 对实测行
+> 全部返回 undefined → `—`；`String("1789363901000000").slice(0,16)` 就是那 16 位数字），
+> 因为基线那一轮期权页用的是 A 股标的（被上游 `-8` 拒绝），没能在浏览器里取到该列的前后对比。
+
+### 本轮**未修**（需要产品决策或超出「显示缺陷」范围，如实列出）
+
+| 项 | 事实 | 为什么不修 |
+|---|---|---|
+| audit 对账差异「本地/券商」列可能渲染 `[object Object]` | `reconcile.compare` 的 `missing_side` 行把**整个持仓字典**放进 `local`/`broker`，页面 `num()` 对非有限值回落 `String(value)` | 当前 `diffs` 为空，**无法用真实数据判定**该列应显示什么（数量？持仓字典？）；改动会编造语义。已由工具的 POISON 扫雷覆盖，一旦出现即报缺陷 |
+| execution OpenAPI 四表用 `rawCell` 原样展示 | 数量 `"1000"`、委托价 `"61"` 都不带千分位，与全站 `num()` 口径不一致 | 该函数有明文理由（「原文数值原样展示，num 会四舍五入」），且**订单号/状态原码必须保持原样**——改成 `num` 会把订单号格式化成 `7,138,921`。需要按列决定，属产品决策 |
+| capital 资金分布「≤1 就 ×100」的单位猜测 | `Number(ratio) <= 1 ? ratio * 100 : ratio` | 上游当前不给 `*_ratio` 键（走的是自算分支），**无法用真实数据判定**该猜测对不对 |
+| 「最大可买可卖」在模拟盘必失败 | 载荷缺 `price`（`trading.py:1175` 明确 price 必填），且列读 `max.max_cash_buy` 而模拟盘实际键是 `max_cash_buy_qty_round_lot` | 属**功能性**缺陷（端点失败 → 整卡无数据），修它要定「用哪个价格算最大可买」，超出显示层 |
+| execution 实盘（live）下四张 OpenAPI 表缺 `market` | `OpenApiBroker._per_market` 强制要求 market | 同上：模式相关功能性缺陷，本环境是 sim，无法复现验证 |
+| signal「最新信号」取的是第一条 signal 行 | 页面用 `find(kind==='signal')` | `store.snapshot()` 已按时间倒序（最新在前），首条**就是**最新——**不是缺陷**；但当前 `previews` 为空，无法用数据复核，如实标注 |
+| schedule 心跳原文字段可能带 `T` | `alerts.emit` 用 ISO 写心跳（当前值恰为空格分隔） | 当前数据不带 T，不构成缺陷；工具已覆盖（一旦出现即报 T_TIMESTAMP） |
+| research/execution 时间列的时区语义 | 服务端用 `toISOString()`（UTC），页面截断显示、不标时区 | 显示格式符合契约（无 T、可读），但「UTC 值当本地时间读」是语义问题，需产品决策 |
+
+### 本轮**未覆盖**（工具的诚实清单）
+
+- **需要表单提交/手输才能出数据的区块**：期权筛选（`option_screen` 要按下「查询」）、
+  期权波动率/行权概率（要手输**期权合约代码**，不是标的）。工具是只读的，不点提交类控件。
+- **需要特定前置状态的区块**：factors 的单标的财报质量卡（恰好 1 只时）、plan 的「计划列表」
+  （>1 个计划时）、signal 的最新信号卡与历史预览（`previews` 非空时）——本轮这些前置条件不满足，
+  对应字段记 `NOT_RENDERED`/`EMPTY`，**不等于通过**。
+- **图表内部像素**：canvas 图表只判「有没有数据可画」（空态文案/跳过计数），不核像素与刻度。
+- **端点恒失败的字段**：A 股 `rt_quote`/`rt_order_book`（`-9 无权限`）→ UNJUDGED；
+  这类字段**必须在 HK/US 标的下复跑**才算覆盖。
+
+---
+
+## 四、本轮结果与缺陷清单
 
 ### 结果（2026-09-17）
 
@@ -253,7 +395,7 @@ critical 告警保留未 ack；③ A1 修复在 `trading_core`，**需重启服�
 （`ORDER_CANDIDATES` 三只），并在报告里明确列出被阻塞的标的；③ 历史遗留行由平台属主按
 OMS 维护流程清理（修复后新增的撤单都会正常回写）。
 
-## 四、复验方法（判闭环）
+## 五、复验方法（判闭环）
 
 ```bash
 # 1) 后端：先只读扫一遍（快、无副作用）
@@ -278,7 +420,7 @@ cd platform/web && npm test
 |---|---|
 | 缺陷 1 / I1 | 1b 阶段：`future_info` 成功或如实降级；缺 `days_before` / `leader_name` → `invalid-operation` 且 message **点名参数**（不再是 `futu-unavailable`）；「`future_info` 出站装配错误」与「过渡码」发现消失（修复 `cc2239c`，**待服务重启生效**） |
 | 缺陷 2 / 3 | 写阶段「带外价 → 拒单契约」一行：`ok:false` + `order-rejected` + message 含 `[errcode=` → 相应发现消失（修复 `f86783f`，**待服务重启生效**） |
-| S2 / M1 | 写阶段「撤单后 OMS 回写(S2)」cleared=true；「撤单后同标的同方向仍被阻塞」消失；`place→modify` 后旧单落 `cancelled`（修复 `f86783f`，**待服务重启生效**）。**验证前提**：扫描前无幽灵单（见 §三「幽灵在途单」） |
+| S2 / M1 | 写阶段「撤单后 OMS 回写(S2)」cleared=true；「撤单后同标的同方向仍被阻塞」消失；`place→modify` 后旧单落 `cancelled`（修复 `f86783f`，**待服务重启生效**）。**验证前提**：扫描前无幽灵单（见 §四「幽灵在途单」） |
 | 缺陷 4 | 1c 契约三行的码从 `analytics-unavailable` 变为 `invalid-operation`，「过渡码」发现消失（修复 `6c4cd7d`） |
 | 缺陷 5 | 1 阶段 `openapi_config`/`auto_pipeline` 用 GET 读成功（不再是 415）（修复 `6c4cd7d`） |
 | 状态类（pipeline） | `pipeline vs kv ran 标记不一致 = 0`，且关注池为空的阶段显示 `skipped` + 原因（不是 `ok`）（修复 `2b823f0`） |
@@ -291,7 +433,7 @@ cd platform/web && npm test
 > `stale_service_contract: true` 与「⚠ 契约未生效」提示就是这个事实的**如实表达**，
 > 不是脚本故障；重启后下单生命周期探针会自动启用。
 
-## 五、已知未覆盖（诚实清单）
+## 六、已知未覆盖（诚实清单）
 
 - **TTL 缓存陈旧**：只验证端点可达与形状，不验证「缓存过期后是否刷新」；
   `_refresh: true` 旁路的时序未测。

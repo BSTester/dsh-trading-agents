@@ -452,6 +452,68 @@ WantedBy=default.target
 
 排查时不必重启服务、不必清缓存：选择器状态在浏览器里，换个市场即可复现/消除。
 
+## 「某页某字段显示不对」怎么复现与定位（字段级审计，2026-09-19）
+
+**症状**：页面上某个数字/百分比/时间看着不对——该有值却是 `—`、明明是比例却没显示 `%`、
+时间戳带着 `T`、或者汇总与明细对不上。
+
+**一条命令复现该页**（只读，不点任何提交类控件；用法与判定码详见
+[E2E-ACCEPTANCE.md](E2E-ACCEPTANCE.md) 的「页面字段级审计」一节）：
+
+```bash
+# 单页复验（最快的定位入口；退出码 0=该页无缺陷、1=有缺陷、2=服务未就绪/中断）
+node scripts/audit_page_fields.mjs --pages capital
+# 标的类页面（market/capital/events）用你实际在看的标的
+node scripts/audit_page_fields.mjs --pages market --symbol HK.09961
+# 期权页必须用 HK/US 标的（A 股会被上游直接拒：option chain only supports HK / US / JP）
+node scripts/audit_page_fields.mjs --pages options --symbol HK.09961
+```
+
+工具把「**后端真实载荷**（同一入口 `POST /api/wb/<endpoint>`）」与「**浏览器里真实渲染的
+文本**（真 Chromium + CDP，抓 Statistic / Descriptions / 表格单元格）」逐字段比对，输出一行
+一条：`页面 | 字段 | 后端值 | 渲染值 | 判定 | 说明`。产物在
+`~/.dsh/logs/page-fields-<ts>/report.json`（每条缺陷都带 backend/rendered/note 三件套）。
+
+**判定码怎么读**（工具的口径，见 `scripts/audit_page_fields.mjs` 文件头）：
+
+| 判定 | 含义 | 是不是缺陷 |
+|---|---|---|
+| `MISSING_WHEN_DATA` | 后端有非空值，渲染全是 `—` | **是**（最常见：候选键写错/路径取错） |
+| `FORMAT` | 两端都有值但对不上（无千分位、比例没 ×100、时间戳带 `T`、原始毫秒时间戳） | **是** |
+| `FABRICATED` | 后端缺失/为空，渲染出 `0`/`0.00`/`NaN`/`[object Object]` | **是** |
+| `T_TIMESTAMP` | 内容区出现带 `T` 的 ISO 时间戳（应过 `stampOf`） | **是**（全文扫雷命中） |
+| `EMPTY` | 两端都空 | 否——**数据确实没有时显示 `—` 是正确的**，别改 |
+| `UNJUDGED` | 端点取数失败（无权限/无凭据/参数不被接受） | 否，但要看清端点错误原文 |
+| `NOT_RENDERED` | 该标签在当前 DOM 里没出现（条件渲染/需要先输入标的/需要点查询） | 需人工判断 |
+
+**定位三步**（照抄即可）：
+
+1. 看缺陷行的 `endpoint` + `path`：那是工具**期望**的取值路径。若与页面源码里的 `pick(row,[...])`
+   候选键不一致，先怀疑**字段名写错**（本项目已发生两次：`capital_flow` 的四档键是
+   `super_in_flow` 而不是 `super_inflow`；`option_chain` 的到期日是 `strike_time` 而不是
+   `expiration_date`）。
+2. 手工核对后端原文（排除是数据问题）：
+   ```bash
+   curl -s -X POST http://127.0.0.1:8397/api/wb/capital_flow \
+     -H 'Content-Type: application/json' -d '{"code":"SH.600000"}' | head -c 800
+   ```
+   （页面上的「原始返回（核对用）」折叠块是同一份事实。）
+3. 改完页面**必须重建静态产物**，否则浏览器加载的还是旧代码：
+   ```bash
+   cd platform/web && npm run build && cd ../..   # 前端改的是 dist，服务不用重启
+   node scripts/audit_page_fields.mjs --pages <页>  # 复跑该页，退出码 0 即闭环
+   ```
+
+**常见误判（先排除，别急着改页面）**：
+
+- **页头市场筛选**把行筛掉了 → 表格空了但不是字段错（见上一节）。
+- **标的没输入/没回车** → 卡片根本没渲染（`NOT_RENDERED`），不是字段错。工具会自动在标的
+  输入框里填入关注池第一只并回车，所以它跑出来是 `NOT_RENDERED` 就该看是不是别的前置条件。
+- **端点本身失败**（权限/凭据/参数）→ `UNJUDGED`，此时页面显示「读取失败：<原文>」是**诚实**
+  行为；例如 A 股 `rt_quote` 恒为 `errcode=-9 realtime quote permission required`。
+- **`0` 不等于缺失**：后端给 0 时页面显示 `0` 是对的；工具只在后端**没有值**而渲染出数字时
+  才判 `FABRICATED`。
+
 ## 标的输入框下拉没有关注池候选（WP24，2026-09-18）
 
 标的输入框（行情/资金/事件/执行/研究/期权/因子的标的字段）的联想候选来自两处：
