@@ -95,6 +95,9 @@ _ALERT_STATUS = {
     "策略未注册": ("build_plan", "skipped"),
     # planner._resolve_strategy（WP14 任务 4）：规则存在但未人工批准 → 不消费
     "规则未启用": ("build_plan", "skipped"),
+    # planner.plan_auto（2026-09-18）：单标的策略（rsi/ma_cross）没有 target_weights，
+    # 无法在组合上下文里分配权重 → 当日不生成计划（软跳过，不是故障：配置能改对）
+    "策略不支持自动计划": ("build_plan", "skipped"),
     "策略权重失败": ("build_plan", "failed"),
     "策略 universe 失败": ("build_plan", "failed"),
     "券商通道不可用": ("build_plan", "failed"),

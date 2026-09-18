@@ -24,7 +24,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 
-from trading_core import autopipeline, daemon, pipeline  # noqa: E402
+from trading_core import autopipeline, daemon, pipeline, planner, store  # noqa: E402
 
 PIPELINE_JS = ROOT / "platform" / "web" / "src" / "services" / "pipeline.js"
 APP_JSX = ROOT / "platform" / "web" / "src" / "app.jsx"
@@ -109,3 +109,51 @@ class DrillCoverageTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SingleTickerStrategyInAutoPipelineTest(unittest.TestCase):
+    """配置里写单标的策略（rsi/ma_cross）时，``plan_auto`` 必须软跳过而非抛异常。
+
+    2026-09-18 实测缺陷：``rsi``/``ma_cross`` 继承 ``SingleTicker``，**没有**
+    ``target_weights``；配置里写成它们时 ``strategy.target_weights`` 直接
+    ``AttributeError``，违反 ``plan_auto`` 的「永不抛」作业契约，且告警里看不出该怎么改。
+    """
+
+    def setUp(self):
+        import json
+        import tempfile
+
+        self.json = json
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.home = Path(self.tmp.name)
+        (self.home / "trading-account-mode").write_text("sim", encoding="utf-8")
+        (self.home / "trading-platform.json").write_text(self.json.dumps({
+            "watchlist": ["SH.600519"],
+            "auto_pipeline": {"enabled": True,
+                              "strategies": [{"market": "SH", "strategy": "rsi"}]},
+        }, ensure_ascii=False), encoding="utf-8")
+        self.conn = store.connect(str(self.home / "t.sqlite"))
+        self.addCleanup(self.conn.close)
+        store.upsert_calendar(self.conn, "SH", [
+            {"day": day, "trade_date_type": "WHOLE", "trade_second": 14400}
+            for day in ("2026-09-15", "2026-09-16")])
+        # 数据就绪门要求「最后交易日 = 2026-09-16」；20 根只是为了满足 ATR 窗口
+        import datetime as dt
+        end = dt.date(2026, 9, 16)
+        days = [(end - dt.timedelta(days=19 - i)).isoformat() for i in range(20)]
+        store.upsert_bars(self.conn, "SH.600519", "1d", [
+            {"t": day, "o": 5.0, "h": 5.5, "l": 4.5, "c": 5.0, "v": 1000.0}
+            for day in days], source="test")
+
+    def test_single_ticker_strategy_soft_skips_instead_of_raising(self):
+        result = planner.plan_auto(self.conn, str(self.home), "SH", today="2026-09-16",
+                                   broker_call=lambda *a, **k: None)
+        self.assertTrue(result["ok"], "必须软跳过（ok=True + skipped），不得抛异常")
+        self.assertIn("target_weights", result["skipped"])
+        self.assertIn("rsi", result["skipped"])
+        titles = [r["title"] for r in self.conn.execute("SELECT title FROM alerts")]
+        self.assertIn("策略不支持自动计划", titles, "告警标题是 pipeline 归因的契约字面量")
+
+    def test_pipeline_attributes_the_new_title_to_build_plan_skipped(self):
+        self.assertEqual(pipeline._ALERT_STATUS.get("策略不支持自动计划"), ("build_plan", "skipped"))

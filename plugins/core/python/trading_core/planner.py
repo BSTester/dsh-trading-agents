@@ -588,9 +588,20 @@ def plan_auto(conn, home, market, today=None, broker_call=None):
             kwargs["watchlist"] = entry["watchlist"]
         return kwargs
 
+    # 单标的策略（``rsi``/``ma_cross`` 继承 ``SingleTicker``）**没有** ``target_weights``：
+    # 它们的语义是「给定一个标的判断方向」，而不是「在一组标的里配置权重」，因此无法用于
+    # 自动流水线。必须在属性访问**之前**判定——直接调用会抛 ``AttributeError``，而本函数的
+    # 契约是「永不抛」（2026-09-18 实测：配置里把策略写成 ``rsi`` 时当日 ``build_plan`` 以
+    # ``AttributeError: 'RsiStrategy' object has no attribute 'target_weights'`` 失败，
+    # 违反契约且告警里看不出该怎么改）。这里改成 fail-closed 软跳过 + 可读原因。
+    target_weights = getattr(strategy, "target_weights", None)
+    if not callable(target_weights):
+        return skip(f"策略 {entry['strategy']} 不支持自动流水线：单标的策略没有 target_weights"
+                    f"（自动流水线要在多个标的间分配权重，需组合策略）",
+                    "warn", "策略不支持自动计划")
+
     try:
-        weights = strategy.target_weights(conn, data_date,
-                                         **_strategy_kwargs(strategy.target_weights))
+        weights = target_weights(conn, data_date, **_strategy_kwargs(target_weights))
     except ValueError as error:
         # 组合策略要读风控配置（权重上限）与命名池（键不存在即配置错误）；
         # trading-risk.json 非法时 risk_config 抛 ValueError——作业契约是「永不抛」，
