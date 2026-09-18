@@ -599,3 +599,51 @@ SH 503 行 / HK 507 / US 511，边界全部 `2027-12-31`；`2026-10-12`（周一
 - 撤单**不判时段**也不判交易日（既有语义：规则 3 对撤单同样生效——`default_ctx_builder`
   的撤单分支只中和敞口字段，`is_trading_day` 仍生效）；本轮未改动该口径。
 
+### 8.8 WP20：全新安装演练暴露的三个真实缺陷（2026-09-18 实测 / 已修）
+
+**背景（三条实测事实，均由 2026-09-18 的全新安装演练暴露）**：
+
+1. **`quality` 作业必然失败**：`daemon.JOBS_DEFAULT["SH"]` 只给 `["quality","--market","SH"]`，
+   而 CLI 的 `quality` **必填** `--symbols/--start/--end` → 实测
+   `trading_core quality: error: the following arguments are required: --symbols, --start, --end`，
+   退出码 2，告警「作业失败 job=quality market=SH exit=2」。
+2. **`@latest-quarter` 从未实现**：作业把**字面量** `"@latest-quarter"` 当报告期传给
+   `merge_announcements` → `akshare.stock_yjbb_em(date="@latest-quarter")` 内部对
+   `data_json["result"]["pages"]`（None）取下标 → `TypeError: 'NoneType' object is not
+   subscriptable`。全仓 `resolve_command` 只实现了 `@watchlist`——**我们自己的占位符漏实现，
+   却表现为看不懂的上游故障**。
+3. **`yfinance` 没进任何安装步骤**：它是数据层生产依赖（`fundamentals` 的 Yahoo 财报备用源
+   `SOURCE_YAHOO` + `market.fetch_yahoo` 港美股长历史通道，富途单次只有 370 根），而
+   `install.sh`/`install.ps1` 只 `pip install akshare playwright`、`platform/requirements.txt`
+   里也没有。全新 venv 上 Python 套件报 `ModuleNotFoundError: No module named 'yfinance'`。
+
+**失败可见性的时间线（本轮最重要的证据）**：旧库 `daemon:state` 里
+`SH:quality:2026-09-16` / `2026-09-17` **都有 ran 标记**（说明它跑过），但旧库 152 条告警里
+**一条「作业失败」都没有**——因为失败可见性是 **2026-09-17 19:57 的 `ce2b47b`** 才加的，
+而两次失败分别发生在 16:10 与 19:11，**都在修复之前**，所以当时是**静默失败**。
+即：**缺陷一直都在，只是旧库的告警面看不见它**——这类缺陷只能靠「全新环境 + 看退出码」发现。
+
+| 修订 | 不变量 / 口径 | 锁定测试 |
+|---|---|---|
+| `daemon.resolve_command(cmd, home, now=None)` 实现 `@latest-quarter` | = **今天之前最近一个已结束季度末**，格式 `YYYYMMDD`（2026-09-18 → `20260630`）。季度末 = 03-31/06-30/09-30/12-31；判据**严格早于今天**——正好落在季度末当天（09-30）取**上一季**，因为业绩报表只认已结束报告期，当日那份还没出 | `tests/test_wp20_install_drill.py::LatestQuarterPlaceholderTest`（13 个边界日） |
+| 新增 `@today` / `@today-<N>d` | 当天 / N 个自然日前，格式 `YYYY-MM-DD`（CLI 的 `--start/--end` 口径）；**时钟口径不另立一套**：`now=` 注入 > `DSH_FAKE_NOW` > 真实时间，日期取 `stamp[:10]`（与 `tick` 逐字一致）。`now` 与 `tick(now=…)` 同形（零参 callable 或完整时间戳）；**无日期占位符时不读时钟**，既有两参调用逐字不变 | `TodayPlaceholderTest`、`LegacyCallContractTest` |
+| **未知占位符显式报错** | 任何以 `@` 开头但不是已知占位符的参数 → `ValueError("未知占位符：…（已知：@watchlist/@latest-quarter/@today/@today-Nd）")`，经 `_run_job` 转成 **`作业异常`** 告警（可见）。判定口径 = 「参数以 `@` 开头」，值里的 `@`（如 `a@b.com`）不受影响 | `UnknownPlaceholderTest`（含 `test_job_runner_turns_it_into_a_visible_alert`） |
+| 修 `JOBS_DEFAULT["SH"]` 的 quality | `["quality","--market","SH","--symbols","@watchlist","--start","@today-180d","--end","@today"]`。窗口 180 自然日的理由（写进 `daemon.py` 注释）：`quality.gap_report` 的 start/end 是**日历区间**（`store.trading_days(market,start,end)`），内部**没有**回看常量；180 自然日 ≈123 交易日 ≥ `rule_engine.IC_WINDOW_DAYS`=120（运行时 IC 加权窗口，§9.3）。`--market` 只决定按哪张日历取交易日、**不筛标的** | `JobDefinitionTest`（含**全作业表**的 CLI 可解析不变量 + 按作业定义真跑一次 `cli.main`） |
+| **只有 SH 链挂 quality**（刻意） | `announced_at` 覆盖率是 A 股 PIT 缺口①的口径（只由本链 16:05 的 `merge_announcements` 从东财 yjbb 补）；港美股 fundamentals 走 `futu/statements`，本就没有公告日——挂上去只会每天报一条结构性恒为 0 的覆盖率。本轮**不凭感觉扩链**；给 HK/US 加之前还需确认各自日历已同步 | `JobDefinitionTest.test_quality_is_declared_for_sh_only` |
+| `sync.merge_announcements_akshare` 取数异常转可读 | 包住 `stock_yjbb_em` 调用 → `RuntimeError("上游 akshare/eastmoney 接口异常（stock_yjbb_em date=…）：<原始类型: 摘要>")`，原始异常挂 `__cause__`。**不软跳过**：`announced_at` 是 PIT 关键字段（§13.4 缺口①），缺数据必须可见（宁缺毋假，§4.2 规则 3）；`df is None/空` 的软返回 `{"matched":0,"rows":0}` 保持不变 | `MergeAnnouncementsFailureTest` |
+| `merge-announcements` CLI 给**失败信封** | `{"ok": false, "error": "公告合并失败：…"}` + 退出 1（与 `sync-bars` 的 F-b 同一手法）。理由：失败告警的 detail **只引用 stdout 尾部**，裸 traceback 走 stderr → 告警只剩 `exit=1`、没有原因 | `test_cli_failure_envelope_names_the_upstream`（含 runner tail/summary → `作业失败` detail 的整链断言） |
+| `yfinance` 显式声明 | `install.sh` / `install.ps1` 的数据渠道依赖行加 `yfinance`（注释写明 Yahoo 财报备用源 + 港美股长历史通道，以及「缺它不报错、只静默降级」）；`platform/requirements.txt` 加 `yfinance==1.7.0`（本机已装版本精确锁定，注释说明它属**数据层**、放这里是为只跑 `install_platform.py` 的人）；README 的安装说明、平台一次性依赖与「数据渠道优先级」表同步 | `DependencyDeclarationTest`（脚本/requirements/README 三处） |
+
+**本轮未修 / 未决（如实登记）**：
+
+- **失败告警的 detail 仍只引用 stdout**（`_subprocess_runner` 的 `tail` 只取 stdout 行）：
+  本轮只给 `merge-announcements` 补了失败信封；**其它作业**若抛未捕获异常（如 quality 遇
+  日历未同步的 `RuntimeError`），告警仍只有 `exit=1`、没有原因。彻底解法是让 `tail`
+  在 stdout 为空时回落 stderr，属跨作业的调度层改动，**本轮明确未动**（避免改动
+  `_subprocess_runner` 的既有返回契约）。
+- **`@latest-quarter` 的「当日未出报」是日历判据，不是披露日判据**：口径只看季度末是否已过，
+  不看该公司是否已披露；作业仍会把当期表拉下来（上游没有的期次返回空表 → 软返回 0 行）。
+- **HK/US 没有 quality 作业**（理由见上表）；`quality` 的缺口检查对它们同样成立，
+  但需要先确认各自日历已同步，登记为遗留。
+
+

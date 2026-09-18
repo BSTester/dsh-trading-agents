@@ -84,8 +84,10 @@ git clone https://github.com/BSTester/dsh-trading-agents; cd dsh-trading-agents;
    它会：把 preset 装到 $HOME/.dsh/.agent-presets/dsh-trading-agents（Windows 为
    %USERPROFILE%\.dsh\...）、安装 workbench / fin-data / trading-engine / futu-keepalive /
    platform-autostart 五个插件、解出统一 Python 层（datasource + core 两个库）并注入交易 venv、
-   创建 venv 并安装 akshare 与 playwright（含 Chromium 浏览器二进制）、装平台服务依赖
-   （platform/requirements.txt：fastapi/uvicorn/mcp…）并构建前端 dist、最后跑一遍安装自检。
+   创建 venv 并安装 akshare、playwright（含 Chromium 浏览器二进制）与 yfinance
+   （Yahoo 财报备用源 + 港美股长历史通道；缺它不报错、只静默降级，故安装器显式声明）、
+   装平台服务依赖（platform/requirements.txt：fastapi/uvicorn/mcp…/yfinance）并构建前端 dist、
+   最后跑一遍安装自检。
    预期能看到「自检通过（✅ 安装完整）」与「重启 dsh web → 新建会话 → 选择「交易智囊模式」…」。
    ⚠️ 过程中会弹出富途授权页（OAuth）等你确认。此刻不想授权就让它跳过，
      之后随时可以补：python ~/.dsh/.agent-presets/dsh-trading-agents/scripts/futu_auth.py
@@ -334,6 +336,9 @@ Harness 会使用原生工具与子代理完成四位分析师报告、多空辩
 
 ```bash
 # 一次性依赖：Python 侧复用交易 venv；前端构建需要 Node（只需联网一次）
+# requirements.txt 除平台服务依赖外还带着**数据层**的 yfinance（Yahoo 财报备用源 +
+# 港美股长历史通道）——缺它不报错、只静默降级，所以放在这里让只跑 install_platform.py
+# 的人也装上；install.sh / install.ps1 同样会装它。
 ~/.dsh/trading-venv/bin/pip install -r platform/requirements.txt
 npm --prefix platform/web install && npm --prefix platform/web run build
 
@@ -734,8 +739,8 @@ systemctl --user list-timers research-duty.timer      # NEXT 即下一次唤醒
 | 1 | **富途 MCP** | 远程 MCP | 行情/K 线/财务/研报/交易，能取到的一律走这里 |
 | 2 | X（**必需**） | `api/graphql` | 社区 `x-client-transaction-id` 实现，热启动约 3s；DOM 抓取为降级 |
 | 3 | Reddit | `api/json` | 同源 `/search.json` 走登录态，结构化返回 |
-| 4 | AKShare | 本地库 | A 股日线/千股千评等补充 |
-| 5 | Yahoo / 网页搜索 | HTTP | 兜底 |
+| 4 | AKShare | 本地库 | A 股日线/千股千评等补充（`akshare`） |
+| 5 | Yahoo / 网页搜索 | HTTP | 兜底：**Yahoo 走 `yfinance`**（财报备用源 + 港美股长历史通道） |
 
 可选扩展：last30days 社媒研究引擎提供近 30 天社媒/全网叙事的广度面（Reddit/HN/Polymarket/GitHub/YouTube 等免密钥来源开箱即用），`python3 scripts/install_last30days.py` 安装到 `~/.dsh` 后新建会话生效，组合方法论见 [skills/last30days-bridge/SKILL.md](skills/last30days-bridge/SKILL.md)——社媒信号只生成假设，验证与交易一律走工作台通道。
 

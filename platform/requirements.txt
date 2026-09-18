@@ -7,3 +7,10 @@ httpx==0.28.1
 cryptography==50.0.1
 # WP8 任务 4 富途 WS 推送（server/futu_push.py 的默认传输；协议层 ping/pong 保活）
 websockets==17.1
+# 数据层依赖（WP20 补，2026-09-18 安装演练缺陷 3）：Yahoo 财报备用源
+# （trading_datasource.fundamentals.load_returns：富途无资产负债表接口时落到这里，
+# SOURCE_YAHOO="yahoo/yfinance"）+ 港美股长历史通道（market.fetch_yahoo；富途单次只有
+# 370 根）。**它不是平台服务依赖**，放在这里是为了让只跑 scripts/install_platform.py
+# 的人也能装上——缺它不会报错、只会静默降级（A 股走 AKShare、港美股长历史直接失败），
+# 这类依赖最容易在安装步骤里漏掉。版本取本机已装版本精确锁定。
+yfinance==1.7.0

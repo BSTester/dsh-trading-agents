@@ -45,7 +45,7 @@ Say "安装 web profile 工作台 Host 和投研/数据插件…"
 & $python (Join-Path $presetDst "scripts\install_plugins.py") install --repo $presetDst --dsh-home $dshHome
 if ($LASTEXITCODE -ne 0) { Warn "必需插件安装失败，请修复错误后重试。"; exit 1 }
 
-# 环境初始化：持久 venv + 数据渠道依赖（AKShare/playwright）
+# 环境初始化：持久 venv + 数据渠道依赖（AKShare/playwright/yfinance）
 $venv = Join-Path $dshHome "trading-venv"
 $venvPython = Join-Path $venv "Scripts\python.exe"
 if ($py) {
@@ -55,10 +55,13 @@ if ($py) {
         if ($LASTEXITCODE -ne 0) { Warn "venv 创建失败，AKShare/X 渠道不可用。" }
     }
     if (Test-Path $venvPython) {
-        Say "安装数据渠道依赖（akshare、playwright，约1-2分钟）…"
+        Say "安装数据渠道依赖（akshare、playwright、yfinance，约1-2分钟）…"
         & $venvPython -m pip install -q --upgrade pip
         if ($LASTEXITCODE -ne 0) { Warn "pip 更新失败，继续使用现有版本。" }
-        & $venvPython -m pip install -q akshare playwright
+        # yfinance（2026-09-18 补）：数据层生产依赖，不是可选件——Yahoo 财报备用源
+        # （trading_datasource.fundamentals）+ 港美股长历史通道（market.fetch_yahoo；
+        # 富途单次只有 370 根）。缺它不报错、只静默降级，这类依赖最容易漏。
+        & $venvPython -m pip install -q akshare playwright yfinance
         if ($LASTEXITCODE -eq 0) { Say "依赖安装完成（$venv）" }
         else { Warn "依赖安装失败：会话内使用时 AI 会提示重试，不影响其他功能" }
         # 浏览器二进制（2026-09-18 补）：pip 只装库、不下载 Chromium，而情绪/资讯采集与

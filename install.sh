@@ -43,7 +43,7 @@ fi
 say "安装 web profile 工作台 Host 和投研/数据插件…"
 "$PYTHON" "$PRESET_DST/scripts/install_plugins.py" install --repo "$PRESET_DST" --dsh-home "$DSH_HOME"
 
-# 3. 环境初始化：持久 venv + 数据渠道依赖（AKShare/playwright）
+# 3. 环境初始化：持久 venv + 数据渠道依赖（AKShare/playwright/yfinance）
 VENV="$DSH_HOME/trading-venv"
 if [[ -n "$PYTHON" ]]; then
   if [[ ! -x "$VENV/bin/python" ]]; then
@@ -51,9 +51,14 @@ if [[ -n "$PYTHON" ]]; then
     "$PYTHON" -m venv "$VENV" || warn "venv 创建失败，AKShare/X 渠道将降级为会话内提示安装"
   fi
   if [[ -x "$VENV/bin/python" ]]; then
-    say "安装数据渠道依赖（akshare、playwright，约1-2分钟）…"
+    say "安装数据渠道依赖（akshare、playwright、yfinance，约1-2分钟）…"
     "$VENV/bin/pip" install -q --upgrade pip 2>/dev/null || true
-    "$VENV/bin/pip" install -q akshare playwright && say "依赖安装完成（$VENV）" \
+    # yfinance（2026-09-18 补）：**数据层生产依赖**，不是可选件——它是 Yahoo 财报备用源
+    # （trading_datasource.fundamentals：富途无资产负债表接口时落到这里，SOURCE_YAHOO）
+    # 与港美股**长历史**通道（market.fetch_yahoo；富途单次只有 370 根）。
+    # **缺它不会报错**：load_returns 静默降级到 AKShare（仅 A 股）、fetch_yahoo 直接失败——
+    # 这类「静默降级」依赖最容易在安装步骤里漏掉，故显式声明。
+    "$VENV/bin/pip" install -q akshare playwright yfinance && say "依赖安装完成（$VENV）" \
       || warn "依赖安装失败：会话内使用时 AI 会提示重试，不影响其他功能"
     # 3.1 浏览器二进制（2026-09-18 补）：`pip install playwright` **只装库、不下载 Chromium**，
     # 而情绪/资讯采集（fin-data）与前端真浏览器 E2E 都要它——此前 README 的一键安装没有这一步，
