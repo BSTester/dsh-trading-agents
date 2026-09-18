@@ -15,12 +15,15 @@
 // services/pipeline.js（node --test 直测），本文件只做接线与布局。
 import React from "react";
 import { Alert, Button, Card, Space, Steps, Tag, Typography } from "antd";
+import { TimelineChart } from "../charts/timeline.jsx";
 import { useEndpoint } from "../services/hooks.js";
 import { modeBadge } from "../services/mode.js";
 import { configWarningRows, stageChainEmptyText } from "../services/fieldState.js";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketLabelOf } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
+import { chartEmptyText } from "../services/portfolioCharts.js";
+import { pipelineTimelineItems } from "../services/runtimeCharts.js";
 import {
   MARKETS, autoPipelineBadge, marketLabel, stageDrill, stageEntries,
   stageStatus, stageStatusText, stageTagColor, stageTimeText,
@@ -68,6 +71,9 @@ export default function PipelinePage() {
   // 全局（晚间链）与自动执行/kill/halt 状态没有市场维度，保持显示。
   const filtered = !isAllMarkets(market);
   const shownMarkets = filtered ? MARKETS.filter((item) => item === market) : MARKETS;
+  // 时间轴跟随同一个市场筛选；未读到快照时传 null（函数据此说「尚未读取」，
+  // 而不是把「还没读到」说成「没有阶段」）。
+  const chain = pipelineTimelineItems(pipeline.value ?? null, { market });
 
   return (
     <Card title="流程" extra={(
@@ -116,6 +122,41 @@ export default function PipelinePage() {
 
         <Card type="inner" title="全局（晚间链）">
           <StageChain stages={stagesOf(value.global)} loading={pipeline.loading} />
+        </Card>
+
+        {/* 当日作业链时间轴（第三批图表）：横轴是时刻，每行一个阶段——条左端是计划时刻
+            （scheduled，按 payload.date 定位）、右端是实际时刻（at），两者都有时条长就是
+            当天的「计划 → 实际」漂移；只有一个时刻时画成瞬时点。派生与跳过计数在
+            services/runtimeCharts.js（node --test 直测），本处只接线。 */}
+        <Card type="inner" title="当日作业链时间轴（计划 → 实际）">
+          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              每行一个阶段：时间条左端是计划时刻、右端是实际时刻，两者都有时条长即当天漂移；
+              只有一个时刻的阶段按瞬时点画。悬停可见阶段名、状态、计划与实际时刻、摘要。
+              {filtered
+                ? `当前筛选：${marketLabelOf(market)} + 全局（与上面的卡片同一份数据）。`
+                : "当前为全部市场：全局链与 SH/HK/US 三条链一起画，行名前缀即所属链。"}
+            </Typography.Text>
+            <TimelineChart items={chain.items}
+              emptyText={chartEmptyText({
+                loading: pipeline.loading && !pipeline.value,
+                loadingText: "流程快照加载中…",
+                count: chain.items.length,
+                emptyText: "流程快照里没有任何阶段（markets/global 为空）。",
+                missingText: "所有阶段都没有可用的计划/实际时刻，没有可画上轨道的项。",
+              })} />
+            {chain.skippedLabels.length > 0 && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {`未画上轨道（无计划时刻、也无实际时刻）：${chain.skippedLabels.join("、")}`}
+              </Typography.Text>)}
+            {chain.crossDay > 0 && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {`其中 ${chain.crossDay} 项的实际时刻不在 ${value.date ?? "—"} 当日（跨日运行记录），`
+                  + "已按实际时刻原样画出，悬停里也有标注。"}
+              </Typography.Text>)}
+            {chain.note && !(pipeline.loading && !pipeline.value) && (
+              <Typography.Text type="warning" style={{ fontSize: 12 }}>{chain.note}</Typography.Text>)}
+          </Space>
         </Card>
 
         <Typography.Text type="secondary" style={{ fontSize: 12 }}>

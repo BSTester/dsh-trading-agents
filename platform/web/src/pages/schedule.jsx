@@ -22,11 +22,14 @@
 // 「不猜」：作业表只列实际返回的 job/ran；缺字段一律 —。
 import React from "react";
 import { Alert, App, Button, Card, Space, Table, Tag, Typography } from "antd";
+import { TimelineChart } from "../charts/timeline.jsx";
 import { callApi } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketLabelOf, viewScheduleJobs } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
+import { chartEmptyText } from "../services/portfolioCharts.js";
+import { scheduleTimelineItems } from "../services/runtimeCharts.js";
 import { stampOf } from "../services/format.jsx";
 
 const HEARTBEAT_STALE_MS = 5 * 60_000;
@@ -67,6 +70,10 @@ export default function SchedulePage() {
   const { message, modal } = App.useApp();
   const schedule = useEndpoint("schedule", {}, []);
   const reconcile = useEndpoint("reconcile", {}, []);
+  // 流程端点只为一件事：拿服务端 _JOB_LABELS 的**中文阶段名**给时间轴当行名
+  // （前端不自建第二份作业名映射表，见 services/runtimeCharts.js 的文件头）；
+  // 取不到就回落原始作业名，并给出一条说明，不影响调度页任何既有内容。
+  const pipeline = useEndpoint("pipeline", {}, []);
   const { market } = useMarketFilter();
   const [busy, setBusy] = React.useState(false);
 
@@ -89,6 +96,8 @@ export default function SchedulePage() {
   const jobView = viewScheduleJobs(value.jobs ?? [], market, { scope: "作业历史" });
   const jobs = jobView.rows;
   const alerts = reconcile.value?.alerts ?? [];
+  // 作业时刻表：吃**同一份**过滤后的行（图与表同源），不再自己过滤一次市场
+  const timeline = scheduleTimelineItems(jobs, { pipeline: pipeline.value });
   // 告警行没有服务端 id：键在渲染前一次算好（antd 的 rowKey 不再传下标）
   const alertRows = alerts.map((row, index) => ({
     ...row, _key: `${row.created_at ?? ""}|${row.title ?? ""}|${index}` }));
@@ -198,6 +207,36 @@ export default function SchedulePage() {
               ? "作业记录加载中…"
               : (jobView.emptyReason ?? "暂无作业记录（daemon 未运行或今日休市）。") }}
             columns={JOB_COLUMNS} />
+        </Card>
+
+        {/* 作业时刻表（第三批图表）：横轴是当天时刻，每行一个作业——回答「今天哪些作业跑了、
+            几点跑的」。调度端点只有实际运行时刻（ran），没有计划时刻字段，故每项都是瞬时点；
+            行名取流程端点的中文阶段名，取不到回落原始作业名并给出说明。派生在
+            services/runtimeCharts.js（node --test 直测），本处只接线。 */}
+        <Card type="inner" title="作业时刻表（按实际运行时刻）">
+          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              横轴是作业最近一次运行的实际时刻（调度端点只有这一列时刻，没有计划时刻，
+              因此每项都是瞬时点）；行名里的前缀是作业键的市场段（GLOBAL 记作「全局」）。
+              与上表同一份过滤结果
+              {filtered ? `（${marketLabelOf(market)} + 全局）` : "（全部市场）"}。
+            </Typography.Text>
+            <TimelineChart items={timeline.items}
+              emptyText={chartEmptyText({
+                reason: jobView.emptyReason,
+                loading: schedule.loading && !schedule.value,
+                loadingText: "作业记录加载中…",
+                count: jobs.length,
+                emptyText: "暂无作业记录（daemon 未运行或今日休市）。",
+                missingText: "作业行都没有可解析的运行时刻，无法定位到时间轴上。",
+              })} />
+            {timeline.skippedLabels.length > 0 && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {`未画上轨道（运行时刻缺失或无法解析）：${timeline.skippedLabels.join("、")}`}
+              </Typography.Text>)}
+            {timeline.note && !pipeline.loading && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>{timeline.note}</Typography.Text>)}
+          </Space>
         </Card>
 
         <Card type="inner" title="告警">

@@ -22,13 +22,16 @@
 // 「只归纳、不推测」：缺字段一律 —，不补默认值；状态码原样展示，不猜标签；
 // 台账模式取 snapshot.value.mode（当前账户模式），切换模式不授权下单。
 import React from "react";
-import { Alert, App, Button, Card, Collapse, Select, Space, Statistic, Table, Tag, Typography } from "antd";
+import { Alert, App, Button, Card, Col, Collapse, Row, Select, Space, Statistic, Table, Tag, Typography } from "antd";
+import { HBarChart } from "../charts/bars.jsx";
 import { callApi } from "../services/api.js";
 import { decideDisabled, remainingSeconds, summaryLines } from "../services/confirm.js";
 import { useEndpoint, useSnapshotPoll } from "../services/hooks.js";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, symbolMarketDisplay, viewBySymbol, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
+import { chartEmptyText } from "../services/portfolioCharts.js";
+import { orderDistribution } from "../services/runtimeCharts.js";
 import { SymbolInput } from "../components/SymbolInput.jsx";
 
 /** ISO 时间 → 展示（分钟精度）；缺失显示「时间未知」（与旧客户端一致，不编造）。 */
@@ -400,6 +403,19 @@ export default function ExecutionPage() {
   // 台账行自带带前缀的 ticker（如 SH.600031）→ 可按标的市场过滤
   const tradeView = viewBySymbol(trades.value?.trades ?? [], market, "ticker", { scope: "本地台账" });
   const tradeRows = tradeView.rows;
+  // 订单分布（第三批图表）：吃上面那张「券商订单」表的**同一份行**（summary.trade_summary.orders），
+  // 不再另取一次数，也不与 OpenAPI 的 orders_history 混算——两者是同一批券商订单（按 order_id
+  // 重合），合起来会重复计数。派生与跳过计数在 services/runtimeCharts.js（node --test 直测）。
+  const distribution = orderDistribution([{ orders }]);
+  const distributionEmpty = chartEmptyText({
+    loading: snapshot.loading && !summary,
+    loadingText: "订单加载中…",
+    count: distribution.total,
+    emptyText: counts.responses
+      ? `观察到的 ${counts.responses} 条券商响应中没有订单事实（均为查询类调用）。`
+      : "暂无券商响应记录。",
+    missingText: "订单行里没有方向、成交情况与状态字段，没有可画的分布。",
+  });
   return (
     <Card title="执行">
       <Space direction="vertical" size="middle" style={{ width: "100%" }}>
@@ -442,6 +458,51 @@ export default function ExecutionPage() {
                 ? `观察到的 ${counts.responses} 条券商响应中没有订单事实（均为查询类调用）。`
                 : "暂无券商响应记录。" }}
             columns={ORDER_COLUMNS} />
+        </Card>
+
+        {/* 订单分布（第三批图表）：与上表同源同口径。两维是**有公开含义**的那些：
+            方向（side，服务端按工具 schema 给中文，数字码 1/2 按 labels.py SIDE 归一）与
+            成交情况（fill，服务端由 qty/cum_qty 自证推导）。券商状态码 status_code 的枚举
+            未公开（页面既有纪律：不猜标签），因此不画成图，只把原码分布写成一行文字。 */}
+        <Card type="inner" title="订单分布（与上表同源）">
+          <Space direction="vertical" size="small" style={{ width: "100%" }}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              {`当前 ${distribution.total} 条订单（快照的券商订单，按订单号去重、保留最后一次观测）。`}
+              {filtered
+                ? "这些订单行没有市场字段（标的无交易所前缀），本图与上表一样不随市场筛选变化。"
+                : ""}
+            </Typography.Text>
+            <Row gutter={[16, 8]}>
+              <Col xs={24} lg={12}>
+                <Typography.Text strong style={{ fontSize: 12 }}>按买卖方向</Typography.Text>
+                <HBarChart items={distribution.bySide}
+                  emptyText={distribution.total > 0
+                    ? "这批订单行没有「方向」字段。"
+                    : distributionEmpty} />
+              </Col>
+              <Col xs={24} lg={12}>
+                <Typography.Text strong style={{ fontSize: 12 }}>按成交情况</Typography.Text>
+                <HBarChart items={distribution.byFill}
+                  emptyText={distribution.total > 0
+                    ? "这批订单行没有「成交情况」字段（OpenAPI 原始行不含该字段）。"
+                    : distributionEmpty} />
+              </Col>
+            </Row>
+            {distribution.byStatus.length > 0 && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {"券商状态原码分布："}
+                {distribution.byStatus.map((row) => `${row.label}×${row.value}`).join("、")}
+                （枚举含义未公开，原样计数，与上表「状态原码」列同源；不猜标签）
+              </Typography.Text>)}
+            {(distribution.skippedSide > 0 || distribution.skippedFill > 0
+              || distribution.skippedStatus > 0) && (
+              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+                {`缺字段未计入：方向 ${distribution.skippedSide} 条 · 成交情况 ${distribution.skippedFill} 条`
+                  + ` · 状态 ${distribution.skippedStatus} 条`}
+                {distribution.skipped > 0
+                  ? `；其中 ${distribution.skipped} 条三个字段都没有（一条图都没进）。` : "。"}
+              </Typography.Text>)}
+          </Space>
         </Card>
 
         <Card type="inner" title="下单 / 改单 / 撤单动作"
