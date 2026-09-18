@@ -6,7 +6,7 @@
   "scripts": {
     "dev": "vite",
     "build": "vite build",
-    "lint:charts": "esbuild src/charts/kline.jsx src/charts/line.jsx src/charts/heatmap.jsx --loader:.jsx=jsx --jsx=automatic --bundle --outdir=node_modules/.cache/chart-check",
+    "lint:charts": "esbuild \"src/charts/*.js\" \"src/charts/*.jsx\" --loader:.jsx=jsx --jsx=automatic --bundle --external:react --external:antd --outdir=node_modules/.cache/chart-check",
     "test": "node --test \"tests/*.test.mjs\""
   },
   "dependencies": {

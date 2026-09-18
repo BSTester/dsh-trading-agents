@@ -51,3 +51,44 @@ export function compactNumber(value) {
   if (abs >= 1e4) return `${(number / 1e4).toFixed(2)}万`;
   return number.toLocaleString("en-US", { maximumFractionDigits: 0 });
 }
+
+/**
+ * 轴标签/行名的通用数值文案（图形原语默认值）：
+ * 整数原样（行权价 760 不该显示成 760.00）、小数保留两位（IV 13.111 → 13.11）、
+ * 千级以上走 compactNumber（成交量 350107 → 35.01万）、缺失 → "—"。
+ */
+export function axisNumberText(value) {
+  if (value === null || value === undefined || value === "") return "—";
+  const number = Number(value);
+  if (!Number.isFinite(number)) return "—";
+  if (Math.abs(number) >= 1000) return compactNumber(number);
+  return Number.isInteger(number) ? String(number) : number.toFixed(2);
+}
+
+/**
+ * 文本按可用宽度截断（超出补省略号），返回值保证 `measure(结果) <= maxWidth`。
+ *
+ * `measure` 由调用方注入：浏览器里传 `(text) => ctx.measureText(text).width`，node 里传桩
+ * 函数——所以本函数可被单测锁定（canvas 本身测不了）。
+ *
+ * 为什么必须有它（而不是让 `fillText` 自己溢出）：canvas 的 `fillText` **没有裁剪、也不报错**，
+ * 超出画布的部分直接消失。2026-09-18 K 线右边缘价格标签就是这样被裁掉一位的；横向条形图的
+ * 左侧行名（如 `US.SPY260918C760000`）同理——它比任何合理的标签列都长。
+ *
+ * 边界兜底：`maxWidth <= 0` → `""`；文本本身放得下 → 原样返回（不做无谓的截断）；
+ * 连省略号都放不下 → `""`（宁可空着，也不画一段被裁一半的字）。
+ */
+export function truncateText(text, maxWidth, measure) {
+  const source = text === null || text === undefined ? "" : String(text);
+  if (!(maxWidth > 0)) return "";
+  const widthOf = typeof measure === "function" ? measure : (value) => value.length * 7;
+  if (!(widthOf(source) > maxWidth)) return source;
+  const ellipsis = "…";
+  if (!(widthOf(ellipsis) <= maxWidth)) return "";
+  for (let keep = source.length - 1; keep > 0; keep -= 1) {
+    if (widthOf(source.slice(0, keep) + ellipsis) <= maxWidth) {
+      return source.slice(0, keep) + ellipsis;
+    }
+  }
+  return ellipsis;
+}

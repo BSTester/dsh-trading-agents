@@ -16,21 +16,25 @@
 // 切成手动编辑整份 filter，此时以 JSON 为准）。
 import React from "react";
 import {
-  Alert, Button, Card, Collapse, Input, InputNumber, Radio, Select, Space, Switch, Table,
-  Typography,
+  Alert, Button, Card, Collapse, Divider, Input, InputNumber, Radio, Select, Space, Switch,
+  Table, Typography,
 } from "antd";
 import { callApi } from "../services/api.js";
 import { useEndpoint } from "../services/hooks.js";
 import { num } from "../services/format.jsx";
 import { RawCollapse } from "../lib/raw-collapse.jsx";
 import { SymbolInput } from "../components/SymbolInput.jsx";
+import { VBarChart } from "../charts/bars.jsx";
+import { CHART_PALETTE } from "../charts/canvas.js";
+import { ScatterChart } from "../charts/scatter.jsx";
+import { themeColors } from "../charts/theme.js";
 import {
   dataplaneHint, exerciseProbabilitySummary, optionVolatilitySummary, strikeRows,
 } from "../services/f10.js";
 import {
-  DEFAULT_OPTION_SCREEN_FORM, OPTION_FIELD_FILTER_FIELDS, OPTION_INDICATOR_TYPE_VERIFIED,
-  OPTION_MARKET_CATEGORIES, buildOptionScreenFilter, formatOptionScreenFilter,
-  parseOptionScreenJson,
+  DEFAULT_OPTION_SCREEN_FORM, MIN_SMILE_ROWS, OPTION_FIELD_FILTER_FIELDS,
+  OPTION_INDICATOR_TYPE_VERIFIED, OPTION_MARKET_CATEGORIES, buildOptionScreenFilter,
+  formatOptionScreenFilter, optionScreenGroups, parseOptionScreenJson, smileSeries, strikeBars,
 } from "../services/optionScreen.js";
 
 const { TextArea } = Input;
@@ -151,6 +155,132 @@ function ScreenRow({ label, hint, children }) {
 }
 
 /**
+ * 期权筛选结果的图表区（WP26，2026-09-18 用户需求：「在适当的地方增加一些图表的展示」）。
+ *
+ * 两张图（放在结果表格**下方**：表格是主结果，图表是补充视角，不让图把表挤到首屏之外）：
+ *   1. **IV 微笑**：x = 行权价、y = 隐含波动率（%），CALL/PUT 两条系列（红/绿分色，
+ *      取自主题——这里只用颜色区分方向，不含涨跌含义；图例里写明系列名）；
+ *   2. **行权价分布**：按行权价聚合的成交量与持仓量（两条竖向柱状，各自一色，避免把
+ *      「量」和「持仓」堆成一根没有意义的柱子）。
+ *
+ * 分组是必须的：真机结果里**混着多个标的与多个到期日**，不分组连出来的「微笑」是把
+ * SPY 与 QQQ 的行权价串成一条线——那不是数据，是画出来的假象。所以两个选择器的选项
+ * 全部从结果行去重派生（标的按行数降序），缺省就是行数最多的那一组。
+ *
+ * 数据与几何全部来自纯函数（services/optionScreen.js + charts/*，均有 node --test）：
+ * 本组件只做接线、派生选项与空态文案；一行都解析不出行权价的合约代码不会被猜，
+ * 而是计数后在图下如实写明。
+ */
+function OptionScreenCharts({ rows, limit }) {
+  const derived = React.useMemo(() => optionScreenGroups(rows), [rows]);
+  const { groups, unparsed } = derived;
+  const [pickedUnderlying, setPickedUnderlying] = React.useState(null);
+  const [pickedKey, setPickedKey] = React.useState(null);
+  const colors = themeColors();
+
+  // 选择器选项：从结果行去重派生（标的按行数降序；同数按名称升序保证稳定）
+  const underlyingOptions = React.useMemo(() => {
+    const counter = new Map();
+    groups.forEach((group) => {
+      counter.set(group.underlying, (counter.get(group.underlying) ?? 0) + group.count);
+    });
+    return [...counter.entries()]
+      .sort((left, right) => (right[1] - left[1]) || left[0].localeCompare(right[0]))
+      .map(([value, count]) => ({ value, label: `${value}（${count} 行）` }));
+  }, [groups]);
+  // 选择器 → 当前组：所选值在新结果里不存在时回落到行数最多的那组（groups[0]）
+  const activeUnderlying = groups.some((group) => group.underlying === pickedUnderlying)
+    ? pickedUnderlying : groups[0]?.underlying ?? null;
+  const expiryOptions = React.useMemo(() => groups
+    .filter((group) => group.underlying === activeUnderlying)
+    .sort((left, right) => right.count - left.count)
+    .map((group) => ({ value: group.key, label: `${group.expiry}（${group.count} 行）` })), [groups, activeUnderlying]);
+  const activeKey = groups.some((group) => group.key === pickedKey
+    && group.underlying === activeUnderlying)
+    ? pickedKey : expiryOptions[0]?.value ?? null;
+  const group = groups.find((one) => one.key === activeKey) ?? null;
+
+  const series = React.useMemo(() => (group ? smileSeries(group) : []).map((one) => ({
+    ...one,
+    // CALL 用涨色（红）、PUT 用跌色（绿）：只为分色可辨，不表示涨跌（图例里有系列名）
+    color: one.key === "CALL" ? colors.up : colors.down,
+  })), [group, colors.up, colors.down]);
+  const bars = React.useMemo(
+    () => (group ? strikeBars(group) : { volume: [], openInterest: [] }), [group]);
+  const volumeItems = bars.volume.map((item) => ({ ...item, color: colors.line }));
+  const openInterestItems = bars.openInterest.map(
+    (item) => ({ ...item, color: CHART_PALETTE[1] }));
+  const usablePoints = group ? group.points.filter((point) => point.iv !== null).length : 0;
+  const limitText = limit === null || limit === undefined || limit === "" ? "未设" : String(limit);
+  const smileEmpty = group
+    ? `本组 ${group.count} 行、其中 ${usablePoints} 行有隐含波动率，画不出微笑`
+      + `（至少 ${MIN_SMILE_ROWS} 个点）：把「条数上限」加到 100 以上再筛选（当前 ${limitText}）。`
+    : "没有可画的组：先筛选出结果，并且结果里要有能解析出行权价的合约代码。";
+
+  if (groups.length === 0) {
+    return (
+      <Alert type="info" showIcon
+        message={`结果里没有可用行：${rows.length} 行都无法从合约代码解析出行权价与到期日。`}
+        description="行权价编码在 code 尾部（如 US.SPY260918C760000 → 760），解析不出就不画——不猜。" />);
+  }
+  return (
+    <Card type="inner" title="图表：IV 微笑与行权价分布" style={{ marginTop: 12 }}>
+      <Space direction="vertical" size="small" style={{ width: "100%" }}>
+        <Space align="center" wrap size={8}>
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>标的</Typography.Text>
+          <Select style={{ width: 200 }} value={activeUnderlying ?? undefined}
+            onChange={(value) => { setPickedUnderlying(value); setPickedKey(null); }}
+            options={underlyingOptions} aria-label="图表分组标的" />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>到期日</Typography.Text>
+          <Select style={{ width: 200 }} value={activeKey ?? undefined}
+            onChange={(value) => setPickedKey(value)}
+            options={expiryOptions} aria-label="图表分组到期日" />
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {`本组 ${group?.count ?? 0} 行 · 缺省选行数最多的一组`
+              + `（结果里共 ${groups.length} 组，混着多个标的/到期日）`}
+          </Typography.Text>
+        </Space>
+        {unparsed > 0 && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {`另有 ${unparsed} 行的合约代码解析不出行权价，未进入任何图（宁缺毋假，不猜行权价）。`}
+          </Typography.Text>)}
+        {/* 真机实测（2026-09-18）：open_interest / strike_date **不请求就恒为 null**。
+            这里如实指出「字段没请求」，而不是让用户对着空柱状图猜是不是没数据。 */}
+        {group && group.points.every((point) => point.openInterest === null) && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            本组 open_interest 全为 null：在「返回字段」里加上 open_interest 再筛选，
+            持仓量图才有柱子（不请求就是 null，不是 0）。
+          </Typography.Text>)}
+        {group && group.expiry.startsWith("代码内 ") && (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            {`本组行没有 strike_date（返回字段里没请求它），到期日是用代码里的 6 位：${group.expiry}。`}
+          </Typography.Text>)}
+        <Typography.Text strong style={{ fontSize: 12 }}>
+          IV 微笑（x = 行权价，y = 隐含波动率 %）
+        </Typography.Text>
+        <ScatterChart series={series} xLabel="行权价" yLabel="隐含波动率 %"
+          height={260} minPoints={MIN_SMILE_ROWS} emptyText={smileEmpty} />
+        <Divider style={{ margin: "4px 0" }} />
+        <Typography.Text strong style={{ fontSize: 12 }}>
+          成交量（按行权价聚合）
+        </Typography.Text>
+        <VBarChart items={volumeItems}
+          emptyText="本组没有可画的成交量：上游这些行的 volume 都是 null。" />
+        <Typography.Text strong style={{ fontSize: 12 }}>
+          持仓量（按行权价聚合）
+        </Typography.Text>
+        <VBarChart items={openInterestItems}
+          emptyText="本组没有可画的持仓量：上游这些行的 open_interest 都是 null。" />
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          两张柱状图各按行权价聚合本组全部行（CALL/PUT 在同价位合并）；柱高单位是「股/张」，
+          横轴是行权价，缺值的行权价不画（图下会写明跳过条数）。数值口径与表格一致：上游给的是
+          数字字符串，页面转数值后再聚合，null 不当 0。
+        </Typography.Text>
+      </Space>
+    </Card>);
+}
+
+/**
  * 期权筛选（WP25 表单化）：默认用**表单控件**生成载荷（组装规则全在
  * services/optionScreen.js，页面不做形状判断）；手写 JSON 收进「高级（JSON）」逃
  * 生口——那里能看表单生成的载荷，也能切到手动编辑整份 filter（打开后以 JSON 为准）。
@@ -209,7 +339,9 @@ function OptionScreen() {
       setBusy(false);
     }
   };
-  const rows = result?.value ? rowsOf(result.value) : [];
+  // rows 按结果记忆：表格与两张图共用同一份数组（每次渲染新建会让图表区白白重算分组）
+  const rows = React.useMemo(
+    () => (result?.value ? rowsOf(result.value) : []), [result]);
   return (
     <>
       <Alert type="info" showIcon style={{ marginBottom: 8 }} message={(
@@ -252,7 +384,7 @@ function OptionScreen() {
             aria-label="指标值 indicator_value.value_list" />
         </ScreenRow>
         <ScreenRow label="返回字段"
-          hint="field_filter 的键；预置的 3 个经验证，其它字段名可自由输入（未验证）">
+          hint="field_filter 的键；预置项里标了「已验证」的经真机验证，其它字段名可自由输入（未验证）">
           <Select mode="tags" style={{ minWidth: 480 }}
             value={form.fieldFilter}
             onChange={(value) => patch("fieldFilter", value)}
@@ -332,6 +464,9 @@ function OptionScreen() {
             scroll={{ x: "max-content" }}
             locale={{ emptyText: "上游返回了空结果。" }}
             columns={chainColumns(rows)} />
+          {/* 图表放在表格下方：表格是筛选的主结果（先看见行），图表是补充视角；
+              两者都用同一份 rows（同一口径，不各自再取一次数）。 */}
+          {rows.length > 0 && <OptionScreenCharts rows={rows} limit={form.limit} />}
           <RawCollapse value={result.value} loading={false} />
         </>)}
     </>);

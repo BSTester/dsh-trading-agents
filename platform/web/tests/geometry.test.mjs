@@ -1,7 +1,9 @@
 // 图表几何纯函数（自 client.js 移植，规格 §4.2）。宿主无关，node --test 直测。
 import test from "node:test";
 import assert from "node:assert/strict";
-import { barIndexAt, tooltipLeft, compactNumber, priceTagRect } from "../src/charts/geometry.js";
+import {
+  axisNumberText, barIndexAt, compactNumber, priceTagRect, tooltipLeft, truncateText,
+} from "../src/charts/geometry.js";
 
 test("barIndexAt：绘图区左右留白返回 null，不得误命中首尾", () => {
   const geometry = { padL: 40, plotW: 400, count: 10 };
@@ -48,4 +50,38 @@ test("priceTagRect：贴顶/贴底与极窄画布都收回画布内", () => {
   const narrow = priceTagRect(20, 40, 12, 20, 46);      // 窄画布比标签还窄
   assert.equal(narrow.x, 0, "宁可压左边界也不出现负 x（负数坐标同样会裁掉价格）");
   assert.equal(priceTagRect(1079, 360, 12, 200, 0).w, 0);
+});
+
+// 2026-09-18 第一批图表原语：`fillText` 没有裁剪也不报错，超宽文字直接被画布吃掉
+// （K 线右侧价格标签已经栽过一次）。行名/轴标签宽度必须先在纯函数里收敛。
+test("truncateText：放得下原样返回，放不下补省略号且结果不超宽", () => {
+  const measure = (text) => text.length * 7;   // 等宽桩：每字符 7px
+  assert.equal(truncateText("SPY", 21, measure), "SPY");
+  assert.equal(truncateText("US.SPY260918C760000", 70, measure), "US.SPY260…",
+               "尽量保留可见前缀（10 字符 × 7px = 70px 刚好放下）");
+  assert.equal(truncateText("US.SPY260918C760000", 1000, measure), "US.SPY260918C760000");
+  for (const width of [14, 21, 49, 70, 140]) {
+    const text = truncateText("US.SPY260918C760000", width, measure);
+    assert.ok(measure(text) <= width, `宽度 ${width} 下 "${text}" 仍超宽`);
+  }
+});
+
+test("truncateText：退化输入的兜底（不返回超宽文本，也不抛）", () => {
+  assert.equal(truncateText("abc", 0, (t) => t.length * 7), "");
+  assert.equal(truncateText("abc", -5, (t) => t.length * 7), "");
+  assert.equal(truncateText("abc", 3, (t) => t.length * 7), "", "连省略号都放不下 → 空");
+  assert.equal(truncateText(null, 100, (t) => t.length * 7), "");
+  assert.equal(truncateText(undefined, 100), "");
+  assert.equal(truncateText(12345, 100, (t) => t.length * 7), "12345", "数字也要能画");
+  assert.equal(truncateText("abc", 10), "…", "缺 measure 时按 7px/字符 估算");
+});
+
+test("axisNumberText：整数原样、小数两位、大数走万/亿、缺失 —", () => {
+  assert.equal(axisNumberText(760), "760");
+  assert.equal(axisNumberText(13.111), "13.11");
+  assert.equal(axisNumberText(350107), "35.01万");
+  assert.equal(axisNumberText(-0.5), "-0.50");
+  assert.equal(axisNumberText(null), "—");
+  assert.equal(axisNumberText(""), "—");
+  assert.equal(axisNumberText("758.5"), "758.50", "上游数字字符串也要认");
 });
