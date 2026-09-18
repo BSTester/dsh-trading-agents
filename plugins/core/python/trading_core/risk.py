@@ -31,9 +31,13 @@ def pre_trade_checks(order, ctx):
     # 规则 2 模式一致
     if order["mode"] != ctx["mode"]:
         return Verdict(False, 2, f"订单模式 {order['mode']} != 账户模式 {ctx['mode']}")
-    # 规则 3 交易时段
+    # 规则 3 交易日（**日粒度**：只查 ctx["is_trading_day"]）
+    # 文案只说它真正检查的事：本规则拿不到时钟/日历，**不判**连续竞价或半日市收盘；
+    # 钟点层的守卫在平台侧——人工写入走 server/trading.py 的时段闸门（sessions），
+    # 自动执行走 autopilot 守卫 9 的执行窗口。文案若声称「非连续竞价时段」，就是
+    # 让调用方以为这里挡得住盘中/收盘后的单，而实际它只按日拦休市。
     if not ctx["is_trading_day"]:
-        return Verdict(False, 3, "非交易日/非连续竞价时段")
+        return Verdict(False, 3, "非交易日：不提交订单")
     # 规则 4 单笔风险
     risk_amt = order["qty"] * (order.get("stop_dist") or order["price"])
     if risk_amt > ctx["equity"] * cfg["risk_per_trade"]:

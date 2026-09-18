@@ -32,6 +32,8 @@ from trading_core import oms as core_oms  # noqa: E402
 from trading_core import store as core_store  # noqa: E402
 
 ORDER = {"symbol": "HK.00700", "side": "BUY", "qty": 100, "price": 123.5}
+#: WP19：时段闸门的**注入时钟**（北京时间 10:00 → 港股 09:00–16:10 窗口内）。
+SESSION_NOW = "2026-09-18 10:00:00"
 RISK_CONFIG = {"risk_per_trade": 0.01, "stop_atr_mult": 2.0, "max_positions": 5,
                "daily_loss_limit_pct": 0.03, "max_position_pct": 0.25}
 
@@ -88,6 +90,7 @@ class _GateCase(unittest.TestCase):
         kw.setdefault("broker", self.broker)
         kw.setdefault("confirm", _Confirm())
         kw.setdefault("ctx_builder", fixed_ctx())
+        kw.setdefault("now", SESSION_NOW)  # WP19 时段闸门：注入固定时刻（港股盘中）
         return trading.TradeGate(str(self.home), **kw)
 
     def rows(self):

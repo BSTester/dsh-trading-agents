@@ -527,6 +527,19 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
                     command_payload["expected_mode"] = payload.get("expected_mode")
                 elif type_ == "cancel_plan" and isinstance(payload.get("plan_hash"), str):
                     command_payload["plan_hash"] = payload["plan_hash"]
+                # WP19 第四组：**人工触发**的时段闸门（与 trade_place/trade_modify 的
+                # 时段闸门同一事实源 trading_core.sessions）。放在模式/口令校验之后
+                # （既有错误消息优先）、写指令文件之前（拒绝时零指令落盘）。
+                # 自动执行链（autopilot.auto_execute）不经本端点：它自己写同形指令文件，
+                # 时段约束由守卫 9 的执行窗口把关——这里只挡「人点的那一下」。
+                # 注入的 trade 替身没有该方法时跳过（测试替身只验路由；见 guard 判定）。
+                guard = getattr(trade, "plan_session_refusal", None)
+                if guard is not None and type_ == "execute_plan":
+                    refusal = guard(command_payload.get("plan_hash"))
+                    if isinstance(refusal, str) and refusal:
+                        return {"ok": False, "error": {"code": trading.SESSION_GATE_CODE,
+                                                       "message": refusal,
+                                                       "details": {}}}
                 # 口令字段到此为止：绝不进入 command_payload（规格 §5.2 P3）
                 nonce = compute.write_command(write_home, type_, command_payload)
                 return {"ok": True, "value": {"queued": True, "nonce": nonce, "action": action}}

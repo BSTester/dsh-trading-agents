@@ -193,9 +193,10 @@ def pre_trade_checks(order, ctx):
     # 规则 2 模式一致
     if order["mode"] != ctx["mode"]:
         return Verdict(False, 2, f"订单模式 {order['mode']} != 账户模式 {ctx['mode']}")
-    # 规则 3 交易时段
+    # 规则 3 交易日（**日粒度**；WP19 修订：文案只说它真正检查的事——原为
+    # 「非交易日/非连续竞价时段」，但本规则没有时钟，钟点判定在平台层时段闸门）
     if not ctx["is_trading_day"]:
-        return Verdict(False, 3, "非交易日/非连续竞价时段")
+        return Verdict(False, 3, "非交易日：不提交订单")
     # 规则 4 单笔风险
     risk_amt = order["qty"] * (order.get("stop_dist") or order["price"])
     if risk_amt > ctx["equity"] * cfg["risk_per_trade"]:

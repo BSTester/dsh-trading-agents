@@ -73,7 +73,8 @@ Harness 内 `plugins/workbench` 保留 `tradingWorkbench` 服务锚
         │   心跳/告警协议不变，daemon CLI 保留为手动入口）
         ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
         ├─ /mcp（mcp SDK streamable-http，74 工具）→ Harness 的 mcp__quantwb__*
-        ├─ 交易闸门：mode → 风控 8 规则（kill=规则 1）→ 业务确认（Web 卡片，进程内）
+        ├─ 交易闸门：mode → 时段闸门（WP19：非可委托时段即拒，撤单放行）
+        │   → 风控 8 规则（kill=规则 1）→ 业务确认（Web 卡片，进程内）
         │   └ broker 适配（sim；live 经 OpenAPI place/modify/cancel/order-confirm，
         │     未经真实 live 下单验证——sim→live 冒烟属 P4 人工准入）
         ├─ WS 推送（富途行情/交易事件 → OMS+告警；对账兜底轮询保留）
@@ -459,7 +460,7 @@ Client 用 `ctx.connection.rpc.call` 调用并继承 Connection 信任——该 
 | `confirm-decide` | `{id, decision: "approved"\|"rejected"}` | 提交用户的决定；**唯一能批准实盘操作的通道**，只由独立 Web 确认卡片的用户点击触发（不进 MCP 工具面） |
 | `factors-history`（WP7） | `{limit?}`（1..120，TTL 5m 缓存） | 定时收集的因子快照历史（按交易日倒序） |
 | `sentiment-history`（WP11） | `{symbol?, limit?}`（1..120，TTL 5m 缓存） | 给了 `symbol` → 该标的情绪快照倒序记录；未给 → 最近有记录日摘要 `{date, symbols, sources, days}`。**只作研究参考，不参与信号计算**（`factors.py` 铁律：情绪永不入因子计算） |
-| `trade_place` / `trade_modify` / `trade_cancel`（WP7；WP8 任务 6 扩面） | `trade_place`: `{symbol*, side*, qty*, order_type?, price?, time_in_force?, session?, aux_price?, lot_type?, remark?, order_class?, multi_leg_info?, client_order_id?}`（官方 place-order 全字段：8 种 order_type / GTC / 美股时段（市价单仅 RTH）/ 触发价 / 港股手数 / 备注 ≤64B / 多腿 MLEG）；`trade_modify`: 另加 `aux_price?`（官方改单请求体无 order_type）；`trade_cancel`: `{order_id*, symbol*, client_order_id?}` | 经交易闸门链的写操作；字段校验（条件必填/枚举/互斥/结构，**早于风控与确认**）失败 → `trading/invalid-operation`（消息带官方允许值），风控/确认/券商失败 → `trading/order-rejected` / `trading/broker-unavailable`，绝不 500；sim 通道仅支持限价当日单，扩展字段如实拒绝、不静默丢弃 |
+| `trade_place` / `trade_modify` / `trade_cancel`（WP7；WP8 任务 6 扩面；WP19 时段闸门） | `trade_place`: `{symbol*, side*, qty*, order_type?, price?, time_in_force?, session?, aux_price?, lot_type?, remark?, order_class?, multi_leg_info?, client_order_id?}`（官方 place-order 全字段：8 种 order_type / GTC / 美股时段（市价单仅 RTH）/ 触发价 / 港股手数 / 备注 ≤64B / 多腿 MLEG）；`trade_modify`: 另加 `aux_price?`（官方改单请求体无 order_type）；`trade_cancel`: `{order_id*, symbol*, client_order_id?}` | 经交易闸门链的写操作；**时段闸门（WP19）**：`place`/`modify` 不在市场可委托时段（`trading_core.sessions`，半日市按 `trade_second` 缩短）→ `trading/order-rejected` + 消息以「时段闸门拒绝：」开头，**零券商调用、不落 OMS/风控行**；**撤单一律放行**（减少敞口不新增风险）。字段校验（条件必填/枚举/互斥/结构，**早于风控与确认**）失败 → `trading/invalid-operation`（消息带官方允许值），风控/确认/券商失败 → `trading/order-rejected` / `trading/broker-unavailable`，绝不 500；sim 通道仅支持限价当日单，扩展字段如实拒绝、不静默丢弃 |
 | `account_positions` / `account_orders` / `account_funds`（WP7） | `{mode?}` | 券商账户查询直通（模式文件约束；不进任何缓存；失败账户列入 `errors` 不掩盖） |
 | `push_status`（WP8 任务 6） | `{}`（空载荷，TTL 0） | 富途 WS 推送状态：`{enabled, started, reason, last_error, quote, trade}`——与 `/healthz` 的 `push` **同一实现、同一事实**（quote/trade 各含 connected/authenticated/最后消息时间/重连次数/订阅意图） |
 | `push_subscribe` / `push_unsubscribe`（WP8 任务 6） | `{quote?, order_book?, ticker?, kline?: [{symbol, period, adjust}]}`（**非交易**载荷） | 追加/精确移除本地连接订阅意图（不改模式、不过风控、不产生订单）；成功回意图快照；推送未启用 → `trading/push-unavailable`（如实拒绝），载荷非法 → `trading/invalid-operation`；幂等（重复订阅不重发订阅帧） |

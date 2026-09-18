@@ -33,6 +33,9 @@ from trading_core import risk as core_risk  # noqa: E402
 from trading_core import store as core_store  # noqa: E402
 
 ORDER = {"symbol": "SH.600519", "side": "BUY", "qty": 100, "price": 123.5}
+#: WP19：时段闸门的**注入时钟**（北京时间，沪市连续竞价内）——用例必须与真实运行时刻
+#: 无关，否则同一份代码在夜间运行就会红（闸门本身只认注入的时刻）。
+SESSION_NOW = "2026-09-18 10:00:00"
 RISK_CONFIG = {"risk_per_trade": 0.01, "max_positions": 5, "max_position_pct": 0.25,
                "daily_loss_limit_pct": 0.03}
 
@@ -141,6 +144,7 @@ class GateTestBase(unittest.TestCase):
         kw.setdefault("broker", self.broker)
         kw.setdefault("confirm", self.confirm)
         kw.setdefault("ctx_builder", fixed_ctx())
+        kw.setdefault("now", SESSION_NOW)  # WP19 时段闸门：注入固定时刻（沪市盘中）
         return trading.TradeGate(str(self.home), **kw)
 
     def order_row(self, cid):
@@ -546,7 +550,10 @@ class DefaultCtxTest(GateTestBase):
         home2 = self.home / "empty"
         home2.mkdir()
         (home2 / "trading-account-mode").write_text("sim\n")
-        gate = trading.TradeGate(str(home2), broker=self.broker, confirm=self.confirm)
+        # 注入盘中时刻：本用例要验的是**规则 3**（日历缺失 → is_trading_day False），
+        # 不能让时段闸门先把它拦下（那样断言的就成了时段而不是规则 3）。
+        gate = trading.TradeGate(str(home2), broker=self.broker, confirm=self.confirm,
+                                 now=SESSION_NOW)
         out = gate.place(dict(ORDER))
         self.assertFalse(out["ok"])
         self.assertIn("3", out["error"]["message"])

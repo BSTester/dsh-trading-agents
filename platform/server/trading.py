@@ -55,6 +55,7 @@ try:
     from trading_core import daemon as core_daemon
     from trading_core import oms as core_oms
     from trading_core import risk as core_risk
+    from trading_core import sessions as core_sessions
     from trading_core import store as core_store
 except ImportError:
     # 未安装 trading_core 的直跑环境：回退仓库路径（既有做法）。
@@ -66,6 +67,7 @@ except ImportError:
     from trading_core import daemon as core_daemon
     from trading_core import oms as core_oms
     from trading_core import risk as core_risk
+    from trading_core import sessions as core_sessions
     from trading_core import store as core_store
 
 from server import futu_data
@@ -319,6 +321,39 @@ def _sim_unsupported(clean):
         unsupported.append("order_class")
     unsupported += [name for name in SIM_LIMIT_ONLY_FIELDS if name in clean]
     return unsupported
+
+
+# ---------------------------------------------------------------------------
+# 人工写入的时段闸门（WP19 第四组）
+# ---------------------------------------------------------------------------
+# 为什么它是**平台层的前置闸门**（与字段校验同层）而不是风控第 9 条规则：
+#   * 风控 8 条是「唯一提交入口」的平台不变量，规则编号被规格/文档/测试逐条对齐（规则 3
+#     只查日粒度的 is_trading_day）；插一条时钟规则会改契约，且 risk.py 拿不到时钟与日历；
+#   * 时段是**市场事实**（本地时区 + trade_second），属于平台层对「这笔请求是否值得送进
+#     风控」的预筛，与「字段是否合法」「live 写是否具备通道能力」同一层；
+#   * 因此判定用 trading_core.sessions 的唯一实现，闸门只负责信封化与顺序。
+# 口径（取向「宁可放过、不可错杀」）与逐市场窗口见 sessions 模块 docstring。
+SESSION_GATE_CODE = "trading/order-rejected"
+SESSION_GATE_PREFIX = "时段闸门拒绝："
+#: 人工 plan-execute 的拒绝文案（同一取向，措辞不同：它判的是「整份计划的所有市场」）。
+PLAN_SESSION_REFUSAL = ("时段闸门拒绝：计划涉及的市场当前全部闭市（{facts}）；"
+                        "本闸门是平台前置校验（未触达券商），券商同样会以非交易时段拒单")
+
+
+def _plan_markets(conn, plan_hash):
+    """计划涉及的市场（取自登记在 OMS 的订单；``plan_hash`` = ``content_hash``）。
+
+    计划的 ``orders.market`` 在冻结登记时按标的前缀写入（``build_and_freeze`` 的
+    ``oms.register_order`` 链路），因此这里不需要解析计划内容里的 symbol——**登记事实**
+    比解析 JSON 更接近真相。``content_hash`` 不是主键（同一内容可冻结多次），故按 hash
+    取**全部**匹配计划的订单再去重（同 hash = 同内容 = 同标的，去重后结果一致）。
+    计划不存在/无订单 → 空列表（调用方按「本闸门无事可判」放行）。
+    """
+    rows = conn.execute(
+        "SELECT DISTINCT orders.market AS market FROM orders"
+        " JOIN plans ON plans.plan_id = orders.plan_id"
+        " WHERE plans.content_hash=? ORDER BY market", (str(plan_hash),)).fetchall()
+    return [str(r["market"]).upper() for r in rows if r["market"]]
 
 
 def _risk_price(clean):
@@ -1874,7 +1909,7 @@ def default_broker(home=None):
 # 交易闸门
 # ---------------------------------------------------------------------------
 class TradeGate:
-    """受约束交易闸门：模式 → 风控 8 规则（含 kill）→ 业务确认 → broker。
+    """受约束交易闸门：模式 → 时段闸门 → 风控 8 规则（含 kill）→ 业务确认 → broker。
 
     依赖注入（构造参数，测试全部可替换）：
       * broker       —— place/modify/cancel/positions/orders/funds 接口
@@ -1889,11 +1924,24 @@ class TradeGate:
                         与 agent.cordis.yml 的 quant-platform-mcp 行 toolCallTimeoutMs
                         同值：MCP 调用在 preset 层 120s 先超时、闸门继续等到 TTL 到期
                         按拒绝收尾，模型侧看到超时但订单**不会**在无批准下提交；
-                        preset 行已调为 180000（WP7 任务 5），作答余量充足）。
+                        preset 行已调为 180000（WP7 任务 5），作答余量充足）；
+      * now          —— **时段闸门的时钟**（WP19）：零参 callable 或北京时刻字符串
+                        ``YYYY-MM-DD HH:MM:SS``；缺省 ``_now``（本模块既有做法：东八区、
+                        秒精度）。测试注入固定时刻即可完全离线、与真实运行时刻无关。
+
+    路径分工（**别把自动执行链也算进本闸门**）：
+      * 本类只覆盖**人工**写入——``trade_place`` / ``trade_modify`` 经 ``_write`` 的时段
+        闸门，``trade_cancel`` 一律放行（减少敞口不新增风险）；工作台的
+        ``plan-execute`` 人工触发在入队前经 ``plan_session_refusal`` 判（同一个
+        ``sessions`` 事实源）；
+      * 自动执行链 ``autopilot.auto_execute`` → 指令轮询 → ``daemon.handle_command`` →
+        ``execute.run`` **不经过本收口**（它直接落指令文件），其时段约束由守卫 9
+        （执行窗口 ``exec_window_minutes``）+ 风控 8 规则把关；改这条链会让「自动执行
+        窗口」与「人工闸门」两套口径纠缠，故刻意不动。
     """
 
     def __init__(self, home, broker=None, confirm=None, risk_fn=None, ctx_builder=None,
-                 conn_factory=None, confirm_ttl_ms=None, today=None):
+                 conn_factory=None, confirm_ttl_ms=None, today=None, now=None):
         self.home = str(home)
         self.broker = broker if broker is not None else default_broker(self.home)
         self.confirm = confirm if confirm is not None else StoreConfirm()
@@ -1903,6 +1951,7 @@ class TradeGate:
         self.confirm_ttl_ms = (store_access.CONFIRM_TTL_MS if confirm_ttl_ms is None
                                else confirm_ttl_ms)
         self.today = today
+        self.now = now if now is not None else _now
 
     # ---- 内部 ----
     def _conn(self):
@@ -1912,6 +1961,78 @@ class TradeGate:
 
     def _today(self):
         return self.today or date.today().isoformat()
+
+    def _moment(self):
+        """时段闸门用的当前北京时刻（注入的 callable 或固定字符串）。"""
+        value = self.now
+        return value() if callable(value) else value
+
+    def _day_trade_second(self, conn, market, moment):
+        """该市场**当日**的 ``trade_second``（日历只读助手；缺行/未同步 → ``None``）。
+
+        ``None`` 表示「全天口径」：闸门按全天窗口判时刻。日历缺失**不**让闸门 fail-closed
+        ——非交易日由风控规则 3 逐单兜底（日粒度），时段闸门只判「这个钟点是否明确闭市」。
+        """
+        calendar_market = CALENDAR_MARKET.get(market)
+        if calendar_market is None:
+            return None
+        try:
+            local_day = core_sessions.market_local(market, moment).date().isoformat()
+            row = core_store.calendar_row(conn, calendar_market, local_day) or {}
+        except Exception:  # noqa: BLE001 —— 任何日历/库故障都退回全天口径（不猜 trade_second）
+            return None
+        return row.get("trade_second")
+
+    def session_refusal(self, conn, clean, moment=None):
+        """人工下单的时段判定：不在可委托时段 → 返回可读原因；可委托 → ``None``。
+
+        单笔订单的**平台前置校验**（撤单不调用本方法，见 ``_write`` 的 2.7 步）。
+        未知市场前缀 → fail-closed；未知 ``session`` 取值 → fail-closed；其余按
+        ``sessions.in_window`` 的宽松口径（只挡明确闭市）。
+        """
+        moment = self._moment() if moment is None else moment
+        market = str(clean.get("symbol", "")).split(".", 1)[0].upper()
+        if market not in CALENDAR_MARKET:
+            return (f"未知市场前缀 {market!r}：无时段口径，按 fail-closed 拒绝"
+                    f"（支持 {'/'.join(sorted(CALENDAR_MARKET))}）")
+        trade_second = self._day_trade_second(conn, market, moment)
+        allowed, reason = core_sessions.in_window(
+            market, moment, us_session=clean.get("session"), trade_second=trade_second)
+        return None if allowed else reason
+
+    def plan_session_refusal(self, plan_hash, moment=None):
+        """人工 ``plan-execute`` 入队前的时段闸门：返回拒绝消息或 ``None``。
+
+        与单笔闸门同一事实源、同一取向，但判的对象是**整份计划**：计划涉及的每个市场
+        各判一次，**只有全部市场都闭市**才拒绝整条指令——计划里有一个市场开着就放行
+        （宁可放过、不可错杀：为闭市的那个市场连坐开市市场的订单，代价远大于让券商拒单）。
+
+        解析口径：``plan_hash`` = 计划 ``content_hash``；市场取自计划**登记在 OMS 的订单**
+        （冻结即登记，规格 §4.6）。计划/订单解析不到（拼错 hash、尚未登记、或计划本来
+        就没有订单）→ 放行：计划合法性由 ``execute.run`` 把关，本闸门只判时段，
+        **不做存在性校验**，否则会把「计划不存在」误报成「时段不对」。
+        """
+        moment = self._moment() if moment is None else moment
+        conn = self._conn()
+        try:
+            markets = _plan_markets(conn, plan_hash)
+            if not markets:
+                return None
+            facts = []
+            for market in markets:
+                trade_second = self._day_trade_second(conn, market, moment)
+                allowed, _reason = core_sessions.in_window(
+                    market, moment, trade_second=trade_second)
+                if allowed:
+                    return None
+                local = core_sessions.market_local(market, moment)
+                windows = core_sessions.windows_for(
+                    market, local.date().isoformat(), trade_second=trade_second)
+                facts.append(f"{market} 本地 {local:%m-%d %H:%M} 不在可委托时段 "
+                             f"{core_sessions.format_windows(windows)}")
+        finally:
+            conn.close()
+        return PLAN_SESSION_REFUSAL.format(facts="；".join(facts))
 
     def _risk_basis(self, conn, clean):
         """风险基准价 → ``(price, error_message)``（WP8 任务 6）。
@@ -2055,6 +2176,19 @@ class TradeGate:
         cid = clean.get("client_order_id") or uuid.uuid4().hex
         conn = self._conn()
         try:
+            # 2.7) 时段闸门（WP19）：人工写入收口的前置校验，与字段校验同层——排在既有本地
+            #      前置拒绝之后（不改写它们的错误码契约），在**任何** OMS/风控/确认/券商
+            #      动作之前（与「本地前置拒绝的零上游口径」一致：零券商调用、不落 OMS、
+            #      不落风控行、不消耗确认）。拒绝码用 trading/order-rejected：这是**业务
+            #      状态**拒绝（市场闭市），不是载荷非法——invalid-operation 留给字段/枚举。
+            #      也包括「重复提交回放」：闭市时连回放也不放行——回放结论会让调用方误以为
+            #      这笔单仍在正常工作，如实拒绝更诚实（回放本身不触达券商，故零上游口径不变）。
+            #      撤单**一律放行**：撤单是减少敞口、不新增风险（与 risk.py 规则 7「熔断即
+            #      撤余单」同口径）；闭市时把撤单也挡住，等于让用户无法处置既有风险。
+            if operation != "cancel":
+                refusal = self.session_refusal(conn, clean)
+                if refusal is not None:
+                    return _envelope_fail(SESSION_GATE_CODE, SESSION_GATE_PREFIX + refusal)
             return self._write_gated(conn, operation, clean, mode, cid, session_id)
         finally:
             conn.close()

@@ -205,7 +205,7 @@ class ChainBase(unittest.TestCase):
 
         2026-09-18 修复：此前 poll 用**真实墙钟**取 ``day`` 判交易日——测试只在「真实日期
         恰好是 D0/D1/D2」时通过，日期一过就红（真实今天不在测试日历里 → 规则 3
-        「非交易日/非连续竞价时段」拒单，订单全 cancelled）。测试不许依赖运行时刻，
+        「非交易日：不提交订单」拒单，订单全 cancelled）。测试不许依赖运行时刻，
         沿用 ``test_wp9_e2e`` 的假时钟口径。
         """
         with mock.patch.dict(os.environ, {daemon.FAKE_NOW_ENV: f"{D2} 09:36:00"}), \

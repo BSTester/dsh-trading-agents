@@ -225,7 +225,7 @@ draft → frozen → submitting → submitted → partial → filled
 |---|---|---|
 | 1 | **kill switch**：`~/.dsh/trading-kill` 存在 → 拒绝一切订单 | 工作台一键创建/清除，删文件即恢复 |
 | 2 | 模式一致：订单 mode == 模式文件 + 账户族匹配 | sim/live 互斥的执行侧延伸 |
-| 3 | 交易时段：按 calendar + market_state | 非连续竞价拒单 |
+| 3 | **交易日**：`is_trading_day`（按 calendar 的交易日白名单，**日粒度**） | 非交易日拒单——「非交易日：不提交订单」。**钟点层不在本规则**（`ctx` 没有时钟/日历）：人工下单的钟点由平台层**时段闸门**判（WP19 `trading_core.sessions` + `server/trading.py`），自动执行由守卫 9 的执行窗口判；原表「按 calendar + market_state / 非连续竞价拒单」的措辞与实际实现不符，2026-09-18 对齐 |
 | 4 | 单笔风险 ≤ 权益 × `risk_per_trade` | risk_config.py 现有 5 参数 |
 | 5 | 成交后单票市值 ≤ 权益 × `max_position_pct` | 同上 |
 | 6 | 成交后持仓数 ≤ `max_positions` | 同上 |

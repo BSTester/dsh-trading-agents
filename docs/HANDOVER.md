@@ -541,3 +541,61 @@ SH 503 行 / HK 507 / US 511，边界全部 `2027-12-31`；`2026-10-12`（周一
 - 真实库已同步到 2027-12-31 是**手工**完成的（本轮之前），本轮只是把它接进调度链；
   实机**未**触发过真实网络同步（`calendar-sync` 取数腿的端到端联网路径本轮未实机验证）。
 
+### 8.7 WP19：交易时段事实源（半日市）+ 人工下单时段闸门（2026-09-18 实现 / 只读复验）
+
+**背景（两条实测事实）**：
+
+1. `calendar` 表有 `trade_second` 列（实测取值 SH=14400 / HK=19800 / US=23400，
+   `trade_date_type` 一律 `WHOLE`），但它在**生产代码里从未被使用**——半日市/提前收盘
+   因此没有建模。数据就绪门 `planner.data_date_for` 只认常量全天收盘
+   `SESSION_CLOSE_BEIJING`（SH/HK 当日 15:00/16:00、US 北京次日 05:00），于是港股半日市
+   （真实收盘本地 12:00）在北京 13:00 仍被判「本次会话尚未收盘」→ **当天不产出任何计划**；
+   美股半日（13:00 ET）同理要等到北京次日 05:00。
+2. 人工/Web 下单**没有任何钟点判定**：全仓唯一的钟点守卫是自动路径的
+   `autopilot._within_exec_window`（守卫 9、执行窗口），而 `risk.pre_trade_checks` 的规则 3
+   只查日粒度 `is_trading_day`——但它的文案写着「非交易日/**非连续竞价时段**」，超出了它
+   实际检查的范围（调用方会以为盘中/收盘后的单在风控里挡得住）。
+
+| 修订 | 不变量 / 口径 | 锁定测试 |
+|---|---|---|
+| 新增 `trading_core/sessions.py` | **时段唯一事实源**（两组共用）：时区一律 `zoneinfo`（SH/SZ/BJ=Asia/Shanghai、HK=Asia/Hong_Kong、US=America/New_York），不手算 DST | `tests/test_core_sessions.py` |
+| **半日市收盘 = 开盘 + `trade_second`**（单段、不含午休） | 港股半日 9000s → 本地 **12:00**、美股半日 12600s → **13:00**；用「全天收盘 − 缺口秒数」会把港股算成 13:00（错）。**全天行仍走已知收盘表**（SH 15:00/HK 16:00/US 16:00），否则港股全天会被算成 15:00。半日市在两地实践里都是单段（只有上午）——这就是本算法成立的理由 | `test_core_sessions.HalfDayCloseTest`、`test_hk_half_day_is_single_segment_not_gap_subtraction` |
+| `planner.data_date_for` 改为「**先解析会话日 → 再用该日真实收盘判是否已收盘**」 | 语义不变：未收盘 → `None`（调用方软跳过）、跨市场日期空间（US +1 天）不变、日历未同步 → `RuntimeError`。`trade_second` **缺失/全天 → 逐字沿用** `SESSION_CLOSE_BEIJING`（美股 EST 05:00 的偏保守 DST 口径**刻意不动**） | `tests/test_core_planner.py::HalfDayCloseTest`（含 `test_full_day_rows_keep_legacy_behaviour`、`test_missing_trade_second_keeps_legacy_behaviour`） |
+| `store.calendar_row(conn, market, day)` | 单日只读助手（唯一实现）：planner 不写裸 SQL；该列为 NULL → 键存在值为 `None`（按全天回落，不编造）；无该行 → `None` | `test_core_store.test_calendar_row_reads_one_day` |
+| **人工写入时段闸门**（平台层，与字段校验同层） | `trade_place`/`trade_modify` 在**风控之前**判时段：不在窗口 → `trading/order-rejected` + 「时段闸门拒绝：…」（含市场/当前市场本地时间/当日窗口/「平台前置校验，券商同样会拒」）；**零券商调用、不落 OMS/风控行、不消耗确认**。**撤单一律放行**（减少敞口不新增风险——与规则 7「熔断即撤余单」同口径）。排在既有本地前置拒绝（2.5 live 写能力 / 2.6 sim 能力边界）**之后**：不改写它们的错误码契约；排在幂等回放**之前**（闭市时连「重复提交回放」也不放行） | `tests/test_wp19_session_gate.py::OrderSessionGateTest` |
+| 可委托窗口（取向「**宁可放过、不可错杀**」） | SH/SZ/BJ **09:15–15:00**（含开盘集合竞价与**午间报单**，午休刻意算在内——用「非连续竞价」当理由挡掉午间报单是错杀）；HK **09:00–16:10**（含开市前竞价与收市竞价）；US 常规（`RTH`/缺省）**09:30–16:00**，请求扩展时段（官方 `PLACE_SESSIONS` 里的 `RTH+Pre/Post-Mkt`/`OVERNIGHT`/`ALL_DAY`）→ **04:00–20:00** 并集；**半日缩短上界**（HK 半日 → 12:00 而非 16:10，US 半日 → 13:00），但**只在缩短日**取 `min`（全天日的 HK 16:10 收市竞价、US 盘前盘后必须保留） | 同上 `HalfDayGateTest`/`UsSessionGateTest`/`InWindowTest` |
+| fail-closed 边界 | 未知市场前缀 / 未知 `session` 取值 → 记不允许 + 明确原因；窗口下界晚于上界（极端提前收盘）→ 「无可委托时段」而非负长度窗口；日历缺当日行 → 按**全天**窗口判时刻（不 fail-closed：非交易日由规则 3 日粒度兜底） | 同上 `SessionRefusalUnitTest`、`test_unknown_us_session_fails_closed` |
+| `plan-execute`（**人工触发**）入队前判时段 | 工作台端点写指令文件**之前**判：计划涉及的市场**全部闭市**才拒（有一个开着就放行——为闭市市场连坐开市市场的订单属错杀）；撤销计划（`action=cancel`）不放闸门；计划/订单解析不到 → 放行（计划合法性由 `execute.run` 把关，本闸门只判时段，不做存在性校验） | `tests/test_wp19_session_gate.py::PlanExecuteGateTest` |
+| **不覆盖自动执行链**（刻意） | `autopilot.auto_execute` → 指令轮询 → `daemon.handle_command` → `execute.run` 不经 `TradeGate`，其时段约束是**守卫 9 的执行窗口**；`TradeGate` 与 `plan_session_refusal` 的 docstring 写清两条路径分工，避免以后有人以为闸门覆盖了自动路径 | 同上（`test_all_markets_closed_is_refused_without_writing_a_command` 只覆盖人工端点） |
+| 规则 3 文案纠正 | 由「非交易日/非连续竞价时段」→「**非交易日：不提交订单**」（它只查 `is_trading_day`）。**不给规则 3 加时钟逻辑**：`ctx` 里没有时钟/日历，且「8 条规则是唯一提交入口 + 编号不许改」是平台不变量——钟点判定属平台层前置闸门 | `test_wp19_session_gate.Rule3WordingTest` |
+
+**字面量契约**：拒绝前缀 `时段闸门拒绝：`（`trading.SESSION_GATE_PREFIX`）、错误码
+`trading/order-rejected`（`trading.SESSION_GATE_CODE`）。本轮**未新增告警标题**（闸门是同步
+拒绝路径，不写 `alerts`），因此 `pipeline._ALERT_STATUS` / `_CONTENT_OUTCOMES` 与标题锁不变。
+
+**夹具修正（属于本轮的连锁影响）**：`tests/test_core_planner.py` 与
+`tests/test_wp9_plan_auto.py` 的日历种子原先给**所有市场**写 `trade_second=14400`——写进
+美股日历就是一行「提前收盘 13:30 ET」的**假数据**，新口径如实读出来了（
+`test_us_chain_before_session_close_skips` 因此红过）。夹具改为按市场写各自的全天秒数；
+`tests/test_wp7_trading.py`/`test_wp8_trading.py`/`test_e2e_defect_fixes.py` 的闸门用例改为
+**注入固定时钟**（否则用例会随真实运行时刻飘）。
+
+**只读复验（2026-09-18，不改 `~/.dsh`、不重启服务、不下单）**：见 `docs/RUNBOOK.md`
+「人工下单时段闸门（WP19）」；本轮以真实日历行（`calendar` 表）与 `sessions` 逐市场算
+当日窗口与「当前是否在窗口内」，结果记在交付回报里。
+
+**诚实登记（未决/边界）**：
+
+- `session` 字段在 **sim 模式**下会被既有的 sim 能力边界先拒（`sim` 只支持限价当日单），
+  因此「美股盘前/盘后窗口」实际只在 **live** 通道可达；这是既有契约，本轮未改；
+- US 的 `OVERNIGHT` / `ALL_DAY` 在券商侧有独立夜盘时刻表，本仓库**没有权威来源**：按
+  「宁可放过」取扩展时段并集 04:00–20:00，**不猜**一张可能把真实夜盘挡掉的窄表（如实登记
+  为近似口径，不是精确时段表）；
+- 半日**缩短窗口只在缩短日取 `min(全天窗口上界, 真实收盘)`**：需求文字给的是无条件
+  `min`，但无条件取 min 会把港股全天日的 16:00–16:10 收市竞价与美股 16:00–20:00 盘后
+  挡掉（与「宁可放过」相反），故按缩短日实现并在此登记该读法；
+- `plan-execute` 的人工闸门判「计划涉及市场**全部**闭市」而非逐单：`execute.run` 是整份
+  计划一次执行，逐单拦截会改执行链语义（本轮明确不动执行链）；
+- 撤单**不判时段**也不判交易日（既有语义：规则 3 对撤单同样生效——`default_ctx_builder`
+  的撤单分支只中和敞口字段，`is_trading_day` 仍生效）；本轮未改动该口径。
+

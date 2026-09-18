@@ -228,6 +228,61 @@ curl -s -X POST http://127.0.0.1:8397/api/wb/factors-history \
    `error.code=trading/openapi-unavailable`（见下节「OpenAPI 凭据与通道（WP8）」）。
 5. **订单 `unknown`（提交超时）**：铁律只查询不重放，走场景 2 对账兜底。
 
+### 人工下单时段闸门（WP19）
+
+**它是什么**：`trade_place` / `trade_modify` 与工作台「执行计划」（`plan-execute` 人工触发）
+在**平台层**（与字段校验同层、风控之前）先判「现在是不是可委托时段」。不在 → 业务失败信封
+`trading/order-rejected` + `message` 以「**时段闸门拒绝：**」开头。**零券商调用、零确认消耗、
+不落 OMS 行、不落 `risk_checks` 行、不写指令文件**（与既有的本地前置拒绝同一口径）。
+**撤单（`trade_cancel`）与 `plan-execute` 的 cancel 动作一律放行**——减少敞口不新增风险。
+
+**被拒时怎么确认是「时段」而不是别的**（按顺序看三个字段即可定性）：
+
+1. `error.message` 前缀是「时段闸门拒绝：」→ 时段；若是「风控规则 N：」→ 风控（8 规则）；
+   「参数非法：」→ 字段校验；「券商通道异常：/券商拒单：」→ 通道/券商；「业务确认未通过：」
+   → 确认卡片。**只有时段闸门的消息里同时含**市场、**当前市场本地时间**与**当日可委托时段**；
+2. `error.code`：`trading/order-rejected`（时段/风控/确认/券商拒单同族）→ 用消息前缀区分；
+3. 两张表应当**没有**这一笔（本地前置拒绝不落痕迹）：
+   ```bash
+   sqlite3 ~/.dsh/trading-data/trading.sqlite \
+     "SELECT COUNT(*) FROM orders WHERE created_at LIKE '$(date +%F)%';" \
+     "SELECT rule,reason FROM risk_checks ORDER BY id DESC LIMIT 3;"
+   ```
+
+**逐市场可委托窗口**（本地时间；口径「宁可放过、不可错杀」——只挡明确闭市）：
+
+| 市场 | 窗口 | 说明 |
+|---|---|---|
+| SH / SZ / BJ | 09:15–15:00 | 含开盘集合竞价与**午间报单**（午休刻意算在内：券商普遍接受午间报单并排队） |
+| HK | 09:00–16:10 | 含 09:00 开市前竞价与 16:00–16:10 收市竞价 |
+| US | 09:30–16:00（常规/`RTH`/缺省）<br>04:00–20:00（`session` 请求 `RTH+Pre/Post-Mkt` / `OVERNIGHT` / `ALL_DAY`） | 扩展时段取官方四个取值的并集（本仓库没有夜盘时刻表的权威来源，宁可用并集放过） |
+
+**半日/提前收盘**：窗口上界取**真实收盘**（港股半日 → 12:00、美股半日 → 13:00），依据是
+日历当日行的 `trade_second`（`calendar` 表；半日 = 开盘 + `trade_second`，**单段不含午休**）。
+怎么核当天是不是半日：
+
+```bash
+sqlite3 ~/.dsh/trading-data/trading.sqlite \
+  "SELECT market,day,trade_date_type,trade_second FROM calendar \
+    WHERE day >= date('now','-1 day') ORDER BY market,day LIMIT 12;"
+# 对照全天秒数：SH/SZ/BJ=14400、HK=19800、US=23400；小于即视为提前收盘
+```
+
+**注意三件事**（避免误判为故障）：
+
+- 闸门**只判钟点，不判交易日**：周末/节假日的「窗口内」时刻仍会放行到下一步，由风控
+  **规则 3**（`is_trading_day`，日粒度）逐单拒绝，文案是「非交易日：不提交订单」——
+  两者分工不同，别把规则 3 当成钟点守卫；
+- 日历**缺当日行**（未同步/休市日）→ 闸门按**全天窗口**判时刻（不 fail-closed），
+  非交易日同样落到规则 3；
+- 闸门**不覆盖自动执行链**：`auto_execute` → 指令轮询 → `execute.run` 不经 `TradeGate`，
+  它的时段约束是**守卫 9 的执行窗口**（`exec_window_minutes`，见「窗口超时 / kill /
+  熔断」一节）；因此「自动补跑为什么没跑」要去查执行窗口告警，而不是这条闸门。
+
+**演练/测试注入时钟**：闸门时钟是 `TradeGate(now=...)`（零参 callable 或
+`YYYY-MM-DD HH:MM:SS` 北京时间字符串），缺省 `_now()`（东八区）。测试必须注入固定时刻，
+否则用例会随真实运行时刻飘。
+
 ### OpenAPI 凭据与通道（WP8）
 
 - **凭据配置**：`~/.dsh/futu-openapi.json`（appkey 模式样例）：

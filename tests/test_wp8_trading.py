@@ -84,6 +84,11 @@ from trading_datasource.futu_openapi import (  # noqa: E402
 
 ORDER = {"symbol": "US.AAPL", "side": "BUY", "qty": 100, "price": 150.5}
 A_SHARE_ORDER = {"symbol": "SH.600519", "side": "BUY", "qty": 100, "price": 123.5}
+#: WP19：时段闸门的**注入时钟**（北京时间 23:00 = ET 11:00/10:00 → 美股常规时段内，
+#: 夏令时/冬令时都在窗口里）。注入后用例与真实运行时刻无关。
+SESSION_NOW = "2026-09-18 23:00:00"
+#: 港股在窗口内的对应注入时刻（09:00–16:10；美股与港股窗口不重叠，故分两个常数）。
+SESSION_NOW_HK = "2026-09-18 10:00:00"
 RISK_CONFIG = {"risk_per_trade": 0.01, "max_positions": 5, "max_position_pct": 0.25,
                "daily_loss_limit_pct": 0.03}
 
@@ -897,6 +902,7 @@ class GateOpenApiTest(unittest.TestCase):
         kw.setdefault("broker", self.broker)
         kw.setdefault("confirm", self.confirm)
         kw.setdefault("ctx_builder", fixed_ctx())
+        kw.setdefault("now", SESSION_NOW)  # WP19 时段闸门：注入固定时刻（美股盘中）
         return trading.TradeGate(str(self.home), **kw)
 
     def order_row(self, cid):
@@ -1302,7 +1308,7 @@ MULTI_LEG = {"option_strategy": "Straddle", "underlying_symbol": "AAPL",
 class PlaceFieldBase(unittest.TestCase):
     """字段校验/透传用例基类：每个用例独立 home（OMS 在途查重按标的+方向）。"""
 
-    def new_gate(self, mode="live", legacy=None, **plan):
+    def new_gate(self, mode="live", legacy=None, now=SESSION_NOW, **plan):
         tmp = tempfile.TemporaryDirectory()
         self.addCleanup(tmp.cleanup)
         home = Path(tmp.name)
@@ -1314,7 +1320,7 @@ class PlaceFieldBase(unittest.TestCase):
         broker = trading.OpenApiBroker(trade=backend, legacy=legacy)
         confirm = FakeConfirm()
         gate = trading.TradeGate(str(home), broker=broker, confirm=confirm,
-                                 ctx_builder=fixed_ctx())
+                                 ctx_builder=fixed_ctx(), now=now)
         return gate, backend, confirm, home
 
     def order(self, **over):
@@ -1547,7 +1553,7 @@ class PlaceConditionalFieldTest(PlaceFieldBase):
         self.assertEqual(backend.calls[-1][1]["session"], "RTH")
 
     def test_lot_type_is_hk_only(self):
-        gate, backend, _, _ = self.new_gate()
+        gate, backend, _, _ = self.new_gate(now=SESSION_NOW_HK)
         out = gate.place(self.order(symbol="HK.00700", lot_type="ODD"))
         self.assertTrue(out["ok"], out)
         self.assertEqual(backend.calls[-1][1]["lot_type"], "ODD")
@@ -1556,7 +1562,7 @@ class PlaceConditionalFieldTest(PlaceFieldBase):
         self.assertFalse(out["ok"])
         self.assertIn("港股", out["error"]["message"])
         self.assertEqual(backend.names(), [])
-        gate, backend, confirm, _ = self.new_gate()
+        gate, backend, confirm, _ = self.new_gate(now=SESSION_NOW_HK)
         self.assert_field_error(gate.place(self.order(symbol="HK.00700", lot_type="HALF")),
                                 "ODD", backend, confirm)
 
