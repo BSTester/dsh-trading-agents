@@ -7,6 +7,7 @@ kill 文件约定 ~/.dsh/trading-kill（WP3 risk.py ctx["kill_path"] 同一事�
 import datetime as dt
 import json
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -28,7 +29,8 @@ from .clock import FAKE_NOW_ENV, _real_now, now_fn, now_stamp, warn_fake_now  # 
 
 JOBS_DEFAULT = {
     # WP7：每个有作业的市场收盘链末尾追加 factors_snapshot（先让数据作业落库，
-    # 快照再吃当日数据）；cmd 形式走既有 runner——@watchlist 替换 / 900s 超时 /
+    # 快照再吃当日数据）；cmd 形式走既有 runner——@watchlist/@latest-quarter/@today-Nd
+    # 占位符替换（daemon.resolve_command）/ 900s 超时 /
     # 失败告警语义与协议零改动。
     # WP11：链尾再追加 sentiment_snapshot（factors_snapshot + 10 分钟）。它是**基础链**
     # 作业而非 auto_pipeline 派生作业：情绪/资讯采集是攒 PIT 历史（250 交易日演进条款
@@ -67,7 +69,28 @@ JOBS_DEFAULT = {
     "SH": [{"name": "sync_bars", "at": "16:00", "cmd": ["sync-bars", "--tickers", "@watchlist"]},
             {"name": "sync_fundamentals", "at": "16:00", "cmd": ["fundamentals", "--tickers", "@watchlist"]},
             {"name": "merge_announcements", "at": "16:05", "cmd": ["merge-announcements", "--period", "@latest-quarter"]},
-            {"name": "quality", "at": "16:10", "cmd": ["quality", "--market", "SH"]},
+            # WP20（2026-09-18 全新安装演练缺陷 1）：补上 CLI **必填**的
+            # `--symbols/--start/--end`。此前只给 `--market SH`，argparse 直接退出 2，
+            # 该作业在**任何**库上必然失败——旧库看起来「跑过」，只是当时失败不可见
+            # （失败可见性是 2026-09-17 19:57 的 ce2b47b 才加的，而两次失败发生在
+            # 16:10 与 19:11，都在此之前 → 静默）。
+            # 窗口 180 自然日：`quality.gap_report` 的 start/end 是**日历区间**
+            # （交给 `store.trading_days(market, start, end)` 取区间内的交易日集合），
+            # 它内部**没有**回看常量，所以窗口只能由作业定义决定；180 自然日按
+            # 250 交易日/年折算 ≈123 交易日 ≥ `rule_engine.IC_WINDOW_DAYS` = 120
+            # （运行时 IC 加权的历史窗口，规格 §9.3）——质量报告覆盖的正是 IC 加权
+            # 真正吃的那段时间。
+            # `--market` 只决定按哪张日历取交易日（并原样回显），**不筛标的**：
+            # 标的来自 `--symbols @watchlist`。
+            # **只有 SH 链挂 quality**（刻意的，不是漏配）：报告里的 `announced_at`
+            # 覆盖率是 A 股 PIT 缺口①的口径——该字段只由本链 16:05 的
+            # merge_announcements 从东财 yjbb 表补齐；港股/美股的 fundamentals 走
+            # futu/statements，本来就没有公告日，挂上去只会每天报一条结构性恒为 0
+            # 的覆盖率（噪音不是信号）。给 HK/US 加质量报告前还得先确认各自日历已
+            # 同步（`store.trading_days` 缺日历会 RuntimeError）。
+            {"name": "quality", "at": "16:10",
+             "cmd": ["quality", "--market", "SH", "--symbols", "@watchlist",
+                     "--start", "@today-180d", "--end", "@today"]},
             {"name": "factors_snapshot", "at": "16:15", "cmd": ["factors-snapshot", "--tickers", "@watchlist"]},
             {"name": "sentiment_snapshot", "at": "16:25", "cmd": ["sentiment-snapshot", "--market", "SH"]},
             {"name": "research_snapshot", "at": "16:30", "cmd": ["research-snapshot", "--market", "SH"]}],
@@ -118,20 +141,98 @@ def platform_config(home):
         return {}
 
 
-def resolve_command(cmd, home):
-    """替换 @watchlist 占位为配置关注池；关注池为空返回 None（调用方跳过该作业）。
+def resolve_command(cmd, home, now=None):
+    """替换作业命令里的占位符，返回新的 list；关注池为空返回 None（调用方跳过该作业）。
 
-    读取经 ``watchlist`` 模块的唯一实现（WP9 修订 I4）：同步作业要吃全量关注池，
-    故此处不做市场分片——分片由 planner/strategies 按市场各取所需。
+    已知占位符（``KNOWN_PLACEHOLDERS``，**唯一权威清单**）：
+
+    * ``@watchlist`` —— 配置关注池，逗号连接（出现多处的作业每一处都替换）。读取经
+      ``watchlist`` 模块的唯一实现（WP9 修订 I4）：同步作业要吃全量关注池，
+      故此处不做市场分片——分片由 planner/strategies 按市场各取所需。关注池为空返回
+      ``None``（不跑作业，也不给 CLI 喂空参数）。
+    * ``@latest-quarter`` —— **今天之前最近一个已结束季度末**，报告期口径 ``YYYYMMDD``
+      （如 2026-09-18 → ``20260630``）。季度末 = 03-31/06-30/09-30/12-31。
+      判据是**严格早于今天**：正好落在季度末当天（如 09-30）取**上一季**——业绩报表
+      （akshare ``stock_yjbb_em``）只认已结束的报告期，当日那份还没出。取本季会让
+      「最近报告期」指向一张不存在的表（上游返回 None → 我们看不懂的下标 TypeError）。
+    * ``@today`` / ``@today-<N>d`` —— 当天 / N 个自然日前，格式 ``YYYY-MM-DD``
+      （CLI 的 ``--start/--end/--since`` 口径；``@latest-quarter`` 的紧凑格式是
+      akshare 报告期的要求，两者不通用）。``N`` 只认十进制非负整数，缺省 0。
+
+    **时钟口径**（与 tick 一致，不另立一套）：``now=`` 注入 > ``DSH_FAKE_NOW`` > 真实
+    时间，日期一律取 ``stamp[:10]``（北京日）。``now`` 与 ``tick(now=…)`` 同形：零参
+    callable（如 ``now_fn()``，测试/演练注入）或完整的 ``YYYY-MM-DD HH:MM:SS`` 时间戳；
+    缺省 ``None`` 即真实时间。**没有日期占位符的作业连时钟都不读**——两参调用的既有
+    行为逐字不变（``tests/test_core_daemon.py`` 的断言）。
+
+    **未知占位符必须响**（WP20，2026-09-18 安装演练缺陷 2 的教训）：任何以 ``@`` 开头
+    但不是已知占位符的参数 → ``ValueError``。此前 ``@latest-quarter`` 未实现时字面量被
+    原样传给 CLI → akshare 内部报 ``TypeError: 'NoneType' object is not subscriptable``，
+    我们自己的漏实现却表现为看不懂的上游故障。抛错会被 ``_run_job`` 捕获并留「作业异常」
+    告警（可见），比静默传字面量好。判定口径就是**参数以 ``@`` 开头**：值里出现 ``@``
+    的普通参数（如 ``a@b.com``）原样保留，不受影响。
     """
     from . import watchlist as watchlist_mod
     cmd = list(cmd)
+    watchlist_arg = None
     if "@watchlist" in cmd:
         symbols = watchlist_mod.watchlist_symbols(home)
         if not symbols:
             return None
-        cmd[cmd.index("@watchlist")] = ",".join(symbols)
-    return cmd
+        watchlist_arg = ",".join(symbols)
+    day = None  # 惰性采样：没有日期占位符就不读时钟（既有两参调用零副作用）
+    resolved = []
+    for arg in cmd:
+        if arg == "@watchlist":     # 每一处都替换（旧实现只换第一处）
+            resolved.append(watchlist_arg)
+            continue
+        if not arg.startswith("@"):
+            resolved.append(arg)
+            continue
+        if arg == "@latest-quarter":
+            day = day or _stamp_day(now)
+            resolved.append(latest_quarter_end(day))
+            continue
+        match = _TODAY_PLACEHOLDER.match(arg)
+        if match is not None:
+            day = day or _stamp_day(now)
+            shift = int(match.group(1) or 0)
+            resolved.append((dt.date.fromisoformat(day) - dt.timedelta(days=shift)).isoformat())
+            continue
+        raise ValueError(f"未知占位符：{arg}（已知：{KNOWN_PLACEHOLDERS}）")
+    return resolved
+
+
+#: 季度末（月-日）。业绩报表只认**已结束**的报告期，故 ``@latest-quarter`` 取
+#: 「今天之前最近一个已结束季度末」（严格早于今天；正好落在季度末当天取上一季）。
+QUARTER_ENDS = ("03-31", "06-30", "09-30", "12-31")
+#: ``@today`` / ``@today-<N>d`` 的识别口径（只认这两种形态；其它写法按未知占位符报错，
+#: 大小写敏感——``@Today``/``@today-180D`` 都不猜）。
+_TODAY_PLACEHOLDER = re.compile(r"^@today(?:-(\d+)d)?$")
+#: 已知占位符清单：既进 ``ValueError`` 文案，也是给人看的唯一权威列表。
+KNOWN_PLACEHOLDERS = "@watchlist/@latest-quarter/@today/@today-Nd"
+
+
+def latest_quarter_end(day):
+    """``day``（``YYYY-MM-DD``）之前最近一个**已结束**季度末，返回 ``YYYYMMDD``。
+
+    字符串比较即可（ISO 日期字典序 = 时间序）；当年四个季度末都未到（如 1 月初）时
+    回落到上一年的 12-31。
+    """
+    for end in reversed(QUARTER_ENDS):
+        if f"{day[:4]}-{end}" < day:
+            return f"{day[:4]}-{end}".replace("-", "")
+    return f"{int(day[:4]) - 1}-12-31".replace("-", "")
+
+
+def _stamp_day(now=None):
+    """当前**北京日**（``YYYY-MM-DD``）：``now`` 注入 > ``DSH_FAKE_NOW`` > 真实时间。
+
+    取法与 tick 逐字一致（``stamp[:10]``），时钟来源仍是 ``clock.now_stamp``——
+    不引入第二套口径。
+    """
+    stamp = now() if callable(now) else now_stamp(now)
+    return stamp[:10]
 
 
 #: 作业「跳过」的告警标题（E2E 缺陷 6）：关注池为空时 `_subprocess_runner` 会直接返回

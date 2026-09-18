@@ -519,6 +519,49 @@ sqlite3 "$DB" "SELECT market, COUNT(*), MIN(day), MAX(day) FROM calendar GROUP B
 > `trading_core` 载入内存了，**改完代码必须 `refresh && restart`** 才生效（只 `refresh`
 > 不重启，服务内调度仍是旧作业表）。
 
+### 作业失败 / 作业异常：先查作业定义与 `@` 占位符（WP20）
+
+**背景（2026-09-18 全新安装演练实测的两个缺陷）**：`quality` 作业只传 `--market SH`，
+而 CLI 的 quality **必填** `--symbols/--start/--end` → argparse 退出 2，
+detail 形如 `job=quality market=SH exit=2`（**detail 里没有原因**——argparse 的用法说明
+走 stderr，而失败告警的 detail 只引用 stdout 尾部）；`@latest-quarter` 从未实现，
+字面量被当报告期传给 `akshare.stock_yjbb_em` → 上游报
+`TypeError: 'NoneType' object is not subscriptable`，看起来像我们自己的下标 bug。
+
+**排障顺序**：
+
+1. **看作业定义实际传给 CLI 的参数**（占位符先展开再交给 CLI）：
+   ```bash
+   PYTHONPATH=<repo>/plugins/datasource/python:<repo>/plugins/core/python python - <<'PY'
+   from trading_core import daemon
+   for mkt, chain in daemon.JOBS_DEFAULT.items():
+       for job in chain:
+           if "cmd" in job:
+               print(mkt, job["name"], job["at"], "→", daemon.resolve_command(job["cmd"], "~/.dsh"))
+   PY
+   ```
+   手工单跑该命令即可复现告警（`~/.dsh/trading-venv/bin/python -B -m trading_core <解析后的参数>`）。
+2. **`@` 占位符只有四个**：`@watchlist`（关注池，空则跳过该作业）、
+   `@latest-quarter`（今天之前最近一个**已结束**季度末，`YYYYMMDD`；正好落在季度末当天
+   取上一季）、`@today` / `@today-<N>d`（`YYYY-MM-DD`，`N` 为自然日数）。
+   **任何其它以 `@` 开头的参数 → 显式 `ValueError`**：
+   `未知占位符：@lastest-quarter（已知：@watchlist/@latest-quarter/@today/@today-Nd）`，
+   由调度层转成 **`作业异常`** 告警（可见）。这是刻意的：此前静默传字面量时，
+   故障表现为上游一个读不懂的 TypeError。**改成别的写法不会被猜**（大小写敏感，
+   `@Today`/`@today-180D` 同样报错）。
+3. **`merge_announcements` 的取数失败**会写明是谁坏了：
+   `公告合并失败：上游 akshare/eastmoney 接口异常（stock_yjbb_em date=20260630）：TypeError: …`
+   ——**它不软跳过**：`announced_at` 是 PIT 的关键字段，缺数据必须可见（宁缺毋假）。
+   `df is None/空` 是上游正常答「本期没有报表」，仍是软返回 `{"matched":0,"rows":0}`。
+4. **`quality` 作业的语义**（不要凭告警里的数字猜）：`--symbols @watchlist` 是标的来源；
+   `--start/--end` 是**日历区间**（`store.trading_days(market, start, end)` 取区间内的
+   交易日集合，quality 内部**没有**回看常量），作业取 `@today-180d → @today`（≈123 交易日，
+   覆盖 `rule_engine.IC_WINDOW_DAYS=120` 的 IC 加权窗口）；`--market` **只决定按哪张日历
+   取交易日**、不筛标的。**只有 SH 链挂 quality**（刻意的）：`announced_at` 覆盖率是 A 股
+   PIT 缺口①的口径，港股/美股 fundamentals 走 futu/statements 本就没有公告日。
+5. detail 被截断到 300 字符、只取 stdout 最后 5 行：**CLI 侧必须给失败信封**
+   （`{"ok": false, "error": …}` + 非零退出），裸 traceback 走 stderr → 告警里看不到原因。
+
 ### 计划「生成了但买不动 / 一笔单都没有」怎么读（WP17）
 
 自动计划的**买入量按可用现金封顶**（现金取券商事实：sim `max_power_long` → `balance`；

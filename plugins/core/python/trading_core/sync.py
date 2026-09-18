@@ -197,11 +197,23 @@ def merge_announcements_akshare(conn, period, akshare_module=None):
     period 形如 "20260630"（报告期）。一次调用覆盖全市场当期业绩表，
     逐行把「股票代码+报告期」匹配到的 fundamentals 行补上公告日。
     只补 announced_at IS NULL 的行，不覆盖已合并的来源。
+
+    **失败语义**（WP20，2026-09-18 安装演练缺陷 2）：取数调用（``stock_yjbb_em``）的
+    任何异常都转成**可读**的 ``RuntimeError``（含「上游 akshare/eastmoney 接口异常」、
+    报告期与原始异常摘要，原始异常挂 ``__cause__``），让「作业失败」告警的 detail 能
+    指出是谁坏了——此前裸 TypeError 透出，看起来像我们自己的下标 bug。
+    ``df is None/空`` 的软返回（上游正常答「本期没有报表」）保持不变：**不软跳过异常**，
+    因为 ``announced_at`` 是 PIT 的关键字段，缺数据必须可见（宁缺毋假，规格 §4.2 规则 3）。
     """
     ak = akshare_module
     if ak is None:
         import akshare as ak
-    df = ak.stock_yjbb_em(date=period)
+    try:
+        df = ak.stock_yjbb_em(date=period)
+    except Exception as error:  # noqa: BLE001 —— 上游什么异常都可能抛（网络/形状/下标）
+        raise RuntimeError(
+            f"上游 akshare/eastmoney 接口异常（stock_yjbb_em date={period}）："
+            f"{type(error).__name__}: {error}") from error
     if df is None or len(df) == 0:
         return {"matched": 0, "rows": 0}
     period_end = f"{period[:4]}-{period[4:6]}-{period[6:8]}"

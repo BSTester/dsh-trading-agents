@@ -695,7 +695,16 @@ def main(argv=None):
             result = {t: sync.sync_fundamentals(conn, t.strip())
                       for t in args.tickers.split(",") if t.strip()}
         elif args.cmd == "merge-announcements":
-            result = sync.merge_announcements_akshare(conn, args.period)
+            # WP20：可读**失败信封**（与 sync-bars 的 F-b 同一手法）。裸 traceback 走
+            # stderr，而作业失败告警的 detail 只引用 stdout 尾部——裸抛等于「exit=1 +
+            # 没有原因」。**不软跳过**（不吞成 ok）：announced_at 是 PIT 的关键字段，
+            # 缺数据必须可见（宁缺毋假，规格 §4.2 规则 3）。
+            try:
+                result = sync.merge_announcements_akshare(conn, args.period)
+            except Exception as error:  # noqa: BLE001 —— 可读错误替代裸 traceback
+                print(json.dumps({"ok": False, "error": f"公告合并失败：{error}"},
+                                 ensure_ascii=False, indent=1))
+                return 1
         elif args.cmd == "universe":
             result = {"symbols": sync.sync_universe(conn, args.index, args.as_of),
                       "as_of": args.as_of,
