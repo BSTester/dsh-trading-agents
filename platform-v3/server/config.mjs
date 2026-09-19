@@ -94,6 +94,8 @@ export function loadConfig(env = process.env, home = env.DSH_HOME || path.join(o
       pythonBin: env.QUANT_PYTHON || path.join(configHome, 'trading-venv', 'bin', 'python'),
       akshareTimeoutMs: Number(env.QUANT_AKSHARE_TIMEOUT_MS || 120000),
       benchmark: env.QUANT_BENCHMARK || 'SH.000300',
+      secUserAgent: env.QUANT_SEC_USER_AGENT || 'quant-platform-v3 (ops@example.com)',
+      tushareToken: env.TUSHARE_TOKEN || null,
     },
     dataDir: env.QUANT_V3_DATA || path.join(process.cwd(), 'data'),
     webDir: path.resolve(path.dirname(decodeURIComponent(new URL(import.meta.url).pathname)), '../web'),

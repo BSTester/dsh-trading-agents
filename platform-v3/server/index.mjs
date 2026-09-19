@@ -20,6 +20,9 @@ import createAkshareSource from './data/akshare.mjs'
 import createPortfolioResolver from './data/portfolio.mjs'
 import { portfolioRisk } from './data/risk-analytics.mjs'
 import { createLocalTools } from './mcp/local-tools.mjs'
+import createSecSource from './data/sec.mjs'
+import createTushareSource from './data/tushare.mjs'
+import createFactorSource from './data/factors.mjs'
 
 const config = loadConfig()
 const metrics = createMetrics()
@@ -30,6 +33,10 @@ const runner = createHeadlessRunner({ config, store, onCall: (record) => metrics
 const oms = createOmsLedger({ store, wbCall: (tool, args, options) => wb.call(tool, args, options) })
 const sdkChannel = createSdkChannel({ config, clock: () => new Date(), store })
 const akshare = createAkshareSource({ pythonBin: config.data.pythonBin, timeoutMs: config.data.akshareTimeoutMs })
+const sec = createSecSource({ userAgent: config.data.secUserAgent })
+const tushare = createTushareSource({ token: config.data.tushareToken })
+const factors = createFactorSource({ wbCall: (tool, args, options) => wb.call(tool, args, options) })
+
 const portfolio = createPortfolioResolver({
   wbCall: (tool, args, options) => wb.call(tool, args, options),
   watchlist: config.sources.watchlist,
@@ -58,6 +65,9 @@ const localTools = createLocalTools({
   wbCall: (tool, args, options) => wb.call(tool, args, options),
   portfolio,
   akshare,
+  sec,
+  tushare,
+  factors,
   strategy,
   config,
 })
@@ -308,6 +318,33 @@ app.get('/api/v3/spot', async ({ query }) => {
   const limit = Math.min(Math.max(Number(query.limit || 20), 1), 100)
   const result = await akshare.spot(limit)
   return result.ok ? { ok: true, ...result } : { ok: false, error: result.error }
+})
+
+// SEC EDGAR 美股财报（公开 XBRL）
+app.get('/api/v3/financials', async ({ query }) => {
+  const ticker = String(query.ticker || '').trim()
+  if (!ticker) return { ok: false, error: { code: 'bad-request', message: 'ticker 必填（美股代码，如 AAPL）' } }
+  const result = await sec.financials(ticker, { statement: String(query.statement || 'income'), periods: Math.min(Math.max(Number(query.periods || 4), 1), 8) })
+  return result.ok ? result : { ok: false, error: result.error }
+})
+
+// Tushare Pro（需 token；未注入则如实报错）
+app.get('/api/v3/tushare', async ({ query }) => {
+  const apiName = String(query.api || 'daily')
+  const allowed = { daily: () => tushare.daily(String(query.ts_code || ''), query.start_date, query.end_date), daily_basic: () => tushare.dailyBasic(String(query.ts_code || ''), query.trade_date), income: () => tushare.income(String(query.ts_code || ''), query.period), stock_basic: () => tushare.stockBasic(Number(query.limit || 20)) }
+  const runner = allowed[apiName]
+  if (!runner) return { ok: false, error: { code: 'bad-request', message: `api 需为 ${Object.keys(allowed).join(' / ')}` } }
+  const result = await runner()
+  return result.ok ? result : { ok: false, error: result.error }
+})
+
+// 因子矩阵 + 因子 IC（热力图数据）
+app.get('/api/v3/factors/matrix', async ({ query }) => {
+  const tickers = String(query.tickers || '').split(',').map((t) => t.trim()).filter(Boolean)
+  const list = tickers.length >= 2 ? tickers : (config.sources.watchlist ?? []).slice(0, 6)
+  const [matrix, ic] = await Promise.all([factors.matrix(list), factors.ic(list, { factor: String(query.factor || 'mom_20'), forwardDays: Number(query.forward_days || 5) })])
+  if (!matrix.ok) return { ok: false, error: matrix.error }
+  return { ok: true, matrix, ic: ic.ok ? ic : { ok: false, error: ic.error } }
 })
 
 app.get('/api/v3/oms/orders', async () => ({ ok: true, ...(await oms.view()) }))

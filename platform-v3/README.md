@@ -77,6 +77,16 @@ curl -s localhost:8407/api/v3/gateway | jq .channels.sdk.lastTurn
   akshare（公开免密钥端点），当前提供 **A 股个股新闻**（标题/摘要/来源/时间/链接 + `as_of`）。
   实测说明：全市场快照接口 `stock_zh_a_spot_em` 在本机网络下被上游断连（`RemoteDisconnected`），
   因此快照类数据继续由工作台提供（富途），AKShare 承担新闻/另类数据。
+- **SEC EDGAR**（`server/data/sec.mjs`，规格 `mcp:sec:*`）：美股三表走公开 XBRL
+  （`companyconcept`），自带 ticker→CIK 映射（缓存）。按期末去重取最近 N 期，并给出
+  `latestEnd` / `ageDays` / **`stale`** ——申报结构变化会让旧标签停用，实测 AAPL 的
+  `Revenues` 最新期是 2018-09-29（age 2912 天，stale=true），当期收入应用
+  `RevenueFromContractWithCustomerExcludingAssessedTax`（age 84 天）。未申报的标签进入 `missing` 而不是编造。
+- **Tushare Pro**（`server/data/tushare.mjs`，规格 `mcp:tushare:*`）：`income` / `daily` /
+  `daily_basic` / `stock_basic` 客户端。需要 `TUSHARE_TOKEN`；**未注入时不发请求**，直接返回
+  `tushare/no-token` 并说明注入方式。
+- **因子矩阵与 IC**（`server/data/factors.mjs`）：横截面因子 z 矩阵（行=标的、列=因子）+ RankIC 序列
+  统计（均值/标准差/IR/最新值），供因子热力图与巡检；实测 6 只 × 36 期 IC，均值 −0.1732、IR −0.341。
 - **PIT 标注**：所有新增数据面返回都带 `as_of` 与 `source`，组合序列按交易日严格对齐后才计算。
 
 ## API（节选）
@@ -86,14 +96,15 @@ curl -s localhost:8407/api/v3/gateway | jq .channels.sdk.lastTurn
 `POST /api/v3/ml/param_sweep`、`POST /api/v3/headless/run`、`POST /api/v3/risk/check`、
 `GET /api/v3/sdk`、`POST /api/v3/sdk/start`、`POST /api/v3/sdk/prompt`、`POST /api/v3/mcp`、
 `GET /api/v3/risk/analytics`（VaR/CVaR/Beta/Alpha/IR/Kupiec）、`GET /api/v3/news`（AKShare A 股新闻）、
-`GET /api/v3/spot`（AKShare 快照，上游不可达时如实报错）。
+`GET /api/v3/spot`（AKShare 快照，上游不可达时如实报错）、`GET /api/v3/financials`（SEC 美股三表）、
+`GET /api/v3/tushare`（Tushare Pro，token 缺失如实报错）、`GET /api/v3/factors/matrix`（因子矩阵 + IC）。
 
 MCP 工具面：`list_tools` / `call_tool`（六域发现代理，覆盖既有 77 工具）+ 一级工具
 `query_quote`、`market_snapshot`、`query_order_book`、`query_capital_flow`、`query_financial`、`stock_screen`、
 `eval_factor_ic`、`list_factors`、`factor_sensitivity`、`sentiment_history`、`calc_indicator`、`check_risk`、
 `query_position`、`account_funds`、`orders_open`、`deals_today`、`request_approval`、`audit_trail`、
-`research_tasks_claim` + 本地计算工具 `run_backtest`、`param_sweep`、`strategy_run`、`calc_var`、`search_news`
-（实测工具面 26 个）。
+`research_tasks_claim` + 本地计算工具 `run_backtest`、`param_sweep`、`strategy_run`、`calc_var`、`search_news`、
+`factor_matrix`、`query_financial_us`、`query_financial_cn`（实测工具面 29 个）。
 
 ## 监控与审计（§8.3 / §4.2）
 

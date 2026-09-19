@@ -3,7 +3,7 @@
 import { backtestMomentum, paramSweep } from '../strategy/backtest.mjs'
 import { portfolioRisk } from '../data/risk-analytics.mjs'
 
-export function createLocalTools({ wbCall, portfolio, akshare, strategy, config }) {
+export function createLocalTools({ wbCall, portfolio, akshare, sec, tushare, factors, strategy, config }) {
   const seriesFor = async (ticker, limit = 500) => {
     const envelope = await wbCall('series', { ticker, period: '1d', limit })
     return envelope?.ok ? (envelope.value?.bars ?? []) : null
@@ -67,6 +67,43 @@ export function createLocalTools({ wbCall, portfolio, akshare, strategy, config 
         if (analytics.error) return { text: analytics.error, isError: true }
         const { equityCurve, ...rest } = analytics
         return { text: JSON.stringify({ portfolioSource: resolved.source, benchmark: bench.ok ? bench.ticker : null, navSource: navInfo.source, ...rest }, null, 1) }
+      },
+    },
+    {
+      name: 'factor_matrix',
+      description: '[alpha] 横截面因子矩阵（工作台 z 值）与因子 IC 序列统计（均值/标准差/IR/最新值），供因子热力图与因子巡检使用。',
+      inputSchema: { type: 'object', properties: { tickers: { type: 'array', items: { type: 'string' }, description: '2..8 个标的；缺省用自选池前 6 只' }, factor: { type: 'string', description: 'IC 因子名，默认 mom_20' }, forward_days: { type: 'number', description: 'IC 前瞻天数，默认 5' } }, additionalProperties: false },
+      async execute(args) {
+        const list = (args.tickers ?? (config.sources.watchlist ?? []).slice(0, 6)).slice(0, 8)
+        const [matrix, ic] = await Promise.all([factors.matrix(list), factors.ic(list, { factor: String(args.factor || 'mom_20'), forwardDays: Number(args.forward_days || 5) })])
+        if (!matrix.ok) return { text: JSON.stringify(matrix.error, null, 1), isError: true }
+        return { text: JSON.stringify({ matrix, ic: ic.ok ? ic : { ok: false, error: ic.error } }, null, 1) }
+      },
+    },
+    {
+      name: 'query_financial_us',
+      description: '[data] 美股财报三表（SEC EDGAR 公开 XBRL，免密钥）：按 us-gaap 概念给出最近若干期数值与申报表单/期末日期。',
+      inputSchema: { type: 'object', properties: { ticker: { type: 'string', description: '美股代码，如 AAPL / NVDA' }, statement: { type: 'string', enum: ['income', 'balance', 'cashflow'], description: '默认 income' }, periods: { type: 'number', description: '期数，默认 4' } }, required: ['ticker'], additionalProperties: false },
+      async execute(args) {
+        const result = await sec.financials(String(args.ticker), { statement: String(args.statement || 'income'), periods: Math.min(Math.max(Number(args.periods || 4), 1), 8) })
+        return result.ok ? { text: JSON.stringify(result, null, 1) } : { text: JSON.stringify(result.error, null, 1), isError: true }
+      },
+    },
+    {
+      name: 'query_financial_cn',
+      description: '[data] A 股财务/行情（Tushare Pro）。需要 TUSHARE_TOKEN；未注入时如实报错，不返回估算值。',
+      inputSchema: { type: 'object', properties: { api: { type: 'string', enum: ['income', 'daily', 'daily_basic', 'stock_basic'], description: '默认 income' }, ts_code: { type: 'string', description: '如 600519.SH' }, period: { type: 'string', description: '报告期，如 20260630' }, limit: { type: 'number' } }, additionalProperties: false },
+      async execute(args) {
+        const apiName = String(args.api || 'income')
+        const result =
+          apiName === 'income'
+            ? await tushare.income(String(args.ts_code || ''), args.period)
+            : apiName === 'daily_basic'
+              ? await tushare.dailyBasic(String(args.ts_code || ''), args.period)
+              : apiName === 'daily'
+                ? await tushare.daily(String(args.ts_code || ''), args.period, args.period)
+                : await tushare.stockBasic(Number(args.limit || 20))
+        return result.ok ? { text: JSON.stringify(result, null, 1) } : { text: JSON.stringify(result.error, null, 1), isError: true }
       },
     },
     {
