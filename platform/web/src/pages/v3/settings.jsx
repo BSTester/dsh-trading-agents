@@ -15,9 +15,9 @@
 // （载荷 {mode, expected_mode, confirmation?}，sim→live 需逐字口令「确认实盘」，服务端独立复核），
 // 页面顶栏已有该入口。此处只做只读展示 + 指向入口的说明，避免出现第二个能改交易模式的地方。
 import React from "react";
-import { Alert, App, Badge, Button, Card, Col, Descriptions, Row, Space, Statistic, Table, Tag, Typography } from "antd";
+import { Alert, App, Badge, Button, Card, Col, Descriptions, Input, Row, Space, Statistic, Table, Tag, Typography } from "antd";
 import { ProCard } from "@ant-design/pro-components";
-import { useV3 } from "../../services/v3api.js";
+import { callV3, postV3, useV3 } from "../../services/v3api.js";
 import { stampOf } from "../../services/format.jsx";
 
 const { Text, Title } = Typography;
@@ -30,6 +30,106 @@ function finite(value) {
 function countText(value) {
   const n = finite(value);
   return n === null ? "—" : n.toLocaleString("zh-CN");
+}
+
+
+/** 页面化密钥配置：读状态 / 保存 / 真实连通性测试 / 清除。
+ *  硬约束：任何输入与响应都不回显凭据值（服务端也不返回），只显示「已配置/未配置 + 来源 + 掩码尾号」。 */
+function CredentialPanel() {
+  const { message } = App.useApp();
+  const [state, setState] = React.useState({ loading: true, keys: [], error: null, busy: null, test: null });
+  const [draft, setDraft] = React.useState("");
+
+  const load = React.useCallback(async () => {
+    setState((prev) => ({ ...prev, loading: true, error: null }));
+    try {
+      const body = await callV3("credentials");
+      setState((prev) => ({ ...prev, loading: false, keys: body.keys ?? [] }));
+    } catch (error) {
+      setState((prev) => ({ ...prev, loading: false, error: String(error.message || error) }));
+    }
+  }, []);
+  React.useEffect(() => { load(); }, [load]);
+
+  const act = async (action, extra = {}) => {
+    setState((prev) => ({ ...prev, busy: action, test: action === "test" ? prev.test : null }));
+    try {
+      const body = await postV3("credentials", { action, key: "tushare_token", ...extra });
+      if (action === "test") {
+        setState((prev) => ({ ...prev, busy: null, test: body }));
+        if (body.ok) message.success(`连通性正常（${body.latency_ms}ms，来源：${body.source}）`);
+        else message.error(body.error?.message ?? "连通性测试失败");
+        return;
+      }
+      if (!body.ok) {
+        message.error(body.error?.message ?? "操作失败");
+        return;
+      }
+      setState((prev) => ({ ...prev, busy: null, keys: body.keys ?? [], test: null }));
+      if (action === "save") { setDraft(""); message.success("已保存（0600 落盘，不回显）"); }
+      if (action === "clear") message.success("已清除页面配置的密钥（环境变量不受影响）");
+    } catch (error) {
+      setState((prev) => ({ ...prev, busy: null }));
+      message.error(String(error.message || error));
+    }
+  };
+
+  const entry = state.keys.find((k) => k.key === "tushare_token") ?? null;
+  return (
+    <ProCard title="密钥与授权（可在本页完成）" bordered loading={state.loading}
+      extra={<Button size="small" type="link" onClick={load}>刷新状态</Button>}>
+      {state.error ? <Alert type="error" showIcon style={{ marginBottom: 8 }} message="凭据状态读取失败" description={state.error} /> : null}
+      <Space direction="vertical" size={10} style={{ width: "100%" }}>
+        <div>
+          <Space size={8} wrap>
+            <Text strong>{entry?.label ?? "Tushare Pro Token"}</Text>
+            {entry?.present
+              ? <Tag color="green">已配置</Tag>
+              : <Tag color="orange">未配置</Tag>}
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              用途：{entry?.usage ?? "A 股财务/行情（/api/v3/tushare）"} · 环境变量：{entry?.env ?? "TUSHARE_TOKEN"}
+            </Text>
+          </Space>
+          <div style={{ marginTop: 4 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {entry?.present
+                ? `来源：${entry.source}${entry.updated_at ? ` · 更新于 ${stampOf(entry.updated_at)}` : ""}${entry.hint ? ` · 尾号 ${entry.hint}` : ""}`
+                : "保存后立即生效（环境变量优先于页面配置）；凭据 0600 落盘，服务端不回显任何值。"}
+            </Text>
+          </div>
+          <Space.Compact style={{ width: "100%", maxWidth: 560, marginTop: 6 }}>
+            <Input.Password value={draft} onChange={(event) => setDraft(event.target.value)}
+              placeholder="粘贴 Tushare Pro token（保存后不再回显）" autoComplete="off" />
+            <Button type="primary" disabled={!draft.trim() || state.busy === "save"}
+              loading={state.busy === "save"} onClick={() => act("save", { value: draft })}>保存</Button>
+          </Space.Compact>
+          <Space size={8} style={{ marginTop: 8 }} wrap>
+            <Button size="small" loading={state.busy === "test"} onClick={() => act("test")}>测试连通性</Button>
+            <Button size="small" danger disabled={!entry?.present || state.busy === "clear"}
+              loading={state.busy === "clear"} onClick={() => act("clear")}>清除页面配置</Button>
+            {state.test ? (
+              state.test.ok
+                ? <Text type="success" style={{ fontSize: 12 }}>测试通过：{state.test.latency_ms}ms · 来源 {state.test.source} · 返回 {state.test.rows} 行</Text>
+                : <Text type="danger" style={{ fontSize: 12 }}>测试失败：{state.test.error?.code} · {state.test.error?.message}</Text>
+            ) : null}
+          </Space>
+        </div>
+        <div>
+          <Space size={8} wrap>
+            <Text strong>富途 OpenAPI 授权（OAuth 2.1 + PKCE）</Text>
+            <Button size="small" onClick={() => { window.location.hash = "#/settings"; }}>前往既有设置页完成授权</Button>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              OAuth 授权需要本机回调端口（http://localhost:&lt;port&gt;/callback），流程在既有工作台「设置」页的
+              「OAuth 授权」面板完成，凭据由服务端落盘（mode=oauth）；本页不重复实现第二套授权，只做状态展示与入口。
+            </Text>
+          </Space>
+        </div>
+        <Text type="secondary" style={{ fontSize: 12 }}>
+          其它数据源无需密钥：AKShare / SEC EDGAR 为公开端点；OpenBB 为可选依赖（未安装时该项如实报 unavailable）。
+        </Text>
+      </Space>
+    </ProCard>
+  );
 }
 
 /** 只读的「无数据源」说明。 */
@@ -200,6 +300,8 @@ export default function V3SettingsPage() {
           </ProCard>
         </Col>
       </Row>
+
+      <CredentialPanel />
 
       <ProCard title="统一授权中心（凭据清单）" bordered loading={settings.loading}
         extra={<Text type="secondary" style={{ fontSize: 12 }}>

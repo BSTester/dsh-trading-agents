@@ -594,7 +594,9 @@ class TushareRouteTests(BlockRealNetwork):
         payload = self.call("/api/v3/tushare", api="daily", ts_code="600519.SH", period="", limit=60)
         detail = self.assert_error(payload, "tushare/")
         self.assertEqual(detail["code"], "tushare/no-token")
-        self.assertEqual(detail["message"], "TUSHARE_TOKEN 未注入（环境变量或配置）")
+        # 文案有意指向「页面可配置」（/api/v3/credentials），与 server/v3_sources.py 同步
+        self.assertEqual(detail["message"],
+                         "TUSHARE_TOKEN 未注入（可在「接入与授权」页配置，或用环境变量）")
         self.assertEqual(fetch.calls, [], "无 token 时绝不能发请求")
 
     def test_empty_token_string_also_counts_as_missing(self):

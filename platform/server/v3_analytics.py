@@ -58,7 +58,7 @@ __all__ = [
 # 策略流水线结果：一轮一行 JSONL（`GET /api/v3/strategy` 返回最后一轮）。
 STRATEGY_RUNS_FILE = "v3-strategy-runs.jsonl"
 
-# 工作台 plan 里可作为组合定义的权重口径：单笔目标权重上限（%，与 platform-v3 同值）。
+# 工作台 plan 里可作为组合定义的权重口径：单笔目标权重上限（%，与 V3 原型同值）。
 SINGLE_NAME_LIMIT_PCT = 2.0
 
 # 自选池等权组合的标的数上限（参考实现 portfolio.resolve 的 limit=8）。

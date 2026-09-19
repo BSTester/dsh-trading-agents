@@ -886,7 +886,7 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
     # V3 子模块自动接线（分析 / 运维 / 外部数据源）：各自提供 register(app, v3_run, home)。
     # 用 import 守卫：模块尚未创建时安静跳过，不阻断服务启动。
-    for _v3_module in ("v3_market", "v3_risk", "v3_analytics", "v3_ops", "v3_sources"):
+    for _v3_module in ("v3_market", "v3_risk", "v3_credentials", "v3_analytics", "v3_ops", "v3_sources"):
         try:
             _module = importlib.import_module(f"server.{_v3_module}")
         except ModuleNotFoundError:

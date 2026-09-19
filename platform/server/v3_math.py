@@ -1,10 +1,10 @@
 """V3 分析类接口的**纯计算内核**（无 IO、无 FastAPI 依赖，便于确定性单测）。
 
 移植源（逐行为准；有意差异在各函数 docstring 里逐条标注）：
-  * ``platform-v3/server/data/risk-analytics.mjs`` —— 交易日对齐、历史模拟法 VaR/CVaR、
+  * V3 原型（已退役）的风险量实现 —— 交易日对齐、历史模拟法 VaR/CVaR、
     Beta/Alpha/IR、最大回撤、Kupiec POF；
-  * ``platform-v3/server/strategy/backtest.mjs`` —— 单标的动量 long/flat 回测与参数扫描；
-  * ``platform-v3/server/data/factors.mjs`` —— 因子 z 矩阵与 IC 统计口径。
+  * V3 原型（已退役）的回测实现 —— 单标的动量 long/flat 回测与参数扫描；
+  * V3 原型（已退役）的因子口径 —— 因子 z 矩阵与 IC 统计口径。
 
 设计约束（与 ``server/app.py`` 的 V3 诚实性约定一致）：
   * **只做算术**：不取数、不读盘、不碰 FastAPI，因此可以用确定性构造数据断言数值；
@@ -42,7 +42,7 @@ __all__ = [
 # 年化交易日数（risk-analytics.mjs / backtest.mjs 同值）。
 TRADING_DAYS = 252
 
-# 综合分只用「动量/趋势」三类 z（估值/波动类只展示，不进综合分——口径见 platform-v3 README）。
+# 综合分只用「动量/趋势」三类 z（估值/波动类只展示，不进综合分——口径以本文件为准）。
 COMPOSITE_KEYS = ("mom_20", "mom_60", "trend")
 
 # 组合风险量的最小样本：对齐后交易日 < 40 → risk/insufficient（参考实现同阈值）。

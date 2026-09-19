@@ -39,7 +39,7 @@ from types import ModuleType
 class ModuleImportTimeout(Exception):
     """三方模块 import 超过预算（见 ``Deps.module``）。"""
 
-# 与 platform-v3/server/data/sec.mjs 的 STATEMENT_TAGS 逐项对齐：三表标签集合是**契约**，
+# 与 V3 原型（已退役）实现 的 STATEMENT_TAGS 逐项对齐：三表标签集合是**契约**，
 # 前端按 statement 分组渲染，这里少一个标签或多一个标签都会让展示与规格不符。
 STATEMENT_TAGS = {
     "income": (
@@ -85,7 +85,7 @@ DEFAULT_TIMEOUT = 25.0
 OPENBB_TIMEOUT = 180.0
 OPENBB_IMPORT_TIMEOUT = 150.0
 
-# tushare API → 请求 fields / 请求参数 / 默认条数。fields 与 platform-v3/server/data/
+# tushare API → 请求 fields / 请求参数 / 默认条数。fields 与 V3 原型（已退役）实现
 # tushare.mjs 的选择一致（那里按用途写死，这里按 api 名分发）。
 TUSHARE_APIS = {
     "income": {
@@ -734,9 +734,13 @@ def fetch_tushare(deps, api, params, limit):
     if meta is None:
         wanted = " / ".join(sorted(TUSHARE_APIS))
         return envelope_error("tushare/unknown-api", f"api 需为 {wanted}，收到 {api!r}")
-    token = deps.get_env("TUSHARE_TOKEN")
+    # 凭据来源：环境变量优先，其次页面配置（server/v3_credentials.py，0600 落盘）
+    from server import v3_credentials
+
+    token, token_source = v3_credentials.resolve_tushare_token(getattr(deps, "home", None), deps.get_env)
     if not token:
-        return envelope_error("tushare/no-token", "TUSHARE_TOKEN 未注入（环境变量或配置）")
+        return envelope_error("tushare/no-token",
+                              "TUSHARE_TOKEN 未注入（可在「接入与授权」页配置，或用环境变量）")
     request_params = {}
     for name in meta["params"]:
         value = params.get(name)

@@ -14,32 +14,53 @@
 | 富途实时行情权限 | 盘口五档、板块涨跌幅 | ❌ 权限缺口（`errcode=-9 realtime quote permission required`） | 券商侧开通 | 页面标注「无数据源」，不填占位 |
 | AKShare | A 股新闻/另类数据 | ✅ 可用（免密钥） | 否 | `GET /api/v3/news` |
 | SEC EDGAR | 美股财报三表（XBRL） | ✅ 可用（免密钥） | 否（需可识别 User-Agent） | `GET /api/v3/financials` |
-| Tushare Pro | A 股财务/行情 | ⏳ **等待注入** | `TUSHARE_TOKEN` | `GET /api/v3/tushare` |
-| OpenBB | 美股基本面（备选） | ⏳ 依赖未安装 | 视数据商而定 | `GET /api/v3/openbb` |
+| Tushare Pro | A 股财务/行情 | ⏳ **等待注入（页面可配）** | `TUSHARE_TOKEN` 或页面保存 | `GET /api/v3/tushare`、`/api/v3/credentials` |
+| OpenBB | 美股基本面（备选） | ✅ 已安装可用（实测 AAPL 指标） | 视数据商而定 | `GET /api/v3/openbb` |
 
 ## 二、需要你提供的东西（按优先级）
 
-### 1. `TUSHARE_TOKEN`（唯一必须的密钥）
-- **注入方式**（任选，推荐第一种）：
-  ```bash
-  # 方式 A：写进服务环境（推荐：随服务生命周期）
-  #   在启动脚本 / systemd unit / shell 里 export，然后重启服务
-  export TUSHARE_TOKEN=你的token
-  cd platform && ~/.dsh/trading-venv/bin/python -m server.run
+### 1. `TUSHARE_TOKEN`（唯一必须的密钥）—— **可在页面上配置**
 
-  # 方式 B：会话内临时验证
-  TUSHARE_TOKEN=你的token curl -s "http://127.0.0.1:8397/api/v3/tushare?api=income&ts_code=600519.SH&period=20260630"
-  ```
-- **验证命令**：注入后应返回 `{ok:true,source:"tushare/income",rows:[...]}`；未注入时返回
-  `{ok:false,error:{code:"tushare/no-token",message:"TUSHARE_TOKEN 未注入（环境变量或配置）"}}`
-  且**不会发出任何网络请求**。
-- 消费页面：`接入与授权`（统一授权中心会由「未注入」变为「已注入」）、`行情与信号`。
+**方式 A（推荐，无需碰命令行）**：打开 `#/v3-settings`（接入与授权）→「密钥与授权」卡片 →
+粘贴 token → **保存** → 点 **测试连通性**（真实调用 Tushare `trade_cal`，返回延迟与上游消息）。
 
-### 2. 富途实时行情权限（券商侧，非密钥）
+- 凭据落 `<DSH_HOME>/v3-credentials.json`，**0600**，原子写；
+- 页面与服务端**都不回显**凭据值，只显示「已配置/未配置 + 来源 + 掩码尾号（…abcd）」；
+- 保存后**立即生效**（无需重启）；**环境变量 `TUSHARE_TOKEN` 优先级高于页面配置**；
+- 「清除页面配置」只删文件里的值，环境变量不受影响；
+- 未配置时 `/api/v3/tushare` 与「测试」按钮都返回 `tushare/no-token`，**不发任何请求**。
+
+**方式 B（部署方）**：环境变量注入后随服务生效：
+```bash
+export TUSHARE_TOKEN=你的token
+cd platform && ~/.dsh/trading-venv/bin/python -m server.run
+```
+
+**接口层验证**（两条等价路径）：
+```bash
+# 页面同款动作
+curl -s -X POST localhost:8397/api/v3/credentials -H 'content-type: application/json' \
+  -d '{"action":"save","key":"tushare_token","value":"你的token"}'
+curl -s -X POST localhost:8397/api/v3/credentials -H 'content-type: application/json' \
+  -d '{"action":"test","key":"tushare_token"}'
+# 生效后的数据接口
+curl -s "localhost:8397/api/v3/tushare?api=income&ts_code=600519.SH&period=20260630"
+```
+- 消费页面：`接入与授权`（密钥与授权卡片 + 统一授权中心）、`行情与信号`。
+
+### 2. 富途 OpenAPI 凭据与 OAuth 授权 —— **已在页面上可用**
+- 位置：既有工作台 **设置页**（`#/settings`）——「富途授权」卡片 + **OAuth 2.1 + PKCE 授权面板**
+  （Client ID 可空=自动注册 → 开始授权 → 2s 轮询 → 服务端落盘 `mode=oauth`，0600）。
+  对应接口：`/api/wb/openapi_config`（AppKey 模式读写）、`/api/wb/openapi_test`（真实连通性）、
+  `/api/wb/openapi_oauth`（start/status/cancel）。
+- V3 接入与授权页的「密钥与授权」卡片给出状态与**入口按钮**（跳转到该页），不重复实现第二套授权。
+- OAuth 需要本机回调端口 `http://localhost:<port>/callback`，因此必须在能访问该回调的机器上操作。
+
+### 3. 富途实时行情权限（券商侧，非密钥）
 - 现盘口/板块涨跌幅走不到，报 `errcode=-9`；开通后无需改代码，`/api/v3/orderbook` 与板块行情即可返回。
 - 消费页面：`行情与信号`（盘口五档卡、板块热力）。
 
-### 3. OpenBB（可选依赖）
+### 4. OpenBB（可选依赖）
 - 若需要：`~/.dsh/trading-venv/bin/pip install openbb`（体积较大，且需与 Python 3.13 兼容）。
 - 未安装时 `/api/v3/openbb` 返回 `openbb/unavailable`，**不发请求**。
 

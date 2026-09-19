@@ -11,7 +11,7 @@ oms/orders,oms/sync,events,audit,brain}``）。
 数据诚实性（逐条，都是本实现的硬约束）
 --------------------------------------
 * **工具面**：本模块不复制任何业务逻辑，也不硬编码工具名——工具清单来自
-  ``server.mcp_tools.TOOLS`` 的导入枚举，域归类复用 ``platform-v3/server/mcp/catalog.mjs``
+  ``server.mcp_tools.TOOLS`` 的导入枚举，域归类复用 V3 原型（已退役）的工具域归类
   的 ``domainOf`` 规则。
 * **通道**：本服务**没有** SDK JSON-RPC 通道、也**没有** Headless CLI 子进程通道。
   相关字段一律 ``status="unavailable"`` + ``reason``，绝不用编造的会话/成功率填充
@@ -58,7 +58,7 @@ from server.config import config_path
 # ---------------------------------------------------------------------------
 # 常量
 # ---------------------------------------------------------------------------
-#: 六大工具域（与 platform-v3/server/mcp/catalog.mjs 的 DOMAINS 逐字一致）
+#: 六大工具域（与 V3 原型（已退役）的 DOMAINS 逐字一致）
 DOMAINS = ("data", "alpha", "ml", "risk", "execution", "ecosystem")
 
 #: 交易写类：一律归 execution（catalog.mjs 的 WRITE_TOOLS）
@@ -79,10 +79,10 @@ V3_LOCAL_TOOLS = (
      "V3 新增本地计算：A 股个股新闻（AKShare 公开端点，免密钥）"),
 )
 
-#: 风控阈值（与 platform-v3/server/risk.mjs 的 DEFAULT_LIMITS 逐项一致）
+#: 风控阈值（与 V3 原型（已退役）实现 的 DEFAULT_LIMITS 逐项一致）
 LIMITS = {"singlePct": 2.0, "industryPct": 20.0, "drawdownPct": 15.0}
 
-#: OMS 生命周期阶段（与 platform-v3/web/pages/execution.js 的 KANBAN 六态一致）
+#: OMS 生命周期阶段（与 V3 原型（已退役）实现 的 KANBAN 六态一致）
 STAGES = ("risk_passed", "manual", "blocked", "submitted", "filled", "rejected")
 
 #: 设置页环境变量清单（任务书 §4）：只报「是否注入 + 来源」，**绝不出值**
@@ -237,7 +237,7 @@ def _value_or_none(envelope):
 def _passthrough(envelope):
     """工具信封 → V3 约定（``{ok:true, value}`` → ``{ok:true, data}``；错误原样透传）。
 
-    与 platform-v3/server/index.mjs 的 ``wbValue`` 同形（前端已按 ``data`` 实现）。
+    与 V3 原型（已退役）实现 的 ``wbValue`` 同形（前端已按 ``data`` 实现）。
     """
     if isinstance(envelope, dict) and envelope.get("ok"):
         return {"ok": True, "data": envelope.get("value")}
@@ -465,7 +465,7 @@ def open_hit(rows, order_id, symbol, side, qty):
 
 
 # ---------------------------------------------------------------------------
-# OMS 台账（对照 platform-v3/server/oms.mjs；**无任何下单方法**）
+# OMS 台账（口径与 V3 原型一致；**无任何下单方法**）
 # ---------------------------------------------------------------------------
 class OmsLedger:
     """把 ``plan`` 的计划订单登记为平台侧订单，逐单风控分级并与在途订单对账。"""

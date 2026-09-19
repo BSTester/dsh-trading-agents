@@ -28,6 +28,19 @@ export async function callV3(path, params = {}, { refresh = false } = {}) {
   return body;
 }
 
+/** 写动作：POST /api/v3/<path>，body 为 JSON。返回解析后的信封（ok=false 不抛错，交由页面展示）。 */
+export async function postV3(path, body = {}) {
+  const headers = { "content-type": "application/json" };
+  const token = getToken();
+  if (token) headers.Authorization = `Bearer ${token}`;
+  const response = await fetch(`/api/v3/${path}`, { method: "POST", headers, body: JSON.stringify(body ?? {}) });
+  let payload = null;
+  try { payload = await response.json(); } catch { payload = null; }
+  if (response.status === 401) throw new Error("需要访问令牌：右上角「令牌」处填入服务配置的 token");
+  if (!response.ok) throw new Error(payload?.error?.message || `HTTP ${response.status}`);
+  return payload;
+}
+
 /** endpoint + params 驱动的取数 hook（与既有 useEndpoint 同形，便于页面共用写法）。 */
 export function useV3(path, params = {}, deps = []) {
   const [state, setState] = React.useState({ loading: true });
