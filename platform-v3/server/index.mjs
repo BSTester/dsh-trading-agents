@@ -24,7 +24,7 @@ const wb = createWorkbenchClient({ ...config.workbench, onCall: ({ tool, ok, ms 
 const store = createStore(config.dataDir)
 const runner = createHeadlessRunner({ config, store, onCall: (record) => metrics.headless(record.success, record.duration_ms, record.tokens_estimate) })
 const oms = createOmsLedger({ store, wbCall: (tool, args, options) => wb.call(tool, args, options) })
-const sdkChannel = createSdkChannel({ config, clock: () => new Date() })
+const sdkChannel = createSdkChannel({ config, clock: () => new Date(), store })
 const strategy = createStrategyService({ wbCall: (tool, args, options) => wb.call(tool, args, options), watchlist: config.sources.watchlist, store })
 
 const strategyLocalTools = [
@@ -152,14 +152,17 @@ app.get('/api/v3/overview', async () => {
     headless,
     channels: {
       mcp: { status: 'running', transport: config.channels.mcp.transport },
-      sdk: { status: sdkChannel.status().status, note: sdkChannel.status().reason ?? config.channels.sdk.note },
+      sdk: (() => {
+        const s = sdkChannel.status()
+        return { status: s.status, reason: s.reason, serverInfo: s.serverInfo, route: s.route, initialized: s.initialized, note: s.reason ?? config.channels.sdk.note }
+      })(),
       headless: { status: 'ready', breaker: headless.breaker },
     },
     limits: { singlePct: 2, industryPct: 20, drawdownPct: 15 },
   }
 })
 
-app.get('/api/v3/brain', async () => ({ headless: runner.stats(), sdk: sdkChannel.status(), decision: strategy.last() }))
+app.get('/api/v3/brain', async () => ({ ok: true, headless: runner.stats(), sdk: { ...sdkChannel.status(), turns: sdkChannel.turns(5) }, decision: strategy.last() }))
 
 app.get('/api/v3/sdk', async () => ({ ok: true, ...sdkChannel.status() }))
 

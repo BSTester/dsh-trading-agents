@@ -1,0 +1,79 @@
+/* 量化交易决策平台 V3.0 —— 控制台样式（沿用 OpenDesign 设计 token）
+   页面不包含任何静态占位数据：所有数值由 /app.js 从 /api/v3/* 真实接口渲染。 */
+* { box-sizing: border-box; margin: 0; padding: 0 }
+:root {
+  --bg: #0b0e13; --panel: #12161d; --panel2: #171c26;
+  --border: #232b37; --border2: #2f3a49;
+  --text: #e6edf3; --muted: #8b97a5; --faint: #626d7c;
+  --blue: #4c8dff; --green: #3fb950; --red: #f8514d; --amber: #d9a112; --purple: #a371f7; --cyan: #39a0ed;
+  --mono: ui-monospace, Menlo, Consolas, monospace;
+}
+body { background: var(--bg); color: var(--text); font: 13px/1.65 -apple-system, 'Segoe UI', 'PingFang SC', 'Microsoft YaHei', sans-serif }
+a { color: inherit; text-decoration: none }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums }
+
+.topbar { display: flex; align-items: center; gap: 14px; height: 46px; padding: 0 16px; background: var(--panel); border-bottom: 1px solid var(--border); position: sticky; top: 0; z-index: 10 }
+.brand { font-weight: 600; letter-spacing: .4px }
+.brand small { color: var(--faint); font-weight: 400; margin-left: 6px }
+.spacer { flex: 1 }
+.badge { display: inline-flex; align-items: center; gap: 5px; padding: 2px 9px; border-radius: 4px; font-size: 11px; font-weight: 600; border: 1px solid transparent }
+.b-sim { color: #7ee2a8; background: rgba(46,160,67,.12); border-color: rgba(46,160,67,.4) }
+.b-live { color: #ffb0ae; background: rgba(248,81,77,.12); border-color: rgba(248,81,77,.45) }
+.pill { display: inline-flex; align-items: center; gap: 5px; padding: 1px 8px; border-radius: 10px; font-size: 11px; border: 1px solid var(--border2); color: var(--muted); background: var(--panel2) }
+.dot { width: 7px; height: 7px; border-radius: 50%; display: inline-block; background: var(--faint) }
+.dot.ok { background: var(--green); box-shadow: 0 0 6px rgba(63,185,80,.7) }
+.dot.bad { background: var(--red) }
+.dot.warn { background: var(--amber) }
+
+.shell { display: flex; min-height: calc(100vh - 46px) }
+.nav { width: 196px; flex: none; background: var(--panel); border-right: 1px solid var(--border); padding: 10px 8px }
+.nav .grp { color: var(--faint); font-size: 10.5px; letter-spacing: 1px; padding: 12px 10px 4px }
+.nav a { display: block; padding: 6px 10px; border-radius: 6px; color: var(--muted); font-size: 12.5px; margin-bottom: 2px }
+.nav a:hover { background: var(--panel2); color: var(--text) }
+.nav a.active { background: rgba(76,141,255,.10); color: var(--text); box-shadow: inset 2px 0 0 var(--blue) }
+.main { flex: 1; min-width: 0; padding: 18px 22px 26px }
+h1 { font-size: 19px; margin-bottom: 4px }
+.sub { color: var(--muted); font-size: 12.5px; margin-bottom: 16px }
+.foot { color: var(--faint); font-size: 11px; margin-top: 18px; padding-top: 10px; border-top: 1px solid var(--border) }
+
+.card { background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 14px 16px; margin-bottom: 14px }
+.card > h3 { font-size: 12.5px; color: var(--muted); font-weight: 600; margin-bottom: 10px; letter-spacing: .3px; display: flex; align-items: center; gap: 8px }
+.card > h3 .r { margin-left: auto; font-weight: 400; color: var(--faint); font-size: 11px }
+.grid { display: grid; gap: 12px }
+.g2 { grid-template-columns: repeat(2, minmax(0,1fr)) }
+.g3 { grid-template-columns: repeat(3, minmax(0,1fr)) }
+.g4 { grid-template-columns: repeat(4, minmax(0,1fr)) }
+.g5 { grid-template-columns: repeat(5, minmax(0,1fr)) }
+.auto { grid-template-columns: repeat(auto-fit, minmax(180px, 1fr)) }
+
+.kpi .k { font-size: 10.5px; color: var(--faint); margin-bottom: 4px }
+.kpi .v { font-size: 20px; font-weight: 700; font-family: var(--mono) }
+.kpi .s { font-size: 11px; color: var(--muted); margin-top: 3px }
+.pos { color: var(--green) } .neg { color: var(--red) } .mut { color: var(--muted) }
+
+table { width: 100%; border-collapse: collapse; font-size: 12.5px }
+th { color: var(--faint); font-weight: 500; text-align: left; padding: 6px 8px; border-bottom: 1px solid var(--border2); font-size: 11px }
+td { padding: 6px 8px; border-bottom: 1px solid var(--border); vertical-align: top }
+tr:last-child td { border-bottom: none }
+.scroll-x { overflow-x: auto }
+
+.tag { display: inline-flex; align-items: center; gap: 4px; padding: 1px 7px; border-radius: 4px; font-size: 11px; border: 1px solid var(--border2); color: var(--muted) }
+.tag.ok { color: var(--green); border-color: rgba(63,185,80,.45) }
+.tag.warn { color: var(--amber); border-color: rgba(217,161,18,.45) }
+.tag.bad { color: var(--red); border-color: rgba(248,81,77,.45) }
+
+.btn { display: inline-flex; align-items: center; gap: 6px; padding: 5px 12px; border-radius: 6px; font-size: 12px; cursor: pointer; border: 1px solid var(--border2); background: transparent; color: var(--muted) }
+.btn:hover { color: var(--text); border-color: var(--blue) }
+.btn[disabled] { opacity: .5; cursor: not-allowed }
+.note { font-size: 11.5px; color: var(--faint); margin-top: 8px; line-height: 1.6 }
+.err { color: var(--red); font-size: 12px }
+.bar { display: flex; align-items: center; gap: 8px; margin: 3px 0 }
+.bar .lbl { width: 240px; flex: none; font-size: 11px; color: var(--muted); font-family: var(--mono) }
+.bar .track { flex: 1; background: var(--panel2); border-radius: 3px; height: 10px; overflow: hidden }
+.bar .fill { display: block; height: 100% }
+.bar .val { width: 56px; flex: none; text-align: right; font-size: 11px; color: var(--muted) }
+.live { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--green) }
+.asof { margin-left: auto; color: var(--faint); font-size: 10.5px }
+pre.answer { white-space: pre-wrap; font: 12.5px/1.7 -apple-system, 'Segoe UI', 'PingFang SC', sans-serif; color: var(--text); background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px }
+@media (max-width: 1100px) { .g3, .g4, .g5 { grid-template-columns: repeat(2, minmax(0,1fr)) } }
+@media (max-width: 760px) { .g2, .g3, .g4, .g5 { grid-template-columns: 1fr } .nav { display: none } }

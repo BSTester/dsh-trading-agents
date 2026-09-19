@@ -1,56 +1,35 @@
-# 单机部署：一个核心网关 + 一个调度器（规格 §5.1 的服务拆分在单机上的最小形态）
-# 既有工作台（8397）仍跑在宿主机上，本编排只消费它，不接管。
+# 单容器部署（默认形态）：一个容器跑全部角色，直连宿主机上的既有工作台（8397）。
+#
+# 挂载三件事，全部只读或独立卷，不复制不修改既有数据源：
+#   1) ~/.dsh             → /dsh-home  既是配置来源（自选池/流水线/富途凭据元信息），
+#                                      也是 dsh 运行时 home（凭据库/会话），供 Headless/SDK 通道使用
+#   2) ~/.npm/_npx        → /npx:ro    复用宿主机已装 dsh（含预编译 node-pty）
+#   3) 具名卷             → /app/data  平台自身数据（headless 日志、OMS 台账、策略轮、审计、SDK 回合）
 services:
-  gateway:
+  quant-v3:
     build:
       context: ..
       dockerfile: deploy/Dockerfile
     image: quant-platform-v3:latest
-    container_name: quant-v3-gateway
-    network_mode: host            # 复用宿主网络，直接访问 127.0.0.1:8397
+    container_name: quant-v3
+    network_mode: host
     environment:
-      QUANT_V3_ROLE: gateway
+      QUANT_V3_ROLE: all
       QUANT_V3_HOST: 127.0.0.1
       QUANT_V3_PORT: "8407"
       WORKBENCH_BASE: http://127.0.0.1:8397
       QUANT_V3_DATA: /app/data
-      # 既有配置（自选池/自动流水线/富途凭据元信息）只读挂入，不复制不修改
-      QUANT_CONFIG_HOME: /config
-      # SDK 通道按需打开（需模型密钥）
-      QUANT_SDK_ENABLED: "0"
-    volumes:
-      - quant-v3-data:/app/data
-      - ${DSH_HOME:-$HOME/.dsh}:/config:ro
-    restart: unless-stopped
-
-  scheduler:
-    # 调度器用 glibc 镜像（alpine 缺 node-pty 原生模块），并把宿主机已有的 dsh 只读挂进来复用；
-    # 容器内还需预置运行时 home（profiles + 模型凭据），见 README「部署」章节。
-    build:
-      context: ..
-      dockerfile: deploy/Dockerfile.scheduler
-    image: quant-platform-v3-scheduler:latest
-    container_name: quant-v3-scheduler
-    network_mode: host
-    environment:
-      QUANT_V3_ROLE: scheduler
-      QUANT_CONFIG_HOME: /config
-      DSH_HOME: /dsh-runtime
+      DSH_HOME: /dsh-home
+      QUANT_CONFIG_HOME: /dsh-home
       DSH_BIN: /npx/node_modules/.bin/dsh
-      QUANT_V3_PORT: "8408"
-      WORKBENCH_BASE: http://127.0.0.1:8397
-      QUANT_V3_DATA: /app/data
+      QUANT_SDK_ENABLED: "1"
       QUANT_HEADLESS_CONCURRENCY: "3"
       QUANT_HEADLESS_TIMEOUT_MS: "300000"
     volumes:
+      - ${DSH_HOME:-$HOME/.dsh}:/dsh-home
+      - ${DSH_NPX_CACHE:-$HOME/.npm/_npx}:/npx:ro
       - quant-v3-data:/app/data
-      - ${DSH_HOME:-$HOME/.dsh}:/config:ro          # 配置只读
-      - quant-v3-runtime:/dsh-runtime                      # 运行时 home（凭据库/会话，可写）
-      - ${DSH_NPX_CACHE:-$HOME/.npm/_npx}:/npx:ro          # 复用宿主机已装 dsh（含预编译 node-pty）
-    depends_on:
-      - gateway
     restart: unless-stopped
 
 volumes:
   quant-v3-data:
-  quant-v3-runtime:

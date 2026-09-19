@@ -82,14 +82,37 @@ test('静态 UI：首页可访问且为设计稿', async () => {
   assert.match(html, /<!DOCTYPE html>/i)
 })
 
-test('实时数据层：包含逐点位深绑定与防御性渲染护栏', async () => {
-  const js = await fetch(`${BASE}/app.js`)
-  const source = await js.text()
-  for (const marker of ['setValueWithUnit', 'bindByLabel', 'bindChannelCard', 'deepBindIndex', 'deepBindTools', 'deepBindSettings', 'deepBindRisk', 'isSeparator', 'lineChartSvg', 'barChartSvg', 'bindSparkline']) {
-    assert.ok(source.includes(marker), `app.js 缺少 ${marker}`)
+test('前端资产：数据驱动渲染层，且不含任何占位字样', async () => {
+  const js = await (await fetch(`${BASE}/app.js`)).text()
+  const css = await (await fetch(`${BASE}/styles.css`)).text()
+  for (const marker of ['PAGES', 'RENDER', 'lineChart', 'bars', '真实数据']) {
+    assert.ok(js.includes(marker), `app.js 缺少 ${marker}`)
   }
-  // 行级防御：渲染表格时过滤非数组行（避免单页结构异常把整块实时条打空）
-  assert.match(source, /filter\(\(r\) => Array\.isArray\(r\)\)/)
+  assert.equal(js.includes('示例'), false, 'app.js 不应出现占位字样')
+  assert.equal(css.includes('示例'), false, 'styles.css 不应出现占位字样')
+})
+
+test('JSON 指标端点：与 Prometheus 文本同源', async () => {
+  const res = await fetch(`${BASE}/api/v3/metrics`)
+  const body = await res.json()
+  assert.equal(body.ok, true)
+  for (const key of ['mcp', 'wb', 'http', 'headless', 'toolTotal', 'toolDomains', 'workbenchUp']) {
+    assert.ok(key in body, `缺少字段 ${key}`)
+  }
+})
+
+test('brain 端点：带 ok 标记与已落盘的 SDK 回合列表', async () => {
+  const body = await (await fetch(`${BASE}/api/v3/brain`)).json()
+  assert.equal(body.ok, true)
+  assert.ok(Array.isArray(body.sdk.turns), 'brain.sdk.turns 应为数组')
+  assert.ok('headless' in body && 'decision' in body)
+})
+
+test('静态 UI：首页可访问且为设计稿', async () => {
+  const res = await fetch(`${BASE}/index.html`)
+  assert.equal(res.headers.get('content-type')?.includes('text/html'), true)
+  const html = await res.text()
+  assert.match(html, /<!DOCTYPE html>/i)
 })
 
 test('JSON 指标端点：与 Prometheus 文本同源', async () => {
@@ -102,13 +125,15 @@ test('JSON 指标端点：与 Prometheus 文本同源', async () => {
   assert.ok(Number.isFinite(body.toolTotal) && body.toolTotal > 0)
 })
 
-test('静态 UI：9 页都挂了实时数据层 app.js', async () => {
-  const js = await fetch(`${BASE}/app.js`)
-  assert.equal(js.status, 200)
+test('静态 UI：9 页均为数据驱动外壳（无内联数据、无占位字样）', async () => {
   for (const page of ['index', 'brain', 'market', 'strategy', 'risk', 'execution', 'gateway', 'tools', 'settings']) {
-    const res = await fetch(`${BASE}/${page}.html`)
-    const html = await res.text()
-    assert.ok(html.includes('src="/app.js"'), `${page}.html missing app.js`)
+    const html = await (await fetch(`${BASE}/${page}.html`)).text()
     assert.match(html, /<!DOCTYPE html>/i)
+    assert.ok(html.includes('src="/app.js"'), `${page}.html 缺 app.js`)
+    assert.ok(html.includes('href="/styles.css"'), `${page}.html 缺 styles.css`)
+    assert.equal(html.includes('示例'), false, `${page}.html 不应出现占位字样`)
+    const body = html.slice(html.indexOf('<body'))
+    const inlineNumbers = body.replace(/<[^>]+>/g, ' ').match(/[0-9]{3,}/g) ?? []
+    assert.deepEqual(inlineNumbers, [], `${page}.html 正文不应内联数字`)
   }
 })

@@ -6,7 +6,7 @@
 // 运行时由 `dsh --profile <sdkProfile>` 启动（dsh-sdk-app bundle）；stdout 只允许 JSON-RPC 帧。
 import { spawn } from 'node:child_process'
 
-export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new Date() }) {
+export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new Date(), store } = {}) {
   const sdk = config.channels.sdk
   const state = {
     status: sdk.enabled ? 'pending' : 'disabled',
@@ -20,6 +20,8 @@ export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new 
   const events = []
   const pendingBySession = new Map()
   let buffer = ''
+  // 回合留痕：assistant 文本与工具调用按会话累积，turn/end 时落盘（页面/接口可长期读取真实会话结论）
+  const turnDraft = new Map()
 
   function keyPresence() {
     return Boolean(process.env.DEEPSEEK_API_KEY || process.env.ZAI_CODING_CN_API_KEY || process.env.ANTHROPIC_API_KEY)
@@ -83,6 +85,37 @@ export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new 
     if (frame.method) {
       events.push({ at: clock().toISOString(), method: frame.method, params: frame.params })
       if (events.length > 200) events.splice(0, events.length - 200)
+      const event = frame.params?.event
+      const sessionId = frame.params?.sessionId ?? null
+      if (event?.type === 'assistant/message') {
+        const draft = turnDraft.get(sessionId) ?? { answer: '', toolCalls: [] }
+        for (const block of event.data?.message?.content ?? []) {
+          if (block.type === 'text' && String(block.text ?? '').trim()) draft.answer = block.text
+          if (block.type === 'tool-call') draft.toolCalls.push(String(block.name ?? ''))
+        }
+        turnDraft.set(sessionId, draft)
+      }
+      if (event?.type === 'turn/end') {
+        const draft = turnDraft.get(sessionId) ?? { answer: '', toolCalls: [] }
+        const reason = event.data?.reason ?? {}
+        const record = {
+          at: clock().toISOString(),
+          sessionId,
+          kind: reason.kind ?? 'completed',
+          code: reason.error?.code ?? reason.failure?.code ?? null,
+          message: reason.error?.message ?? reason.failure?.message ?? null,
+          answer: draft.answer,
+          toolCalls: draft.toolCalls,
+          profile: sdk.profile,
+          route: { provider: sdk.provider, model: sdk.model },
+        }
+        try {
+          store?.append('sdk_turns.jsonl', record)
+        } catch {
+          // 留痕失败不影响会话
+        }
+        turnDraft.delete(sessionId)
+      }
     }
   }
 
@@ -181,7 +214,12 @@ export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new 
     }
   }
 
-  return { start, prompt, stop, status, events }
+  function turns(limit = 5) {
+    const persisted = store?.readAll('sdk_turns.jsonl') ?? []
+    return persisted.slice(-limit).reverse()
+  }
+
+  return { start, prompt, stop, status, events, turns }
 }
 
 export default createSdkChannel
