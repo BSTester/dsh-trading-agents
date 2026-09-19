@@ -95,3 +95,31 @@ test('config：默认值与既有配置复用（不打印密钥）', () => {
   assert.ok(config.sources.futu)
   assert.ok(!JSON.stringify(config).includes('app_key'))
 })
+
+test('headless：平台超时 kill 不被记成正常退出（exit 124 + killed_by）', async () => {
+  const { EventEmitter } = await import('node:events')
+  const fakeChild = new EventEmitter()
+  fakeChild.stdout = new EventEmitter()
+  fakeChild.stderr = new EventEmitter()
+  fakeChild.kill = () => {
+    // 模拟被 kill 后进程以 code 0 收尾（真实场景常见），并推迟到下一个 tick 触发 close
+    setImmediate(() => fakeChild.emit('close', 0, 'SIGTERM'))
+  }
+  const spawnImpl = () => {
+    setImmediate(() => fakeChild.stdout.emit('data', '部分输出\n'))
+    return fakeChild
+  }
+  const store = { append() {}, readAll: () => [], readJson: () => null, writeJson() {} }
+  const { createHeadlessRunner } = await import('../server/gateway/headless.mjs')
+  const runner = createHeadlessRunner({
+    config: { home: '/tmp', channels: { headless: { dshBin: 'dsh', profile: 'headless', timeoutMs: 60, concurrency: 1, tokenBudgetPerCall: 1000 } } },
+    store,
+    spawnImpl,
+  })
+  const record = await runner.execute('任务')
+  assert.equal(record.timed_out, true)
+  assert.equal(record.exit_code, 124)
+  assert.equal(record.raw_exit_code, 0)
+  assert.equal(record.killed_by, 'platform-timeout')
+  assert.equal(record.success, false)
+})

@@ -88,7 +88,10 @@ export function createHeadlessRunner({ config, store, spawnImpl = spawn, clock =
           prompt,
           answer,
           diagnostics: timedOut ? `${stderr}\n[platform] 超时 ${headless.timeoutMs}ms，已强制 kill` : stderr,
-          exit_code: code,
+          // 超时被平台 kill 不是正常退出：记 124（timeout 约定）并标注原因，保留原始退出码
+          exit_code: timedOut ? 124 : code,
+          raw_exit_code: code,
+          killed_by: timedOut ? 'platform-timeout' : null,
           signal,
           success: code === 0 && !timedOut,
           timed_out: timedOut,

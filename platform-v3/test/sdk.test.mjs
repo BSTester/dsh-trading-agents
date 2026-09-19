@@ -7,6 +7,17 @@ import createSdkChannel from '../server/gateway/sdk.mjs'
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..')
 
+// 等事件回流（轮询），避免竞态；所有会 spawn 的用例都用 try/finally 保证 stop()
+async function waitFor(predicate, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs
+  while (Date.now() < deadline) {
+    if (predicate()) return true
+    await new Promise((r) => setTimeout(r, 25))
+  }
+  return false
+}
+
+
 function makeConfig(overrides = {}) {
   return {
     home: '/tmp/quant-v3-sdk-home',
@@ -41,22 +52,29 @@ test('握手成功：serverInfo 为 deepseek-harness-sdk-runtime', async () => {
 
 test('session/prompt 入队回执 + 事件流', async () => {
   const channel = createSdkChannel({ config: makeConfig() })
-  await channel.start()
-  const result = await channel.prompt('quant-001', '分析当前持仓风险')
-  assert.equal(result.ok, true)
-  assert.equal(result.messageId, 'msg-1')
-  const methods = channel.status().events.map((e) => e.method)
-  assert.ok(methods.includes('session.status'))
-  assert.ok(methods.includes('session.event'))
-  await channel.stop()
+  try {
+    await channel.start()
+    const result = await channel.prompt('quant-001', '分析当前持仓风险')
+    assert.equal(result.ok, true)
+    assert.equal(result.messageId, 'msg-1')
+    await waitFor(() => channel.status().events.some((e) => e.method === 'session.event'))
+    const methods = channel.status().events.map((e) => e.method)
+    assert.ok(methods.includes('session.status'))
+    assert.ok(methods.includes('session.event'))
+  } finally {
+    await channel.stop()
+  }
 })
 
 test('未握手直接 prompt：先自动握手', async () => {
   const channel = createSdkChannel({ config: makeConfig() })
-  const result = await channel.prompt('quant-002', '评估隔夜新闻')
-  assert.equal(result.ok, true)
-  assert.equal(channel.status().initialized, true)
-  await channel.stop()
+  try {
+    const result = await channel.prompt('quant-002', '评估隔夜新闻')
+    assert.equal(result.ok, true)
+    assert.equal(channel.status().initialized, true)
+  } finally {
+    await channel.stop()
+  }
 })
 
 test('无密钥：握手照常成功（握手不需要密钥），但给出会话警告', async () => {
@@ -99,13 +117,16 @@ test('requireKey=true 时按显式要求预检并拒绝', async () => {
 
 test('最近一轮结论从事件流提取（turn/end 错误码）', async () => {
   const channel = createSdkChannel({ config: makeConfig() })
-  await channel.start()
-  await channel.prompt('quant-003', '自检')
+  try {
+    await channel.start()
+    await channel.prompt('quant-003', '自检')
   // 手写一条 turn/end 错误事件，验证 status().lastTurn 的提取
   channel.events.push({ at: new Date().toISOString(), method: 'session.event', params: { sessionId: 'quant-003', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: { code: 'MISSING_CREDENTIAL', message: 'llm-deepseek: no API key' } } } } } })
   const status = channel.status()
   assert.equal(status.lastTurn.kind, 'error')
   assert.equal(status.lastTurn.code, 'MISSING_CREDENTIAL')
-  assert.match(status.lastTurn.message, /no API key/)
-  await channel.stop()
+    assert.match(status.lastTurn.message, /no API key/)
+  } finally {
+    await channel.stop()
+  }
 })
