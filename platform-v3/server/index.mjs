@@ -347,6 +347,27 @@ app.get('/api/v3/factors/matrix', async ({ query }) => {
   return { ok: true, matrix, ic: ic.ok ? ic : { ok: false, error: ic.error } }
 })
 
+// 盘口深度 / 板块行情（工作台真实数据，供行情页元素）
+app.get('/api/v3/orderbook', async ({ query }) => {
+  const ticker = String(query.ticker || 'SH.600519')
+  return wbValue(wb.call('rt_order_book', { code: ticker }))
+})
+
+app.get('/api/v3/plates', async ({ query }) => wbValue(wb.call('plate_list', { market: String(query.market || 'SH'), plate_class: String(query.plate_class || 'ALL') })))
+
+// 参数扫描网格（真实回测，供策略页热力图）
+app.get('/api/v3/ml/sweep', async ({ query }) => {
+  const ticker = String(query.ticker || 'SH.600519')
+  const limit = Math.min(Math.max(Number(query.limit || 500), 60), 2000)
+  const envelope = await wb.call('series', { ticker, period: '1d', limit })
+  if (!envelope?.ok) return { ok: false, error: envelope?.error ?? { code: 'wb/error' } }
+  const result = paramSweep(envelope.value.bars, {
+    windows: String(query.windows || '10,20,30,60').split(',').map(Number).filter(Number.isFinite),
+    rebalanceDays: String(query.rebalance || '5,10,20').split(',').map(Number).filter(Number.isFinite),
+  })
+  return { ok: true, ticker, ...result }
+})
+
 app.get('/api/v3/oms/orders', async () => ({ ok: true, ...(await oms.view()) }))
 
 app.post('/api/v3/oms/sync', async () => oms.sync())
