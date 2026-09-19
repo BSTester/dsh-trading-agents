@@ -421,6 +421,7 @@ failed，err 还误报「已达重试上限」**——运维据此排查会被�
 | 计划期**结构性预警** | 现金封顶/现金不可得/持仓数超限/零订单都发 warn 并进 `plan_auto` 的 `warnings`；**零订单计划在流程页按 `skipped` 呈现**（「没做成」不得显示「已完成」）；预警**不改作业状态**（作业确实跑完） | 同文件 `PlanAutoStructuralWarningTest`（含 `_ALERT_STATUS`/`_CONTENT_OUTCOMES` 字面量锁） |
 | `missing_in_oms` **收编**（收敛路径） | 券商独有订单在差异判定前导入台账（`plan_id=reconcile-import`、`err` 带券商单号与原始状态码）后**重新匹配**；只认已发布枚举，表外码/无单号**不导入**、保留为差异；幂等；**只读券商** | 同文件 `ReconcileImportTest` |
 | 收编的两条配套口径 | ① 收编行按**对账日期**落 `created_at`（不是墙钟）——订单匹配按对账日取窗，否则重放历史日期时刚收编的行落在窗口外、critical + halt 原样复现；② 收编行**不建立持仓知识**（`footprint_symbols` 排除 `IMPORT_PLAN_ID`）——零成交收编单不会把历史存量持仓从 `untracked` 升级成 `missing_side`，有成交的经 fills 回填照常进足迹 | 同文件两个对偶用例 |
+| ↑ ②的**推广**（2026-09-19，见 §8.12） | 持仓知识只来自「**买入成交**」或「本地相信自己已/可能已成交的订单」（`POSITION_CLAIM_STATES`）；收编行、`draft`/`frozen`、无成交的 `cancelled`/`rejected` 都不建立持仓知识。原实现只特判了收编行，于是手工计划的**作废卖单**把 8 只历史存量持仓升级成 `missing_side`（真机熔断） | `tests/test_reconcile_footprint.py::FootprintKnowledgeTest` |
 
 **真机证据（2026-09-18 00:19–00:22，sim）**：
 
@@ -850,3 +851,126 @@ Python 全量 2411 例 `OK (skipped=5)`、根 `node --test tests/*.test.mjs` 66 
 （行情页输入 `600` → 候选 `SH.600000/SH.600009/…` 各带「A股 SH」标签）与
 `/tmp/sym-factors.png`（因子页多标的字段同样的候选），另实测持仓候选
 （`00100` → `HK.00100 MINIMAX-W`）与自由输入 `XX.NEWCODE` 不丢值、回车仍触发查询。
+
+### 8.12 对账持仓足迹口径修正 + 港股负持仓复核（2026-09-19 实机复盘 / 已修）
+
+**背景**：为页面字段审计造数据时，对账报了 11 条差异并置 halt（`reason=reconcile_diff`、
+`set_at 2026-09-19 10:27:57`，digest `diffs=11 / untracked=5`）。其中两条被列为「可疑缺陷」，
+本轮按真机证据复核：一条**不成立**（误读），一条**成立并已修**。
+
+**① 「港股成交回填把买入记成了卖出」——复核结论：不成立（误读），未改方向口径**
+
+真机订单原文（`sim_trade_history_order_list`，acc=9393 港股模拟账户，2026-09-14 窗口）：
+
+| 券商单号 | 标的 | `side` | 券商原文 `text` | 累计成交/均价 | 期望方向 | 本地 OMS `side` | 本地 fills 符号 | 一致 |
+|---|---|---|---|---|---|---|---|---|
+| 7138921 | HK.00981 | 2 | 中芯破位保险-61.3防线下方减1000 | 1000 / 61.4 | SELL | SELL | −1000 | ✅ |
+| 7138918 | HK.00100 | 2 | MINIMAX减200-263.4已破-限价下移253 | 200 / 253 | SELL | SELL | −200 | ✅ |
+| 7138916 | HK.02513 | 2 | 智谱清仓-限价下移729-配售714套利压 | 100 / 729 | SELL | SELL | −100 | ✅ |
+| 7138393/7138394/7138395/7138396 | HK.02513/03986/00100/09988 | 2 | 清仓/减仓（未成交） | 0 | SELL | SELL（收编为 `cancelled`） | 无 | ✅ |
+| 7138398–7138401 | SZ.002131/SZ.002716/SH.601179/SH.600089 | 2 | 清仓/减仓（未成交） | 0 | SELL | SELL（同上） | 无 | ✅ |
+| 7138429 / 7138397 | US.MHI2609 / US.MSTR | 2 | 「挂空」/「减400留600」 | 0 | SELL | SELL（同上） | 无 | ✅ |
+| 7149712 / 7149716 | SH.600010 | 1 | （自动流水线买入单，见 §8.3） | 0 | BUY | —（本机未回填） | — | ✅ 交叉验证 |
+| 7150081–7150312 | SH.601988 | 1 | （本地自动计划买入单） | 0 | BUY | BUY（收编行） | 无 | ✅ |
+
+- **`1=Buy / 2=Sell` 在两个端点/两个通道本就是同一份枚举**：工作台 `orders_open` 里的中文
+  「买入/卖出」是 `platform/server/labels.py` 的 `SIDE = {1:"买入",2:"卖出"}` 对同一份整数码的
+  中文化（前端 `platform/web/src/services/runtimeCharts.js` 的 `SIDE_CODES` 同值），**不是两套
+  枚举**；`broker.place` 出站也用 `side_code = 1 if side == "BUY" else 2`。用户假设的「两通道
+  方向口径不同」在真机上不成立。
+- 因此本地 `−1000 / −200` 是**符号正确**的结果：那两张单是**部分减仓**（券商持仓行原文
+  `qty` 仍为 1000 / 200，成本 `buy_avg_price` 78.838 / 417.05）。本地为负的真因是**建仓腿缺失**
+  ——本地库被清空，而券商订单历史窗口（约 30 天）到不了建仓那天；`HK.02513` 则是「清仓卖出」
+  且券商已平，本地只剩那条卖出腿。
+- **结论：没有方向缺陷，`SIDE_BY_CODE` 不改**。把 2 改成 BUY 才会把真实卖单读成买单。
+  新增 `tests/test_reconcile_footprint.py::SideCodeTest`（2 例）把码义与符号钉死，防止后人「修」反。
+
+**② 清库/存量持仓被升级成 `missing_side`（critical + halt）——成立，已修**
+
+- **断因**（实机 + 代码双证）：`footprint_symbols` 把「**任何**非收编订单行」都算作持仓知识。
+  于是手工计划 `PLN-20260918-sim-6815` 的 9 张**作废**单（1 张买入 + 8 张卖出；`status='cancelled'`、
+  `broker_order_id IS NULL`——kill switch 拦下、从未到券商、零成交）让 8 只券商侧历史存量持仓
+  进入两侧比对 → 本地 `None` vs 券商有量 → `missing_side` → critical + halt。
+  这与 §8.3 第 ② 条已记录的收编行问题是**同源**的：原实现只特判了
+  `plan_id='reconcile-import'`，而原则是「**订单行本身不含持仓事实**」。
+- **修法**（`reconcile.footprint_symbols`，两个正交条件，都是「本地**买入**主张」）：
+  ①**买入成交**（`fills` 挂在 BUY 订单上 = 本地观察到过**建仓**事件）；
+  ②**本地相信自己买入过的订单**（新增常量 `POSITION_CLAIM_STATES = ("partial","filled","unknown")`
+  且 `side=BUY` —— 即使 fills 因缺均价而没回填，缺口也必须继续可见）。
+  收编行、`draft`/`frozen`、无成交的 `cancelled`/`rejected`、以及**卖出**订单都**不**建立
+  持仓知识。②必须带 `side=BUY`：自动流水线卖存量老仓（目标外清出）会留下 `filled` 卖单，
+  若它算持仓知识，「平台自己卖老仓」这一步就会把链熔断。
+- **只有减仓腿的标的落在哪**：那三只港股既不是「两侧事实分歧」，本地也无从主张持仓 →
+  券商侧仓位进 `untracked`；本地那个**无法支撑的主张**进**新键 `local_unbacked`**
+  （`daily` 返回值 + `daily:digest` 计数 + `reconcile:latest` 明细），如实列出、
+  **不计差异、不 halt**。`HK.02513`（券商已平）只在 `local_unbacked` 里可见——**不静默丢弃**。
+- **真实单边缺失不受影响**（不得为了消差异而削弱检测）：「本地认为已平仓、券商仍持有」的标的
+  必然有买入成交 → 仍在足迹内 → 本地净持仓 0（无条目）vs 券商有量 → `missing_side` → critical + halt
+  （`test_real_one_sided_missing_still_halts`）；「本地已记买入成交但券商未给均价」的缺口也不许藏进
+  untracked（`test_broker_contacted_order_without_fills_still_compares`）。
+
+**实机前后对比**（`PYTHONPATH=plugins/core/python ~/.dsh/trading-venv/bin/python -B -m trading_core
+reconcile-daily --today 2026-09-19`，本机 sim，真机券商通道）
+
+| | diffs | untracked | local_unbacked | 熔断 |
+|---|---|---|---|---|
+| 修复前 | **11**（HK.00100 `qty` local −200/broker 200、HK.00981 `qty` −1000/1000、HK.02513 `missing_side` local −100/broker 无、8 只 A 股 `missing_side` local 无/券商有量） | 5 | 键不存在 | `set_halt(reason=reconcile_diff)` |
+| 修复后 | **0** | 15（该窗口内全部券商持仓，含那 8 只） | 3（HK.00100 / HK.00981 / HK.02513） | 本次 run `halted=false`；既有 halt 仍由人工 `clear_halt` 清除 |
+
+**遗留 / 边界（如实登记）**
+
+- **改了既有 E2E 夹具（`tests/test_wp9_e2e.py` 场景 ③）**：那条用例原先靠「零成交的 `draft`
+  订单行也算持仓知识」制造差异——正是本次修掉的根因。夹具改为显式种一笔**窗口外的本地建仓**
+  （订单 + 成交 100 股），券商持 12490 股 → `qty` 差异（`qty_diff=-12390`）→ 守卫 4 拦下；
+  用例的**目的**（真差异 → 熔断 → 次日自动执行被拦）逐字未变，并新增一条断言把「熔断判据是
+  两侧数量分歧」钉死（另见 `_seed_local_acquisition` docstring）。
+- **负持仓不再 critical，而是 `local_unbacked`**：这是本轮**唯一**的口径放宽，理由与边界写在
+  `footprint_symbols` docstring 与测试里。**已知边界**：只有卖出成交的标的（真做空）也会落入
+  `local_unbacked`、不判差异——本机 sim 的证券账户是长仓现金账户（持仓行 `pstn_type=0` 且
+  `qty` 为正），期货空头目前只经收编行出现；将来若真的做空且要判它，必须先给「建仓腿」补一个
+  正向定义（不能靠"负数=账本残缺"这一条）。
+- **本地一旦有过买入主张就永久进入比对**（故意的保守方向）：例如券商另有清库前的存量、本地
+  只知新买的那一笔时，会报 `qty` 差异并熔断。宁可报警也不放过真差异；只有「本地连买入主张都
+  没有」才归 `untracked` / `local_unbacked`。
+- 本地库清空后**不可能**从券商 30 天订单窗口重建成本：`buy_avg_price` 是券商持仓的聚合口径、
+  不是成交事实，按既有纪律「回填只认券商订单历史」→ **不补造建仓成交**（宁缺毋假）。
+- `HK.02513` 本地 −100 与券商「已平」仍不完全自洽（清仓卖单在窗口内、买单在窗口外）；
+  `local_unbacked` 是把这件事**如实列出**的落点，不等于「已查明为无差异」。
+- **清熔断判据**（本轮实际执行）：① 剩余差异逐条查明为演练/清库产物；② 修复后重跑
+  `diffs=[]`；③ 才调 `store.clear_halt` 并把理由写进告警。`daily` 零差异**永不**自动清 halt
+  的纪律不变（§8.3、RUNBOOK 场景 3）。
+
+**清熔断记录（2026-09-19 11:38:56，用户已批准）**
+
+- 入口：`store.clear_halt(conn)`（既有唯一入口），随后 `alerts.emit(level="warn",
+  title="熔断解除", detail=<理由>)`——`clear_halt` 本身不带 reason 参数，理由以告警留痕
+  （告警 35，detail 逐条写明三类差异的成因与重跑证据）。清除前
+  `{"active": true, "reason": "reconcile_diff", "set_at": "2026-09-19 10:27:57"}` →
+  清除后 `{"active": false, "reason": null, "set_at": "2026-09-19 11:38:56"}`。
+- 清除**前**先跑生产执行体核验（`daemon._subprocess_runner(['reconcile-daily'])`，即 19:00
+  GLOBAL 链那条腿：子进程 + 仓库 `PYTHONPATH` 前置，`repo_paths.repo_root()` =
+  本仓库）：`diffs=0 / untracked=15 / local_unbacked=3 / halted=false`。
+  服务进程自 10:48 起在内存里持有的是**修复前**的 `trading_core`（`run.py` 会把仓库数据层
+  插到 `sys.path` 最前，因此它加载的本就是仓库代码，只是加载时间早于本次修改），但**对账
+  作业走子进程**——`_subprocess_runner` 把仓库数据层前置给子进程，子进程吃的是**仓库磁盘上
+  的当前代码**。**结论：不需要 refresh / 重启服务**，19:00 的对账不会用旧口径重新置位 halt。
+- 端点复核（缓存 TTL 30s 过后）：`POST /api/wb/schedule` → `halt: false`、
+  `kill: false`；`POST /api/wb/pipeline` → `halt: {"halted": false, "halt_reason": null}`、
+  `auto_pipeline.enabled: true`（`exec_at` SH 09:35 / HK 09:45 / US 22:35、
+  `reconcile_at` 19:00）。**注意：本构建的 `/healthz` 只回 `mode/ok/push/scheduler`，
+  不暴露 halt**（halt 的端点事实源是 schedule/pipeline 两个快照）。
+- 未动的约束：`~/.dsh/trading-platform.json` mtime 仍是 2026-09-18 23:27:10
+  （关注池 35 只 / `auto_pipeline.enabled=true` / `exit_outside_target=true` 逐项复核）；
+  演练残留保留（研报 `RT-20260918-SH-daily_brief-94B01A.md`、手工计划
+  `PLN-20260918-SIM-12FB`、本地量化台账 `SH.600031 8200 @17.89`）；未清库、未下单。
+
+**证据**：`tests/test_reconcile_footprint.py` 9 例（方向码映射、回填买卖符号、
+作废单/`draft`/`filled` 卖单不建立持仓知识、只有减仓腿 → `untracked` + `local_unbacked`、
+真实单边缺失仍 critical + halt、`unknown` 买入订单仍在足迹、digest/kv 暴露
+`local_unbacked`）；既有对账相关模块（`test_wp9_reconcile_daily` + `test_wp17_reconcile_import`
++ `test_core_reconcile` + `test_e2e_oms_align` + `test_e2e_pipeline_honesty`）77 例全绿，
+`test_wp9_e2e` 7 例全绿（含改过夹具的场景 ③）；三套全量：
+Python `Ran 2428 tests ... OK (skipped=5)`、根 `node --test tests/*.test.mjs` 73 例、
+`platform/web` `npm test` 408 例。真机证据：券商订单原文与持仓原文见上表（本节复核时用
+`~/.dsh/trading-venv/bin/python` 只读拉取 `sim_trade_history_order_list` /
+`sim_trade_position_list`，**未写任何券商侧数据**）。

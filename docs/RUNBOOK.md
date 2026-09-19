@@ -403,12 +403,33 @@ WantedBy=default.target
      差异已能自动收敛」小节；历史日期的遗留单要带 `--today <对账日>`），跑完确认
      `diffs: []`；
    * 券商已撤而本地仍在途 → `reconcile-daily` 按官方状态码自动收敛；对账覆盖不到的
-     历史行才用 `oms-align` 人工留痕（见本文开头「订单终态人工对齐」）。
+     历史行才用 `oms-align` 人工留痕（见本文开头「订单终态人工对齐」）；
+   * **清库重建后的存量持仓不该熔断**（2026-09-19 实机，见 HANDOVER §8.12）：本地库被清空
+     或换库后，券商侧的存量老仓在本地**没有任何建仓成交**——按持仓口径它们属于
+     `untracked`（如实列出、**不计差异**），**不是** `missing_side`。判据就在重跑输出里：
+     `diffs: []`、`untracked` 里能看到这些标的、`halted: false`（本次 run 无差异）。
+     若这些标的仍报 `missing_side`，先查**是不是有零成交的本地订单行被算成了持仓知识**
+     （`draft`/`frozen`、本地作废的 `cancelled`/`rejected`、只有卖出腿的成交）——那是口径
+     缺陷，不是真差异，别用「人工对齐」硬压。
+     同理，本地只有**减仓腿**（回填出来的卖出成交、没有建仓成交）的标的也不计差异：
+     它们出现在 `reconcile:latest.local_unbacked`（本地账本不完整，如实列出）。
+   * 真差异长什么样（**必须继续 critical + halt**）：本地**有买入成交**却与券商对不上——
+     「本地认为已平仓、券商仍持有」（本地净持仓 0 vs 券商有量）或数量不一致
+     （本地 100 vs 券商 12490）。这类不要当成口径噪音。
 5. 修正本地台账、迁移完在途单后，清 halt：
    ```bash
    ~/.dsh/trading-venv/bin/python -B -c "from trading_core import store; \
      store.clear_halt(store.connect())"
    ```
+   **清 halt 必须留理由**：`clear_halt` 不带 reason 参数、平台也没有 ack 入口，所以清完要
+   紧接着写一条留痕告警（否则后人只看到历史 critical，答不出「为什么不用继续 halt」）：
+   ```bash
+   ~/.dsh/trading-venv/bin/python -B -c "from trading_core import alerts, store; \
+     alerts.emit(store.connect(), home='$HOME/.dsh', level='warn', title='熔断解除', \
+     detail='<逐条写明差异成因 + 重跑证据 diffs=0>')"
+   ```
+   理由要能回答「不是让它闭嘴」：差异**逐条**查明（哪几条是演练/清库产物、哪几条已收敛），
+   并附上一次 `diffs: []` 的重跑证据。
 6. 若当时上了 kill switch：人工确认后 `unkill`（删除 `~/.dsh/trading-kill`）。
 7. 次日恢复验证：daemon 到点正常 `build_plan` 产出冻结计划；工作台红点消失；`is_halted` 为 `False`。
 
@@ -772,7 +793,9 @@ PYTHONPATH=plugins/core/python:plugins/datasource/python \
 **判定收敛成功的三条**：输出 `digest.orders_imported ≥ 1` 且 `diffs: []`、`halted: false`；
 OMS 里 `SELECT plan_id,err FROM orders WHERE plan_id='reconcile-import'` 能对上券商单号；
 `reconcile:latest` 的 `diffs` 为空。**收敛 ≠ 抹掉事实**：券商持仓里没有成交足迹的历史存量
-仍如实列在 `untracked`（不计差异），有成交的收编单会回填 fills 并照常比对持仓。
+仍如实列在 `untracked`（不计差异）；收编单**确有买入成交**时经 fills 回填照常比对持仓
+（2026-09-19 起：只有**卖出**成交的标的算「本地账本不完整」，落 `untracked` +
+`reconcile:latest.local_unbacked`，不计差异——见 HANDOVER §8.12）。
 
 收敛确认后按场景 3 第 4 步 `clear_halt`；留存的历史 critical 告警是**记录**（平台没有 ack
 入口），随对账不再重现而自然过期。

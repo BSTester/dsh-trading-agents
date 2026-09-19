@@ -14,8 +14,10 @@ critical 告警 + halt（**只暂停后续执行，绝不自动平仓**）→ TC
   仍然判定：「券商累计成交已足/未足 与 OMS 状态 filled/partial 互相矛盾」——
   它不需要状态码语义，只用成交数量 + OMS 自身状态；
 * **持仓口径**：本地台账 = OMS ``fills`` 派生的**累计**净持仓（买 + 卖 −）；
-  只有 OMS 有足迹（任何订单或成交）的标的参与差异判定——券商有持仓而 OMS 无任何
-  记录的标的记入 ``untracked``，**不计差异**（多半是平台外建的仓，报差异是噪音）；
+  只有**能支撑持仓主张**的标的参与差异判定（口径见 ``footprint_symbols``：本地观察到过
+  建仓的**买入成交**，或本地相信自己**买入**过的订单）——其余券商仓位记入
+  ``untracked``、本地那些无法支撑的主张记入 ``local_unbacked``，两者都**如实列出、
+  不计差异、不 halt**（多半是平台外建的仓，报差异是噪音）；
 * **先同步券商事实，再判差异**（修复 sim 系统性假差异与两条自锁熔断路径）：sim 通道的
   成交**不经** WS 交易事件通道（``platform/server/trading.py::_record_fill`` 只在推送
   路径写 ``fills``），因此本地台账在 sim 常态下既没有成交、订单状态也停在 ``submitted``。
@@ -43,6 +45,17 @@ _TZ8 = _dt.timezone(_dt.timedelta(hours=8))
 #: OMS 中「应当能在券商侧查到」的状态（真正到过券商的在途/终态）。
 #: draft/frozen 未提交、cancelled/rejected 无需券商佐证——都不核对（否则是噪音）。
 BROKER_EXPECTED_STATES = ("submitting", "submitted", "partial", "filled", "unknown")
+
+#: 本地订单中「本地相信自己**买入**过、且可能已经成交」的状态——即使 ``fills`` 缺失
+#: （例如券商没给成交均价，回填如实跳过），本地 OMS 也已经记下「这单买入成交过」，
+#: 持仓缺口必须继续可见。**持仓知识只来自「买入主张」**：买入成交（建仓腿），或
+#: 这里的买入订单；从未到券商的 ``draft``/``frozen``、无成交的 ``cancelled``/``rejected``，
+#: 以及**卖出**订单都不构成持仓主张——把它们算成足迹会让券商侧的历史存量持仓被误判成
+#: ``missing_side``（实机 2026-09-19：手工计划 ``PLN-20260918-sim-6815`` 的 9 张**从未
+#: 提交**的作废单——1 张买入 + 8 张卖出——把 8 只历史存量持仓从 ``untracked`` 升级成
+#: ``missing_side`` →
+#: critical + halt）。
+POSITION_CLAIM_STATES = ("partial", "filled", "unknown")
 
 #: 券商只读工具（对账绝无写调用；出现写类即 bug）。
 SIM_READ_TOOLS = ("sim_trade_account_list", "sim_trade_position_list",
@@ -137,24 +150,53 @@ def local_net_positions(conn):
 
 
 def footprint_symbols(conn):
-    """本地台账**有持仓知识**的标的（成交记录，或非收编的订单记录）。
+    """本地台账**能支撑持仓主张**的标的（= 有资格参与持仓级比对的标的）。
+
+    持仓主张只有一种：**本地买入过**。它有两个来源（少一个就会把真差异藏起来）：
+
+      * **买入成交**（``fills`` 挂在 BUY 订单上）：本地台账观察到过**建仓**事件——这是
+        「本地认为该标的持有多少」唯一的事实基础。**只有卖出成交不算**：那说明券商侧该
+        仓位是平台外建仓（本地库被清空、或建仓腿早于券商订单窗口），本地无从主张它持有
+        什么（实机 2026-09-19：港股 ``HK.00100``/``HK.00981``/``HK.02513`` 只有三张回填
+        自券商历史的**减仓/清仓**成交，本地净持仓 −200/−1000/−100 是账本残缺，不是两侧
+        事实分歧）；
+      * **本地相信自己买入过的订单**（``POSITION_CLAIM_STATES`` + ``side=BUY``）：即便
+        ``fills`` 缺失（券商未给成交均价 → 回填如实跳过），本地 OMS 已记「买入成交过」，
+        缺口必须继续可见（宁缺毋假：见 ``tests/test_wp9_reconcile_daily.py`` 的同名用例）。
+
+    **不建立持仓知识**的三类（都是本仓库踩过的自锁熔断）：
+
+      * 收编行（``IMPORT_PLAN_ID``）：那是本模块自己写下的记账产物，只回答「这张券商单本地
+        为什么没有」（2026-09-18 实机：收编零成交的 ``SH.603993`` 让历史存量从 ``untracked``
+        升级成 ``missing_side``——收敛路径用自己的产物制造新差异）；
+      * 从未到过券商的本地单（``draft``/``frozen``）与无成交的作废单（``cancelled``/
+        ``rejected``）：本地单方面取消/作废，券商侧什么都没发生过。**这条是必须的**：
+        自动流水线在 16:20 建好次日计划、次日 09:35 才执行，而 19:00 的对账看到的正是
+        一批 ``draft`` 单——若它们算足迹，凡是「券商持存量老仓 + 关注池内」的标的
+        每天都会报 ``missing_side``（2026-09-19 实机：9 张作废单让 8 只老仓报 missing_side）；
+      * **卖出**订单与只有卖出成交的标的：本地从未观察到建仓，无从主张持仓（这些标的的
+        本地主张随 ``local_unbacked`` 如实列出）。
 
     用**累计**口径而非「当日增量」：本地台账（fills 净持仓）本就是累计的，拿当日足迹
     去比会把昨日建仓的标的整个排除在核对之外，只减少噪音却漏掉真实差异。
 
-    **收编行本身不算持仓知识**（2026-09-18 实机复盘）：``IMPORT_PLAN_ID`` 的行是对账
-    自己写下的记账产物，只回答「这张券商单本地为什么没有」，**不含任何持仓事实**。若把
-    它计入足迹，收编一张**已撤/零成交**的历史单就会让该标的从 ``untracked``（历史存量，
-    如实列出、不计差异）升级成 ``missing_side``（critical + halt）——收敛路径用自己的
-    产物制造新差异，闭环照样锁死（实机：券商持 ``SH.603993`` 2100 股，收编单 0 成交）。
-    收编单**确有成交**时，其 fills 由回填产生，经下面的 fills 分支照常进足迹，持仓差异
-    不会被放过（见 ``tests/test_wp17_reconcile_import.py`` 的两个对偶用例）。
+    **真实单边缺失不受影响**：「本地认为已平仓、券商仍持有」的标的必然有买入成交 → 仍在
+    足迹内 → 本地净持仓为 0（``local_net_positions`` 丢掉零值）→ 与券商有量比出
+    ``missing_side`` → critical + halt（``tests/test_reconcile_footprint.py`` 的对偶用例）。
+
+    **已知边界（故意的保守方向）**：本地只要有过买入主张就永久进入比对，哪怕它对某标的的
+    历史只知一角（例如券商另有清库前的存量、本地只知新买的那一笔）——那种不一致会报
+    ``qty`` 差异并熔断。宁可报警也不放过真差异；反之，「本地连买入主张都没有」才归
+    ``untracked``/``local_unbacked``。
     """
+    marks = ",".join("?" * len(POSITION_CLAIM_STATES))
     rows = conn.execute(
-        "SELECT symbol FROM orders WHERE plan_id != ?"   # 见 docstring：收编行不建持仓知识
-        " UNION SELECT o.symbol AS symbol FROM fills f"
-        " JOIN orders o ON o.client_order_id=f.client_order_id",
-        (IMPORT_PLAN_ID,)).fetchall()
+        "SELECT o.symbol AS symbol FROM fills f"           # ① 建仓腿：买入成交
+        " JOIN orders o ON o.client_order_id=f.client_order_id"
+        " WHERE UPPER(o.side) = ?"
+        " UNION SELECT symbol FROM orders"                 # ② 本地相信自己买入过（fills 缺口）
+        " WHERE plan_id != ? AND UPPER(side) = ? AND status IN (" + marks + ")",
+        ("BUY", IMPORT_PLAN_ID, "BUY", *POSITION_CLAIM_STATES)).fetchall()
     return {row["symbol"] for row in rows}
 
 
@@ -618,9 +660,13 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
 
       {"ok": True,  "skipped": <原因>}                       软跳过（live/无账户）
       {"ok": False, "error": <原因>}                         通道/模式失败（fail-closed）
-      {"ok": True,  "diffs": [...], "untracked": [...],
+      {"ok": True,  "diffs": [...], "untracked": [...], "local_unbacked": [...],
        "orders": {...}, "tca": {...}, "digest": {...},
        "fills_backfilled": {...}, "orders_advanced": {...}, "halted": <bool>}  对账完成
+
+    ``untracked`` 是「券商有仓位、本地无从判断」的标的；``local_unbacked`` 是「本地有
+    fills 净持仓、但没有任何建仓买入成交（因此无法支撑持仓主张）」的标的（两者都如实列出、
+    **不计差异**、不 halt——见 ``footprint_symbols``）。
 
     ``fills_backfilled`` 是「券商订单历史 → fills」的回填摘要（``count`` 落库条数、
     ``skipped`` 无均价跳过数、``note`` 标注聚合成交非逐笔）；``orders_advanced`` 是
@@ -698,12 +744,19 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     advance = _advance_order_states(conn, matched[0])
     diffs = _order_diffs(conn, today, broker_rows, matched=matched)
 
-    # 持仓级：本地 = fills 派生净持仓（含本次回填）；只核对 OMS 有足迹的标的
+    # 持仓级：本地 = fills 派生净持仓（含本次回填）；只核对**能支撑持仓主张**的标的
+    # （footprint：有建仓买入成交，或本地相信自己买入过的订单——见 footprint_symbols）。
     footprint = footprint_symbols(conn)
-    local = {s: {"qty": q} for s, q in local_net_positions(conn).items() if s in footprint}
+    net = local_net_positions(conn)
+    local = {s: {"qty": q} for s, q in net.items() if s in footprint}
     broker_subset = {s: v for s, v in broker_positions.items() if s in footprint}
     diffs.extend(compare(conn, local, broker_subset))
     untracked = sorted(set(broker_positions) - footprint)
+    # 本地账本**无法支撑**的持仓主张（只有减仓/平仓腿、没有任何建仓买入成交）：本地账本
+    # 内容不完整，不是「两侧事实分歧」，因此**如实列出、不计差异、不 halt**（与 untracked
+    # 同级）。清库重建/本地历史早于券商订单窗口时这里会**非空**——它是「本地为什么是负
+    # 持仓」的可见答案，绝不是让自己闭嘴。
+    local_unbacked = sorted(s for s in net if s not in footprint)
 
     halted = bool(diffs)
     if halted:
@@ -725,17 +778,21 @@ def daily(conn, home, mode=None, today=None, broker_call=None, now=None):
     # 更早的一次对账差异），否则自动执行守卫只会 info 级跳过、页面看不出停摆原因。
     # 本函数不自动清除已生效的 halt——恢复永远由人工 clear_halt 决定（先查明原因）。
     digest = {"as_of": today, "mode": mode, "orders": order_status_counts(conn, today),
-              "diffs": len(diffs), "untracked": len(untracked), "tca": tca_summary,
+              "diffs": len(diffs), "untracked": len(untracked),
+              # 本地无法支撑的持仓主张（只有减仓腿；如实列出、不计差异——见 footprint_symbols）
+              "local_unbacked": len(local_unbacked), "tca": tca_summary,
               "fills_backfilled": backfill_digest, "orders_advanced": advance_digest,
               # 收编计数（2026-09-17）：券商独有订单被导入台账的条数（0 = 无需收敛）
               "orders_imported": len(imported["imported"]),
               "import_skipped": len(imported["skipped"]),
               **store.halt_summary(conn), "at": stamp}
-    # snapshot-reconcile 的既有取数口径（diffs/at）+ 本任务新增 untracked/mode
+    # snapshot-reconcile 的既有取数口径（diffs/at）+ untracked/mode/local_unbacked
     store.kv_set(conn, "reconcile:latest",
-                 {"diffs": diffs, "untracked": untracked, "mode": mode, "at": stamp})
+                 {"diffs": diffs, "untracked": untracked, "local_unbacked": local_unbacked,
+                  "mode": mode, "at": stamp})
     store.kv_set(conn, "daily:digest", digest)
     return {"ok": True, "diffs": diffs, "untracked": untracked,
+            "local_unbacked": local_unbacked,
             "orders": digest["orders"], "tca": tca_summary, "digest": digest,
             "fills_backfilled": backfill, "orders_advanced": advance, "halted": halted}
 

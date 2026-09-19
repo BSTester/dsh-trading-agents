@@ -212,6 +212,33 @@ class AutoPipelineE2E(unittest.TestCase):
         self._tick(f"{D1} 16:20:00")   # 收盘链：数据就绪 → build_plan
         self._tick(f"{D1} 19:00:00")   # GLOBAL 链：reconcile → tca → digest
 
+    def _seed_local_acquisition(self, symbol, qty, day="2026-09-10"):
+        """种一笔**对账窗口之外**的本地建仓（订单 + 成交），让本地台账对该标的有持仓主张。
+
+        场景 ③ 需要「两侧**真实**分歧」。2026-09-19 之前它靠「零成交的 ``draft`` 订单行也
+        算持仓知识」这一旧口径制造差异——而那正是实机把清库后存量持仓误判成
+        ``missing_side``（critical + halt）的同一个根因（见 docs/HANDOVER.md §8.12）。
+        footprint 口径修正后，「券商有持仓、本地一条成交都没有」按既有文档就是 ``untracked``
+        （如实列出、不计差异），因此夹具改为：本地台账记 100 股（有建仓成交），券商实际持
+        12490 股 —— 本地 100 vs 券商 12490 的 ``qty`` 差异才是本场景真正的判据，
+        「差异 → 熔断 → 守卫 4 拦下」的验证不受影响。
+
+        ``created_at`` 取窗口外的旧日期：订单级判定按对账日取窗，这笔历史建仓不该再被当成
+        当日的 ``missing_at_broker``。
+        """
+        now = f"{day} 10:00:00"
+        self.conn.execute(
+            "INSERT INTO orders(client_order_id,plan_id,symbol,market,side,qty,price,"
+            "status,broker_order_id,mode,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
+            ("SEED-ACQ-1", "SEED-LOCAL", symbol, symbol.split(".", 1)[0], "BUY", qty,
+             100.0, "filled", None, "sim", now, now))
+        self.conn.execute(
+            "INSERT INTO fills(fill_id,client_order_id,price,qty,traded_at,created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            ("SEED-ACQ-F1", "SEED-ACQ-1", 100.0, qty, None, now))
+        self.conn.commit()
+
     # ---- 观测 ----
 
     def _pending(self):
@@ -321,10 +348,19 @@ class AutoPipelineE2E(unittest.TestCase):
         self._calendar()
         self._bars()
 
-        # 券商持 12490 股，本地台账（OMS fills）零记录 → 对账必然报差异
+        # 本地台账记 100 股（建仓成交）+ 券商持 12490 股 → **两侧真实分歧** → 对账报差异。
+        # 夹具口径见 _seed_local_acquisition：不再依赖「零成交订单行算持仓知识」的旧口径。
         with self._running(held=12490) as (broker_calls, _):
-            self._day_one()
+            self._tick(f"{D1} 16:20:00")           # 收盘链：build_plan（订单 draft）
+            self._seed_local_acquisition(SYMBOL, 100)
+            self._tick(f"{D1} 19:00:00")           # GLOBAL 链：reconcile → 熔断
             self.assertTrue(store.is_halted(self.conn), "对账差异应自动暂停执行")
+            # 熔断的**判据**是两侧真实的数量分歧（本地 100 vs 券商 12490），
+            # 不是「本地零记录」——后者按文档口径是 untracked、不计差异。
+            latest = store.kv_get(self.conn, "reconcile:latest")
+            self.assertEqual([(d["symbol"], d["kind"], d.get("qty_diff"))
+                              for d in latest["diffs"]],
+                             [(SYMBOL, "qty", 100 - 12490)], latest["diffs"])
             self._tick(f"{D2} 09:35:00")
 
         # 守卫 4（熔断）在写指令之前拦下：零指令、零下单、订单仍停在 draft
