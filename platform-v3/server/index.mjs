@@ -214,6 +214,21 @@ app.get('/api/v3/execution', async () => {
   return { ok: true, positions: positions.data ?? null, orders_open: orders.data ?? null, deals_today: deals.data ?? null, oms: omsView }
 })
 
+app.get('/api/v3/metrics', async () => {
+  const health = await wb.health()
+  const tools = mcp.catalog
+  return {
+    ok: true,
+    ...metrics.snapshot(),
+    toolTotal: Object.values(tools).reduce((sum, list) => sum + list.length, 0),
+    toolDomains: Object.keys(tools).length,
+    workbenchUp: health.ok,
+    headless: { ...metrics.snapshot().headless, today: runner.stats().today, breaker: runner.stats().breaker },
+    oms: oms.statusCounts(),
+    sdk: sdkChannel.status(),
+  }
+})
+
 app.get('/api/v3/oms/orders', async () => ({ ok: true, ...(await oms.view()) }))
 
 app.post('/api/v3/oms/sync', async () => oms.sync())

@@ -34,6 +34,48 @@ export function createMetrics() {
       bump('quant_v3_headless_duration_ms_count')
       bump('quant_v3_headless_tokens_estimate_sum', tokens ?? 0)
     },
+    // 结构化快照：给 UI 逐点位绑定用（与 Prometheus 文本同源）
+    snapshot() {
+      const out = { mcp: { calls: 0, errors: 0, durationMsSum: 0, tools: {} }, wb: { calls: 0, errors: 0, durationMsSum: 0, byTool: {} }, http: { requests: 0, errors: 0, durationMsSum: 0 }, headless: { calls: 0, errors: 0, durationMsSum: 0, tokens: 0 } }
+      const parse = (key) => {
+        const match = key.match(/^([a-z0-9_]+)(?:\{(.*)\})?$/)
+        const labels = {}
+        if (match?.[2]) {
+          for (const pair of match[2].split(',')) {
+            const [k, v] = pair.split('=')
+            labels[k] = String(v ?? '').replace(/"/g, '')
+          }
+        }
+        return { name: match?.[1] ?? key, labels }
+      }
+      for (const [key, value] of counters) {
+        const { name, labels } = parse(key)
+        if (name === 'quant_v3_wb_calls_total') {
+          out.wb.calls += value
+          if (labels.result === 'error') out.wb.errors += value
+          out.wb.byTool[labels.tool] = (out.wb.byTool[labels.tool] ?? 0) + value
+        } else if (name === 'quant_v3_wb_call_duration_ms_sum') out.wb.durationMsSum += value
+        else if (name === 'quant_v3_mcp_tool_calls_total') {
+          out.mcp.calls += value
+          if (labels.result === 'error') out.mcp.errors += value
+          out.mcp.tools[labels.tool] = (out.mcp.tools[labels.tool] ?? 0) + value
+        } else if (name === 'quant_v3_mcp_tool_duration_ms_sum') out.mcp.durationMsSum += value
+        else if (name === 'quant_v3_http_requests_total') {
+          out.http.requests += value
+          if (!String(labels.status).startsWith('2')) out.http.errors += value
+        } else if (name === 'quant_v3_http_request_duration_ms_sum') out.http.durationMsSum += value
+        else if (name === 'quant_v3_headless_calls_total') {
+          out.headless.calls += value
+          if (labels.result === 'failure') out.headless.errors += value
+        } else if (name === 'quant_v3_headless_duration_ms_sum') out.headless.durationMsSum += value
+        else if (name === 'quant_v3_headless_tokens_estimate_sum') out.headless.tokens += value
+      }
+      out.mcp.avgMs = out.mcp.calls > 0 ? Math.round(out.mcp.durationMsSum / out.mcp.calls) : 0
+      out.wb.avgMs = out.wb.calls > 0 ? Math.round(out.wb.durationMsSum / out.wb.calls) : 0
+      out.http.avgMs = out.http.requests > 0 ? Math.round(out.http.durationMsSum / out.http.requests) : 0
+      out.headless.avgMs = out.headless.calls > 0 ? Math.round(out.headless.durationMsSum / out.headless.calls) : 0
+      return out
+    },
     gauge(name, value, labels = '') {
       gauges.set(label([name, labels]), value)
     },

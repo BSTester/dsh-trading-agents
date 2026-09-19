@@ -82,6 +82,26 @@ test('静态 UI：首页可访问且为设计稿', async () => {
   assert.match(html, /<!DOCTYPE html>/i)
 })
 
+test('实时数据层：包含逐点位深绑定与防御性渲染护栏', async () => {
+  const js = await fetch(`${BASE}/app.js`)
+  const source = await js.text()
+  for (const marker of ['setValueWithUnit', 'bindByLabel', 'bindChannelCard', 'deepBindIndex', 'deepBindTools', 'isSeparator']) {
+    assert.ok(source.includes(marker), `app.js 缺少 ${marker}`)
+  }
+  // 行级防御：渲染表格时过滤非数组行（避免单页结构异常把整块实时条打空）
+  assert.match(source, /filter\(\(r\) => Array\.isArray\(r\)\)/)
+})
+
+test('JSON 指标端点：与 Prometheus 文本同源', async () => {
+  const res = await fetch(`${BASE}/api/v3/metrics`)
+  const body = await res.json()
+  assert.equal(body.ok, true)
+  for (const key of ['mcp', 'wb', 'http', 'headless', 'toolTotal', 'toolDomains', 'workbenchUp']) {
+    assert.ok(key in body, `缺少字段 ${key}`)
+  }
+  assert.ok(Number.isFinite(body.toolTotal) && body.toolTotal > 0)
+})
+
 test('静态 UI：9 页都挂了实时数据层 app.js', async () => {
   const js = await fetch(`${BASE}/app.js`)
   assert.equal(js.status, 200)

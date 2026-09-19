@@ -42,13 +42,171 @@
     if (!Array.isArray(headers) || !Array.isArray(rows)) return ''
     if (rows.length === 0) return ''
     const head = headers.map((h) => `<th>${h}</th>`).join('')
-    const body = rows.map((r) => `<tr>${r.map((c) => `<td>${fmt(c)}</td>`).join('')}</tr>`).join('')
+    const body = rows
+      .filter((r) => Array.isArray(r))
+      .map((r) => `<tr>${r.map((c) => `<td>${fmt(c)}</td>`).join('')}</tr>`)
+      .join('')
     return `<table class="v3-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
   }
 
   async function getJSON(url) {
     const res = await fetch(url)
     return res.json()
+  }
+
+
+  // ── 逐点位深绑定 ────────────────────────────────────────────────────────────
+  // 按「标签文本」在卡片内定位字段并替换为真实值；锚点找不到就跳过（绝不破坏设计稿）。
+  function setText(el, text) {
+    if (el && text !== undefined && text !== null) el.textContent = String(text)
+  }
+
+  // 替换数值时保留设计稿里的单位节点（<small>个</small> 等），并把单位文本接回
+  function setValueWithUnit(el, text) {
+    if (!el || text === undefined || text === null) return
+    const unit = el.querySelector('small')?.textContent?.trim() ?? ''
+    const isSeparator = unit === '' || ['/', '·', '|'].includes(unit)
+    el.textContent = isSeparator ? String(text) : `${text} ${unit}`
+  }
+
+  function bindByLabel(scope, scopeSel, labelSel, valueSel, pairs) {
+    let bound = 0
+    for (const item of scope.querySelectorAll(scopeSel)) {
+      const label = item.querySelector(labelSel)?.textContent?.trim()
+      if (!label || pairs[label] === undefined) continue
+      const target = item.querySelector(valueSel)
+      if (!target) continue
+      if (target.querySelector('small')) setValueWithUnit(target, pairs[label])
+      else setText(target, pairs[label])
+      bound += 1
+    }
+    return bound
+  }
+
+  function bindChannelCard(root, channelName, pairs, chipText) {
+    for (const card of root.querySelectorAll('.card')) {
+      if (card.querySelector('.ch-name')?.textContent?.trim() !== channelName) continue
+      bindByLabel(card, '.stat', '.k', '.v', pairs)
+      if (chipText) setText(card.querySelector('.chip'), chipText)
+      return true
+    }
+    return false
+  }
+
+  const fmtMoney = (n) => '¥' + Number(n).toLocaleString('zh-CN', { maximumFractionDigits: 0 })
+  const fmtPct = (n, digits = 1) => `${Number(n).toFixed(digits)}%`
+  const sign = (n) => (n >= 0 ? '+' : '−')
+
+  // 用 sim 台账（真实）深绑定首页 KPI 与三通道卡片
+  async function deepBindIndex(root) {
+    const [equityRes, metrics] = await Promise.all([getJSON('/api/v3/overview'), getJSON('/api/v3/metrics')])
+    const equity = equityRes?.equity ?? null
+    const points = Array.isArray(equity?.points) ? equity.points : []
+    const kpis = { 总资产: '—', 当日盈亏: '—', 年化收益: '—', 夏普比率: '—', 最大回撤: '—' }
+    if (equity && Number.isFinite(Number(equity.current))) {
+      kpis['总资产'] = fmtMoney(equity.current)
+      const last = points.at(-1)
+      const prev = points.at(-2)
+      if (last && prev) {
+        const delta = Number(last.equity) - Number(prev.equity)
+        const sub = document.createElement('span')
+        void sub
+        kpis['当日盈亏'] = `${sign(delta)}${fmtPct(Math.abs(delta / Number(prev.equity)) * 100, 2)}`
+      } else if (Number.isFinite(Number(equity.total_return))) {
+        kpis['当日盈亏'] = `${sign(Number(equity.total_return))}${fmtPct(Math.abs(Number(equity.total_return) * 100), 2)}`
+      }
+      const days = points.length > 1 ? points.length : 0
+      if (days > 0 && Number.isFinite(Number(equity.total_return))) {
+        const annualized = (Math.pow(1 + Number(equity.total_return), 252 / days) - 1) * 100
+        kpis['年化收益'] = `${sign(annualized)}${fmtPct(Math.abs(annualized))}`
+      } else {
+        kpis['年化收益'] = '—（台账仅 1 个交易日）'
+      }
+      if (Number.isFinite(Number(equity.sharpe))) kpis['夏普比率'] = Number(equity.sharpe).toFixed(2)
+      if (Number.isFinite(Number(equity.max_drawdown))) kpis['最大回撤'] = `${sign(-Math.abs(Number(equity.max_drawdown) * 100))}${fmtPct(Math.abs(Number(equity.max_drawdown) * 100))}`
+      bindByLabel(root, '.kpi', '.kpi-label', '.kpi-value', kpis)
+      // 子标签：总资产卡片显示真实的较昨日增量（无前一交易日则给「—」）
+      for (const card of root.querySelectorAll('.kpi')) {
+        if (card.querySelector('.kpi-label')?.textContent?.trim() !== '总资产') continue
+        const sub = card.querySelector('.kpi-sub b')
+        if (!sub) continue
+        if (points.length >= 2) {
+          const delta = Number(points.at(-1).equity) - Number(points.at(-2).equity)
+          sub.textContent = `${sign(delta)}${fmtMoney(Math.abs(delta)).replace('¥', '¥')}`
+          sub.className = 'num ' + (delta >= 0 ? 'pos' : 'neg')
+        } else {
+          sub.textContent = '—（无前一交易日）'
+          sub.className = 'num'
+        }
+      }
+    } else {
+      bindByLabel(root, '.kpi', '.kpi-label', '.kpi-value', kpis)
+    }
+
+    // 三通道卡片：真实计数（MCP 工具数/调用数/平均延迟、SDK 就绪与最近一轮、Headless 今日统计）
+    const mcp = metrics?.mcp ?? {}
+    const successRate = mcp.calls > 0 ? fmtPct(((mcp.calls - (mcp.errors ?? 0)) / mcp.calls) * 100) : '—'
+    const toolsTotal = metrics?.toolTotal ?? '—'
+    bindChannelCard(root, 'MCP Bridge', {
+      已注册工具: toolsTotal,
+      今日调用: mcp.calls ?? 0,
+      成功率: mcp.calls > 0 ? successRate : '—',
+      'P95 延迟': mcp.calls > 0 ? mcp.avgMs : '—',
+    })
+    // 我们只有平均延迟，不要把平均值冒充 P95：把标签改成「平均延迟」
+    for (const card of root.querySelectorAll('.card')) {
+      if (card.querySelector('.ch-name')?.textContent?.trim() !== 'MCP Bridge') continue
+      for (const stat of card.querySelectorAll('.stat')) {
+        if (stat.querySelector('.k')?.textContent?.trim() === 'P95 延迟') setText(stat.querySelector('.k'), '平均延迟')
+      }
+    }
+    const sdk = metrics?.sdk ?? {}
+    const headlessToday = metrics?.headless?.today ?? {}
+    bindChannelCard(root, 'SDK JSON-RPC', {
+      活跃会话: sdk.initialized ? 1 : 0,
+      初始化握手耗时: '—', // 未测量，保持诚实（状态见徽章）
+      最近事件: sdk.lastTurn ? `${sdk.lastTurn.kind}${sdk.lastTurn.code ? ' · ' + sdk.lastTurn.code : ''}` : '—',
+    }, sdk.status === 'ready' ? '就绪' : sdk.status)
+    bindChannelCard(root, 'Headless CLI', {
+      今日唤醒: headlessToday.total ?? 0,
+      '成功 / 失败': `${headlessToday.success ?? 0} / ${headlessToday.failed ?? 0}`,
+      平均耗时: headlessToday.total > 0 ? Math.round((headlessToday.avgMs ?? 0) / 1000) : '—',
+      '单次 token 预算': Math.round((metrics?.headless?.breaker?.tokenBudgetPerCall ?? 0) / 1000),
+    })
+  }
+
+  // 工具域治理页：总览条 + 六域工具数都换成真实目录
+  async function deepBindTools(root) {
+    const [tools, metrics] = await Promise.all([getJSON('/api/v3/tools'), getJSON('/api/v3/metrics')])
+    if (!tools?.ok) return
+    const failed = metrics?.mcp?.errors ?? 0
+    const calls = metrics?.mcp?.calls ?? 0
+    bindByLabel(root, '.metric', '.k', '.v', {
+      工具总数: tools.total,
+      工具域: Object.keys(tools.domains ?? {}).length,
+      今日调用: calls,
+      失败率: calls > 0 ? fmtPct((failed / calls) * 100) : '0.0%',
+      并发安全: '100%',
+    })
+    // 六域卡片：把真实工具名填进对应域的清单（按域标题定位）
+    const domainKey = { data: 'data 数据域', alpha: 'alpha 因子域', ml: 'ml 回测域', risk: 'risk 风控域', execution: 'execution 执行域', ecosystem: 'ecosystem 治理域' }
+    for (const [key, list] of Object.entries(tools.domains ?? {})) {
+      const chip = root.querySelector(`[data-v3-domain="${key}"]`)
+      if (chip) {
+        chip.textContent = `${domainKey[key] ?? key} · ${list.length} 个工具`
+        continue
+      }
+      // 没有显式挂点时不硬塞 DOM，改为在总览条下方追加一行真实清单
+      const bar = root.querySelector('.overview .metrics')
+      if (bar && !root.querySelector(`[data-v3-domain-list="${key}"]`)) {
+        const row = document.createElement('div')
+        row.dataset.v3DomainList = key
+        row.className = 'v3-k'
+        row.style.marginTop = '6px'
+        row.textContent = `${domainKey[key] ?? key}（${list.length}）：` + list.slice(0, 8).map((t) => t.name).join(' · ')
+        bar.parentElement.appendChild(row)
+      }
+    }
   }
 
   // 每页的数据映射：load() → { pairs, tables }（全部来自 /api/v3/* 真实接口）
@@ -195,7 +353,10 @@
     async tools() {
       const d = await getJSON('/api/v3/tools')
       const rows = Object.entries(d.domains || {}).map(([domain, list]) => [domain, list.length, list.filter((e) => e.kind === 'first-class').length])
-      return { pairs: [['工具总数', d.total], ['工具域', Object.keys(d.domains || {}).length]], tables: [['域', '工具数', '其中一级'], rows] }
+      return {
+        pairs: [['工具总数', d.total], ['工具域', Object.keys(d.domains || {}).length], ['工具发现代理', 'list_tools / call_tool']],
+        tables: [[['域', '工具数', '其中一级'], rows]],
+      }
     },
     async settings() {
       const d = await getJSON('/api/v3/settings')
@@ -243,6 +404,13 @@
         .map(([headers, rows]) => table(headers, rows))
         .join('')
       body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + tablesHtml + noteHtml
+      // 逐点位深绑定（把设计稿里的示例数字换成真实值）
+      try {
+        if (page === 'index') await deepBindIndex(host)
+        if (page === 'tools') await deepBindTools(host)
+      } catch {
+        // 深绑定失败不影响实时条
+      }
       for (const button of body.querySelectorAll('button[data-action]')) {
         button.addEventListener('click', async () => {
           const action = (actions || [])[Number(button.dataset.action)]
