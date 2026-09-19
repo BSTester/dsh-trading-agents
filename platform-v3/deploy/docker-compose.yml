@@ -1,0 +1,50 @@
+# 单机部署：一个核心网关 + 一个调度器（规格 §5.1 的服务拆分在单机上的最小形态）
+# 既有工作台（8397）仍跑在宿主机上，本编排只消费它，不接管。
+services:
+  gateway:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: quant-platform-v3:latest
+    container_name: quant-v3-gateway
+    network_mode: host            # 复用宿主网络，直接访问 127.0.0.1:8397
+    environment:
+      QUANT_V3_ROLE: gateway
+      QUANT_V3_HOST: 127.0.0.1
+      QUANT_V3_PORT: "8407"
+      WORKBENCH_BASE: http://127.0.0.1:8397
+      QUANT_V3_DATA: /app/data
+      # 既有配置（自选池/自动流水线/富途凭据元信息）只读挂入，不复制不修改
+      QUANT_CONFIG_HOME: /config
+      # SDK 通道按需打开（需模型密钥）
+      QUANT_SDK_ENABLED: "0"
+    volumes:
+      - quant-v3-data:/app/data
+      - ${DSH_HOME:-$HOME/.dsh}:/config:ro
+    restart: unless-stopped
+
+  scheduler:
+    # 需要镜像内含 dsh（build: args: INSTALL_DSH=1）或把 scheduler 跑在宿主机上
+    image: quant-platform-v3:latest
+    container_name: quant-v3-scheduler
+    network_mode: host
+    environment:
+      QUANT_V3_ROLE: scheduler
+      QUANT_CONFIG_HOME: /config
+      DSH_HOME: /dsh-runtime
+      QUANT_V3_PORT: "8408"
+      WORKBENCH_BASE: http://127.0.0.1:8397
+      QUANT_V3_DATA: /app/data
+      QUANT_HEADLESS_CONCURRENCY: "3"
+      QUANT_HEADLESS_TIMEOUT_MS: "300000"
+    volumes:
+      - quant-v3-data:/app/data
+      - ${DSH_HOME:-$HOME/.dsh}:/config:ro          # 配置只读
+      - quant-v3-runtime:/dsh-runtime              # 运行时 home（凭据库/会话，可写）
+    depends_on:
+      - gateway
+    restart: unless-stopped
+
+volumes:
+  quant-v3-data:
+  quant-v3-runtime:

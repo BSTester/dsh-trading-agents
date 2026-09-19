@@ -99,6 +99,40 @@ MCP 工具面：`list_tools` / `call_tool`（六域发现代理，覆盖既有 7
 **常驻运行**：`install/quant-v3.service` 为 systemd 单元模板（默认 127.0.0.1:8407，
 日志 `~/.dsh/quant-v3.log`，SDK 通道默认关闭）。
 
+## 部署（角色拆分 / 容器 / K8s）
+
+同一镜像按 `QUANT_V3_ROLE` 挂载不同子系统，对应规格 §5.1 的服务拆分：
+
+| 角色 | 提供 | 说明 |
+|---|---|---|
+| `all` | 全部 | 单机默认，行为与既有部署一致 |
+| `gateway` | HTTP API + MCP 工具面 + `/metrics` | 不提供静态 UI；可多副本 |
+| `web` | 9 页控制台 UI + 只读 API | 可多副本 |
+| `scheduler` | 调度循环 + Headless 通道 | **单副本语义**（同日同规则只触发一次），只暴露 `/healthz` |
+
+角色控制是真实生效的（实测：`scheduler` 角色请求 `/api/v3/tools` 返回 404，`gateway` 角色请求
+`/index.html` 返回 `role/not-serving-ui`）。
+
+**配置来源与运行时 home 分离**：`QUANT_CONFIG_HOME` 只用于读取既有配置
+（`trading-platform.json` 自选池/流水线、`futu-token`、`futu-openapi.json`），`DSH_HOME` 仍是运行时
+自己的 home（凭据库、会话）。容器化时把宿主机配置目录**只读**挂进来即可复用全部数据来源：
+
+```bash
+cd platform-v3
+docker build -f deploy/Dockerfile -t quant-platform-v3:3.0.0-alpha.1 .
+docker run -d --name quant-v3 --network host \
+  -e QUANT_V3_ROLE=gateway -e WORKBENCH_BASE=http://127.0.0.1:8397 \
+  -e QUANT_CONFIG_HOME=/config -v "$HOME/.dsh:/config:ro" \
+  quant-platform-v3:3.0.0-alpha.1
+curl -s localhost:8407/healthz && curl -s "localhost:8407/api/v3/market/watchlist?n=3"
+```
+
+- `deploy/docker-compose.yml`：单机最小形态（gateway + scheduler，共享数据卷；scheduler 需要镜像内
+  有 `dsh`：构建时加 `--build-arg INSTALL_DSH=1`，或让 scheduler 跑在宿主机上复用既有 dsh）。
+- `deploy/k8s/platform-v3.yaml`：ConfigMap + Secret + 三个 Deployment/Service（gateway×2、web×1、
+  scheduler×1，含探针与资源限额）。**既有工作台（8397）不在集群内**——它是数据源与唯一执行入口，
+  集群内 pod 通过 `WORKBENCH_BASE` 指向它；交易边界不因容器化改变。
+
 ```
 sudo cp install/quant-v3.service /etc/systemd/system/
 sudo systemctl daemon-reload && sudo systemctl enable --now quant-v3

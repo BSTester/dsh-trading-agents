@@ -22,17 +22,27 @@ function readTrim(file) {
 }
 
 export function loadConfig(env = process.env, home = env.DSH_HOME || path.join(os.homedir(), '.dsh')) {
-  const legacy = readJson(path.join(home, 'trading-platform.json')) || {}
-  const futuToken = readTrim(path.join(home, 'futu-token'))
-  const futuTokenExpiry = readTrim(path.join(home, 'futu-token-expiry'))
-  const futuOpenapi = readJson(path.join(home, 'futu-openapi.json'))
+  // 配置来源与运行时 home 分离：容器化部署时把宿主机配置目录只读挂进来，
+  // 用 QUANT_CONFIG_HOME 指向它，而 DSH_HOME 仍是运行时自己的 home（凭据库/会话）。
+  const configHome = env.QUANT_CONFIG_HOME || home
+  const legacy = readJson(path.join(configHome, 'trading-platform.json')) || {}
+  const futuToken = readTrim(path.join(configHome, 'futu-token'))
+  const futuTokenExpiry = readTrim(path.join(configHome, 'futu-token-expiry'))
+  const futuOpenapi = readJson(path.join(configHome, 'futu-openapi.json'))
 
   const config = {
     env,
     home,
+    configHome,
     service: {
       host: env.QUANT_V3_HOST || '127.0.0.1',
       port: Number(env.QUANT_V3_PORT || 8407),
+      // 部署角色（规格 §5.1 服务拆分）：同一镜像按角色挂载子系统，可独立扩缩容
+      //   all       单机全功能（默认，保持既有行为）
+      //   gateway   HTTP API + MCP 工具面（不含调度循环与静态 UI）
+      //   scheduler 调度循环 + Headless 通道（只提供 /healthz）
+      //   web       静态 UI + 只读 API（不含调度循环，MCP 仍可调用）
+      role: env.QUANT_V3_ROLE || 'all',
     },
     // 既有工作台（数据来源，只读消费；交易确认边界也在那边）
     workbench: {

@@ -123,3 +123,18 @@ test('headless：平台超时 kill 不被记成正常退出（exit 124 + killed_
   assert.equal(record.killed_by, 'platform-timeout')
   assert.equal(record.success, false)
 })
+
+test('config：QUANT_CONFIG_HOME 只影响配置读取，运行时 home 保持不变', async () => {
+  const fs = await import('node:fs')
+  const os = await import('node:os')
+  const path = await import('node:path')
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'quant-v3-cfg-'))
+  fs.writeFileSync(path.join(dir, 'trading-platform.json'), JSON.stringify({ service: { port: 8397 }, watchlist: ['SH.600519', 'SZ.000001'], futu_channel: 'openapi' }))
+  fs.writeFileSync(path.join(dir, 'futu-token-expiry'), '2026-09-19T17:01:36')
+  const config = loadConfig({ DSH_HOME: '/runtime/home', QUANT_CONFIG_HOME: dir })
+  assert.equal(config.configHome, dir)
+  assert.equal(config.home, '/runtime/home') // 运行时 home 不被配置目录顶替
+  assert.deepEqual(config.sources.watchlist, ['SH.600519', 'SZ.000001'])
+  assert.equal(config.sources.futu.mcpTokenExpiry, '2026-09-19T17:01:36')
+  assert.equal(config.workbench.base, 'http://127.0.0.1:8397')
+})

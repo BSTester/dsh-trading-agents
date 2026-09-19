@@ -101,6 +101,14 @@ const scheduler = createScheduler({
   wbCall: (tool, args, options) => wb.call(tool, args, options),
 })
 
+const ROLE = config.service.role
+const ROLES = {
+  all: { http: true, web: true, scheduler: true, mcp: true },
+  gateway: { http: true, web: false, scheduler: false, mcp: true },
+  scheduler: { http: false, web: false, scheduler: true, mcp: false },
+  web: { http: true, web: true, scheduler: false, mcp: true },
+}[ROLE] ?? { http: true, web: true, scheduler: true, mcp: true }
+
 const startedAt = Date.now()
 const app = createApp({
   onRequest: ({ method, pathname, status, durationMs, remote }) => {
@@ -347,7 +355,15 @@ const server = http.createServer(async (req, res) => {
     res.end(metrics.render({ workbenchUp: health.ok, omsStages: oms.statusCounts(), headlessStats: runner.stats(), sdkStatus: sdkChannel.status() }))
     return
   }
-  if (pathname === '/healthz' || pathname.startsWith('/api/')) return void app.handle(req, res)
+  if (req.method === 'GET' && pathname === '/healthz' && !ROLES.http) {
+    res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
+    return void res.end(JSON.stringify({ ok: true, service: 'quant-platform-v3', role: ROLE, subsystems: ROLES }))
+  }
+  if (pathname === '/healthz' || (ROLES.http && pathname.startsWith('/api/'))) return void app.handle(req, res)
+  if (!ROLES.web) {
+    res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
+    return void res.end(JSON.stringify({ ok: false, error: { code: 'role/not-serving-ui', message: `role=${ROLE} 不提供静态 UI 或该 API` } }))
+  }
   if (req.method !== 'GET') {
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })
     return void res.end('method not allowed')
@@ -355,12 +371,12 @@ const server = http.createServer(async (req, res) => {
   serveStatic(pathname, res)
 })
 
-if (process.env.QUANT_V3_SCHEDULER !== '0') {
+if (ROLES.scheduler && process.env.QUANT_V3_SCHEDULER !== '0') {
   setInterval(() => scheduler.tick(), 30_000).unref()
 }
 
 server.listen(config.service.port, config.service.host, () => {
-  console.log(`[quant-v3] listening on http://${config.service.host}:${config.service.port} (workbench=${config.workbench.base})`)
+  console.log(`[quant-v3] listening on http://${config.service.host}:${config.service.port} role=${ROLE} subsystems=${JSON.stringify(ROLES)} (workbench=${config.workbench.base})`)
   // SDK 通道启用时主动握手（非阻塞）：让通道在启动后即 ready，而不是等第一次调用
   if (config.channels.sdk.enabled) {
     sdkChannel
