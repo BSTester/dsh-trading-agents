@@ -151,7 +151,7 @@ app.get('/api/v3/overview', async () => {
   }
 })
 
-app.get('/api/v3/brain', async () => ({ headless: runner.stats(), sdk: sdkChannel.status() }))
+app.get('/api/v3/brain', async () => ({ headless: runner.stats(), sdk: sdkChannel.status(), decision: strategy.last() }))
 
 app.get('/api/v3/sdk', async () => ({ ok: true, ...sdkChannel.status() }))
 
@@ -167,6 +167,39 @@ app.post('/api/v3/sdk/prompt', async ({ body }) => {
 app.get('/api/v3/market', async ({ query }) => {
   const ticker = query.ticker || (config.sources.watchlist[0] ?? 'SH.600519')
   return wbValue(wb.call('series', { ticker, period: query.period || '1d', limit: Number(query.limit || 120) }))
+})
+
+app.get('/api/v3/market/watchlist', async ({ query }) => {
+  const limit = Math.min(Math.max(Number(query.n || 6), 2), 8)
+  const tickers = (config.sources.watchlist ?? []).slice(0, limit)
+  if (tickers.length < 2) return { ok: false, error: { code: 'watchlist/empty', message: '自选池为空' } }
+  const [factorsEnvelope, ...seriesEnvelopes] = await Promise.all([
+    wb.call('factors', { tickers }, { timeoutMs: 180000 }),
+    ...tickers.map((ticker) => wb.call('series', { ticker, period: '1d', limit: 30 })),
+  ])
+  const factorRows = factorsEnvelope?.ok ? (factorsEnvelope.value?.rows ?? []) : []
+  const rows = tickers.map((ticker, index) => {
+    const bars = seriesEnvelopes[index]?.ok ? (seriesEnvelopes[index].value?.bars ?? []) : []
+    const last = bars.at(-1)
+    const prev = bars.at(-2)
+    const factors = factorRows.find((row) => row.ticker === ticker)?.factors ?? null
+    const num = (value) => (Number.isFinite(Number(value)) ? Number(Number(value).toFixed(4)) : null)
+    return {
+      ticker,
+      close: num(last?.c ?? factors?.close),
+      changePct: last && prev ? num(((last.c - prev.c) / prev.c) * 100) : null,
+      mom20Pct: factors?.mom_20 === undefined ? null : num(factors.mom_20 * 100),
+      vol20Pct: factors?.vol_20 === undefined ? null : num(factors.vol_20 * 100),
+      peTtm: factors?.pe_ttm === undefined ? null : num(factors.pe_ttm),
+      pb: factors?.pb === undefined ? null : num(factors.pb),
+      asOf: last?.t ?? null,
+    }
+  })
+  return {
+    ok: true,
+    rows,
+    sources: { kline: 'futu/quote_history_kline', factors: factorsEnvelope?.ok ? 'workbench/factors' : null },
+  }
 })
 
 app.get('/api/v3/strategy', async () => {
@@ -328,6 +361,13 @@ if (process.env.QUANT_V3_SCHEDULER !== '0') {
 
 server.listen(config.service.port, config.service.host, () => {
   console.log(`[quant-v3] listening on http://${config.service.host}:${config.service.port} (workbench=${config.workbench.base})`)
+  // SDK 通道启用时主动握手（非阻塞）：让通道在启动后即 ready，而不是等第一次调用
+  if (config.channels.sdk.enabled) {
+    sdkChannel
+      .start()
+      .then((result) => console.log(`[quant-v3] sdk channel: ${result.ok ? 'ready ' + JSON.stringify(result.serverInfo) : 'pending ' + result.error?.message}`))
+      .catch((error) => console.log(`[quant-v3] sdk channel start failed: ${error?.message ?? error}`))
+  }
 })
 
 export { server, config, app, mcp, runner, scheduler, oms }

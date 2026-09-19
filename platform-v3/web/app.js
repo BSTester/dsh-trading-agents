@@ -369,27 +369,56 @@
     },
     async brain() {
       const d = await getJSON('/api/v3/brain')
-      const rows = (d.last || []).map((c) => [String(c.started_at || '').slice(11, 19), c.success ? '成功' : '失败', c.exit_code, `${Math.round((c.duration_ms || 0) / 1000)}s`, c.tokens_estimate])
-      return { pairs: [['今日调用', d.today?.total], ['成功', d.today?.success], ['失败', d.today?.failed], ['平均耗时', `${Math.round((d.today?.avgMs || 0) / 1000)}s`, true]], tables: [['时间', '结果', 'exit', '耗时', 'token 估算'], rows] }
+      const sdk = d.sdk || {}
+      const decision = d.decision || null
+      const top = decision?.proposals?.[0] || null
+      const callRows = (d.headless?.last || []).map((c) => [String(c.started_at || '').slice(11, 19), c.success ? '成功' : '失败', c.exit_code, `${Math.round((c.duration_ms || 0) / 1000)}s`, c.tokens_estimate])
+      const proposalRows = (decision?.proposals || []).map((p) => [p.ticker, p.action, `${p.targetWeightPct ?? '—'}%`, p.riskLevel, String(p.basis || '').slice(0, 44)])
+      return {
+        pairs: [
+          ['Headless 今日', `${d.headless?.today?.total ?? 0} 次（成功 ${d.headless?.today?.success ?? 0} / 失败 ${d.headless?.today?.failed ?? 0}）`, true],
+          ['Headless 平均耗时', `${Math.round((d.headless?.today?.avgMs ?? 0) / 1000)}s`, true],
+          ['SDK 通道', sdk.status ?? '—'],
+          ['SDK 运行时', sdk.serverInfo ? `${sdk.serverInfo.name} ${sdk.serverInfo.version}` : '—', true],
+          ['最近一轮', sdk.lastTurn ? `${sdk.lastTurn.kind}${sdk.lastTurn.code ? ' · ' + sdk.lastTurn.code : ''}` : '—'],
+          ['决策来源', decision ? `研究流水线 ${String(decision.asOf || '').slice(0, 19).replace('T', ' ')}` : '尚未运行流水线'],
+          ['决策', top ? `${top.ticker} ${top.action} ${top.targetWeightPct}%` : '—'],
+          ['风险等级', top?.riskLevel ?? '—'],
+          ['置信度', '—（工作台未提供）'],
+        ],
+        tables: [
+          [['时间', '结果', 'exit', '耗时', 'token 估算'], callRows],
+          [['标的', '动作', '目标权重', '风险', '依据'], proposalRows],
+        ],
+        actions: [{ label: '运行流水线产出决策', method: 'POST', url: '/api/v3/strategy/run', body: { topN: 2 } }],
+      }
     },
+
     async market() {
-      const d = await getJSON('/api/v3/market?ticker=SH.600519&period=1d&limit=120')
-      if (!d.ok) return { pairs: [['行情', '取不到：' + (d.error?.message || '未知')]] }
-      const bars = d.data?.bars || []
+      const [headline, watch] = await Promise.all([
+        getJSON('/api/v3/market?ticker=SH.600519&period=1d&limit=120'),
+        getJSON('/api/v3/market/watchlist?n=6'),
+      ])
+      const bars = headline?.data?.bars || []
       const last = bars.at(-1) || {}
       const prev = bars.at(-2) || {}
       const chg = prev.c ? (((last.c - prev.c) / prev.c) * 100).toFixed(2) + '%' : '—'
+      const rows = (watch?.rows || []).map((r) => [r.ticker, r.close, r.changePct, r.mom20Pct, r.peTtm, r.pb, r.asOf])
       return {
         pairs: [
-          ['标的', d.data?.ticker, true],
-          ['数据源', d.data?.source, true],
-          ['最新收盘', last.c, true],
+          ['标的', headline?.data?.ticker ?? '—', true],
+          ['数据源', headline?.data?.source ?? '—', true],
+          ['最新收盘', last.c ?? '—', true],
           ['日涨跌', chg, true],
-          ['K 线根数', d.data?.count, true],
-          ['as_of', d.data?.as_of, true],
+          ['K 线根数', headline?.data?.count ?? '—', true],
+          ['as_of', headline?.data?.as_of ?? '—', true],
+          ['自选池覆盖', (watch?.rows || []).length, true],
         ],
+        tables: [[['代码', '现价', '日涨跌%', '20日动量%', 'PE(TTM)', 'PB', 'as_of'], rows]],
+        note: `数据源：${headline?.data?.source ?? '—'} + ${watch?.sources?.factors ?? 'workbench/factors'}（自选池前 6 只，实时拉取）`,
       }
     },
+
     async strategy() {
       const d = await getJSON('/api/v3/strategy')
       if (!d.ok) return { pairs: [['研究流水线', '取不到：' + (d.error?.message || '未知')]] }
