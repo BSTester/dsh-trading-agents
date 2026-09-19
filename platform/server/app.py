@@ -942,6 +942,28 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # 精确命中（见 guard 的「等值或前缀」说明）。
     app.router.routes.extend(mcp_app.routes)
 
+    # V3 工作台（Ant Design Pro 版）静态服务：/pro/* ← platform/web-pro/dist
+    # 与设计稿原样版（/v3/*）并存：同一套 /api/v3 与 /api/wb 接口，两种前端实现。
+    pro_root = Path(__file__).resolve().parent.parent / "web-pro" / "dist"
+
+    @app.get("/pro")
+    async def pro_root_redirect():
+        from fastapi.responses import RedirectResponse
+
+        return RedirectResponse(url="/pro/", status_code=307)
+
+    @app.get("/pro/{path:path}")
+    async def pro_static(path: str):
+        """AntD 工作台静态文件；未命中的路径回落 index.html（hash 路由，无服务端路由需求）。"""
+        from fastapi.responses import FileResponse, PlainTextResponse
+
+        if not pro_root.exists():
+            return PlainTextResponse("工作台未构建：cd platform/web-pro && npm run build", status_code=503)
+        candidate = (pro_root / path).resolve()
+        if str(candidate).startswith(str(pro_root.resolve())) and candidate.is_file():
+            return FileResponse(candidate)
+        return FileResponse(pro_root / "index.html")
+
     @app.get("/")
     async def v3_console_root():
         """根路径 → V3 控制台首页（设计稿原样页面）。

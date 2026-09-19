@@ -64,6 +64,17 @@ curl -s "localhost:8397/api/v3/tushare?api=income&ts_code=600519.SH&period=20260
 - 若需要：`~/.dsh/trading-venv/bin/pip install openbb`（体积较大，且需与 Python 3.13 兼容）。
 - 未安装时 `/api/v3/openbb` 返回 `openbb/unavailable`，**不发请求**。
 
+## 二·五、两种前端实现（同一套后端与数据）
+
+| 版本 | 访问 | 实现 | 构建 |
+|---|---|---|---|
+| **设计稿原样版**（基准） | `http://127.0.0.1:8397/v3/<page>.html`（根路径 `/` → 307 跳此） | OpenDesign 设计稿的 HTML/CSS **原样**（`platform/web/public/v3/`）+ 每页一个数据 binder；`platform/tools/compare_with_design.sh` 逐字节校验与设计稿一致 | **无构建**（静态文件直服） |
+| **Ant Design Pro 工作台** | `http://127.0.0.1:8397/pro/#/<key>` | `platform/web-pro`（Vite + React + antd + pro-components，`base=/pro/`）；菜单分组（监控/研究/交易/系统）与功能模块与设计稿版**一一对应** | `cd platform/web-pro && npm run build`（产物 `dist/`，由 FastAPI 在 `/pro/*` 下服务，未命中回落 index.html） |
+
+两版**共用同一套接口**：读 `GET /api/v3/*`，写 `POST /api/wb/*`（受约束入口）。
+两版页头/顶栏互相提供跳转链接（设计稿版的链接由 `shared.js` 运行时注入，不改设计稿 HTML）。
+约定一致：取不到显式「无数据源 + 原因」，**任何一版都不出现示例/占位数据**；密钥只显示状态与掩码。
+
 ## 三、页面与接口对应
 
 V3 控制台是 **OpenDesign 设计稿的 HTML/CSS 原样页面**（`platform/web/public/v3/`，Vite 构建原样拷到

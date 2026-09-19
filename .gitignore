@@ -8,3 +8,7 @@ __pycache__/
 .install-pack-*/
 .install-test-*/
 .install-write-*
+
+# V3 工作台（Ant Design Pro 版）：依赖与构建产物
+platform/web-pro/node_modules/
+platform/web-pro/dist/

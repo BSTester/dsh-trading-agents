@@ -214,6 +214,26 @@
   }
   guardTextContent()
 
+
+  /** 在顶栏注入「切到 AntD 工作台」入口：两版并存，互相可跳。
+   *  设计稿 HTML 一字不改——链接由脚本运行时插入，且不参与数据绑定。 */
+  function proWorkbenchLink() {
+    const bar = document.querySelector('.topbar') || document.querySelector('header')
+    if (!bar || bar.querySelector('#proWorkbenchLink')) return
+    const page = (location.pathname.split('/').pop() || 'index.html').replace(/\.html$/, '')
+    const map = { index: 'overview', brain: 'brain', market: 'market', strategy: 'strategy',
+      risk: 'risk', execution: 'execution', gateway: 'gateway', tools: 'tools', settings: 'settings' }
+    const link = document.createElement('a')
+    link.id = 'proWorkbenchLink'
+    link.href = `/pro/#/${map[page] ?? 'overview'}`
+    link.textContent = 'AntD 工作台 →'
+    link.title = '同一套数据与功能，Ant Design Pro 版'
+    link.style.cssText = 'margin-left:10px;font-size:11px;color:var(--blue);text-decoration:none;white-space:nowrap'
+    bar.appendChild(link)
+  }
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', proWorkbenchLink)
+  else proWorkbenchLink()
+
   window.V3 = {
     esc, num, money, signed, stamp, hhmmss, dash,
     api, post, wb, setText, setByLabel, tableByHeaders, nodata, replaceWith, paint, svgLine, stampAsOf, demoSweep,
