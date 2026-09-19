@@ -1,0 +1,646 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>网关与调度 · 量化决策平台 V3.0</title>
+<style>
+:root{--bg:#0b0e13;--panel:#12161d;--panel2:#171c26;--border:#232b37;--border2:#2f3a49;--text:#e6edf3;--muted:#8b97a5;--faint:#626d7c;--blue:#4c8dff;--green:#3fb950;--red:#f8514d;--amber:#d9a112;--purple:#a371f7;--cyan:#39a0ed;--mono:ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg);color:var(--text);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif}
+a{color:var(--blue)}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;position:relative}
+:focus-visible{outline:2px solid rgba(76,141,255,.55);outline-offset:1px}
+::-webkit-scrollbar{width:9px;height:9px}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:6px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---------- 顶栏 ---------- */
+.topbar{position:sticky;top:0;z-index:60;height:46px;display:flex;align-items:center;gap:16px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--border)}
+.brand{flex:none;font-size:14px;font-weight:600;letter-spacing:.02em;white-space:nowrap}
+.brand small{color:var(--faint);font-weight:400;font-size:11px;margin-left:8px}
+.topmid{flex:1;display:flex;align-items:center;justify-content:center;gap:12px;min-width:0;flex-wrap:wrap}
+.t-item{font-size:12px;color:var(--muted);white-space:nowrap}
+.t-item b{font-weight:600;color:var(--text);margin-left:4px}
+.up{color:var(--green)!important}
+.down{color:var(--red)!important}
+.env{font-family:var(--mono);font-size:11px;letter-spacing:.1em;padding:2px 9px;border-radius:5px;color:var(--blue);border:1px solid rgba(76,141,255,.45);background:rgba(76,141,255,.1)}
+.pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--muted);border:1px solid var(--border);background:var(--panel2);padding:2px 9px;border-radius:999px;white-space:nowrap}
+.pill .dot{width:6px;height:6px}
+.demo-pill{color:var(--amber);border:1px dashed rgba(217,161,18,.5);background:rgba(217,161,18,.07)}
+.topright{flex:none;font-size:12px;color:var(--muted)}
+
+/* ---------- 侧导航 ---------- */
+.sidenav{position:fixed;top:46px;left:0;bottom:0;width:196px;background:var(--panel);border-right:1px solid var(--border);padding:10px 0 18px;overflow-y:auto;z-index:50}
+.nav-group{padding:14px 16px 4px;font-size:11px;color:var(--faint);letter-spacing:.14em}
+.sidenav a{display:block;padding:7px 16px;margin:1px 8px;border-radius:6px;color:var(--muted);text-decoration:none;font-size:13px;transition:background .12s,color .12s}
+.sidenav a:hover{background:var(--panel2);color:var(--text)}
+.sidenav a.active{background:rgba(76,141,255,.12);color:var(--blue);font-weight:600}
+
+/* ---------- 主区 ---------- */
+.main{margin-left:196px;padding:18px 22px 28px}
+.page{max-width:none}
+.page>section{margin-bottom:16px}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:14px;flex-wrap:wrap;margin-bottom:16px}
+.page-head h1{font-size:19px;font-weight:600;letter-spacing:.02em}
+.page-head .sub{color:var(--muted);font-size:12px;margin-top:3px}
+.head-status{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+.head-status .note{font-size:11px;color:var(--faint)}
+
+.grid-3{display:grid;grid-template-columns:repeat(3,1fr);gap:14px}
+
+/* ---------- 通道卡片 ---------- */
+.ch-top{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.ch-name{font-size:14px;font-weight:600}
+.dot{display:inline-block;width:8px;height:8px;border-radius:50%;flex:none}
+.dot-green{background:var(--green);box-shadow:0 0 6px rgba(63,185,80,.55)}
+.dot-blue{background:var(--blue)}
+.dot-amber{background:var(--amber);box-shadow:0 0 6px rgba(217,161,18,.5)}
+.dot-red{background:var(--red);box-shadow:0 0 6px rgba(248,81,77,.5)}
+.st{display:inline-flex;align-items:center;gap:6px;font-size:11px;padding:1px 9px;border-radius:999px;border:1px solid;white-space:nowrap}
+.st .dot{width:6px;height:6px}
+.st-green{color:var(--green);border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.08)}
+.st-amber{color:var(--amber);border-color:rgba(217,161,18,.4);background:rgba(217,161,18,.08)}
+.demo-tag{margin-left:auto;font-size:10px;color:var(--faint);border:1px solid var(--border);border-radius:4px;padding:0 6px;letter-spacing:.08em}
+.ch-meta{margin-top:12px;display:grid;gap:5px}
+.kv{display:flex;gap:10px;font-size:12px;min-width:0}
+.kv .k{flex:none;width:46px;color:var(--faint);font-size:11px;padding-top:1px}
+.kv .v2{color:var(--muted);min-width:0}
+.ell{overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.mono-chip{font-family:var(--mono);font-size:11.5px;color:var(--cyan);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:5px 9px;display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ver-line{font-family:var(--mono);font-size:11px;color:var(--muted);display:block;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.ch-metrics{display:grid;grid-template-columns:repeat(4,1fr);gap:8px;margin:12px 0 0}
+.ch-metrics.two{grid-template-columns:repeat(2,1fr)}
+.m .v{font-size:16px;font-weight:600;line-height:1.3}
+.m .l{font-size:11px;color:var(--faint)}
+.m .unit{font-size:11px;color:var(--muted);font-weight:400;margin-left:1px}
+.m .v.green{color:var(--green)}
+.m .v.red{color:var(--red)}
+.m .v.purple{color:var(--purple)}
+.ev-list{margin-top:12px;display:grid;gap:6px}
+.ev{display:flex;align-items:center;gap:8px;font-size:12px;color:var(--muted)}
+.ev .ev-t{margin-left:auto;font-family:var(--mono);font-size:11px;color:var(--faint)}
+.ev .dot{width:6px;height:6px}
+.ev .ok-t{color:var(--green)}
+.lc{margin-top:13px;background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:9px 11px}
+.lc-head{display:flex;align-items:center;justify-content:space-between;font-size:11px;color:var(--faint)}
+.lc-cur{font-family:var(--mono);color:var(--blue)}
+.lc-flow{display:flex;align-items:center;margin-top:8px}
+.lc-node{font-family:var(--mono);font-size:11px;padding:2px 11px;border:1px solid var(--border2);border-radius:999px;color:var(--muted);background:var(--panel)}
+.lc-node.on{border-color:rgba(76,141,255,.6);color:var(--blue);background:rgba(76,141,255,.1);box-shadow:0 0 0 3px rgba(76,141,255,.08)}
+.lc-line{flex:1;height:1px;background:var(--border2);min-width:14px}
+.exits{margin-top:12px}
+.exits-title{font-size:11px;color:var(--faint);margin-bottom:3px}
+.exit-row{display:flex;align-items:center;gap:8px;font-size:11.5px;margin-top:5px}
+.exit-code{flex:none;width:44px;color:var(--muted);font-family:var(--mono)}
+.exit-track{flex:1;height:5px;background:var(--panel2);border:1px solid var(--border);border-radius:999px;overflow:hidden}
+.exit-track i{display:block;height:100%;border-radius:999px}
+.exit-n{flex:none;width:22px;text-align:right;font-family:var(--mono);color:var(--text)}
+.ch-actions{display:flex;gap:8px;margin-top:13px;flex-wrap:wrap}
+.btn{display:inline-flex;align-items:center;gap:6px;background:var(--panel2);border:1px solid var(--border2);color:var(--text);font-size:12px;font-family:inherit;padding:5px 11px;border-radius:6px;cursor:pointer;text-decoration:none;transition:border-color .12s,color .12s,background .12s}
+.btn:hover{border-color:var(--blue);color:var(--blue)}
+.ch-link{font-size:11.5px}
+
+/* ---------- 卡片头 ---------- */
+.card-head{display:flex;align-items:center;justify-content:space-between;gap:10px;flex-wrap:wrap;margin-bottom:10px}
+.card-head h2{font-size:14px;font-weight:600;display:flex;align-items:center;gap:8px}
+.head-right{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.head-right .pill.faint{color:var(--faint);border-style:dashed}
+
+/* ---------- 调用日志表 ---------- */
+.table-wrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;table-layout:fixed;font-size:12.5px}
+th{text-align:left;font-weight:500;color:var(--faint);font-size:11px;letter-spacing:.04em;padding:7px 10px;border-bottom:1px solid var(--border);white-space:nowrap}
+th.r{text-align:right}
+td{padding:9px 10px;border-bottom:1px solid var(--border);vertical-align:middle;color:var(--muted)}
+td.t-time{color:var(--text)}
+tbody tr:last-child td{border-bottom:0}
+tbody tr{transition:background .1s}
+tbody tr:hover td{background:rgba(255,255,255,.022)}
+.r{text-align:right}
+td.ell{color:var(--muted)}
+.tag{display:inline-block;font-size:11px;padding:1px 8px;border-radius:5px;border:1px solid;white-space:nowrap}
+.tag-blue{color:var(--blue);border-color:rgba(76,141,255,.4);background:rgba(76,141,255,.08)}
+.tag-purple{color:var(--purple);border-color:rgba(163,113,247,.4);background:rgba(163,113,247,.08)}
+.tag-amber{color:var(--amber);border-color:rgba(217,161,18,.4);background:rgba(217,161,18,.08)}
+.ec{display:inline-block;min-width:28px;text-align:center;padding:1px 7px;border-radius:5px;font-family:var(--mono);font-size:11.5px;border:1px solid}
+.ec-0{color:var(--green);background:rgba(63,185,80,.1);border-color:rgba(63,185,80,.35)}
+.ec-1{color:var(--red);background:rgba(248,81,77,.12);border-color:rgba(248,81,77,.4)}
+.ec-130{color:var(--amber);background:rgba(217,161,18,.1);border-color:rgba(217,161,18,.35)}
+.stderr-line{color:var(--red);opacity:.9}
+.ops{display:flex;flex-direction:column;gap:3px;align-items:flex-start}
+.txt-btn{background:none;border:none;padding:0;font-family:inherit;font-size:12px;color:var(--blue);cursor:pointer;text-align:left}
+.txt-btn:hover{text-decoration:underline}
+.txt-btn.red{color:var(--red)}
+.row-fail td{background:rgba(248,81,77,.055)}
+.row-fail:hover td{background:rgba(248,81,77,.085)!important}
+.row-fail td.t-time{color:var(--red)}
+
+/* ---------- 调度器 ---------- */
+.sched{display:grid;grid-template-columns:repeat(3,1fr);gap:0 22px}
+.sched-title{font-size:12px;font-weight:600;color:var(--text);padding-bottom:7px;border-bottom:1px solid var(--border)}
+.sched-col+.sched-col{border-left:1px solid var(--border);padding-left:22px}
+.sched-row{display:flex;gap:10px;padding:9px 0;border-bottom:1px dashed var(--border);align-items:flex-start}
+.sched-row:last-child{border-bottom:0;padding-bottom:2px}
+.sched-info{min-width:0}
+.sched-name{font-size:12.5px;font-weight:500;color:var(--text)}
+.sched-name .t{color:var(--faint);font-family:var(--mono);font-size:11.5px;font-weight:400;margin-left:6px}
+.sched-sub{font-size:11.5px;color:var(--muted);margin-top:2px}
+.sched-sub b{color:var(--text);font-weight:500}
+.sched-row.off .sched-info{opacity:.5}
+.switch{position:relative;display:inline-block;width:30px;height:17px;flex:none;margin-top:3px}
+.switch input{position:absolute;opacity:0;width:0;height:0}
+.switch span{position:absolute;inset:0;background:var(--border2);border-radius:999px;cursor:pointer;transition:background .15s}
+.switch span::after{content:"";position:absolute;top:2px;left:2px;width:13px;height:13px;border-radius:50%;background:var(--muted);transition:left .15s,background .15s}
+.switch input:checked+span{background:rgba(76,141,255,.35)}
+.switch input:checked+span::after{left:15px;background:var(--blue)}
+.switch input:focus-visible+span{outline:2px solid rgba(76,141,255,.55);outline-offset:1px}
+
+/* ---------- 熔断保护 ---------- */
+.brk{border-color:rgba(217,161,18,.32)}
+.brk-grid{display:grid;grid-template-columns:repeat(4,1fr);gap:12px}
+.brk-item{background:var(--panel2);border:1px solid var(--border);border-radius:8px;padding:10px 12px}
+.brk-item .l{font-size:11px;color:var(--faint)}
+.brk-item .v{font-size:18px;font-weight:600;margin-top:2px}
+.brk-item .v .of{font-size:12px;color:var(--faint);font-weight:400}
+.brk-item .v .unit{font-size:11px;color:var(--muted);font-weight:400;margin-left:2px}
+.brk-item .sub{font-size:11px;color:var(--muted);margin-top:3px}
+.cells{display:flex;gap:4px;margin:7px 0 2px}
+.cell{width:24px;height:10px;border-radius:3px;border:1px solid var(--border2);background:var(--panel)}
+.cell.on{background:rgba(217,161,18,.3);border-color:rgba(217,161,18,.65);box-shadow:0 0 6px rgba(217,161,18,.3)}
+.prog{height:6px;border-radius:999px;background:var(--panel);border:1px solid var(--border);overflow:hidden;margin:9px 0 3px}
+.prog i{display:block;height:100%;background:var(--amber);border-radius:999px}
+.warn-pill{display:inline-flex;align-items:center;gap:6px;font-size:11px;color:var(--amber);border:1px solid rgba(217,161,18,.45);background:rgba(217,161,18,.08);padding:2px 10px;border-radius:999px}
+.kill{margin-top:13px;padding-top:11px;border-top:1px solid var(--border);display:flex;align-items:center;gap:9px;font-size:12px;color:var(--muted);flex-wrap:wrap}
+.kill b{color:var(--text);font-weight:600}
+.kill .k-r{color:var(--red)}
+
+/* ---------- Profile / Bundle ---------- */
+.path{font-family:var(--mono);font-size:11.5px;color:var(--cyan);background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:4px 10px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:100%}
+.bundle-head,.bundle-row{display:grid;grid-template-columns:minmax(0,1.6fr) 90px 110px 110px;gap:10px;align-items:center}
+.bundle-head{font-size:11px;color:var(--faint);padding:0 0 6px;border-bottom:1px solid var(--border)}
+.bundle-row{padding:9px 0;border-bottom:1px solid var(--border);font-size:12.5px}
+.bundle-row:last-child{border-bottom:0;padding-bottom:2px}
+.b-name{font-family:var(--mono);color:var(--text);overflow:hidden;white-space:nowrap;text-overflow:ellipsis}
+.b-ver,.b-entries{font-family:var(--mono);color:var(--muted)}
+.st-badge{justify-self:start;display:inline-flex;align-items:center;gap:5px;font-size:11px;padding:1px 9px;border-radius:999px;border:1px solid;white-space:nowrap}
+.st-badge i{width:5px;height:5px;border-radius:50%}
+.ok-badge{color:var(--green);border-color:rgba(63,185,80,.35);background:rgba(63,185,80,.08)}
+.ok-badge i{background:var(--green)}
+.lazy-badge{color:var(--amber);border-color:rgba(217,161,18,.35);background:rgba(217,161,18,.08)}
+.lazy-badge i{background:var(--amber)}
+
+/* ---------- 页脚 / Toast ---------- */
+.foot{margin-top:20px;padding:12px 0 2px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;font-size:11px;color:var(--faint)}
+.toast{position:fixed;right:18px;bottom:18px;z-index:99;max-width:420px;background:var(--panel2);border:1px solid var(--border2);color:var(--text);font-size:12.5px;padding:9px 14px;border-radius:8px;box-shadow:0 10px 28px rgba(0,0,0,.45);opacity:0;transform:translateY(6px);transition:opacity .2s,transform .2s;pointer-events:none}
+.toast.show{opacity:1;transform:none}
+
+@media (max-width:1120px){
+  .grid-3{grid-template-columns:1fr 1fr}
+  .brk-grid{grid-template-columns:1fr 1fr}
+  .topmid .t-item{display:none}
+}
+@media (max-width:820px){
+  .grid-3,.sched{grid-template-columns:1fr}
+  .sched-col+.sched-col{border-left:0;padding-left:0;border-top:1px solid var(--border);margin-top:6px;padding-top:8px}
+  .brk-grid{grid-template-columns:1fr}
+  .topmid{display:none}
+  .bundle-head,.bundle-row{grid-template-columns:minmax(0,1.4fr) 80px 100px}
+  .bundle-head .bh-st,.bundle-row .b-st{display:none}
+}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">量化决策平台 V3.0<small>Harness-Centric</small></div>
+  <div class="topmid">
+    <span class="env">SIM</span>
+    <span class="t-item">权益<b class="num">¥1,284,650</b></span>
+    <span class="t-item">日内<b class="num up">+1.24%</b></span>
+    <span class="pill demo-pill">示例数据</span>
+    <span class="pill" title="三通道心跳"><i class="dot dot-green"></i>MCP<i class="dot dot-green"></i>SDK<i class="dot dot-green"></i>Headless</span>
+  </div>
+  <div class="topright num">2025-06-13 周五</div>
+</header>
+
+<nav class="sidenav">
+  <div class="nav-group">监控</div>
+  <a href="index.html">系统概览</a>
+  <a href="brain.html">决策大脑</a>
+  <div class="nav-group">研究</div>
+  <a href="market.html">行情与信号</a>
+  <a href="strategy.html">策略与因子</a>
+  <div class="nav-group">交易</div>
+  <a href="risk.html">风险监控</a>
+  <a href="execution.html">执行与审批</a>
+  <div class="nav-group">系统</div>
+  <a href="gateway.html" class="active" aria-current="page">网关与调度</a>
+  <a href="tools.html">工具域治理</a>
+      <a href="settings.html">接入与授权</a>
+</nav>
+
+<main class="main">
+<div class="page">
+
+  <section class="page-head" data-od-id="gateway-page-header">
+    <div>
+      <h1>网关与调度</h1>
+      <p class="sub">平台与 Harness 之间的「一核三通道」运维视图 · MCP Bridge / SDK JSON-RPC / Headless CLI</p>
+    </div>
+    <div class="head-status">
+      <span class="st st-green"><i class="dot dot-green"></i>三通道正常</span>
+      <span class="note num">刷新于 14:48:00 · 示例</span>
+    </div>
+  </section>
+
+  <section class="grid-3" data-od-id="channel-cards">
+
+    <div class="card">
+      <div class="ch-top">
+        <span class="dot dot-green"></span>
+        <span class="ch-name">MCP Bridge</span>
+        <span class="st st-green">运行中</span>
+        <span class="demo-tag">示例</span>
+      </div>
+      <div class="ch-meta">
+        <div class="kv"><span class="k">方向</span><span class="v2">平台 → Harness（工具暴露）</span></div>
+        <div class="kv"><span class="k">协议</span><span class="v2 num">MCP stdio / Streamable HTTP</span></div>
+      </div>
+      <div class="ch-metrics">
+        <div class="m"><div class="v num">59</div><div class="l">已注册工具</div></div>
+        <div class="m"><div class="v num">1,284</div><div class="l">今日调用</div></div>
+        <div class="m"><div class="v num green">99.2%</div><div class="l">成功率</div></div>
+        <div class="m"><div class="v num">320<span class="unit">ms</span></div><div class="l">P95 延迟</div></div>
+      </div>
+      <div class="lc">
+        <div class="lc-head"><span>生命周期状态机</span><span class="lc-cur">当前 · start</span></div>
+        <div class="lc-flow">
+          <span class="lc-node on">start</span><span class="lc-line"></span><span class="lc-node">stop</span><span class="lc-line"></span><span class="lc-node">update</span>
+        </div>
+      </div>
+      <div class="ch-meta" style="margin-top:10px">
+        <div class="kv"><span class="k">adapter</span><span class="v2 ver-line" title="@helibeiqi/dsh-cordis-universal-adapter">@helibeiqi/dsh-cordis-universal-adapter</span></div>
+      </div>
+      <div class="ch-actions">
+        <button class="btn" data-toast="重载配置指令已下发 · MCP Bridge 正在热加载 59 个已注册工具（示例）">重载配置</button>
+        <button class="btn" data-toast="已注册工具 59 · 最近注册：quant_get_factor_exposure（示例）">查看工具清单</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="ch-top">
+        <span class="dot dot-green"></span>
+        <span class="ch-name">SDK JSON-RPC</span>
+        <span class="st st-green">有状态通道正常</span>
+        <span class="demo-tag">示例</span>
+      </div>
+      <div class="ch-meta">
+        <div class="kv"><span class="k">方向</span><span class="v2">平台 ↔ Harness（人工会话）</span></div>
+        <div class="kv"><span class="k">协议</span><span class="v2">换行分帧 JSON-RPC / stdio</span></div>
+      </div>
+      <div class="ch-metrics two">
+        <div class="m"><div class="v num purple">3</div><div class="l">活跃会话</div></div>
+        <div class="m"><div class="v num">1.8<span class="unit">s</span></div><div class="l">初始化握手</div></div>
+      </div>
+      <div class="ev-list">
+        <div class="ev"><i class="dot dot-green"></i><span class="ok-t">session/prompt 完成</span><span class="ev-t">14:32</span></div>
+        <div class="ev"><i class="dot dot-blue"></i><span>session/initialize 握手成功</span><span class="ev-t">09:15</span></div>
+      </div>
+      <div class="ch-meta" style="margin-top:12px">
+        <div class="kv"><span class="k">协议标识</span><span class="v2 ver-line" title="deepseek-harness-sdk-runtime">deepseek-harness-sdk-runtime</span></div>
+      </div>
+      <div class="ch-actions">
+        <button class="btn" data-toast="活跃会话 3 · 最近事件：session/prompt 完成 14:32（示例）">查看会话列表</button>
+      </div>
+    </div>
+
+    <div class="card">
+      <div class="ch-top">
+        <span class="dot dot-green"></span>
+        <span class="ch-name">Headless CLI</span>
+        <span class="st st-green">调度正常</span>
+        <span class="demo-tag">示例</span>
+      </div>
+      <div class="ch-meta">
+        <div class="kv"><span class="k">方向</span><span class="v2">平台 → Harness（自动唤醒）</span></div>
+        <div class="kv"><span class="k">协议</span><span class="v2">CLI 子进程</span></div>
+      </div>
+      <div style="margin-top:10px">
+        <span class="mono-chip" title='dsh --profile headless "扫描A股新能源板块异动，输出今日观察清单"'>dsh --profile headless "扫描A股新能源板块…"</span>
+      </div>
+      <div class="ch-metrics">
+        <div class="m"><div class="v num">12</div><div class="l">今日唤醒</div></div>
+        <div class="m"><div class="v num green">11</div><div class="l">成功</div></div>
+        <div class="m"><div class="v num red">1</div><div class="l">失败</div></div>
+        <div class="m"><div class="v num">42<span class="unit">s</span></div><div class="l">平均耗时</div></div>
+      </div>
+      <div class="exits">
+        <div class="exits-title">退出码分布 · 今日</div>
+        <div class="exit-row"><span class="exit-code">exit 0</span><div class="exit-track"><i style="width:91.7%;background:var(--green)"></i></div><span class="exit-n">11</span></div>
+        <div class="exit-row"><span class="exit-code">exit 1</span><div class="exit-track"><i style="width:8.3%;background:var(--red)"></i></div><span class="exit-n">1</span></div>
+        <div class="exit-row"><span class="exit-code">exit 130</span><div class="exit-track"></div><span class="exit-n">0</span></div>
+      </div>
+      <div class="ch-actions">
+        <a class="btn ch-link" href="#headless-call-log">查看完整调用日志 ↓</a>
+      </div>
+    </div>
+
+  </section>
+
+  <section class="card" id="headless-call-log" data-od-id="headless-call-log">
+    <div class="card-head">
+      <h2>Headless 调用日志</h2>
+      <div class="head-right">
+        <span class="pill">今日 12 次唤醒 · 下表为最近 6 条</span>
+        <span class="pill faint">示例</span>
+      </div>
+    </div>
+    <div class="table-wrap">
+      <table>
+        <colgroup>
+          <col style="width:8%"><col style="width:9%"><col style="width:26%"><col style="width:8%"><col style="width:6%"><col style="width:8%"><col style="width:25%"><col style="width:10%">
+        </colgroup>
+        <thead>
+          <tr>
+            <th>时间</th><th>任务类型</th><th>提示词摘要</th><th>exit_code</th><th class="r">耗时</th><th class="r">token 估算</th><th>stdout 摘要</th><th>操作</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="num t-time">08:30:02</td>
+            <td><span class="tag tag-blue">开盘扫描</span></td>
+            <td class="ell">定时 08:30：扫描A股新能源板块异动与北向资金流向，输出今日观察清单</td>
+            <td><span class="ec ec-0">0</span></td>
+            <td class="num r">46s</td>
+            <td class="num r">38.2K</td>
+            <td class="ell">已输出 12 条观察标的，3 条进入决策队列</td>
+            <td class="ops">
+              <button class="txt-btn" data-toast="stdout · 08:30:02 开盘扫描：已输出 12 条观察标的，3 条进入决策队列（示例）">查看 stdout</button>
+              <button class="txt-btn" data-toast="stderr · 08:30:02：为空（示例）">stderr</button>
+            </td>
+          </tr>
+          <tr>
+            <td class="num t-time">09:31:18</td>
+            <td><span class="tag tag-amber">风险复盘</span></td>
+            <td class="ell">开盘复盘：首小时持仓波动、止损触发与 VaR 偏移检查</td>
+            <td><span class="ec ec-0">0</span></td>
+            <td class="num r">38s</td>
+            <td class="num r">29.6K</td>
+            <td class="ell">VaR 偏移 +0.4%，无止损触发，无需人工介入</td>
+            <td class="ops">
+              <button class="txt-btn" data-toast="stdout · 09:31:18 风险复盘：VaR 偏移 +0.4%，无止损触发（示例）">查看 stdout</button>
+              <button class="txt-btn" data-toast="stderr · 09:31:18：为空（示例）">stderr</button>
+            </td>
+          </tr>
+          <tr>
+            <td class="num t-time">10:47:55</td>
+            <td><span class="tag tag-purple">新闻评估</span></td>
+            <td class="ell">事件·突发新闻：储能补贴政策调整对电池链持仓的影响评估</td>
+            <td><span class="ec ec-0">0</span></td>
+            <td class="num r">52s</td>
+            <td class="num r">61.4K</td>
+            <td class="ell">相关性低，仅纳入观察清单，不建议调仓</td>
+            <td class="ops">
+              <button class="txt-btn" data-toast="stdout · 10:47:55 新闻评估：相关性低，仅纳入观察清单（示例）">查看 stdout</button>
+              <button class="txt-btn" data-toast="stderr · 10:47:55：为空（示例）">stderr</button>
+            </td>
+          </tr>
+          <tr>
+            <td class="num t-time">12:00:04</td>
+            <td><span class="tag tag-amber">风险复盘</span></td>
+            <td class="ell">定时 12:00：午间复盘——上午信号命中率与因子暴露漂移检查</td>
+            <td><span class="ec ec-0">0</span></td>
+            <td class="num r">41s</td>
+            <td class="num r">33.8K</td>
+            <td class="ell">动量因子暴露漂移 +1.8%，处于容忍带内</td>
+            <td class="ops">
+              <button class="txt-btn" data-toast="stdout · 12:00:04 风险复盘：动量暴露漂移 +1.8%，容忍带内（示例）">查看 stdout</button>
+              <button class="txt-btn" data-toast="stderr · 12:00:04：为空（示例）">stderr</button>
+            </td>
+          </tr>
+          <tr class="row-fail">
+            <td class="num t-time">13:22:47</td>
+            <td><span class="tag tag-amber">风险复盘</span></td>
+            <td class="ell">事件·持仓异动：某持仓标的盘中急跌超 4%，评估止损与对冲预案</td>
+            <td><span class="ec ec-1">1</span></td>
+            <td class="num r">300s</td>
+            <td class="num r">187.3K</td>
+            <td class="ell"><span class="stderr-line">stderr：agent loop ended without completion</span></td>
+            <td class="ops">
+              <button class="txt-btn" data-toast="stdout · 13:22:47：无 stdout，进程于 300s 超时被平台强制 kill（示例）">查看 stdout</button>
+              <button class="txt-btn red" data-toast="stderr 首行 · 13:22:47：agent loop ended without completion（示例）">stderr</button>
+            </td>
+          </tr>
+          <tr>
+            <td class="num t-time">14:10:33</td>
+            <td><span class="tag tag-purple">新闻评估</span></td>
+            <td class="ell">午后新闻流跟踪：板块轮动消息过滤与相关性粗筛</td>
+            <td><span class="ec ec-0">0</span></td>
+            <td class="num r">44s</td>
+            <td class="num r">35.1K</td>
+            <td class="ell">过滤 27 条噪音，保留 4 条进入下一轮评估</td>
+            <td class="ops">
+              <button class="txt-btn" data-toast="stdout · 14:10:33 新闻评估：过滤 27 条噪音，保留 4 条（示例）">查看 stdout</button>
+              <button class="txt-btn" data-toast="stderr · 14:10:33：为空（示例）">stderr</button>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section class="card" data-od-id="scheduler">
+    <div class="card-head">
+      <h2>调度器</h2>
+      <div class="head-right">
+        <span class="pill">启用 8 / 9</span>
+        <span class="pill faint">示例</span>
+      </div>
+    </div>
+    <div class="sched">
+      <div class="sched-col">
+        <div class="sched-title">定时触发</div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用开盘前扫描"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">开盘前扫描<span class="t num">08:30</span></div>
+            <div class="sched-sub">今日已触发 08:30 · 下次 <b class="num">08:30 · 17h42m</b></div>
+          </div>
+        </div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用午间复盘"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">午间复盘<span class="t num">12:00</span></div>
+            <div class="sched-sub">今日已触发 12:00 · 下次 <b class="num">12:00 · 21h12m</b></div>
+          </div>
+        </div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用收盘后分析"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">收盘后分析<span class="t num">16:00</span></div>
+            <div class="sched-sub">今日未触发 · 下次 <b class="num">16:00 · 1h12m</b></div>
+          </div>
+        </div>
+      </div>
+      <div class="sched-col">
+        <div class="sched-title">事件触发</div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用突发新闻触发"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">突发新闻</div>
+            <div class="sched-sub">最近 <b class="num">10:47</b> · 触发新闻评估</div>
+          </div>
+        </div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用持仓异动触发"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">持仓异动</div>
+            <div class="sched-sub">最近 <b class="num">13:22</b> · 触发风险复盘（300s 超时）</div>
+          </div>
+        </div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用风控阈值突破触发"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">风控阈值突破</div>
+            <div class="sched-sub">最近 <b class="num">06-12 14:05</b> · 触发风险复盘</div>
+          </div>
+        </div>
+        <div class="sched-row off">
+          <label class="switch"><input type="checkbox" aria-label="启用因子信号反转触发"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">因子信号反转</div>
+            <div class="sched-sub">已停用 · 最近 <b class="num">06-09 10:12</b></div>
+          </div>
+        </div>
+      </div>
+      <div class="sched-col">
+        <div class="sched-title">流水线节点触发</div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用调仓前决策确认"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">调仓前决策确认</div>
+            <div class="sched-sub">挂钩 OMS 调仓流程 · 最近 <b class="num">06-12 15:30</b></div>
+          </div>
+        </div>
+        <div class="sched-row">
+          <label class="switch"><input type="checkbox" checked aria-label="启用策略参数变更审核"><span></span></label>
+          <div class="sched-info">
+            <div class="sched-name">策略参数变更审核</div>
+            <div class="sched-sub">挂钩策略研究域 · 最近 <b class="num">06-10 11:20</b></div>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section class="card brk" data-od-id="circuit-breaker">
+    <div class="card-head">
+      <h2><span class="dot dot-amber"></span>熔断保护</h2>
+      <div class="head-right">
+        <span class="warn-pill"><i class="dot dot-amber" style="width:6px;height:6px"></i>平台外部熔断 · 保护生效中</span>
+        <span class="pill faint">示例</span>
+      </div>
+    </div>
+    <div class="brk-grid">
+      <div class="brk-item">
+        <div class="l">并发上限</div>
+        <div class="v num">3<span class="unit">路</span></div>
+        <div class="cells" title="当前占用 1 / 3"><span class="cell on"></span><span class="cell"></span><span class="cell"></span></div>
+        <div class="sub">当前占用 <span class="num">1 / 3</span></div>
+      </div>
+      <div class="brk-item">
+        <div class="l">单次超时</div>
+        <div class="v num">300<span class="unit">s</span></div>
+        <div class="sub">超时触发强制 kill</div>
+      </div>
+      <div class="brk-item">
+        <div class="l">单次 token 预算</div>
+        <div class="v num">200<span class="unit">K</span></div>
+        <div class="sub">超出即中断本次唤醒</div>
+      </div>
+      <div class="brk-item">
+        <div class="l">今日累计 token</div>
+        <div class="v num">1.84M <span class="of">/ 5M</span></div>
+        <div class="prog"><i style="width:36.8%"></i></div>
+        <div class="sub"><span class="num">36.8%</span> · 剩余 <span class="num">3.16M</span></div>
+      </div>
+    </div>
+    <div class="kill">
+      <span class="dot dot-red"></span>
+      <span>最近一次强制 kill：<b class="num">13:27:47</b> · 原因<span class="k-r">「超时 300s」</span> · 释放并发位 <b class="num">2 / 3</b> · 关联任务「风险复盘 · 持仓异动」</span>
+    </div>
+  </section>
+
+  <section class="card" data-od-id="profile-bundle">
+    <div class="card-head">
+      <h2>Profile 与 Bundle</h2>
+      <span class="path" title="$DSH_HOME/profiles/quant-headless/">$DSH_HOME/profiles/quant-headless/</span>
+    </div>
+    <div class="bundle-head">
+      <span>Bundle</span><span>版本</span><span>条目</span><span class="bh-st">加载状态</span>
+    </div>
+    <div class="bundle-row">
+      <span class="b-name">dsh-base</span>
+      <span class="b-ver">v3.0.2</span>
+      <span class="b-entries">78 entries</span>
+      <span class="st-badge ok-badge b-st"><i></i>已加载</span>
+    </div>
+    <div class="bundle-row">
+      <span class="b-name">dsh-headless</span>
+      <span class="b-ver">v3.0.2</span>
+      <span class="b-entries">9 entries</span>
+      <span class="st-badge ok-badge b-st"><i></i>已加载</span>
+    </div>
+    <div class="bundle-row">
+      <span class="b-name">dsh-cordis-universal-adapter</span>
+      <span class="b-ver">v1.8.4</span>
+      <span class="b-entries">59 tools</span>
+      <span class="st-badge ok-badge b-st"><i></i>已加载</span>
+    </div>
+    <div class="bundle-row">
+      <span class="b-name">dsh-quant-data-mcp</span>
+      <span class="b-ver">v0.9.7</span>
+      <span class="b-entries">21 tools</span>
+      <span class="st-badge lazy-badge b-st"><i></i>按需加载</span>
+    </div>
+  </section>
+
+  <footer class="foot">
+    <span>示例数据，非真实账户 · 量化决策平台 V3.0 · 网关与调度</span>
+    <span class="num">数据截至 2025-06-13 14:48:00 · 三通道心跳正常</span>
+  </footer>
+
+</div>
+</main>
+
+<div class="toast" id="toast" role="status" aria-live="polite"></div>
+
+<script>
+(function(){
+  var toast = document.getElementById('toast'), tm;
+  function show(msg){
+    toast.textContent = msg;
+    toast.classList.add('show');
+    clearTimeout(tm);
+    tm = setTimeout(function(){ toast.classList.remove('show'); }, 2400);
+  }
+  Array.prototype.forEach.call(document.querySelectorAll('[data-toast]'), function(el){
+    el.addEventListener('click', function(e){
+      e.preventDefault();
+      show(el.getAttribute('data-toast'));
+    });
+  });
+  Array.prototype.forEach.call(document.querySelectorAll('.switch input'), function(sw){
+    sw.addEventListener('change', function(){
+      show(sw.checked ? '调度项已启用（示例，未持久化）' : '调度项已停用（示例，未持久化）');
+    });
+  });
+})();
+</script>
+
+<script src="shared.js"></script>
+<script src="gateway.js" defer></script>
+</body>
+</html>

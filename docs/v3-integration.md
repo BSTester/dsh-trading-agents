@@ -21,7 +21,7 @@
 
 ### 1. `TUSHARE_TOKEN`（唯一必须的密钥）—— **可在页面上配置**
 
-**方式 A（推荐，无需碰命令行）**：打开 `#/v3-settings`（接入与授权）→「密钥与授权」卡片 →
+**方式 A（推荐，无需碰命令行）**：打开 `/v3/settings.html`（接入与授权）→「密钥与授权」卡片 →
 粘贴 token → **保存** → 点 **测试连通性**（真实调用 Tushare `trade_cal`，返回延迟与上游消息）。
 
 - 凭据落 `<DSH_HOME>/v3-credentials.json`，**0600**，原子写；
@@ -66,29 +66,36 @@ curl -s "localhost:8397/api/v3/tushare?api=income&ts_code=600519.SH&period=20260
 
 ## 三、页面与接口对应
 
+V3 控制台是 **OpenDesign 设计稿的 HTML/CSS 原样页面**（`platform/web/public/v3/`，Vite 构建原样拷到
+`dist/v3/`，由 FastAPI 直接服务；`/` 307 跳转到 `/v3/index.html`）。设计稿的标记与样式**一字未改**
+（`platform/tools/compare_with_design.sh` 逐字节校验），真实数据由每页一个 binder（`/v3/<page>.js`）
+注入设计稿原有 DOM 节点；取不到的区块显式标注「无数据源」。
+
 | 页面（hash 路由） | 接口 |
 |---|---|
-| `#/v3-overview` 系统概览 | `/api/v3/overview` |
-| `#/v3-brain` 决策大脑 | `/api/v3/brain` |
-| `#/v3-market` 行情与信号 | `/api/v3/market`、`/market/watchlist`、`/factors/matrix`、`/plates`、`/orderbook` |
-| `#/v3-strategy` 策略与因子 | `/api/v3/strategy`、`/factors/matrix`、`/ml/sweep`、`/ml/backtest` |
-| `#/v3-risk` 风险监控 | `/api/v3/risk/analytics`、`/risk`、`/oms/orders`、`/events` |
-| `#/v3-execution` 执行与审批 | `/api/v3/execution`、`/oms/orders`、`/audit` |
-| `#/v3-gateway` 网关与调度 | `/api/v3/gateway`、`/metrics` |
-| `#/v3-tools` 工具域治理 | `/api/v3/tools`、`/metrics` |
-| `#/v3-settings` 接入与授权 | `/api/v3/settings`、`/metrics`、`/news`、`/financials`、`/tushare`、`/openbb` |
+| `/v3/index.html` 系统概览 | `/api/v3/overview` |
+| `/v3/brain.html` 决策大脑 | `/api/v3/brain` |
+| `/v3/market.html` 行情与信号 | `/api/v3/market`、`/market/watchlist`、`/factors/matrix`、`/plates`、`/orderbook` |
+| `/v3/strategy.html` 策略与因子 | `/api/v3/strategy`、`/factors/matrix`、`/ml/sweep`、`/ml/backtest` |
+| `/v3/risk.html` 风险监控 | `/api/v3/risk/analytics`、`/risk`、`/oms/orders`、`/events` |
+| `/v3/execution.html` 执行与审批 | `/api/v3/execution`、`/oms/orders`、`/audit` |
+| `/v3/gateway.html` 网关与调度 | `/api/v3/gateway`、`/metrics` |
+| `/v3/tools.html` 工具域治理 | `/api/v3/tools`、`/metrics` |
+| `/v3/settings.html` 接入与授权 | `/api/v3/settings`、`/metrics`、`/news`、`/financials`、`/tushare`、`/openbb` |
 
 ## 四、部署与自检
 
 ```bash
-# 前端构建（产物由 FastAPI 直接服务）
+# 前端构建（产物由 FastAPI 直接服务；设计稿页面随 public/ 原样拷入 dist/v3）
 cd platform/web && npm run build
 
 # 服务（构建产物在 platform/web/dist，FastAPI 静态兜底直接打开）
 cd platform && ~/.dsh/trading-venv/bin/python -m server.run     # http://127.0.0.1:8397
 
-# 逐页验收（无「示例」、无占位数字、真实值命中、无错误态）
+# 逐页验收（无「示例」、无设计稿残留占位数字、真实值命中、设计结构锚点、无崩溃）
 bash platform/tools/verify_v3_pages.sh http://127.0.0.1:8397
+# 设计稿保真度（服务端 HTML 与设计稿源文件逐字节一致）
+bash platform/tools/compare_with_design.sh http://127.0.0.1:8397
 ```
 
 ## 五、诚实性约定（实现层面强制）

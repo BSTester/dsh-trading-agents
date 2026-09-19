@@ -940,6 +940,17 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # 精确命中（见 guard 的「等值或前缀」说明）。
     app.router.routes.extend(mcp_app.routes)
 
+    @app.get("/")
+    async def v3_console_root():
+        """根路径 → V3 控制台首页（设计稿原样页面）。
+
+        AntD 版工作台仍在 ``/index.html``；V3 控制台是设计稿的 HTML/CSS 原样页面
+        （菜单、布局、卡片、图表形态与设计稿完全一致），数据由 /api/v3/* 注入。
+        """
+        from fastapi.responses import RedirectResponse
+
+        return RedirectResponse(url="/v3/index.html", status_code=307)
+
     @app.get("/{path:path}")
     async def static_files(path: str):
         """Node 原实现（已退役）：GET 走静态托管 + SPA 兜底。"""

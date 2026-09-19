@@ -24,17 +24,6 @@ import PipelinePage from "./pages/pipeline.jsx";
 import SchedulePage from "./pages/schedule.jsx";
 import AuditPage from "./pages/audit.jsx";
 import SettingsPage from "./pages/settings.jsx";
-// V3 控制台（Ant Design Pro）：9 页对应 OpenDesign 设计稿 od-quant-harness-platform/*
-import V3OverviewPage from "./pages/v3/overview.jsx";
-import V3BrainPage from "./pages/v3/brain.jsx";
-import V3MarketPage from "./pages/v3/market.jsx";
-import V3StrategyPage from "./pages/v3/strategy.jsx";
-import V3RiskPage from "./pages/v3/risk.jsx";
-import V3ExecutionPage from "./pages/v3/execution.jsx";
-import V3GatewayPage from "./pages/v3/gateway.jsx";
-import V3ToolsPage from "./pages/v3/tools.jsx";
-import V3SettingsPage from "./pages/v3/settings.jsx";
-import { V3_THEME } from "./pages/v3/theme.js";
 
 const PAGES = [
   { key: "overview", name: "概览", element: <OverviewPage /> },
@@ -58,20 +47,6 @@ const PAGES = [
   { key: "settings", name: "设置", element: <SettingsPage /> },
 ];
 
-// V3 控制台页面（顺序 = 设计稿导航：监控 → 研究 → 交易 → 系统）
-const V3_PAGES = [
-  { key: "v3-overview", name: "系统概览", group: "监控", element: <V3OverviewPage /> },
-  { key: "v3-brain", name: "决策大脑", group: "监控", element: <V3BrainPage /> },
-  { key: "v3-market", name: "行情与信号", group: "研究", element: <V3MarketPage /> },
-  { key: "v3-strategy", name: "策略与因子", group: "研究", element: <V3StrategyPage /> },
-  { key: "v3-risk", name: "风险监控", group: "交易", element: <V3RiskPage /> },
-  { key: "v3-execution", name: "执行与审批", group: "交易", element: <V3ExecutionPage /> },
-  { key: "v3-gateway", name: "网关与调度", group: "系统", element: <V3GatewayPage /> },
-  { key: "v3-tools", name: "工具域治理", group: "系统", element: <V3ToolsPage /> },
-  { key: "v3-settings", name: "接入与授权", group: "系统", element: <V3SettingsPage /> },
-];
-const V3_GROUPS = ["监控", "研究", "交易", "系统"];
-const ALL_PAGES = [...V3_PAGES, ...PAGES];
 
 function currentKey() {
   return (location.hash.replace(/^#\//, "").split("?")[0]) || "overview";
@@ -172,16 +147,10 @@ function Shell() {
   const snapshot = useSnapshotPoll();
   const mode = snapshot.value?.mode ?? "sim";
   const { market, setMarket } = useMarketFilter();
-  const page = ALL_PAGES.find((item) => item.key === key) ?? V3_PAGES[0];
+  const page = PAGES.find((item) => item.key === key) ?? PAGES[0];
   return (
-    <ProLayout title="量化决策平台 V3" layout="mix" fixSiderbar
-      route={{ path: "/", routes: [
-        { path: "/v3", name: "V3 控制台",
-          routes: V3_GROUPS.flatMap((group) =>
-            V3_PAGES.filter((p) => p.group === group).map((p) => ({ path: `/${p.key}`, name: `${group} · ${p.name}` }))) },
-        { path: "/legacy", name: "既有工作台",
-          routes: PAGES.map(({ key: k, name }) => ({ path: `/${k}`, name })) },
-      ] }}
+    <ProLayout title="量化工作台" layout="mix" fixSiderbar
+      route={{ path: "/", routes: PAGES.map(({ key: k, name }) => ({ path: `/${k}`, name })) }}
       location={{ pathname: `/${page.key}` }}
       menuItemRender={(item, dom) => (
         <a href={`#${item.path}`} onClick={() => setKey(item.path.slice(1))}>{dom}</a>)}
@@ -198,10 +167,7 @@ function Shell() {
             数据按 TTL 本地缓存；模式切换不授权下单
           </Typography.Text>
         </Space>) }}>
-      {page.key.startsWith("v3-")
-        // V3 页面套设计稿 token（作用域化：既有页面保持 antd 默认主题）
-        ? <ConfigProvider locale={zhCN} theme={V3_THEME}>{page.element}</ConfigProvider>
-        : page.element}
+      {page.element}
     </ProLayout>
   );
 }
