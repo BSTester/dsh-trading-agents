@@ -14,3 +14,16 @@ websockets==17.1
 # 的人也能装上——缺它不会报错、只会静默降级（A 股走 AKShare、港美股长历史直接失败），
 # 这类依赖最容易在安装步骤里漏掉。版本取本机已装版本精确锁定。
 yfinance==1.7.0
+# ── 外部数据源 V3（server/v3_sources.py）── 以下均为**可选**依赖，刻意不锁版本、不写进上面
+# 的精确锁定区：装了才启用的数据源，缺了只让对应路由如实报错，不影响服务启动与其它路由。
+#
+#   * openbb（可选，/api/v3/openbb）：`pip install openbb` 后该路由才做真实基本面取数；
+#     未安装时直接返回 {ok:false,error:{code:'openbb/unavailable'}}，**不发任何网络请求**。
+#     注意它的 import 以十秒计（本机实测 44-57s 冷启动），所以 v3_sources 只在请求内惰性
+#     import，装配期不碰它。
+#   * akshare（/api/v3/news、/api/v3/spot）与 pandas/numpy：免密钥 A 股数据源。这两个路由
+#     未安装时回 akshare/missing 错误。本机安装演练里 akshare 走的是 trading-venv，故这里
+#     不重复声明；若要在全新环境启用请自行安装。
+#   * Tushare Pro（/api/v3/tushare）不需要额外依赖（纯 httpx），但需要 TUSHARE_TOKEN；
+#     未注入时该路由一次请求都不发。SEC EDGAR（/api/v3/financials）同样零依赖，只需
+#     QUANT_SEC_USER_AGENT（缺省 quant-platform-v3 (ops@example.com)）。

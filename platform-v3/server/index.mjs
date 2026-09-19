@@ -368,6 +368,14 @@ app.get('/api/v3/ml/sweep', async ({ query }) => {
   return { ok: true, ticker, ...result }
 })
 
+// 工作台事件流 / 审计链（真实数据：供告警流与决策链路追溯）
+app.get('/api/v3/events', async ({ query }) => {
+  const ticker = String(query.ticker || (config.sources.watchlist ?? [])[0] || 'SH.600519')
+  return wbValue(wb.call('events', { ticker, ...(query.window ? { window: Number(query.window) } : {}) }))
+})
+
+app.get('/api/v3/audit', async ({ query }) => wbValue(wb.call('audit', query.window ? { window: Number(query.window) } : {})))
+
 app.get('/api/v3/oms/orders', async () => ({ ok: true, ...(await oms.view()) }))
 
 app.post('/api/v3/oms/sync', async () => oms.sync())

@@ -42,7 +42,9 @@
 """
 import asyncio
 import contextlib
+import importlib
 import json
+from datetime import datetime, timezone
 import os
 import re
 from pathlib import Path
@@ -866,6 +868,68 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         if request.method != "POST":
             return error_envelope("trading/method-not-allowed", "仅 POST", 405)
         return error_envelope("trading/unknown-endpoint", f"未知端点 {rest}", 404)
+
+    # ── V3 控制台 API（/api/v3/*）──────────────────────────────────────────────
+    # 与既有 /api/wb/* 共存：同样复用上面那一份 handle + bound_tools（同一数据路径，
+    # 不新造第二事实源）。V3 页面只读；执行入口仍在工作台 Web。
+    v3_tools = {tool.definition.name: tool for tool in bound_tools}
+
+    def v3_run(name, payload=None):
+        """按名调用既有工具面，返回原始信封 {ok, value|error}（不抛异常）。"""
+        tool = v3_tools.get(name)
+        if tool is None:
+            return {"ok": False, "error": {"code": "v3/unknown-tool", "message": f"未知工具 {name}"}}
+        try:
+            return tool.run(payload or {})
+        except Exception as error:  # noqa: BLE001 —— 与工具面口径一致：失败进 error 信封
+            return {"ok": False, "error": {"code": "v3/tool-failed", "message": str(error)[:300]}}
+
+    # V3 子模块自动接线（分析 / 运维 / 外部数据源）：各自提供 register(app, v3_run, home)。
+    # 用 import 守卫：模块尚未创建时安静跳过，不阻断服务启动。
+    for _v3_module in ("v3_market", "v3_risk", "v3_analytics", "v3_ops", "v3_sources"):
+        try:
+            _module = importlib.import_module(f"server.{_v3_module}")
+        except ModuleNotFoundError:
+            continue
+        _register = getattr(_module, "register", None)
+        if callable(_register):
+            _register(app, v3_run, home)
+
+    @app.get("/api/v3/overview")
+    async def v3_overview():
+        """V3 系统概览：台账权益/持仓/今日成交/冻结计划/调度心跳/数据源健康/推送状态。"""
+        wanted = {
+            "equity": ("equity", {"window": 60}),
+            "positions": ("positions", {}),
+            "deals_today": ("deals_today", {}),
+            "plan": ("plan", {}),
+            "schedule": ("schedule", {}),
+            "sources": ("sources", {}),
+            "snapshot": ("snapshot", {}),
+            "push_status": ("push_status", {}),
+        }
+
+        def collect():
+            out = {}
+            errors = []
+            for key, (tool, payload) in wanted.items():
+                envelope = v3_run(tool, payload)
+                if envelope.get("ok"):
+                    out[key] = envelope.get("value")
+                else:
+                    out[key] = None
+                    errors.append({"tool": tool, "error": envelope.get("error")})
+            return out, errors
+
+        values, errors = await asyncio.to_thread(collect)
+        return JSONResponse(status_code=200, content={
+            "ok": True,
+            "mode": read_mode(home),
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "source": "platform/v3（复用既有 56 工具面的同一 handle）",
+            **values,
+            "errors": errors,
+        })
 
     # /mcp：MCP streamable-http 端点（规格 §3.6，SDK 挂载）。
     # 有意差异 10：不用 ``app.mount("/mcp", mcp_app)``——Starlette 的 Mount 只匹配
