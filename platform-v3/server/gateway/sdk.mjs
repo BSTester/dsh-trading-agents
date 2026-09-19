@@ -25,6 +25,21 @@ export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new 
     return Boolean(process.env.DEEPSEEK_API_KEY || process.env.ZAI_CODING_CN_API_KEY || process.env.ANTHROPIC_API_KEY)
   }
 
+  // 从事件流里提取「最近一轮」的结论：turn/end 的 reason（成功=completed，失败=错误码+原文）
+  function lastTurn() {
+    for (let i = events.length - 1; i >= 0; i--) {
+      const event = events[i]?.params?.event
+      if (!event || event.type !== 'turn/end') continue
+      const reason = event.data?.reason ?? {}
+      if (reason.kind === 'error') {
+        const failure = reason.error ?? reason.failure ?? {}
+        return { kind: 'error', code: failure.code ?? null, message: failure.message ?? null, at: events[i].at }
+      }
+      return { kind: reason.kind ?? 'completed', at: events[i].at }
+    }
+    return null
+  }
+
   function status() {
     return {
       status: state.status,
@@ -34,6 +49,8 @@ export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new 
       profile: sdk.profile,
       route: { provider: sdk.provider, model: sdk.model, reasoningEffort: sdk.reasoningEffort, maxTokens: sdk.maxTokens },
       credentials: { modelKeyPresent: keyPresence() },
+      sessionWarning: keyPresence() ? null : '未检测到模型密钥（DEEPSEEK_API_KEY / ZAI_CODING_CN_API_KEY）：握手可用，但 session/prompt 会在模型调用处返回 MISSING_CREDENTIAL',
+      lastTurn: lastTurn(),
       events: events.slice(-20),
     }
   }
@@ -73,12 +90,12 @@ export function createSdkChannel({ config, spawnImpl = spawn, clock = () => new 
     if (!sdk.enabled) return { ok: false, error: { code: 'sdk/disabled', message: state.reason } }
     if (state.initialized) return { ok: true }
     if (state.child) return { ok: false, error: { code: 'sdk/starting', message: '握手进行中' } }
-    if (sdk.requireKey !== false && !keyPresence()) {
-      state.reason = '缺少模型密钥环境变量（DEEPSEEK_API_KEY / ZAI_CODING_CN_API_KEY）——SDK 运行时路由解析需要'
+    if (sdk.requireKey === true && !keyPresence()) {
+      state.reason = '缺少模型密钥环境变量（DEEPSEEK_API_KEY / ZAI_CODING_CN_API_KEY）'
       return { ok: false, error: { code: 'sdk/no-credentials', message: state.reason } }
     }
     state.child = spawnImpl(sdk.dshBin || config.channels.headless.dshBin, Array.isArray(sdk.argv) ? sdk.argv : ['--profile', sdk.profile], {
-      env: { ...process.env, DSH_HOME: config.home },
+      env: { ...process.env, DSH_HOME: sdk.home || config.home },
       stdio: ['pipe', 'pipe', 'pipe'],
     })
     const child = state.child

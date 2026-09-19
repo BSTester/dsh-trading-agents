@@ -222,7 +222,10 @@ app.get('/api/v3/gateway', async () => ({
   ok: true,
   channels: {
     mcp: { direction: '平台→Harness（工具暴露）', protocol: 'MCP stdio/NDJSON + HTTP /api/v3/mcp', status: 'running' },
-    sdk: { direction: '平台↔Harness（会话驱动）', protocol: '换行分帧 JSON-RPC / stdio', status: sdkChannel.status().status, reason: sdkChannel.status().reason, route: sdkChannel.status().route, serverInfo: sdkChannel.status().serverInfo, profile: sdkChannel.status().profile },
+    sdk: (() => {
+      const s = sdkChannel.status()
+      return { direction: '平台↔Harness（会话驱动）', protocol: '换行分帧 JSON-RPC / stdio', status: s.status, reason: s.reason, route: s.route, serverInfo: s.serverInfo, profile: s.profile, sessionWarning: s.sessionWarning, lastTurn: s.lastTurn }
+    })(),
     headless: { direction: '平台→Harness（自动唤醒）', protocol: 'CLI 子进程', command: `${config.channels.headless.dshBin} --profile ${config.channels.headless.profile} "<task>"`, status: 'ready' },
   },
   scheduler: scheduler.view(),

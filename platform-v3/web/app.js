@@ -39,7 +39,8 @@
   }
 
   function table(headers, rows) {
-    if (!rows || rows.length === 0) return ''
+    if (!Array.isArray(headers) || !Array.isArray(rows)) return ''
+    if (rows.length === 0) return ''
     const head = headers.map((h) => `<th>${h}</th>`).join('')
     const body = rows.map((r) => `<tr>${r.map((c) => `<td>${fmt(c)}</td>`).join('')}</tr>`).join('')
     return `<table class="v3-table"><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table>`
@@ -185,7 +186,10 @@
           ['熔断并发 占用/上限', `${d.headless?.breaker?.active ?? 0} / ${d.headless?.breaker?.concurrencyLimit ?? 3}`, true],
           ['单次超时', `${Math.round((d.headless?.breaker?.timeoutMs || 0) / 1000)}s`, true],
         ],
-        tables: [['定时规则', '触发点', '任务'], rules, ['时间', '结果', 'exit', '耗时'], last],
+        tables: [
+          [['定时规则', '触发点', '任务'], rules],
+          [['时间', '结果', 'exit', '耗时'], last],
+        ],
       }
     },
     async tools() {
@@ -234,7 +238,11 @@
         .map((action, index) => `<button class="v3-refresh" data-action="${index}" style="margin-left:0;margin-right:8px">${action.label}</button>`)
         .join('')
       const noteHtml = note ? `<div class="v3-k" style="margin:8px 0 0">约束：${note}</div>` : ''
-      body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + (tables || []).map(([headers, rows]) => table(headers, rows)).join('') + noteHtml
+      const tablesHtml = (Array.isArray(tables) ? tables : [])
+        .filter((entry) => Array.isArray(entry) && Array.isArray(entry[0]))
+        .map(([headers, rows]) => table(headers, rows))
+        .join('')
+      body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + tablesHtml + noteHtml
       for (const button of body.querySelectorAll('button[data-action]')) {
         button.addEventListener('click', async () => {
           const action = (actions || [])[Number(button.dataset.action)]

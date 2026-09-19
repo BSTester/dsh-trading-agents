@@ -52,8 +52,11 @@ export function loadConfig(env = process.env, home = env.DSH_HOME || path.join(o
         reasoningEffort: env.QUANT_SDK_EFFORT || 'high',
         maxTokens: Number(env.QUANT_SDK_MAX_TOKENS || 49152),
         cwd: env.QUANT_SDK_CWD || process.cwd(),
-        requireKey: true,
-        note: '需要部署 dsh-sdk-app bundle（dsh --profile sdk，@deepseek-ai/dsh-sdk-app）与模型密钥；未就绪时状态如实标注 pending',
+        // SDK 运行时独立的 DSH_HOME（缺省用 config.home）——sdk profile 是 shipped profile，可直接引导
+        home: env.QUANT_SDK_HOME || undefined,
+        // 握手不需要模型密钥（真实运行时 initialize 可在无密钥下成功）；只有会话需要，故默认不预检
+        requireKey: env.QUANT_SDK_REQUIRE_KEY === '1',
+        note: 'sdk 为 shipped profile（dsh --profile sdk，@deepseek-ai/dsh-sdk-app），握手无需密钥；session/prompt 需要模型密钥',
       },
       headless: {
         enabled: true,

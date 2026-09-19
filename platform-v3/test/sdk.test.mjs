@@ -59,19 +59,53 @@ test('未握手直接 prompt：先自动握手', async () => {
   await channel.stop()
 })
 
-test('缺密钥且未跳过门槛：如实 pending，不启动运行时', async () => {
-  const config = makeConfig({ requireKey: true })
-  const saved = process.env.DEEPSEEK_API_KEY
+test('无密钥：握手照常成功（握手不需要密钥），但给出会话警告', async () => {
+  const saved = [process.env.DEEPSEEK_API_KEY, process.env.ZAI_CODING_CN_API_KEY, process.env.ANTHROPIC_API_KEY]
   delete process.env.DEEPSEEK_API_KEY
   delete process.env.ZAI_CODING_CN_API_KEY
   delete process.env.ANTHROPIC_API_KEY
   try {
-    const channel = createSdkChannel({ config })
+    const channel = createSdkChannel({ config: makeConfig() })
+    const started = await channel.start()
+    assert.equal(started.ok, true)
+    const status = channel.status()
+    assert.equal(status.status, 'ready')
+    assert.equal(status.credentials.modelKeyPresent, false)
+    assert.match(status.sessionWarning, /MISSING_CREDENTIAL|模型密钥/)
+    await channel.stop()
+  } finally {
+    if (saved[0] !== undefined) process.env.DEEPSEEK_API_KEY = saved[0]
+    if (saved[1] !== undefined) process.env.ZAI_CODING_CN_API_KEY = saved[1]
+    if (saved[2] !== undefined) process.env.ANTHROPIC_API_KEY = saved[2]
+  }
+})
+
+test('requireKey=true 时按显式要求预检并拒绝', async () => {
+  const saved = [process.env.DEEPSEEK_API_KEY, process.env.ZAI_CODING_CN_API_KEY, process.env.ANTHROPIC_API_KEY]
+  delete process.env.DEEPSEEK_API_KEY
+  delete process.env.ZAI_CODING_CN_API_KEY
+  delete process.env.ANTHROPIC_API_KEY
+  try {
+    const channel = createSdkChannel({ config: makeConfig({ requireKey: true }) })
     const result = await channel.start()
     assert.equal(result.ok, false)
     assert.equal(result.error.code, 'sdk/no-credentials')
-    assert.equal(channel.status().status, 'pending')
   } finally {
-    if (saved !== undefined) process.env.DEEPSEEK_API_KEY = saved
+    if (saved[0] !== undefined) process.env.DEEPSEEK_API_KEY = saved[0]
+    if (saved[1] !== undefined) process.env.ZAI_CODING_CN_API_KEY = saved[1]
+    if (saved[2] !== undefined) process.env.ANTHROPIC_API_KEY = saved[2]
   }
+})
+
+test('最近一轮结论从事件流提取（turn/end 错误码）', async () => {
+  const channel = createSdkChannel({ config: makeConfig() })
+  await channel.start()
+  await channel.prompt('quant-003', '自检')
+  // 手写一条 turn/end 错误事件，验证 status().lastTurn 的提取
+  channel.events.push({ at: new Date().toISOString(), method: 'session.event', params: { sessionId: 'quant-003', event: { type: 'turn/end', data: { turn: 1, reason: { kind: 'error', error: { code: 'MISSING_CREDENTIAL', message: 'llm-deepseek: no API key' } } } } } })
+  const status = channel.status()
+  assert.equal(status.lastTurn.kind, 'error')
+  assert.equal(status.lastTurn.code, 'MISSING_CREDENTIAL')
+  assert.match(status.lastTurn.message, /no API key/)
+  await channel.stop()
 })

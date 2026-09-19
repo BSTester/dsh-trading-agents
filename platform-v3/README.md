@@ -35,10 +35,21 @@ npm test                  # node --test
 | SDK JSON-RPC | `server/gateway/sdk.mjs`（按 `dsh-sdk-protocol` 线协议实现）| 已实现；缺模型密钥或未部署 sdk profile 时如实 pending |
 | Headless CLI | `POST /api/v3/headless/run` + 调度器（08:30 / 12:00 / 16:00），外部熔断（并发 3 / 300s / 200K token） | ready |
 
-SDK 通道用 `dsh --profile sdk`（`@deepseek-ai/dsh-sdk-app` bundle）拉起隔离运行时：握手校验
-`serverInfo.name === deepseek-harness-sdk-runtime`，`session/prompt` 入队并回收 `session.event` /
-`session.status` 通知。协议一致性由 `test/fixtures/fake-dsh-sdk.mjs` 桩运行时验证；真实会话需要部署
-凭据（`DEEPSEEK_API_KEY` / `ZAI_CODING_CN_API_KEY`），未就绪时接口返回 `pending` + 具体原因，不伪造状态。
+SDK 通道用 `dsh --profile sdk`（`sdk` 是 **shipped profile**，由 `@deepseek-ai/dsh-sdk-app` bundle 提供）拉起隔离运行时：
+握手校验 `serverInfo.name === deepseek-harness-sdk-runtime`，`session/prompt` 入队并回收 `session.event` /
+`session.status` 通知。运行时 home 用 `QUANT_SDK_HOME` 独立指定（缺省 `DSH_HOME`），避免与线上 home 混用。
+
+**握手不需要模型密钥**（真实运行时实测可在无密钥下完成 `initialize`），只有 `session/prompt` 走到模型调用时
+才需要：缺密钥时该轮以 `MISSING_CREDENTIAL` 结束，通道状态里的 `lastTurn` 会带上运行时原文与错误码，
+`sessionWarning` 同步提示。真实会话请在启动环境注入 `DEEPSEEK_API_KEY`（或 `ZAI_CODING_CN_API_KEY`）。
+
+```bash
+QUANT_SDK_ENABLED=1 QUANT_SDK_HOME=$PWD/platform-v3/data/sdk-home npm start
+curl -sX POST localhost:8407/api/v3/sdk/start          # → serverInfo: deepseek-harness-sdk-runtime
+curl -sX POST localhost:8407/api/v3/sdk/prompt -H 'content-type: application/json' \
+     -d '{"sessionId":"quant-001","text":"分析当前持仓风险"}'
+curl -s localhost:8407/api/v3/gateway | jq .channels.sdk.lastTurn
+```
 
 ## 研究流水线与回测（strategy-svc）
 
