@@ -45,12 +45,16 @@ const META_TOOLS = [
   },
 ]
 
-export function createMcpServer({ wbCall, wbToolNames, log }) {
+export function createMcpServer({ wbCall, wbToolNames, log, localTools = [] }) {
   const catalog = buildCatalog(wbToolNames)
   const firstClassByName = new Map(FIRST_CLASS.map((t) => [t.name, t]))
+  const localByName = new Map(localTools.map((t) => [t.name, t]))
 
   function toolList() {
     const tools = META_TOOLS.map((t) => ({ name: t.name, description: t.description, inputSchema: t.inputSchema }))
+    for (const tool of localTools) {
+      tools.push({ name: tool.name, description: tool.description, inputSchema: tool.inputSchema })
+    }
     for (const tool of FIRST_CLASS) {
       tools.push({ name: tool.name, description: `[${tool.domain}] ${tool.desc}（→ workbench ${tool.wb}）`, inputSchema: FIRST_CLASS_SCHEMAS[tool.name] ?? schema({}) })
     }
@@ -74,6 +78,14 @@ export function createMcpServer({ wbCall, wbToolNames, log }) {
       const entries = domain ? { [domain]: catalog[domain] ?? [] } : catalog
       const total = Object.values(entries).reduce((sum, list) => sum + list.length, 0)
       return { text: JSON.stringify({ total, domains: entries }, null, 1) }
+    }
+    const local = localByName.get(name)
+    if (local) {
+      try {
+        return await local.execute(args ?? {})
+      } catch (error) {
+        return { text: `${name} error: ${error?.message ?? String(error)}`, isError: true }
+      }
     }
     if (name === 'call_tool') {
       const target = String(args?.name || '')

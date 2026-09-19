@@ -12,6 +12,8 @@ import createStore from './store.mjs'
 import { createHeadlessRunner, createScheduler } from './gateway/headless.mjs'
 import createSdkChannel from './gateway/sdk.mjs'
 import { checkOrder, createOms } from './risk.mjs'
+import { backtestMomentum, paramSweep } from './strategy/backtest.mjs'
+import createStrategyService from './strategy/pipeline.mjs'
 
 const config = loadConfig()
 const wb = createWorkbenchClient(config.workbench)
@@ -19,6 +21,44 @@ const store = createStore(config.dataDir)
 const runner = createHeadlessRunner({ config, store })
 const oms = createOms({ store })
 const sdkChannel = createSdkChannel({ config, clock: () => new Date() })
+const strategy = createStrategyService({ wbCall: (tool, args, options) => wb.call(tool, args, options), watchlist: config.sources.watchlist, store })
+
+const strategyLocalTools = [
+  {
+    name: 'run_backtest',
+    description: '[ml] 单标的动量 long/flat 回测。真实富途日 K；PIT 对齐：t 日持仓仅由 ≤t-1 收盘价决定，无前视。轻量引擎（等权、无滑点建模），与 workbench 因子回测互补。',
+    inputSchema: { type: 'object', properties: { ticker: { type: 'string', description: '标的，如 SH.600519' }, window: { type: 'number', description: '动量窗口，默认 20' }, rebalanceDays: { type: 'number', description: '调仓周期（天），默认 5' }, limit: { type: 'number', description: 'K 线根数，默认 500' } }, required: ['ticker'], additionalProperties: false },
+    async execute(args) {
+      const envelope = await wb.call('series', { ticker: String(args.ticker), period: '1d', limit: Number(args.limit || 500) })
+      if (!envelope?.ok) return { text: JSON.stringify(envelope?.error ?? {}, null, 1), isError: true }
+      const result = backtestMomentum(envelope.value.bars, { window: Number(args.window || 20), rebalanceDays: Number(args.rebalanceDays || 5) })
+      if (result.error) return { text: result.error, isError: true }
+      const equity = result.equity
+      result.equity = [equity[0], equity[Math.floor(equity.length / 2)], equity.at(-1)]
+      return { text: JSON.stringify(result.metrics, null, 1) }
+    },
+  },
+  {
+    name: 'param_sweep',
+    description: '[ml] 参数扫描：动量窗口 × 调仓周期网格，返回各格 sharpe/年化/最大回撤与最优格（热力图数据）。',
+    inputSchema: { type: 'object', properties: { ticker: { type: 'string' }, windows: { type: 'array', items: { type: 'number' }, description: '默认 [10,20,30,60]' }, rebalanceDays: { type: 'array', items: { type: 'number' }, description: '默认 [5,10,20]' }, limit: { type: 'number' } }, required: ['ticker'], additionalProperties: false },
+    async execute(args) {
+      const envelope = await wb.call('series', { ticker: String(args.ticker), period: '1d', limit: Number(args.limit || 500) })
+      if (!envelope?.ok) return { text: JSON.stringify(envelope?.error ?? {}, null, 1), isError: true }
+      const result = paramSweep(envelope.value.bars, { windows: args.windows ?? [10, 20, 30, 60], rebalanceDays: args.rebalanceDays ?? [5, 10, 20] })
+      return { text: JSON.stringify(result, null, 1) }
+    },
+  },
+  {
+    name: 'strategy_run',
+    description: '[ecosystem] 运行 PDAT→PAAT→PCPT→PRT→PET 研究流水线，产出调仓建议提案（不下单；执行走工作台受约束入口）。',
+    inputSchema: { type: 'object', properties: { universe: { type: 'array', items: { type: 'string' }, description: '缺省用自选池前 8 只' }, topN: { type: 'number', description: '多头候选数，默认 2' }, window: { type: 'number', description: '动量窗口，默认 20' } }, additionalProperties: false },
+    async execute(args) {
+      const run = await strategy.run({ universe: args.universe, topN: Number(args.topN || 2), window: Number(args.window || 20) })
+      return { text: JSON.stringify(run, null, 1) }
+    },
+  },
+]
 
 const WB_TOOL_NAMES = new Set([
   'snapshot', 'switch_mode', 'series', 'equity', 'positions', 'correlation', 'sensitivity', 'risk', 'trades', 'events',
@@ -36,8 +76,9 @@ const WB_TOOL_NAMES = new Set([
 ])
 
 const mcp = createMcpServer({
-  wbCall: (tool, args) => wb.call(tool, args),
+  wbCall: (tool, args, options) => wb.call(tool, args, options),
   wbToolNames: WB_TOOL_NAMES,
+  localTools: strategyLocalTools,
   log: (message) => console.log(`[mcp] ${message}`),
 })
 
@@ -48,7 +89,7 @@ const scheduler = createScheduler({
     { id: 'close_analysis', at: '16:00', task: 'pre_market_scan' },
   ],
   runner,
-  wbCall: (tool, args) => wb.call(tool, args),
+  wbCall: (tool, args, options) => wb.call(tool, args, options),
 })
 
 const startedAt = Date.now()
@@ -111,7 +152,38 @@ app.get('/api/v3/market', async ({ query }) => {
   return wbValue(wb.call('series', { ticker, period: query.period || '1d', limit: Number(query.limit || 120) }))
 })
 
-app.get('/api/v3/strategy', async () => wbValue(wb.call('factors', {})))
+app.get('/api/v3/strategy', async () => {
+  const last = strategy.last()
+  if (last) return { ok: true, run: last }
+  return { ok: true, run: null, note: '尚未运行研究流水线：点「运行流水线 PDAT→PET」或 POST /api/v3/strategy/run' }
+})
+
+app.post('/api/v3/strategy/run', async ({ body }) => {
+  const run = await strategy.run({ universe: body.universe, topN: Number(body.topN || 2), window: Number(body.window || 20) })
+  return { ok: true, run }
+})
+
+app.get('/api/v3/strategy/last', async () => {
+  const last = strategy.last()
+  return last ? { ok: true, run: last } : { ok: false, error: { code: 'strategy/never-run', message: '尚未运行流水线（POST /api/v3/strategy/run）' } }
+})
+
+app.post('/api/v3/ml/backtest', async ({ body }) => {
+  if (!body.ticker) return { ok: false, error: { code: 'bad-request', message: 'ticker 必填' } }
+  const envelope = await wb.call('series', { ticker: String(body.ticker), period: '1d', limit: Number(body.limit || 500) })
+  if (!envelope?.ok) return { ok: false, error: envelope?.error ?? { code: 'wb/error' } }
+  const result = backtestMomentum(envelope.value.bars, { window: Number(body.window || 20), rebalanceDays: Number(body.rebalanceDays || 5) })
+  if (result.error) return { ok: false, error: { code: 'backtest/insufficient', message: result.error } }
+  return { ok: true, ticker: body.ticker, metrics: result.metrics, equity: result.equity }
+})
+
+app.post('/api/v3/ml/param_sweep', async ({ body }) => {
+  if (!body.ticker) return { ok: false, error: { code: 'bad-request', message: 'ticker 必填' } }
+  const envelope = await wb.call('series', { ticker: String(body.ticker), period: '1d', limit: Number(body.limit || 500) })
+  if (!envelope?.ok) return { ok: false, error: envelope?.error ?? { code: 'wb/error' } }
+  const result = paramSweep(envelope.value.bars, { windows: body.windows ?? [10, 20, 30, 60], rebalanceDays: body.rebalanceDays ?? [5, 10, 20] })
+  return { ok: true, ticker: body.ticker, ...result }
+})
 
 app.get('/api/v3/risk', async () => wbValue(wb.call('risk', {})))
 

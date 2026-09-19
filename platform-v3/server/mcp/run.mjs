@@ -4,10 +4,15 @@
 //   env:    WORKBENCH_BASE（缺省 http://127.0.0.1:8397）
 import loadConfig from '../config.mjs'
 import createWorkbenchClient from '../wb-client.mjs'
+import createStore from '../store.mjs'
+import { backtestMomentum, paramSweep } from '../strategy/backtest.mjs'
+import createStrategyService from '../strategy/pipeline.mjs'
 import { createMcpServer } from './stdio.mjs'
 
 const config = loadConfig()
 const wb = createWorkbenchClient(config.workbench)
+const store = createStore(config.dataDir)
+const strategy = createStrategyService({ wbCall: (tool, args, options) => wb.call(tool, args, options), watchlist: config.sources.watchlist, store })
 
 const WB_TOOL_NAMES = new Set([
   'snapshot', 'switch_mode', 'series', 'equity', 'positions', 'correlation', 'sensitivity', 'risk', 'trades', 'events',
@@ -24,5 +29,41 @@ const WB_TOOL_NAMES = new Set([
   'admin_cancel_run', 'admin_cancel_stale', 'admin_prune_runs',
 ])
 
-const mcp = createMcpServer({ wbCall: (tool, args) => wb.call(tool, args), wbToolNames: WB_TOOL_NAMES })
+const mcp = createMcpServer({
+  wbCall: (tool, args, options) => wb.call(tool, args, options),
+  wbToolNames: WB_TOOL_NAMES,
+  localTools: [
+    {
+      name: 'run_backtest',
+      description: '[ml] 单标的动量 long/flat 回测（真实富途日 K，PIT 对齐）。',
+      inputSchema: { type: 'object', properties: { ticker: { type: 'string' }, window: { type: 'number' }, rebalanceDays: { type: 'number' }, limit: { type: 'number' } }, required: ['ticker'], additionalProperties: false },
+      async execute(args) {
+        const envelope = await wb.call('series', { ticker: String(args.ticker), period: '1d', limit: Number(args.limit || 500) })
+        if (!envelope?.ok) return { text: JSON.stringify(envelope?.error ?? {}, null, 1), isError: true }
+        const result = backtestMomentum(envelope.value.bars, { window: Number(args.window || 20), rebalanceDays: Number(args.rebalanceDays || 5) })
+        if (result.error) return { text: result.error, isError: true }
+        return { text: JSON.stringify(result.metrics, null, 1) }
+      },
+    },
+    {
+      name: 'param_sweep',
+      description: '[ml] 参数扫描：动量窗口 × 调仓周期网格（sharpe/年化/最大回撤 + 最优格）。',
+      inputSchema: { type: 'object', properties: { ticker: { type: 'string' }, windows: { type: 'array', items: { type: 'number' } }, rebalanceDays: { type: 'array', items: { type: 'number' } }, limit: { type: 'number' } }, required: ['ticker'], additionalProperties: false },
+      async execute(args) {
+        const envelope = await wb.call('series', { ticker: String(args.ticker), period: '1d', limit: Number(args.limit || 500) })
+        if (!envelope?.ok) return { text: JSON.stringify(envelope?.error ?? {}, null, 1), isError: true }
+        return { text: JSON.stringify(paramSweep(envelope.value.bars, { windows: args.windows ?? [10, 20, 30, 60], rebalanceDays: args.rebalanceDays ?? [5, 10, 20] }), null, 1) }
+      },
+    },
+    {
+      name: 'strategy_run',
+      description: '[ecosystem] 运行 PDAT→PET 研究流水线，产出调仓建议提案（不下单）。',
+      inputSchema: { type: 'object', properties: { universe: { type: 'array', items: { type: 'string' } }, topN: { type: 'number' }, window: { type: 'number' } }, additionalProperties: false },
+      async execute(args) {
+        const run = await strategy.run({ universe: args.universe, topN: Number(args.topN || 2), window: Number(args.window || 20) })
+        return { text: JSON.stringify(run, null, 1) }
+      },
+    },
+  ],
+})
 mcp.serveStdio()

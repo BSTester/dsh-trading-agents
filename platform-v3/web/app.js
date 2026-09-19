@@ -93,10 +93,27 @@
     },
     async strategy() {
       const d = await getJSON('/api/v3/strategy')
-      if (!d.ok) return { pairs: [['因子库', '取不到：' + (d.error?.message || '未知')]] }
-      const factors = Array.isArray(d.data) ? d.data : d.data?.factors ?? d.data?.items ?? []
-      const rows = (Array.isArray(factors) ? factors : []).slice(0, 8).map((f) => [f.name ?? f.factor ?? '?', f.value ?? f.score ?? '—'])
-      return { pairs: [['因子条目', Array.isArray(factors) ? factors.length : Object.keys(factors).length]], tables: [['因子', '数值'], rows] }
+      if (!d.ok) return { pairs: [['研究流水线', '取不到：' + (d.error?.message || '未知')]] }
+      if (!d.run) {
+        return { pairs: [['研究流水线', d.note || '尚未运行']], actions: [{ label: '运行流水线 PDAT→PET', method: 'POST', url: '/api/v3/strategy/run', body: { topN: 2 } }] }
+      }
+      const run = d.run
+      const s = run.stages || {}
+      const rows = (run.proposals || []).map((p) => [p.ticker, p.action, `${p.targetWeightPct ?? '—'}%`, p.riskLevel, String(p.basis || '').slice(0, 40)])
+      return {
+        pairs: [
+          ['PDAT K线数', s.PDAT?.bars],
+          ['PAAT 因子覆盖', `${s.PAAT?.withFactors ?? 0} / ${s.PAAT?.analyzed ?? 0}`],
+          ['评分来源', s.PAAT?.scoreSource],
+          ['PCPT 多头候选', (s.PCPT?.longs || []).join(' ')],
+          ['PCPT 减仓候选', (s.PCPT?.reduces || []).join(' ')],
+          ['PRT 单票权重', `${s.PRT?.weightPctPerName ?? '—'}%`],
+          ['PET 提案数', s.PET?.proposals],
+          ['as_of', run.asOf ? String(run.asOf).slice(0, 19).replace('T', ' ') : '—'],
+        ],
+        tables: [[['标的', '动作', '目标权重', '风险', '依据'], rows]],
+        actions: [{ label: '重新运行流水线', method: 'POST', url: '/api/v3/strategy/run', body: { topN: 2 } }],
+      }
     },
     async risk() {
       const d = await getJSON('/api/v3/risk')
@@ -180,9 +197,28 @@
     panel.innerHTML = `<div class="v3-head"><span class="v3-title">实时数据 · ${page}</span><span class="v3-badge" id="v3-badge">● LIVE</span><button class="v3-refresh" id="v3-refresh">刷新</button><span class="v3-asof">来源 /api/v3/* · ${asOf} · 真实数据</span></div><div id="v3-body"><div class="v3-k">加载中…</div></div>`
     document.getElementById('v3-refresh').addEventListener('click', refresh)
     try {
-      const { pairs, tables } = await loader()
+      const { pairs, tables, actions } = await loader()
       const body = document.getElementById('v3-body')
-      body.innerHTML = cells(pairs || []) + (tables || []).map(([headers, rows]) => table(headers, rows)).join('')
+      const actionHtml = (actions || [])
+        .map((action, index) => `<button class="v3-refresh" data-action="${index}" style="margin-left:0;margin-right:8px">${action.label}</button>`)
+        .join('')
+      body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + (tables || []).map(([headers, rows]) => table(headers, rows)).join('')
+      for (const button of body.querySelectorAll('button[data-action]')) {
+        button.addEventListener('click', async () => {
+          const action = (actions || [])[Number(button.dataset.action)]
+          if (!action) return
+          const badge = document.getElementById('v3-badge')
+          badge.textContent = '● 执行中…'
+          button.disabled = true
+          try {
+            await fetch(action.url, { method: action.method || 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(action.body || {}) })
+          } catch (error) {
+            badge.textContent = `● 触发失败：${String((error && error.message) || error)}`
+            badge.className = 'v3-badge err'
+          }
+          refresh()
+        })
+      }
     } catch (error) {
       const badge = document.getElementById('v3-badge')
       badge.textContent = '● 接口异常'
