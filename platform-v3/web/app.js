@@ -86,6 +86,35 @@
       .join('')
   }
 
+  const nodata = (what, why) => `<div class="nodata"><b>${esc(what)}：无数据源</b>${why ? ' · ' + esc(why) : ''}</div>`
+
+  function timeline(items) {
+    if (!items || items.length === 0) return nodata('事件时间线', '暂无已记录的平台事件')
+    return `<div class="tl">${items
+      .map(
+        (i) =>
+          `<div class="tl-item ${i.kind ?? ''}"><div class="tl-time">${esc(i.time ?? '—')}</div><div class="tl-title">${esc(i.title ?? '')}</div><div class="tl-body">${esc(i.body ?? '')}</div></div>`,
+      )
+      .join('')}</div>${items.some((i) => i.foot) ? `<div class="tl-foot">${esc(items.find((i) => i.foot)?.foot ?? '')}</div>` : ''}`
+  }
+
+  function health(items) {
+    return `<div class="health">${items
+      .map(
+        (i) =>
+          `<div class="hcard"><div class="ht"><b>${esc(i.name)}</b>${tag(i.status, i.kind ?? '')}</div><div class="hd">${esc(i.detail ?? '')}</div></div>`,
+      )
+      .join('')}</div>`
+  }
+
+  function gauge(label, usedPct, limitPct, color = 'var(--blue)') {
+    const used = Number(usedPct)
+    const limit = Number(limitPct)
+    const ratio = Number.isFinite(used) && Number.isFinite(limit) && limit > 0 ? Math.min(100, (used / limit) * 100) : 0
+    const shown = Number.isFinite(used) ? `${used}%` : '无数据源'
+    return `<div class="gauge"><div class="gk"><span>${esc(label)}</span><span class="num">${shown} / 阈值 ${limit}%</span></div><div class="gt"><span class="gf" style="width:${ratio.toFixed(1)}%;background:${color}"></span></div></div>`
+  }
+
   const channelTag = (status) => tag(status ?? '—', status === 'running' || status === 'ready' ? 'ok' : status === 'disabled' ? '' : 'warn')
 
   function shell(page, overview) {
@@ -125,52 +154,108 @@
 
   const RENDER = {
     async index() {
-      const [overview, metrics, strategy] = await Promise.all([api('/api/v3/overview'), api('/api/v3/metrics'), api('/api/v3/strategy')])
+      const [overview, metrics, strategy, execution, settings] = await Promise.all([
+        api('/api/v3/overview'),
+        api('/api/v3/metrics'),
+        api('/api/v3/strategy'),
+        api('/api/v3/execution'),
+        api('/api/v3/settings'),
+      ])
       if (!overview.ok) return errBox('总览', overview.error)
       const equity = overview.equity ?? {}
       const points = Array.isArray(equity.points) ? equity.points : []
-      const headless = overview.headless ?? {}
-      const today = headless.today ?? {}
+      const last = points.at(-1)
+      const prev = points.at(-2)
+      const dailyPct = last && prev ? ((Number(last.equity) - Number(prev.equity)) / Number(prev.equity)) * 100 : null
+      const days = points.length > 1 ? points.length : 0
+      const annualized = days > 0 && Number.isFinite(Number(equity.total_return)) ? (Math.pow(1 + Number(equity.total_return), 252 / days) - 1) * 100 : null
       const dd = Number(equity.max_drawdown)
+      const headless = overview.headless ?? {}
+      const oms = execution.oms ?? {}
+      const manualOrders = (oms.orders ?? []).filter((o) => o.stage === 'manual').slice(0, 4)
+      const maxSinglePct = (oms.orders ?? []).reduce((max, o) => Math.max(max, oms.nav ? (Number(o.value) / Number(oms.nav)) * 100 : 0), 0)
       const run = strategy?.run ?? null
+      const sdk = overview.channels?.sdk ?? {}
+      const sdkTurns = (await api('/api/v3/brain')).sdk?.turns ?? []
+      const events = []
+      for (const t of sdkTurns.slice(0, 3)) {
+        events.push({ time: stamp(t.at), title: `SDK 回合 ${t.kind}${t.code ? ' · ' + t.code : ''}`, body: `会话 ${t.sessionId ?? '—'} · 工具调用 ${(t.toolCalls ?? []).length} 次 · 回答 ${(t.answer ?? '').length} 字`, kind: t.kind === 'completed' ? 'ok' : 'bad' })
+      }
+      for (const c of (headless.last ?? []).slice(0, 3)) {
+        events.push({ time: hhmmss(c.started_at), title: `Headless ${c.success ? '完成' : '失败'}（exit ${dash(c.exit_code)}）`, body: `耗时 ${Math.round((c.duration_ms ?? 0) / 1000)}s · token 估算 ${dash(c.tokens_estimate)}`, kind: c.success ? 'ok' : 'bad' })
+      }
+      if (run) events.push({ time: stamp(run.asOf), title: `研究流水线产出 ${run.proposals?.length ?? 0} 条提案`, body: (run.proposals ?? []).slice(0, 3).map((p) => `${p.ticker} ${p.action}`).join('、'), kind: 'ok' })
+      const entries = [...Object.entries(metrics.mcp?.tools ?? {}), ...Object.entries(metrics.wb?.byTool ?? {}).map(([n, c]) => [`wb:${n}`, c])].sort((a, b) => b[1] - a[1]).slice(0, 5)
+      const futu = settings.futu ?? {}
       return (
         kpis([
-          ['sim 台账权益', money(equity.current), equity.mode ? `模式 ${equity.mode}` : ''],
-          ['累计收益', Number.isFinite(Number(equity.total_return)) ? signed(Number(equity.total_return) * 100, 4, '%') : '—', '台账口径', Number(equity.total_return) >= 0 ? 'pos' : 'neg'],
-          ['夏普（台账）', num(equity.sharpe), `成交 ${dash(equity.trades)} 笔`],
-          ['最大回撤（台账）', Number.isFinite(dd) ? signed(-Math.abs(dd) * 100, 2, '%') : '—', null, 'neg'],
-          ['Headless 今日', `${today.total ?? 0} 次`, `成功 ${today.success ?? 0} / 失败 ${today.failed ?? 0}`],
-          ['台账点位', points.length, points.length > 0 ? `最近 ${points.at(-1)?.t ?? '—'}` : '尚无点位'],
+          ['总资产（sim 台账）', money(equity.current), equity.mode ? `模式 ${equity.mode}` : ''],
+          ['当日盈亏', dailyPct === null ? '—' : signed(dailyPct, 2, '%'), dailyPct === null ? '台账仅 1 个点位，无前一日基准' : `基准 ${prev?.t ?? '—'}`, Number(dailyPct) >= 0 ? 'pos' : 'neg'],
+          ['年化收益', annualized === null ? '—' : signed(annualized, 2, '%'), annualized === null ? '台账点位不足，未年化' : `${days} 个交易日年化`, Number(annualized) >= 0 ? 'pos' : 'neg'],
+          ['夏普比率', num(equity.sharpe), `成交 ${dash(equity.trades)} 笔`],
+          ['最大回撤', Number.isFinite(dd) ? signed(-Math.abs(dd) * 100, 2, '%') : '—', '阈值 15%', 'neg'],
         ]) +
         card(
           '三通道状态',
           `<div class="grid g3">${['mcp', 'sdk', 'headless']
             .map((key) => {
               const c = overview.channels?.[key] ?? {}
-              const extra =
+              const status = c.status ?? '—'
+              const stats =
                 key === 'mcp'
-                  ? `已注册工具 ${dash(metrics.toolTotal)} · 今日调用 ${dash(metrics.mcp?.calls)} · 失败 ${dash(metrics.mcp?.errors)}`
+                  ? [['已注册工具', dash(metrics.toolTotal)], ['今日调用', dash(metrics.mcp?.calls)], ['失败', dash(metrics.mcp?.errors)], ['平均延迟', `${metrics.mcp?.avgMs ?? 0}ms`]]
                   : key === 'sdk'
-                    ? `运行时 ${dash(c.serverInfo?.name ?? '—')} ${dash(c.serverInfo?.version ?? '')} · ${dash(c.reason ?? c.note ?? '待握手')}`
-                    : `并发上限 ${dash(c.breaker?.concurrencyLimit)} · 超时 ${Math.round((c.breaker?.timeoutMs ?? 0) / 1000)}s`
-              return `<div class="card" style="margin:0"><h3>${key.toUpperCase()} ${channelTag(c.status)}</h3><div class="note" style="margin:0">${esc(extra)}</div></div>`
+                    ? [['运行时', dash(c.serverInfo?.name ?? '—')], ['版本', dash(c.serverInfo?.version ?? '—')], ['路由', `${dash(c.route?.provider)}/${dash(c.route?.model)}`], ['已落盘回合', dash(sdkTurns.length)]]
+                    : [['并发上限', dash(c.breaker?.concurrencyLimit)], ['进行/排队', `${c.breaker?.active ?? 0}/${c.breaker?.queued ?? 0}`], ['单次超时', `${Math.round((c.breaker?.timeoutMs ?? 0) / 1000)}s`], ['今日唤醒', `${headless.today?.total ?? 0}`]]
+              return `<div class="card" style="margin:0"><h3>${key.toUpperCase()} ${channelTag(status)}</h3><div class="grid g2">${stats
+                .map(([k, v]) => `<div class="kpi"><div class="k">${esc(k)}</div><div class="v" style="font-size:14px">${v}</div></div>`)
+                .join('')}</div></div>`
             })
             .join('')}</div>`,
         ) +
+        `<div class="col3">` +
+        card('决策链路时间线', timeline(events), `${events.length} 条真实事件`) +
         card(
-          '最近决策（PDAT→PET 流水线）',
-          run
-            ? table(
-                ['标的', '动作', '目标权重', '风险', '依据'],
-                (run.proposals ?? []).map((p) => [esc(p.ticker), p.action, `${dash(p.targetWeightPct)}%`, p.riskLevel, esc(String(p.basis ?? '').slice(0, 60))]),
-              ) + `<div class="note">流水线时间 ${stamp(run.asOf)} · 评分来源 ${esc(run.stages?.PAAT?.scoreSource ?? '—')} · 因子覆盖 ${run.stages?.PAAT?.withFactors ?? 0}/${run.stages?.PAAT?.analyzed ?? 0}</div>`
-            : '<div class="note">尚未运行研究流水线。</div>',
-          '<button class="btn" data-act="strategy-run">运行流水线</button>',
+          '风控红线',
+          gauge('单笔交易上限', maxSinglePct > 0 ? Number(maxSinglePct.toFixed(2)) : null, 2, 'var(--amber)') +
+            gauge('最大回撤', Number.isFinite(dd) ? Number(Math.abs(dd * 100).toFixed(2)) : null, 15, 'var(--red)') +
+            gauge('单一行业暴露', null, 20, 'var(--blue)') +
+            nodata('行业暴露', '工作台未提供行业维度敞口'),
         ) +
         card(
-          '台账权益曲线',
-          points.length >= 2 ? lineChart(points.map((p) => p.equity)) : `<div class="note">台账仅 ${points.length} 个交易日点位，无可绘制曲线（不做插值、不用占位）</div>`,
-          points.length >= 2 ? `as_of ${dash(points.at(-1)?.t)}` : '',
+          'Agent Loop 实时状态',
+          `<div class="grid g2">${[
+            ['SDK 通道', sdk.status ?? '—'],
+            ['最近一轮', sdk.lastTurn?.kind ?? '—'],
+            ['已落盘回合', sdkTurns.length],
+            ['Headless 今日', `${headless.today?.total ?? 0} 次`],
+          ]
+            .map(([k, v]) => `<div class="kpi"><div class="k">${esc(k)}</div><div class="v" style="font-size:14px">${v}</div></div>`)
+            .join('')}</div>` +
+            `<div class="note" style="margin-top:8px">工具调用 Top5（本进程计数）</div>${bars(entries)}`,
+        ) +
+        `</div>` +
+        card(
+          '待审批（OMS 分级 manual）',
+          manualOrders.length > 0
+            ? manualOrders
+                .map(
+                  (o) =>
+                    `<div class="approve" style="margin-bottom:8px"><div class="at">${tag(o.stage, 'warn')}<b>${esc(o.ticker)}</b> ${o.side} ${dash(o.qty)} 股</div><div class="akv"><span>金额 ${money(o.value)}</span><span>风控：${esc((o.risk?.reasons ?? [])[0] ?? '—')}</span><span>计划 ${esc(o.plan_id ?? '—')}</span></div></div>`,
+                )
+                .join('')
+            : nodata('待审批订单', '当前 OMS 台账没有 manual 阶段订单'),
+          `${oms.orders?.length ?? 0} 单在台账`,
+        ) +
+        card(
+          '数据源健康',
+          health([
+            { name: 'workbench 8397', status: metrics.workbenchUp ? '在线' : '不可达', kind: metrics.workbenchUp ? 'ok' : 'bad', detail: `工具面 ${metrics.toolTotal ?? '—'} 个 · 今日调用 ${metrics.wb?.calls ?? 0}` },
+            { name: '富途 OpenAPI', status: futu.channel ?? '—', kind: futu.channel ? 'ok' : 'warn', detail: `模式 ${futu.openapi?.mode ?? '—'} · MCP Bearer ${futu.mcp_bearer?.present ? '有效至 ' + futu.mcp_bearer.expiry : '缺失'}` },
+            { name: 'AKShare', status: '已接入', kind: 'ok', detail: 'A 股新闻（免密钥）；全市场快照上游不可达' },
+            { name: 'SEC EDGAR', status: '已接入', kind: 'ok', detail: '美股三表 XBRL（companyconcept）' },
+            { name: 'Tushare Pro', status: settings.env?.find((e) => e.key === 'TUSHARE_TOKEN')?.injected ? '已注入' : '未注入', kind: settings.env?.find((e) => e.key === 'TUSHARE_TOKEN')?.injected ? 'ok' : 'warn', detail: '未注入 token 时不发请求' },
+          ]),
         )
       )
     },
@@ -287,23 +372,30 @@
     },
 
     async risk() {
-      const [risk, overview, metrics] = await Promise.all([api('/api/v3/risk'), api('/api/v3/overview'), api('/api/v3/metrics')])
+      const [risk, overview, metrics, analytics] = await Promise.all([
+        api('/api/v3/risk'),
+        api('/api/v3/overview'),
+        api('/api/v3/metrics'),
+        api('/api/v3/risk/analytics?limit=250'),
+      ])
       const config = risk?.data?.config ?? null
       const source = risk?.data?.source ?? null
       const equity = overview.equity ?? {}
       const dd = Number(equity.max_drawdown)
       const stages = metrics.oms ?? {}
+      const a = analytics?.ok ? analytics.analytics : null
+      const metricCard = (label, value, sub) => `<div class="kpi"><div class="k">${esc(label)}</div><div class="v">${value}</div><div class="s">${esc(sub ?? '')}</div></div>`
       return (
-        kpis([
-          ['最大回撤（台账）', Number.isFinite(dd) ? signed(-Math.abs(dd) * 100, 2, '%') : '—', 'sim 台账', 'neg'],
-          ['夏普（台账）', num(equity.sharpe), `成交 ${dash(equity.trades)} 笔`],
-          ['待人工确认', stages.manual ?? 0, 'OMS 分级'],
-          ['红线阻断', stages.blocked ?? 0, 'OMS 分级'],
-          ['已提交', stages.submitted ?? 0, '工作台在途命中'],
-          ['风控配置来源', source ? '工作台' : '—', esc(String(source ?? '').slice(0, 28))],
-        ]) +
+        `<section class="card"><div class="grid g5">${[
+          metricCard('VaR（95%，1d）', a ? `${num(a.varDailyPct, 3)}%` : '—', a ? `金额 ${money(a.varAmount)}` : '组合风险量不可用'),
+          metricCard('CVaR（95%，1d）', a ? `${num(a.cvarDailyPct, 3)}%` : '—', a ? `金额 ${money(a.cvarAmount)}` : ''),
+          metricCard('Beta', a ? num(a.beta, 3) : '—', analytics?.benchmarkTicker ? `基准 ${esc(analytics.benchmarkTicker)}` : '基准不可用'),
+          metricCard('Alpha（年化）', a ? `${num(a.alphaAnnPct, 2)}%` : '—', a && a.benchmarkAnnReturnPct !== null ? `基准年化 ${num(a.benchmarkAnnReturnPct, 2)}%` : '基准不可用'),
+          metricCard('IR（信息比率）', a ? num(a.ir, 3) : '—', a ? `样本 ${a.observations} 天` : ''),
+        ].join('')}</div><div class="note">组合来源 ${esc(analytics?.portfolioSource ?? '—')} · 方法：${esc(a?.method ?? '—')} · 窗口 ${esc(a?.window?.from ?? '—')} ~ ${esc(a?.window?.to ?? '—')}</div></section>` +
+        `<div class="col3">` +
         card(
-          '工作台风控配置（真实读取）',
+          '事前风控',
           config
             ? table(
                 ['规则', '配置值', '字段'],
@@ -314,11 +406,48 @@
                   ['单日亏损上限', pct(Number(config.daily_loss_limit_pct) * 100, 1), 'daily_loss_limit_pct'],
                   ['单票上限', pct(Number(config.max_position_pct) * 100, 1), 'max_position_pct'],
                 ],
-              ) + `<div class="note">来源：${esc(source ?? '—')}。工作台未提供的组合风险量（VaR/CVaR/Beta/Alpha/IR）本页不展示，也不填占位值。</div>`
+              ) + `<div class="note">来源：${esc(source ?? '—')}（工作台真实配置）</div>`
             : errBox('风控配置', risk?.error),
         ) +
-        card('订单风控分级（OMS 台账）', bars(Object.entries(stages), 'var(--amber)')) +
-        card('平台侧阈值（兜底）', table(['项', '阈值'], [['单笔交易上限', '2%（超过转人工确认）'], ['单一行业暴露', '20%（超过强制阻断）'], ['最大回撤', '15%（触及强制阻断）']]), '以工作台风控为准')
+        card(
+          '事中风控',
+          `<div class="grid g2">${[
+            ['台账回撤', Number.isFinite(dd) ? signed(-Math.abs(dd) * 100, 2, '%') : '—'],
+            ['组合年化波动', a ? `${num(a.annVolPct, 2)}%` : '—'],
+            ['待人工确认', stages.manual ?? 0],
+            ['红线阻断', stages.blocked ?? 0],
+          ]
+            .map(([k, v]) => metricCard(k, v, ''))
+            .join('')}</div>` + `<div class="note">实时告警流由工作台 events 工具提供，本页未接入（无数据源）。</div>`,
+        ) +
+        card(
+          '事后风控',
+          `<div class="grid g2">${[
+            ['Kupiec 检验', a?.kupiec?.pass === undefined ? '—' : a.kupiec.pass ? '通过' : '拒绝'],
+            ['破位/期望', a?.kupiec ? `${a.kupiec.breaches} / ${(a.observations * 0.05).toFixed(1)}` : '—'],
+            ['组合年化收益', a ? `${num(a.annReturnPct, 2)}%` : '—'],
+            ['组合最大回撤', a ? `${num(a.maxDrawdownPct, 2)}%` : '—'],
+          ]
+            .map(([k, v]) => metricCard(k, v, ''))
+            .join('')}</div>` + `<div class="note">绩效归因（行业/因子/个股）工作台未提供 → 无数据源，不做占位。</div>`,
+        ) +
+        `</div>` +
+        card(
+          '暴露与集中度',
+          a && Object.keys(a.tickers ?? {}).length > 0
+            ? bars(Object.entries(a.tickers).map(([t, w]) => [t, Number((w * 100).toFixed(2))]), 'var(--cyan)') +
+              `<div class="note">按组合权重（${esc(analytics.portfolioSource)}）；行业维度敞口工作台未提供 → 无数据源。</div>`
+            : nodata('组合暴露', '无可用组合权重'),
+        ) +
+        card('组合净值曲线（真实日 K 计算）', a?.equityCurve?.length >= 2 ? lineChart(a.equityCurve.map((p) => p.v)) : nodata('回撤/净值曲线', '样本不足或风险量不可用'), a ? `${a.window.from} ~ ${a.window.to} · ${a.observations} 个交易日` : '') +
+        card('风控规则表（工作台真实配置）', config ? table(['规则', '阈值', '当前值', '状态', '来源'], [['单笔风险占比', pct(Number(config.risk_per_trade) * 100, 1), '—', tag('生效', 'ok'), esc(source ?? '—')], ['ATR 止损倍数', num(config.stop_atr_mult, 1), '—', tag('生效', 'ok'), esc(source ?? '—')], ['最大持仓数', dash(config.max_positions), '—', tag('生效', 'ok'), esc(source ?? '—')], ['单日亏损上限', pct(Number(config.daily_loss_limit_pct) * 100, 1), '—', tag('生效', 'ok'), esc(source ?? '—')], ['单票上限', pct(Number(config.max_position_pct) * 100, 1), '—', tag('生效', 'ok'), esc(source ?? '—')]]) : nodata('风控规则表', '工作台配置不可用')) +
+        card(
+          '阻断记录（OMS 台账 blocked）',
+          (await api('/api/v3/oms/orders')).orders?.filter((o) => o.stage === 'blocked').length > 0
+            ? table(['订单', '标的', '规则', '原因'], (await api('/api/v3/oms/orders')).orders.filter((o) => o.stage === 'blocked').map((o) => [esc(String(o.id).slice(0, 10)), esc(o.ticker), esc((o.risk?.reasons ?? [])[0] ?? '—'), esc((o.risk?.reasons ?? [])[1] ?? '—')]))
+            : nodata('阻断记录', '当前台账无 blocked 阶段订单'),
+          `${stages.blocked ?? 0} 条`,
+        )
       )
     },
 

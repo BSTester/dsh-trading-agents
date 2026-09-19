@@ -77,3 +77,36 @@ tr:last-child td { border-bottom: none }
 pre.answer { white-space: pre-wrap; font: 12.5px/1.7 -apple-system, 'Segoe UI', 'PingFang SC', sans-serif; color: var(--text); background: var(--panel2); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px }
 @media (max-width: 1100px) { .g3, .g4, .g5 { grid-template-columns: repeat(2, minmax(0,1fr)) } }
 @media (max-width: 760px) { .g2, .g3, .g4, .g5 { grid-template-columns: 1fr } .nav { display: none } }
+
+/* ── 决策链路时间线（对齐设计稿 index 的时间线形态）────────────── */
+.tl { position: relative; padding-left: 16px }
+.tl::before { content: ''; position: absolute; left: 4px; top: 4px; bottom: 4px; width: 1px; background: var(--border2) }
+.tl-item { position: relative; padding: 0 0 12px 14px }
+.tl-item::before { content: ''; position: absolute; left: -16px; top: 5px; width: 9px; height: 9px; border-radius: 50%; background: var(--panel); border: 2px solid var(--blue) }
+.tl-item.ok::before { border-color: var(--green) }
+.tl-item.warn::before { border-color: var(--amber) }
+.tl-item.bad::before { border-color: var(--red) }
+.tl-time { font-family: var(--mono); font-size: 10.5px; color: var(--faint) }
+.tl-title { font-size: 12.5px; margin: 1px 0 2px }
+.tl-body { font-size: 11.5px; color: var(--muted) }
+.tl-foot { font-size: 11px; color: var(--faint); padding-left: 14px }
+
+/* ── 数据源健康 / 无数据源标记 ───────────────────────────────── */
+.health { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px }
+.hcard { border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; background: var(--panel2) }
+.hcard .ht { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 3px }
+.hcard .ht b { font-size: 12.5px }
+.hcard .hd { font-size: 11px; color: var(--muted); line-height: 1.6 }
+.nodata { border: 1px dashed var(--border2); border-radius: 6px; padding: 8px 10px; font-size: 11.5px; color: var(--faint) }
+.nodata b { color: var(--muted) }
+
+/* ── 审批卡 / 三栏风控 ──────────────────────────────────────── */
+.approve { border: 1px solid var(--border); border-radius: 8px; padding: 12px 14px; background: var(--panel2) }
+.approve .at { display: flex; align-items: center; gap: 8px; margin-bottom: 6px }
+.approve .akv { font-size: 11.5px; color: var(--muted); display: flex; gap: 10px; flex-wrap: wrap }
+.col3 { display: grid; grid-template-columns: repeat(3, minmax(0,1fr)); gap: 12px }
+@media (max-width: 1100px) { .col3 { grid-template-columns: 1fr } }
+.gauge { display: flex; flex-direction: column; gap: 2px; margin: 6px 0 }
+.gauge .gk { font-size: 11px; color: var(--muted); display: flex; justify-content: space-between }
+.gauge .gt { background: var(--panel2); border-radius: 3px; height: 8px; overflow: hidden }
+.gauge .gf { display: block; height: 100% }
