@@ -81,3 +81,14 @@ test('静态 UI：首页可访问且为设计稿', async () => {
   const html = await res.text()
   assert.match(html, /<!DOCTYPE html>/i)
 })
+
+test('静态 UI：9 页都挂了实时数据层 app.js', async () => {
+  const js = await fetch(`${BASE}/app.js`)
+  assert.equal(js.status, 200)
+  for (const page of ['index', 'brain', 'market', 'strategy', 'risk', 'execution', 'gateway', 'tools', 'settings']) {
+    const res = await fetch(`${BASE}/${page}.html`)
+    const html = await res.text()
+    assert.ok(html.includes('src="/app.js"'), `${page}.html missing app.js`)
+    assert.match(html, /<!DOCTYPE html>/i)
+  }
+})
