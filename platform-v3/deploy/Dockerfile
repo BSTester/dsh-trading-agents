@@ -7,8 +7,10 @@ ENV NODE_ENV=production
 COPY package.json ./
 COPY server ./server
 COPY web ./web
-# 运行时数据（headless 日志、OMS 台账、策略轮、审计）挂载卷
-RUN mkdir -p /app/data && chown -R node:node /app
+# 运行时数据（headless 日志、OMS 台账、策略轮、审计）与 dsh 运行时 home 挂载卷。
+# 注意：具名卷默认归 root，容器以 node 用户运行 → 必须预建目录并授权，否则 dsh 无法
+# 创建 profiles/ 目录（实测报 EACCES: mkdir '/dsh-runtime/profiles/headless'）。
+RUN mkdir -p /app/data /dsh-runtime && chown -R node:node /app /dsh-runtime
 # scheduler 角色需要 dsh 运行时（容器内拉起 headless）：构建时加 --build-arg INSTALL_DSH=1
 # 说明：默认不装，保持镜像精简；单机部署也可让 scheduler 跑在宿主机上复用既有 dsh。
 ARG INSTALL_DSH=""

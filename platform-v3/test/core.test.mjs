@@ -138,3 +138,23 @@ test('config：QUANT_CONFIG_HOME 只影响配置读取，运行时 home 保持�
   assert.equal(config.sources.futu.mcpTokenExpiry, '2026-09-19T17:01:36')
   assert.equal(config.workbench.base, 'http://127.0.0.1:8397')
 })
+
+test('调度器：到点触发一次，同日不重复触发', async () => {
+  const { createScheduler } = await import('../server/gateway/headless.mjs')
+  const fired = []
+  const runner = { buildPrompt: () => '任务', execute: async () => ({ success: true, exit_code: 0 }) }
+  const scheduler = createScheduler({
+    rules: [{ id: 'pre_market_scan', at: '08:30', task: 'pre_market_scan' }],
+    runner,
+    wbCall: async () => ({ ok: false }),
+    clock: () => new Date('2026-09-19T08:30:10'),
+  })
+  scheduler.tick(new Date('2026-09-19T08:29:00'))
+  assert.equal(scheduler.view().firedToday.length, 0)
+  scheduler.tick(new Date('2026-09-19T08:30:00'))
+  await new Promise((r) => setTimeout(r, 10))
+  assert.equal(scheduler.view().firedToday.length, 1)
+  scheduler.tick(new Date('2026-09-19T08:30:30')) // 同日再 tick 不应重复
+  assert.equal(scheduler.view().firedToday.length, 1)
+  void fired
+})

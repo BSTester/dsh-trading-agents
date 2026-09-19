@@ -24,14 +24,19 @@ services:
     restart: unless-stopped
 
   scheduler:
-    # 需要镜像内含 dsh（build: args: INSTALL_DSH=1）或把 scheduler 跑在宿主机上
-    image: quant-platform-v3:latest
+    # 调度器用 glibc 镜像（alpine 缺 node-pty 原生模块），并把宿主机已有的 dsh 只读挂进来复用；
+    # 容器内还需预置运行时 home（profiles + 模型凭据），见 README「部署」章节。
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile.scheduler
+    image: quant-platform-v3-scheduler:latest
     container_name: quant-v3-scheduler
     network_mode: host
     environment:
       QUANT_V3_ROLE: scheduler
       QUANT_CONFIG_HOME: /config
       DSH_HOME: /dsh-runtime
+      DSH_BIN: /npx/node_modules/.bin/dsh
       QUANT_V3_PORT: "8408"
       WORKBENCH_BASE: http://127.0.0.1:8397
       QUANT_V3_DATA: /app/data
@@ -40,7 +45,8 @@ services:
     volumes:
       - quant-v3-data:/app/data
       - ${DSH_HOME:-$HOME/.dsh}:/config:ro          # 配置只读
-      - quant-v3-runtime:/dsh-runtime              # 运行时 home（凭据库/会话，可写）
+      - quant-v3-runtime:/dsh-runtime                      # 运行时 home（凭据库/会话，可写）
+      - ${DSH_NPX_CACHE:-$HOME/.npm/_npx}:/npx:ro          # 复用宿主机已装 dsh（含预编译 node-pty）
     depends_on:
       - gateway
     restart: unless-stopped

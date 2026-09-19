@@ -372,7 +372,16 @@ const server = http.createServer(async (req, res) => {
 })
 
 if (ROLES.scheduler && process.env.QUANT_V3_SCHEDULER !== '0') {
-  setInterval(() => scheduler.tick(), 30_000).unref()
+  setInterval(() => scheduler.tick(), Number(process.env.QUANT_V3_SCHEDULER_TICK_MS || 30_000)).unref()
+  // 启动自检：立即触发一次首条规则，把调度 → Headless → 记录 → 熔断计数整条链路真跑一遍
+  if (process.env.QUANT_V3_SCHEDULER_SMOKE === '1') {
+    const rule = scheduler.view().rules[0]
+    console.log(`[quant-v3] scheduler smoke: firing ${rule.id} (${rule.task})`)
+    scheduler
+      .fire(rule)
+      .then((record) => console.log(`[quant-v3] scheduler smoke: exit=${record.exit_code} timed_out=${record.timed_out} success=${record.success}`))
+      .catch((error) => console.log(`[quant-v3] scheduler smoke failed: ${error?.message ?? error}`))
+  }
 }
 
 server.listen(config.service.port, config.service.host, () => {

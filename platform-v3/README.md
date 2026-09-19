@@ -127,8 +127,16 @@ docker run -d --name quant-v3 --network host \
 curl -s localhost:8407/healthz && curl -s "localhost:8407/api/v3/market/watchlist?n=3"
 ```
 
-- `deploy/docker-compose.yml`：单机最小形态（gateway + scheduler，共享数据卷；scheduler 需要镜像内
-  有 `dsh`：构建时加 `--build-arg INSTALL_DSH=1`，或让 scheduler 跑在宿主机上复用既有 dsh）。
+- `deploy/docker-compose.yml`：单机最小形态（gateway + scheduler，共享数据卷）。
+- **调度器镜像必须用 glibc 基础镜像**：`node:22-alpine` 是 musl，缺 glibc 下的 `node-pty` 原生模块，
+  dsh 基础 bundle 导入 `dsh-subprocess-local` 时直接抛 `Failed to load native module: pty`
+  （实测：scheduler 容器内 headless 调用 exit=1，诊断即此错误）。因此拆两个镜像：
+  `deploy/Dockerfile`（alpine，供 gateway/web，不需要 dsh）与
+  `deploy/Dockerfile.scheduler`（bookworm-slim + 编译工具 + 全局 dsh，供 scheduler）。
+  容器内跑 headless 还需要**预置运行时 home**：`DSH_HOME` 里要有 `profiles/`（可从配置卷初始化
+  复制）与模型凭据；二者缺一，headless 会以 exit 1 如实失败并写明诊断。
+- 启动自检：`QUANT_V3_SCHEDULER_SMOKE=1` 会在服务启动后立即触发首条规则，把
+  调度 → Headless → 记录 → 熔断计数整条链路真跑一次（用于部署验收）。
 - `deploy/k8s/platform-v3.yaml`：ConfigMap + Secret + 三个 Deployment/Service（gateway×2、web×1、
   scheduler×1，含探针与资源限额）。**既有工作台（8397）不在集群内**——它是数据源与唯一执行入口，
   集群内 pod 通过 `WORKBENCH_BASE` 指向它；交易边界不因容器化改变。
