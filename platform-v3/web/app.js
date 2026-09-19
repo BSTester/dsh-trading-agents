@@ -130,16 +130,47 @@
     },
     async execution() {
       const d = await getJSON('/api/v3/execution')
-      const positions = d.positions
-      const posRows = Array.isArray(positions) ? positions.map((p) => [p.ticker ?? p.code ?? '?', p.qty ?? p.quantity ?? '—', p.avg_cost ?? '—', p.current ?? p.last ?? '—']) : []
+      // 工作台三个列表工具都返回 { groups: [{ rows: [] }] } 的分组结构，平铺后计数
+      const rowsOf = (payload) => {
+        if (!payload) return []
+        if (Array.isArray(payload)) return payload
+        if (Array.isArray(payload.groups)) return payload.groups.flatMap((g) => g.rows ?? [])
+        if (Array.isArray(payload.rows)) return payload.rows
+        return []
+      }
+      const positions = rowsOf(d.positions)
+      const posRows = positions.map((p) => [p.ticker ?? p.symbol ?? p.code ?? '?', p.qty ?? p.quantity ?? '—', p.avg_cost ?? p.cost_price ?? '—', p.current ?? p.last ?? p.price ?? '—'])
+      const openCount = rowsOf(d.orders_open).length
+      const dealCount = rowsOf(d.deals_today).length
+      const oms = d.oms || {}
+      const stages = oms.stages || {}
+      const omsRows = (oms.orders || []).map((o) => [
+        o.id.slice(0, 10),
+        o.ticker,
+        o.side,
+        o.qty,
+        o.value,
+        o.stage,
+        (o.risk && o.risk.reasons && o.risk.reasons[0]) || '阈值内',
+      ])
+      const pending = oms.confirmation && oms.confirmation.pending
       return {
         pairs: [
-          ['持仓条目', Array.isArray(positions) ? positions.length : '—'],
-          ['在途订单', Array.isArray(d.orders_open) ? d.orders_open.length : '—'],
-          ['今日成交', Array.isArray(d.deals_today) ? d.deals_today.length : '—'],
-          ['OMS 台账', (d.oms || []).length],
+          ['持仓条目', positions.length],
+          ['在途订单', openCount],
+          ['今日成交', dealCount],
+          ['OMS 台账', (oms.orders || []).length],
+          ['待人工确认', stages.manual ?? 0],
+          ['红线阻断', stages.blocked ?? 0],
+          ['工作台确认通道', pending ? '有待确认请求' : '空闲'],
+          ['确认 TTL', oms.confirmation ? `${Math.round((oms.confirmation.ttl_ms || 0) / 1000)}s` : '—'],
         ],
-        tables: [['标的', '数量', '成本', '现价'], posRows.slice(0, 8)],
+        tables: [
+          [['标的', '数量', '成本', '现价'], posRows.slice(0, 6)],
+          [['订单', '标的', '方向', '数量', '金额', '阶段', '风控'], omsRows],
+        ],
+        note: oms.note,
+        actions: [{ label: '与工作台对账', method: 'POST', url: '/api/v3/oms/sync', body: {} }],
       }
     },
     async gateway() {
@@ -197,12 +228,13 @@
     panel.innerHTML = `<div class="v3-head"><span class="v3-title">实时数据 · ${page}</span><span class="v3-badge" id="v3-badge">● LIVE</span><button class="v3-refresh" id="v3-refresh">刷新</button><span class="v3-asof">来源 /api/v3/* · ${asOf} · 真实数据</span></div><div id="v3-body"><div class="v3-k">加载中…</div></div>`
     document.getElementById('v3-refresh').addEventListener('click', refresh)
     try {
-      const { pairs, tables, actions } = await loader()
+      const { pairs, tables, actions, note } = await loader()
       const body = document.getElementById('v3-body')
       const actionHtml = (actions || [])
         .map((action, index) => `<button class="v3-refresh" data-action="${index}" style="margin-left:0;margin-right:8px">${action.label}</button>`)
         .join('')
-      body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + (tables || []).map(([headers, rows]) => table(headers, rows)).join('')
+      const noteHtml = note ? `<div class="v3-k" style="margin:8px 0 0">约束：${note}</div>` : ''
+      body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + (tables || []).map(([headers, rows]) => table(headers, rows)).join('') + noteHtml
       for (const button of body.querySelectorAll('button[data-action]')) {
         button.addEventListener('click', async () => {
           const action = (actions || [])[Number(button.dataset.action)]

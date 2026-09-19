@@ -37,48 +37,4 @@ export function checkOrder(order, context, limits = DEFAULT_LIMITS) {
   return { action, reasons }
 }
 
-// OMS 状态机：created → risk_checked → (auto|manual|blocked) → submitted → (filled|partial|rejected)
-// manual 需要 workbench 侧确认卡通过后才可 submit；blocked 是终态。
-export function createOms({ store }) {
-  const orders = store.readJson('oms_orders.json') || {}
-
-  function create(order, check) {
-    const id = `OMS-${Date.now()}-${Math.floor(Math.random() * 1e4)}`
-    orders[id] = {
-      id,
-      created_at: new Date().toISOString(),
-      order,
-      trace_id: `trace-${id.toLowerCase()}`,
-      stage: 'risk_checked',
-      action: check.action,
-      reasons: check.reasons,
-      events: [
-        { at: new Date().toISOString(), event: 'created' },
-        { at: new Date().toISOString(), event: 'risk_checked', detail: check.reasons.join('；') || '阈值内' },
-      ],
-    }
-    store.writeJson('oms_orders.json', orders)
-    return orders[id]
-  }
-
-  function transition(id, stage, detail) {
-    const record = orders[id]
-    if (!record) return null
-    record.stage = stage
-    record.events.push({ at: new Date().toISOString(), event: stage, detail: detail ?? '' })
-    store.writeJson('oms_orders.json', orders)
-    return record
-  }
-
-  function list() {
-    return Object.values(orders).sort((a, b) => (a.created_at < b.created_at ? 1 : -1))
-  }
-
-  function get(id) {
-    return orders[id] ?? null
-  }
-
-  return { create, transition, list, get }
-}
-
-export default { checkOrder, createOms }
+export default { checkOrder }

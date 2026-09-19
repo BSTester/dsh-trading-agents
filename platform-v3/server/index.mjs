@@ -11,7 +11,8 @@ import createMcpServer from './mcp/stdio.mjs'
 import createStore from './store.mjs'
 import { createHeadlessRunner, createScheduler } from './gateway/headless.mjs'
 import createSdkChannel from './gateway/sdk.mjs'
-import { checkOrder, createOms } from './risk.mjs'
+import { checkOrder } from './risk.mjs'
+import createOmsLedger from './oms.mjs'
 import { backtestMomentum, paramSweep } from './strategy/backtest.mjs'
 import createStrategyService from './strategy/pipeline.mjs'
 
@@ -19,7 +20,7 @@ const config = loadConfig()
 const wb = createWorkbenchClient(config.workbench)
 const store = createStore(config.dataDir)
 const runner = createHeadlessRunner({ config, store })
-const oms = createOms({ store })
+const oms = createOmsLedger({ store, wbCall: (tool, args, options) => wb.call(tool, args, options) })
 const sdkChannel = createSdkChannel({ config, clock: () => new Date() })
 const strategy = createStrategyService({ wbCall: (tool, args, options) => wb.call(tool, args, options), watchlist: config.sources.watchlist, store })
 
@@ -193,8 +194,13 @@ app.get('/api/v3/execution', async () => {
     wbValue(wb.call('orders_open', {})),
     wbValue(wb.call('deals_today', {})),
   ])
-  return { ok: true, positions: positions.data ?? null, orders_open: orders.data ?? null, deals_today: deals.data ?? null, oms: oms.list() }
+  const omsView = await oms.view()
+  return { ok: true, positions: positions.data ?? null, orders_open: orders.data ?? null, deals_today: deals.data ?? null, oms: omsView }
 })
+
+app.get('/api/v3/oms/orders', async () => ({ ok: true, ...(await oms.view()) }))
+
+app.post('/api/v3/oms/sync', async () => oms.sync())
 
 app.get('/api/v3/gateway', async () => ({
   ok: true,
