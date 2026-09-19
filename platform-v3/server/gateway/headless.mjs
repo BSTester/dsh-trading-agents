@@ -45,7 +45,7 @@ export function createSemaphore(limit) {
   }
 }
 
-export function createHeadlessRunner({ config, store, spawnImpl = spawn, clock = () => new Date() }) {
+export function createHeadlessRunner({ config, store, spawnImpl = spawn, clock = () => new Date(), onCall } = {}) {
   const headless = config.channels.headless
   const semaphore = createSemaphore(headless.concurrency)
   let killed = 0
@@ -105,6 +105,11 @@ export function createHeadlessRunner({ config, store, spawnImpl = spawn, clock =
       try {
         const record = await runOnce(prompt)
         store.append('headless_calls.jsonl', record)
+        try {
+          onCall?.(record)
+        } catch {
+          // 观测失败不影响业务
+        }
         return record
       } finally {
         semaphore.release()

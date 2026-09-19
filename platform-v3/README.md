@@ -68,6 +68,32 @@ MCP 工具面：`list_tools` / `call_tool`（六域发现代理，覆盖既有 7
 `query_position`、`account_funds`、`orders_open`、`deals_today`、`request_approval`、`audit_trail`、
 `research_tasks_claim` + 本地计算工具 `run_backtest`、`param_sweep`、`strategy_run`。
 
+## 监控与审计（§8.3 / §4.2）
+
+`GET /metrics` 暴露 Prometheus 文本指标（进程内计数 + 实时分量），字段与规格的告警项一一对应：
+
+| 指标 | 用途 / 告警阈值（规格 §8.3） |
+|---|---|
+| `quant_v3_headless_calls_total{result}` + `quant_v3_headless_duration_ms_sum` | Headless 调用成功率 < 95%、平均耗时 > 60s |
+| `quant_v3_sdk_channel_ready` | SDK 会话就绪度（活跃数 > 10 由上层会话表看） |
+| `quant_v3_mcp_tool_calls_total{tool,result}` + `quant_v3_mcp_tool_duration_ms_sum` | MCP 工具调用延迟 > 5s、失败率 > 5% |
+| `quant_v3_wb_calls_total{tool,result}` + `quant_v3_wb_call_duration_ms_sum` | 数据源（workbench 77 工具）连接与延迟 |
+| `quant_v3_workbench_up` | 数据源断连 |
+| `quant_v3_oms_orders{stage}` | 待人工确认/阻断突增 |
+| `quant_v3_headless_active` / `quant_v3_headless_queued` | 熔断并发与排队 |
+
+**审计**：所有变更类 API（POST，`/api/v3/mcp` 除外）与**每次 MCP 工具调用**（含 `trade_*` 直通）
+追加写入 `data/audit.jsonl`（时间、动作、状态、耗时、源地址）。
+
+**常驻运行**：`install/quant-v3.service` 为 systemd 单元模板（默认 127.0.0.1:8407，
+日志 `~/.dsh/quant-v3.log`，SDK 通道默认关闭）。
+
+```
+sudo cp install/quant-v3.service /etc/systemd/system/
+sudo systemctl daemon-reload && sudo systemctl enable --now quant-v3
+systemctl status quant-v3 && curl -s localhost:8407/metrics | head
+```
+
 ## 目录
 
 ```
@@ -75,8 +101,10 @@ server/          服务端（零依赖 Node ≥22.19）
   mcp/           平台 MCP 服务器（stdio + HTTP 端点共用核心；含本地计算工具）
   gateway/       三通道：headless.mjs（Headless Runner + 调度器 + 外部熔断）、sdk.mjs（SDK JSON-RPC 客户端）
   strategy/      PDAT→PET 研究流水线（pipeline.mjs）+ 回测与参数扫描引擎（backtest.mjs）
-  risk.mjs       风控分级（自动/人工/阻断）+ OMS 状态机
+  risk.mjs       风控分级（自动/人工/红线阻断）    oms.mjs  订单台账 + 与工作台对账（无下单入口）
+  observability.mjs  指标（/metrics）与审计（data/audit.jsonl）
+install/         systemd 单元模板
 web/             9 页控制台 UI（OpenDesign 设计稿）+ app.js 实时数据层
-test/            node --test（27 例，含协议桩与集成测试）
-data/            运行时数据（gitignore）：headless 调用日志、OMS 台账、策略研究轮（FR-MON-003）
+test/            node --test（34 例，含协议桩与集成测试）
+data/            运行时数据（gitignore）：headless 调用日志、OMS 台账、策略研究轮、审计日志
 ```

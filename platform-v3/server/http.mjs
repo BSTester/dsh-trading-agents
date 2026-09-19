@@ -1,5 +1,5 @@
-// 极简路由器（零依赖）：路径参数 :name、JSON body、JSON 响应。
-export function createApp() {
+// 极简路由器（零依赖）：路径参数 :name、JSON body、JSON 响应、可选请求观测回调。
+export function createApp({ onRequest } = {}) {
   const routes = []
 
   function add(method, pattern, handler) {
@@ -53,8 +53,19 @@ export function createApp() {
 
   async function handle(req, res) {
     const url = new URL(req.url, 'http://localhost')
+    const startedAt = Date.now()
+    let status = 404
+    const finish = () => {
+      try {
+        onRequest?.({ method: req.method, pathname: url.pathname, status, durationMs: Date.now() - startedAt, remote: req.socket?.remoteAddress ?? null })
+      } catch {
+        // 观测失败不影响业务
+      }
+    }
+    res.on('finish', finish)
     const found = match(req.method, url.pathname)
     if (!found) {
+      status = 404
       res.writeHead(404, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ ok: false, error: { code: 'not-found', message: url.pathname } }))
       return
@@ -63,10 +74,15 @@ export function createApp() {
       const body = req.method === 'POST' || req.method === 'PUT' ? await readBody(req) : {}
       const query = Object.fromEntries(url.searchParams.entries())
       const result = await found.handler({ params: found.params, query, body, req, res })
-      if (result === undefined) return // handler 已自行写响应
+      if (result === undefined) {
+        status = res.statusCode ?? 200
+        return // handler 已自行写响应
+      }
+      status = 200
       res.writeHead(200, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify(result))
     } catch (error) {
+      status = 400
       res.writeHead(400, { 'content-type': 'application/json; charset=utf-8' })
       res.end(JSON.stringify({ ok: false, error: { code: 'bad-request', message: error?.message ?? String(error) } }))
     }

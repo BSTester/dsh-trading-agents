@@ -15,11 +15,14 @@ import { checkOrder } from './risk.mjs'
 import createOmsLedger from './oms.mjs'
 import { backtestMomentum, paramSweep } from './strategy/backtest.mjs'
 import createStrategyService from './strategy/pipeline.mjs'
+import { createMetrics, createAudit } from './observability.mjs'
 
 const config = loadConfig()
-const wb = createWorkbenchClient(config.workbench)
+const metrics = createMetrics()
+const audit = createAudit(config.dataDir)
+const wb = createWorkbenchClient({ ...config.workbench, onCall: ({ tool, ok, ms }) => metrics.wbCall(tool, ok, ms) })
 const store = createStore(config.dataDir)
-const runner = createHeadlessRunner({ config, store })
+const runner = createHeadlessRunner({ config, store, onCall: (record) => metrics.headless(record.success, record.duration_ms, record.tokens_estimate) })
 const oms = createOmsLedger({ store, wbCall: (tool, args, options) => wb.call(tool, args, options) })
 const sdkChannel = createSdkChannel({ config, clock: () => new Date() })
 const strategy = createStrategyService({ wbCall: (tool, args, options) => wb.call(tool, args, options), watchlist: config.sources.watchlist, store })
@@ -81,6 +84,11 @@ const mcp = createMcpServer({
   wbToolNames: WB_TOOL_NAMES,
   localTools: strategyLocalTools,
   log: (message) => console.log(`[mcp] ${message}`),
+  onToolCall: ({ name, ok, ms }) => {
+    metrics.tool(name, ok, ms)
+    // 工具面审计（含 trade_* 直通调用）：谁在何时调了什么、成没成
+    audit.append({ kind: 'mcp-tool', action: name, status: ok ? 200 : 500, ms })
+  },
 })
 
 const scheduler = createScheduler({
@@ -94,7 +102,15 @@ const scheduler = createScheduler({
 })
 
 const startedAt = Date.now()
-const app = createApp()
+const app = createApp({
+  onRequest: ({ method, pathname, status, durationMs, remote }) => {
+    // 路径中的 id 归一，避免指标基数爆炸
+    metrics.http(pathname.replace(/\/[0-9a-f]{8,}/gi, '/<id>'), method, status, durationMs)
+    if (method === 'POST' && pathname !== '/api/v3/mcp') {
+      audit.append({ kind: 'api', action: pathname, status, ms: durationMs, remote })
+    }
+  },
+})
 
 function wbValue(promise) {
   return promise.then((envelope) => {
@@ -268,8 +284,14 @@ function serveStatic(pathname, res) {
   res.end(fs.readFileSync(target))
 }
 
-const server = http.createServer((req, res) => {
+const server = http.createServer(async (req, res) => {
   const pathname = new URL(req.url, 'http://localhost').pathname
+  if (pathname === '/metrics') {
+    const health = await wb.health()
+    res.writeHead(200, { 'content-type': 'text/plain; version=0.0.4; charset=utf-8' })
+    res.end(metrics.render({ workbenchUp: health.ok, omsStages: oms.statusCounts(), headlessStats: runner.stats(), sdkStatus: sdkChannel.status() }))
+    return
+  }
   if (pathname === '/healthz' || pathname.startsWith('/api/')) return void app.handle(req, res)
   if (req.method !== 'GET') {
     res.writeHead(405, { 'content-type': 'text/plain; charset=utf-8' })

@@ -45,7 +45,7 @@ const META_TOOLS = [
   },
 ]
 
-export function createMcpServer({ wbCall, wbToolNames, log, localTools = [] }) {
+export function createMcpServer({ wbCall, wbToolNames, log, localTools = [], onToolCall } = {}) {
   const catalog = buildCatalog(wbToolNames)
   const firstClassByName = new Map(FIRST_CLASS.map((t) => [t.name, t]))
   const localByName = new Map(localTools.map((t) => [t.name, t]))
@@ -114,10 +114,20 @@ export function createMcpServer({ wbCall, wbToolNames, log, localTools = [] }) {
     if (method === 'tools/list') return { jsonrpc: '2.0', id, result: { tools: toolList() } }
     if (method === 'tools/call') {
       const name = String(params?.name || '')
+      const startedAt = Date.now()
+      const report = (ok) => {
+        try {
+          onToolCall?.({ name, ok, ms: Date.now() - startedAt })
+        } catch {
+          // 观测失败不影响业务
+        }
+      }
       try {
         const outcome = await handleToolCall(name, params?.arguments ?? {})
+        report(outcome.isError !== true)
         return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: outcome.text }], isError: outcome.isError === true } }
       } catch (error) {
+        report(false)
         return { jsonrpc: '2.0', id, result: { content: [{ type: 'text', text: `tool error: ${error?.message ?? String(error)}` }], isError: true } }
       }
     }

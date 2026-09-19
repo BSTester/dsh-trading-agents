@@ -1,0 +1,24 @@
+[Unit]
+Description=Quant Trading Platform V3 (Harness-Centric) — 平台服务
+Documentation=file:///home/penn/workspace/dsh-trading-agents/platform-v3/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=penn
+WorkingDirectory=/home/penn/workspace/dsh-trading-agents/platform-v3
+# 数据来源（既有工作台）必须先就绪；本服务只消费，不接管
+Environment=QUANT_V3_HOST=127.0.0.1
+Environment=QUANT_V3_PORT=8407
+Environment=WORKBENCH_BASE=http://127.0.0.1:8397
+# SDK 通道：部署好 sdk profile 与模型密钥后再打开
+Environment=QUANT_SDK_ENABLED=0
+ExecStart=/usr/bin/node server/index.mjs
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/penn/.dsh/quant-v3.log
+StandardError=append:/home/penn/.dsh/quant-v3.log
+
+[Install]
+WantedBy=default.target
