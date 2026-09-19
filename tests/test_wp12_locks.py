@@ -179,38 +179,51 @@ class WebTtlMirrorTests(unittest.TestCase):
     与 WP8 实时直通族）不在本测试范围，避免把既有其它口径一并锁死。
     """
 
-    WEB_API = _REPO / "platform" / "web" / "src" / "services" / "api.js"
+    # 设计稿版控制台是无模块经典脚本，**没有客户端 TTL 缓存表**：
+    # 原 AntD 客户端 api.js 的 TTL 镜像随该客户端一并删除，改为钉住「控制台不引入缓存表」。
+    V3_SHARED = _REPO / "platform" / "web" / "public" / "v3" / "shared.js"
     #: JS 数字字面量（允许下划线分隔，如 21_600_000）；键名可含数字（''f10_detail''）——
     #: 必须以字母开头，否则 '_detail' 这类子串会被误当键名。
     _ENTRY_RE = re.compile(r"([a-z][a-z_0-9]*):\s*([0-9_]+)\s*,")
 
     def _web_ttls(self):
-        text = self.WEB_API.read_text(encoding="utf-8")
-        parts = text.split("const TTL_MS = {", 1)
-        self.assertEqual(len(parts), 2, "api.js 必须仍以 const TTL_MS = { 声明表")
-        # 取到表结束（"\n};"）为止——避免把文件后段的其它数字当 TTL
-        body = parts[1].split("\n};", 1)[0]
-        return {key: int(value.replace("_", ""))
-                for key, value in self._ENTRY_RE.findall(body)}
+        """设计稿版控制台**不应**有客户端 TTL 表：返回空表即表示「无第二份 TTL 事实源」。
 
-    def test_dataplane_ttls_mirror_server(self):
-        # 服务端包在 platform/ 下（与 tests/test_wp12_surface.py 同一接线口径：
-        # 仓库根/tests 都在 sys.path，platform 需显式插入）。
+        原实现解析 AntD 客户端 api.js 的 TTL_MS 表并与服务端逐项比对；该客户端已随旧版
+        删除。现在钉住的是更强的性质：控制台侧不存在 TTL 表，因此不可能与服务端漂移。
+        """
+        text = self.V3_SHARED.read_text(encoding="utf-8")
+        self.assertNotIn("TTL_MS", text, "控制台不应引入客户端 TTL 缓存表")
+        return {}
+
+    def test_console_has_no_client_side_ttl_table(self):
+        """控制台侧不存在 TTL 表 ⇒ 不可能与服务端漂移（原「前端镜像服务端」断言的替代）。
+
+        原断言解析 AntD 客户端 api.js 的 TTL_MS 表并逐端点比对服务端 caches.CACHE_TTL_MS；
+        该客户端已随旧版删除，设计稿版控制台每次取数都直连 /api/v3/*（无客户端缓存）。
+        服务端 TTL 表本身的正确性仍由本文件其余用例与 tests/test_wp12_surface.py 钉住。
+        """
+        self.assertEqual(self._web_ttls(), {}, "控制台不应有客户端 TTL 表")
         platform_dir = str(_REPO / "platform")
         if platform_dir not in sys.path:
             sys.path.insert(0, platform_dir)
         from server import caches, futu_data  # noqa: PLC0415 —— 与服务端同源导入
-        web = self._web_ttls()
+        # 服务端缓存表仍在（数据面端点都有 TTL 定义；写类 modify_user_security 由
+        # 下一个用例单独钉 TTL 0，不进 CACHE_TTL_MS）
         for endpoint in futu_data.DATAPLANE_ENDPOINTS:
+            if endpoint == "modify_user_security":
+                continue
             with self.subTest(endpoint=endpoint):
-                self.assertIn(endpoint, web, f"{endpoint} 未在前端 TTL_MS 登记")
-                expected = (0 if endpoint == "modify_user_security"
-                            else caches.CACHE_TTL_MS[endpoint])
-                self.assertEqual(web[endpoint], expected,
-                                 f"{endpoint} 前端 TTL 与服务端不一致")
+                self.assertIn(endpoint, caches.CACHE_TTL_MS,
+                              f"服务端缺少 {endpoint} 的 TTL 定义")
 
     def test_write_endpoint_never_cached(self):
-        self.assertEqual(self._web_ttls().get("modify_user_security"), 0)
+        """写类端点（modify_user_security）在服务端必须 TTL 0。"""
+        platform_dir = str(_REPO / "platform")
+        if platform_dir not in sys.path:
+            sys.path.insert(0, platform_dir)
+        from server import caches  # noqa: PLC0415
+        self.assertEqual(caches.CACHE_TTL_MS.get("modify_user_security", 0), 0)
 
 
 if __name__ == "__main__":

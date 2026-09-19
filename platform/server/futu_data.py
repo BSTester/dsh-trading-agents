@@ -199,7 +199,7 @@ OPTION_SCREEN_EXAMPLE = (
 #: （2026-09-17，docs/TOOL-LIMITS.md「期权筛选的最小可用载荷」；值 → 上游英文码）。
 #: 非支持值被上游**静默忽略**（回空列表 + total=0，不报错）——所以错误消息、MCP 工具
 #: 描述与 Web 表单只提供这 7 个，不给「自由输入一个看起来成功、其实什么都没筛」的值。
-#: 三处镜像（本常量 ↔ platform/web/src/services/optionScreen.js ↔ docs/TOOL-LIMITS.md）
+#: 三处镜像（本常量 ↔ platform/web/lib/services/optionScreen.js ↔ docs/TOOL-LIMITS.md）
 #: 由 tests/test_wp25_option_form.py 双向锁定。
 OPTION_MARKET_CATEGORIES = (
     (0, "US_STOCK"),

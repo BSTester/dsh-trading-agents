@@ -1124,7 +1124,7 @@ git commit -m "feat(preset): WP6 preset 行替换（quant-platform-mcp 行 + per
 
 ### 任务 8：前端脚手架（Vite + antd5 + ProComponents + ProLayout 壳）
 
-**文件：** 创建 `platform/web/package.json`、`platform/web/vite.config.mjs`、`platform/web/index.html`、`platform/web/src/main.jsx`、`platform/web/src/app.jsx`、`platform/web/src/services/api.js`、`platform/web/src/services/hooks.js`、`platform/web/src/pages/`（11 个占位页组件，任务 9–11 逐个替换为真实现）
+**文件：** 创建 `platform/web/package.json`、`platform/web/vite.config.mjs`、`platform/web/index.html`、`platform/web/src/main.jsx`、`platform/web/src/app.jsx`、`platform/web/lib/services/api.js`、`platform/web/lib/services/hooks.js`、`platform/web/src/pages/`（11 个占位页组件，任务 9–11 逐个替换为真实现）
 
 - [ ] **步骤 1：`platform/web/package.json`**
 
@@ -1182,7 +1182,7 @@ export default defineConfig({
 </html>
 ```
 
-- [ ] **步骤 4：`platform/web/src/services/api.js`（数据层，规格 §4.3：两层缓存变一层半）**
+- [ ] **步骤 4：`platform/web/lib/services/api.js`（数据层，规格 §4.3：两层缓存变一层半）**
 
 ```js
 // 数据层：POST /api/wb/<endpoint>；envelope 解包 + 客户端内存缓存（TTL 对齐旧 client.js）。
@@ -1233,7 +1233,7 @@ export async function callApi(endpoint, payload = {}, { refresh = false } = {}) 
 }
 ```
 
-- [ ] **步骤 5：`platform/web/src/services/hooks.js`**
+- [ ] **步骤 5：`platform/web/lib/services/hooks.js`**
 
 ```js
 import React from "react";
@@ -1385,7 +1385,7 @@ git commit -m "feat(web): WP6 前端脚手架（ProLayout 壳/数据层/11 页�
 
 ### 任务 9：图表移植（geometry 纯函数带测试 + 三个 canvas 组件）
 
-**文件：** 创建 `platform/web/src/charts/geometry.js`、`platform/web/tests/geometry.test.mjs`、`platform/web/src/charts/line.jsx`、`platform/web/src/charts/kline.jsx`、`platform/web/src/charts/heatmap.jsx`
+**文件：** 创建 `platform/web/lib/charts/geometry.js`、`platform/web/tests/geometry.test.mjs`、`platform/web/lib/charts/line.jsx`、`platform/web/lib/charts/kline.jsx`、`platform/web/lib/charts/heatmap.jsx`
 
 - [ ] **步骤 1：先写失败测试 `platform/web/tests/geometry.test.mjs`（断言移植自 `plugins/workbench/src/client.js` 既有测试语义：绘图区外不命中、右缘翻转、缺失值显示 —）**
 
@@ -2157,7 +2157,7 @@ $ # 6) 未声明端点
 HTTP 404（前端 endpoints.js 预检会先拦；404 文案保留兜底）
 ```
 
-要点：错误文案与 `platform/web/src/services/mode.js` 的本地预检文案**逐字相同**；
+要点：错误文案与 `platform/web/lib/services/mode.js` 的本地预检文案**逐字相同**；
 成功响应的 `order_authorized: false` 即页头提示里展示的字段；
 `expected_mode` 透传使陈旧页面被服务端拒绝（步骤 4）。
 
@@ -2248,7 +2248,7 @@ HTTP 404（前端 endpoints.js 预检会先拦；404 文案保留兜底）
     配置任何实现任务**——计划任务 12 只给了计划页执行门槛（`确认执行`），模式切换被漏掉。
     计划与实际代码的双重漏项使该不变量在独立 Web 侧**只有文档承诺、没有 UI 入口**
     （MCP 通道按 §3.2 封死 live，legacy 面板之外无路可走）。最终整体审查据此判为阻断项，
-    本次补齐：新增 `platform/web/src/services/mode.js`（纯函数 `switchModeRequest` /
+    本次补齐：新增 `platform/web/lib/services/mode.js`（纯函数 `switchModeRequest` /
     `modeBadge`）+ `tests/mode.test.mjs`（5 用例），`app.jsx` 页头徽章改为可点开的
     「账户模式」对话框（Radio 选目标模式、live 且当前非 live 时显示口令输入、
     `callApi("switch-mode", …)` 成功后提示带 `order_authorized: false` 并刷新 snapshot）。
@@ -2256,7 +2256,7 @@ HTTP 404（前端 endpoints.js 预检会先拦；404 文案保留兜底）
 14. **前端 `snapshot.endpoints` 预检初版未实现（已补齐）**：规格 §4.3 要求「未声明端点直接
     显示『服务版本陈旧，请重启服务』且**不发起请求**」，初版 `services/api.js` 只保留了
     服务端 404 的兜底文案，没有任何声明比对。本次补齐：新增
-    `platform/web/src/services/endpoints.js`（`declaredEndpoints` 非数组→null；
+    `platform/web/lib/services/endpoints.js`（`declaredEndpoints` 非数组→null；
     `endpointMissing` 在声明集合为 null 时不拦，避免旧服务被前端拦死）+
     `tests/endpoints.test.mjs`（4 用例）；`api.js` 维护模块级 `declared`（snapshot 响应写入
     `body.value.endpoints`），非 snapshot 调用前先预检，命中即 `throw` 且**不发请求**，

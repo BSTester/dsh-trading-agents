@@ -16,8 +16,8 @@ import {
 } from "../scripts/audit_page_fields.mjs";
 import {
   clockText, dayText, minuteText, numText, pctOfText, stampText,
-} from "../platform/web/src/services/formatCore.js";
-import { fmtNum } from "../platform/web/src/services/f10.js";
+} from "../platform/web/lib/services/formatCore.js";
+import { fmtNum } from "../platform/web/lib/services/f10.js";
 
 const ROUTES = ["overview", "market", "capital", "options", "signal", "portfolio", "risk",
   "factors", "execution", "research", "events", "plan", "pipeline", "schedule", "audit",

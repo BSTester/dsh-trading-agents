@@ -2,8 +2,11 @@
 // 本文件只把 /api/v3/* 的真实值写进设计稿 DOM，并把没有数据源的区块显式标注（不留占位数字）。
 //
 // 硬边界（与后端 /api/v3/execution 的 oms.note 同口径）：
-//   执行入口只有一个——平台工作台 Web 的「执行已冻结计划」（plan_execute）+ 人工确认（LIVE 需口令「确认执行」）。
-//   V3 控制台只登记、风控分级、对账与展示，**不含任何下单/改单/撤单/审批写入口**。
+//   本页是**本仓库唯一允许触发订单动作的界面**（既有 AntD 工作台将被删除），两条写通道：
+//     ① 冻结计划执行——「执行已冻结计划」弹窗内的 plan-execute（人工二次确认；LIVE 需逐字口令「确认执行」）；
+//     ② 人工审批决定——「待确认请求」区块的 confirm-decide（载荷只有 {id, decision}）。
+//   两条通道都只在人工点击后发生：加载/轮询只读，绝不写；首次点击只进入待确认态，第二次点击才提交。
+//   平台不含逐单下单/改单/撤单入口；台账里 stage=manual 只是平台侧台账的审批阶段，不是券商待确认。
 //
 // 数据源（逐块对应）：
 //   /api/v3/execution   —— 持仓（券商模拟账户快照）、在途订单、当日成交、OMS 台账视图
@@ -11,6 +14,8 @@
 //   /api/v3/metrics     —— 通道与工具面计数（顶栏状态点）
 //   /api/v3/audit       —— 审计链（信号生成看板 + 决策链路追溯）
 //   /api/v3/risk        —— 事前阈值配置（追溯区的风控阈值口径）
+//   /api/wb/plan        —— 冻结计划（真实 plan_id/content_hash/status/mode/orders），执行入口的唯一目标来源
+//   /api/wb/confirmation—— 待确认实盘操作（pending/ttl_ms），人工审批决定区块的唯一来源
 //
 // 无数据源（工具面确实没有）：券商成交流水（滑点/成交率/撤单率、成交均价）、模块化执行参数（TWAP 片数）、
 //   PIT 因子快照与情绪评分、盘中市场状态、逐单决策 trace id。
@@ -147,7 +152,7 @@
     const env = q('.exec-mode .pill.env')
     if (env) env.textContent = `${String(mode || 'sim').toUpperCase()} 模拟环境`
     const hint = q('.exec-mode .hint')
-    if (hint) hint.textContent = 'LIVE 需口令「确认执行」（工作台 Web 入口）'
+    if (hint) hint.textContent = '本页含唯一受约束执行入口 · LIVE 需逐字口令「确认执行」'
 
     const plan = dominantPlan(orders)
     const chip = q('.plan-chip')
@@ -157,7 +162,9 @@
         : '冻结计划：无数据源'
     }
     const note = q('.exec-note')
-    if (note) note.textContent = '本平台不含下单入口：执行只在工作台 Web（plan_execute + 人工确认）'
+    if (note) {
+      note.textContent = '本页「执行已冻结计划」是平台唯一受约束下单入口（plan-execute + 人工二次确认）；平台不含逐单下单入口'
+    }
 
     const manual = orders.filter((order) => order.stage === 'manual').length
     const filled = q('#statFilled')
@@ -166,11 +173,12 @@
     if (pending) {
       pending.textContent = String(manual)
       pending.style.color = manual > 0 ? 'var(--amber)' : 'var(--muted)'
+      pending.title = '平台 OMS 台账（/api/v3/oms/orders）stage=manual 的订单数——这是平台侧台账的审批阶段，不是券商待确认；券商待确认见「待确认请求」区块'
     }
     const button = q('#btnFreeze')
-    if (button) button.title = '入口在工作台 Web：执行已冻结计划（plan_execute）+ 人工确认；本控制台只读展示'
+    if (button) button.title = '打开冻结计划执行弹窗：plan-execute 只在人工二次确认后写入指令文件；LIVE 需逐字口令「确认执行」'
     const head = q('.exec-head')
-    if (head) head.title = (oms && oms.note) || '执行入口只在工作台 Web'
+    if (head) head.title = '本页含唯一受约束执行入口：执行已冻结计划（plan-execute，人工二次确认）与待确认请求（confirm-decide）'
   }
 
   /* ── 3. 订单生命周期看板 ───────────────────────────────────────────────── */
@@ -312,8 +320,9 @@
           `<div class="appr-line"><span class="k">决策快照</span><span class="v mut num">计划 ${esc(String(first.plan_id || '—'))} · ${esc(clock(first.updated_at))}${fin(nav) ? ` · NAV ${esc(money(nav))}` : ''}</span></div>` +
           `<div class="appr-line"><span class="k">台账订单号</span><span class="v mut num">${esc(String(first.id || '—'))}</span></div>` +
           '<div style="border:1px dashed var(--border2);border-radius:6px;padding:9px 10px;font-size:11.5px;color:var(--faint);line-height:1.7">' +
-          '审批入口不在本控制台：执行只在平台工作台 Web 的「执行已冻结计划」（<b>plan_execute</b>）+ 人工确认，LIVE 需口令「确认执行」。' +
-          'V3 只登记、风控分级、对账与展示。</div>'
+          '审批与执行入口就在本页：①「执行已冻结计划」弹窗（<b>plan-execute</b>，人工二次确认；LIVE 需逐字口令「确认执行」）；' +
+          '②下方「待确认请求」区块（<b>confirm-decide</b>，唯一能批准实盘操作的通道）。' +
+          '台账 stage=manual 只是平台侧台账的审批阶段，<b>不是</b>券商待确认。</div>'
       } else if (appr) {
         V3.nodata(appr, '待人工确认订单', 'OMS 台账无 manual 阶段订单')
       }
@@ -321,15 +330,15 @@
       if (approved) {
         const big = q('.big', approved)
         const line = q('p', approved)
-        if (big) big.textContent = '已批准 · 由工作台 Web 提交 OMS'
-        if (line) line.textContent = '本控制台不代下单：审批动作在工作台 Web 完成后，订单状态经 /api/v3/oms/sync 对账回写台账。'
+        if (big) big.textContent = '已批准 · 经本页确认通道提交 OMS'
+        if (line) line.textContent = '批准动作来自本页「待确认请求」区块（confirm-decide）；订单状态经 /api/v3/oms/sync 对账回写台账。'
       }
       const rejected = q('#stateRejected', manualScope)
       if (rejected) {
         const big = q('.big', rejected)
         const line = q('p', rejected)
         if (big) big.textContent = '已拒绝 · 信号退回决策大脑'
-        if (line) line.textContent = '拒绝动作同样在工作台 Web 完成；OMS 台账据对账结果更新 stage，不进入执行队列。'
+        if (line) line.textContent = '拒绝同样在本页「待确认请求」区块完成；OMS 台账据对账结果更新 stage，不进入执行队列。'
       }
       const queue = q('.queue-next', manualScope)
       if (queue) {
@@ -597,53 +606,59 @@
   }
 
   /* ── 7. 冻结计划弹窗（真实计划内容 + 明确下单入口） ────────────────────── */
-  function renderModal(orders, plan) {
+  function renderModal(orders, planLedger) {
     const mask = q('#planMask')
     if (!mask) return
     const sub = q('.m-sub', mask)
     const list = q('.m-list', mask)
     const note = q('.m-note', mask)
-    const scoped = plan ? orders.filter((order) => String(order.plan_id) === plan.plan_id) : []
+    // 目标计划来自 /api/wb/plan（真实 content_hash 与订单）——执行入口绝不绑定台账推测值；
+    // 台账（/api/v3/oms/orders）只在计划端点取不到时兜底展示，且明确标注来源。
+    const plan = currentPlan()
+    const planOrders = plan && Array.isArray(plan.orders) ? plan.orders : null
+    const ledgerScoped = planLedger
+      ? orders.filter((order) => String(order.plan_id) === planLedger.plan_id) : []
+    const scoped = planOrders || ledgerScoped
     if (sub) {
-      sub.innerHTML = plan
-        ? `冻结计划 <span class="num">${esc(plan.plan_id)}</span> · 共 <span class="num">${scoped.length}</span> 条订单（台账 stage：${esc(plan.status || '—')}）`
-        : '冻结计划：无数据源'
+      if (plan) {
+        sub.innerHTML = `冻结计划 <span class="num">${esc(plan.plan_id)}</span> · 共 <span class="num">${scoped.length}</span> 条订单` +
+          `（状态 ${esc(plan.status || '—')}）· 内容哈希 <span class="num">${esc(planHashOf(plan) || '—')}</span>`
+      } else if (planLedger) {
+        sub.innerHTML = `冻结计划 <span class="num">${esc(planLedger.plan_id)}</span> · 共 <span class="num">${scoped.length}</span> 条订单（台账 stage：${esc(planLedger.status || '—')}）`
+      } else {
+        sub.textContent = GATE.planErr
+          ? `冻结计划取数失败：${GATE.planErr}`
+          : '冻结计划：无数据源（/api/wb/plan 未返回计划）'
+      }
     }
     const rows = list ? qa('.o-row', list) : []
     const tpl = rows[0]
     if (list && tpl) {
       const clone = tpl.cloneNode(true)
       list.innerHTML = ''
-      for (const order of scoped.slice(0, 3)) {
+      for (const order of scoped.slice(0, 5)) {
         const node = clone.cloneNode(true)
         const left = q('.l', node)
-        if (left) left.innerHTML = `<b>${esc(order.ticker)}</b> <span class="m">${esc(sideText(order.side))} · ${esc(String(order.strategy_id || ''))}</span>`
+        if (left) left.innerHTML = `<b>${esc(order.ticker || order.symbol || '—')}</b> <span class="m">${esc(sideText(order.side))} · ${esc(String(order.status || order.strategy_id || ''))}</span>`
         const right = q('.r', node)
-        if (right) right.textContent = `${num(order.qty, 0)} 股 · 限价 ${num(order.price, 2)} · ${money(order.value)}`
+        if (right) right.textContent = `${num(order.qty, 0)} 股 · 限价 ${num(order.price, 2)}`
         list.appendChild(node)
       }
       if (scoped.length === 0) {
         const node = clone.cloneNode(true)
         const left = q('.l', node)
-        if (left) left.textContent = '无数据源：台账无冻结计划订单'
+        if (left) left.textContent = plan ? '该计划没有订单' : '无数据源：未取到冻结计划'
         const right = q('.r', node)
         if (right) right.textContent = ''
         list.appendChild(node)
       }
     }
     if (note) {
-      note.textContent = '本控制台不含下单入口：请在平台工作台 Web 使用「执行已冻结计划」（plan_execute）+ 人工确认，SIM 免口令，LIVE 需口令「确认执行」。此处仅展示台账登记的计划订单。'
+      note.innerHTML = '执行已冻结计划是<b>唯一受约束下单入口</b>：下方按钮需<b>人工二次确认</b>——首次点击只进入待确认态并展示将提交的载荷，' +
+        '第二次点击才写入指令文件；LIVE 还需逐字口令「确认执行」。<b>execute</b> 提交 plan_hash + expected_mode' +
+        '（模式已变化会被服务端拒绝，请刷新重试），取消用 action=cancel。本页不含逐单下单入口。'
     }
-    const confirm = q('#mConfirm', mask)
-    if (confirm && confirm.dataset.v3Bound !== '1') {
-      const clone = confirm.cloneNode(true)
-      clone.dataset.v3Bound = '1'
-      confirm.replaceWith(clone)
-      clone.addEventListener('click', () => {
-        mask.classList.remove('open')
-        toast('本平台不含下单入口：请在平台工作台 Web 执行（plan_execute + 人工确认）', 'warn')
-      })
-    }
+    renderPlanGate()
   }
 
   /* ── 8. 页脚 ───────────────────────────────────────────────────────────── */
@@ -651,19 +666,496 @@
     const foot = q('footer.foot')
     if (!foot) return
     foot.innerHTML =
-      '<span>数据来源：本服务 /api/v3/execution、/api/v3/oms/orders、/api/v3/metrics、/api/v3/audit 实时接口' +
+      '<span>数据来源：本服务 /api/v3/execution、/api/v3/oms/orders、/api/v3/metrics、/api/v3/audit 与 /api/wb/plan、/api/wb/confirmation 实时接口' +
       '（工作台工具面 + 券商模拟持仓）· 取不到的项显式标注「无数据源」，页面不含占位数字</span>' +
-      `<span class="num">量化决策平台 V3.0 · 执行与审批 · 持仓 as_of ${esc(stamp(positions && positions.as_of))} · 平台不含下单入口</span>`
+      `<span class="num">量化决策平台 V3.0 · 执行与审批 · 持仓 as_of ${esc(stamp(positions && positions.as_of))} · 唯一受约束执行入口（plan-execute + 人工二次确认）</span>`
+  }
+
+  /* ── 9. 人工执行与审批写入口（plan-execute / confirm-decide） ─────────────
+   * 本页是本仓库**唯一允许触发订单动作的界面**（既有 AntD 工作台将删除），
+   * 两条写通道只用服务端已冻结的契约：
+   *   POST /api/wb/plan          空载荷 → {ok,value:{plans:[{plan_id,content_hash,status,mode,target,orders[]}],alerts,mode}}
+   *   POST /api/wb/plan-execute  白名单 {plan_hash,expected_mode,confirmation,action}
+   *     · action 缺省 = execute；取消 = action:'cancel'
+   *     · execute 必须带 plan_hash；expected_mode 必须等于服务端当前模式，
+   *       否则「模式已变化…请刷新后重试」（app.py:528-531）
+   *     · 当前模式 live 时还必须逐字带 confirmation:'确认执行'（app.py:532-533）
+   *   POST /api/wb/confirmation  空载荷 → {ok,value:{pending:{id,operation,tool,mode,session_id,summary,…}|null,ttl_ms}}
+   *   POST /api/wb/confirm-decide 白名单**只有** {id,decision}；decision ∈ approved/rejected
+   *     （store_access.decide_confirmation：Invalid decision; expected approved/rejected）
+   * 三重保守约束：
+   *   ① 只在人工点击后发生——加载与轮询只读，绝不写；
+   *   ② 必须二次点击：首次点击只进入待确认态并展示将提交的载荷，第二次点击才发请求；
+   *   ③ live 执行口令在客户端先校验，不合规**一个字节都不发**；口令只存在于 input.value，
+   *      不进 localStorage、不进日志、不进任何提示文案。
+   * 口径区分：/api/v3/oms/orders 里 stage=manual 是**平台侧台账**的审批阶段，不是券商待确认；
+   * 券商实盘业务确认只出现在「待确认请求」区块（confirm-decide）。 */
+  const PLAN_CONFIRM_WORD = '确认执行'
+  const CONFIRM_TTL_FALLBACK = 120
+  const ARM_TTL_MS = 20000
+  const GATE = {
+    plan: null, planErr: null, mode: 'sim',
+    pending: null, ttlMs: null, confirmErr: null,
+    armedPlan: null, armedDecision: null,
+    planMsg: null, confirmMsg: null,
+    busy: false, armTimer: null, timers: false,
+  }
+
+  /** 失败一律展示 error.code + message（shared.js 的网络失败也是同一形状）。 */
+  const errText = (payload, fallback) => {
+    const error = payload && payload.error
+    if (error && (error.code || error.message)) {
+      return `${error.code || 'error'}：${error.message || fallback || '请求失败'}`
+    }
+    return fallback || '请求失败（服务端未给出 error.code/message）'
+  }
+  const isLive = () => String(GATE.mode || 'sim').toLowerCase() === 'live'
+  /** 端点按创建时间倒序返回（最新在前）：plans[0] 即当前计划，与既有工作台同一口径——
+   *  执行入口不随任何展示筛选改变目标，提交的 content_hash 永远是这一条。 */
+  function currentPlan() {
+    const plans = GATE.plan && Array.isArray(GATE.plan.plans) ? GATE.plan.plans : []
+    return plans[0] || null
+  }
+  const planHashOf = (plan) => (plan && typeof plan.content_hash === 'string' && plan.content_hash
+    ? plan.content_hash : null)
+  /** confirmation 端点口径 {pending:{…}|null,ttl_ms}；兼容直接给 {id,…} 的形态。 */
+  function pendingOf(value) {
+    if (!value || typeof value !== 'object') return null
+    if (value.pending !== undefined) return value.pending || null
+    return value.id ? value : null
+  }
+  /** 剩余存活秒数（与 src/services/confirm.js 同一规则）：0=已到期，null=到期时间未知。 */
+  function remainingSeconds(expiresAt) {
+    const at = Date.parse(String(expiresAt == null ? '' : expiresAt))
+    if (Number.isNaN(at)) return null
+    return Math.max(0, Math.ceil((at - Date.now()) / 1000))
+  }
+  async function loadPlan() {
+    const env = await V3.wb('plan', {})
+    if (env && env.ok) {
+      GATE.plan = env.value || {}
+      GATE.mode = GATE.plan.mode || GATE.mode
+      GATE.planErr = null
+    } else {
+      GATE.planErr = errText(env, 'POST /api/wb/plan 取数失败')
+    }
+    return env
+  }
+  async function loadConfirmation() {
+    const env = await V3.wb('confirmation', {})
+    if (env && env.ok) {
+      const value = env.value || {}
+      GATE.pending = pendingOf(value)
+      GATE.ttlMs = Number.isFinite(Number(value.ttl_ms)) ? Number(value.ttl_ms) : null
+      GATE.confirmErr = null
+    } else {
+      GATE.confirmErr = errText(env, 'POST /api/wb/confirmation 取数失败')
+    }
+    return env
+  }
+  const refreshGateOnly = () => Promise.all([loadPlan(), loadConfirmation()])
+  function setPlanMsg(text, tone) {
+    GATE.planMsg = text ? { text, tone: tone || 'info' } : null
+    renderPlanGate()
+  }
+  function setConfirmMsg(text, tone) {
+    GATE.confirmMsg = text ? { text, tone: tone || 'info' } : null
+    renderConfirmChannel()
+  }
+  /** 待确认态自动作废：二次点击窗口过期即撤销，避免「很久以前的那一次点击」被兑现。 */
+  function armExpiry() {
+    if (GATE.armTimer) clearTimeout(GATE.armTimer)
+    GATE.armTimer = setTimeout(() => {
+      GATE.armedPlan = null
+      GATE.armedDecision = null
+      renderPlanGate()
+      renderConfirmChannel()
+    }, ARM_TTL_MS)
+  }
+  function resetArm() {
+    GATE.armedPlan = null
+    GATE.armedDecision = null
+    renderPlanGate()
+    renderConfirmChannel()
+  }
+
+  /* ── 9a. 冻结计划执行（弹窗内控件） ─────────────────────────────────────── */
+  function buildPlanGate(mask) {
+    let gate = q('#v3PlanGate', mask)
+    if (gate) return gate
+    gate = document.createElement('div')
+    gate.id = 'v3PlanGate'
+    gate.innerHTML =
+      '<div class="appr-line"><span class="k">当前模式</span><span class="v num" id="v3PlanMode">—</span></div>' +
+      '<div class="appr-line"><span class="k">expected_mode</span><span class="v num" id="v3PlanExpected">—</span></div>' +
+      '<div class="appr-line"><span class="k">plan_hash</span><span class="v num" id="v3PlanHash">—</span></div>' +
+      '<div class="pass-row" id="v3PlanPassRow" style="display:none">' +
+        '<input type="password" id="v3PlanPass" placeholder="输入口令：确认执行" autocomplete="off" aria-label="确认执行口令">' +
+      '</div>' +
+      '<div class="block-reason" id="v3PlanWarn">执行已冻结计划是<b>唯一受约束下单入口</b>：只在人工点击并<b>二次确认</b>后写入指令文件，' +
+        '绝不自动执行、加载时不写。SIM 免口令；LIVE 需逐字口令「确认执行」。</div>' +
+      '<div class="appr-line" id="v3PlanConfirmLine" style="display:none">' +
+        '<span class="k">待确认载荷</span><span class="v num" id="v3PlanConfirmText">—</span></div>' +
+      '<div class="pass-err" id="v3PlanErr" style="display:none"></div>'
+    const note = q('.m-note', mask)
+    const btns = q('.m-btns', mask)
+    if (note && note.parentElement && btns) note.parentElement.insertBefore(gate, btns)
+    else mask.appendChild(gate)
+    // 「取消计划」按钮（action:'cancel'）：插在「确认执行」左边，沿用设计稿 .m-btns 布局
+    const confirmBtn = q('#mConfirm', mask)
+    if (btns && confirmBtn && !q('#v3PlanCancel', btns)) {
+      const cancelPlan = document.createElement('button')
+      cancelPlan.className = 'btn'
+      cancelPlan.id = 'v3PlanCancel'
+      cancelPlan.textContent = '取消计划'
+      btns.insertBefore(cancelPlan, confirmBtn)
+    }
+    return gate
+  }
+  function renderPlanGate() {
+    const mask = q('#planMask')
+    if (!mask) return
+    const gate = buildPlanGate(mask)
+    if (!gate) return
+    const plan = currentPlan()
+    const modeText = String(GATE.mode || 'sim')
+    const liveNow = isLive()
+    V3.setText(gate, '#v3PlanMode', liveNow ? 'LIVE（实盘）' : `${modeText.toUpperCase()}（模拟）`)
+    V3.setText(gate, '#v3PlanExpected', modeText)
+    V3.setText(gate, '#v3PlanHash', planHashOf(plan) || (GATE.planErr ? '取数失败' : '—'))
+    const passRow = q('#v3PlanPassRow', gate)
+    if (passRow) passRow.style.display = liveNow ? 'flex' : 'none'
+    const armed = GATE.armedPlan
+    const btn = q('#mConfirm', mask)
+    if (btn) {
+      btn.textContent = armed && armed.action === 'execute' ? '再次点击确认执行'
+        : (liveNow ? '执行已冻结计划（LIVE 需口令）' : '执行已冻结计划')
+      btn.disabled = GATE.busy
+      btn.title = '提交 plan-execute（action=execute）：唯一受约束下单入口，需二次点击确认' +
+        (liveNow ? '；LIVE 必须先输入逐字口令「确认执行」，口令不合规不发请求' : '；SIM 免口令')
+    }
+    const cancelBtn = q('#v3PlanCancel', mask)
+    if (cancelBtn) {
+      cancelBtn.textContent = armed && armed.action === 'cancel' ? '再次点击确认取消' : '取消计划'
+      cancelBtn.disabled = GATE.busy
+      cancelBtn.title = '提交 plan-execute（action=cancel）：只本地撤销未提交订单，需二次点击确认；左侧「取消」只关闭弹窗，不提交任何指令'
+    }
+    const line = q('#v3PlanConfirmLine', gate)
+    const lineText = q('#v3PlanConfirmText', gate)
+    if (line && lineText) {
+      line.style.display = armed ? 'flex' : 'none'
+      if (armed) {
+        lineText.textContent = armed.action === 'cancel'
+          ? `action=cancel · plan_hash=${armed.plan_hash} · expected_mode=${armed.expected_mode}`
+          : `action=execute · plan_hash=${armed.plan_hash} · expected_mode=${armed.expected_mode}` +
+            (armed.live ? ` · confirmation=${PLAN_CONFIRM_WORD}` : ' · 无 confirmation（非 live）')
+      }
+    }
+    const box = q('#v3PlanErr', gate)
+    if (box) {
+      const msg = GATE.planMsg
+      box.style.display = msg ? 'block' : 'none'
+      box.textContent = msg ? msg.text : ''
+      box.style.color = msg && msg.tone === 'ok' ? 'var(--green)'
+        : msg && msg.tone === 'warn' ? 'var(--amber)' : 'var(--red)'
+    }
+  }
+  function bindPlanGate() {
+    const mask = q('#planMask')
+    if (!mask) return
+    // 设计稿内联脚本在解析时已给 #mConfirm 绑了演示 toast（HTML 不能改）：克隆替换掉它，
+    // 从此这个按钮只走真实 plan-execute 通道。
+    const confirmBtn = q('#mConfirm', mask)
+    if (confirmBtn && confirmBtn.dataset.v3Bound !== '1') {
+      const clone = confirmBtn.cloneNode(true)
+      clone.dataset.v3Bound = '1'
+      confirmBtn.replaceWith(clone)
+      clone.addEventListener('click', () => planExecuteClick('execute'))
+    }
+    const cancelBtn = q('#v3PlanCancel', mask)
+    if (cancelBtn && cancelBtn.dataset.v3Bound !== '1') {
+      cancelBtn.dataset.v3Bound = '1'
+      cancelBtn.addEventListener('click', () => planExecuteClick('cancel'))
+    }
+    const closeBtn = q('#mCancel', mask)
+    if (closeBtn && closeBtn.dataset.v3Reset !== '1') {
+      closeBtn.dataset.v3Reset = '1'
+      closeBtn.title = '只关闭弹窗，不提交任何指令'
+      closeBtn.addEventListener('click', resetArm)   // 关闭弹窗 = 撤销待确认态
+    }
+    const openBtn = q('#btnFreeze')
+    if (openBtn && openBtn.dataset.v3Refresh !== '1') {
+      openBtn.dataset.v3Refresh = '1'
+      openBtn.addEventListener('click', () => {
+        resetArm()
+        refreshGateOnly().then(() => { renderModal([], dominantPlan([])) }).catch(() => {})
+      })
+    }
+  }
+  /**
+   * 执行/取消冻结计划。任何一次点击都以「口令校验 → 计划校验 → 是否已处于待确认态」的顺序处理，
+   * 校验不通过时在**发请求之前** return。
+   * @param {'execute'|'cancel'} action
+   */
+  async function planExecuteClick(action) {
+    const want = action === 'cancel' ? 'cancel' : 'execute'
+    if (GATE.busy) { setPlanMsg('正在刷新或提交，请稍候再点击…', 'warn'); return }
+    const plan = currentPlan()
+    const hash = planHashOf(plan)
+    const pass = q('#v3PlanPass')
+    const password = pass ? String(pass.value || '') : ''
+    // ① 口令门槛优先于一切：live 执行口令不合规 → 不发任何请求（读写都不发）
+    if (want === 'execute' && isLive() && password !== PLAN_CONFIRM_WORD) {
+      setPlanMsg(`实时账户执行需输入口令「${PLAN_CONFIRM_WORD}」；口令不合规，未发出任何请求`, 'err')
+      return
+    }
+    if (!hash) {
+      setPlanMsg(GATE.planErr || '无冻结计划：/api/wb/plan 未返回可执行计划（content_hash 缺失）', 'err')
+      return
+    }
+    if (want === 'execute' && plan.status !== 'frozen') {
+      setPlanMsg(`当前计划状态为 ${plan.status || '未知'}（非冻结态），不可执行；请刷新后重试`, 'err')
+      return
+    }
+    // ② 首次点击：只进入待确认态（不发写请求），并立刻重新拉取 plan/confirmation
+    if (!GATE.armedPlan || GATE.armedPlan.action !== want) {
+      GATE.armedPlan = { action: want, plan_hash: hash, expected_mode: GATE.mode, live: isLive() }
+      GATE.busy = true
+      setPlanMsg(want === 'execute'
+        ? '待确认：请核对下方载荷，再次点击「执行已冻结计划」才写入指令（不会自动执行）'
+        : '待确认：请再次点击「取消计划」提交取消指令', 'warn')
+      try {
+        await refreshGateOnly()          // 执行前重新拉取（只读）
+      } finally {
+        GATE.busy = false
+      }
+      const fresh = currentPlan()
+      if (GATE.armedPlan && (planHashOf(fresh) !== GATE.armedPlan.plan_hash || GATE.mode !== GATE.armedPlan.expected_mode)) {
+        GATE.armedPlan = null
+        setPlanMsg('计划或账户模式已变化（plan_hash / mode），已撤销待确认态，请核对后重新点击', 'err')
+      }
+      renderPlanGate()
+      renderModal([], dominantPlan([]))
+      renderConfirmChannel()
+      armExpiry()
+      return
+    }
+    // ③ 第二次点击 = 提交（载荷就是上一次点击展示出来的那一份）
+    const armed = GATE.armedPlan
+    if (armed.action === 'execute' && armed.live && password !== PLAN_CONFIRM_WORD) {
+      setPlanMsg(`实时账户执行需输入口令「${PLAN_CONFIRM_WORD}」；口令不合规，未发出任何请求`, 'err')
+      return
+    }
+    GATE.busy = true
+    renderPlanGate()
+    try {
+      const payload = armed.action === 'cancel'
+        ? { plan_hash: armed.plan_hash, expected_mode: armed.expected_mode, action: 'cancel' }
+        : { plan_hash: armed.plan_hash, expected_mode: armed.expected_mode }
+      if (armed.action === 'execute' && armed.live) payload.confirmation = PLAN_CONFIRM_WORD
+      const env = await V3.wb('plan-execute', payload)
+      if (env && env.ok) {
+        const value = env.value || {}
+        GATE.armedPlan = null
+        if (pass) pass.value = ''      // 口令不留存
+        setPlanMsg(`已提交（action=${value.action || armed.action}，nonce=${value.nonce || '—'}）：`
+          + '指令文件已写入，状态由 daemon 回写；计划合法性与风控在 daemon 侧复核', 'ok')
+        toast(armed.action === 'cancel' ? '取消计划指令已提交' : '执行指令已提交（等待 daemon 回写）', 'ok')
+      } else {
+        setPlanMsg(errText(env, 'plan-execute 失败'), 'err')
+      }
+    } catch (error) {
+      setPlanMsg(String((error && error.message) || error), 'err')
+    } finally {
+      GATE.busy = false
+      await refreshGateOnly()          // 执行后重新拉取
+      renderPlanGate()
+      renderModal([], dominantPlan([]))
+      renderConfirmChannel()
+    }
+  }
+
+  /* ── 9b. 人工审批决定（待确认请求 → confirm-decide） ─────────────────────── */
+  function ensureConfirmSection() {
+    let section = q('#v3ConfirmChannel')
+    if (section) return section
+    const anchor = q('[data-od-id="graded-approval"]')
+    if (!anchor || !anchor.parentElement) return null
+    section = document.createElement('section')
+    section.className = 'card'
+    section.id = 'v3ConfirmChannel'
+    section.innerHTML =
+      '<div class="sec-head">' +
+        '<h2>待确认请求</h2>' +
+        '<span class="sub">实盘业务确认 · /api/wb/confirmation → confirm-decide（唯一能批准实盘操作的通道）</span>' +
+      '</div>' +
+      '<div id="v3ConfirmBody"></div>' +
+      '<div class="queue-next" id="v3ConfirmNote"></div>'
+    anchor.parentElement.insertBefore(section, anchor.nextSibling)
+    return section
+  }
+  function renderConfirmChannel() {
+    const section = ensureConfirmSection()
+    if (!section) return
+    const body = q('#v3ConfirmBody', section)
+    if (!body) return
+    const note = q('#v3ConfirmNote', section)
+    const ttlSeconds = GATE.ttlMs ? Math.round(GATE.ttlMs / 1000) : CONFIRM_TTL_FALLBACK
+    if (note) {
+      note.innerHTML = '口径区分：/api/v3/oms/orders 台账里 stage=manual 的订单是<b>平台侧台账的审批阶段</b>（风控超单笔上限退回人工），' +
+        '<b>不是</b>券商待确认；<b>券商实盘业务确认</b>只出现在本区块——批准即授权该笔实盘操作，拒绝或超过 ' +
+        `${esc(ttlSeconds)} 秒未作答一律按拒绝处理（fail-closed）。本页不产生下单参数：决策载荷只有 {id, decision}。`
+    }
+    if (GATE.confirmErr) {
+      body.innerHTML = '<div class="appr-card"><div class="appr-top"><b>待确认请求读取失败</b>' +
+        '<span class="badge b-red">取数失败</span></div>' +
+        `<div class="appr-line"><span class="k">错误</span><span class="v" style="color:var(--red)">${esc(GATE.confirmErr)}</span></div></div>`
+      return
+    }
+    const pending = GATE.pending
+    if (!pending || !pending.id) {
+      // 无待确认时同样把两个控件摆在页面上（禁用）：确认通道的存在与口径对操作者可见，
+      // 但没有 id 就无从作答——服务端也会拒（没有待确认的实盘操作）。
+      body.innerHTML = '<div class="appr-card">' +
+        '<div class="appr-top"><b>当前无待确认请求</b><span class="badge b-blue">空闲</span></div>' +
+        '<div class="appr-line"><span class="k">说明</span><span class="v">只有实盘写操作（下单/改单/撤单）才会产生待确认；' +
+        'SIM 模式与只读动作不产生。请求出现后本区块每 10 秒自动重读一次。</span></div>' +
+        '<div class="pass-row">' +
+          '<button class="btn btn-primary" id="v3Approve" disabled>批准</button>' +
+          '<button class="btn" id="v3Reject" disabled>拒绝</button>' +
+        '</div>' +
+        `<div class="pass-err" id="v3ConfirmErr" style="display:${GATE.confirmMsg ? 'block' : 'none'};color:var(--red)">` +
+          `${esc(GATE.confirmMsg ? GATE.confirmMsg.text : '')}</div>` +
+        '<div class="queue-next">没有待确认请求时按钮不可用（决策载荷必须带服务端给出的 id，本页不能凭空构造）。</div>' +
+      '</div>'
+      return
+    }
+    const remain = remainingSeconds(pending.expires_at)
+    const expired = remain !== null && remain <= 0
+    const armed = GATE.armedDecision
+    const fields = pending.summary && Array.isArray(pending.summary.fields) ? pending.summary.fields : []
+    const remainText = remain === null ? '剩余时间未知' : (expired ? '已超时（服务端按拒绝）' : `等待确认中 · 剩余 ${remain} 秒`)
+    body.innerHTML = '<div class="appr-card">' +
+      `<div class="appr-top"><b>${esc(pending.operation || '实盘写操作')}</b>` +
+        `<span class="badge ${expired || remain === null ? 'b-red' : 'b-amber'}" id="v3ConfirmRemain">${esc(remainText)}</span></div>` +
+      '<div class="appr-kv">' +
+        `<div><div class="k">请求编号 id</div><div class="v num" id="v3ConfirmId">${esc(pending.id)}</div></div>` +
+        `<div><div class="k">工具</div><div class="v num">${esc(pending.tool || '—')}</div></div>` +
+        `<div><div class="k">模式</div><div class="v num">${esc(pending.mode || '—')}</div></div>` +
+        `<div><div class="k">来源 session</div><div class="v num">${esc(pending.session_id || '—')}</div></div>` +
+      '</div>' +
+      '<div class="appr-line"><span class="k">时间</span><span class="v num">' +
+        `发起 ${esc(stamp(pending.at))} · 到期 ${esc(stamp(pending.expires_at))} · 状态 ${esc(pending.status || 'pending')}</span></div>` +
+      (fields.length
+        ? fields.map((field) => '<div class="appr-line"><span class="k">' + esc(field.label || '—') + '</span>' +
+            '<span class="v num">' + esc(field.value == null ? '—' : field.value) + '</span></div>').join('')
+        : '<div class="appr-line"><span class="k">摘要</span><span class="v">服务端未给出 summary.fields</span></div>') +
+      '<div class="pass-row">' +
+        `<button class="btn btn-primary" id="v3Approve"${expired || remain === null || GATE.busy ? ' disabled' : ''}>` +
+          `${armed && armed.decision === 'approved' ? '再次点击确认批准' : '批准'}</button>` +
+        `<button class="btn" id="v3Reject"${GATE.busy ? ' disabled' : ''}>` +
+          `${armed && armed.decision === 'rejected' ? '再次点击确认拒绝' : '拒绝'}</button>` +
+      '</div>' +
+      `<div class="pass-err" id="v3ConfirmErr" style="display:${GATE.confirmMsg ? 'block' : 'none'};` +
+        `color:${GATE.confirmMsg && GATE.confirmMsg.tone === 'ok' ? 'var(--green)' : GATE.confirmMsg && GATE.confirmMsg.tone === 'warn' ? 'var(--amber)' : 'var(--red)'}">` +
+        `${esc(GATE.confirmMsg ? GATE.confirmMsg.text : '')}</div>` +
+      '<div class="queue-next">批准是唯一能授权实盘操作的通道：决策载荷只有 {id, decision}，本页不能填写任何下单参数。' +
+        '首次点击只进入待确认态，<b>第二次点击才提交</b>；决定后立刻重读 confirmation。</div>' +
+    '</div>'
+    const approve = q('#v3Approve', body)
+    if (approve) approve.addEventListener('click', () => decideClick('approved'))
+    const reject = q('#v3Reject', body)
+    if (reject) reject.addEventListener('click', () => decideClick('rejected'))
+  }
+  function tickConfirmCountdown() {
+    if (!GATE.pending) return
+    const badge = q('#v3ConfirmRemain')
+    if (!badge) return
+    const remain = remainingSeconds(GATE.pending.expires_at)
+    const expired = remain !== null && remain <= 0
+    badge.textContent = remain === null ? '剩余时间未知' : (expired ? '已超时（服务端按拒绝）' : `等待确认中 · 剩余 ${remain} 秒`)
+    badge.className = `badge ${expired || remain === null ? 'b-red' : 'b-amber'}`
+    const approve = q('#v3Approve')
+    if (approve) approve.disabled = expired || remain === null || GATE.busy
+  }
+  /**
+   * 批准/拒绝。首次点击只进入待确认态（不发请求）；第二次点击提交 {id, decision}。
+   * decision 取值来自服务端：approved / rejected（store_access.decide_confirmation）。
+   */
+  async function decideClick(decision) {
+    if (GATE.busy) { setConfirmMsg('正在提交或刷新，请稍候再点击…', 'warn'); return }
+    const pending = GATE.pending
+    if (!pending || !pending.id) { setConfirmMsg('无待确认请求（可能已处理或已超时）', 'err'); return }
+    const remain = remainingSeconds(pending.expires_at)
+    if (remain !== null && remain <= 0) {
+      setConfirmMsg('该请求已超时（服务端按拒绝 fail-closed 处理），请刷新后查看最新状态', 'err')
+      return
+    }
+    if (!GATE.armedDecision || GATE.armedDecision.decision !== decision || GATE.armedDecision.id !== pending.id) {
+      GATE.armedDecision = { id: pending.id, decision }
+      GATE.busy = true
+      setConfirmMsg(decision === 'approved'
+        ? '待确认：批准即授权该笔实盘操作；请再次点击「确认批准」提交 {id, decision}'
+        : '待确认：请再次点击「确认拒绝」提交 {id, decision}', 'warn')
+      try {
+        await loadConfirmation()          // 决定前重新拉取（只读）
+      } finally {
+        GATE.busy = false
+      }
+      const fresh = GATE.pending
+      if (GATE.armedDecision && (!fresh || fresh.id !== GATE.armedDecision.id)) {
+        GATE.armedDecision = null
+        setConfirmMsg('待确认请求已变化（已处理 / 已超时 / 换了一笔），已撤销待确认态，请核对后重新点击', 'err')
+      }
+      renderConfirmChannel()
+      armExpiry()
+      return
+    }
+    const armed = GATE.armedDecision
+    GATE.busy = true
+    try {
+      const env = await V3.wb('confirm-decide', { id: armed.id, decision: armed.decision })
+      if (env && env.ok) {
+        const value = env.value || {}
+        setConfirmMsg(`已${armed.decision === 'approved' ? '批准' : '拒绝'}（id=${value.id || armed.id}，`
+          + `operation=${value.operation || '—'}）；服务端按先到者定论记账`, 'ok')
+        toast(`已${armed.decision === 'approved' ? '批准' : '拒绝'}该笔实盘操作`, armed.decision === 'approved' ? 'ok' : 'warn')
+      } else {
+        setConfirmMsg(errText(env, 'confirm-decide 失败'), 'err')
+      }
+    } catch (error) {
+      setConfirmMsg(String((error && error.message) || error), 'err')
+    } finally {
+      GATE.busy = false
+      GATE.armedDecision = null
+      await refreshGateOnly()             // 决定后立刻重读 confirmation（与 plan）
+      await render().catch(() => {})      // 台账/看板据对账结果重读（失败不再抛到监听器外）
+    }
+  }
+  /** 只读轮询：1 秒更新倒计时（无请求），10 秒重读待确认，30 秒重读计划/模式。 */
+  function startGateTimers() {
+    if (GATE.timers) return
+    GATE.timers = true
+    setInterval(tickConfirmCountdown, 1000)
+    setInterval(() => {
+      loadConfirmation().then(() => { renderConfirmChannel() }).catch(() => {})
+    }, 10000)
+    setInterval(() => {
+      loadPlan().then(() => { renderPlanGate() }).catch(() => {})
+    }, 30000)
   }
 
   /* ── 主流程 ────────────────────────────────────────────────────────────── */
   async function render() {
-    const [execEnv, omsEnv, metricsEnv, auditEnv, riskEnv] = await Promise.all([
+    // 只读取数（含两条写通道的**读**端点）：加载阶段绝不调用 plan-execute / confirm-decide
+    const [execEnv, omsEnv, metricsEnv, auditEnv, riskEnv, planEnv, confirmEnv] = await Promise.all([
       V3.api('execution'),
       V3.api('oms/orders'),
       V3.api('metrics'),
       V3.api('audit?window=120'),
       V3.api('risk'),
+      V3.wb('plan', {}),
+      V3.wb('confirmation', {}),
     ])
     const exec = execEnv && execEnv.ok ? execEnv : null
     const oms = omsEnv && omsEnv.ok ? omsEnv : (exec && exec.oms ? exec.oms : null)
@@ -676,6 +1168,21 @@
     const nav = oms && fin(oms.nav) ? Number(oms.nav) : null
     const openRows = flatRows(exec && exec.orders_open, ['rows', 'orders'])
     const dealRows = flatRows(exec && exec.deals_today, ['rows', 'deals'])
+    if (planEnv && planEnv.ok) {
+      GATE.plan = planEnv.value || {}
+      GATE.mode = GATE.plan.mode || GATE.mode
+      GATE.planErr = null
+    } else {
+      GATE.planErr = errText(planEnv, 'POST /api/wb/plan 取数失败')
+    }
+    if (confirmEnv && confirmEnv.ok) {
+      const value = confirmEnv.value || {}
+      GATE.pending = pendingOf(value)
+      GATE.ttlMs = Number.isFinite(Number(value.ttl_ms)) ? Number(value.ttl_ms) : null
+      GATE.confirmErr = null
+    } else {
+      GATE.confirmErr = errText(confirmEnv, 'POST /api/wb/confirmation 取数失败')
+    }
 
     renderTopbar(mode, nav, metrics)
     renderExecHead(oms, orders, dealRows, mode)
@@ -684,9 +1191,12 @@
     renderOrderTable(orders, (order) => renderTrace(order, audit, riskCfg, nav))
     renderHoldings(qa('.hq-grid > .card')[0], positions)
     renderQuality(qa('.hq-grid > .card')[1], exec, orders, openRows)
-    renderModal(orders, dominantPlan(orders))
+    renderModal(orders, dominantPlan(orders))   // 内部渲染 plan-execute 控件
+    bindPlanGate()
+    renderConfirmChannel()                      // 「待确认请求」区块（confirm-decide）
     renderFooter(metrics, positions)
     scrubDesignScript()
+    startGateTimers()
   }
 
   render().catch((error) => {

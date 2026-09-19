@@ -71,7 +71,7 @@ Harness 内 `plugins/workbench` 保留 `tradingWorkbench` 服务锚
       独立服务进程（platform/，FastAPI + uvicorn 单进程；WP7 独立量化平台）
         ├─ 服务内调度器（吸收 daemon 作业链：sync→quality→factors_snapshot；
         │   心跳/告警协议不变，daemon CLI 保留为手动入口）
-        ├─ POST /api/wb/<endpoint>（envelope 契约）→ Ant Design Pro 前端
+        ├─ POST /api/wb/<endpoint>（envelope 契约）→ V3 控制台（设计稿原样页面 + /api/v3 数据注入）
         ├─ /mcp（mcp SDK streamable-http，74 工具）→ Harness 的 mcp__quantwb__*
         ├─ 交易闸门：mode → 时段闸门（WP19：非可委托时段即拒，撤单放行）
         │   → 风控 8 规则（kill=规则 1）→ 业务确认（Web 卡片，进程内）
@@ -317,7 +317,7 @@ futu → AKShare → Yahoo）、`last30days`（可选组件，未安装即缺席
 
 | 层 | 位置 | 作用 |
 |---|---|---|
-| 客户端内存缓存 | `platform/web/src/services/api.js`（按接口 TTL，对齐旧 client.js） | 切页签、重开页面不再重复请求 |
+| 客户端内存缓存 | `platform/web/lib/services/api.js`（按接口 TTL，对齐旧 client.js） | 切页签、重开页面不再重复请求 |
 | 服务 TTL 缓存 | `platform/server/caches.py` 的 `CACHE_TTL_MS`（按接口粒度，1–30 分钟） | 即使客户端重新请求也不会重跑取数 |
 
 `_refresh: true` 是显式旁路标记（不参与各接口的字段校验）；页面的「刷新」按钮会清空

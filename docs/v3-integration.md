@@ -1,6 +1,6 @@
 # V3 接入与授权：接口已对齐，等待注入密钥
 
-本文记录 V3 控制台（Ant Design Pro 前端 + FastAPI 后端）**已对齐的数据源接口**、
+本文记录 V3 控制台（**设计稿原样页面 + FastAPI 后端**，无前端构建步骤）**已对齐的数据源接口**、
 **需要密钥的位置**、以及**注入后如何生效**。原则：没有密钥时接口不报 500、不发无效请求，
 而是返回可读错误（`{ok:false,error:{code,message}}`），页面显式显示「无数据源 + 原因」；
 注入后无需改代码，重启服务即生效。
@@ -86,8 +86,7 @@ V3 控制台是 **OpenDesign 设计稿的 HTML/CSS 原样页面**（`platform/we
 ## 四、部署与自检
 
 ```bash
-# 前端构建（产物由 FastAPI 直接服务；设计稿页面随 public/ 原样拷入 dist/v3）
-cd platform/web && npm run build
+# 无前端构建步骤：V3 控制台就在 platform/web/public/v3/，FastAPI 直接服务该目录
 
 # 服务（构建产物在 platform/web/dist，FastAPI 静态兜底直接打开）
 cd platform && ~/.dsh/trading-venv/bin/python -m server.run     # http://127.0.0.1:8397

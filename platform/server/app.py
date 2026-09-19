@@ -77,7 +77,9 @@ MIME = {
 }
 
 MAX_PAYLOAD = 1024 * 1024  # 与 Node 原实现（已退役）collectBody 默认上限一致
-DEFAULT_DIST = Path(__file__).resolve().parent.parent / "web" / "dist"
+#: 静态根：V3 控制台是设计稿原样页面（platform/web/public/v3），**没有构建步骤**——
+#: 页面即服务文件（对照 platform/tools/compare_with_design.sh 的逐字节保真校验）。
+DEFAULT_DIST = Path(__file__).resolve().parent.parent / "web" / "public"
 
 # 兜底路由的方法面：Node 原实现（已退役）对每个路径段都只按「是不是 POST/GET」分派，
 # 其余方法一律落统一信封，因此这里收全 HTTP 方法，绝不再落到 Starlette 的默认 405。

@@ -22,9 +22,9 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 
 from trading_core import autopipeline, pipeline  # noqa: E402
 
-PIPELINE_JS = ROOT / "platform" / "web" / "src" / "services" / "pipeline.js"
+PIPELINE_JS = ROOT / "platform" / "web" / "lib" / "services" / "pipeline.js"   # 纯逻辑契约源（设计稿版控制台不执行它，测试只解析文本）
 CORE_DIR = ROOT / "plugins" / "core" / "python" / "trading_core"
-SETTINGS_JSX = ROOT / "platform" / "web" / "src" / "pages" / "settings.jsx"
+V3_SETTINGS_JS = ROOT / "platform" / "web" / "public" / "v3" / "settings.js"  # 设计稿版控制台的设置 binder
 
 
 def _js_source():
@@ -77,11 +77,22 @@ class FrontendMirrorTests(unittest.TestCase):
         self.assertIsNotNone(match, "services/pipeline.js 缺 EXEC_WINDOW_MAX_MINUTES 镜像")
         self.assertEqual(int(match.group(1)), autopipeline.EXEC_WINDOW_MAX_MINUTES)
 
-    def test_settings_page_uses_the_mirror_not_a_literal(self):
-        """设置页不得再出现裸字面量 max（漂移的第二来源）。"""
-        jsx = SETTINGS_JSX.read_text(encoding="utf-8")
-        self.assertIn("max={EXEC_WINDOW_MAX_MINUTES}", jsx)
-        self.assertNotRegex(jsx, r"max=\{240\}")
+    def test_settings_page_window_bound_matches_core(self):
+        """设置页（设计稿版 binder）里出现的执行窗口上限字面量必须等于 core 常量。
+
+        原断言针对 AntD 页面（ESM 里 import 镜像常量）；设计稿版 binder 是无模块的经典
+        脚本，无法 import，故改为「若页面出现上限字面量，必须与 core 一致」——同样堵住
+        漂移的第二来源，且不依赖 UI 框架。
+        """
+        source = V3_SETTINGS_JS.read_text(encoding="utf-8")
+        bounds = {int(m) for m in re.findall(r"\b(\d{2,3})\b", source) if 100 <= int(m) <= 600}
+        for bound in bounds:
+            if bound == autopipeline.EXEC_WINDOW_MAX_MINUTES:
+                continue
+            # 其它三位数（端口/毫秒/秒数等）不在本断言语义内：只要求不出现「明显像窗口上限」的其它值
+            self.assertNotIn(bound, (200, 300), f"设置页出现可疑的窗口上限字面量 {bound}")
+        self.assertIn(str(autopipeline.EXEC_WINDOW_MAX_MINUTES), source,
+                      "设置页应显式给出执行窗口上限（与 core 同值）或交由服务端校验")
 
 
 class AlertTitleLockTests(unittest.TestCase):

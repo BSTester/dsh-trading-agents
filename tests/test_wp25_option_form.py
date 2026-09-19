@@ -8,7 +8,7 @@
 三处来源，任何一处漂移都要在这里炸出来（手法沿用 ``tests/test_wp10_locks.py``：
 解析源码比对，不相信「记得同步」）：
 
-  1. ``platform/web/src/services/optionScreen.js`` 的 ``OPTION_MARKET_CATEGORIES``
+  1. ``platform/web/lib/services/optionScreen.js`` 的 ``OPTION_MARKET_CATEGORIES``
      ——表单单选/多选的选项面；
   2. ``platform/server/futu_data.py`` 的 ``OPTION_MARKET_CATEGORIES``
      ——服务端错误消息与 MCP 工具描述引用的事实源；
@@ -28,7 +28,7 @@ sys.path.insert(0, str(ROOT / "platform"))
 
 from server import futu_data, mcp_tools  # noqa: E402
 
-OPTION_SCREEN_JS = ROOT / "platform" / "web" / "src" / "services" / "optionScreen.js"
+OPTION_SCREEN_JS = ROOT / "platform" / "web" / "lib" / "services" / "optionScreen.js"  # 共享契约源
 TOOL_LIMITS = ROOT / "docs" / "TOOL-LIMITS.md"
 
 

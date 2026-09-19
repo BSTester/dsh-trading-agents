@@ -660,7 +660,7 @@ SH 503 行 / HK 507 / US 511，边界全部 `2027-12-31`；`2026-10-12`（周一
 
 | 修订 | 不变量 / 口径 | 锁定测试 |
 |---|---|---|
-| 新增 `platform/web/src/services/strategies.js` | 策略下拉的取值域 = 内置策略（4 个，core `strategies.REGISTRY` 的镜像）∪ `rules` 端点里 `status==='enabled'` 的 `rule_id`；`candidate/validating/passed/failed/disabled` **一律不进下拉**（`_resolve_strategy` 不会消费它们）。当前值不可用时给「补位项」（如「已停用：xxx」「未知策略名」）——**不因选择器没有该项而静默改配置** | `platform/web/tests/strategies.test.mjs`（6 例）+ 漂移锁 `tests/test_wp22_settings_options.py::FrontendStrategyMirrorTests` |
+| 新增 `platform/web/lib/services/strategies.js` | 策略下拉的取值域 = 内置策略（4 个，core `strategies.REGISTRY` 的镜像）∪ `rules` 端点里 `status==='enabled'` 的 `rule_id`；`candidate/validating/passed/failed/disabled` **一律不进下拉**（`_resolve_strategy` 不会消费它们）。当前值不可用时给「补位项」（如「已停用：xxx」「未知策略名」）——**不因选择器没有该项而静默改配置** | `platform/web/tests/strategies.test.mjs`（6 例）+ 漂移锁 `tests/test_wp22_settings_options.py::FrontendStrategyMirrorTests` |
 | 内置策略清单 = REGISTRY 镜像 | id 集合逐字相等（正则解析 JS + Python 常量比对，沿用 `test_wp10_locks` 手法）；标签/说明必须中文非空 | `FrontendStrategyMirrorTests.test_ids_match_core_registry` |
 | `selectable: false` = 缺 `target_weights` | ⚠ **本轮实测的新缺陷**：`rsi` 与 `ma_cross`（`SingleTicker` 子类）**没有 `target_weights`**，`plan_auto` 走到 `strategy.target_weights(...)` 会抛 `AttributeError: 'RsiStrategy' object has no attribute 'target_weights'`（复现：临时 home + 单日日历 + 一根 bar + `strategy=rsi`）。它违反 `plan_auto` 自己的「永不抛」契约 → 当日 build_plan 作业失败。写入侧**仍按「内置策略 id 一律合法」放行**（否则要多出第二份「哪些策略能在自动路径跑」的登记表，两处迟早漂移）；设置页把这两项**显示为「自动流水线不支持」并禁止选择**，配置里已有的值原样回显 + 黄条说明 | `test_selectable_matches_core_capability`（能力事实 ↔ JS 标志的漂移锁） |
 | 4 个字段改控件 | 策略/池键 → `Select`（策略带分组：内置策略 / 已批准规则 / 配置里的当前值；池键 `mode="tags"` 默认 `watchlist` 且允许自定义键名）；`exec_at`/`reconcile_at` → `TimePicker`（`HH:mm`） | `tests/test_wp22_settings_options.py::SettingsPageControlTests`（结构锁：不得退回自由文本框） |
@@ -695,7 +695,7 @@ SH 503 行 / HK 507 / US 511，边界全部 `2027-12-31`；`2026-10-12`（周一
 
 **用户原话**：「还需要加强一下，各个页面中的信息，需要按市场分类来查看，现在混为一谈不方便。」
 
-**前置（本轮之前已就绪，本轮未改口径）**：`platform/web/src/services/marketFilter.js`
+**前置（本轮之前已就绪，本轮未改口径）**：`platform/web/lib/services/marketFilter.js`
 （市场值/标的 → 市场链的纯函数 + 8 例 node --test）、`services/marketContext.jsx`
 （`MarketFilterProvider` + `useMarketFilter`，选择持久化在 localStorage）、`app.jsx`
 页头选择器（可访问名「市场筛选」）。本轮新增 `services/marketView.js`（页面级纯函数：
@@ -778,7 +778,7 @@ Playwright 实机截图（全部市场 vs 只看港股）见本轮回报，5 个
    合并点在 `app.py` 的 snapshot 分支——`store_access.snapshot()` 保持「只用标准库」与
    「与 store.js 逐行对应」两条既有不变式（见下面「与任务假设不符」第 1 条）。
    关注池缺失/为空/配置损坏 → 空数组；`trading_core` 不可导入 → 同样空数组，**不阻断快照**。
-2. **前端纯函数**：`platform/web/src/services/symbols.js` —— `toFutuSymbol`（逐条镜像
+2. **前端纯函数**：`platform/web/lib/services/symbols.js` —— `toFutuSymbol`（逐条镜像
    `trading_datasource.market.to_futu_symbol`）、`symbolCandidates`、
    `symbolCandidatesFromPayloads`、`filterSymbolCandidates`、`splitSymbolList` /
    `joinSymbolList`。跨语言镜像由 `tests/test_wp24_symbol_mirror.py` 锁（正则解析 JS 常量
@@ -875,7 +875,7 @@ Python 全量 2411 例 `OK (skipped=5)`、根 `node --test tests/*.test.mjs` 66 
 
 - **`1=Buy / 2=Sell` 在两个端点/两个通道本就是同一份枚举**：工作台 `orders_open` 里的中文
   「买入/卖出」是 `platform/server/labels.py` 的 `SIDE = {1:"买入",2:"卖出"}` 对同一份整数码的
-  中文化（前端 `platform/web/src/services/runtimeCharts.js` 的 `SIDE_CODES` 同值），**不是两套
+  中文化（前端 `platform/web/lib/services/runtimeCharts.js` 的 `SIDE_CODES` 同值），**不是两套
   枚举**；`broker.place` 出站也用 `side_code = 1 if side == "BUY" else 2`。用户假设的「两通道
   方向口径不同」在真机上不成立。
 - 因此本地 `−1000 / −200` 是**符号正确**的结果：那两张单是**部分减仓**（券商持仓行原文
