@@ -485,6 +485,87 @@
     if (side) side.textContent = `v3 · 工具 ${metrics.toolTotal ?? '—'} 个 · 凭据未配置时 Tushare 取数直接返回 no-token`
   }
 
+  /** Tushare token 的**页面化配置**：在设计稿凭据表下方就地渲染输入框 + 保存/测试/清除。
+   *  设计稿 HTML 不改；控件使用设计稿自己的 .input/.btn 类与 token 变量，视觉与页面一致。
+   *  安全：输入框 type=password，保存后立即清空；服务端与页面都不回显凭据值（只显示掩码尾号）。 */
+  function renderCredentialOps(credentials, refresh) {
+    const section = document.querySelector('[data-od-id="credential-registry"]')
+    if (!section) return
+    const entries = Array.isArray(credentials.keys) ? credentials.keys : []
+    const entry = entries[0]
+    if (!entry) return
+    const present = Boolean(entry.present)
+
+    // 1) 表格行内操作列：把「只读」换成真实按钮
+    const firstRowOps = section.querySelector('#credTable tbody tr td:last-child .ops')
+    if (firstRowOps) {
+      firstRowOps.innerHTML = '<button class="op" data-cred="test">测试</button>'
+        + (present ? '<button class="op danger" data-cred="clear">清除</button>' : '')
+    }
+
+    // 2) 表下就地表单（已存在则不重复创建）
+    let panel = section.querySelector('#v3CredOps')
+    if (!panel) {
+      panel = document.createElement('div')
+      panel.id = 'v3CredOps'
+      panel.className = 'table-foot'
+      panel.style.cssText = 'display:flex;flex-wrap:wrap;gap:8px;align-items:center;margin-top:10px'
+      panel.innerHTML = '<span style="color:var(--muted)">' + esc(entry.label) + '：</span>'
+        + '<input class="input" id="v3CredValue" type="password" autocomplete="off" '
+        + 'placeholder="粘贴 token（保存后不再回显）" style="min-width:320px">'
+        + '<button class="btn" id="v3CredSave">保存</button>'
+        + '<button class="btn" id="v3CredTest">测试连通性</button>'
+        + (present ? '<button class="btn" id="v3CredClear">清除页面配置</button>' : '')
+        + '<span id="v3CredMsg" style="color:var(--faint)"></span>'
+      const wrap = section.querySelector('.table-wrap')
+      ;(wrap ?? section).parentElement?.appendChild(panel) ?? section.appendChild(panel)
+
+      const msg = (text, tone) => {
+        const box = panel.querySelector('#v3CredMsg')
+        if (box) { box.textContent = text; box.style.color = tone === 'bad' ? 'var(--red)' : tone === 'ok' ? 'var(--green)' : 'var(--faint)' }
+      }
+      const act = async (action) => {
+        const input = panel.querySelector('#v3CredValue')
+        const value = input?.value?.trim() ?? ''
+        if (action === 'save' && !value) { msg('请先粘贴 token', 'bad'); return }
+        msg('执行中…')
+        try {
+          const body = await V3.post('credentials', { action, key: entry.key, value })
+          if (!body?.ok) { msg(`${body?.error?.code ?? '失败'}：${body?.error?.message ?? ''}`, 'bad'); return }
+          if (action === 'test') {
+            msg(body.ok ? `连通正常（${body.latency_ms}ms · 来源 ${body.source}）` : '', 'ok')
+            if (body.error) msg(`${body.error.code}：${body.error.message}`, 'bad')
+          } else {
+            if (action === 'save' && input) input.value = ''
+            msg(action === 'save' ? '已保存（0600 落盘，立即生效；环境变量优先）' : '已清除页面配置（环境变量不受影响）', 'ok')
+          }
+          await refresh()
+        } catch (error) {
+          msg(String(error?.message ?? error), 'bad')
+        }
+      }
+      panel.querySelector('#v3CredSave')?.addEventListener('click', () => act('save'))
+      panel.querySelector('#v3CredTest')?.addEventListener('click', () => act('test'))
+      panel.querySelector('#v3CredClear')?.addEventListener('click', () => act('clear'))
+    }
+
+    // 3) 行内按钮绑定（每次渲染后重新绑定）
+    section.querySelectorAll('[data-cred]').forEach((btn) => {
+      btn.addEventListener('click', async () => {
+        const action = btn.dataset.cred
+        const value = panel.querySelector('#v3CredValue')?.value?.trim() ?? ''
+        const msg = panel.querySelector('#v3CredMsg')
+        if (action === 'save' && !value) { if (msg) { msg.textContent = '请先在下方输入 token'; msg.style.color = 'var(--red)' } return }
+        const body = await V3.post('credentials', { action, key: entry.key, value })
+        if (msg) {
+          msg.textContent = body?.ok ? (action === 'test' ? `连通正常（${body.latency_ms}ms）` : '已清除') : `${body?.error?.code ?? '失败'}`
+          msg.style.color = body?.ok ? 'var(--green)' : 'var(--red)'
+        }
+        await refresh()
+      })
+    })
+  }
+
   async function render() {
     const [settings, metrics, overview, orders, audit, credentials] = await Promise.all([
       V3.api('settings'), V3.api('metrics'), V3.api('overview'), V3.api('oms/orders'),
@@ -502,6 +583,7 @@
     }
     if (audit.ok) renderAudit(audit)
     renderCredentials(credentials.ok ? credentials : { keys: [] }, settings.ok ? settings : {}, metrics.ok ? metrics : {})
+    if (credentials.ok) renderCredentialOps(credentials, render)
     if (metrics.ok) renderFooter(settings.ok ? settings : {}, metrics, credentials.ok ? credentials : { keys: [] })
     V3.demoSweep(document.body)
   }
