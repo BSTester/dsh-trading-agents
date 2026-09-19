@@ -85,7 +85,7 @@ test('静态 UI：首页可访问且为设计稿', async () => {
 test('实时数据层：包含逐点位深绑定与防御性渲染护栏', async () => {
   const js = await fetch(`${BASE}/app.js`)
   const source = await js.text()
-  for (const marker of ['setValueWithUnit', 'bindByLabel', 'bindChannelCard', 'deepBindIndex', 'deepBindTools', 'isSeparator']) {
+  for (const marker of ['setValueWithUnit', 'bindByLabel', 'bindChannelCard', 'deepBindIndex', 'deepBindTools', 'deepBindSettings', 'deepBindRisk', 'isSeparator', 'lineChartSvg', 'barChartSvg', 'bindSparkline']) {
     assert.ok(source.includes(marker), `app.js 缺少 ${marker}`)
   }
   // 行级防御：渲染表格时过滤非数组行（避免单页结构异常把整块实时条打空）

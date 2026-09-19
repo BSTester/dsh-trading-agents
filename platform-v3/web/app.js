@@ -125,6 +125,7 @@
       if (Number.isFinite(Number(equity.sharpe))) kpis['夏普比率'] = Number(equity.sharpe).toFixed(2)
       if (Number.isFinite(Number(equity.max_drawdown))) kpis['最大回撤'] = `${sign(-Math.abs(Number(equity.max_drawdown) * 100))}${fmtPct(Math.abs(Number(equity.max_drawdown) * 100))}`
       bindByLabel(root, '.kpi', '.kpi-label', '.kpi-value', kpis)
+      bindSparkline(root, points.map((p) => p.equity))
       // 子标签：总资产卡片显示真实的较昨日增量（无前一交易日则给「—」）
       for (const card of root.querySelectorAll('.kpi')) {
         if (card.querySelector('.kpi-label')?.textContent?.trim() !== '总资产') continue
@@ -209,6 +210,65 @@
     }
   }
 
+
+
+  // ── 真实数据图形（自绘 SVG，不依赖任何图表库）────────────────────────────────
+  function lineChartSvg(values, { width = 720, height = 170, color = 'var(--blue)' } = {}) {
+    const nums = values.map(Number).filter((v) => Number.isFinite(v))
+    if (nums.length < 2) return ''
+    const min = Math.min(...nums)
+    const max = Math.max(...nums)
+    const span = max - min || 1
+    const x = (i) => (i / (nums.length - 1)) * (width - 8) + 4
+    const y = (v) => height - 16 - ((v - min) / span) * (height - 34)
+    const d = nums.map((v, i) => `${i === 0 ? 'M' : 'L'}${x(i).toFixed(1)},${y(v).toFixed(1)}`).join(' ')
+    const area = `${d} L${x(nums.length - 1).toFixed(1)},${height - 16} L${x(0).toFixed(1)},${height - 16} Z`
+    return `<svg viewBox="0 0 ${width} ${height}" style="width:100%;height:${height}px" role="img">
+      <path d="${area}" fill="rgba(76,141,255,.10)" stroke="none"></path>
+      <path d="${d}" fill="none" stroke="${color}" stroke-width="1.5"></path>
+      <text x="6" y="14" fill="var(--faint)" font-size="10">${max.toFixed(2)}</text>
+      <text x="6" y="${height - 4}" fill="var(--faint)" font-size="10">${min.toFixed(2)}</text>
+    </svg>`
+  }
+
+  function barChartSvg(entries, { width = 720, height = 24, color = 'var(--purple)' } = {}) {
+    const rows = entries.filter(([, v]) => Number.isFinite(Number(v)))
+    if (rows.length === 0) return ''
+    const max = Math.max(...rows.map(([, v]) => Number(v))) || 1
+    return rows
+      .map(([label, value]) => {
+        const pct = (Number(value) / max) * 100
+        return `<div style="display:flex;align-items:center;gap:8px;margin:3px 0">
+          <span class="v3-k" style="width:230px;flex:none;margin:0;font-family:var(--mono)">${label}</span>
+          <span style="flex:1;background:var(--panel2);border-radius:3px;height:10px;overflow:hidden">
+            <span style="display:block;height:100%;width:${pct.toFixed(1)}%;background:${color}"></span>
+          </span>
+          <span class="v3-k" style="width:52px;flex:none;margin:0;text-align:right">${value}</span>
+        </div>`
+      })
+      .join('')
+  }
+
+  // 首页 KPI 迷你走势：用 sim 台账真实点位重算 polygon（设计稿里是硬编码点）
+  function bindSparkline(root, values) {
+    const svg = root.querySelector('.kpi .spark')
+    const polygon = svg?.querySelector('polygon')
+    if (!polygon) return false
+    const series = (values ?? []).map(Number).filter((v) => Number.isFinite(v))
+    if (series.length < 2) {
+      // 台账不足两个交易日：清掉设计稿的硬编码趋势线，不留假走势
+      polygon.setAttribute('points', '')
+      svg.setAttribute('aria-label', series.length === 0 ? '无台账点位' : '仅 1 个台账点位，无趋势可画')
+      return false
+    }
+    const nums = series
+    const min = Math.min(...nums)
+    const max = Math.max(...nums)
+    const span = max - min || 1
+    const points = nums.map((v, i) => `${((i / (nums.length - 1)) * 116).toFixed(1)},${(30 - ((v - min) / span) * 28).toFixed(1)}`)
+    polygon.setAttribute('points', `${points.join(' ')} 116,36 0,36`)
+    return true
+  }
 
   // ── 表格级绑定工具（按表头定位表格，按行文本定位行）─────────────────────────
   function findTable(root, headerText) {
@@ -368,7 +428,14 @@
       }
     },
     async brain() {
-      const d = await getJSON('/api/v3/brain')
+      const [d, metrics] = await Promise.all([getJSON('/api/v3/brain'), getJSON('/api/v3/metrics')])
+      const toolEntries = [
+        ...Object.entries(metrics?.mcp?.tools ?? {}),
+        ...Object.entries(metrics?.wb?.byTool ?? {}).map(([name, count]) => [`wb:${name}`, count]),
+      ].sort((a, b) => b[1] - a[1]).slice(0, 6)
+      const metricsChart = toolEntries.length > 0
+        ? barChartSvg(toolEntries)
+        : '<div class="v3-k">尚无调用计数：调用一次 MCP 工具或刷新任一页面后出现</div>'
       const sdk = d.sdk || {}
       const decision = d.decision || null
       const top = decision?.proposals?.[0] || null
@@ -391,6 +458,7 @@
           [['标的', '动作', '目标权重', '风险', '依据'], proposalRows],
         ],
         actions: [{ label: '运行流水线产出决策', method: 'POST', url: '/api/v3/strategy/run', body: { topN: 2 } }],
+        chart: metricsChart,
       }
     },
 
@@ -415,6 +483,8 @@
           ['自选池覆盖', (watch?.rows || []).length, true],
         ],
         tables: [[['代码', '现价', '日涨跌%', '20日动量%', 'PE(TTM)', 'PB', 'as_of'], rows]],
+        chart: bars.length >= 2 ? lineChartSvg(bars.map((b) => b.c)) : '',
+        chartNote: bars.length >= 2 ? `近 ${bars.length} 根真实日 K 收盘（${headline?.data?.source ?? '—'}，as_of ${headline?.data?.as_of ?? '—'}）` : '',
         note: `数据源：${headline?.data?.source ?? '—'} + ${watch?.sources?.factors ?? 'workbench/factors'}（自选池前 6 只，实时拉取）`,
       }
     },
@@ -562,17 +632,19 @@
     panel.innerHTML = `<div class="v3-head"><span class="v3-title">实时数据 · ${page}</span><span class="v3-badge" id="v3-badge">● LIVE</span><button class="v3-refresh" id="v3-refresh">刷新</button><span class="v3-asof">来源 /api/v3/* · ${asOf} · 真实数据</span></div><div id="v3-body"><div class="v3-k">加载中…</div></div>`
     document.getElementById('v3-refresh').addEventListener('click', refresh)
     try {
-      const { pairs, tables, actions, note } = await loader()
+      const { pairs, tables, actions, note, chart, chartNote } = await loader()
       const body = document.getElementById('v3-body')
       const actionHtml = (actions || [])
         .map((action, index) => `<button class="v3-refresh" data-action="${index}" style="margin-left:0;margin-right:8px">${action.label}</button>`)
         .join('')
+      const chartHtml = chart ? `<div style="margin-top:10px">${chart}</div>` : ''
+      const chartNoteHtml = chartNote ? `<div class="v3-k" style="margin:4px 0 0">${chartNote}</div>` : ''
       const noteHtml = note ? `<div class="v3-k" style="margin:8px 0 0">约束：${note}</div>` : ''
       const tablesHtml = (Array.isArray(tables) ? tables : [])
         .filter((entry) => Array.isArray(entry) && Array.isArray(entry[0]))
         .map(([headers, rows]) => table(headers, rows))
         .join('')
-      body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + tablesHtml + noteHtml
+      body.innerHTML = (actionHtml ? `<div style="margin-bottom:8px">${actionHtml}</div>` : '') + cells(pairs || []) + chartHtml + chartNoteHtml + tablesHtml + noteHtml
       // 逐点位深绑定（把设计稿里的示例数字换成真实值）
       try {
         if (page === 'index') await deepBindIndex(host)
