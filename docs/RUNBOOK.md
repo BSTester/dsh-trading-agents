@@ -466,7 +466,9 @@ node scripts/audit_page_fields.mjs --pages capital
 # 标的类页面（market/capital/events）用你实际在看的标的
 node scripts/audit_page_fields.mjs --pages market --symbol HK.09961
 # 期权页必须用 HK/US 标的（A 股会被上游直接拒：option chain only supports HK / US / JP）
-node scripts/audit_page_fields.mjs --pages options --symbol HK.09961
+# 衍生品卡还要一个**期权合约代码**；不给就自动从 option_screen 真机结果里挑第一条
+node scripts/audit_page_fields.mjs --pages options --symbol HK.09961 \
+  --option-code US.SPY260918C760000
 ```
 
 工具把「**后端真实载荷**（同一入口 `POST /api/wb/<endpoint>`）」与「**浏览器里真实渲染的
@@ -513,6 +515,31 @@ node scripts/audit_page_fields.mjs --pages options --symbol HK.09961
   行为；例如 A 股 `rt_quote` 恒为 `errcode=-9 realtime quote permission required`。
 - **`0` 不等于缺失**：后端给 0 时页面显示 `0` 是对的；工具只在后端**没有值**而渲染出数字时
   才判 `FABRICATED`。
+
+### 页面显示 `—` 到底是「没数据」还是「取数层级不对」：先造数据再判（2026-09-19）
+
+`EMPTY`（两端都空）只说明**现在**没数据，**不等于格式验证过**。要判「有数据时显示得对不对」，
+得先按平台自己的写入路径把数据造出来，再复跑该页。完整命令表与「生成前 → 生成后」证据见
+[E2E-ACCEPTANCE.md](E2E-ACCEPTANCE.md) 的「空态字段怎么变成可判定字段」。要点：
+
+| 想要的数据 | 命令（都在仓库根） | 前提 / 副作用 |
+|---|---|---|
+| 信号页 `snapshot.previews` | `node scripts/workbench_admin.mjs seed-preview --ticker SH.600000 --strategy rsi` | 跑的是 `engine.py signal`（与 `quant_signal` 工具同一条命令），只写 sim |
+| 研究页 runs / 已发布研报 | `node scripts/workbench_admin.mjs seed-research --ticker SH.600000 --report-file <md> --sources-file <json>` | 只调 `beginResearch`/`publishResearch`；**内容真实与否由调用方负责** |
+| 执行页 `fills` / 审计页 `diffs` | `PYTHONPATH=plugins/core/python ~/.dsh/trading-venv/bin/python -B -m trading_core reconcile-daily --today <对账日>` | 回填只认**券商订单历史**：券商当天没有成交单时 fills 仍是 0（先 `--today <有成交的那天>` 让对账收编券商单）；**有差异会 `set_halt`**（见场景 3） |
+| 组合页权益 / 执行页「本地台账」 | `DSH_HOME=~/.dsh ~/.dsh/trading-venv/bin/python -B plugins/engine/python/engine.py decide --ticker <标的> --strategy rsi --apply` | 本地模拟器**只在 sim** 下可用；只在真有 BUY 信号时才产单（`HOLD` 时 `order=null`，别以为命令没跑） |
+| 计划页「计划列表」卡 | `PYTHONPATH=plugins/core/python ~/.dsh/trading-venv/bin/python -B -m trading_core plan-build --mode SIM --strategy <策略> --target '{"SH.600000":0.03}' --prices '{"SH.600000":9.07}' --as-of <交易日>` | `origin=manual`，**不会被自动执行**；`plans.length > 1` 才渲染列表卡 |
+| 财报卡（因子页） | 数据本来就在；缺的是取证方式 → 审计工具的 `quality` phase 会只填 1 只标的 | 卡片要求 `tickers.length === 1`，而 ic 要 3..8 只，同一次输入喂不出两种 |
+
+**几条容易踩的**：
+
+- `equity` 曲线要 **≥2 个交易日**的台账成交才会画。同一天造的成交只出 1 个点，
+  页面会显示「权益序列仅 1 个点，不足以绘制」——这是**如实空态**，不是缺陷；
+  等第二个交易日再跑一次 `decide --apply` 就有了。
+- `reconcile-daily` 的订单匹配按**对账日**取窗（`_match_orders` 用 `created_at LIKE <today>%`），
+  所以补跑历史日期必须显式 `--today`，否则窗口里没有订单、`fills` 回填为 0。
+- 造完数据**别忘了一件**：`--today <今天>` 跑对账若产生差异会把 halt 立起来，
+  自动执行随之暂停；不需要这个副作用就别跑当天那一轮（或按场景 3 处置）。
 
 ## 标的输入框下拉没有关注池候选（WP24，2026-09-18）
 

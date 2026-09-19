@@ -22,11 +22,20 @@
  *   EMPTY               两端都空 → 数据确实没有，显示 — 是**正确**行为 ⇒ ok
  *   UNJUDGED            端点数取失败，无后端事实可比 ⇒ 观察（不判缺陷，如实列出）
  *
+ * 交互卡片（2026-09-19 扩展）：期权筛选要**点「筛选」**、衍生品卡要**输合约代码再点「查询」**、
+ * 因子页的财报卡只在**恰好 1 个标的**时才渲染。这些「数据存在但默认视图里没有」的字段，
+ * 用页面规格里的 `phases` 二次取证：每个 phase 自带端点、动作与字段，动作只点**只读查询**
+ * 控件（筛选/查询按钮、标的输入框），不碰任何提交/下单/执行/模式类控件。
+ *
  * 用法：
- *   node scripts/audit_page_fields.mjs [--pages a,b] [--json] [--symbol SH.600000] [--help]
+ *   node scripts/audit_page_fields.mjs [--pages a,b] [--json] [--symbol SH.600000]
+ *       [--option-code US.SPY260918C760000] [--verbose] [--help]
  *     --pages a,b   只审计指定路由（单页复验；未知键报错并列出可用键）
  *     --json        额外把报告路径打到 stdout（报告始终落盘）
  *     --symbol      标的类页面用的标的（默认取关注池第一只，缺省 SH.600000）
+ *     --option-code 衍生品卡（derivative_detail）用的**期权合约代码**；缺省自动调
+ *                   option_screen 从真机结果里挑第一个 code，挑不到就如实标 UNJUDGED
+ *                   （绝不编一个看起来对的合约代码）
  *     --verbose     打印每条字段明细（默认只打印非 ok 条目）
  *   环境：AUDIT_BASE / AUDIT_CHROME / AUDIT_MAX_WAIT_MS / AUDIT_ROUTE_BUDGET_MS / AUDIT_KEEP
  * 退出码：0 = 未发现真实缺陷；1 = 发现真实缺陷；2 = 服务未就绪或运行中断。
@@ -111,6 +120,31 @@ function expectCount(value) {
   return expectNum(value, 0);
 }
 
+/**
+ * **固定小数位**数值：`page.fmtNum()`（services/f10.js）与 antd `Statistic precision={n}`
+ * 都是 `toLocaleString(zh-CN, {minimumFractionDigits: n, maximumFractionDigits: n})` —— 与
+ * `expectNum`（只限上界）不同，它会**补齐**尾零（61.4 → 61.40、999809.29 → 999,809.29）。
+ * 两者都是「同一个数值的确定写法」，所以 numFixed 的 accept 只此一种（比 num 更严），
+ * 由 `tests/audit-page-fields.test.mjs` 与 f10.fmtNum 逐值锁死。
+ */
+function expectFixed(value, digits = 2) {
+  if (value === null || value === undefined || value === "") return DASH;
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return String(value);
+  // 页面先把值按同位数四舍五入再交给 antd（antd 的 precision 是**截断**，
+  // 见 services/formatCore.js 的 roundTo）——这里按同一路径算期望文本。
+  const rounded = Number(parsed.toFixed(digits));
+  return rounded.toLocaleString("zh-CN",
+    { minimumFractionDigits: digits, maximumFractionDigits: digits });
+}
+
+/** 自然日差 → 事件页时间线尾注（`${n} 天后` / `${-n} 天前`；0 也是「0 天后」）。 */
+function expectDaysUntil(value) {
+  const days = Number(value);
+  if (value === null || value === undefined || value === "" || !Number.isFinite(days)) return DASH;
+  return days >= 0 ? `${days} 天后` : `${-days} 天前`;
+}
+
 /** 毫秒/微秒整数 → 分钟精度时刻（独立实现，与 formatCore.minuteText 由单测锁一致）。 */
 function microToMinute(value) {
   if (value === null || value === undefined || value === "") return DASH;
@@ -160,6 +194,10 @@ const CONTRACTS = {
   rawString: (value) => ({ accept: [expectText(value)], reject: null }),
   text: (value) => ({ accept: [expectText(value)], reject: null }),
   count: (value) => ({ accept: [expectCount(value)], reject: null }),
+  /** antd Statistic precision=2 / f10.fmtNum：固定两位（不足补零，千分位照旧）。 */
+  numFixed2: (value) => ({ accept: [expectFixed(value, 2)], reject: null }),
+  /** 事件页 days_until → 「N 天后 / N 天前」（负数=已过去）。 */
+  daysUntil: (value) => ({ accept: [expectDaysUntil(value)], reject: null }),
   /** 原样字符串（antd Statistic 对数字走 String(value)，不做任何位数处理）。 */
   raw: (value) => ({ accept: [expectText(value)], reject: null }),
   /** 正数带 + 号的原样值（factors 综合分：+0.2517 / -0.1）。 */
@@ -175,6 +213,14 @@ const CONTRACTS = {
 };
 
 function contractOf(value, kind) {
+  // 后端给的是**对象**时，页面的 num()/rawCell 只能把它 String() 成 "[object Object]" ——
+  // 这是「拿未知当已知」，没有任何可接受的渲染文本，因此 accept 为空、并明确给出错误形态。
+  // （不这么做的话，expectNum 的 `String(value)` 兜底会把 [object Object] 算成「期望文本命中」，
+  // 把真缺陷判成 ok——那正是本工具最不该犯的错。）
+  if (value !== null && typeof value === "object") {
+    return { accept: [], reject: /\[object Object\]|NaN|undefined/,
+      why: "后端值是对象（页面按数值列渲染只能得到 [object Object]）" };
+  }
   const fn = CONTRACTS[kind];
   if (!fn) throw new Error(`未知 kind：${kind}`);
   return fn(value);
@@ -199,6 +245,7 @@ const POISON = ["NaN", "undefined", "[object Object]", "Invalid Date", "Infinity
 // ---------------------------------------------------------------------------
 const S = "__symbol__";      // 标的占位
 const T3 = "__tickers3__";   // 关注池前 3 只（factors/ic 需要多标的）
+const O = "__option_code__"; // 期权合约代码占位（衍生品卡）
 
 /** 概览页「因子快照」：实测 payload = {date, tickers:{标的:{因子:值}}, computed_at, note}。 */
 function factorSnapshot(eps) {
@@ -247,7 +294,9 @@ const PAGE_SPEC = [
     ],
   },
   {
-    key: "market", name: "行情", needsSymbol: true,
+    // 实时报价/盘口走富途直通：A 股实测 -9 realtime quote permission required（恒空），
+    // 只有港美标的能出数，所以这一页默认挑关注池里的第一只 HK 标的（可用 --symbol 覆盖）。
+    key: "market", name: "行情", needsSymbol: true, preferMarket: "HK",
     endpoints: {
       instrument: ["instrument", { ticker: S }],
       rtQuote: ["rt_quote", { codes: [S] }],
@@ -255,24 +304,35 @@ const PAGE_SPEC = [
       series: ["series", { ticker: S, period: "1d", limit: 250 }],
     },
     fields: [
-      { label: "名称", where: "description", endpoint: "instrument", path: ["name"], kind: "text" },
-      { label: "最新价", where: "description", endpoint: "instrument", path: ["price"], kind: "num" },
-      { label: "涨跌幅", where: "description", endpoint: "instrument", path: ["change_pct"], kind: "signedPct" },
-      { label: "今开 / 最高 / 最低", where: "description", endpoint: "instrument", contains: true,
-        paths: [["open"], ["high"], ["low"]], kind: "num" },
-      { label: "成交量", where: "description", endpoint: "instrument", path: ["volume"], kind: "num0" },
-      { label: "成交额", where: "description", endpoint: "instrument", path: ["turnover"], kind: "num0" },
-      { label: "每手股数", where: "description", endpoint: "instrument", path: ["lot_size"], kind: "num0" },
-      { label: "数据时间", where: "description", endpoint: "instrument", path: ["as_of"], kind: "stamp" },
-      { label: "最新价", where: "description", endpoint: "rtQuote",
+      // 标的卡（页面外层 Card「行情」）与实时报价卡有 4 个同名标签，必须按卡片限定，
+      // 否则一张卡缺值时会被另一张卡的值「救」成 ok（假阴性）。
+      { label: "名称", where: "description", endpoint: "instrument", card: "行情",
+        path: ["name"], kind: "text" },
+      { label: "最新价", where: "description", endpoint: "instrument", card: "行情",
+        path: ["price"], kind: "num" },
+      { label: "涨跌幅", where: "description", endpoint: "instrument", card: "行情",
+        path: ["change_pct"], kind: "signedPct" },
+      { label: "今开 / 最高 / 最低", where: "description", endpoint: "instrument", card: "行情",
+        contains: true, paths: [["open"], ["high"], ["low"]], kind: "num" },
+      { label: "成交量", where: "description", endpoint: "instrument", card: "行情",
+        path: ["volume"], kind: "num0" },
+      { label: "成交额", where: "description", endpoint: "instrument", card: "行情",
+        path: ["turnover"], kind: "num0" },
+      { label: "每手股数", where: "description", endpoint: "instrument", card: "行情",
+        path: ["lot_size"], kind: "num0" },
+      { label: "数据时间", where: "description", endpoint: "instrument", card: "行情",
+        path: ["as_of"], kind: "stamp" },
+      { label: "最新价", where: "description", endpoint: "rtQuote", card: "实时报价（rt_quote）",
         path: [["code_list", "quote_list"], 0, "last_price"], kind: "num" },
-      { label: "涨跌幅", where: "description", endpoint: "rtQuote",
-        path: [["code_list", "quote_list"], 0, ["change_rate", "change_pct"]], kind: "signedPct" },
-      { label: "昨收", where: "description", endpoint: "rtQuote",
+      // 页面 changePctOf：优先上游 change_rate/change_pct/premium_rate，**都没有**才用
+      // （最新价 − 昨收）/昨收 换算。规格必须按同一顺序取值，否则会误判成「后端空、页面有值」。
+      { label: "涨跌幅", where: "description", endpoint: "rtQuote", card: "实时报价（rt_quote）",
+        values: (eps) => [quoteChangePct(eps, ["code_list", "quote_list"], 0)], kind: "signedPct" },
+      { label: "昨收", where: "description", endpoint: "rtQuote", card: "实时报价（rt_quote）",
         path: [["code_list", "quote_list"], 0, ["prev_close_price", "prev_close"]], kind: "num" },
-      { label: "成交量", where: "description", endpoint: "rtQuote",
+      { label: "成交量", where: "description", endpoint: "rtQuote", card: "实时报价（rt_quote）",
         path: [["code_list", "quote_list"], 0, ["volume", "turnover_vol"]], kind: "num0" },
-      { label: "成交额", where: "description", endpoint: "rtQuote",
+      { label: "成交额", where: "description", endpoint: "rtQuote", card: "实时报价（rt_quote）",
         path: [["code_list", "quote_list"], 0, ["turnover", "amount"]], kind: "num0" },
     ],
   },
@@ -340,6 +400,71 @@ const PAGE_SPEC = [
       { label: "成交量", where: "table_column", table: "期权链", endpoint: "chain",
         path: ["option_chain", "[]", ["volume", "turnover_vol"]], kind: "num0" },
     ],
+    // 两张卡都必须先**操作**才出数：筛选区要按下「筛选」按钮，衍生品卡要先有合约代码
+    // 再按「查询」。两个 phase 各自重新导航、各自带端点与字段，互不依赖。
+    phases: [
+      {
+        key: "screen",
+        // 与页面表单默认值（optionScreen.js DEFAULT_OPTION_SCREEN_FORM）同源的载荷，
+        // 但**独立组装**：形状依据是 docs/TOOL-LIMITS.md 的最小可用载荷，不是 import 页面代码。
+        endpoints: {
+          screen: ["option_screen", {
+            filter: {
+              strategy: { market_category_list: [0], filter_group_list: [] },
+              field_filter: {
+                option_type: 1, volume: 1, implied_volatility: 1,
+                open_interest: 1, strike_date: 1, code: 1,
+              },
+              limit: 20,
+            },
+          }],
+        },
+        action: async (page) => {
+          const clicked = await page.clickCardButton("期权筛选（option_screen）", "筛选");
+          if (!clicked.ok) return clicked;
+          await page.waitIdle();
+          return { ok: true };
+        },
+        fields: [
+          { label: "代码", where: "table_column", table: "期权筛选", endpoint: "screen",
+            path: ["option_list", "[]", "code"], kind: "text" },
+          { label: "成交量", where: "table_column", table: "期权筛选", endpoint: "screen",
+            path: ["option_list", "[]", "volume"], kind: "num0" },
+          { label: "持仓量", where: "table_column", table: "期权筛选", endpoint: "screen",
+            path: ["option_list", "[]", "open_interest"], kind: "num0" },
+        ],
+      },
+      {
+        key: "derivative",
+        endpoints: {
+          vol: ["derivative_detail", { code: O, section: "option_volatility" }],
+          prob: ["derivative_detail", { code: O, section: "option_exercise_probability" }],
+        },
+        action: async (page, ctx) => {
+          if (!ctx.optionCode) {
+            return { ok: false, reason: "没有可用的期权合约代码（--option-code 未给且 option_screen 挑不到）" };
+          }
+          const filled = await page.fillContract(ctx.optionCode);
+          if (!filled.ok) return filled;
+          await page.waitIdle();
+          // 「点了但没反应」不算成功：两张子卡必须真的出现键值行，否则如实报失败
+          if (!(await page.hasDerivativeRows())) {
+            return { ok: false,
+              reason: "点击「查询」后衍生品卡没有出现键值行（按钮未命中或上游失败）" };
+          }
+          return { ok: true };
+        },
+        fields: [
+          // DerivativeRows 是「次要色标签 + 值」的键值行；数值走 f10.fmtNum（固定两位）
+          { label: "平均隐含波动率", where: "pair", endpoint: "vol",
+            path: ["average_impvol"], kind: "numFixed2" },
+          { label: "IV 状态", where: "pair", endpoint: "vol",
+            path: ["impvol_status"], kind: "text" },
+          { label: "标的价格", where: "pair", endpoint: "prob",
+            path: ["security_price"], kind: "numFixed2" },
+        ],
+      },
+    ],
   },
   {
     key: "signal", name: "信号", needsSymbol: false,
@@ -351,14 +476,23 @@ const PAGE_SPEC = [
             .find((item) => item?.kind === "signal" && item?.value?.ticker !== undefined);
           return row ? [row.value.ticker] : [];
         }, kind: "text" },
+      // 页面优先渲染 strategy_label（"rsi(25,75)"），没有才退回 strategy（"rsi"）——
+      // 规格必须按**页面取的那个键**给期望值，否则会把「正确的标签渲染」误判成 FORMAT。
       { label: "策略", where: "statistic", endpoint: "snapshot",
-        values: (eps) => previewField(eps, "strategy"), kind: "text" },
+        values: (eps) => previewField(eps, "strategy_label", "strategy"), kind: "text" },
+      { label: "信号", where: "statistic", endpoint: "snapshot",
+        values: (eps) => previewField(eps, "signal_label", "signal"), kind: "text" },
+      // Statistic 带 precision={2} → 固定两位小数（61.4 → 61.40）
       { label: "收盘价", where: "statistic", endpoint: "snapshot",
-        values: (eps) => previewField(eps, "price"), kind: "num" },
+        values: (eps) => previewField(eps, "price"), kind: "numFixed2" },
       { label: "ATR(14)", where: "statistic", endpoint: "snapshot",
-        values: (eps) => previewField(eps, "atr"), kind: "num" },
+        values: (eps) => previewField(eps, "atr"), kind: "numFixed2" },
+      { label: "数据日期", where: "statistic", endpoint: "snapshot",
+        values: (eps) => previewField(eps, "date"), kind: "text" },
       { label: "时间", where: "table_column", table: "历史预览", endpoint: "snapshot",
         path: ["previews", "[]", "at"], kind: "stamp" },
+      { label: "标的", where: "table_column", table: "历史预览", endpoint: "snapshot",
+        path: ["previews", "[]", "value", "ticker"], kind: "text" },
       { label: "策略", where: "table_column", table: "历史预览", endpoint: "snapshot",
         path: ["previews", "[]", "value", "strategy"], kind: "text" },
     ],
@@ -370,7 +504,8 @@ const PAGE_SPEC = [
       equity: ["equity", { mode: "$mode", window: 250 }],
     },
     fields: [
-      { label: "最新权益", where: "statistic", endpoint: "equity", path: ["current"], kind: "num" },
+      // Statistic precision={2} → 固定两位小数
+      { label: "最新权益", where: "statistic", endpoint: "equity", path: ["current"], kind: "numFixed2" },
       { label: "累计收益率", where: "statistic", endpoint: "equity", path: ["total_return"], kind: "pctRatio" },
       { label: "最大回撤", where: "statistic", endpoint: "equity", path: ["max_drawdown"], kind: "pctRatio" },
       { label: "台账成交笔数", where: "statistic", endpoint: "equity", path: ["trades"], kind: "count" },
@@ -424,7 +559,6 @@ const PAGE_SPEC = [
     endpoints: {
       factors: ["factors", { tickers: T3, window: 250 }],
       ic: ["ic", { tickers: T3, factor: "mom_20", forward: 5, window: 250 }],
-      quality: ["quality", { ticker: S }],
       sentiment: ["sentiment-history", {}],
     },
     fields: [
@@ -449,10 +583,46 @@ const PAGE_SPEC = [
         path: ["rows", "[]", "factors", "close"], kind: "num3" },
       { label: "因子日", where: "table_column", table: "因子打分", endpoint: "factors",
         path: ["rows", "[]", "as_of"], kind: "text" },
-      { label: "报告期", where: "description", endpoint: "quality", path: ["latest", "period_end"], kind: "text" },
-      { label: "营业收入", where: "description", endpoint: "quality", path: ["latest", "revenue"], kind: "num" },
-      { label: "毛利率", where: "description", endpoint: "quality", path: ["latest", "gross_margin"], kind: "pctValue" },
     ],
+    // 财报卡只在**恰好 1 个标的**时才发请求（factors.jsx:151 `tickers.length === 1 ? … : null`），
+    // 而 ic 需要 3..8 只——同一个输入框喂不出两种标的数。所以这里换成第二趟：重新导航、
+    // 只填 1 只标的，专门给财报卡取证（不做「把 3 只改成 1 只」的注入，那是伪造页面状态）。
+    phases: [{
+      key: "quality",
+      endpoints: { quality: ["quality", { ticker: S }] },
+      action: async (page, ctx) => {
+        await page.navigate();
+        const fill = await page.fillSymbol(ctx.symbol);
+        await page.waitIdle();
+        return { ok: Boolean(fill?.ok), detail: fill?.ok ? null : fill?.reason ?? "标的未填入" };
+      },
+      fields: [
+        { label: "报告期", where: "description", endpoint: "quality",
+          path: ["latest", "period_end"], kind: "text" },
+        { label: "财年", where: "description", endpoint: "quality",
+          path: ["latest", "fiscal_year"], kind: "raw" },
+        { label: "币种", where: "description", endpoint: "quality",
+          path: ["currency"], kind: "text" },
+        { label: "会计准则", where: "description", endpoint: "quality",
+          path: ["latest", "accounting_standards"], kind: "text" },
+        { label: "财报期间数", where: "description", endpoint: "quality",
+          values: (eps) => [(eps.quality.value?.periods ?? []).length], kind: "count" },
+        { label: "营业收入", where: "description", endpoint: "quality",
+          path: ["latest", "revenue"], kind: "num" },
+        { label: "毛利润", where: "description", endpoint: "quality",
+          path: ["latest", "gross_profit"], kind: "num" },
+        { label: "净利润", where: "description", endpoint: "quality",
+          path: ["latest", "net_profit"], kind: "num" },
+        { label: "毛利率", where: "description", endpoint: "quality",
+          path: ["latest", "gross_margin"], kind: "pctValue" },
+        { label: "净利率", where: "description", endpoint: "quality",
+          path: ["latest", "net_margin"], kind: "pctValue" },
+        { label: "营收同比", where: "description", endpoint: "quality",
+          path: ["latest", "revenue_yoy"], kind: "pctValue" },
+        { label: "净利同比", where: "description", endpoint: "quality",
+          path: ["latest", "net_profit_yoy"], kind: "pctValue" },
+      ],
+    }],
   },
   {
     key: "execution", name: "执行", needsSymbol: false,
@@ -507,19 +677,63 @@ const PAGE_SPEC = [
     endpoints: { snapshot: ["snapshot", {}], rules: ["rules", {}] },
     fields: [
       { label: "状态", where: "table_column", table: "运行", endpoint: "snapshot",
-        path: ["runs", "[]", "status"], kind: "text" },
+        values: (eps) => (eps.snapshot.value?.runs ?? [])
+          .map((row) => RUN_STATUS_LABEL[row.status] ?? row.status), kind: "text" },
       { label: "标的", where: "table_column", table: "运行", endpoint: "snapshot",
         path: ["runs", "[]", "ticker"], kind: "text" },
+      { label: "模式", where: "table_column", table: "运行", endpoint: "snapshot",
+        values: (eps) => (eps.snapshot.value?.runs ?? [])
+          .map((row) => MODE_LABEL[row.mode] ?? row.mode), kind: "text" },
+      { label: "开始时间", where: "table_column", table: "运行", endpoint: "snapshot",
+        path: ["runs", "[]", "started_at"], kind: "stamp" },
       { label: "规则", where: "table_column", table: "规则候选池", endpoint: "rules",
         path: ["rules", "[]", "rule_id"], kind: "text" },
+      // 已发布研报（表列名与运行表重名，靠卡片标题「已发布研报」区分）
+      { label: "标的", where: "table_column", table: "已发布研报", endpoint: "snapshot",
+        path: ["reports", "[]", "ticker"], kind: "text" },
+      { label: "发布时间", where: "table_column", table: "已发布研报", endpoint: "snapshot",
+        path: ["reports", "[]", "published_at"], kind: "stamp" },
+      { label: "评级", where: "table_column", table: "已发布研报", endpoint: "snapshot",
+        values: (eps) => (eps.snapshot.value?.reports ?? [])
+          .map((row) => row.rating_label ?? row.rating), kind: "text" },
+      { label: "来源数", where: "table_column", table: "已发布研报", endpoint: "snapshot",
+        values: (eps) => (eps.snapshot.value?.reports ?? [])
+          .map((row) => (row.sources ?? []).length), kind: "count" },
     ],
   },
   {
+    // 事件页标的是**输入驱动**的：默认标的（关注池第一只 SH.600000）实测只有 1 条事件，
+    // 时间线虽然渲染了但覆盖不到「多条 + 不同 days_until」的形态。这里从关注池里挑第一只
+    // 「真有事件」的标的（按事件条数优先），挑不到就退回默认并把字段标 UNJUDGED——
+    // 不编事件、也不放宽判定。
     key: "events", name: "事件", needsSymbol: true,
+    symbolResolver: async (callApi, watchlist, fallback) => {
+      const candidates = [...new Set([fallback, ...watchlist])].filter(Boolean);
+      let best = null;
+      for (const ticker of candidates.slice(0, 12)) {
+        const call = await callApi("events", { ticker, days: 400 });
+        const count = (call.value?.events ?? []).length;
+        if (count > 0 && (best === null || count > best.count)) best = { ticker, count };
+        if (count >= 3) break;   // 够判「多条 + Tag/日期/详情/相对天数」即可，不再多打端点
+      }
+      return best ? best.ticker : fallback;
+    },
     endpoints: { events: ["events", { ticker: S, days: 400 }] },
     fields: [
       { label: "(事件日期)", where: "text", endpoint: "events", pattern: "(\\d{4}-\\d{2}-\\d{2})",
         values: (eps) => (eps.events.value?.events ?? []).map((row) => row.date), kind: "text" },
+      // 时间线不是表格：类型在 Tag 里，日期/详情/相对天数是裸 span，各自按「本项全文包含」判。
+      { label: "(事件类型)", where: "timeline", endpoint: "events", from: "tag",
+        values: (eps) => (eps.events.value?.events ?? []).map((row) => row.type),
+        kind: "text", contains: true },
+      { label: "(事件日期·时间线)", where: "timeline", endpoint: "events", contains: true,
+        values: (eps) => (eps.events.value?.events ?? []).map((row) => row.date), kind: "text" },
+      { label: "(事件详情)", where: "timeline", endpoint: "events", contains: true,
+        values: (eps) => (eps.events.value?.events ?? []).map((row) => row.detail), kind: "text" },
+      { label: "(相对天数)", where: "timeline", endpoint: "events", contains: true,
+        values: (eps) => (eps.events.value?.events ?? [])
+          .filter((row) => row.days_until !== null && row.days_until !== undefined)
+          .map((row) => row.days_until), kind: "daysUntil" },
     ],
   },
   {
@@ -583,10 +797,20 @@ const PAGE_SPEC = [
         path: ["entries", "[]", "ticker"], kind: "text" },
       { label: "标的", where: "table_column", table: "对账差异", endpoint: "reconcile",
         path: ["diffs", "[]", "symbol"], kind: "text" },
+      // 差异类型只映射源码里出现的 kind（reconcile.py compare/_order_diffs），未知值页面
+      // 原样展示，这里也原样——不编标签。
+      { label: "差异类型", where: "table_column", table: "对账差异", endpoint: "reconcile",
+        values: (eps) => (eps.reconcile.value?.diffs ?? [])
+          .map((row) => DIFF_KIND_LABEL[row.kind] ?? row.kind), kind: "text" },
+      // 数量类差异取 local/broker，市值类取 local_value/broker_value；两侧都缺失时页面
+      // num(undefined) 给「—」。注意 `local`/`broker` 可能是**对象**（missing_side 时券商侧
+      // 是 {qty:N}）——页面 num(对象) 会渲染成 [object Object]，这正是要抓的形态。
       { label: "本地", where: "table_column", table: "对账差异", endpoint: "reconcile",
         path: ["diffs", "[]", ["local", "local_value"]], kind: "num" },
       { label: "券商", where: "table_column", table: "对账差异", endpoint: "reconcile",
         path: ["diffs", "[]", ["broker", "broker_value"]], kind: "num" },
+      { label: "数量差（本地−券商）", where: "table_column", table: "对账差异", endpoint: "reconcile",
+        path: ["diffs", "[]", "qty_diff"], kind: "count" },
       { label: "(自检时间)", where: "text", endpoint: "sources",
         pattern: "自检时间 (\\d{4}-\\d{2}-\\d{2}[ T]\\d{2}:\\d{2}:\\d{2})",
         values: (eps) => [eps.sources.value?.checked_at], kind: "stamp" },
@@ -610,18 +834,55 @@ const PAGE_SPEC = [
   },
 ];
 
-/** 信号页：最新一条 signal 预览的某个字段。 */
-function previewField(eps, key) {
+/** 研究页状态/模式的中文标签（页面 research.jsx 的 RUN_STATUS / MODE_LABEL 同口径； *  未收录的取值页面原样回退展示，这里也原样回退——不猜含义）。 */
+const RUN_STATUS_LABEL = {
+  running: "进行中", completed: "已发布", cancelled: "已取消", abandoned: "已中断",
+};
+const MODE_LABEL = { sim: "模拟", live: "实盘" };
+
+/** 对账差异类型的中文标签（页面 audit.jsx 的 DIFF_KIND 同口径；未知取值原样展示）。 */
+const DIFF_KIND_LABEL = { missing_side: "单边缺失", qty: "数量不一致", value: "市值不一致" };
+
+/**
+ * 行情页实时报价的涨跌幅（页面 market.jsx changePctOf 的同序取值）：
+ * 优先上游 `change_rate`/`change_pct`/`premium_rate`；**都没有**才由（最新价 − 昨收）/昨收
+ * 换算。实测 HK.00100 的 rt_quote 只给 last_price/prev_close_price（change_* 为 null），
+ * 页面按换算显示 +18.92% —— 规格若只读上游字段就会把这条正确渲染误判成「后端空」。
+ */
+function quoteChangePct(eps, entryPath, index) {
+  // 注意：entryPath 本身是**候选键数组**，必须当作一个路径段（不能再展开），
+  // 否则 ["code_list","quote_list"] 会被摊成两个字符串段、整条路径走空。
+  const entry = resolvePath(eps.rtQuote.value, [entryPath, index])[0];
+  if (!entry || typeof entry !== "object") return undefined;
+  for (const key of ["change_rate", "change_pct", "premium_rate"]) {
+    if (entry[key] !== undefined && entry[key] !== null) return entry[key];
+  }
+  const last = Number(entry.last_price ?? entry.cur_price ?? entry.price);
+  const prev = Number(entry.prev_close_price ?? entry.prev_close);
+  if (Number.isFinite(last) && Number.isFinite(prev) && prev !== 0) {
+    return ((last - prev) / prev) * 100;
+  }
+  return undefined;
+}
+
+
+/** 信号页：最新一条 signal 预览的某个字段（可给候选键，取第一个存在的——与页面 `a ?? b` 同序）。 */
+function previewField(eps, ...keys) {
   const row = (eps.snapshot.value?.previews ?? [])
-    .find((item) => item?.kind === "signal" && item?.value && item.value[key] !== undefined);
-  return row ? [row.value[key]] : [];
+    .find((item) => item?.kind === "signal" && item?.value
+      && keys.some((key) => item.value[key] !== undefined));
+  if (!row) return [];
+  for (const key of keys) {
+    if (row.value[key] !== undefined) return [row.value[key]];
+  }
+  return [];
 }
 
 // ---------------------------------------------------------------------------
 // CLI
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-  const opts = { pages: null, json: false, symbol: null, verbose: false, help: false };
+  const opts = { pages: null, json: false, symbol: null, optionCode: null, verbose: false, help: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--help" || arg === "-h") opts.help = true;
@@ -630,6 +891,8 @@ function parseArgs(argv) {
     else if (arg === "--pages") opts.pages = String(argv[++i] ?? "");
     else if (arg.startsWith("--pages=")) opts.pages = arg.slice("--pages=".length);
     else if (arg === "--symbol") opts.symbol = String(argv[++i] ?? "");
+    else if (arg === "--option-code") opts.optionCode = String(argv[++i] ?? "");
+    else if (arg.startsWith("--option-code=")) opts.optionCode = arg.slice("--option-code=".length);
     else {
       process.stderr.write(`未知参数：${arg}\n`);
       opts.help = true;
@@ -812,9 +1075,16 @@ const DOM_PROBE = `(() => {
   const content = pick();
   if (!content) return { missing: true };
   const txt = (el) => (el ? (el.innerText || '').replace(/\\s+/g, ' ').trim() : '');
+  // 同页可能有多张卡渲染**同名标签**（行情页的「涨跌幅」在标的卡与实时报价卡各一个）——
+  // 每项都记下所属卡片标题，规格里给了 card 时按它过滤，避免拿 A 卡的值去判 B 卡的字段。
+  const cardOf = (el) => {
+    const card = el && el.closest ? el.closest('.ant-card') : null;
+    return txt(card ? card.querySelector('.ant-card-head-title') : null);
+  };
   const items = [];
   content.querySelectorAll('.ant-statistic').forEach((node) => {
-    items.push({ where: 'statistic', label: txt(node.querySelector('.ant-statistic-title')),
+    items.push({ where: 'statistic', card: cardOf(node),
+      label: txt(node.querySelector('.ant-statistic-title')),
       value: txt(node.querySelector('.ant-statistic-content')) });
   });
   // 说明：antd 5 的 Descriptions **两种形态**——bordered 渲染成 th/td（没有 .ant-descriptions-item
@@ -826,7 +1096,8 @@ const DOM_PROBE = `(() => {
       const row = labelEl.closest('tr') || labelEl.parentElement;
       valueEl = row ? row.querySelector('.ant-descriptions-item-content') : null;
     }
-    items.push({ where: 'description', label: txt(labelEl), value: txt(valueEl) });
+    items.push({ where: 'description', card: cardOf(labelEl),
+      label: txt(labelEl), value: txt(valueEl) });
   });
   const tables = [];
   content.querySelectorAll('.ant-table').forEach((table) => {
@@ -849,11 +1120,36 @@ const DOM_PROBE = `(() => {
       description: txt(node.querySelector('.ant-steps-item-description')),
     });
   });
+  // 时间线（事件页）：每项一个 .ant-timeline-item，项内没有 label→value 结构，
+  // 因此整项全文 + 项内 Tag 文本都取下来（判定按全文 contains，类型按 Tag 精确）。
+  const timeline = [...content.querySelectorAll('.ant-timeline-item')].map((node) => ({
+    tag: txt(node.querySelector('.ant-tag')),
+    text: txt(node),
+  }));
+  // 「次要色标签 + 值」的键值行（期权页 DerivativeRows：<Text type="secondary">标签</Text>
+  // 与 <Text>值</Text> 是 antd Space 的两个子项，各自被 .ant-space-item 包一层，因此先看
+  // 元素兄弟、再退到 space-item 的兄弟；只认**值确实是 .ant-typography** 的配对（行权概率
+  // 卡里 key= 那种行内片段直接排除，它不是键值行）。
+  const pairs = [];
+  content.querySelectorAll('.ant-typography-secondary').forEach((labelEl) => {
+    const label = txt(labelEl);
+    if (!label || label.endsWith("=")) return;
+    let valueEl = labelEl.nextElementSibling;
+    if (!valueEl || !valueEl.classList.contains('ant-typography')) {
+      const item = labelEl.closest('.ant-space-item') || labelEl.parentElement;
+      const nextItem = item ? item.nextElementSibling : null;
+      valueEl = nextItem ? nextItem.querySelector('.ant-typography') : null;
+    }
+    if (!valueEl) return;
+    pairs.push({ label, value: txt(valueEl) });
+  });
   return {
     missing: false,
     items,
     tables,
     steps,
+    timeline,
+    pairs,
     cards,
     scanText: (scan.innerText || '').replace(/\\s+/g, ' ').trim(),
   };
@@ -997,6 +1293,23 @@ function renderedFor(field, probe, spec) {
     return { values: out, labelFound: tableFound,
       source: `表列「${field.label}」${field.tableOrder !== undefined ? `（卡片第 ${field.tableOrder + 1} 张表）` : ""}` };
   }
+  if (field.where === "timeline") {
+    // 时间线（事件页）不是表格：antd Timeline 每项一个 .ant-timeline-item，
+    // 项内是裸标签+span（Tag 类型 / 日期 / 详情 / 相对天数），没有 label→value 结构。
+    // `from: "tag"` 取该项的 Tag 文本（事件类型），否则取整项全文（日期/详情/相对天数）。
+    const items = probe.timeline ?? [];
+    const values = items.map((item) => (field.from === "tag"
+      ? String(item.tag ?? "") : String(item.text ?? "")));
+    return { values, labelFound: items.length > 0,
+      source: `时间线项（共 ${items.length} 项）${field.from === "tag" ? "的 Tag" : ""}` };
+  }
+  if (field.where === "pair") {
+    // 「次要色标签 + 兄弟值」的键值行（期权页 DerivativeRows 用这种写法，不是 Descriptions）。
+    const values = (probe.pairs ?? [])
+      .filter((pair) => pair.label === field.label || String(pair.label).startsWith(field.label))
+      .map((pair) => pair.value);
+    return { values, labelFound: values.length > 0, source: `键值行「${field.label}」` };
+  }
   if (field.where === "step") {
     const values = [];
     for (const step of probe.steps ?? []) {
@@ -1020,9 +1333,11 @@ function renderedFor(field, probe, spec) {
   const wanted = field.where === "statistic" ? "statistic" : "description";
   const values = (probe.items ?? [])
     .filter((item) => item.where === wanted
+      && (!field.card || String(item.card ?? "").includes(field.card))
       && (item.label === field.label || String(item.label).startsWith(field.label)))
     .map((item) => item.value);
-  return { values, labelFound: values.length > 0, source: `${wanted}「${field.label}」` };
+  return { values, labelFound: values.length > 0,
+    source: `${wanted}「${field.label}」${field.card ? `（卡片「${field.card}」）` : ""}` };
 }
 
 /** 后端事实 → 判定用的值列表：values 函数优先；paths 是复合单元格的多路取值；agg=count 收敛成条数。 */
@@ -1059,12 +1374,16 @@ function judgeField(field, spec, endpoints, probe, symbol) {
   const rendered = renderedFor(field, probe, spec);
   const renderedValues = rendered.values;
 
-  // 契约：每个非空后端值给出可接受文本 + 明确的错误形态
+  // 契约：每个非空后端值给出可接受文本 + 明确的错误形态。
+  // **空白归一**：DOM 探针取的是 `innerText` 且把连续空白折成一个空格，而 HTML 本身也会折叠
+  // 空白——后端值里的双空格（实测：事件页 detail「每股派息 0  · 财年 2025」）在页面上就是
+  // 单空格。这里按渲染口径归一后再比，不是放宽判定（数值/千分位/百分号一位都不能少）。
+  const norm = (text) => String(text).replace(/\s+/g, " ").trim();
   const accept = new Set();
   const rejects = [];
   for (const value of dataValues) {
     const contract = contractOf(value, field.kind);
-    for (const text of contract.accept) accept.add(text);
+    for (const text of contract.accept) accept.add(norm(text));
     if (contract.reject) rejects.push({ re: contract.reject, why: contract.why });
   }
   const acceptList = [...accept].filter((text) => text !== DASH && text !== "");
@@ -1098,6 +1417,14 @@ function judgeField(field, spec, endpoints, probe, symbol) {
   }
   const allDash = renderedValues.every((text) => text === "" || text === DASH
     || /^[—\-–]+$/.test(text));
+  // 毒值判定**优先于「部分命中」**：同一列里既有对得上的值、又有 [object Object]/NaN 时，
+  // 先判 ok 会把真缺陷盖掉（2026-09-19 实测：审计页「券商」列同时有 `200` 与 `[object Object]`，
+  // 早先的判定顺序把它判成了 ok，只有页级全文扫雷发现了它）。
+  const poison = renderedValues.find((text) => POISON.some((p) => text.includes(p)));
+  if (poison) {
+    return { ...summary, judge: "FABRICATED",
+      note: `渲染出现 ${poison}（后端值：${sample(dataValues)}）` };
+  }
   const hits = acceptList.filter(hit);
   if (hits.length > 0) {
     const coverage = `${hits.length}/${acceptList.length}`;
@@ -1107,10 +1434,6 @@ function judgeField(field, spec, endpoints, probe, symbol) {
   if (allDash) {
     return { ...summary, judge: "MISSING_WHEN_DATA",
       note: `后端有 ${dataValues.length} 个非空值，渲染全是 —：期望至少出现 ${sample(acceptList)}` };
-  }
-  const poison = renderedValues.find((text) => POISON.some((p) => text.includes(p)));
-  if (poison) {
-    return { ...summary, judge: "FABRICATED", note: `渲染出现 ${poison}（后端值：${sample(dataValues)}）` };
   }
   const rejected = rejects.find(({ re }) => renderedValues.some((text) => re.test(text)));
   if (rejected) {
@@ -1139,15 +1462,115 @@ function scanText(text) {
 }
 
 // ---------------------------------------------------------------------------
+// 交互取证的页面动作（只点**只读查询**控件：标的输入、筛选、查询）
+// ---------------------------------------------------------------------------
+
+/** 卡片内按「去空白文本」定位一个按钮，返回它的视口中心（找不到 null）。 */
+function buttonCenterExpr(cardTitle, buttonText) {
+  return `(() => {
+    const root = document.querySelector('.ant-pro-layout-content')
+      || document.querySelector('.ant-layout-content') || document.getElementById('root');
+    const cards = [...(root ?? document).querySelectorAll('.ant-card')];
+    const card = cards.find((node) => {
+      const title = node.querySelector('.ant-card-head-title');
+      const text = title ? (title.innerText || '').replace(/\\s+/g, '') : '';
+      return text.includes(${JSON.stringify(cardTitle.replace(/\s+/g, ""))});
+    });
+    if (!card) return { error: '未找到卡片' };
+    const buttons = [...card.querySelectorAll('button.ant-btn')];
+    // antd 给两个汉字的按钮插了空格（"筛 选"），因此一律**去掉所有空白**再比
+    const button = buttons.find((node) =>
+      (node.innerText || '').replace(/\\s+/g, '') === ${JSON.stringify(buttonText)})
+      || buttons.find((node) =>
+        (node.innerText || '').replace(/\\s+/g, '').includes(${JSON.stringify(buttonText)}));
+    if (!button) {
+      return { error: '卡片内没有按钮',
+        buttons: buttons.map((node) => (node.innerText || '').trim()).slice(0, 8) };
+    }
+    // 必须**先滚动到视野内再量坐标**：CDP 的鼠标事件按视口坐标派发，元素在视口外时
+    // 事件打不到它（实测：期权页衍生品卡按钮在页面底部，"点击成功"但 React 状态没变）。
+    button.scrollIntoView({ block: 'center', inline: 'center' });
+    const rect = button.getBoundingClientRect();
+    if (!rect.width || !rect.height) return { error: '按钮不可见（宽高为 0）' };
+    return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+  })()`;
+}
+
+/** 真鼠标点击卡片内的按钮（React 的 onClick 走原生 click 冒泡，这里给的是真事件）。 */
+async function clickCardButton(cdp, cardTitle, buttonText) {
+  const found = await evaluate(cdp, buttonCenterExpr(cardTitle, buttonText));
+  if (!found || found.error) {
+    return { ok: false, reason: `${cardTitle}：${found?.error ?? "定位失败"}`
+      + (found?.buttons ? `｜按钮：${JSON.stringify(found.buttons)}` : "") };
+  }
+  // 坐标已在 buttonCenterExpr 里 scrollIntoView 之后量取，这里直接用；不再滚动（滚动会让它失效）。
+  for (const type of ["mousePressed", "mouseReleased"]) {
+    await cdp.send("Input.dispatchMouseEvent", {
+      type, x: found.x, y: found.y, button: "left", clickCount: 1,
+    });
+  }
+  return { ok: true };
+}
+
+/** 衍生品卡是否真的出了结果（点击后必须有键值行，否则「点了但没反应」不能被当成成功）。 */
+async function hasDerivativeRows(cdp) {
+  return evaluate(cdp, `(() => {
+    const root = document.querySelector('.ant-pro-layout-content')
+      || document.querySelector('.ant-layout-content') || document.getElementById('root');
+    const cards = [...(root ?? document).querySelectorAll('.ant-card')];
+    const card = cards.find((node) => {
+      const title = node.querySelector('.ant-card-head-title');
+      return title && (title.innerText || '').replace(/\\s+/g, '').includes('期权波动率与行权概率');
+    });
+    if (!card) return false;
+    return card.querySelectorAll('.ant-typography-secondary').length > 0
+      && [...card.querySelectorAll('.ant-typography-secondary')]
+        .some((el) => (el.innerText || '').trim() && !(el.innerText || '').trim().endsWith('='));
+  })()`);
+}
+
+/** 期权合约输入框（普通 Input，placeholder 固定）填值：原生 setter + React 合成 input 事件。 */
+async function fillContractInput(cdp, code) {
+  const result = await evaluate(cdp, `(() => {
+    const input = [...document.querySelectorAll('input')]
+      .find((el) => (el.placeholder || '').includes('期权合约代码'));
+    if (!input) return { error: '页面没有「期权合约代码」输入框' };
+    const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+    setter.call(input, ${JSON.stringify(code)});
+    input.dispatchEvent(new Event('input', { bubbles: true }));
+    return { value: input.value };
+  })()`);
+  if (!result || result.error) return { ok: false, reason: result?.error ?? "填值失败" };
+  if (result.value !== code) return { ok: false, reason: `输入框值为 ${JSON.stringify(result.value)}` };
+  const clicked = await clickCardButton(cdp, "期权波动率与行权概率（derivative_detail）", "查询");
+  return clicked.ok ? { ok: true } : clicked;
+}
+
+/** 期权筛选表单的载荷：按 docs/TOOL-LIMITS.md 的最小可用载荷 + 页面表单默认值独立组装。 */
+function optionScreenPayload() {
+  return {
+    filter: {
+      strategy: { market_category_list: [0], filter_group_list: [] },
+      field_filter: {
+        option_type: 1, volume: 1, implied_volatility: 1,
+        open_interest: 1, strike_date: 1, code: 1,
+      },
+      limit: 20,
+    },
+  };
+}
+// ---------------------------------------------------------------------------
 // 主流程
 // ---------------------------------------------------------------------------
 async function main() {
   if (OPTS.help) {
     log("页面字段级审计（后端事实 × 浏览器渲染，零新依赖）");
-    log("  用法：node scripts/audit_page_fields.mjs [--pages a,b] [--json] [--symbol SH.600000] [--verbose]");
+    log("  用法：node scripts/audit_page_fields.mjs [--pages a,b] [--json] [--symbol SH.600000]");
+    log("        [--option-code US.SPY260918C760000] [--verbose]");
     log("    --pages a,b  只审计指定路由（单页复验）");
     log("    --json       额外输出报告路径");
-    log("    --symbol     标的类页面用的标的（默认 SH.600000）");
+    log("    --symbol     标的类页面用的标的（默认关注池第一只；行情页默认挑 HK——A 股实时报价 -9 无权限）");
+    log("    --option-code 衍生品卡（derivative_detail）用的期权合约代码；缺省自动从 option_screen 真机结果挑");
     log("    --verbose    打印每条字段明细");
     log("  退出码：0 无缺陷 / 1 有缺陷 / 2 服务未就绪或中断");
     log(`  可用路由：${PAGE_SPEC.map((p) => p.key).join(",")}`);
@@ -1174,26 +1597,43 @@ async function main() {
   // 标的默认取关注池第一只（与页面候选同源）；多标的页取前 3 只（factors 需 2..8、ic 需 3..8）
   let symbol = OPTS.symbol ?? "";
   let tickers3 = [];
+  let watchlist = [];
   {
     const snap = await callApi("snapshot", {});
-    const watchlist = Array.isArray(snap.value?.watchlist) ? snap.value.watchlist.map(String) : [];
+    watchlist = Array.isArray(snap.value?.watchlist) ? snap.value.watchlist.map(String) : [];
     if (!symbol) symbol = watchlist.length > 0 ? watchlist[0] : "SH.600000";
     tickers3 = watchlist.slice(0, 3);
     if (tickers3.length < 3) tickers3 = [symbol, "SH.600009", "SH.600010"];
-    // 部分页面的数据面只支持特定市场（实测：期权链对 A 股标的直接 -8 拒绝），
-    // 故允许页面声明 preferMarket —— 从关注池里挑第一只该市场链的标的（挑不到退回默认）。
+    // 部分页面的数据面只支持特定市场（实测：期权链对 A 股标的直接 -8 拒绝、A 股实时报价 -9
+    // 无权限），故允许页面声明 preferMarket —— 从关注池里挑第一只该市场链的标的（挑不到退回默认）。
     for (const page of PAGE_SPEC) {
       if (!page.preferMarket) continue;
       const picked = watchlist.find((item) => String(item).startsWith(`${page.preferMarket}.`));
       page.symbol = picked ?? symbol;
     }
+    // 需要「数据里真有东西」的页面（事件页）自己挑标的：挑不到就退回默认，后面的字段
+    // 自然落 UNJUDGED/NOT_RENDERED——不在工具里假装有数据。
+    for (const page of PAGE_SPEC) {
+      if (!page.symbolResolver) continue;
+      const resolved = await page.symbolResolver(callApi, watchlist, page.symbol ?? symbol);
+      if (resolved) page.symbol = resolved;
+    }
+  }
+  // 衍生品卡需要**期权合约代码**（关注池与持仓都不产出它）：用户没给就调 option_screen
+  // 从真机结果里挑第一个；挑不到就留空，衍生品 phase 会如实报 UNJUDGED。
+  let optionCode = OPTS.optionCode ?? "";
+  let optionCodeSource = OPTS.optionCode ? "--option-code" : null;
+  if (!optionCode) {
+    const screen = await callApi("option_screen", optionScreenPayload());
+    optionCode = String(screen.value?.option_list?.[0]?.code ?? "");
+    if (optionCode) optionCodeSource = "option_screen 真机结果首条";
   }
   const mode = health.mode ?? "sim";
 
   await mkdir(OUT_DIR, { recursive: true });
   const report = {
     startedAt: new Date().toISOString(),
-    base: BASE, mode, symbol,
+    base: BASE, mode, symbol, optionCode, optionCodeSource,
     options: { pages: OPTS.pages, verbose: OPTS.verbose },
     pages: [], defects: [], observations: [],
   };
@@ -1239,6 +1679,57 @@ async function main() {
     let loadFired = false;
     cdp.on("Page.loadEventFired", () => (loadFired = true));
 
+    /** 导航到某路由并等到 load 事件（先 about:blank 清掉上一页的网络与 DOM）。 */
+    async function loadRoute(route) {
+      loadFired = false;
+      await cdp.send("Page.navigate", { url: "about:blank" });
+      await sleep(150);
+      net.inflight.clear();
+      net.lastEventAt = Date.now();
+      await cdp.send("Page.navigate", { url: `${BASE}/#/${route}` });
+      const dl = Date.now() + 15000;
+      while (!loadFired && Date.now() < dl) await sleep(80);
+    }
+
+    /** 网络空闲 + DOM 连续 3 次采样不变 → 探针快照。 */
+    async function settleProbe(deadline) {
+      const waitStart = Date.now();
+      let idle = false;
+      while (Date.now() - waitStart < MAX_WAIT_MS && Date.now() < deadline) {
+        if (net.inflight.size === 0 && Date.now() - net.lastEventAt >= IDLE_MS) { idle = true; break; }
+        await sleep(80);
+      }
+      const sig = (p) => `${(p.items ?? []).length}|${(p.tables ?? []).length}`
+        + `|${(p.timeline ?? []).length}|${(p.pairs ?? []).length}|${(p.scanText ?? "").length}`;
+      let probe = await evaluate(cdp, DOM_PROBE);
+      let stable = 1;
+      let last = sig(probe);
+      const stableStart = Date.now();
+      while (Date.now() - stableStart < Math.min(12000, Math.max(0, deadline - Date.now()))) {
+        await sleep(500);
+        const cur = await evaluate(cdp, DOM_PROBE);
+        const curSig = sig(cur);
+        stable = curSig === last ? stable + 1 : 1;
+        last = curSig;
+        probe = cur;
+        if (stable >= 3 && net.inflight.size === 0) break;
+      }
+      return { probe, idle };
+    }
+
+    /** 页面动作句柄：phase 只能通过它导航 / 填空 / 点只读按钮，拿不到 cdp 本体。 */
+    function pageApi(spec, deadline) {
+      return {
+        navigate: () => loadRoute(spec.key),
+        fillSymbol: (value) => fillSymbol(cdp, value),
+        /** 直接等一批取数（不返回探针）。 */
+        waitIdle: async () => { await settleProbe(deadline); },
+        fillContract: (code) => fillContractInput(cdp, code),
+        hasDerivativeRows: () => hasDerivativeRows(cdp),
+        clickCardButton: (card, text) => clickCardButton(cdp, card, text),
+      };
+    }
+
     for (const spec of selected) {
       const routeStart = Date.now();
       const routeDeadline = routeStart + ROUTE_BUDGET_MS;
@@ -1247,24 +1738,24 @@ async function main() {
       const endpoints = {};
       const substitute = (value) => (value === "$mode" ? mode
         : value === S ? pageSymbol
-          : value === T3 ? tickers3
-            : Array.isArray(value) ? value.map(substitute) : value);
+          : value === O ? optionCode
+            : value === T3 ? tickers3
+              : Array.isArray(value) ? value.map(substitute) : value);
       const resolvePayload = (payload) => Object.fromEntries(
         Object.entries(payload).map(([k, v]) => [k, substitute(v)]));
-      for (const [key, [name, payload]] of Object.entries(spec.endpoints)) {
-        const effective = resolvePayload(payload);
-        const result = await callApi(name, effective);
-        endpoints[key] = { name, payload: effective, value: result.value, error: result.error };
-      }
+      /** 取一批端点事实（spec.endpoints 与 phase.endpoints 共用）。 */
+      const collectEndpoints = async (declared) => {
+        const out = {};
+        for (const [key, [name, payload]] of Object.entries(declared)) {
+          const effective = resolvePayload(payload);
+          const result = await callApi(name, effective);
+          out[key] = { name, payload: effective, value: result.value, error: result.error };
+        }
+        return out;
+      };
+      Object.assign(endpoints, await collectEndpoints(spec.endpoints));
       // ② 页面事实
-      loadFired = false;
-      await cdp.send("Page.navigate", { url: "about:blank" });
-      await sleep(150);
-      net.inflight.clear();
-      net.lastEventAt = Date.now();
-      await cdp.send("Page.navigate", { url: `${BASE}/#/${spec.key}` });
-      const dl = Date.now() + 15000;
-      while (!loadFired && Date.now() < dl) await sleep(80);
+      await loadRoute(spec.key);
 
       let symbolFill = null;
       if (spec.needsSymbol) {
@@ -1276,28 +1767,8 @@ async function main() {
         symbolFill = await fillSymbol(cdp, tickers3.join(","));
         await sleep(300);
       }
-      // 网络空闲
-      const waitStart = Date.now();
-      let idle = false;
-      while (Date.now() - waitStart < MAX_WAIT_MS && Date.now() < routeDeadline) {
-        if (net.inflight.size === 0 && Date.now() - net.lastEventAt >= IDLE_MS) { idle = true; break; }
-        await sleep(80);
-      }
-      // DOM 稳定：连续 3 次采样签名不变
-      const sig = (p) => `${(p.items ?? []).length}|${(p.tables ?? []).length}|${(p.scanText ?? "").length}`;
-      let probe = await evaluate(cdp, DOM_PROBE);
-      let stable = 1;
-      let last = sig(probe);
-      const stableStart = Date.now();
-      while (Date.now() - stableStart < Math.min(12000, Math.max(0, routeDeadline - Date.now()))) {
-        await sleep(500);
-        const cur = await evaluate(cdp, DOM_PROBE);
-        const curSig = sig(cur);
-        stable = curSig === last ? stable + 1 : 1;
-        last = curSig;
-        probe = cur;
-        if (stable >= 3 && net.inflight.size === 0) break;
-      }
+      const settled = await settleProbe(routeDeadline);
+      let probe = settled.probe;
 
       // ③ 判定
       const fields = spec.fields.map((field) => judgeField(field, spec, endpoints, probe, symbol));
@@ -1305,14 +1776,54 @@ async function main() {
       const endpointErrors = Object.entries(endpoints)
         .filter(([, call]) => call.error)
         .map(([key, call]) => ({ endpoint: call.name, error: call.error, key }));
+
+      // ④ 交互卡片：每个 phase 自带端点/动作/字段，动作只点只读查询控件
+      const phases = [];
+      for (const phase of spec.phases ?? []) {
+        const phaseEndpoints = await collectEndpoints(phase.endpoints);
+        Object.assign(endpoints, phaseEndpoints);
+        const action = await phase.action(pageApi(spec, routeDeadline), { symbol: pageSymbol, optionCode })
+          .catch((error) => ({ ok: false, reason: String(error?.message ?? error) }));
+        if (!action?.ok) {
+          // 动作失败 → 本 phase 字段一律 UNJUDGED（没有页面事实可比），理由如实带出
+          const blocked = phase.fields.map((field) => ({
+            ...judgeField(field, spec, phaseEndpoints, { items: [], tables: [], steps: [], timeline: [], pairs: [], scanText: "" }, symbol),
+            judge: "UNJUDGED",
+            note: `交互未完成，字段无法判定：${action?.reason ?? "未知原因"}`,
+          }));
+          phases.push({ key: phase.key, ok: false, detail: action?.reason ?? null, fields: blocked, probes: null });
+          fields.push(...blocked);
+          log(`      · phase ${phase.key} 未完成：${action?.reason ?? "未知原因"}`);
+          continue;
+        }
+        const after = await settleProbe(routeDeadline);
+        const phaseFields = phase.fields.map((field) => judgeField(field, spec, phaseEndpoints, after.probe, symbol));
+        const phaseScans = scanText(after.probe.scanText ?? "");
+        scans.push(...phaseScans.map((scan) => ({ ...scan, phase: phase.key })));
+        endpointErrors.push(...Object.entries(phaseEndpoints)
+          .filter(([, call]) => call.error)
+          .map(([key, call]) => ({ endpoint: call.name, error: call.error, key: `${phase.key}.${key}` })));
+        phases.push({
+          key: phase.key, ok: action.ok, detail: action.detail ?? null, fields: phaseFields,
+          probes: { cards: after.probe.cards ?? [],
+            tables: (after.probe.tables ?? []).map((table) => ({
+              card: table.card, headers: table.headers, rows: (table.rows ?? []).length })),
+            timeline: (after.probe.timeline ?? []).length,
+            pairs: (after.probe.pairs ?? []).length },
+        });
+        fields.push(...phaseFields);
+      }
+
       const entry = {
         route: spec.key, name: spec.name,
         url: `${BASE}/#/${spec.key}`,
-        symbol: pageSymbol, idle, symbolFill,
+        symbol: pageSymbol, idle: settled.idle, symbolFill,
         endpoints: Object.fromEntries(Object.entries(endpoints)
           .map(([k, v]) => [k, { name: v.name, payload: v.payload, error: v.error ?? null }])),
         fieldCount: fields.length,
         fields, scans, endpointErrors,
+        phases: phases.map((phase) => ({ key: phase.key, ok: phase.ok, detail: phase.detail,
+          fieldCount: phase.fields.length, probes: phase.probes })),
         cards: probe.cards ?? [],
         // 诊断用：页面上每张表的卡片标题与表头（定位「字段取自哪张表」时的第一手证据）
         tables: (probe.tables ?? []).map((table) => ({
@@ -1328,6 +1839,7 @@ async function main() {
       if (scans.length) flags.push(`扫雷x${scans.length}`);
       if (endpointErrors.length) flags.push(`端点失败x${endpointErrors.length}`);
       if (symbolFill && !symbolFill.ok) flags.push(`标的未填入:${symbolFill.reason}`);
+      for (const phase of phases) if (!phase.ok) flags.push(`交互未完成:${phase.key}`);
       log(`  ${spec.key.padEnd(10)} 字段${String(fields.length).padStart(3)} ` +
         `${flags.length ? "⚠ " + flags.join(" ") : "✓"}（${entry.routeMs}ms）`);
     }
@@ -1390,6 +1902,11 @@ async function main() {
       return acc;
     }, {}),
     observations: report.observations.length,
+    // 交互卡片（phases）单独计数：它们的字段已并入 fields，但「哪些字段是靠点按钮取到的」
+    // 必须在汇总里看得见，否则「字段数变多」看不出是被覆盖了还是被判轻了。
+    phases: report.pages.reduce((sum, p) => sum + (p.phases ?? []).length, 0),
+    phaseFields: report.pages.reduce((sum, p) =>
+      sum + (p.phases ?? []).reduce((acc, phase) => acc + phase.fieldCount, 0), 0),
   };
   report.totals = totals;
   report.finishedAt = new Date().toISOString();
@@ -1401,11 +1918,15 @@ async function main() {
   log("=== 结果 ===");
   log(`  页面 ${totals.pages}｜字段 ${totals.fields}（ok ${totals.ok}｜空态正确 ${totals.empty}）`
     + `｜缺陷 ${totals.defects}（${JSON.stringify(totals.byJudge)}）｜观察 ${totals.observations}`);
+  log(`  交互取证 phase ${totals.phases} 个、其中字段 ${totals.phaseFields} 条`
+    + `（合约代码 ${optionCode || "（未取到）"}，来源 ${optionCodeSource ?? "无"}）`);
   for (const page of report.pages) {
     const bad = page.fields.filter((f) => ["MISSING_WHEN_DATA", "FORMAT", "FABRICATED"].includes(f.judge));
     log(`  ${page.route.padEnd(10)} 字段${String(page.fieldCount).padStart(3)} ` +
       `ok${String(page.fields.filter((f) => f.judge === "ok").length).padStart(3)} ` +
       `缺陷${String(bad.length).padStart(2)}` +
+      ((page.phases ?? []).length
+        ? `｜交互 ${page.phases.map((phase) => `${phase.key}${phase.ok ? "✓" : "✗"}`).join(",")}` : "") +
       (bad.length ? ` → ${[...new Set(bad.map((f) => `${f.label}:${f.judge}`))].slice(0, 4).join("、")}` : ""));
   }
   if (report.defects.length) {

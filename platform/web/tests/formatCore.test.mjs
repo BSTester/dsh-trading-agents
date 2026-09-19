@@ -8,7 +8,7 @@ import test from "node:test";
 import assert from "node:assert/strict";
 
 import {
-  MISSING, clockText, dayText, numText, pctOfText, stampText,
+  MISSING, clockText, dayText, numText, pctOfText, roundTo, stampText,
 } from "../src/services/formatCore.js";
 
 test("numText：缺失 → —，绝不显示 0", () => {
@@ -81,4 +81,17 @@ test("dayText：毫秒时间戳 → YYYY-MM-DD（不再显示 10 位假日期）
   assert.equal(dayText("2026-09-18 00:00:00"), "2026-09-18");
   assert.equal(dayText("2026-09-18"), "2026-09-18");
   assert.equal(dayText(null), MISSING);
+});
+
+test("roundTo：antd Statistic 的 precision 是截断，必须先四舍五入（2026-09-19 实测缺陷）", () => {
+  // 真机取证：ATR 5.915678571428567 在 signal 页被 antd 渲染成 "5.91"（正确 5.92），
+  // 因为 antd es/statistic/Number.js 对小数串是 padEnd + slice（截断），不做四舍五入。
+  assert.equal(roundTo(5.915678571428567, 2), 5.92);
+  assert.equal(roundTo(5.915678571428567, 2).toFixed(2), "5.92");
+  // 固定位数语义与 numText 的「最多 N 位」不同：交给 antd 的仍是数值，由 precision 补零
+  assert.equal(String(roundTo(61.4, 2)), "61.4");
+  assert.equal(roundTo(999809.29, 2), 999809.29);
+  // 缺失/非数值原样返回（页面靠 `?? "—"` 与 Statistic 原样字符串渲染兜底）
+  for (const empty of [null, undefined, "", "—"]) assert.equal(roundTo(empty, 2), empty);
+  assert.equal(roundTo("abc", 2), "abc");
 });

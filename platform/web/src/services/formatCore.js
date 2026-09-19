@@ -33,6 +33,23 @@ export function pctOfText(ratio, digits = 2) {
   return `${(parsed * 100).toFixed(digits)}%`;
 }
 
+/**
+ * 按 `digits` 位**四舍五入**后的数值（给 antd `Statistic precision` 用）。
+ *
+ * 为什么需要（2026-09-19 实测 + antd 源码取证）：antd 的 `Statistic` 在带 `precision` 时
+ * **不四舍五入，而是截断**——`es/statistic/Number.js` 里是
+ * `decimal.padEnd(precision, '0').slice(0, precision)`：ATR 真值 `5.915678571428567`
+ * 会渲染成 `5.91`（正确值是 `5.92`）。把值先按同位数四舍五入再交给 Statistic，显示才等于
+ * 数值本身；非有限值（含页面回落的 `"—"`）原样返回，保持「缺失显示 —」的既有语义。
+ */
+export function roundTo(value, digits = 2) {
+  const parsed = Number(value);
+  if (value === null || value === undefined || value === "" || !Number.isFinite(parsed)) {
+    return value;
+  }
+  return Number(parsed.toFixed(digits));
+}
+
 /** 秒级时间戳统一展示：ISO 的 T 分隔 → 与库内时间一致的空格分隔；缺失显示 —。 */
 export function stampText(value) {
   return value ? String(value).replace("T", " ").slice(0, 19) : MISSING;

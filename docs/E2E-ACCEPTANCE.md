@@ -195,6 +195,29 @@ research/events/plan/pipeline/schedule/audit/settings）。每页做两件事：
 | `UNJUDGED` | 端点取数失败（无权限/无凭据/参数不被接受） | ❌ 但要点名端点错误原文 |
 | `NOT_RENDERED` | 标签在 DOM 里没出现（条件渲染/需先输入标的） | ❌ 观察项 |
 
+**毒值优先于「部分命中」**：同一列里既有对得上的值、又有 `[object Object]`/`NaN` 时，先判 ok
+会把真缺陷盖掉（2026-09-19 实测：审计页「券商」列同时是 `200, 1,000, [object Object]`），
+所以 `FABRICATED` 的毒值判据在 `hits` 短路上**之前**执行。期望文本比对前按渲染口径做空白归一
+（HTML 折叠连续空白），这是对齐渲染事实，不是放宽数值/千分位/百分号判据。
+
+### 交互卡片取证（phases，2026-09-19 新增）
+
+有些字段「数据存在但默认视图里没有」——必须先在页面上**操作**才出来。这类区块用页面规格里的
+`phases` 二次取证：每个 phase 自带端点表、动作与字段，动作**只点只读查询控件**（筛选按钮、
+查询按钮、标的输入框），不碰任何提交/下单/执行/模式类控件。已覆盖：
+
+| 页面 | phase | 动作 | 新增字段 |
+|---|---|---|---|
+| options | `screen` | 在「期权筛选（option_screen）」卡片里按下「筛选」 | 结果表代码 / 成交量 / 持仓量 |
+| options | `derivative` | 往「期权合约代码」输入框填 `--option-code` 并按下「查询」 | 平均隐含波动率 / IV 状态 / 标的价格 |
+| factors | `quality` | 重新导航后只填**1 只**标的（ic 需要 3..8 只，同一输入框喂不出两种标的数） | 财报卡 12 项（报告期/财年/币种/会计准则/期间数/营收/毛利/净利/毛利率/净利率/营收同比/净利同比） |
+
+动作失败（按钮没命中、合约代码挑不到）时该 phase 的字段一律 `UNJUDGED` 并在日志里带出原因——
+**「点了但没反应」不会被当成通过**（衍生品 phase 还会校验两张子卡真的出现了键值行）。
+
+非表格结构也纳入了探针：事件页的时间线按 `.ant-timeline-item` 抓「整项全文 + Tag 文本」，
+期权衍生品卡的键值行按「次要色标签 + `.ant-space-item` 兄弟值」配对（`key=` 那种行内片段排除）。
+
 判定的期望文本由工具**独立实现**（`CONTRACTS`），再由 `tests/audit-page-fields.test.mjs`
 与 `services/formatCore.js` 的真实实现逐值对齐——既不共用一份代码（否则实现有 bug 会被
 工具原样祝福），也不允许两处漂移。
@@ -205,23 +228,57 @@ research/events/plan/pipeline/schedule/audit/settings）。每页做两件事：
 node scripts/audit_page_fields.mjs                          # 全量 16 路由
 node scripts/audit_page_fields.mjs --pages capital,market    # 单页/多页复验（未知键报错并列可用键）
 node scripts/audit_page_fields.mjs --pages options --symbol HK.09961   # 标的类页面指定标的
-node scripts/audit_page_fields.mjs --json                    # 额外打印报告路径
+node scripts/audit_page_fields.mjs --pages options --option-code US.SPY260918C760000
+node scripts/audit_page_fields.mjs --json --verbose          # 额外打印报告路径 / 逐字段明细
 node scripts/audit_page_fields.mjs --help
 ```
 
-- **标的**：默认取关注池第一只（与页面候选同源）。期权页声明了 `preferMarket: "HK"`
+- **标的**：默认取关注池第一只（与页面候选同源）。期权页与行情页都声明了 `preferMarket: "HK"`
   ——实测 `option_chain` 对 A 股标的**直接拒绝**（`option chain only supports HK / US / JP
-  markets`），用 A 股标的跑只会得到 UNJUDGED。行情页的**实时报价/盘口**同理（A 股 `rt_quote`
-  恒 `errcode=-9 realtime quote permission required`），需补一次 HK 标的：
-  `node scripts/audit_page_fields.mjs --pages market --symbol HK.09961`。
+  markets`）、A 股 `rt_quote` 恒 `errcode=-9 realtime quote permission required`，用 A 股标的
+  跑这两页只会得到 UNJUDGED（`--symbol` 仍可覆盖）。事件页另有 `symbolResolver`：从关注池里
+  挑第一只**真有事件**的标的（默认标的 SH.600000 只有 1 条，覆盖不到多条时间线的形态）。
+- **`--option-code`**：衍生品卡要的是**期权合约代码**（关注池与持仓都不产出它）。缺省时工具
+  自己调 `option_screen` 取真机结果首条的 `code`；取不到就把该 phase 的字段判 `UNJUDGED`
+  并写明原因，**不会编一个看起来对的合约代码**。
 - **退出码**：`0` 无缺陷；`1` 发现缺陷；`2` 服务未就绪或运行中断。
 - **等待预算**：`AUDIT_ROUTE_BUDGET_MS`（单路由预算，默认 90s）、`AUDIT_MAX_WAIT_MS`
   （网络空闲上限）、`AUDIT_BASE` / `AUDIT_CHROME` 覆盖地址与浏览器。
 - **产物**：`~/.dsh/logs/page-fields-<ts>/report.json`——逐字段明细
-  （`page/label/where/endpoint/path/kind/backend/rendered/judge/note`）、全文扫雷结果、
-  每页抓到的表格清单（诊断「这个值取自哪张表」）与端点错误原文。
-- **只读**：在标的输入框里输入并回车（这是页面的正常查询动作），
+  （`page/label/where/endpoint/path/kind/backend/rendered/judge/note`）、每个 phase 的
+  动作结论与探针计数、全文扫雷结果、每页抓到的表格清单（诊断「这个值取自哪张表」）与端点错误原文。
+- **只读**：在输入框里输入并回车/点只读查询按钮（都是页面的正常查询动作），
   不点击任何提交类控件、不改服务状态、不装依赖。
+
+---
+
+### 空态字段怎么变成可判定字段（数据生成，2026-09-19）
+
+上一轮有 30 项因**没数据**只判到 `EMPTY`/`NOT_RENDERED`（等于没验证格式）。本轮先按平台
+自己的写入路径把数据造出来，再复验。**全部只用平台自己的工具/存储 API，不手写 JSON、不切模式、
+不改 `trading-platform.json`、不清库。**
+
+| 数据 | 生成命令（DSH_HOME 默认 ~/.dsh） | 生成前 | 生成后 |
+|---|---|---|---|
+| 工作台信号预览 | `node scripts/workbench_admin.mjs seed-preview --ticker SH.600000 --strategy rsi`（×3：SH.600000 / HK.09961 / US.NVDA） | `snapshot.previews = 0` | `= 3` |
+| 研究运行 + 已发布研报 | `node scripts/workbench_admin.mjs seed-research --ticker SH.600000 --rating Hold --report-file <md> --sources-file <json>` | runs/reports 均 0 | runs 1 / reports 1（来源 2 条） |
+| 券商成交回填（fills） | `PYTHONPATH=plugins/core/python ~/.dsh/trading-venv/bin/python -B -m trading_core reconcile-daily --today 2026-09-14` | `fills = 0` | `fills = 3`（HK.00981 1000@61.4、HK.00100 200@253、HK.02513 100@729；15 条券商单收编进 OMS） |
+| 对账差异（diffs） | 同上，末尾再跑一次当天：`… reconcile-daily --today 2026-09-19` | `diffs = 0` | `diffs = 11`（2 条数量不一致 + 9 条单边缺失） |
+| 本地模拟台账（组合权益 + 执行页本地台账） | `DSH_HOME=~/.dsh ~/.dsh/trading-venv/bin/python -B plugins/engine/python/engine.py decide --ticker SH.600031 --strategy rsi --apply` | `quant-ledger.json` 不存在、`equity.points = 0`、`trades = 0` | 1 笔模拟买入（8200 股 @17.89，含费 190.71）、`equity` 出数、`trades = 1` |
+| 第二个计划（计划列表卡） | `PYTHONPATH=plugins/core/python ~/.dsh/trading-venv/bin/python -B -m trading_core plan-build --mode SIM --strategy momentum_value_top5 --target '{"SH.600000": 0.03}' --prices '{"SH.600000": 9.07}' --as-of 2026-09-18` | `plan.plans = 1`（`plans.length > 1` 才渲染列表卡） | `= 2`（新增 `PLN-20260918-SIM-12FB`，`origin=manual`，不会被自动执行） |
+| 财报卡（factors quality） | 数据本来就在（`fundamentals` 578 行）；缺的是**取证方式** → 见上面 factors 的 `quality` phase | `NOT_RENDERED`（工具只填 3 只标的，而卡片要恰好 1 只） | 12 项全部 ok |
+| 期权筛选 / 衍生品 | 无需写库；用 phase 在页面上点「筛选」/填合约代码点「查询」 | 未覆盖 | 6 项全部 ok |
+| 行情页实时报价/盘口 | 无需写库；行情页改为默认挑 HK 标的 | A 股标的恒 `-9` → UNJUDGED | 13 项（12 ok + 1 空态） |
+| 事件页时间线 | 无需写库；`symbolResolver` 自动挑有事件的标的 | 只审计到 1 个字段 | 5 项全部 ok |
+
+> **`reconcile-daily` 的两个前提与副作用（必须知道）**：
+> ① `fills` 的回填**只认券商订单历史**（`_backfill_fills`，幂等、只补差额）。本机券商侧
+> 30 天窗口里**只有 2026-09-14 那 3 张单真成交**（`cum_qty > 0`），且当天本地台账没有对应
+> 订单，所以必须先跑 `--today 2026-09-14` 让对账把券商单收编进 OMS 再回填；不带 `--today`
+> 跑当天只会拿到空订单窗口，`fills` 依然是 0。
+> ② 有差异就会 `set_halt(True, reason="reconcile_diff")`——本轮真实造出了 11 条差异，
+> **自动执行因此被熔断**。这是平台的设计行为（差异不平就暂停），恢复要人工查明后
+> `store.clear_halt`（见 `docs/RUNBOOK.md` 场景 3）。不想要这个副作用就别跑当天的对账。
 
 ---
 
@@ -232,38 +289,105 @@ node scripts/audit_page_fields.mjs --help
 | **基线**（修复前） | 122 | 38 | 18 | 20 | **13** | 6（+1 条重复计数） | 53 | **1** |
 | **修复后**（全量 16 页） | 124 | 90 | 20 | **0** | 0 | 0 | 16 | **0** |
 | 补充：`--pages market --symbol HK.09961`（实时报价/盘口数据面） | 13 | 12 | 1 | **0** | 0 | 0 | 0 | **0** |
+| **本轮**（造数据 + 交互取证 + 修 2 处新缺陷，全量 16 页） | **154** | **150** | **4** | **0** | 0 | 0 | **0** | **0** |
 
 产物：`~/.dsh/logs/page-fields-<ts>/report.json`（基线 `page-fields-2026-09-18T18-34-59-801Z`、
-修复后 `page-fields-2026-09-18T19-02-24-094Z`、HK 补充轮 `page-fields-2026-09-18T19-05-43-827Z`）。
+修复后 `page-fields-2026-09-18T19-02-24-094Z`、HK 补充轮 `page-fields-2026-09-18T19-05-43-827Z`、
+本轮 `page-fields-2026-09-19T02-59-10-910Z`）。
 
-> **口径说明（重要）**：基线那 20 条判定里，6 条是**工具自己的规格写错**（把有意的展示映射
+**本轮相对上一轮的三个变化**（口径没动，判定码与退出码语义不变）：
+
+1. **字段 124 → 154**：新增的 30 条全部来自「原来取不到证的区块」——期权筛选 3 条、
+   期权衍生品 3 条、因子财报卡 12 条（上一轮 16 条里 3 条在旧规格下是 NOT_RENDERED，
+   本轮换成 12 条的完整卡）、研究运行/研报 6 条、信号页 3 条（信号/数据日期/历史预览标的）、
+   对账差异 2 条（差异类型/数量差）、事件时间线 4 条（减去原来的 1 条日期正则）；
+   同时删掉了两个**规格写错**的字段（signal 的「策略」按原始 `strategy` 比对，
+   而页面渲染的是 `strategy_label`；factors 的财报路径写在 base 而非单标的 phase）。
+2. **ok 90 → 150、空态 20 → 4**：剩下的 4 条空态都是**真的没有数据**（见下表），
+   且这 4 条本轮已用真实载荷核实过「两端确实都空」。
+3. **新发现并修掉的 2 处真页面缺陷 + 3 处工具侧误判**（见后两节）。
+
+**逐页结论（本轮）**
+
+| 页面 | 审计字段数 | ok | 空态正确 | 缺陷 | 备注 |
+|---|---|---|---|---|---|
+| overview | 10 | 10 | 0 | 0 | 因子数/覆盖标的在 `payload.tickers` 对象上取，全部命中 |
+| market | 13 | **13** | 0 | 0 | 兜底 `preferMarket: "HK"` 后**默认就覆盖**实时报价/盘口（上一轮要手动 `--symbol`）；同名标签按卡片限定 |
+| capital | 10 | 10 | 0 | 0 | 四档键名/毫秒时间戳/分布表全部命中 |
+| options | 11 | 9 | 2 | 0 | 新增 `screen`/`derivative` 两个 phase 共 6 条：筛选结果 3 条 + 衍生品 3 条全部命中 |
+| signal | **9** | **9** | 0 | 0 | 造出 3 条 signal 预览后全覆盖；**发现并修掉 ATR 截断缺陷** |
+| portfolio | 7 | 7 | 0 | 0 | 造出本地台账后 `current/total_return/max_drawdown/trades` 全部命中 |
+| risk | 14 | 14 | 0 | 0 | 无变化 |
+| factors | **25** | **25** | 0 | 0 | base 3 只标的（13 条）+ `quality` phase 单标的（12 条） |
+| execution | 14 | 12 | 2 | 0 | 本地台账有 1 笔模拟买入；OpenAPI 四表有 51 条订单/3 条成交；`收益`/`胜率` 仍空（无卖出） |
+| research | **9** | **9** | 0 | 0 | 造出 1 个 run + 1 篇已发布研报；运行表 + 研报表全部命中 |
+| events | **5** | **5** | 0 | 0 | `symbolResolver` 自动挑到 US.NVDA（5 条事件）；时间线 4 条字段全部命中 |
+| plan | 6 | **6** | 0 | 0 | 造出第 2 个手工计划 → 「计划列表」卡渲染，`创建时间`/`订单数` 命中 |
+| pipeline | 2 | 2 | 0 | 0 | 无变化 |
+| schedule | 4 | 4 | 0 | 0 | 无变化 |
+| audit | 11 | 11 | 0 | 0 | 造出 11 条对账差异后差异表渲染；**发现并修掉 `[object Object]` 缺陷** |
+| settings | 4 | 4 | 0 | 0 | 无变化 |
+
+**仍然空态的 4 条**（不是「已验证」，是「确实没有数据」）：
+
+| 页面 / 字段 | 后端 | 渲染 | 为什么空 |
+|---|---|---|---|
+| options 成交量（期权链） | 全 null | `—` | HK 期权链（HK.00100）这些行的 `volume` 上游就是 null；US 那边有值（筛选 phase 的成交量 815,132 就命中） |
+| options 标的价格（行权概率卡） | 顶层无 `security_price` | `—` | **上游把 `security_price`/`strike_probability`/`timestamp` 放在 `item_list[]` 里**，卡片按顶层键读 → 全 `—`。见「未修」清单 |
+| execution 收益（本地台账） | 无卖出记录 | `—` | T+1 约束下当天买入当天不可卖，本地台账只有 1 笔 BUY，`return` 字段本来就不存在 |
+| execution 胜率（卖出计） | `win_rate = null` | `—` | 同上：没有 SELL 行时 `win_rate` 恒为 null |
+
+### 本轮修掉的真页面缺陷（2 条）
+
+| # | 页面 / 字段 | 后端值 | 渲染值（修复前） | 为什么是缺陷 | 修法 |
+|---|---|---|---|---|---|
+| 1 | signal 最新信号 · ATR(14)（同因也影响 `收盘价` 与 portfolio `最新权益`） | `5.915678571428567` | `5.91` | 正确值是 `5.92`。根因是 **antd `Statistic` 带 `precision` 时截断而非四舍五入**（`node_modules/antd/es/statistic/Number.js`：`decimal.padEnd(precision,'0').slice(0,precision)`）。这是全站口径不一致：其他数值展示（`num`/`pctOf`/`f10.fmtNum`）都四舍五入 | 新增 `formatCore.roundTo(value, digits)`（`Number(v.toFixed(digits))`）并在 3 个 `precision={2}` 的 Statistic 上传入，先四舍五入再交给 antd；`platform/web/tests/formatCore.test.mjs` 与审计工具 `numFixed2` 契约各自锁住 |
+| 2 | audit 对账差异 · 本地/券商列 | `local=null, broker={"qty":5200}`（`missing_side`）、`local={"qty":-100}` | `[object Object]` | `reconcile.compare` 的两类差异**值形状不同**：`qty` 类给整数、`missing_side` 类给**整份持仓字典**。页面 `num()` 对非有限值回落 `String(value)`，把字典渲染成 `[object Object]`——页面出现这种东西等于「拿未知当已知」 | `audit.jsx` 新增 `diffQty()`：字典取它的 `qty`（唯一的数量事实），`null`/取不到 qty 显示 `—`；`qty` 类整数行为不变 |
+
+### 本轮修掉的工具侧误判（3 条，不是页面缺陷）
+
+| 判定 | 页面对照 | 为什么是工具写错 |
+|---|---|---|
+| events 「事件详情」`FORMAT`（后端 `每股派息 0  · …` 双空格 vs 渲染单空格） | HTML 折叠连续空白 | 期望文本未按渲染口径做空白归一 → 比对前统一 `replace(/\s+/g," ")` |
+| market 涨跌幅（实时报价卡）`EMPTY`，同列却渲染 `+18.92%` | 页面 `changePctOf`：上游 `change_rate/change_pct` 都没有时，用（最新价−昨收）/昨收 换算 | 规格只读了上游字段 → 改成与页面同序取值（`quoteChangePct`） |
+| audit 「券商」列判 `ok`（同列已有 `[object Object]`） | 该列确实渲染了 `[object Object]`（真缺陷） | 判定顺序问题：`hits` 短路在毒值判据之前 → **毒值判定提前**（这条误判掩盖了上面那条第 2 号真缺陷） |
+
+### 本轮**未修**（需要产品决策或超出「显示缺陷」范围，如实列出）
+
+| 项 | 事实 | 为什么不修 |
+|---|---|---|
+| options 「行权概率」卡整卡显示 `—` | 上游 `option_exercise_probability` 的响应只有 `item_list[]`，`security_price`/`timestamp`/`strike_probability` 都在**数组元素**里；`f10.exerciseProbabilitySummary` 按顶层键读 → 三项全 `—`（`docs/TOOL-LIMITS.md` 的锁定表把这三个字段记成 section 级字段） | 「取哪一条 item、怎么和 `strike_probability` 配对」锁定表没写（实测 item[0] 只有 price/timestamp，item[1] 才有 strike_probability）→ 映射等于**猜语义**。**本轮不猜，如实暴露**：字段判定记 `EMPTY` 并在本节点名，修它要先确定 item_list 的排序与配对规则 |
+| audit 对账差异「本地/券商」列 | 已修渲染（取 `qty`），但 `missing_side` 的语义仍是「一侧没有持仓」 | 显示层已不撒谎；`local=-100`（只有卖出成交、没有对应买入）这类**负持仓**是数据层事实（券商 30 天订单窗口缺历史买单），要不要在数据层修是另一个决策 |
+| execution OpenAPI 四表用 `rawCell` 原样展示 | 数量 `"1000"`、委托价 `"61"` 不带千分位，与全站 `num()` 口径不一致 | 该函数有明文理由（原文数值原样展示；订单号/状态原码必须保持原样）。需按列决定 |
+| capital 资金分布「≤1 就 ×100」的单位猜测 | 上游当前不给 `*_ratio` 键（走自算分支） | **无法用真实数据判定**该猜测对不对 |
+| 「最大可买可卖」模拟盘必失败 | 载荷缺 `price`（`trading.py:1175` 明确必填），且列读 `max.max_cash_buy` 而模拟盘实际键是 `max_cash_buy_qty_round_lot` | 属**功能性**缺陷（端点失败 → 整卡无数据），修它要先定「用哪个价格算最大可买」 |
+| execution 实盘（live）下四张 OpenAPI 表缺 `market` | `OpenApiBroker._per_market` 强制要求 market | 模式相关功能性缺陷；本环境是 sim，无法复现验证 |
+| 研究/执行页时间列的时区语义 | 服务端用 `toISOString()`（UTC），页面截断显示且不标时区 | 显示格式符合契约（无 T、可读），但「UTC 值当本地时间读」是语义问题，需产品决策 |
+| **portfolio 权益曲线本身**（canvas） | 需要**≥2 个交易日**的本地台账成交才画；同一天只能造出 1 个点 | 不是缺陷、也不是工具限制：页面已如实显示「权益序列仅 1 个点，不足以绘制」。要验证曲线得等到第二个交易日再跑一次 `engine.py decide --apply` |
+| 本地模拟台账没有**定时写入方** | `~/.dsh/quant-ledger.json` 只被 `engine.py decide --apply`（CLI/对话工具）写，`auto_pipeline`/调度链**不写**它 | 结构性事实（不是显示缺陷）：不人工跑 `decide`，组合页权益与执行页本地台账就长期是空态。要不要给它一个调度写入方是产品决策 |
+
+### 本轮**未覆盖**（工具的诚实清单）
+
+- **图表内部像素**：canvas 图表只判「有没有数据可画」（空态文案/跳过计数），不核像素与刻度。
+- **端点恒失败的字段**：A 股 `rt_quote`/`rt_order_book`（`-9 无权限`）→ UNJUDGED；
+  行情页已自动改用 HK 标的覆盖，但**A 股那一路的失败形态**仍未被「有数据」的用例覆盖。
+- **需要点提交类控件的区块**：确认卡片（`confirmation`）、规则审批（`rules-decide`）、
+  计划执行（`plan-execute`）、模式切换——这些会改状态，按工具的只读纪律**不点**，
+  由 `e2e_web.mjs` 与后端测试覆盖。
+- **仍为空态的 4 条字段**：见上表，它们**不是**「已验证」，是「确实没有数据」。
+
+---
+
+以下三节保留**上一轮（2026-09-19 上午，提交 `63118d2`）**的原始记录，作为历史对照；
+本轮的口径补充见上文。
+
+> **口径说明（上一轮）**：基线那 20 条判定里，6 条是**工具自己的规格写错**（把有意的展示映射
 > 当成后端原值比对：overview 账户模式「模拟 SIM」、research 规则状态「未通过」、plan/pipeline
 > 的取值正则把时间戳截断、audit 时间列的精度种类选错、settings 通道带后缀），另有 1 条是同一
 > 根因（audit 自检时间带 `T`）的字段判定与全文扫雷各记一次。这 7 条已在**工具侧**修掉（正则/
 > 种类/包含匹配），不是页面缺陷。**真页面缺陷 = 13 条**。
 
-**逐页结论（修复后）**
-
-| 页面 | 审计字段数 | ok | 空态正确 | 缺陷 | 备注 |
-|---|---|---|---|---|---|
-| overview | 10 | 10 | 0 | 0 | 基线 3 条判定＝2 条真缺陷（因子数/覆盖标的恒 —）+1 条工具假阳性 |
-| market | 13 | 7 | 1 | 0 | A 股标的的实时报价/盘口端点恒 `-9 无权限` → UNJUDGED；HK 标的复跑 12/13 ok |
-| capital | 10 | 10 | 0 | 0 | 基线 8 条真缺陷（四档键名不符 + 毫秒时间戳 + 分布表整列 —）全部修好 |
-| options | 5 | 4 | 1 | 0 | 期权链需 HK/US 标的（页面规格声明 `preferMarket: HK`）；需手输期权合约的衍生品卡未覆盖 |
-| signal | 6 | 0 | 2 | 0 | `snapshot.previews` 为空（无信号/回测预览）→ **无法判定格式**，不等于通过 |
-| portfolio | 7 | 3 | 4 | 0 | 权益台账无数据（current/total_return/max_drawdown/trades 全空）→ 4 项空态 |
-| risk | 14 | 14 | 0 | 0 | 基线 1 条真缺陷（positions.as_of 带 T） |
-| factors | 16 | 13 | 0 | 0 | 需先在关注池输入框填 ≥3 只标的；单标的财报质量卡（恰好 1 只才渲染）未覆盖 |
-| execution | 14 | 7 | 7 | 0 | 本地台账无成交记录（7 项空态）；OpenAPI 四张表按 DOM 序号定位 |
-| research | 3 | 1 | 2 | 0 | 运行记录与研报为空；规则候选池 1 条 ok |
-| events | 1 | 1 | 0 | 0 | 只审计到事件日期（Timeline 非表格结构） |
-| plan | 6 | 4 | 0 | 0 | 只有 1 个计划 → 「计划列表」卡片不渲染（`plans.length > 1` 才渲染） |
-| pipeline | 2 | 2 | 0 | 0 | 只审计日期与一个阶段时刻（Steps 结构） |
-| schedule | 4 | 4 | 0 | 0 | 作业历史 10 行 / 告警 20 条，字段全部命中 |
-| audit | 9 | 6 | 3 | 0 | 对账差异为空（3 项空态）；基线 1 条真缺陷（sources.checked_at 带 T） |
-| settings | 4 | 4 | 0 | 0 | 凭据/通道/算法/掩码 AppKey 全部命中 |
-
-### 本轮修掉的真页面缺陷（17 条）
+### 上一轮修掉的真页面缺陷（17 条）
 
 其中 13 条由基线审计直接指出，另外 4 条由**代码 + 真实载荷**判定（基线那一轮因前置条件不满足
 或端点无权限没能在浏览器里取到前后对比，逐条注明证据）。
@@ -292,7 +416,7 @@ capital 补实测候选键（`*_in_flow`）与「流入−流出」净流入换�
 factors「正 IC 占比」与四处时间戳改走 `pctOf`/`stampOf`；overview 三个 Statistic 在读取失败时
 显示 `—` 而不是 `0`。
 
-### 工具侧修掉的 6 条假阳性（不是页面缺陷，如实列出）
+### 上一轮工具侧修掉的 6 条假阳性（不是页面缺陷，如实列出）
 
 | 判定 | 页面对照 | 为什么是工具写错 |
 |---|---|---|
@@ -303,11 +427,11 @@ factors「正 IC 占比」与四处时间戳改走 `pctOf`/`stampOf`；overview 
 | audit 时间 `2026-09-18T11:46:28.281Z` | 页面 `timeOf` 输出 `2026-09-18 11:46` | 种类选错（应分钟精度）→ 新增 `stampMinute` |
 | settings 通道 `openapi` vs `openapi（本页凭据）` | 页面有意带后缀 | 改成包含匹配 |
 
-### 本轮**未修**（需要产品决策或超出「显示缺陷」范围，如实列出）
+### 上一轮**未修**（需要产品决策或超出「显示缺陷」范围，如实列出）
 
 | 项 | 事实 | 为什么不修 |
 |---|---|---|
-| audit 对账差异「本地/券商」列可能渲染 `[object Object]` | `reconcile.compare` 的 `missing_side` 行把**整个持仓字典**放进 `local`/`broker`，页面 `num()` 对非有限值回落 `String(value)` | 当前 `diffs` 为**空**，无法用真实数据判定该列应显示什么（数量？持仓字典？）；改动等于编造语义。工具已加 POISON 扫雷（`[object Object]` 一旦出现即报缺陷） |
+| audit 对账差异「本地/券商」列可能渲染 `[object Object]` | `reconcile.compare` 的 `missing_side` 行把**整个持仓字典**放进 `local`/`broker`，页面 `num()` 对非有限值回落 `String(value)` | 上一轮 `diffs` 为**空**，无法用真实数据判定该列应显示什么 → **本轮造出 11 条真实差异后已确认是缺陷并修掉**（见上文「本轮修掉的真页面缺陷」第 2 条） |
 | execution OpenAPI 四表用 `rawCell` 原样展示 | 数量 `"1000"`、委托价 `"61"` 都不带千分位，与全站 `num()` 口径不一致 | 该函数有明文理由（「原文数值原样展示，num 会四舍五入」），且**订单号/状态原码必须保持原样**——改成 `num` 会把订单号变成 `7,138,921`。需按列决定 |
 | capital 资金分布「≤1 就 ×100」的单位猜测 | `Number(ratio) <= 1 ? ratio * 100 : ratio` | 上游当前不给 `*_ratio` 键（走自算分支），**无法用真实数据判定**该猜测对不对 |
 | 「最大可买可卖」模拟盘必失败 | 载荷缺 `price`（`trading.py:1175` 明确 price 必填），且列读 `max.max_cash_buy` 而模拟盘实际键是 `max_cash_buy_qty_round_lot` | 属**功能性**缺陷（端点失败 → 整卡无数据）；修它要先定「用哪个价格算最大可买」，超出显示层 |
@@ -315,7 +439,7 @@ factors「正 IC 占比」与四处时间戳改走 `pctOf`/`stampOf`；overview 
 | 研究/执行页时间列的时区语义 | 服务端用 `toISOString()`（UTC），页面截断显示且不标时区 | 显示格式符合契约（无 T、可读），但「UTC 值当本地时间读」是语义问题，需产品决策 |
 | schedule 心跳原文可能带 `T` | `alerts.emit` 用 ISO 写心跳（当前值恰为空格分隔） | 当前数据不带 T → 本轮**不构成缺陷**；工具已覆盖，一旦出现即报 `T_TIMESTAMP` |
 
-### 本轮**未覆盖**（工具的诚实清单）
+### 上一轮**未覆盖**（工具的诚实清单）
 
 - **需要表单提交/手输才能出数据的区块**：期权筛选（`option_screen` 要按下「查询」）、
   期权波动率/行权概率（要手输**期权合约代码**，不是标的）。工具是只读的，不点提交类控件。

@@ -149,6 +149,22 @@ const SOURCE_COLUMNS = [
     render: (_field, row) => (row.status !== "ok" && row.fix ? row.fix : "—") },
 ];
 
+/**
+ * 对账差异的「本地/券商」单元格（数量列）。
+ *
+ * `reconcile.compare` 的两类差异**值形状不同**（reconcile.py:104-124）：
+ *   * `kind="qty"` → `local`/`broker` 是**整数数量**；
+ *   * `kind="missing_side"` → `local`/`broker` 是**整份持仓字典**（`{qty: N}`）或 `null`。
+ * 早先直接 `num(row.local ?? row.local_value)`：`num()` 对非有限值回落 `String(value)`，
+ * 把持仓字典渲染成 **`[object Object]`**（2026-09-19 真机取证：`broker={"qty":5200}` → 页面上
+ * 该格就是 `[object Object]`）。这里取字典里的 `qty`（唯一的数量事实）；`null`（该侧确实
+ * 没有持仓）与取不到 `qty` 的字典都显示 `—`——**绝不把未知渲染成一个看起来像数字的东西**。
+ */
+function diffQty(value, digits = 0) {
+  if (value && typeof value === "object") return num(value.qty, digits);
+  return num(value, digits);
+}
+
 const DIFF_COLUMNS = [
   { title: "标的", key: "symbol", render: (_field, row) => row.symbol ?? "—" },
   { title: "差异类型", key: "kind",
@@ -158,9 +174,9 @@ const DIFF_COLUMNS = [
       </Tag>) },
   // 数量类差异取 local/broker，市值类差异取 local_value/broker_value（reconcile.py:12-24）
   { title: "本地", key: "local", align: "right",
-    render: (_field, row) => num(row.local ?? row.local_value) },
+    render: (_field, row) => diffQty(row.local ?? row.local_value) },
   { title: "券商", key: "broker", align: "right",
-    render: (_field, row) => num(row.broker ?? row.broker_value) },
+    render: (_field, row) => diffQty(row.broker ?? row.broker_value) },
   { title: "数量差（本地−券商）", key: "qty_diff", align: "right",
     render: (_field, row) => num(row.qty_diff, 0) },
 ];

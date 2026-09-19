@@ -19,7 +19,7 @@
 import React from "react";
 import { Alert, Card, Col, Divider, Row, Space, Statistic, Table, Tag, Typography } from "antd";
 import { useEndpoint } from "../services/hooks.js";
-import { num, pctOf, maskedAccount, stampOf } from "../services/format.jsx";
+import { num, pctOf, maskedAccount, round, stampOf } from "../services/format.jsx";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketDisplay, marketLabelOf, viewGroups } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
@@ -165,7 +165,7 @@ export default function PortfolioPage() {
           {!equity.error && !equity.loading && equity.value && equityPoints.length === 0 && (
             <Typography.Text type="secondary">暂无权益序列。</Typography.Text>)}
           <Row gutter={16} style={{ marginTop: 12 }}>
-            <Col span={6}><Statistic title="最新权益" value={equity.value?.current ?? "—"} precision={2} /></Col>
+            <Col span={6}><Statistic title="最新权益" value={round(equity.value?.current, 2) ?? "—"} precision={2} /></Col>
             <Col span={6}><Statistic title="累计收益率" value={pctOf(equity.value?.total_return)} /></Col>
             <Col span={6}><Statistic title="最大回撤" value={pctOf(equity.value?.max_drawdown)} /></Col>
             <Col span={6}><Statistic title="台账成交笔数" value={equity.value?.trades ?? "—"} /></Col>

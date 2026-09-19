@@ -15,6 +15,9 @@ import { useSnapshotPoll } from "../services/hooks.js";
 import { useMarketFilter } from "../services/marketContext.jsx";
 import { marketLabelOf, symbolMarketDisplay, viewSignalPreviews } from "../services/marketView.js";
 import { isAllMarkets } from "../services/marketFilter.js";
+// antd Statistic 带 precision 时是**截断**（ATR 5.9157 会显示成 5.91，正确值 5.92）：
+// 先按同位数四舍五入再把数值交给它。口径见 services/formatCore.js 的 roundTo。
+import { round } from "../services/format.jsx";
 
 const KIND_LABEL = { signal: "信号", backtest: "回测" };
 const MODE_LABEL = { sim: "模拟", live: "实盘" };
@@ -57,8 +60,8 @@ export default function SignalPage() {
               <Col span={4}><Statistic title="信号" value={value.signal_label ?? value.signal ?? "—"}
                 valueStyle={{ color: value.signal === "BUY" ? "#cf1322"
                   : value.signal === "SELL" ? "#3f8600" : undefined }} /></Col>
-              <Col span={4}><Statistic title="收盘价" value={value.price ?? "—"} precision={2} /></Col>
-              <Col span={4}><Statistic title="ATR(14)" value={value.atr ?? "—"} precision={2} /></Col>
+              <Col span={4}><Statistic title="收盘价" value={round(value.price, 2) ?? "—"} precision={2} /></Col>
+              <Col span={4}><Statistic title="ATR(14)" value={round(value.atr, 2) ?? "—"} precision={2} /></Col>
               <Col span={4}><Statistic title="数据日期" value={value.date ?? "—"} /></Col>
             </Row>
           </Card>

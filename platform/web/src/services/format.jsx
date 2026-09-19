@@ -7,7 +7,7 @@
 import React from "react";
 import { Tooltip } from "antd";
 import {
-  MISSING, clockText, dayText, minuteText, numText, pctOfText, stampText,
+  MISSING, clockText, dayText, minuteText, numText, pctOfText, roundTo, stampText,
 } from "./formatCore.js";
 
 export { MISSING };
@@ -15,6 +15,11 @@ export { MISSING };
 /** 数值格式化：null/undefined/空串显示 —；非有限数值原样字符串；其余按中文环境千分位。 */
 export function num(value, digits = 2) {
   return numText(value, digits);
+}
+
+/** 按 digits 位四舍五入后的数值（antd Statistic 的 precision 是**截断**，见 formatCore.roundTo）。 */
+export function round(value, digits = 2) {
+  return roundTo(value, digits);
 }
 
 /** 比例 → 百分数显示（纯单位换算，非指标计算）：0.0123 → 1.23%。 */
