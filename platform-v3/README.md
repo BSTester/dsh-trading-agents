@@ -24,35 +24,59 @@ npm test                  # node --test
 环境变量：`QUANT_V3_PORT`（默认 8407）、`WORKBENCH_BASE`（默认 http://127.0.0.1:8397）、
 `DSH_BIN`、`QUANT_HEADLESS_PROFILE`（默认 headless）、`QUANT_HEADLESS_TIMEOUT_MS`（默认 300000）、
 `QUANT_HEADLESS_CONCURRENCY`（默认 3）、`QUANT_HEADLESS_TOKEN_BUDGET`（默认 200000）、
-`QUANT_SDK_ENABLED`（SDK 通道，需要 SDK 服务插件时开启）。
+`QUANT_SDK_ENABLED`（SDK 通道开关）、`QUANT_SDK_PROFILE`（默认 sdk）、`QUANT_SDK_PROVIDER`/`QUANT_SDK_MODEL`/
+`QUANT_SDK_EFFORT`/`QUANT_SDK_MAX_TOKENS`/`QUANT_SDK_CWD`（SDK 握手路由参数）。
 
 ## 三通道
 
 | 通道 | 入口 | 状态 |
 |---|---|---|
 | MCP Bridge | `server/mcp/run.mjs`（stdio）+ `POST /api/v3/mcp`（单消息 JSON-RPC） | running |
-| SDK JSON-RPC | 需要 `@deepseek-ai/dsh-sdk-jsonrpc-server` + `deepseek-harness-sdk`（当前部署未装，状态如实标注 pending） | pending |
+| SDK JSON-RPC | `server/gateway/sdk.mjs`（按 `dsh-sdk-protocol` 线协议实现）| 已实现；缺模型密钥或未部署 sdk profile 时如实 pending |
 | Headless CLI | `POST /api/v3/headless/run` + 调度器（08:30 / 12:00 / 16:00），外部熔断（并发 3 / 300s / 200K token） | ready |
+
+SDK 通道用 `dsh --profile sdk`（`@deepseek-ai/dsh-sdk-app` bundle）拉起隔离运行时：握手校验
+`serverInfo.name === deepseek-harness-sdk-runtime`，`session/prompt` 入队并回收 `session.event` /
+`session.status` 通知。协议一致性由 `test/fixtures/fake-dsh-sdk.mjs` 桩运行时验证；真实会话需要部署
+凭据（`DEEPSEEK_API_KEY` / `ZAI_CODING_CN_API_KEY`），未就绪时接口返回 `pending` + 具体原因，不伪造状态。
+
+## 研究流水线与回测（strategy-svc）
+
+`server/strategy/` 实现规格的 PDAT→PAAT→PCPT→PRT→PET 五阶段：
+
+- **PDAT** 取 workbench `series` 真实富途日 K（自选池前 8 只，默认）；
+- **PAAT** 取 workbench `factors` 的真实多因子 z 值（横截面 8 只需 ~40s，故单独放宽超时）；
+  因子不可用时退化为「本地 K 线动量横截面 z」并在 `stages.PAAT.scoreSource` 如实标注；
+- **PCPT/PRT/PET** 排名 → 等权目标权重（受单笔上限约束）→ 产出调仓建议**提案**（含依据与风险等级）；
+- 提案不落单：执行仍走既有工作台受约束入口（`trade_place` + Web 确认卡）。
+
+回测引擎 `server/strategy/backtest.mjs`：单标的动量 long/flat 向量化回测 + 参数网格扫描。
+**PIT 对齐**：t 日持仓只由 ≤ t-1 的收盘价决定，无前视；指标口径为持仓日基准
+（`heldDays` / `flatDays` / `winRatePct` / `signalFlips`），空仓日不计入胜率。
+局限：等权、无滑点与佣金建模，属于轻量自研引擎，与 workbench 的因子回测互补。
 
 ## API（节选）
 
 `GET /healthz`、`GET /api/v3/overview|brain|market|strategy|risk|execution|gateway|tools|settings`、
-`POST /api/v3/headless/run`、`POST /api/v3/risk/check`、`POST /api/v3/mcp`。
+`POST /api/v3/strategy/run`、`GET /api/v3/strategy/last`、`POST /api/v3/ml/backtest`、
+`POST /api/v3/ml/param_sweep`、`POST /api/v3/headless/run`、`POST /api/v3/risk/check`、
+`GET /api/v3/sdk`、`POST /api/v3/sdk/start`、`POST /api/v3/sdk/prompt`、`POST /api/v3/mcp`。
 
 MCP 工具面：`list_tools` / `call_tool`（六域发现代理，覆盖既有 77 工具）+ 一级工具
 `query_quote`、`market_snapshot`、`query_order_book`、`query_capital_flow`、`query_financial`、`stock_screen`、
 `eval_factor_ic`、`list_factors`、`factor_sensitivity`、`sentiment_history`、`calc_indicator`、`check_risk`、
 `query_position`、`account_funds`、`orders_open`、`deals_today`、`request_approval`、`audit_trail`、
-`research_tasks_claim`。
+`research_tasks_claim` + 本地计算工具 `run_backtest`、`param_sweep`、`strategy_run`。
 
 ## 目录
 
 ```
 server/          服务端（零依赖 Node ≥22.19）
-  mcp/           平台 MCP 服务器（stdio + HTTP 端点共用核心）
-  gateway/       Headless Runner + 调度器（外部熔断）
+  mcp/           平台 MCP 服务器（stdio + HTTP 端点共用核心；含本地计算工具）
+  gateway/       三通道：headless.mjs（Headless Runner + 调度器 + 外部熔断）、sdk.mjs（SDK JSON-RPC 客户端）
+  strategy/      PDAT→PET 研究流水线（pipeline.mjs）+ 回测与参数扫描引擎（backtest.mjs）
   risk.mjs       风控分级（自动/人工/阻断）+ OMS 状态机
-web/             9 页控制台 UI（OpenDesign 设计稿落地）
-test/            node --test
-data/            运行时数据（gitignore）：headless 调用日志、OMS 台账（FR-MON-003）
+web/             9 页控制台 UI（OpenDesign 设计稿）+ app.js 实时数据层
+test/            node --test（27 例，含协议桩与集成测试）
+data/            运行时数据（gitignore）：headless 调用日志、OMS 台账、策略研究轮（FR-MON-003）
 ```
