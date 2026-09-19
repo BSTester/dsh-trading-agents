@@ -1,0 +1,636 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>策略与因子 · 量化决策平台 V3.0</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#0b0e13;--panel:#12161d;--panel2:#171c26;--border:#232b37;--border2:#2f3a49;--text:#e6edf3;--muted:#8b97a5;--faint:#626d7c;--blue:#4c8dff;--green:#3fb950;--red:#f8514d;--amber:#d9a112;--purple:#a371f7;--cyan:#39a0ed;--mono:ui-monospace,Menlo,Consolas,monospace}
+html{color-scheme:dark}
+body{background:var(--bg);color:var(--text);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",system-ui,sans-serif}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+a{color:inherit}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px}
+button,select,input{font-family:inherit}
+:focus-visible{outline:1px solid var(--blue);outline-offset:1px}
+
+/* ── 顶栏 ── */
+.topbar{position:fixed;top:0;left:0;right:0;height:46px;z-index:60;display:flex;align-items:center;gap:14px;padding:0 16px;background:var(--panel);border-bottom:1px solid var(--border)}
+.brand{font-size:13.5px;font-weight:600;white-space:nowrap}
+.brand .ver{color:var(--blue);font-weight:700}
+.brand-sub{font-size:10px;color:var(--faint);border-left:1px solid var(--border2);padding-left:9px;margin-left:2px;white-space:nowrap}
+.tb-mid{flex:1;display:flex;align-items:center;gap:10px;min-width:0;overflow:hidden}
+.env{font-size:10.5px;font-weight:700;letter-spacing:.08em;color:var(--blue);border:1px solid rgba(76,141,255,.45);background:rgba(76,141,255,.12);border-radius:4px;padding:1px 7px;flex:none}
+.tb-item{display:inline-flex;align-items:baseline;gap:5px;white-space:nowrap}
+.tb-item .lbl{font-size:10.5px;color:var(--faint)}
+.tb-item .num{font-size:12px}
+.up{color:var(--green)}.down{color:var(--red)}.amber{color:var(--amber)}
+.pill-demo{font-size:10px;color:var(--amber);border:1px dashed rgba(217,161,18,.55);border-radius:999px;padding:1px 8px;white-space:nowrap;flex:none}
+.chan{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;color:var(--muted);border:1px solid var(--border);border-radius:999px;padding:1px 9px;background:var(--panel2);white-space:nowrap;flex:none}
+.dot{width:6px;height:6px;border-radius:50%;flex:none}
+.dot-g{background:var(--green)}.dot-a{background:var(--amber)}
+.tb-right{text-align:right;white-space:nowrap}
+.tb-right .num{font-size:12px}
+.tb-right .lbl{font-size:10px;color:var(--faint);margin-left:6px}
+
+/* ── 侧导航 ── */
+.sidenav{position:fixed;top:46px;left:0;bottom:0;width:196px;background:var(--panel);border-right:1px solid var(--border);overflow-y:auto;padding:12px 0}
+.nav-title{font-size:10px;color:var(--faint);letter-spacing:.14em;padding:8px 16px 4px}
+.nav-group a{display:block;padding:6px 16px;font-size:12.5px;color:var(--muted);text-decoration:none;border-left:2px solid transparent}
+.nav-group a:hover{color:var(--text);background:rgba(255,255,255,.03)}
+.nav-group a.active{color:var(--blue);background:var(--panel2);border-left-color:var(--blue)}
+
+/* ── 主区 ── */
+.main{margin:46px 0 0 196px;padding:18px 22px 22px;max-width:none;display:flex;flex-direction:column;gap:14px;min-height:calc(100vh - 46px)}
+.card-head{display:flex;justify-content:space-between;align-items:flex-start;gap:12px;margin-bottom:10px}
+.card-title{font-size:13px;font-weight:600}
+.card-sub{font-size:11px;color:var(--muted);margin-top:2px}
+.card-side{font-size:11px;color:var(--faint);text-align:right;white-space:nowrap}
+.cols{display:grid;grid-template-columns:1.5fr 1fr;gap:14px;align-items:start}
+.col{display:flex;flex-direction:column;gap:14px;min-width:0}
+.foot{margin-top:2px;padding-top:12px;border-top:1px solid var(--border);display:flex;justify-content:space-between;gap:12px;color:var(--faint);font-size:11px}
+
+/* ── 按钮 ── */
+.btn{border:none;border-radius:6px;cursor:pointer;font-size:12px;font-weight:600;padding:7px 14px;transition:filter .15s}
+.btn:active{transform:translateY(1px)}
+.btn-primary{background:var(--blue);color:#fff}
+.btn-primary:hover{filter:brightness(1.1)}
+.btn-primary:disabled{opacity:.55;cursor:default;filter:none}
+.btn-block{width:100%;margin-top:12px;padding:8px}
+
+/* ── 徽章 ── */
+.badge{display:inline-block;font-size:10.5px;line-height:1.6;padding:0 7px;border-radius:4px;border:1px solid;white-space:nowrap}
+.b-green{color:var(--green);border-color:rgba(63,185,80,.4);background:rgba(63,185,80,.1)}
+.b-amber{color:var(--amber);border-color:rgba(217,161,18,.4);background:rgba(217,161,18,.1)}
+.b-blue{color:var(--blue);border-color:rgba(76,141,255,.4);background:rgba(76,141,255,.1)}
+.b-purple{color:var(--purple);border-color:rgba(163,113,247,.4);background:rgba(163,113,247,.1)}
+.b-gray{color:var(--muted);border-color:var(--border2);background:var(--panel2)}
+
+/* ── 研究流水线 ── */
+.pipe{display:flex;align-items:center;gap:18px;flex-wrap:wrap}
+.pipe-steps{display:flex;align-items:center;flex:1;min-width:480px;flex-wrap:wrap;row-gap:10px}
+.step{display:flex;align-items:center;gap:8px}
+.s-c{width:26px;height:26px;border-radius:50%;display:flex;align-items:center;justify-content:center;font-size:11px;border:1px solid var(--border2);color:var(--faint);background:var(--panel2);flex:none}
+.step.done .s-c{background:rgba(63,185,80,.12);border-color:rgba(63,185,80,.5);color:var(--green)}
+.step.cur .s-c{border-color:var(--blue);background:rgba(76,141,255,.1)}
+.s-c .pulse{width:8px;height:8px;border-radius:50%;background:var(--blue);animation:pulse 1.6s ease-in-out infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.2}}
+.s-l{line-height:1.3}
+.s-l b{display:block;font-size:11.5px;font-weight:600;color:var(--muted);font-family:var(--mono)}
+.s-l span{font-size:10px;color:var(--faint)}
+.step.done .s-l b{color:var(--text)}
+.step.cur .s-l b{color:var(--blue)}
+.step.cur .s-l span{color:var(--muted)}
+.s-line{flex:1;height:2px;background:var(--border);margin:0 8px;min-width:16px}
+.s-line.ok{background:rgba(63,185,80,.45)}
+.pipe-side{display:flex;align-items:center;gap:16px;flex-wrap:wrap}
+.pi{display:flex;flex-direction:column;line-height:1.4}
+.pi .lbl{font-size:10px;color:var(--faint)}
+.pi .val{font-size:12px}
+
+/* ── 因子表 ── */
+.tscroll{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:12.5px;min-width:780px}
+th{font-size:10.5px;font-weight:500;color:var(--faint);text-align:right;padding:5px 10px 7px;border-bottom:1px solid var(--border);white-space:nowrap}
+td{padding:7px 10px;text-align:right;border-bottom:1px solid var(--border);white-space:nowrap}
+th:first-child,td:first-child{text-align:left}
+tbody tr:hover{background:rgba(255,255,255,.02)}
+tbody tr:last-child td{border-bottom:none}
+.f-name{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.cat{display:inline-flex;align-items:center;gap:6px;color:var(--muted)}
+.cat-dot{width:7px;height:7px;border-radius:50%;display:inline-block}
+.tnote{margin-top:9px;font-size:10.5px;color:var(--faint)}
+
+/* ── 策略列表 ── */
+.strat-row{border:1px solid var(--border);border-radius:6px;background:var(--panel2);padding:9px 12px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
+.strat-row:last-child{margin-bottom:0}
+.strat-row:hover{border-color:var(--border2)}
+.strat-row.active{border-color:rgba(76,141,255,.6);background:rgba(76,141,255,.06)}
+.s-top{display:flex;align-items:center;justify-content:space-between;gap:8px}
+.s-name{font-size:12.5px;font-weight:600}
+.s-meta{font-size:11px;color:var(--muted);margin-top:3px}
+.s-meta b{color:var(--text);font-weight:600}
+
+/* ── 回测曲线 ── */
+.legend{display:flex;gap:14px;font-size:10.5px;color:var(--muted);align-items:center;flex-wrap:wrap}
+.legend i{display:inline-block;width:14px;height:3px;border-radius:2px;margin-right:5px;vertical-align:middle}
+.mstrip{display:flex;justify-content:flex-end;gap:20px;flex-wrap:wrap;margin:2px 0 8px}
+.m{display:flex;flex-direction:column;line-height:1.35;text-align:right}
+.m .m-l{font-size:10px;color:var(--faint)}
+.m .m-v{font-size:13px;font-weight:600}
+.chart{width:100%;height:auto;display:block}
+
+/* ── 参数热力图 ── */
+.hm-cap{display:flex;justify-content:space-between;font-size:10px;color:var(--faint);margin-bottom:6px;font-family:var(--mono)}
+.hm{display:grid;grid-template-columns:88px repeat(5,1fr);gap:4px}
+.hm-colhead{text-align:center;font-size:11px;color:var(--faint);padding:2px 0;font-family:var(--mono)}
+.hm-rowhead{display:flex;align-items:center;justify-content:center;font-size:11px;color:var(--faint);font-family:var(--mono)}
+.hm-cell{position:relative;border-radius:5px;text-align:center;padding:11px 0;font-size:12px;border:1px solid transparent}
+.hm-cell.best{border-color:var(--green)}
+.hm-cell.best em{position:absolute;top:3px;right:6px;font-size:9px;color:var(--green);font-style:normal;line-height:1}
+.hm-legend i{display:inline-block;width:54px;height:7px;border-radius:3px;background:linear-gradient(90deg,rgba(76,141,255,.09),rgba(76,141,255,.63));vertical-align:middle;margin-right:6px}
+.hm-note{margin-top:10px;font-size:10.5px;color:var(--faint)}
+
+/* ── 生成器 ── */
+.f-label{font-size:11px;color:var(--muted);margin:12px 0 6px}
+.f-label:first-child{margin-top:0}
+.ro{font-size:9.5px;color:var(--faint);margin-left:5px}
+.w-row{display:grid;grid-template-columns:104px 1fr 42px;align-items:center;gap:10px;margin-bottom:8px}
+.w-name{font-size:11px;color:var(--muted);font-family:var(--mono);font-variant-numeric:tabular-nums}
+.w-val{font-size:12px;text-align:right}
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:4px;background:var(--border2);border-radius:2px;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:12px;height:12px;border-radius:50%;background:var(--blue);border:2px solid var(--bg);cursor:pointer}
+input[type=range]::-moz-range-thumb{width:12px;height:12px;border-radius:50%;background:var(--blue);border:2px solid var(--bg);cursor:pointer}
+.w-total{font-size:11px;color:var(--muted);margin:2px 0 2px}
+.w-total b{font-weight:600}
+.w-total b.warn{color:var(--amber)}
+.w-hint{color:var(--amber);font-size:10.5px}
+.f-grid{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+select{width:100%;background:var(--panel2);border:1px solid var(--border2);color:var(--text);border-radius:6px;padding:6px 8px;font-size:12px}
+.chips{display:flex;gap:8px;flex-wrap:wrap}
+.chip{border:1px solid var(--border2);background:var(--panel2);border-radius:5px;padding:3px 9px;font-size:11px;color:var(--muted)}
+.chip b{color:var(--text);font-weight:600}
+.submit-status{font-size:11.5px;margin-top:8px}
+.submit-status:empty{display:none}
+.submit-status.ok{color:var(--green)}
+.submit-status.err{color:var(--amber)}
+
+/* ── 研究轮记录 ── */
+.rounds{list-style:none}
+.rounds li{display:grid;grid-template-columns:86px 1fr 56px 76px;align-items:center;gap:8px;padding:7px 0;border-bottom:1px solid var(--border);font-size:11.5px}
+.rounds li:last-child{border-bottom:none}
+.r-t{color:var(--faint);font-size:11px}
+.r-s{color:var(--muted)}
+.r-link{color:var(--blue);text-decoration:none;font-size:11.5px;text-align:right;white-space:nowrap}
+.r-link:hover{text-decoration:underline}
+
+@media (max-width:1180px){.cols{grid-template-columns:1fr}}
+@media (max-width:980px){.sidenav{display:none}.main{margin-left:0}.chan{display:none}}
+@media (max-width:860px){.tb-item{display:none}}
+</style>
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">量化决策平台 <span class="ver">V3.0</span></div>
+  <span class="brand-sub">Harness-Centric</span>
+  <div class="tb-mid">
+    <span class="env">SIM</span>
+    <span class="tb-item"><span class="lbl">权益</span><span class="num">¥2,845,600</span></span>
+    <span class="tb-item"><span class="lbl">日内涨跌</span><span class="num up">+1.24%</span></span>
+    <span class="pill-demo">示例数据</span>
+    <span class="chan" title="MCP Bridge · 工具暴露通道心跳"><i class="dot dot-g"></i>MCP 12ms</span>
+    <span class="chan" title="SDK JSON-RPC · 人工会话通道"><i class="dot dot-g"></i>SDK 会话中</span>
+    <span class="chan" title="Headless CLI · 自动唤醒通道"><i class="dot dot-a"></i>Headless 待唤醒</span>
+  </div>
+  <div class="tb-right"><span class="num">2026-09-19</span><span class="lbl">14:08</span></div>
+</header>
+
+<nav class="sidenav" aria-label="主导航">
+  <div class="nav-group">
+    <div class="nav-title">监控</div>
+    <a href="index.html">系统概览</a>
+    <a href="brain.html">决策大脑</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-title">研究</div>
+    <a href="market.html">行情与信号</a>
+    <a href="strategy.html" class="active" aria-current="page">策略与因子</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-title">交易</div>
+    <a href="risk.html">风险监控</a>
+    <a href="execution.html">执行与审批</a>
+  </div>
+  <div class="nav-group">
+    <div class="nav-title">系统</div>
+    <a href="gateway.html">网关与调度</a>
+    <a href="tools.html">工具域治理</a>
+      <a href="settings.html">接入与授权</a>
+  </div>
+</nav>
+
+<main class="main">
+
+  <!-- 1. 研究流水线 -->
+  <section class="card" data-od-id="research-pipeline">
+    <div class="pipe">
+      <div class="pipe-steps">
+        <div class="step done">
+          <div class="s-c">✓</div>
+          <div class="s-l"><b>PDAT</b><span>数据准备 · 09:33 完成</span></div>
+        </div>
+        <div class="s-line ok"></div>
+        <div class="step cur">
+          <div class="s-c"><i class="pulse"></i></div>
+          <div class="s-l"><b>PAAT</b><span>因子分析 · 进行中 4/6 批次</span></div>
+        </div>
+        <div class="s-line"></div>
+        <div class="step">
+          <div class="s-c num">3</div>
+          <div class="s-l"><b>PCPT</b><span>规则候选 · 待开始</span></div>
+        </div>
+        <div class="s-line"></div>
+        <div class="step">
+          <div class="s-c num">4</div>
+          <div class="s-l"><b>PRT</b><span>回测验证 · 待开始</span></div>
+        </div>
+        <div class="s-line"></div>
+        <div class="step">
+          <div class="s-c num">5</div>
+          <div class="s-l"><b>PET</b><span>评估产出 · 待开始</span></div>
+        </div>
+      </div>
+      <div class="pipe-side">
+        <div class="pi"><span class="lbl">研究轮</span><span class="val num">mining-2026-09-19</span></div>
+        <div class="pi"><span class="lbl">状态</span><span class="val num amber" id="runTime">已运行 6m12s</span></div>
+        <button class="btn btn-primary" id="btnNewRound">新建研究轮</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- 2. 因子库 -->
+  <section class="card" data-od-id="factor-library">
+    <div class="card-head">
+      <div>
+        <div class="card-title">因子库</div>
+        <div class="card-sub">近 60 日滚动 IC · PIT 数据 · 日频</div>
+      </div>
+      <div class="card-side">8 个候选因子 · 4 有效 / 2 衰减 / 2 待观察</div>
+    </div>
+    <div class="tscroll">
+      <table>
+        <thead>
+          <tr>
+            <th>因子名</th><th>类别</th><th>IC（近 60 日）</th><th>IR</th><th>分层年化多空</th><th>换手率</th><th title="与现有因子池的最大绝对相关性">相关性</th><th>状态</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="f-name">mom_20d</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--blue)"></i>动量</span></td>
+            <td class="num">0.041</td><td class="num">0.58</td><td class="num up">+14.2%</td><td class="num" style="color:var(--muted)">3.1x</td><td class="num">0.31</td>
+            <td><span class="badge b-green">有效</span></td>
+          </tr>
+          <tr>
+            <td class="f-name">value_ep</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--purple)"></i>价值</span></td>
+            <td class="num">0.028</td><td class="num">0.42</td><td class="num up">+9.6%</td><td class="num" style="color:var(--muted)">2.2x</td><td class="num">0.24</td>
+            <td><span class="badge b-green">有效</span></td>
+          </tr>
+          <tr>
+            <td class="f-name">quality_roe</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--cyan)"></i>质量</span></td>
+            <td class="num">0.033</td><td class="num">0.47</td><td class="num up">+11.8%</td><td class="num" style="color:var(--muted)">1.8x</td><td class="num">0.29</td>
+            <td><span class="badge b-green">有效</span></td>
+          </tr>
+          <tr>
+            <td class="f-name">sent_news</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--amber)"></i>情绪</span></td>
+            <td class="num">0.019</td><td class="num">0.31</td><td class="num up">+5.4%</td><td class="num" style="color:var(--muted)">6.5x</td><td class="num amber">0.52</td>
+            <td><span class="badge b-amber">衰减 32%</span></td>
+          </tr>
+          <tr>
+            <td class="f-name">alt_northbound</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--green)"></i>另类</span></td>
+            <td class="num">0.036</td><td class="num">0.51</td><td class="num up">+12.6%</td><td class="num" style="color:var(--muted)">2.7x</td><td class="num">0.35</td>
+            <td><span class="badge b-gray">待观察</span></td>
+          </tr>
+          <tr>
+            <td class="f-name">mom_60d</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--blue)"></i>动量</span></td>
+            <td class="num">0.037</td><td class="num">0.44</td><td class="num up">+10.9%</td><td class="num" style="color:var(--muted)">2.4x</td><td class="num">0.46</td>
+            <td><span class="badge b-amber">衰减 21%</span></td>
+          </tr>
+          <tr>
+            <td class="f-name">value_bp</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--purple)"></i>价值</span></td>
+            <td class="num">0.024</td><td class="num">0.38</td><td class="num up">+7.8%</td><td class="num" style="color:var(--muted)">1.9x</td><td class="num">0.27</td>
+            <td><span class="badge b-green">有效</span></td>
+          </tr>
+          <tr>
+            <td class="f-name">sent_social</td>
+            <td><span class="cat"><i class="cat-dot" style="background:var(--amber)"></i>情绪</span></td>
+            <td class="num">0.017</td><td class="num">0.28</td><td class="num up">+4.1%</td><td class="num" style="color:var(--muted)">7.2x</td><td class="num amber">0.55</td>
+            <td><span class="badge b-gray">待观察</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <div class="tnote">注：IC 为 RankIC（60 日滚动）；相关性为与现有因子池的最大绝对相关，&gt;0.50 标黄提示共线性风险。示例数据。</div>
+  </section>
+
+  <div class="cols">
+    <div class="col">
+
+      <!-- 3. 策略列表 -->
+      <section class="card" data-od-id="strategy-list">
+        <div class="card-head">
+          <div>
+            <div class="card-title">策略列表</div>
+            <div class="card-sub">点击行切换右侧回测视图</div>
+          </div>
+          <div class="card-side">5 个策略 · 示例</div>
+        </div>
+        <div class="strat-row active" data-strat="multi">
+          <div class="s-top"><span class="s-name">多因子选股</span><span class="badge b-green">运行中</span></div>
+          <div class="s-meta num">回测 2026-09-12 · 夏普 <b>1.92</b> · 回撤 <b class="down">−8.4%</b> · v2.4.1 · 近30日 <b class="up">+4.2%</b></div>
+        </div>
+        <div class="strat-row" data-strat="lgbm">
+          <div class="s-top"><span class="s-name">ML·LightGBM</span><span class="badge b-blue">回测中</span></div>
+          <div class="s-meta num">回测 2026-09-18 · 夏普 <b>1.64</b> · 回撤 <b class="down">−10.2%</b> · v0.9.3 · 近30日 —</div>
+        </div>
+        <div class="strat-row" data-strat="lasso">
+          <div class="s-top"><span class="s-name">ML·Lasso</span><span class="badge b-gray">已停用</span></div>
+          <div class="s-meta num">回测 2026-06-30 · 夏普 <b>0.87</b> · 回撤 <b class="down">−12.6%</b> · v1.1.0 · 近30日 —</div>
+        </div>
+        <div class="strat-row" data-strat="event">
+          <div class="s-top"><span class="s-name">事件驱动·财报超预期</span><span class="badge b-green">运行中</span></div>
+          <div class="s-meta num">回测 2026-08-28 · 夏普 <b>1.38</b> · 回撤 <b class="down">−6.9%</b> · v3.0.2 · 近30日 <b class="up">+2.1%</b></div>
+        </div>
+        <div class="strat-row" data-strat="pairs">
+          <div class="s-top"><span class="s-name">统计套利·配对</span><span class="badge b-purple">灰度</span></div>
+          <div class="s-meta num">回测 2026-09-05 · 夏普 <b>1.51</b> · 回撤 <b class="down">−5.7%</b> · v0.8.7 · 近30日 <b class="up">+0.8%</b></div>
+        </div>
+      </section>
+
+      <!-- 4. 回测曲线 -->
+      <section class="card" data-od-id="backtest-curve">
+        <div class="card-head">
+          <div>
+            <div class="card-title">回测曲线</div>
+            <div class="card-sub" id="curveSub">多因子选股 v2.4.1 · 2024-09 ~ 2026-09 · 基准：中证500</div>
+          </div>
+          <div class="legend">
+            <span><i style="background:var(--blue)"></i>策略净值</span>
+            <span><i style="background:var(--faint)"></i>中证500</span>
+            <span><i style="background:rgba(248,81,77,.6)"></i>回撤</span>
+          </div>
+        </div>
+        <div class="mstrip">
+          <div class="m"><span class="m-l">年化</span><span class="m-v num up" id="mAnn">21.3%</span></div>
+          <div class="m"><span class="m-l">夏普</span><span class="m-v num" id="mSharpe">1.92</span></div>
+          <div class="m"><span class="m-l">最大回撤</span><span class="m-v num down" id="mDd">−8.4%</span></div>
+          <div class="m"><span class="m-l">胜率</span><span class="m-v num" id="mWin">56.2%</span></div>
+          <div class="m"><span class="m-l">换手</span><span class="m-v num" id="mTurn">3.1x</span></div>
+        </div>
+        <svg class="chart" viewBox="0 0 730 250" role="img" aria-label="策略净值与基准对比曲线及回撤面积图（示例数据）">
+          <line x1="44" y1="46" x2="700" y2="46" stroke="var(--border)" stroke-width="1"/>
+          <line x1="44" y1="72" x2="700" y2="72" stroke="var(--border)" stroke-width="1"/>
+          <line x1="44" y1="98" x2="700" y2="98" stroke="var(--border)" stroke-width="1"/>
+          <line x1="44" y1="124" x2="700" y2="124" stroke="var(--border)" stroke-width="1"/>
+          <line x1="44" y1="150" x2="700" y2="150" stroke="var(--border2)" stroke-width="1"/>
+          <line x1="217" y1="16" x2="217" y2="210" stroke="var(--border)" stroke-width="1" opacity=".55"/>
+          <line x1="373" y1="16" x2="373" y2="210" stroke="var(--border)" stroke-width="1" opacity=".55"/>
+          <line x1="530" y1="16" x2="530" y2="210" stroke="var(--border)" stroke-width="1" opacity=".55"/>
+          <line x1="44" y1="165" x2="700" y2="165" stroke="var(--border)" stroke-width="1"/>
+          <text x="40" y="49" text-anchor="end" font-size="9.5" fill="var(--faint)" font-family="Menlo,Consolas,monospace">1.40</text>
+          <text x="40" y="75" text-anchor="end" font-size="9.5" fill="var(--faint)" font-family="Menlo,Consolas,monospace">1.30</text>
+          <text x="40" y="101" text-anchor="end" font-size="9.5" fill="var(--faint)" font-family="Menlo,Consolas,monospace">1.20</text>
+          <text x="40" y="127" text-anchor="end" font-size="9.5" fill="var(--faint)" font-family="Menlo,Consolas,monospace">1.10</text>
+          <text x="40" y="153" text-anchor="end" font-size="9.5" fill="var(--faint)" font-family="Menlo,Consolas,monospace">1.00</text>
+          <text x="40" y="168" text-anchor="end" font-size="9.5" fill="var(--faint)" font-family="Menlo,Consolas,monospace">0%</text>
+          <text x="40" y="212" text-anchor="end" font-size="9.5" fill="var(--faint)" font-family="Menlo,Consolas,monospace">−8%</text>
+          <path d="M60,165 L93,165 L126,181 L159,165 L192,165 L225,185 L258,165 L291,165 L324,188 L357,165 L390,165 L423,178 L456,165 L489,165 L522,210 L555,193 L588,165 L621,181 L654,165 L687,165 Z" fill="rgba(248,81,77,.16)"/>
+          <path d="M60,165 L93,165 L126,181 L159,165 L192,165 L225,185 L258,165 L291,165 L324,188 L357,165 L390,165 L423,178 L456,165 L489,165 L522,210 L555,193 L588,165 L621,181 L654,165 L687,165" fill="none" stroke="rgba(248,81,77,.55)" stroke-width="1"/>
+          <path d="M60,150 L93,147 L126,155 L159,142 L192,150 L225,158 L258,145 L291,137 L324,147 L357,134 L390,140 L423,129 L456,137 L489,124 L522,132 L555,119 L588,127 L621,114 L654,108 L687,103" fill="none" stroke="var(--faint)" stroke-width="1.5"/>
+          <path d="M60,150 L93,145 L126,153 L159,137 L192,129 L225,140 L258,119 L291,111 L324,124 L357,103 L390,93 L423,101 L456,82 L489,69 L522,98 L555,88 L588,62 L621,72 L654,41 L687,33" fill="none" stroke="var(--blue)" stroke-width="2"/>
+          <circle cx="687" cy="33" r="3" fill="var(--blue)"/>
+          <circle cx="687" cy="103" r="2.5" fill="var(--faint)"/>
+          <text x="694" y="36" font-size="10" fill="var(--blue)" font-family="Menlo,Consolas,monospace">1.45</text>
+          <text x="694" y="106" font-size="10" fill="var(--faint)" font-family="Menlo,Consolas,monospace">1.18</text>
+          <text x="60" y="232" text-anchor="middle" font-size="10" fill="var(--faint)" font-family="Menlo,Consolas,monospace">2024-09</text>
+          <text x="217" y="232" text-anchor="middle" font-size="10" fill="var(--faint)" font-family="Menlo,Consolas,monospace">2025-03</text>
+          <text x="373" y="232" text-anchor="middle" font-size="10" fill="var(--faint)" font-family="Menlo,Consolas,monospace">2025-09</text>
+          <text x="530" y="232" text-anchor="middle" font-size="10" fill="var(--faint)" font-family="Menlo,Consolas,monospace">2026-03</text>
+          <text x="687" y="232" text-anchor="middle" font-size="10" fill="var(--faint)" font-family="Menlo,Consolas,monospace">2026-09</text>
+        </svg>
+      </section>
+
+      <!-- 5. 参数扫描热力图 -->
+      <section class="card" data-od-id="param-scan-heatmap">
+        <div class="card-head">
+          <div>
+            <div class="card-title">参数扫描 · 夏普热力图</div>
+            <div class="card-sub">momentum_window × rebalance_days · 目标：夏普最大化</div>
+          </div>
+          <div class="card-side"><span class="hm-legend"><i></i>夏普 1.2 → 1.9</span></div>
+        </div>
+        <div class="hm-cap"><span>rebalance_days ↓</span><span>momentum_window →</span></div>
+        <div class="hm">
+          <div class="hm-colhead"></div>
+          <div class="hm-colhead">10</div><div class="hm-colhead">15</div><div class="hm-colhead">20</div><div class="hm-colhead">25</div><div class="hm-colhead">30</div>
+
+          <div class="hm-rowhead">5</div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.14)" title="夏普 1.28"><span class="num">1.28</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.27)" title="夏普 1.45"><span class="num">1.45</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.39)" title="夏普 1.61"><span class="num">1.61</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.32)" title="夏普 1.52"><span class="num">1.52</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.18)" title="夏普 1.33"><span class="num">1.33</span></div>
+
+          <div class="hm-rowhead">10</div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.20)" title="夏普 1.36"><span class="num">1.36</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.37)" title="夏普 1.58"><span class="num">1.58</span></div>
+          <div class="hm-cell best" style="background:rgba(76,141,255,.63)" title="最优：夏普 1.92"><span class="num">1.92</span><em>最优</em></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.49)" title="夏普 1.74"><span class="num">1.74</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.30)" title="夏普 1.49"><span class="num">1.49</span></div>
+
+          <div class="hm-rowhead">20</div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.09)" title="夏普 1.21"><span class="num">1.21</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.23)" title="夏普 1.39"><span class="num">1.39</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.43)" title="夏普 1.66"><span class="num">1.66</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.37)" title="夏普 1.58"><span class="num">1.58</span></div>
+          <div class="hm-cell" style="background:rgba(76,141,255,.25)" title="夏普 1.42"><span class="num">1.42</span></div>
+        </div>
+        <div class="hm-note">共 15 组参数 · 全量回测耗时 4m12s · 示例数据</div>
+      </section>
+
+    </div>
+    <div class="col">
+
+      <!-- 6. 策略生成器 -->
+      <section class="card" data-od-id="strategy-generator">
+        <div class="card-head">
+          <div>
+            <div class="card-title">策略生成器</div>
+            <div class="card-sub">因子权重与参数调优 · 提交后进入回测队列</div>
+          </div>
+          <div class="card-side">目标：多因子选股</div>
+        </div>
+
+        <div class="f-label">因子权重</div>
+        <div class="w-row">
+          <label class="w-name" for="wMom">mom_20d</label>
+          <input type="range" class="w-slider" id="wMom" min="0" max="60" step="1" value="35">
+          <span class="w-val num">35%</span>
+        </div>
+        <div class="w-row">
+          <label class="w-name" for="wVal">value_ep</label>
+          <input type="range" class="w-slider" id="wVal" min="0" max="60" step="1" value="20">
+          <span class="w-val num">20%</span>
+        </div>
+        <div class="w-row">
+          <label class="w-name" for="wQua">quality_roe</label>
+          <input type="range" class="w-slider" id="wQua" min="0" max="60" step="1" value="25">
+          <span class="w-val num">25%</span>
+        </div>
+        <div class="w-row">
+          <label class="w-name" for="wSen">sent_news</label>
+          <input type="range" class="w-slider" id="wSen" min="0" max="60" step="1" value="10">
+          <span class="w-val num">10%</span>
+        </div>
+        <div class="w-row">
+          <label class="w-name" for="wAlt">alt_northbound</label>
+          <input type="range" class="w-slider" id="wAlt" min="0" max="60" step="1" value="10">
+          <span class="w-val num">10%</span>
+        </div>
+        <div class="w-total">权重合计 <b class="num" id="wTotal">100%</b> <span class="w-hint" id="wHint"></span></div>
+
+        <div class="f-grid">
+          <div>
+            <label class="f-label" for="rebal">调仓频率</label>
+            <select id="rebal">
+              <option>每 5 个交易日</option>
+              <option selected>每 10 个交易日</option>
+              <option>每 20 个交易日</option>
+            </select>
+          </div>
+          <div>
+            <label class="f-label" for="pool">股票池</label>
+            <select id="pool">
+              <option>沪深300</option>
+              <option selected>中证500</option>
+              <option>中证800</option>
+              <option>全市场（流动性过滤）</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="f-label">风控约束 <span class="ro">只读 · 由风控引擎下发</span></div>
+        <div class="chips">
+          <span class="chip">单笔 ≤ <b class="num">2%</b></span>
+          <span class="chip">行业 ≤ <b class="num">20%</b></span>
+          <span class="chip">回撤 ≤ <b class="num">15%</b></span>
+        </div>
+
+        <button class="btn btn-primary btn-block" id="btnSubmit">提交回测</button>
+        <div class="submit-status" id="submitStatus" aria-live="polite"></div>
+      </section>
+
+      <!-- 7. 研究轮记录 -->
+      <section class="card" data-od-id="research-rounds">
+        <div class="card-head">
+          <div>
+            <div class="card-title">最近 3 次研究轮记录</div>
+            <div class="card-sub">阶段产出归档于研究库</div>
+          </div>
+        </div>
+        <ul class="rounds">
+          <li>
+            <span class="r-t num">09-19 14:02</span>
+            <span class="r-s">PAAT · 因子分析</span>
+            <span class="badge b-amber">进行中</span>
+            <a class="r-link" href="#">因子候选池</a>
+          </li>
+          <li>
+            <span class="r-t num">09-12 09:30</span>
+            <span class="r-s">PCPT · 规则候选</span>
+            <span class="badge b-green">已完成</span>
+            <a class="r-link" href="#">规则候选</a>
+          </li>
+          <li>
+            <span class="r-t num">09-05 20:15</span>
+            <span class="r-s">PRT · 回测验证</span>
+            <span class="badge b-green">已完成</span>
+            <a class="r-link" href="#">回测报告</a>
+          </li>
+        </ul>
+      </section>
+
+    </div>
+  </div>
+
+  <footer class="foot">
+    <span>示例数据，非真实账户 · 所有数字均为演示样例</span>
+    <span>量化决策平台 V3.0 · Harness-Centric 控制台</span>
+  </footer>
+</main>
+
+<script>
+(function(){
+  /* 研究轮计时（自 6m12s 起走秒） */
+  var t = 372, tEl = document.getElementById('runTime');
+  setInterval(function(){
+    t++;
+    tEl.textContent = '已运行 ' + Math.floor(t/60) + 'm' + String(t%60).padStart(2,'0') + 's';
+  }, 1000);
+
+  /* 新建研究轮 */
+  var bn = document.getElementById('btnNewRound');
+  bn.addEventListener('click', function(){
+    if (bn.disabled) return;
+    var old = bn.textContent;
+    bn.textContent = '已创建（示例）';
+    bn.disabled = true;
+    setTimeout(function(){ bn.textContent = old; bn.disabled = false; }, 1400);
+  });
+
+  /* 策略行 → 回测视图联动 */
+  var STRATS = {
+    multi: {name:'多因子选股',        ver:'v2.4.1', ann:'21.3%', sharpe:'1.92', dd:'−8.4%',  win:'56.2%', turn:'3.1x'},
+    lgbm:  {name:'ML·LightGBM',      ver:'v0.9.3', ann:'16.8%', sharpe:'1.64', dd:'−10.2%', win:'54.0%', turn:'4.6x'},
+    lasso: {name:'ML·Lasso',         ver:'v1.1.0', ann:'6.9%',  sharpe:'0.87', dd:'−12.6%', win:'51.5%', turn:'5.2x'},
+    event: {name:'事件驱动·财报超预期', ver:'v3.0.2', ann:'14.2%', sharpe:'1.38', dd:'−6.9%',  win:'58.7%', turn:'2.4x'},
+    pairs: {name:'统计套利·配对',      ver:'v0.8.7', ann:'12.6%', sharpe:'1.51', dd:'−5.7%',  win:'55.1%', turn:'8.3x'}
+  };
+  function setCurve(s){
+    document.getElementById('curveSub').textContent = s.name + ' ' + s.ver + ' · 2024-09 ~ 2026-09 · 基准：中证500';
+    document.getElementById('mAnn').textContent = s.ann;
+    document.getElementById('mSharpe').textContent = s.sharpe;
+    document.getElementById('mDd').textContent = s.dd;
+    document.getElementById('mWin').textContent = s.win;
+    document.getElementById('mTurn').textContent = s.turn;
+  }
+  var rows = document.querySelectorAll('.strat-row');
+  rows.forEach(function(r){
+    r.addEventListener('click', function(){
+      rows.forEach(function(x){ x.classList.remove('active'); });
+      r.classList.add('active');
+      setCurve(STRATS[r.dataset.strat]);
+    });
+  });
+
+  /* 因子权重滑块 + 校验 */
+  var ws = Array.prototype.slice.call(document.querySelectorAll('.w-slider'));
+  function total(){ return ws.reduce(function(a,s){ return a + Number(s.value); }, 0); }
+  function updW(){
+    var t = total();
+    var el = document.getElementById('wTotal');
+    el.textContent = t + '%';
+    el.classList.toggle('warn', t !== 100);
+    document.getElementById('wHint').textContent = t === 100 ? '' : '（需等于 100%）';
+  }
+  ws.forEach(function(s){
+    s.addEventListener('input', function(){
+      s.parentNode.querySelector('.w-val').textContent = s.value + '%';
+      updW();
+    });
+  });
+
+  /* 提交回测 */
+  document.getElementById('btnSubmit').addEventListener('click', function(){
+    var st = document.getElementById('submitStatus');
+    var t = total();
+    if (t !== 100) {
+      st.className = 'submit-status err';
+      st.textContent = '提交失败：因子权重合计 ' + t + '%，须为 100%';
+    } else {
+      st.className = 'submit-status ok';
+      st.textContent = '已提交回测（示例）· 策略：多因子选股 · 队列位置 1 · 预计耗时 4m12s';
+    }
+  });
+})();
+</script>
+</body>
+</html>

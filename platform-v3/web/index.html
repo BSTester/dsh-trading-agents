@@ -1,0 +1,562 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="dark">
+<title>系统概览 · 量化决策平台 V3.0</title>
+<style>
+:root{--bg:#0b0e13;--panel:#12161d;--panel2:#171c26;--border:#232b37;--border2:#2f3a49;--text:#e6edf3;--muted:#8b97a5;--faint:#626d7c;--blue:#4c8dff;--green:#3fb950;--red:#f8514d;--amber:#d9a112;--purple:#a371f7;--cyan:#39a0ed;--mono:ui-monospace,Menlo,Consolas,monospace}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{background:var(--bg)}
+body{color:var(--text);font:13px/1.65 -apple-system,BlinkMacSystemFont,"Segoe UI","PingFang SC","Hiragino Sans GB","Microsoft YaHei",sans-serif;-webkit-font-smoothing:antialiased}
+a{color:var(--muted);text-decoration:none}
+a:hover{color:var(--blue)}
+a:focus-visible,button:focus-visible{outline:1.5px solid var(--blue);outline-offset:2px;border-radius:4px}
+.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+.mono{font-family:var(--mono)}
+.pos{color:var(--green)}.neg{color:var(--red)}.warn{color:var(--amber)}.faint{color:var(--faint)}
+.card{background:var(--panel);border:1px solid var(--border);border-radius:8px;padding:14px 16px;transition:border-color .15s}
+.card:hover{border-color:var(--border2)}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:var(--border2);border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
+
+/* ---- dots / chips / tags ---- */
+.dot{display:inline-block;width:6px;height:6px;border-radius:50%;flex:none}
+.dg{background:var(--green)}.da{background:var(--amber)}.db{background:var(--blue)}
+.chip{display:inline-flex;align-items:center;gap:5px;font-size:10.5px;line-height:1.7;padding:0 8px;border-radius:999px;border:1px solid;white-space:nowrap;flex:none}
+.chip.g{color:var(--green);border-color:rgba(63,185,80,.35);background:rgba(63,185,80,.08)}
+.chip.a{color:var(--amber);border-color:rgba(217,161,18,.38);background:rgba(217,161,18,.08)}
+.chip.r{color:var(--red);border-color:rgba(248,81,77,.38);background:rgba(248,81,77,.08)}
+.chip.b{color:var(--blue);border-color:rgba(76,141,255,.38);background:rgba(76,141,255,.08)}
+.chip.c{color:var(--cyan);border-color:rgba(57,160,237,.38);background:rgba(57,160,237,.08)}
+.chip.p{color:var(--purple);border-color:rgba(163,113,247,.38);background:rgba(163,113,247,.08)}
+.tag{font-size:10.5px;font-weight:600;padding:0 7px;border-radius:4px;line-height:1.8;white-space:nowrap;flex:none}
+.tag.b{color:var(--blue);background:rgba(76,141,255,.13)}
+.tag.p{color:var(--purple);background:rgba(163,113,247,.13)}
+.tag.c{color:var(--cyan);background:rgba(57,160,237,.13)}
+
+/* ---- topbar ---- */
+.topbar{position:sticky;top:0;z-index:50;height:46px;display:flex;align-items:center;gap:16px;padding:0 16px;background:rgba(18,22,29,.94);backdrop-filter:blur(6px);border-bottom:1px solid var(--border)}
+.tb-brand{display:flex;align-items:baseline;gap:8px;white-space:nowrap}
+.tb-title{font-size:13px;font-weight:700;letter-spacing:.5px}
+.tb-sub{font-size:10px;color:var(--faint);font-family:var(--mono);letter-spacing:.5px}
+.tb-center{flex:1;display:flex;align-items:center;justify-content:center;gap:12px;min-width:0;overflow:hidden}
+.env{font-family:var(--mono);font-size:10.5px;font-weight:700;color:var(--cyan);border:1px solid rgba(57,160,237,.4);background:rgba(57,160,237,.1);padding:0 8px;border-radius:4px;letter-spacing:1px}
+.tb-kv{font-size:11px;color:var(--faint);white-space:nowrap}
+.tb-kv b{font-size:12px;color:var(--text);font-weight:600;margin-left:3px}
+.tb-kv b.neg{color:var(--red)}
+.sep{width:1px;height:14px;background:var(--border2);flex:none}
+.pill-demo{font-size:10.5px;color:var(--amber);border:1px dashed rgba(217,161,18,.45);background:rgba(217,161,18,.07);padding:0 9px;border-radius:999px;white-space:nowrap;flex:none}
+.beats{display:flex;gap:8px}
+.beat{display:inline-flex;align-items:center;gap:5px;font-family:var(--mono);font-size:10.5px;color:var(--muted);border:1px solid var(--border);background:var(--panel2);padding:0 8px;border-radius:999px;white-space:nowrap}
+.tb-right{font-size:11px;color:var(--muted);white-space:nowrap}
+
+/* ---- layout / sidenav ---- */
+.layout{display:flex;align-items:stretch;min-height:calc(100vh - 46px)}
+.sidenav{width:196px;flex:none;background:var(--panel);border-right:1px solid var(--border);padding:12px 10px;display:flex;flex-direction:column;gap:14px;position:sticky;top:46px;height:calc(100vh - 46px);overflow-y:auto}
+.nav-cat{font-size:10px;color:var(--faint);letter-spacing:3px;padding:0 10px;margin-bottom:4px}
+.nav-item{display:block;position:relative;font-size:12.5px;color:var(--muted);padding:6px 10px;border-radius:6px;line-height:1.5}
+.nav-item:hover{background:var(--panel2);color:var(--text)}
+.nav-item.active{background:rgba(76,141,255,.10);color:var(--text);box-shadow:inset 2px 0 0 var(--blue)}
+.nav-foot{margin-top:auto;border-top:1px solid var(--border);padding:10px 10px 2px;display:block}
+.nf-line{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:6px}
+.nf-sub{font-size:10px;color:var(--faint);font-family:var(--mono);margin-top:2px}
+.nav-foot:hover .nf-line{color:var(--text)}
+
+/* ---- main ---- */
+.main{flex:1;min-width:0;padding:18px 22px 24px}
+.inner{max-width:none;margin:0 auto}
+.page-head{display:flex;align-items:flex-end;justify-content:space-between;gap:12px;margin-bottom:14px;flex-wrap:wrap}
+.page-head h1{font-size:18px;font-weight:700;letter-spacing:.5px}
+.page-sub{font-size:11.5px;color:var(--faint);margin-top:2px}
+.page-tools{display:flex;align-items:center;gap:10px;font-size:11px;color:var(--faint)}
+.page-tools b{color:var(--text);font-weight:600}
+.btn-ghost{font-family:inherit;font-size:11.5px;color:var(--muted);background:transparent;border:1px solid var(--border2);border-radius:6px;padding:3px 14px;cursor:pointer}
+.btn-ghost:hover{color:var(--text);border-color:var(--faint)}
+.btn-ghost:disabled{opacity:.6;cursor:default}
+.btn{display:inline-block;font-size:12px;font-weight:600;color:#fff;background:var(--blue);border:1px solid transparent;border-radius:6px;padding:5px 16px;text-align:center}
+.btn:hover{background:#3d7ce6;color:#fff}
+.link{font-size:12px;color:var(--muted)}
+.link:hover{color:var(--blue)}
+
+/* ---- grids ---- */
+.grid{display:grid;gap:12px;margin-bottom:12px}
+.kpis{grid-template-columns:repeat(5,minmax(0,1fr))}
+.chans{grid-template-columns:repeat(3,minmax(0,1fr))}
+.mid{grid-template-columns:minmax(0,7fr) minmax(0,5fr)}
+.col{display:flex;flex-direction:column;gap:12px}
+
+/* ---- KPI ---- */
+.kpi{position:relative;min-height:98px;overflow:hidden}
+.kpi-label{font-size:11px;color:var(--faint);letter-spacing:1.5px}
+.kpi-value{font-size:18px;font-weight:600;margin-top:3px}
+.kpi-sub{font-size:11px;color:var(--faint);margin-top:2px;max-width:58%}
+.kpi-sub b{font-weight:600}
+.spark{position:absolute;right:10px;bottom:10px;width:42%;height:34px;display:block;overflow:visible}
+.spark polyline{fill:none;stroke:currentColor;stroke-width:1.5}
+.spark polygon{fill:currentColor;fill-opacity:.1}
+.spark circle{fill:currentColor}
+
+/* ---- channel cards ---- */
+.ch-head{display:flex;align-items:flex-start;gap:8px;margin-bottom:10px}
+.ch-ico{width:8px;height:8px;border-radius:2px;margin-top:6px;flex:none}
+.ch-name{font-size:13px;font-weight:700}
+.ch-sub{font-size:10px;color:var(--faint)}
+.ch-head .chip{margin-left:auto;margin-top:1px}
+.stats{display:grid;grid-template-columns:1fr 1fr;gap:8px 10px}
+.stat{background:var(--panel2);border:1px solid var(--border);border-radius:6px;padding:7px 10px;min-width:0}
+.stat .k{display:flex;align-items:center;gap:6px;font-size:10.5px;color:var(--faint);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.stat .v{font-size:15px;font-weight:600;margin-top:1px}
+.stat .v small{font-size:10.5px;color:var(--faint);font-weight:400}
+.stat .v.mono{font-size:12.5px;font-weight:500}
+.stat.wide{grid-column:1/-1;display:flex;align-items:center;justify-content:space-between;gap:10px}
+.stat.wide .v{margin-top:0}
+.ch-foot{margin-top:10px;padding-top:8px;border-top:1px dashed var(--border);font-size:11px;color:var(--faint);display:flex;justify-content:space-between;align-items:center;gap:8px}
+.ch-foot b{color:var(--text);font-weight:600}
+.ch-foot a{white-space:nowrap}
+
+/* ---- card headers ---- */
+.card-h{display:flex;align-items:center;gap:8px;margin-bottom:10px}
+.card-h h3{font-size:13px;font-weight:700;letter-spacing:.3px}
+.card-h .aux{margin-left:auto;font-size:11.5px;color:var(--faint);white-space:nowrap}
+.card-h .aux:hover{color:var(--blue)}
+
+/* ---- timeline ---- */
+.tl-card{display:flex;flex-direction:column}
+.tl{flex:1;padding:2px 0}
+.tl-item{display:grid;grid-template-columns:50px 18px minmax(0,1fr);gap:0 8px;padding:7px 0}
+.tl-time{font-size:10.5px;color:var(--faint);text-align:right;padding-top:3px}
+.tl-axis{position:relative}
+.tl-axis::before{content:"";position:absolute;left:50%;transform:translateX(-50%);top:-9px;bottom:-9px;width:1px;background:var(--border2)}
+.tl-item:first-child .tl-axis::before{top:15px}
+.tl-item:last-child .tl-axis::before{bottom:auto;height:16px}
+.tl-dot{position:absolute;left:50%;top:11px;width:9px;height:9px;transform:translateX(-50%);border-radius:50%;background:var(--bg);border:2px solid var(--faint);z-index:1}
+.tl-dot.b{border-color:var(--blue)}
+.tl-dot.a{border-color:var(--amber)}
+.tl-dot.now{border-color:var(--amber);animation:pulse 1.8s ease-out infinite}
+.tl-body{min-width:0}
+.tl-line1{display:flex;align-items:center;gap:7px;flex-wrap:wrap}
+.tl-title{flex:1;min-width:160px;font-size:12.5px}
+.tl-foot{margin-top:auto;padding-top:10px;border-top:1px dashed var(--border);font-size:11px;color:var(--faint);display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap}
+.tl-foot b{color:var(--text);font-weight:600}
+
+/* ---- risk bars ---- */
+.rb{margin-bottom:12px}
+.rb:last-of-type{margin-bottom:0}
+.rb-top{display:flex;justify-content:space-between;align-items:baseline;font-size:11.5px;color:var(--muted);gap:8px}
+.rb-top b{color:var(--text);font-weight:600}
+.rb-track{position:relative;height:8px;margin-top:5px;border-radius:4px}
+.rb-clip{position:absolute;inset:0;border-radius:4px;overflow:hidden;background:var(--panel2);border:1px solid var(--border)}
+.rb-fill{position:absolute;left:0;top:0;bottom:0;border-radius:3px 0 0 3px}
+.rb-fill.ok{background:linear-gradient(90deg,rgba(63,185,80,.45),var(--green))}
+.rb-fill.mid{background:linear-gradient(90deg,rgba(217,161,18,.4),var(--amber))}
+.rb-tick{position:absolute;top:-4px;bottom:-4px;right:0;width:2px;background:var(--red);border-radius:1px}
+.rb-legend{font-size:10px;color:var(--faint);margin-top:10px;display:flex;gap:14px}
+.rb-legend i{display:inline-block;width:8px;height:8px;border-radius:2px;margin-right:5px;vertical-align:-1px}
+
+/* ---- agent loop ---- */
+.al-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.segs{display:flex;gap:3px;margin-top:6px}
+.segs i{width:12px;height:4px;border-radius:2px;background:var(--panel2);border:1px solid var(--border)}
+.segs i.on{background:var(--blue);border-color:var(--blue)}
+.segs i.cur{background:rgba(76,141,255,.45);border-color:var(--blue)}
+.mini{height:5px;background:var(--panel2);border:1px solid var(--border);border-radius:3px;margin-top:6px;overflow:hidden}
+.mini i{display:block;height:100%;background:linear-gradient(90deg,#2b62b8,var(--cyan));border-radius:3px}
+.al-tools-h{margin:12px 0 8px;font-size:11px;color:var(--faint);display:flex;justify-content:space-between;gap:8px}
+.tool{margin-bottom:8px}
+.tool:last-child{margin-bottom:0}
+.tool-top{display:flex;justify-content:space-between;gap:8px;font-size:10.5px;color:var(--muted)}
+.tool-top .tname{font-family:var(--mono);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.tool-top .tcount{color:var(--text);font-family:var(--mono);flex:none}
+.tool-bar{height:5px;background:var(--panel2);border:1px solid var(--border);border-radius:3px;margin-top:3px;overflow:hidden}
+.tool-bar i{display:block;height:100%;background:linear-gradient(90deg,#2f66c4,var(--blue));border-radius:3px}
+
+/* ---- approvals ---- */
+.sec-row{display:flex;align-items:center;gap:10px;margin:4px 0 10px;flex-wrap:wrap}
+.sec-row h2{font-size:14px;font-weight:700;letter-spacing:.3px}
+.sec-row .note{font-size:11px;color:var(--faint)}
+.sec-row .aux{margin-left:auto;font-size:11.5px;color:var(--faint);white-space:nowrap}
+.sec-row .aux:hover{color:var(--blue)}
+.appr{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:12px}
+.appr-card{display:flex;flex-direction:column;gap:8px}
+.appr-top{display:flex;align-items:center;gap:8px}
+.appr-top .chip{margin-left:auto}
+.appr-title{font-size:13.5px;font-weight:600}
+.appr-desc{font-size:11.5px;color:var(--faint)}
+.appr-foot{display:flex;align-items:center;justify-content:space-between;margin-top:auto;padding-top:9px;border-top:1px dashed var(--border)}
+
+/* ---- data sources ---- */
+.ds{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:8px}
+.ds-st{font-size:10px;margin-left:8px}
+.ds-st.ok{color:var(--green)}
+.ds-st.fb{color:var(--amber)}
+
+/* ---- footer ---- */
+.foot{display:flex;justify-content:space-between;gap:10px;flex-wrap:wrap;border-top:1px solid var(--border);margin-top:16px;padding-top:10px;font-size:10.5px;color:var(--faint)}
+
+/* ---- motion ---- */
+@keyframes rise{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+.rise{animation:rise .45s ease both}
+.d1{animation-delay:.05s}.d2{animation-delay:.1s}.d3{animation-delay:.15s}.d4{animation-delay:.2s}.d5{animation-delay:.25s}
+@keyframes pulse{0%{box-shadow:0 0 0 0 rgba(217,161,18,.45)}70%{box-shadow:0 0 0 6px rgba(217,161,18,0)}100%{box-shadow:0 0 0 0 rgba(217,161,18,0)}}
+.anim{transition:width .8s cubic-bezier(.25,.7,.3,1)}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+
+/* ---- responsive ---- */
+@media(max-width:1240px){.tb-kv{display:none}}
+@media(max-width:1100px){.kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}
+@media(max-width:1020px){.mid{grid-template-columns:1fr}}
+@media(max-width:920px){
+.chans{grid-template-columns:1fr}
+.layout{flex-direction:column}
+.sidenav{position:static;width:auto;height:auto;flex-direction:row;align-items:center;gap:2px;overflow-x:auto;padding:8px 12px;border-right:0;border-bottom:1px solid var(--border)}
+.nav-group{display:flex;align-items:center;gap:2px}
+.nav-group+.nav-group{border-left:1px solid var(--border);padding-left:10px;margin-left:8px}
+.nav-cat{display:none}
+.nav-item{white-space:nowrap}
+.nav-foot{display:none}
+}
+@media(max-width:680px){
+.kpis{grid-template-columns:repeat(2,minmax(0,1fr))}
+.appr{grid-template-columns:1fr}
+.ds{grid-template-columns:1fr 1fr}
+.beat{font-size:0;gap:0;padding:0 6px}
+}
+@media(max-width:520px){.beats{display:none}.tb-right{display:none}}
+@media(max-width:440px){.kpis{grid-template-columns:1fr}.ds{grid-template-columns:1fr}}
+</style>
+</head>
+<body>
+
+<!-- 顶栏 -->
+<header class="topbar">
+  <div class="tb-brand"><span class="tb-title">量化决策平台 V3.0</span><span class="tb-sub">Harness-Centric</span></div>
+  <div class="tb-center">
+    <span class="env" title="当前环境：SIM 模拟">SIM</span>
+    <span class="sep"></span>
+    <span class="tb-kv">权益 <b class="num">¥1,024,380</b></span>
+    <span class="tb-kv">日内 <b class="num neg">−0.62%</b></span>
+    <span class="sep"></span>
+    <span class="pill-demo" title="本页所有数字均为演示用示例">示例数据</span>
+    <span class="beats">
+      <span class="beat" title="MCP Bridge 心跳正常"><i class="dot dg"></i>MCP</span>
+      <span class="beat" title="SDK JSON-RPC 心跳正常"><i class="dot dg"></i>SDK</span>
+      <span class="beat" title="Headless CLI 心跳正常"><i class="dot dg"></i>Headless</span>
+    </span>
+  </div>
+  <div class="tb-right num" id="tbDate">2025-06-13 周五</div>
+</header>
+
+<div class="layout">
+  <!-- 左侧导航 -->
+  <nav class="sidenav">
+    <div class="nav-group">
+      <div class="nav-cat">监控</div>
+      <a class="nav-item active" href="index.html">系统概览</a>
+      <a class="nav-item" href="brain.html">决策大脑</a>
+    </div>
+    <div class="nav-group">
+      <div class="nav-cat">研究</div>
+      <a class="nav-item" href="market.html">行情与信号</a>
+      <a class="nav-item" href="strategy.html">策略与因子</a>
+    </div>
+    <div class="nav-group">
+      <div class="nav-cat">交易</div>
+      <a class="nav-item" href="risk.html">风险监控</a>
+      <a class="nav-item" href="execution.html">执行与审批</a>
+    </div>
+    <div class="nav-group">
+      <div class="nav-cat">系统</div>
+      <a class="nav-item" href="gateway.html">网关与调度</a>
+      <a class="nav-item" href="tools.html">工具域治理</a>
+      <a class="nav-item" href="settings.html">接入与授权</a>
+    </div>
+    <a class="nav-foot" href="brain.html" title="进入决策大脑">
+      <span class="nf-line"><i class="dot dg"></i>Agent Loop 运行中</span>
+      <span class="nf-sub">deepseek-v4-flash · turn 3/12</span>
+    </a>
+  </nav>
+
+  <!-- 主内容 -->
+  <main class="main">
+    <div class="inner">
+
+      <div class="page-head rise">
+        <div>
+          <h1>系统概览</h1>
+          <div class="page-sub">平台（身体）× Harness（决策大脑）· 全局运行状态 · 环境 SIM</div>
+        </div>
+        <div class="page-tools">
+          <span>数据截至 <b class="num" id="ts">15:04:32</b></span>
+          <button class="btn-ghost" id="btnRefresh" type="button">刷新</button>
+        </div>
+      </div>
+
+      <!-- 1) KPI -->
+      <section class="grid kpis rise d1" data-od-id="sec-1">
+        <div class="card kpi">
+          <div class="kpi-label">总资产</div>
+          <div class="kpi-value num">¥1,024,380</div>
+          <div class="kpi-sub">较昨日 <b class="num neg">−¥6,391</b></div>
+          <svg class="spark" viewBox="0 0 120 36" preserveAspectRatio="none" style="color:var(--blue)" aria-hidden="true">
+            <polygon points="0,30 4,29 8,28 12,29 16,27 20,26 24,25 28,26 32,24 36,23 40,22 44,23 48,21 52,20 56,19 60,20 64,18 68,17 72,16 76,17 80,15 84,14 88,13 92,12 96,11 100,10 104,9 108,10 112,12 116,11 116,36 0,36"></polygon>
+            <polyline vector-effect="non-scaling-stroke" points="0,30 4,29 8,28 12,29 16,27 20,26 24,25 28,26 32,24 36,23 40,22 44,23 48,21 52,20 56,19 60,20 64,18 68,17 72,16 76,17 80,15 84,14 88,13 92,12 96,11 100,10 104,9 108,10 112,12 116,11"></polyline>
+            <circle cx="116" cy="11" r="2.2"></circle>
+          </svg>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">当日盈亏</div>
+          <div class="kpi-value num neg">−0.62%</div>
+          <div class="kpi-sub">昨收 <b class="num">¥1,030,771</b></div>
+          <svg class="spark" viewBox="0 0 120 36" preserveAspectRatio="none" style="color:var(--red)" aria-hidden="true">
+            <polygon points="0,10 4,9 8,11 12,10 16,12 20,14 24,13 28,15 32,17 36,16 40,18 44,17 48,19 52,21 56,20 60,22 64,21 68,23 72,24 76,23 80,25 84,26 88,25 92,27 96,26 100,28 104,27 108,29 112,28 116,29 116,36 0,36"></polygon>
+            <polyline vector-effect="non-scaling-stroke" points="0,10 4,9 8,11 12,10 16,12 20,14 24,13 28,15 32,17 36,16 40,18 44,17 48,19 52,21 56,20 60,22 64,21 68,23 72,24 76,23 80,25 84,26 88,25 92,27 96,26 100,28 104,27 108,29 112,28 116,29"></polyline>
+            <circle cx="116" cy="29" r="2.2"></circle>
+          </svg>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">年化收益</div>
+          <div class="kpi-value num pos">+18.4%</div>
+          <div class="kpi-sub">近 <b class="num">252</b> 个交易日</div>
+          <svg class="spark" viewBox="0 0 120 36" preserveAspectRatio="none" style="color:var(--green)" aria-hidden="true">
+            <polygon points="0,28 4,27 8,28 12,26 16,25 20,26 24,24 28,23 32,24 36,22 40,21 44,22 48,20 52,19 56,20 60,18 64,17 68,18 72,16 76,15 80,16 84,14 88,13 92,14 96,12 100,11 104,12 108,10 112,9 116,8 116,36 0,36"></polygon>
+            <polyline vector-effect="non-scaling-stroke" points="0,28 4,27 8,28 12,26 16,25 20,26 24,24 28,23 32,24 36,22 40,21 44,22 48,20 52,19 56,20 60,18 64,17 68,18 72,16 76,15 80,16 84,14 88,13 92,14 96,12 100,11 104,12 108,10 112,9 116,8"></polyline>
+            <circle cx="116" cy="8" r="2.2"></circle>
+          </svg>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">夏普比率</div>
+          <div class="kpi-value num">1.86</div>
+          <div class="kpi-sub">滚动 <b class="num">60</b> 日窗口</div>
+          <svg class="spark" viewBox="0 0 120 36" preserveAspectRatio="none" style="color:var(--cyan)" aria-hidden="true">
+            <polygon points="0,26 4,25 8,27 12,24 16,23 20,25 24,22 28,24 32,21 36,23 40,20 44,22 48,19 52,21 56,18 60,20 64,19 68,17 72,19 76,16 80,18 84,15 88,17 92,14 96,16 100,13 104,15 108,12 112,13 116,11 116,36 0,36"></polygon>
+            <polyline vector-effect="non-scaling-stroke" points="0,26 4,25 8,27 12,24 16,23 20,25 24,22 28,24 32,21 36,23 40,20 44,22 48,19 52,21 56,18 60,20 64,19 68,17 72,19 76,16 80,18 84,15 88,17 92,14 96,16 100,13 104,15 108,12 112,13 116,11"></polyline>
+            <circle cx="116" cy="11" r="2.2"></circle>
+          </svg>
+        </div>
+        <div class="card kpi">
+          <div class="kpi-label">最大回撤</div>
+          <div class="kpi-value num warn">−6.3%</div>
+          <div class="kpi-sub">阈值 <b class="num">15%</b> · 当前安全</div>
+          <svg class="spark" viewBox="0 0 120 36" preserveAspectRatio="none" style="color:var(--amber)" aria-hidden="true">
+            <polygon points="0,6 4,7 8,6 12,8 16,9 20,8 24,10 28,11 32,12 36,11 40,13 44,14 48,15 52,14 56,16 60,17 64,16 68,18 72,19 76,20 80,19 84,21 88,22 92,23 96,22 100,24 104,25 108,26 112,27 116,27 116,36 0,36"></polygon>
+            <polyline vector-effect="non-scaling-stroke" points="0,6 4,7 8,6 12,8 16,9 20,8 24,10 28,11 32,12 36,11 40,13 44,14 48,15 52,14 56,16 60,17 64,16 68,18 72,19 76,20 80,19 84,21 88,22 92,23 96,22 100,24 104,25 108,26 112,27 116,27"></polyline>
+            <circle cx="116" cy="27" r="2.2"></circle>
+          </svg>
+        </div>
+      </section>
+
+      <!-- 2) 三通道状态 -->
+      <section class="grid chans rise d2" data-od-id="sec-2">
+        <div class="card">
+          <div class="ch-head">
+            <i class="ch-ico" style="background:var(--blue)"></i>
+            <div><div class="ch-name">MCP Bridge</div><div class="ch-sub">工具暴露通道</div></div>
+            <span class="chip g"><i class="dot dg"></i>运行中</span>
+          </div>
+          <div class="stats">
+            <div class="stat"><div class="k">已注册工具</div><div class="v num">59 <small>个</small></div></div>
+            <div class="stat"><div class="k">今日调用</div><div class="v num">1,284 <small>次</small></div></div>
+            <div class="stat"><div class="k">成功率</div><div class="v num pos">99.2%</div></div>
+            <div class="stat"><div class="k">P95 延迟</div><div class="v num">320 <small>ms</small></div></div>
+          </div>
+          <div class="ch-foot"><span>状态机状态 <b class="mono">start</b>（运行中）</span><a href="tools.html">工具域治理 →</a></div>
+        </div>
+        <div class="card">
+          <div class="ch-head">
+            <i class="ch-ico" style="background:var(--purple)"></i>
+            <div><div class="ch-name">SDK JSON-RPC</div><div class="ch-sub">人工会话通道</div></div>
+            <span class="chip g"><i class="dot dg"></i>正常</span>
+          </div>
+          <div class="stats">
+            <div class="stat"><div class="k">活跃会话</div><div class="v num">3 <small>个</small></div></div>
+            <div class="stat"><div class="k">初始化握手耗时</div><div class="v num">1.8 <small>s</small></div></div>
+            <div class="stat wide"><div class="k">最近事件</div><div class="v mono">session / prompt 完成</div></div>
+          </div>
+          <div class="ch-foot"><span>JSON-RPC 2.0 · 有状态通道</span><a href="brain.html">决策大脑 →</a></div>
+        </div>
+        <div class="card">
+          <div class="ch-head">
+            <i class="ch-ico" style="background:var(--cyan)"></i>
+            <div><div class="ch-name">Headless CLI</div><div class="ch-sub">自动唤醒通道</div></div>
+            <span class="chip g"><i class="dot dg"></i>熔断正常</span>
+          </div>
+          <div class="stats">
+            <div class="stat"><div class="k">今日唤醒</div><div class="v num">12 <small>次</small></div></div>
+            <div class="stat"><div class="k">成功 / 失败</div><div class="v num"><span class="pos">11</span> <small>/</small> <span class="neg">1</span></div></div>
+            <div class="stat"><div class="k">平均耗时</div><div class="v num">42 <small>s</small></div></div>
+            <div class="stat"><div class="k">单次 token 预算</div><div class="v num">200 <small>K</small></div></div>
+          </div>
+          <div class="ch-foot"><span>当前并发 <b class="num">1 / 3</b></span><a href="gateway.html">网关与调度 →</a></div>
+        </div>
+      </section>
+
+      <!-- 3/4/5) 时间线 + 风控 + Agent Loop -->
+      <section class="grid mid rise d3" data-od-id="sec-3">
+        <div class="card tl-card">
+          <div class="card-h">
+            <h3>决策链路时间线</h3><span class="chip c">最近 5 条</span>
+            <a class="aux" href="brain.html">进入决策大脑 →</a>
+          </div>
+          <div class="tl">
+            <div class="tl-item">
+              <div class="tl-time num">08:30:00</div>
+              <div class="tl-axis"><i class="tl-dot b"></i></div>
+              <div class="tl-body"><div class="tl-line1"><span class="tag p">定时</span><span class="tl-title">开盘扫描完成：拉取隔夜行情、新闻与资金流快照</span><span class="chip g">低</span><span class="chip b">自动执行</span></div></div>
+            </div>
+            <div class="tl-item">
+              <div class="tl-time num">08:31:18</div>
+              <div class="tl-axis"><i class="tl-dot b"></i></div>
+              <div class="tl-body"><div class="tl-line1"><span class="tag c">事件</span><span class="tl-title">新能源板块隔夜情绪偏空，消息面以利空为主</span><span class="chip a">中</span><span class="chip b">自动执行</span></div></div>
+            </div>
+            <div class="tl-item">
+              <div class="tl-time num">08:32:05</div>
+              <div class="tl-axis"><i class="tl-dot b"></i></div>
+              <div class="tl-body"><div class="tl-line1"><span class="tag b">流水线节点</span><span class="tl-title">风控通过：单笔敞口 <span class="num">1.2%</span> ≤ <span class="num">2%</span> 红线</span><span class="chip g">低</span><span class="chip b">自动执行</span></div></div>
+            </div>
+            <div class="tl-item">
+              <div class="tl-time num">08:33:40</div>
+              <div class="tl-axis"><i class="tl-dot a"></i></div>
+              <div class="tl-body"><div class="tl-line1"><span class="tag b">流水线节点</span><span class="tl-title">生成调仓建议：新能源板块建议减仓至 <span class="num">12%</span></span><span class="chip a">中</span><span class="chip a">人工确认</span></div></div>
+            </div>
+            <div class="tl-item">
+              <div class="tl-time num">08:33:41</div>
+              <div class="tl-axis"><i class="tl-dot now"></i></div>
+              <div class="tl-body"><div class="tl-line1"><span class="tag c">事件</span><span class="tl-title">建议已推送至审批队列，等待人工确认</span><span class="chip a">中</span><span class="chip a">人工确认</span></div></div>
+            </div>
+          </div>
+          <div class="tl-foot">
+            <span>本链路 <b class="num">5</b> 节点 · 总耗时 <b class="num">3 分 41 秒</b> · 产生待审批 <b class="num">1</b> 条</span>
+            <a href="brain.html">查看完整链路 →</a>
+          </div>
+        </div>
+
+        <div class="col">
+          <div class="card">
+            <div class="card-h"><h3>风控红线</h3><a class="aux" href="risk.html">风险监控 →</a></div>
+            <div class="rb">
+              <div class="rb-top"><span>单笔交易上限 <b class="num">2%</b></span><span class="num">已用 1.2%</span></div>
+              <div class="rb-track"><div class="rb-clip"><i class="rb-fill ok anim" style="width:60%"></i></div><i class="rb-tick"></i></div>
+            </div>
+            <div class="rb">
+              <div class="rb-top"><span>单一行业暴露上限 <b class="num">20%</b></span><span class="num">新能源 14%</span></div>
+              <div class="rb-track"><div class="rb-clip"><i class="rb-fill mid anim" style="width:70%"></i></div><i class="rb-tick"></i></div>
+            </div>
+            <div class="rb">
+              <div class="rb-top"><span>最大回撤阈值 <b class="num">15%</b></span><span class="num">当前 −6.3%</span></div>
+              <div class="rb-track"><div class="rb-clip"><i class="rb-fill ok anim" style="width:42%"></i></div><i class="rb-tick"></i></div>
+            </div>
+            <div class="rb-legend">
+              <span><i style="background:var(--green)"></i>当前占比</span>
+              <span><i style="background:var(--amber)"></i>接近阈值</span>
+              <span><i style="background:var(--red);width:2px"></i>阈值红线</span>
+            </div>
+          </div>
+
+          <div class="card">
+            <div class="card-h">
+              <h3>Agent Loop 实时状态</h3>
+              <span class="chip g"><i class="dot dg"></i>运行中</span>
+              <a class="aux" href="brain.html">决策大脑 →</a>
+            </div>
+            <div class="al-grid">
+              <div class="stat">
+                <div class="k">当前 turn</div>
+                <div class="v num">3 <small>/ 12</small></div>
+                <div class="segs"><i class="on"></i><i class="on"></i><i class="cur"></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></div>
+              </div>
+              <div class="stat">
+                <div class="k">已用 token</div>
+                <div class="v num">12,480 <small>/ 49,152</small></div>
+                <div class="mini"><i class="anim" style="width:25.4%"></i></div>
+              </div>
+              <div class="stat"><div class="k">模型</div><div class="v mono">deepseek-v4-flash</div></div>
+              <div class="stat"><div class="k">推理强度</div><div class="v"><span class="chip p num">max</span></div></div>
+            </div>
+            <div class="al-tools-h"><span>工具调用 Top 5</span><span>当前 Loop 累计 · 示例</span></div>
+            <div class="tool"><div class="tool-top"><span class="tname">mcp:quant_data:query_quote</span><span class="tcount">18</span></div><div class="tool-bar"><i class="anim" style="width:100%"></i></div></div>
+            <div class="tool"><div class="tool-top"><span class="tname">mcp:quant_alpha:calc_indicator</span><span class="tcount">11</span></div><div class="tool-bar"><i class="anim" style="width:61%"></i></div></div>
+            <div class="tool"><div class="tool-top"><span class="tname">mcp:quant_risk:check_risk</span><span class="tcount">7</span></div><div class="tool-bar"><i class="anim" style="width:39%"></i></div></div>
+            <div class="tool"><div class="tool-top"><span class="tname">mcp:quant_data:search_news</span><span class="tcount">5</span></div><div class="tool-bar"><i class="anim" style="width:28%"></i></div></div>
+            <div class="tool"><div class="tool-top"><span class="tname">mcp:quant_ml:run_backtest</span><span class="tcount">2</span></div><div class="tool-bar"><i class="anim" style="width:11%"></i></div></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- 6) 待审批 -->
+      <div class="sec-row rise d4">
+        <h2>待人工审批</h2><span class="chip a">2 条待处理</span>
+        <span class="note">执行入口唯一 · 所有执行动作须经人工审批</span>
+        <a class="aux" href="execution.html">进入执行与审批 →</a>
+      </div>
+      <section class="appr rise d4" data-od-id="sec-4">
+        <div class="card appr-card">
+          <div class="appr-top"><span class="tag b">调仓建议</span><span class="chip g"><i class="dot dg"></i>风控预检通过</span></div>
+          <div class="appr-title">新能源权重 <span class="num">+2.1%</span> → 建议减仓至 <span class="num">12%</span></div>
+          <div class="appr-desc">来源：Agent Loop · turn 3 决策链路 · 关联红线：单一行业暴露 <span class="num">14% / 20%</span></div>
+          <div class="appr-foot"><a class="link" href="brain.html">查看决策链路</a><a class="btn" href="execution.html">去审批</a></div>
+        </div>
+        <div class="card appr-card">
+          <div class="appr-top"><span class="tag p">策略参数变更</span><span class="chip g"><i class="dot dg"></i>PIT 校验通过</span></div>
+          <div class="appr-title">动量因子窗口 <span class="num">20</span> → <span class="num">15</span></div>
+          <div class="appr-desc">来源：策略与因子研究 · 变更经人工确认后于下一 turn 生效</div>
+          <div class="appr-foot"><a class="link" href="brain.html">查看决策链路</a><a class="btn" href="execution.html">去审批</a></div>
+        </div>
+      </section>
+
+      <!-- 7) 数据源健康 -->
+      <section class="card rise d5" data-od-id="sec-5">
+        <div class="card-h">
+          <h3>数据源健康</h3>
+          <span class="aux">回退链路：AKShare → Tushare Pro（自动切换）</span>
+        </div>
+        <div class="ds">
+          <div class="stat"><div class="k"><i class="dot dg"></i>富途 OpenD</div><div class="v"><span class="num">12</span><small> ms</small><span class="ds-st ok">正常</span></div></div>
+          <div class="stat"><div class="k"><i class="dot dg"></i>Tushare Pro</div><div class="v"><span class="num">45</span><small> ms</small><span class="ds-st ok">正常</span></div></div>
+          <div class="stat"><div class="k"><i class="dot da"></i>AKShare</div><div class="v"><span class="num">210</span><small> ms</small><span class="ds-st fb">自动回退中</span></div></div>
+          <div class="stat"><div class="k"><i class="dot dg"></i>dsh-quant-data-mcp</div><div class="v"><span class="num">28</span><small> ms</small><span class="ds-st ok">正常</span></div></div>
+        </div>
+      </section>
+
+      <footer class="foot">
+        <span>示例数据，非真实账户 · 页面内所有数字与状态均为演示样例</span>
+        <span>量化决策平台 V3.0 · Harness-Centric · SIM 环境</span>
+      </footer>
+
+    </div>
+  </main>
+</div>
+
+<script>
+(function(){
+  "use strict";
+  function p2(n){return (n<10?"0":"")+n;}
+  var d=new Date(),wd="日一二三四五六";
+  var dateEl=document.getElementById("tbDate");
+  if(dateEl){dateEl.textContent=d.getFullYear()+"-"+p2(d.getMonth()+1)+"-"+p2(d.getDate())+" 周"+wd[d.getDay()];}
+  var ts=document.getElementById("ts"),btn=document.getElementById("btnRefresh");
+  if(btn&&ts){
+    btn.addEventListener("click",function(){
+      var n=new Date();
+      ts.textContent=p2(n.getHours())+":"+p2(n.getMinutes())+":"+p2(n.getSeconds());
+      btn.textContent="已刷新";btn.disabled=true;
+      setTimeout(function(){btn.textContent="刷新";btn.disabled=false;},1200);
+    });
+  }
+  var fills=document.querySelectorAll(".anim");
+  Array.prototype.forEach.call(fills,function(el,i){
+    var w=el.style.width;
+    if(!w){return;}
+    el.style.transitionDelay=(i*70)+"ms";
+    el.style.width="0%";
+    requestAnimationFrame(function(){requestAnimationFrame(function(){
+      el.style.width=w;
+      setTimeout(function(){el.style.transitionDelay="0ms";},1000+i*70);
+    });});
+  });
+})();
+</script>
+</body>
+</html>
