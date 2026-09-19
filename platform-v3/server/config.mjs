@@ -44,8 +44,16 @@ export function loadConfig(env = process.env, home = env.DSH_HOME || path.join(o
       mcp: { transport: env.QUANT_MCP_TRANSPORT || 'stdio', enabled: true },
       sdk: {
         enabled: env.QUANT_SDK_ENABLED === '1',
+        dshBin: env.QUANT_SDK_BIN || env.DSH_BIN || 'dsh',
+        argv: undefined,
         profile: env.QUANT_SDK_PROFILE || 'sdk',
-        note: 'SDK JSON-RPC 通道：需要 @deepseek-ai/dsh-sdk-jsonrpc-server 与 deepseek-harness-sdk，当前部署未安装时如实标注 pending',
+        provider: env.QUANT_SDK_PROVIDER || 'deepseek-official',
+        model: env.QUANT_SDK_MODEL || 'deepseek-flash',
+        reasoningEffort: env.QUANT_SDK_EFFORT || 'high',
+        maxTokens: Number(env.QUANT_SDK_MAX_TOKENS || 49152),
+        cwd: env.QUANT_SDK_CWD || process.cwd(),
+        requireKey: true,
+        note: '需要部署 dsh-sdk-app bundle（dsh --profile sdk，@deepseek-ai/dsh-sdk-app）与模型密钥；未就绪时状态如实标注 pending',
       },
       headless: {
         enabled: true,

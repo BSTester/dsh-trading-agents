@@ -10,6 +10,7 @@ import createWorkbenchClient from './wb-client.mjs'
 import createMcpServer from './mcp/stdio.mjs'
 import createStore from './store.mjs'
 import { createHeadlessRunner, createScheduler } from './gateway/headless.mjs'
+import createSdkChannel from './gateway/sdk.mjs'
 import { checkOrder, createOms } from './risk.mjs'
 
 const config = loadConfig()
@@ -17,6 +18,7 @@ const wb = createWorkbenchClient(config.workbench)
 const store = createStore(config.dataDir)
 const runner = createHeadlessRunner({ config, store })
 const oms = createOms({ store })
+const sdkChannel = createSdkChannel({ config, clock: () => new Date() })
 
 const WB_TOOL_NAMES = new Set([
   'snapshot', 'switch_mode', 'series', 'equity', 'positions', 'correlation', 'sensitivity', 'risk', 'trades', 'events',
@@ -67,7 +69,7 @@ app.get('/healthz', async () => {
     version: '3.0.0-alpha.1',
     uptime_s: Math.round((Date.now() - startedAt) / 1000),
     workbench,
-    channels: { mcp: 'running', headless: 'ready', sdk: config.channels.sdk.enabled ? 'enabled' : 'pending' },
+    channels: { mcp: 'running', headless: 'ready', sdk: sdkChannel.status().status },
   }
 })
 
@@ -84,14 +86,25 @@ app.get('/api/v3/overview', async () => {
     headless,
     channels: {
       mcp: { status: 'running', transport: config.channels.mcp.transport },
-      sdk: { status: config.channels.sdk.enabled ? 'enabled' : 'pending', note: config.channels.sdk.note },
+      sdk: { status: sdkChannel.status().status, note: sdkChannel.status().reason ?? config.channels.sdk.note },
       headless: { status: 'ready', breaker: headless.breaker },
     },
     limits: { singlePct: 2, industryPct: 20, drawdownPct: 15 },
   }
 })
 
-app.get('/api/v3/brain', async () => runner.stats())
+app.get('/api/v3/brain', async () => ({ headless: runner.stats(), sdk: sdkChannel.status() }))
+
+app.get('/api/v3/sdk', async () => ({ ok: true, ...sdkChannel.status() }))
+
+app.post('/api/v3/sdk/start', async () => sdkChannel.start())
+
+app.post('/api/v3/sdk/prompt', async ({ body }) => {
+  const sessionId = String(body.sessionId || `quant-${Date.now()}`)
+  const text = String(body.text || '').trim()
+  if (text === '') return { ok: false, error: { code: 'sdk/empty-prompt', message: 'text 不能为空' } }
+  return sdkChannel.prompt(sessionId, text)
+})
 
 app.get('/api/v3/market', async ({ query }) => {
   const ticker = query.ticker || (config.sources.watchlist[0] ?? 'SH.600519')
@@ -115,7 +128,7 @@ app.get('/api/v3/gateway', async () => ({
   ok: true,
   channels: {
     mcp: { direction: '平台→Harness（工具暴露）', protocol: 'MCP stdio/NDJSON + HTTP /api/v3/mcp', status: 'running' },
-    sdk: { direction: '平台↔Harness（会话驱动）', protocol: '换行分帧 JSON-RPC / stdio', status: config.channels.sdk.enabled ? 'enabled' : 'pending', note: config.channels.sdk.note },
+    sdk: { direction: '平台↔Harness（会话驱动）', protocol: '换行分帧 JSON-RPC / stdio', status: sdkChannel.status().status, reason: sdkChannel.status().reason, route: sdkChannel.status().route, serverInfo: sdkChannel.status().serverInfo, profile: sdkChannel.status().profile },
     headless: { direction: '平台→Harness（自动唤醒）', protocol: 'CLI 子进程', command: `${config.channels.headless.dshBin} --profile ${config.channels.headless.profile} "<task>"`, status: 'ready' },
   },
   scheduler: scheduler.view(),
