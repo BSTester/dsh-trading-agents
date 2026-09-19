@@ -209,6 +209,146 @@
     }
   }
 
+
+  // ── 表格级绑定工具（按表头定位表格，按行文本定位行）─────────────────────────
+  function findTable(root, headerText) {
+    for (const table of root.querySelectorAll('table')) {
+      if ((table.querySelector('thead')?.textContent ?? '').includes(headerText)) return table
+    }
+    return null
+  }
+
+  function rewriteRows(table, rows) {
+    const tbody = table?.querySelector('tbody')
+    const template = tbody?.querySelector('tr')
+    if (!tbody || !template) return false
+    const cloned = template.cloneNode(true)
+    tbody.innerHTML = ''
+    for (const row of rows) {
+      const tr = cloned.cloneNode(true)
+      const tds = tr.querySelectorAll('td')
+      for (let i = 0; i < tds.length; i++) tds[i].textContent = row[i] === undefined || row[i] === null ? '—' : String(row[i])
+      tbody.appendChild(tr)
+    }
+    return true
+  }
+
+  function setCell(table, rowMatch, colIndex, text) {
+    if (!table) return false
+    for (const tr of table.querySelectorAll('tbody tr')) {
+      if (!tr.textContent.includes(rowMatch)) continue
+      const td = tr.querySelectorAll('td')[colIndex]
+      if (td) td.textContent = String(text)
+      return true
+    }
+    return false
+  }
+
+  // 指标卡（首页 .kpi / 各页 .metric / 风控页 .mcard / 配置页 .kv）统一按标签绑定
+  function bindCards(root, pairs) {
+    let bound = 0
+    for (const [scopeSel, labelSel, valueSel] of [['.kpi', '.kpi-label', '.kpi-value'], ['.metric', '.k', '.v'], ['.mcard', '.lbl', '.val'], ['.kv', '.k', '.v'], ['.stat', '.k', '.v']]) {
+      for (const scope of root.querySelectorAll(scopeSel)) {
+        const label = scope.querySelector(labelSel)?.textContent?.trim()
+        if (!label || pairs[label] === undefined) continue
+        const target = scope.querySelector(valueSel)
+        if (!target) continue
+        if (target.querySelector('small')) setValueWithUnit(target, pairs[label])
+        else setText(target, pairs[label])
+        // 值为「—」时同步清掉子标题里的示例说明，避免与「无数据」自相矛盾
+        if (String(pairs[label]) === '—') {
+          const sub = scope.querySelector('.sub') ?? scope.querySelector('.kpi-sub') ?? scope.querySelector('.kv-note')
+          if (sub && /示例/.test(sub.textContent ?? '')) sub.textContent = '工作台暂未提供该量'
+        }
+        bound += 1
+      }
+    }
+    return bound
+  }
+
+  const ENV_PURPOSE = {
+    DSH_HOME: 'Harness home 目录',
+    DEEPSEEK_API_KEY: 'DeepSeek 推理密钥（BYOK）',
+    QUANT_MCP_NODE: 'MCP 服务器 Node 可执行文件',
+    QUANT_MCP_SERVER: 'MCP 服务器入口文件',
+    QUANT_MCP_CWD: 'MCP 服务器工作目录',
+    QUANT_MCP_LOG: 'MCP 服务器日志路径',
+    FUTU_OPEND_HOST: '富途 OpenD 地址',
+    FUTU_OPEND_PORT: '富途 OpenD 端口',
+    TUSHARE_TOKEN: 'Tushare Pro Token',
+  }
+
+  // 接入与授权页：环境变量矩阵、富途 MCP Bearer、凭据表状态全部按真实配置回填
+  async function deepBindSettings(root) {
+    const settings = await getJSON('/api/v3/settings')
+    if (!settings?.ok) return
+
+    const envTable = findTable(root, '变量名')
+    if (envTable) {
+      rewriteRows(
+        envTable,
+        (settings.env ?? []).map((e) => [e.key, ENV_PURPOSE[e.key] ?? '—', e.injected ? '已注入' : '未注入', e.source]),
+      )
+    }
+
+    const bearer = settings.futu?.mcp_bearer ?? {}
+    const openapi = settings.futu?.openapi ?? {}
+    bindCards(root, {
+      '渠道': settings.futu?.channel ?? '—',
+      'OpenAPI 模式': openapi.mode ?? '—',
+      '凭据来源': bearer.present ? '~/.dsh/futu-token' : '—',
+      '有效期至': bearer.present ? (bearer.expiry ?? '—') : '—',
+      '当前模式': settings.trading_mode ?? '—',
+    })
+
+    const credTable = findTable(root, '凭据')
+    if (credTable) {
+      setCell(credTable, '富途 MCP Bearer', 4, bearer.present ? '已授权' : '待授权')
+      setCell(credTable, '富途 MCP Bearer', 5, bearer.present ? (bearer.expiry ?? '—') : '—')
+      const envOf = (key) => (settings.env ?? []).find((e) => e.key === key)
+      const tushare = envOf('TUSHARE_TOKEN')
+      setCell(credTable, 'Tushare Pro Token', 4, tushare?.injected ? '已授权' : '待授权')
+      const deepseek = envOf('DEEPSEEK_API_KEY')
+      setCell(credTable, 'DeepSeek API Key', 4, deepseek?.injected ? '已授权' : '待授权')
+    }
+  }
+
+  // 风险监控页：风控规则表用工作台真实风控配置；组合指标里我们真有的才填，其余显式置「—」
+  async function deepBindRisk(root) {
+    const [riskRes, overview, metrics] = await Promise.all([
+      getJSON('/api/v3/risk'),
+      getJSON('/api/v3/overview'),
+      getJSON('/api/v3/metrics'),
+    ])
+    const equity = overview?.equity ?? null
+    const dd = Number.isFinite(Number(equity?.max_drawdown)) ? Math.abs(Number(equity.max_drawdown) * 100) : null
+    bindCards(root, {
+      '最大回撤': dd === null ? '—' : `${sign(-dd)}${fmtPct(dd)}`,
+      // 工作台未提供这些组合风险量：显示「—」，绝不留设计稿示例值
+      'VaR（95%，1d）': '—',
+      'CVaR（95%，1d）': '—',
+      Beta: '—',
+      'Alpha（年化）': '—',
+      'IR（信息比率）': '—',
+      红线阻断: metrics?.oms?.blocked ?? 0,
+      待人工确认: metrics?.oms?.manual ?? 0,
+    })
+
+    const config = riskRes?.data?.config ?? null
+    const source = riskRes?.data?.source ?? '—'
+    const rulesTable = findTable(root, '规则名')
+    if (rulesTable && config) {
+      const pct = (v) => `${(Number(v) * 100).toFixed(1)}%`
+      rewriteRows(rulesTable, [
+        ['单笔风险占比', pct(config.risk_per_trade), '—', '生效', source, '编辑'],
+        ['ATR 止损倍数', Number(config.stop_atr_mult).toFixed(1), '—', '生效', source, '编辑'],
+        ['最大持仓数', config.max_positions, '—', '生效', source, '编辑'],
+        ['单日亏损上限', pct(config.daily_loss_limit_pct), '—', '生效', source, '编辑'],
+        ['单票上限', pct(config.max_position_pct), '—', '生效', source, '编辑'],
+      ])
+    }
+  }
+
   // 每页的数据映射：load() → { pairs, tables }（全部来自 /api/v3/* 真实接口）
   const RENDER = {
     async index() {
@@ -408,6 +548,8 @@
       try {
         if (page === 'index') await deepBindIndex(host)
         if (page === 'tools') await deepBindTools(host)
+        if (page === 'settings') await deepBindSettings(host)
+        if (page === 'risk') await deepBindRisk(host)
       } catch {
         // 深绑定失败不影响实时条
       }

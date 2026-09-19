@@ -266,7 +266,11 @@ app.get('/api/v3/settings', async () => {
       mcp_bearer: { present: futu.mcpTokenPresent, expiry: futu.mcpTokenExpiry },
       openapi: { mode: futu.openapiMode, config_keys: futu.openapiConfigKeys },
     },
-    env: envKeys.map((key) => ({ key, injected: Boolean(process.env[key] || (key === 'DSH_HOME' && config.home)) , source: process.env[key] ? '环境变量' : key === 'DSH_HOME' ? '默认' : '未注入' })),
+    env: envKeys.map((key) => {
+      const injected = Boolean(process.env[key] || (key === 'DSH_HOME' && config.home))
+      const source = process.env[key] ? '环境变量' : key === 'DSH_HOME' ? '默认（DSH_HOME）' : '环境变量（未注入）'
+      return { key, injected, source }
+    }),
     data_sources: ['workbench(8397) 77 工具', '富途 OpenAPI/OpenD', 'futu-token(MCP Bearer)', 'trading-venv(akshare/pandas)', '~/.dsh/trading-platform.json(自选/流水线配置)'],
   }
 })
