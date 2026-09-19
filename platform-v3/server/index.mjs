@@ -16,6 +16,10 @@ import createOmsLedger from './oms.mjs'
 import { backtestMomentum, paramSweep } from './strategy/backtest.mjs'
 import createStrategyService from './strategy/pipeline.mjs'
 import { createMetrics, createAudit } from './observability.mjs'
+import createAkshareSource from './data/akshare.mjs'
+import createPortfolioResolver from './data/portfolio.mjs'
+import { portfolioRisk } from './data/risk-analytics.mjs'
+import { createLocalTools } from './mcp/local-tools.mjs'
 
 const config = loadConfig()
 const metrics = createMetrics()
@@ -25,44 +29,15 @@ const store = createStore(config.dataDir)
 const runner = createHeadlessRunner({ config, store, onCall: (record) => metrics.headless(record.success, record.duration_ms, record.tokens_estimate) })
 const oms = createOmsLedger({ store, wbCall: (tool, args, options) => wb.call(tool, args, options) })
 const sdkChannel = createSdkChannel({ config, clock: () => new Date(), store })
+const akshare = createAkshareSource({ pythonBin: config.data.pythonBin, timeoutMs: config.data.akshareTimeoutMs })
+const portfolio = createPortfolioResolver({
+  wbCall: (tool, args, options) => wb.call(tool, args, options),
+  watchlist: config.sources.watchlist,
+  defaultBenchmark: config.data.benchmark,
+})
+
 const strategy = createStrategyService({ wbCall: (tool, args, options) => wb.call(tool, args, options), watchlist: config.sources.watchlist, store })
 
-const strategyLocalTools = [
-  {
-    name: 'run_backtest',
-    description: '[ml] 单标的动量 long/flat 回测。真实富途日 K；PIT 对齐：t 日持仓仅由 ≤t-1 收盘价决定，无前视。轻量引擎（等权、无滑点建模），与 workbench 因子回测互补。',
-    inputSchema: { type: 'object', properties: { ticker: { type: 'string', description: '标的，如 SH.600519' }, window: { type: 'number', description: '动量窗口，默认 20' }, rebalanceDays: { type: 'number', description: '调仓周期（天），默认 5' }, limit: { type: 'number', description: 'K 线根数，默认 500' } }, required: ['ticker'], additionalProperties: false },
-    async execute(args) {
-      const envelope = await wb.call('series', { ticker: String(args.ticker), period: '1d', limit: Number(args.limit || 500) })
-      if (!envelope?.ok) return { text: JSON.stringify(envelope?.error ?? {}, null, 1), isError: true }
-      const result = backtestMomentum(envelope.value.bars, { window: Number(args.window || 20), rebalanceDays: Number(args.rebalanceDays || 5) })
-      if (result.error) return { text: result.error, isError: true }
-      const equity = result.equity
-      result.equity = [equity[0], equity[Math.floor(equity.length / 2)], equity.at(-1)]
-      return { text: JSON.stringify(result.metrics, null, 1) }
-    },
-  },
-  {
-    name: 'param_sweep',
-    description: '[ml] 参数扫描：动量窗口 × 调仓周期网格，返回各格 sharpe/年化/最大回撤与最优格（热力图数据）。',
-    inputSchema: { type: 'object', properties: { ticker: { type: 'string' }, windows: { type: 'array', items: { type: 'number' }, description: '默认 [10,20,30,60]' }, rebalanceDays: { type: 'array', items: { type: 'number' }, description: '默认 [5,10,20]' }, limit: { type: 'number' } }, required: ['ticker'], additionalProperties: false },
-    async execute(args) {
-      const envelope = await wb.call('series', { ticker: String(args.ticker), period: '1d', limit: Number(args.limit || 500) })
-      if (!envelope?.ok) return { text: JSON.stringify(envelope?.error ?? {}, null, 1), isError: true }
-      const result = paramSweep(envelope.value.bars, { windows: args.windows ?? [10, 20, 30, 60], rebalanceDays: args.rebalanceDays ?? [5, 10, 20] })
-      return { text: JSON.stringify(result, null, 1) }
-    },
-  },
-  {
-    name: 'strategy_run',
-    description: '[ecosystem] 运行 PDAT→PAAT→PCPT→PRT→PET 研究流水线，产出调仓建议提案（不下单；执行走工作台受约束入口）。',
-    inputSchema: { type: 'object', properties: { universe: { type: 'array', items: { type: 'string' }, description: '缺省用自选池前 8 只' }, topN: { type: 'number', description: '多头候选数，默认 2' }, window: { type: 'number', description: '动量窗口，默认 20' } }, additionalProperties: false },
-    async execute(args) {
-      const run = await strategy.run({ universe: args.universe, topN: Number(args.topN || 2), window: Number(args.window || 20) })
-      return { text: JSON.stringify(run, null, 1) }
-    },
-  },
-]
 
 const WB_TOOL_NAMES = new Set([
   'snapshot', 'switch_mode', 'series', 'equity', 'positions', 'correlation', 'sensitivity', 'risk', 'trades', 'events',
@@ -79,10 +54,18 @@ const WB_TOOL_NAMES = new Set([
   'admin_cancel_run', 'admin_cancel_stale', 'admin_prune_runs',
 ])
 
+const localTools = createLocalTools({
+  wbCall: (tool, args, options) => wb.call(tool, args, options),
+  portfolio,
+  akshare,
+  strategy,
+  config,
+})
+
 const mcp = createMcpServer({
   wbCall: (tool, args, options) => wb.call(tool, args, options),
   wbToolNames: WB_TOOL_NAMES,
-  localTools: strategyLocalTools,
+  localTools,
   log: (message) => console.log(`[mcp] ${message}`),
   onToolCall: ({ name, ok, ms }) => {
     metrics.tool(name, ok, ms)
@@ -271,6 +254,60 @@ app.get('/api/v3/metrics', async () => {
     oms: oms.statusCounts(),
     sdk: sdkChannel.status(),
   }
+})
+
+app.get('/api/v3/risk/analytics', async ({ query }) => {
+  const limit = Math.min(Math.max(Number(query.limit || 250), 60), 2000)
+  const confidence = Number(query.confidence || 0.95)
+  const benchmarkTicker = query.benchmark || config.data.benchmark
+  let explicit = null
+  if (query.weights) {
+    try {
+      explicit = JSON.parse(query.weights)
+    } catch {
+      return { ok: false, error: { code: 'bad-request', message: 'weights 需为 JSON 对象' } }
+    }
+  }
+  const resolved = await portfolio.resolve({ weights: explicit })
+  if (!resolved.weights) return { ok: false, error: { code: 'risk/no-portfolio', message: resolved.source } }
+  const tickers = Object.keys(resolved.weights)
+  if (tickers.length === 1) {
+    return { ok: false, error: { code: 'risk/single-name', message: `组合仅 1 个标的（${resolved.source}），单标的组合风险量无横截面意义` } }
+  }
+  const [seriesMap, bench, navInfo] = await Promise.all([
+    portfolio.loadSeriesMap(tickers, limit),
+    portfolio.benchmark(benchmarkTicker, limit),
+    portfolio.nav(),
+  ])
+  const analytics = portfolioRisk({
+    seriesByTicker: seriesMap,
+    benchmarkBars: bench.ok ? bench.bars : null,
+    weights: resolved.weights,
+    confidence,
+    nav: navInfo.nav,
+  })
+  if (analytics.error) return { ok: false, error: { code: 'risk/insufficient', message: analytics.error } }
+  return {
+    ok: true,
+    portfolioSource: resolved.source,
+    benchmarkTicker: bench.ok ? bench.ticker : null,
+    nav: navInfo.nav,
+    analytics,
+    sources: { kline: 'futu/quote_history_kline', nav: navInfo.source },
+  }
+})
+
+app.get('/api/v3/news', async ({ query }) => {
+  const symbol = String(query.symbol || '600519').replace(/^(SH|SZ|HK|US)\./i, '')
+  const limit = Math.min(Math.max(Number(query.limit || 10), 1), 50)
+  const result = await akshare.news(symbol, limit)
+  return result.ok ? { ok: true, ...result } : { ok: false, error: result.error }
+})
+
+app.get('/api/v3/spot', async ({ query }) => {
+  const limit = Math.min(Math.max(Number(query.limit || 20), 1), 100)
+  const result = await akshare.spot(limit)
+  return result.ok ? { ok: true, ...result } : { ok: false, error: result.error }
 })
 
 app.get('/api/v3/oms/orders', async () => ({ ok: true, ...(await oms.view()) }))

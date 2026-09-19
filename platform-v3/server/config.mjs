@@ -89,6 +89,12 @@ export function loadConfig(env = process.env, home = env.DSH_HOME || path.join(o
       watchlist: Array.isArray(legacy.watchlist) ? legacy.watchlist : [],
       autoPipeline: legacy.auto_pipeline || null,
     },
+    // 数据面：akshare 走既有 trading-venv（公开免密钥端点），基准指数用于 Beta/Alpha/IR
+    data: {
+      pythonBin: env.QUANT_PYTHON || path.join(configHome, 'trading-venv', 'bin', 'python'),
+      akshareTimeoutMs: Number(env.QUANT_AKSHARE_TIMEOUT_MS || 120000),
+      benchmark: env.QUANT_BENCHMARK || 'SH.000300',
+    },
     dataDir: env.QUANT_V3_DATA || path.join(process.cwd(), 'data'),
     webDir: path.resolve(path.dirname(decodeURIComponent(new URL(import.meta.url).pathname)), '../web'),
   }

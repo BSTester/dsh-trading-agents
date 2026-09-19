@@ -66,18 +66,34 @@ curl -s localhost:8407/api/v3/gateway | jq .channels.sdk.lastTurn
 （`heldDays` / `flatDays` / `winRatePct` / `signalFlips`），空仓日不计入胜率。
 局限：等权、无滑点与佣金建模，属于轻量自研引擎，与 workbench 的因子回测互补。
 
+## 数据面（补齐规格 §FR-DATA-002 与 risk 域）
+
+- **组合风险量**（`server/data/risk-analytics.mjs`）：历史模拟法 **VaR / CVaR**（非参数）、
+  **Beta / Alpha / IR**（对基准指数回归）、组合最大回撤、**Kupiec POF 检验**（LR + 卡方(1) p 值）。
+  计算链：workbench `series` 真实日 K → 按交易日对齐 → 组合加权日收益 → 指标；有 NAV 时同时给出金额。
+  组合定义解析顺序：**请求显式权重 → 工作台 frozen 计划目标（≥2 只）→ 自选池等权**，来源随结果返回。
+  口径与局限随结果标注（未计交易成本、除分红送转外的公司行为）。
+- **AKShare 数据源**（`server/data/akshare.mjs` + `akshare_bridge.py`）：走既有 `trading-venv` 的
+  akshare（公开免密钥端点），当前提供 **A 股个股新闻**（标题/摘要/来源/时间/链接 + `as_of`）。
+  实测说明：全市场快照接口 `stock_zh_a_spot_em` 在本机网络下被上游断连（`RemoteDisconnected`），
+  因此快照类数据继续由工作台提供（富途），AKShare 承担新闻/另类数据。
+- **PIT 标注**：所有新增数据面返回都带 `as_of` 与 `source`，组合序列按交易日严格对齐后才计算。
+
 ## API（节选）
 
 `GET /healthz`、`GET /api/v3/overview|brain|market|strategy|risk|execution|gateway|tools|settings`、
 `POST /api/v3/strategy/run`、`GET /api/v3/strategy/last`、`POST /api/v3/ml/backtest`、
 `POST /api/v3/ml/param_sweep`、`POST /api/v3/headless/run`、`POST /api/v3/risk/check`、
-`GET /api/v3/sdk`、`POST /api/v3/sdk/start`、`POST /api/v3/sdk/prompt`、`POST /api/v3/mcp`。
+`GET /api/v3/sdk`、`POST /api/v3/sdk/start`、`POST /api/v3/sdk/prompt`、`POST /api/v3/mcp`、
+`GET /api/v3/risk/analytics`（VaR/CVaR/Beta/Alpha/IR/Kupiec）、`GET /api/v3/news`（AKShare A 股新闻）、
+`GET /api/v3/spot`（AKShare 快照，上游不可达时如实报错）。
 
 MCP 工具面：`list_tools` / `call_tool`（六域发现代理，覆盖既有 77 工具）+ 一级工具
 `query_quote`、`market_snapshot`、`query_order_book`、`query_capital_flow`、`query_financial`、`stock_screen`、
 `eval_factor_ic`、`list_factors`、`factor_sensitivity`、`sentiment_history`、`calc_indicator`、`check_risk`、
 `query_position`、`account_funds`、`orders_open`、`deals_today`、`request_approval`、`audit_trail`、
-`research_tasks_claim` + 本地计算工具 `run_backtest`、`param_sweep`、`strategy_run`。
+`research_tasks_claim` + 本地计算工具 `run_backtest`、`param_sweep`、`strategy_run`、`calc_var`、`search_news`
+（实测工具面 26 个）。
 
 ## 监控与审计（§8.3 / §4.2）
 
