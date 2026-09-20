@@ -723,8 +723,8 @@ export default function MarketPage() {
   });
   if (mt) {
     healthCards.push({
-      key: "dsh-quant-data-mcp",
-      name: "dsh-quant-data-mcp（workbench 工具面）",
+      key: "workbench-toolface",
+      name: "平台工作台工具面（本平台自建；未接入 dsh-quant-data-mcp）",
       statusText: mt.workbenchUp ? "在线" : "不可达",
       status: mt.workbenchUp ? "success" : "error",
       detail: `MCP 工具域 · ${fmt.dash(mt.toolDomains)} 域 · ${fmt.dash(mt.toolTotal)} 个工具 · 今日调用 ${

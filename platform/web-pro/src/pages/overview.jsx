@@ -533,7 +533,7 @@ export default function OverviewPage() {
       }));
   if (mt) {
     healthRows.push({
-      name: "dsh-quant-data-mcp（workbench 工具面）",
+      name: "平台工作台工具面（本平台自建；未接入 dsh-quant-data-mcp）",
       ok: Boolean(mt.workbenchUp),
       detail: `MCP 工具域 · ${fmt.dash(mt.toolDomains)} 域 · ${fmt.dash(mt.toolTotal)} 个工具 · 今日调用 ${mcpCalls} 次 · 失败 ${mcpErrors} 次 · 平均 ${fmt.dash(
         mt.mcp && mt.mcp.avgMs,

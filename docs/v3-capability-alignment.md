@@ -1,7 +1,11 @@
 # V3.0 能力对齐审计（「其他能力都对齐了吗？」）
 
+> 🧭 **先读哪里**：**第二轮核对**（本文件 §「第二轮核对（基于 `docs/v3-spec.md` 原文）」，紧随本块之后）
+> 是**当前口径**；其下的 §一~§八 是**第一轮（快照 `8b75fcc`）归档**，仅用于对照。
+> 规格原文已落库为 **`docs/v3-spec.md`**（942 行，逐字提取，自检 `grep -c '^#### FR-' = 21` ✅）。
+
 > 审计对象：`量化交易决策平台需求规格说明书与系统详细设计文档` **V3.0**（2026-09-19），
-> 全文见会话记录（用户消息，31,324 字符）。**以规格条目为唯一尺子**。
+> 全文见会话记录（用户消息，31,324 字符）→ 已落库 `docs/v3-spec.md`。**以规格条目为唯一尺子**。
 >
 > **审计快照**：`git rev-parse --short HEAD` = **8b75fcc**；工作区同时有并行 agent 的未提交改动
 > （`platform/server/{app,mcp_tools,v3_ops}.py` 已改，`v3_nlp.py` / `v3_risk_gate.py` / `v3_mcp.py`
@@ -14,7 +18,178 @@
 
 ---
 
-## 一、汇总表
+## 第二轮核对（基于 `docs/v3-spec.md` 原文）
+
+> **本节是第二轮结论；凡与下文 §一~§八 冲突，一律以本节为准。**
+>
+> **规格原文已落库**：`docs/v3-spec.md`（942 行 / 48,933 B），来源标注在文件头 3 行元信息里 ——
+> `/home/penn/.dsh/sessions/--home-penn-workspace-dsh-trading-agents--/session-adcad99b-79f9-43df-a6a1-2e3586121b63/session.v3.jsonl.zstd`
+> 第 1135 行 `user/message`（`seq=1133`）逐字提取，未改写。自检：`grep -c '^#### FR-' docs/v3-spec.md` = **21** ✅；
+> §4.1~4.4 / §5.1 / §5.2 / §6 / §8.2 / §8.3 / §10 / 附录 A / B / C **全部在位** ✅；表格 88 行、代码块 42 个（未压成散文）。
+> 同会话另有两份副本（第 484 行 `seq=482`、第 6769 行 `seq=6767`），正文**逐字符一致**，仅前置用户口语不同；
+> 全量 356 份 session 日志里**没有** V1/V2 或其它标称版本的规格原文（`zstdgrep -c 文档版本` 命中的 5 个会话中，出现的全部是 `文档版本**：V3.0`）
+> —— 因此「标称 V3.0 唯一一份」= 标题下三行元信息 `**文档版本**：V3.0` / `**编制日期**：2026-09-19` / `**文档状态**：正式发布`。
+>
+> **第二轮快照**：`git rev-parse --short HEAD` = **48cd3d7**（第一轮 = `8b75fcc`；工作区仅新增未跟踪的 `docs/v3-spec.md`）。
+> 运行中的 8397 进程 `quantwb_process_uptime_seconds` = **4338 s**（约 21:25 前 **72 分钟**重启过）
+> → **第一轮「运行进程早于工作区改动」的前提已失效，本轮所有实测都是重启后的新进程**。
+>
+> **只读纪律**（与第一轮同）：全程只 `GET`，加一次只读 MCP 握手（`initialize` + `tools/list`，不调用任何工具）。
+> **未调用** `trade_*` / `sim_trade_*` / `plan-execute` / `confirm-decide` / `switch-mode`；未重启服务；未改 `platform/**`（本轮只写文档）。
+> 探测窗口：**2026-09-20 21:21–21:31 +08:00**。
+>
+> **本轮搜索证据口径**：凡「未实现」都附「搜了什么 + 命中数」，不猜。
+
+### 2.1 修正后的汇总计数
+
+| 状态 | 第一轮 | **第二轮** | 变化 |
+|---|---|---|---|
+| ✅ 对齐 | 5 | **3** | −2 |
+| 🟡 部分对齐 | 21 | **25** | +4 |
+| ❌ 缺失 | 2 | **1** | −1 |
+| ⚪ 不适用 | 2 | **1** | −1 |
+| ❓ 未验证 | 1 | **1** | 0 |
+| **合计** | 31 | **31** | — |
+
+- 对齐 + 部分对齐 = **28/29 = 96.6%**（第一轮 26/28 = 92.9%）。分母变化来自「不适用」由 2 降到 1。
+- 唯一完全缺失：**`FR-GATEWAY-002`**（SDK JSON-RPC 会话通道）。
+- 唯一不适用：`DES-5.1`（K8s/Kafka/Redis/PG → 单容器 SQLite，**用户显式授权**）。
+- 唯一未验证：`NFR-PERF §4.1`。
+- 净变化说明：**涨的 2 条（`FR-TOOLS-002`、`FR-GATEWAY-001`）不是「做好了」，是第一轮口径判错**；
+  **跌的 4 条（`FR-TOOLS-001`、`FR-EXEC-003`、`FR-GATEWAY-005`→未跌、`FR-GATEWAY-001` 由不适用转部分）里没有一条是能力退步**，全部是「第一轮判浅 / 判宽」。
+
+### 2.2 状态变化清单（第一轮 → 第二轮，含推翻理由）
+
+| 编号 | 第一轮 | **第二轮** | 推翻理由（新证据） |
+|---|---|---|---|
+| **FR-GATEWAY-001** | ⚪ 不适用（用户豁免 adapter） | 🟡 **部分** | 用户豁免的是 **adapter 这个实现载体**，不是这条需求的三个功能子项。子项①inbound 连通 ✅；②命名契约 `mcp:<serverId>:<toolName>` ❌（Harness 侧实际是 `mcp__quantwb__<toolName>`，见 §2.3）；③**outbound 反向暴露（`ctx.tools.schemas()` → `McpServer` → `serveStdio`，命名 `dsh:<toolName>`）在整台机器上 0 实现**：`grep -rl "serveStdio\|McpServer\|createMcpServer" ~/.dsh/profiles/node_modules/@deepseek-ai/ ~/.dsh/profiles/web/node_modules/@bstester/` → **0 命中**；`@helibeiqi` 未安装；`dsh-harness-mcp-server` 未安装。第一轮把「载体被豁免」当成了「整条不适用」，漏掉了 outbound 这个真缺口。 |
+| **FR-TOOLS-001** | ✅ 对齐 | 🟡 **部分** | 第一轮只核了「6 个域齐不齐」，没核规格表里的 **MCP 方法名**。规格逐条给了 13 个 `mcp:<域>:<工具>` 方法名（`mcp:quant_data:query_quote` …），实测 MCP `tools/list` 的 116 条里**逐字命中 0 条**：名字是裸 `series` / `rt_quote` / `capital_flow` … + `v3_*` 桥接前缀（`mcp__quantwb__` 命名空间由客户端加，不由服务端给）。域覆盖 6/6 ✅，但方法名契约 0/13。 |
+| **FR-TOOLS-002** | ❌ 缺失 | 🟡 **部分** | 第一轮的证据是 `grep -n "isConcurrencySafe\|render\|annotations\|readOnlyHint" platform/server/mcp_tools.py` **0 命中** —— **找错了文件**：`annotations` 在 `platform/server/v3_mcp.py:646-648`（`readOnlyHint` / `destructiveHint` / `idempotentHint` 三件套，覆盖 39 条桥接工具；实测 `tools/list` 里 **39/116 条带 annotations**）。且工具描述确为模型视角的契约文本（`platform/server/mcp_tools.py:265` `ToolDefinition`，`v3_mcp.py` 逐路由 `PARAM_DOCS`）。五条子规范仍 **4 条未达**（等长 null 对齐 / `render` 分离 / 全量 `isConcurrencySafe` / `skill/quant-research` 层），故只能到「部分」。 |
+| **FR-EXEC-003** | ✅ 对齐 | 🟡 **部分** | 第一轮实测了 VaR/CVaR/Beta/Alpha/IR/Kupiec/最大回撤（确实全在，本轮复现），但把规格的**事中/事后另外三项**用一句「未见实现」并入了说明，**没有降级状态**。逐项查：**杠杆率**（`grep -rni "leverage\|杠杆" platform/server` → 5 命中，全部是窝轮 `leverage_direction`/`leverage_multiple` **请求参数**，无组合杠杆读数）；**流动性风险**（`grep -rni "liquidity\|流动性" platform/server` → **0 命中**）；**绩效归因**（`grep -rni "attribution\|performance_attribution\|归因分析" platform/server` → **0 命中**；`归因` 的 27 处是「成交按市场归因」，不是归因分析）。三项 0 实现 → 不能算对齐。 |
+| **FR-GATEWAY-005** | ✅ 对齐 | ✅ 对齐（不变） | 复查后**维持对齐**：规格正文的硬要求（专属 Profile + `package.json` manifest + `cordis.patch.yml` + `dsh-base`+`dsh-headless` 组合）全部满足且实测跑通；规格里那份 `bundles` 是 **yaml 代码块示例**，其中 adapter 一项**用户显式豁免**、`dsh-quant-data-mcp` 一项与 `FR-DATA-002` 同源（不重复扣分）。差异如实列出但不改状态。 |
+
+**证据级更正、状态不变（2 条）**
+
+| 编号 | 状态 | 第一轮结论 → 第二轮结论 |
+|---|---|---|
+| **FR-STRAT-003** | 🟡 部分（不变） | 第一轮：「**运行进程未挂载**：实测 `GET /api/v3/sentiment` 返回 SPA 兜底 HTML → 该能力**当前不可用**」。第二轮**推翻**：实测 `GET /api/v3/sentiment?symbol=600519&days=7` → `HTTP 200 application/json`，`{"ok":true,"source":"akshare/stock_news_em","as_of":"2026-09-20T13:26:00Z","score":-0.105574,"documents":7,"scored":4,"coverage":0.571429,"top_terms":[{"term":"被执行","polarity":-0.7,"count":3},…]}`。**能力已在线**。仍判部分的真实原因变成：①「事件识别」无独立实现（0 命中）；②**情绪分未进因子矩阵、未进策略流水线**（`grep -rn "sentiment" platform/server/v3_analytics.py platform/server/v3_ml.py` → **0 命中**，唯一命中在 `v3_ops.py:239` 的域名正则）。 |
+| **FR-EXEC-002** | 🟡 部分（不变） | 第一轮：「**运行进程仍是 `no-data`** … 行业红线**不下闸** → 工作区已接、待重启生效」。第二轮**推翻**：重启后实测 `GET /api/v3/oms/orders` → `"industry_source":"cache/futu/info_owner_plate"`、`"industry_pct":50.0`、`"industry_top":"半导体"`、`"industry_as_of":"2026-09-20T13:01:39Z"`，且 `industry_markets` 三市场全部 `breach:true`（SH 37.5% / HK 40.0% / US 50.0%，阈值 20%），来源文件 `~/.dsh/v3-risk-probe.json`（21:01 写入）。闸门调用点 `platform/server/v3_ops.py:1077`（`industry_context`）+ `:1113`（`check_order` 收到 `context["industry_pct"]`）**在线生效**。仍判部分的原因收窄为：live 写**未做真实下单验证**（本轮禁写），且运行台账里 `stages={"manual":10}` 无 `blocked_industry` 实例。 |
+
+### 2.3 逐条复核表（31 条 · 规格原文为唯一尺子）
+
+> 读法：`规格原句` 是 `docs/v3-spec.md` 的**直接摘录**（行号给出），`file:line` 是本轮 `48cd3d7` 快照的工作区行号。
+> 实测证据一律带 `source` / `as_of` 或探测时刻；`未实现` 一律附搜索命令与命中数。
+
+#### A. Harness 集成网关（规格 §3.1）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **FR-GATEWAY-001** | 「应部署 `@helibeiqi/dsh-cordis-universal-adapter`…命名 `mcp:<serverId>:<toolName>`…**Outbound 方向**：通过 `ctx.tools.schemas()` 枚举已注册工具，注册到 `McpServer`，经 `serveStdio`（或 HTTP）暴露…命名 `dsh:<toolName>`」（spec:116-124） | 🟡 **部分** | inbound：`platform/install/quant-headless/cordis.patch.yml:156-166`（insert `@deepseek-ai/dsh-mcp-client`，`serverName: quantwb`，`url: http://127.0.0.1:8397/mcp`）；`~/.dsh/profiles/headless/cordis.patch.yml:24-31`；`~/.dsh/.agent-presets/dsh-trading-agents/agent.cordis.yml:182-194`（`disabled: false`）。**outbound：无（0 命中）** | 实测 `GET /api/v3/gateway`（21:25）→ `channels.mcp={"status":"running","protocol":"MCP streamable-http（/mcp，SDK 2.2.0 的 streamable_http_app）","tools":116,"tools_total":116,"tools_domain_catalog":82,"tools_bridge":39}`。MCP 握手 `tools/list` → 116 条。**Harness 侧工具名 = `mcp__quantwb__<toolName>`（配置级推断 + 文档旁证，非直接握手观测）**：命名模板出处 `~/.dsh/profiles/node_modules/@deepseek-ai/dsh-mcp-client/lib/index.js` 的 `` `mcp__${serverName}__${rawName}` ``（serverName 由配置给，**不**由服务端给），而 `serverName: quantwb` 写在 `~/.dsh/.agent-presets/dsh-trading-agents/agent.cordis.yml:186`（安装版 `disabled: false`；**注意**：仓库工作区同名文件 `agent.cordis.yml:184` 是 `disabled: true`，两者不一致）。旁证：`platform/install/quant-headless/README.md:156` 记录真跑一次 `dsh --profile quant-headless` 时「模型列出 9 个本地工具 + **77 个 MCP 工具**」；`scripts/research_duty.sh:53,56` 与预设 persona/SKILL 文本均逐字写 `mcp__quantwb__research_tasks_claim` / `mcp__quantwb__research_tasks_report`。**「当前 web 会话是否真的挂载了该行」= 无法验证**：父会话日志（`session-adcad99b…`）里 **没有任何** `tool/call` 的 name 是 `mcp__quantwb__*`（14 次 `tool/call` 全是 bash/edit/subagent），本 subagent（子代理）会话的工具面里也没有这些工具；即无法把「配置已启用」升级为「运行时已挂载」。**outbound 搜索**：`grep -rl "serveStdio\|McpServer\|createMcpServer" ~/.dsh/profiles/node_modules/@deepseek-ai/ ~/.dsh/profiles/web/node_modules/@bstester/` → **0**；`grep -rn "serveStdio\|McpServer" plugins/ platform/js` → **0**；`ls ~/.dsh/profiles/node_modules/@helibeiqi` → No such file；`dsh-harness-mcp-server` 未安装 | **⚪不适用 → 🟡部分（推翻）**；outbound 是新发现的真缺口（§三 G2） |
+| **FR-GATEWAY-002** | 「应部署 `@deepseek-ai/dsh-sdk-jsonrpc-server`…为每个 sessionId 打开一个会话、把用户提示词排入队列，并把每个会话事件与 Agent 状态转换流式发回平台」（spec:133）；「平台后端可使用 `deepseek-harness-sdk`（Python）…`DeepSeekHarness`」（spec:139-153） | ❌ **缺失** | `platform/server/v3_ops.py:130`（`SDK_REASON`）、`:135`（`SDK_PROTOCOL`）、`:1877` / `:1915` / `:2090` / `:2098`（四处硬编码 unavailable）。**新事实**：`~/.dsh/profiles/sdk/package.json:5-10` bundles=`["@deepseek-ai/dsh-base","@deepseek-ai/dsh-sdk-app"]`，但 `~/.dsh/profiles/sdk/cordis.patch.yml` = `[]`（空） | ①`/home/penn/.dsh/trading-venv/bin/python -c "import deepseek_harness"` → `ModuleNotFoundError: No module named 'deepseek_harness'`；②`pip list \| grep -i "harness\|sdk\|jsonrpc"` → 空；③实测 `GET /api/v3/gateway` → `channels.sdk={"status":"unavailable","reason":"本服务未挂载 SDK JSON-RPC 通道","protocol":"换行分帧 JSON-RPC / stdio（未挂载）"}`；④`grep -rn "jsonrpc\|session/prompt\|DeepSeekHarness" platform/server` → 仅 3 处常量文案；⑤**包已就位**：`~/.dsh/profiles/node_modules/@deepseek-ai/` 下有 `dsh-sdk-jsonrpc-server`、`dsh-sdk-app`、`dsh-sdk-minimal`、`dsh-sdk-protocol` | 与第一轮**同判**（缺失）；但**缺口显著变小**：三个官方包已安装、`sdk` profile 骨架已建，只差 1 行 patch + 装 Python SDK + 写客户端（第一轮估 3–5 人日偏大） |
+| **FR-GATEWAY-003** | 「应实现 Headless Runner，由平台调度器调用 `dsh --profile headless`…**通道契约**：stdout：最后一次非空 assistant 文本…stderr：成功时为空；失败时输出…exit 0 / exit 1 / exit 130」（spec:158-172） | 🟡 **部分** | 平台服务内 **0 实现**：`platform/server/v3_ops.py:131-132`；`grep -rn "subprocess" platform/server/*.py` → `compute.py:34,149`（跑 python 计算脚本）与 `v3_report.py:15,295`（PDF 导出），**无 headless**。外置承担：`scripts/research_duty.sh:74`（`runner=("$dsh_bin" --profile "$profile" "$prompt")`）、`:82`（`"${runner[@]}" 2>&1 \| tee "$log"`）、`:83`（`status="${PIPESTATUS[0]}"`）、`:86-91`（退出码分流） | 实测 `GET /api/v3/gateway` → `channels.headless={"status":"unavailable","reason":"本服务未挂载 Headless CLI 子通道（无 dsh --profile headless 子进程调度）"}`；`systemctl --user list-timers` → `research-duty.timer` NEXT `Mon 2026-09-21 19:20:00`（active，LAST 2026-09-18 20:02）；`platform/install/quant-headless/README.md:121,155-156` 记录真跑退出码 0 | 与第一轮一致；**加深**：`:82` 的 `2>&1 \| tee` 把 **stdout 与 stderr 合并**，规格要求的二者分离契约**未实现**；退出码 130 只是被 `:89-90` 当普通非零码透传，无独立优雅关闭语义 |
+| **FR-GATEWAY-004** | 「**定时触发**：开盘前扫描（08:30）、午间复盘（12:00）、收盘后分析（16:00）。**事件触发**：突发新闻、持仓异动、风控阈值突破、因子信号反转。**流水线节点触发**：调仓前决策确认、策略参数变更审核…**外部熔断保护**…超时、并发限制和费用预算」（spec:180-186）；「并发上限（默认 3 个并行）…token 预算（默认 200K）」（spec:555） | 🟡 **部分** | 现有定时链（**非 headless**）：`plugins/core/python/trading_core/daemon.py:69-105`；服务内调度器 `platform/server/scheduler.py:83`（`build_tick` → `daemon.tick` 包装，无 headless）。唯一 headless 唤醒：`install/research-duty.timer`（`OnCalendar=Mon..Fri 19:20`）+ `scripts/research_duty.sh:17`（`DSH_DUTY_TIMEOUT=1800`）、`:75-76`（`timeout`） | 逐项：08:30 开盘前扫描 **❌**（`grep -rn "08:30" platform plugins scripts install` → 仅 `platform/install/README.md:107`、`quant-v3-probe.timer:11` 的**探针**说明）；12:00 午间复盘 **❌**（12:00 命中全在交易时段/日历语义：`v3_market_calendar.py:85-86`、`plugins/core/python/trading_core/sessions.py`）；16:00 收盘后 headless **❌**（`daemon.py:69-70` 的 16:00 是 `sync_bars`/`sync_fundamentals` **数据同步**，不是大脑唤醒）；事件触发 **❌**（`grep -rni "event_driven\|事件驱动" platform/server plugins` → 0）；流水线节点触发 **❌**；并发上限 3 **❌**；token/费用预算 200K **❌**；超时 ✅（1800 s，仅外置脚本）。实测 `GET /api/v3/gateway` → `scheduler.rules=[]`、`headless={"today":{"total":0,…},"breaker":null,"last":[],"status":"unavailable"}` | 与第一轮一致；**新增排除**：规格点名的 16:00 在 `daemon.py` 里是数据作业，第一轮把它算作「已有时点」，本轮确认**不是** headless 触发 |
+| **FR-GATEWAY-005** | 「应创建专属 Profile…Headless 模式使用 `dsh-base` + `dsh-headless` 组合…Profile 目录包含 `package.json`（…`dsh.profile` manifest）以及 `cordis.patch.yml`（用户 patch 层）」（spec:210-212）；示例 bundles（spec:217-224） | ✅ **对齐** | `platform/install/quant-headless/package.json:7-10`（**实际 bundles = `["@deepseek-ai/dsh-base","@deepseek-ai/dsh-headless"]`**，`patchReload:"startup"`）；`platform/install/quant-headless/cordis.yml:1`（空根，表明树由 patch 合成）；`platform/install/quant-headless/cordis.patch.yml:39`（`system-prompt` personaPrefix）/`:101-138`（16 行 disabled 白名单）/`:156-166`（唯一 insert 行）；`platform/install/quant-headless/pnpm-workspace.yaml`。线上：`~/.dsh/profiles/headless/package.json:5-11` + `~/.dsh/profiles/headless/cordis.patch.yml:24-31` | `platform/install/quant-headless/README.md:155-157`：临时 `DSH_HOME` 真跑 `dsh --profile quant-headless --dump-config` → **退出码 0 / 88 行**；`personaPrefix` 已是量化分析师文本；16 行 `disabled`；`quant-platform-mcp` 已 insert；`ls ~/.dsh/profiles/node_modules \| wc -l` = **279**、**无 `@helibeiqi`**、mtime 未变 | 与第一轮**同判**（对齐）。**差异逐项列全**：规格示例 4 条 bundles → 实际 **2 条**；缺 `dsh-cordis-universal-adapter`（**用户显式豁免**，且 `ls ~/.dsh/profiles/node_modules/@helibeiqi` → No such file）与 `dsh-quant-data-mcp`（未接，与 `FR-DATA-002` 同源）。spec:210 说 `dsh-base` 有 **78 个 entry**，`cordis.patch.yml:6` 自述现为 **87 行**（版本漂移，非缺口） |
+
+#### B. 平台量化工具域（规格 §3.2）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **FR-TOOLS-001** | 「应实现一个 MCP 服务器，暴露以下六大域的量化工具。参考 dsh-quant 的 59 工具·6 域架构：data / alpha / ML / risk / execution / ecosystem」（spec:233），表列 13 个代表工具与 `mcp:quant_data:query_quote` 等**方法名**（spec:235-249） | 🟡 **部分** | `platform/server/v3_ops.py:86`（`DOMAINS` 六域）、`:245`（`domain_of`）、`:93-104`（`V3_LOCAL_TOOLS` 5 个本地计算）、`:1939`（`GET /api/v3/tools`）；MCP 注册 `platform/server/mcp_tools.py`（77 直通）+ `platform/server/v3_mcp.py:630`（39 桥接） | 实测 `GET /api/v3/tools` → `{"ok":true,"total":82,"domains":{data:32,alpha:7,ml:2,risk:4,execution:18,ecosystem:19}}`；`/metrics` → `quantwb_build_info{version="3.0",tools="82",domains="6"} 1`、`quantwb_tools{scope="mcp"} 116`、`{scope="domain"} 82`；MCP `tools/list` 116 = 77 直通 + 39 `v3_*`。口径对账：`82 = 77 MCP 直通 + 5 V3 本地计算（v3_ops.py:93-104）`；**方法名逐字命中 0/13**（实得名为 `series` / `rt_quote` / `capital_flow` / `f10_detail` / `trade_place` … + `v3_*`） | **✅对齐 → 🟡部分（推翻）**：第一轮只数「域数一致（6）」就判对齐，漏核规格表里的方法名契约；工具面 116 ≫ 参考 59 |
+| **FR-TOOLS-002** | 「- **工具 schema 注入系统提示词**…- **等长 null 对齐**：输出与输入等长，头部窗口位置为 `null`…- **规范 JSON + render 分离**…- **全部 isConcurrencySafe**…- **Skill 层**：`skill/quant-research` 让模型自行加载工作流」（spec:255-259）；附录 A 给出 `output: { schema, render }`（spec:866-869） | 🟡 **部分** | 工具契约：`platform/server/mcp_tools.py:265`（`ToolDefinition`）、`:1299`（`BoundTool`）、`:513-545`（`trade_place` 全字段契约，模型视角中文描述）；注解：`platform/server/v3_mcp.py:56`（`NON_READONLY_PATHS`）、`:646`（`readOnlyHint`）、`:647`（`destructiveHint`）、`:648`（`idempotentHint`） | 逐条：①schema 注入 —— 工具描述确为模型视角契约文本 ✅（**但注入动作在 Harness 侧的工具注册通道，平台无系统提示词写入实现**，`grep -rn "system-prompt\|systemPrompt" platform/server` → 0）；②**等长 null 对齐** ❌（`grep -rn "等长\|按索引对齐" platform/server/*.py` → **0**）；③**`render` 分离** ❌（真实 MCP 握手 `tools/list` 的 116 条里 `outputSchema` **0 条**、含 `render` 键 **0 条**；`mcp_tools.py`/`v3_mcp.py` 里 `render` 命中全部是 `observability._render_*` Prometheus 函数）；④`isConcurrencySafe` ❌（`grep -rn "isConcurrencySafe" platform/` → **0**）—— 但 **MCP 官方注解三件套已有**：实测 39/116 条带 `annotations`，其中 `readOnlyHint=true` 36 条；⑤`skill/quant-research` ❌（`find skills -name SKILL.md` → 11 个：`quant-trading`/`research-institute`/`trading-agents`/`last30days-bridge`/`futu-skills`×7，**无 `quant-research`**） | **❌缺失 → 🟡部分（推翻）**：第一轮 grep 只扫 `mcp_tools.py`，漏了 `v3_mcp.py` 的 MCP 注解 —— 证据不成立。五条子规范实际 **1 条部分达成 + 4 条未达** |
+| **FR-TOOLS-003** | 「平台应向 Harness 暴露的 MCP 工具数量应控制在合理范围。参考 `dsh-quant-data-mcp` 的做法：提供 6 个 A 股数据工具…东方财富与腾讯数据源自动回退，所有数据源使用公开免密钥端点」（spec:263）；「平台应实现**工具发现代理**：MCP 服务器暴露一个 `list_tools` 入口和一个 `call_tool` 入口」（spec:265） | 🟡 **部分** | 域分组/过滤：`platform/server/v3_ops.py:1939`（`?domain=`）；桥接：`platform/server/v3_mcp.py:630`（把 39 条 `/api/v3/*` 路由镜像成 MCP 工具）、`platform/server/app.py:1032`（`v3_mcp.register(app.state.mcp, app)`） | 实测 MCP `tools/list`（21:27）= **116 条**，**无 `list_tools`、无 `call_tool`** 工具（`names` 里 `"list_tools" in names == False`、`"call_tool" in names == False`）。**上下文成本量化**：`tools/list` 响应 JSON = **79,624 字符 / 116 条 ≈ 686 字符/工具 ≈ 2 万 token**（按 4 字符≈1 token 粗估），一次性进入每次请求的 `tools` 参数 —— 与规格「避免上百个工具 schema 撑爆上下文窗口」正面冲突。`dsh-quant-data-mcp` 全仓库**非文档引用**：`platform/web-pro/src/pages/market.jsx:726-727`、`overview.jsx:536`（**仅作为卡片名称字面量**，见 §2.6 新发现 N1）；实现层 0 引用 | 与第一轮一致；**新增量化**：116 条 schema ≈ 2 万 token 的真实成本，以及「无 `list_tools`/`call_tool`」的握手级证据（第一轮未做握手） |
+
+#### C. 数据层（规格 §3.3）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **FR-DATA-001** | 「交易执行支持市价单、限价单、**条件单**、改单/撤单、订单查询、持仓查询」（spec:272） | 🟡 **部分** | **条件单（契约+闸门层）**：`platform/server/trading.py:257`（`PLACE_ORDER_TYPES = ("LIMIT","MARKET","AUCTION","AUCTION_LIMIT","STOP","STOP_LIMIT","MARKET_IF_TOUCHED","LIMIT_IF_TOUCHED")`）、`:261`（`AUX_PRICE_ORDER_TYPES = ("STOP","STOP_LIMIT","MARKET_IF_TOUCHED","LIMIT_IF_TOUCHED")`，规格要求触发价必填）、`:662`（枚举校验）、`:691-698`（aux_price 必填/互斥/3 位小数）、`:1595`（`trade.place_order(**kwargs)`）；工具面：`platform/server/mcp_tools.py:196-197`（`order_type` Literal 8 枚举）、`:519`（aux_price 必填说明）、`:637`（`order_type` 参数） | 测试 `tests/test_wp8_trading.py::test_place_order_official_constraints_rejected_locally`（`:377-378`：`{"order_type":"STOP_LIMIT"} → 需 aux_price`、`{"order_type":"MARKET_IF_TOUCHED"} → 需 aux_price`）、`::test_all_eight_order_types_and_four_sides`（`:327`）、`::test_aux_price_required_for_trigger_order_types`（`:1481`）、`::test_aux_price_mutually_exclusive_with_non_trigger_types`（`:1493`）、`::test_aux_price_format_is_official_three_decimals`（`:1498`）。**sim 通道边界**：`platform/server/trading.py:121`（`SIM_MAX_QTY_ORDER_TYPES={"LIMIT":1,"MARKET":3}`）、`:306`（`SIM_LIMIT_ONLY_FIELDS`）→ 模拟盘只支持限价/市价，触发类会被**如实拒绝**而非静默丢弃 | **第一轮「未见实现 / 未验证」→ 确定：条件单在契约与闸门层已实现**。第一轮的 `grep 条件单` 只搜中文词且只搜 `futu_data.py`，漏了 `trading.py:257` 的英文枚举。仍未验证的部分：**live 真实券商往返**（本轮禁写） |
+| **FR-DATA-002** | 表列 5 源：Tushare Pro / AKShare / OpenBB / SEC EDGAR / `dsh-quant-data-mcp`（spec:276-282）；「`dsh-quant-data-mcp` 是零依赖 MCP stdio server…只用 Node 内置模块，无需 API key…公开免密钥端点（东方财富/腾讯）」（spec:284） | 🟡 **部分（4/5）** | `platform/server/v3_sources.py:1398`（Tushare 走 HTTP `http://api.tushare.pro`）、`:1648/1657/1670/1692/1705`（news/spot/financials/tushare/openbb）；降级链 `platform/server/v3_fallback.py:1`；凭据 `platform/server/v3_credentials.py:27`（`TUSHARE_TOKEN`） | 第一轮逐源实测记录（news=akshare、financials=sec/companyconcept、openbb=equity.fundamental.metrics、tushare=no-token）本轮未复跑（避免重复外部调用），**`/api/v3/sources/status` 仍可读**。**`dsh-quant-data-mcp` 实现层 0 引用**：`grep -rn "dsh-quant-data-mcp" --include=* .`（排除 node_modules/.git）= **16 处，分布**：`docs/v3-spec.md` 8（规格原文）、`docs/v3-capability-alignment.md` 3（本文档）、`platform/web-pro/src/pages/market.jsx` 2 + `overview.jsx` 1（**仅卡片名称字面量**）、`platform/web-pro/dist/assets/index-*.js` 2（构建产物）。**`platform/server` / `plugins` / `install` 命中 0** | 与第一轮同判；**新增**：这个规格点名的包被**前端当成数据源名称展示**（新发现 N1），容易被误读为已接入 |
+| **FR-DATA-003** | 「系统应确保所有历史数据查询遵循 Point-in-Time 原则。平台侧的 **`data/cache.py` 作为唯一数据读取接口**，确保所有历史数据查询遵循 PIT 原则，防止前视偏差」（spec:288） | 🟡 **部分** | 规格点名的 `data/cache.py` **不存在**：`find . -name 'cache.py'` → 0；`ls platform/data/` → No such file。实际缓存层：`platform/server/caches.py:1`（391 行，TTL 两级 + 磁盘）。**PIT 约束分散在 4 处**：`platform/server/v3_analytics.py:978`（回测 `t` 日持仓只用 `≤ t-1` 收盘）、`:1045`（ML 特征只用 `≤ t`）、`platform/server/v3_ml.py:6-7` + `:222`（特征矩阵第 `i` 行只依赖 `closes[0..i]`）、`platform/server/v3_math.py:356-357`、`platform/server/trading.py:366`（基准价 PIT） | 测试：`platform/tests/test_v3_ml.py::PITTests`（含「打乱 `t` 之后数据」的反证）、`platform/tests/test_v3_analytics.py::test_pit_signal_uses_only_past_closes`（`:366`）、`::test_mutating_the_last_close_cannot_change_any_position`（`:388`）、`platform/tests/test_v3_ml.py::test_labels_are_forward_returns_not_contemporaneous` | 与第一轮同判。**缺口影响**：没有单一入口 → ①PIT 纪律**不可集中审计**（要读 5 个文件的注释才能拼出全貌）；②新增数据读取路径**不会自动继承** PIT 约束（`caches.py` 只是 TTL 缓存，不含任何 PIT 语义）；③规格点名的文件路径与实现不一致，验收时按字面找会「找不到」 |
+| **FR-DATA-004** | 「应实现数据源健康检查机制。当主数据源不可用时自动降级至备用数据源」（spec:292） | ✅ **对齐** | `platform/server/v3_fallback.py:1`（`run_chain`）、`:646` 附近（`GET /api/v3/sources/status`）；探针素材 `platform/install/quant-v3-probe.{service,timer}` | 测试 `platform/tests/test_v3_fallback.py`（含 `test_all_failed_returns_none_none_and_full_timeline`）；`docs/e2e-and-data-gaps.md` 记录 `/api/v3/spot` 全链失败体含 `chain=[{source:"akshare/stock_zh_a_spot_em",ok:false,ms:22443,attempts:[…]}]`（真实来源 + 真实耗时 + 逐次尝试，不返回占位） | 与第一轮一致（对齐） |
+
+#### D. 策略层（规格 §3.4）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **FR-STRAT-001** | 「应支持多因子选股框架，涵盖**价值、成长、动量、质量、情绪、另类六类因子**。参考 dsh-quant 的 **PDAT→PAAT→PCPT→PRT→PET 五阶段**研究流水线」（spec:299） | 🟡 **部分** | 五阶段：`platform/server/v3_analytics.py:789`（`run_pipeline`）、路由 `:1169`（`GET /api/v3/strategy`）、`platform/server/v3_ops.py:98-99`（`strategy_run` 工具）。因子：`plugins/workbench/python/factors.py:27`（`FACTOR_SIGN`）、`:61-85`（`factor_values`）→ `:84` 返回 8 个价量因子；估值：`plugins/workbench/python/factors.py:88`（`valuation_values`）。**成长/质量因子**：`plugins/workbench/python/quality.py:58-60`（`roe` / `roa`）、`:110`（`gross_margin`）、`:115-116`（`revenue_yoy` / `net_profit_yoy`）。情绪：`platform/server/v3_nlp.py:936`（`GET /api/v3/sentiment`） | **实测 `/api/v3/factors/matrix`（as_of 2026-09-18，source `workbench/factors(z)`）**：`factors = ['liq_ratio','mdd_60','mom_20','mom_60','pb','pb_pct','pe_ttm','pe_ttm_pct','peg','ps','ps_pct','rsi_14','trend','vol_20']`（**14 个**）。逐类映射：**价值** ✅ `pe_ttm/pe_ttm_pct/pb/pb_pct/ps/ps_pct/peg`（7）；**动量** ✅ `mom_20/mom_60/trend`（3）；**质量** ❌ 矩阵内 0（`roe`/`roa`/`gross_margin` 只在 `quality.py`，**未进矩阵、未进流水线**）；**成长** ❌ 矩阵内 0（`revenue_yoy`/`net_profit_yoy` 同上）；**情绪** ❌ 矩阵内 0（`grep -rn "sentiment" platform/server/v3_analytics.py platform/server/v3_ml.py` → **0**）；**另类** ❌ 矩阵内 0（`capital_flow*`/`short_interest`/`option_chain` 是**独立 MCP 工具**，不进因子面）。另有 `rsi_14`/`trend`（技术）、`vol_20`/`mdd_60`/`liq_ratio`（波动/流动性）。**五阶段实测**：`GET /api/v3/brain` → `decision.stages = {"PDAT":{"bars":240,"universe":["US.NVDA","US.MSTR"]},"PAAT":{"analyzed":2,"withFactors":2,"scoreSource":"workbench/factors(z)"},"PCPT":{"longs":[…]}, "PRT":{"capped":true,"weightPctPerName":2.0},"PET":{"proposals":2}}` ✅ 五阶段**真实存在且在线** | 与第一轮同判（部分）；**本轮给出逐类清单**：六类里 **2 类达标（价值/动量）、4 类未进因子面（成长/质量/情绪/另类）**。第一轮说「情绪类由 v3_nlp 补（工作区）」——**不成立**：v3_nlp 只出独立评分，不进矩阵/流水线 |
+| **FR-STRAT-002** | 「支持多因子选股策略、机器学习策略（Lasso/LightGBM/MLP）、**事件驱动策略**、**统计套利策略**。参数优化支持**数千次完整回测**和热力图可视化」（spec:303） | 🟡 **部分** | ML：`platform/server/v3_ml.py:50`（`FEATURE_NAMES`，全部由收盘价推出）、`platform/server/v3_analytics.py:1030` 附近（同口径评估）、`:1185`（`GET /api/v3/ml/sweep`）、`:1199`（`POST /api/v3/ml/backtest`）+ `:1099`（`GET /api/v3/ml/models`）；网格：`platform/server/v3_math.py:452`（`param_sweep`）；热力图：`platform/web-pro/src/components/charts.jsx:89`（`Heatmap`） | **事件驱动 0 实现**：`grep -rni "event_driven\|event-driven\|事件驱动" platform/server platform/web-pro/src plugins` → **0**。**统计套利 0 实现**：`grep -rni "统计套利\|cointegration\|协整\|stat_arb"` → **0**；`pairs` 27 处全部是 `(key,value)` 元组变量名（`v3_math.py:369` 等），无配对交易。**「数千次回测」实测量化**：`GET /api/v3/ml/sweep?ticker=SH.600519` → `grid` **12 格**（windows `[10,20,30,60]` × rebalance `[5,10,20]`），`best={"window":30,"rebalanceDays":20,"sharpe":0.236}`；代码上限 `platform/server/v3_analytics.py:940`（`_int_list(..., 8)` 两次）→ **上限 8×8 = 64 格/次**（`v3_math.py:452` 双层循环）。**与规格「数千次」差 1.5–2 个数量级** | 与第一轮同判；**新增硬数字**：网格上限 **64 格/次**（默认 12），第一轮只说「数千次不成立」没给上限 |
+| **FR-STRAT-003** | 「集成实时情绪评分、**事件识别**、多源情绪融合、**情绪因子构建**」（spec:307） | 🟡 **部分** | `platform/server/v3_nlp.py:688`（打分主函数）、`:903`（同步实现）、`:936`（`@app.get("/api/v3/sentiment")`）、`:924`（`register`）、`:983`（`app.state.v3_nlp`）；装配 `platform/server/app.py:921` | **能力已在线（推翻第一轮）**：`GET /api/v3/sentiment?symbol=600519&days=7` → `HTTP 200 application/json`，`{"ok":true,"symbol":"600519","as_of":"2026-09-20T13:26:00.071850+00:00","source":"akshare/stock_news_em","score":-0.105574,"documents":7,"scored":4,"coverage":0.571429,"positive":1,"negative":2,"neutral":1,"top_terms":[{"term":"被执行","polarity":-0.7,"count":3,"weight":-2.1},…]}`；MCP `tools/list` 里也已有 `v3_sentiment`。测试 `platform/tests/test_v3_nlp.py`（**56 例**，含 `test_route_is_registered`、`test_no_news_returns_null_score_not_zero`、`test_lexicon_covers_spec_mandated_terms`）。**仍缺**：①事件识别（无独立抽取/分类器，只有极性词表）；②**情绪因子未进因子矩阵/策略流水线**（0 命中） | 证据级推翻（状态仍部分）：第一轮「运行进程未挂载、返回 SPA HTML」**已失效**（服务重启后生效）。真实缺口收窄为「事件识别 + 因子化接入」 |
+
+#### E. 执行层（规格 §3.5）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **FR-EXEC-001** | 「基于富途 OpenAPI 构建 OMS，负责将策略信号转化为交易订单并管理全生命周期」（spec:314） | 🟡 **部分** | `platform/server/v3_ops.py:911`（`class OmsLedger`）、`:1103`（`_upsert`，风控分级 + 状态历史）、`:2016`（`GET /api/v3/oms/orders`）、`:1586` 附近（`POST /api/v3/oms/sync`）；落库 `platform/server/v3_db.py:119`（`TABLE_SPECS`，`oms_orders`/`oms_sync`） | 实测 `GET /api/v3/oms/orders`（21:2x）→ `{"ok":true,"nav":999809.29,"nav_source":"sim-ledger(equity.current)","drawdown_pct":0.0,"drawdown_source":"sim-ledger(max_drawdown)","stages":{"manual":10},"orders":[…],"confirmation":{"pending":null,"ttl_ms":120000}}`；`/metrics` → `quantwb_oms_orders{stage="manual"} 10`，其余阶段 0 | 与第一轮同判；live 写仍**未经真实下单验证**（`docs/P4-live-trading.md` 自述，本轮禁写） |
+| **FR-EXEC-002** | 「**自动执行**：预设风控阈值内的订单，平台直接调用富途交易接口；**人工确认**：超过阈值的订单，通过 Web/IM 通道请求人工审批；**强制阻断**：触发风控红线的订单，直接拒绝并记录」（spec:318-320） | 🟡 **部分** | `platform/server/v3_ops.py:107`（`LIMITS={"singlePct":2.0,"industryPct":20.0,"drawdownPct":15.0}`）、`:110`（`STAGES`）、`:494`（`check_order` 纯函数）、`:1037`（`industry_context` 封装）、`:1077`（取真实行业读数）、`:1113`（`check_order(...)` 传入 `context["industry_pct"]`）；行业读数 `platform/server/v3_risk_gate.py:338`（`industry_context`）；探针 `~/.dsh/v3-risk-probe.json` | **闸门已在线（推翻第一轮「no-data」）**：实测 `GET /api/v3/oms/orders` → `"industry_source":"cache/futu/info_owner_plate"`、`"industry_pct":50.0`、`"industry_top":"半导体"`、`"industry_as_of":"2026-09-20T13:01:39.096948+00:00"`、`"industry_missing":0`、`"industry_markets"` 三市场全 `breach:true`（SH 37.5% / HK 40.0% / US 50.0%，`limit_pct:20.0`）。`GET /api/v3/risk/industry?market=SH` → `as_of 2026-09-20T13:29:32Z`、`limitPct 20.0`、`breach true`、逐标的真实行业映射。测试 `platform/tests/test_v3_risk_gate.py`（**28 例**，含 `test_industry_red_line_beats_single_order_conclusion`、`test_industry_pct_equal_to_limit_is_not_blocked`）、`platform/tests/test_v3_ops.py::test_check_order_thresholds`（`:1223`） | 证据级推翻（状态仍部分）：第一轮「行业红线不下闸、待重启」**已失效**。仍部分：live 写未做真实下单验证 + 运行台账无 `blocked_industry` 实例 |
+| **FR-EXEC-003** | 「**事前风控**：订单合规校验（持仓限制、单笔上限、行业集中度）、**资金检查**。**事中风控**：实时监控策略回撤、**杠杆率**、**流动性风险**。**事后风控**：**绩效归因分析**、最大回撤统计、VaR 计算。参考 dsh-quant 的 risk 域提供 **VaR/CVaR/Beta/Alpha/IR + Kupiec 检验**」（spec:324） | 🟡 **部分** | ✅ 有：`platform/server/v3_ops.py:494`（事前：单笔 2% / 行业 20% / 回撤 15%）；`platform/server/v3_math.py:188`（`kupiec_pof`）、`:171`（`max_drawdown`）、`:228`（`portfolio_risk`：VaR/CVaR/Beta/Alpha/IR）；`platform/server/v3_analytics.py:447`（`risk_analytics`）、`:456-458`（字段清单）、`:1134`（`GET /api/v3/risk/analytics`）。❌ 无：杠杆率 / 流动性 / 绩效归因 / 资金检查 | ✅ 实测 `GET /api/v3/risk/analytics?limit=60` → `analytics={"confidence":0.95,"observations":59,"varDailyPct":1.458,"cvarDailyPct":1.648,"varAmount":14580.96,"cvarAmount":16477.91,"annVolPct":14.84,"annReturnPct":19.5,"maxDrawdownPct":-5.26,"beta":-0.081,"alphaAnnPct":16.58,"ir":2.059,"benchmarkAnnReturnPct":-35.85,"kupiec":{"lr":1.8035,"pValue":0.1793,"breaches":1,"observations":59,"pass":true}}`，`benchmark=SH.000300`、`benchmarkSource=futu/quote_history_kline`、窗口 `2026-06-29 → 2026-09-18`。测试 `platform/tests/test_v3_analytics.py::test_var_uses_the_historical_quantile_and_cvar_the_tail_mean`（`:303`）、`::test_beta_estimator_is_population_cov_over_sample_variance`（`:264`）、`::test_breaches_matching_the_expected_rate_pass`（`:219`）。❌ **杠杆率**：`grep -rni "leverage\|杠杆" platform/server` → 5 命中，**全部**是窝轮 `leverage_direction`/`leverage_multiple` **请求参数**（`mcp_tools.py:1006-1007`、`futu_data.py:1181-1182`、`app.py:242`），**无组合杠杆读数**。❌ **流动性风险**：`grep -rni "liquidity\|流动性" platform/server` → **0**。❌ **绩效归因**：`grep -rni "attribution\|performance_attribution\|归因分析" platform/server` → **0**（`归因` 27 处均为「成交按市场归因」）。❌ **资金检查**：`grep -rni "buying_power\|available_funds\|资金检查" platform/server` → **0**（`check_order` 规则 1 只在「缺 NAV/金额」时退回 `manual`，不校验可用资金） | **✅对齐 → 🟡部分（推翻）**：第一轮把「杠杆/流动性未见实现」写进了说明却**没降级状态**。逐项后 6 项达标、**4 项 0 实现** |
+
+#### F. 监控与可视化（规格 §3.6）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **FR-MON-001** | 「每笔交易记录完整的决策链路：**信号溯源**（因子值、模型输出、情绪评分）、**决策快照**（市场状态和参数配置）、**执行链路**（订单全生命周期事件）」（spec:331） | 🟡 **部分** | stage 落盘 `platform/server/v3_analytics.py:789`；`platform/server/v3_ops.py:2071`（`GET /api/v3/brain`）、审计链 `platform/server/audit_chain.py:1`（354 行）+ `platform/server/v3_ops.py:1616` 附近（`/api/v3/audit`） | 实测 `GET /api/v3/brain` → `decision.stages`（PDAT…PET 全在）、`proposals[].basis="综合动量 z=0.7071（mom_20=0.36952）"`、`asOf` / `market` / `universe_source="futu/sim_trade_position_list#US"` → 信号溯源（**仅动量类**）✅ + 决策快照 ✅；实测 `GET /api/v3/audit?window=120` → `stats={"signals":3,"orders":1,"order_kinds":{"订单查询":1},"fills":1,"linked":0,"unlinked":2,"link_rule":"同标的、信号时间在前且间隔 ≤ 7 天"}`、`entries` 5 条（含 `kind/at/ticker/detail/source/source_label/origin`）→ 执行链路 ✅。**模型输出与情绪评分未进决策链**：`basis` 无 ML/情绪项（v3_nlp 虽已在线，但零接线） | 与第一轮同判；**新证据**：v3_nlp 上线**没有**改变「情绪评分未进决策链」这一事实 |
+| **FR-MON-002** | 「系统概览…行情图表（**TradingView K线图**叠加策略信号）、策略分析（因子敏感性热力图）、决策面板、风险监控、交易记录、**Harness 会话状态（Agent Loop 运行状态、工具调用统计）**」（spec:335） | 🟡 **部分** | 前端 10 页 `platform/web-pro/src/pages/{overview,brain,market,strategy,risk,execution,gateway,tools,settings,research}.jsx`；图表 `platform/web-pro/src/components/charts.jsx:1-3`（`LineChart` `:17` / `CandleChart` `:46` / `Heatmap` `:89` / `BarList` `:131`）；Harness 状态 `platform/web-pro/src/pages/brain.jsx:162-198`、`:673-684`、`:942-990`、`gateway.jsx:209-320` | **TradingView 未使用（确定）**：`platform/web-pro/package.json` dependencies = `{"@ant-design/pro-components","antd","dayjs","react","react-dom"}`，devDependencies = `{"@vitejs/plugin-react","vite"}` —— **无任何图表库**（无 `lightweight-charts` / `tradingview` / `echarts` / `recharts` / `@antv/*` / `klinecharts`）；`charts.jsx:1-3` 自述「工作台共享图表组件（**纯 SVG，无额外依赖**）」，K 线由 `CandleChart`（`:46`）用 `<rect>` 手绘蜡烛 + 成交量柱。**Harness 会话状态**：页面**有真实字段** —— `brain.jsx:673`「Agent Loop 事件流（/api/v3/brain · sdk.events）」、`:680`（step/start · assistant/message · tool/call · tool/result · turn/end）、`:951`「落盘回合数（turns）」、`:942`（serverInfo）、`:947`（route）；**但数据源恒空** —— 实测 `GET /api/v3/brain` → `sdk={"status":"unavailable","serverInfo":null,"route":null,"lastTurn":null,"turns":[],"events":[]}`（21:2x）。**工具调用统计：真实存在** —— `/metrics` → `quantwb_mcp_calls_total 95`、`quantwb_mcp_errors_total 0`、`quantwb_tool_calls_total{tool="audit"} 9`（+confirmation 12 / equity 12 / orders_open 12 / positions 12 / schedule 21 / sources 11 / deals_today 4 / events 2） | 与第一轮同判；**新确定项**：TradingView 是规格点名的具体库，实测**未采用**，手绘 SVG 替代（第一轮未核依赖） |
+| **FR-MON-003** | 「平台应记录每次 headless 调用的完整信息：**任务提示词、stdout 答案、stderr 诊断信息、退出码、执行耗时、token 消耗估算**。这些日志写入平台数据库，**不依赖 Harness 的 Session 存储**」（spec:339） | 🟡 **部分** | 表结构 `platform/server/v3_db.py:156-170`（`headless_log`：`id, started_at, success, exit_code, duration_ms, tokens_estimate` + payload JSON）、`:30`（设计注释同列）、`:114`（`HEADLESS_LOG_FILE`）、`:218`（JSONL 冷备映射 `{"file":"v3-headless-log.jsonl","table":"headless_log","format":"jsonl"}`） | **表/冷备/迁移齐备，但生产者与读取端都缺**：`grep -rn "headless_log\|HEADLESS_LOG_FILE" --include=*.py .`（排除 node_modules/.git）= **仅 5 处**：`v3_db.py:30/114/156/218` + `platform/tests/test_v3_db.py:175/180/187`（**只有测试用**）。`platform/server/v3_ops.py` 里 `headless.last` **硬编码 `[]`**（`:1932`、`:2088`），**无任何读取 `headless_log` 的端点**；实测 `GET /api/v3/brain` → `headless={"today":{"total":0,"success":0,"failed":0,"avgMs":0,"killed":0},"breaker":null,"last":[],"status":"unavailable"}` | 与第一轮同判（部分）；**加深**：第一轮只说「生产者缺失」，本轮补上「**读取端也缺失**」——`last` 是硬编码空数组，不是「表空所以查出来空」 |
+
+#### G. 非功能需求（规格 §4）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **NFR-PERF §4.1** | 六项：行情数据延迟 `< 100ms`；订单执行延迟 `< 500ms`；MCP 工具调用延迟 `< 2s`；Headless 调用延迟 `< 30s`；SDK 会话首次握手 `< 30s`；系统可用性 `99.9%`（spec:346-353） | ❓ **未验证** | `platform/server/observability.py:831`（`@app.get("/metrics")`） | **逐项标注**：①行情 `<100ms` —— **未验证**（无埋点；且 A 股实时权限缺失 `errcode=-9`，当前权限下不可测）；②订单 `<500ms` —— **未验证**（无埋点，且禁写）；③MCP `<2s` —— **部分可测且当前不达标**：`/metrics` → `quantwb_mcp_call_duration_seconds 2.384`（**进程内均值**，超 2s）；④Headless `<30s` —— **未验证**（通道未挂载，无样本）；⑤SDK 握手 `<30s` —— **未验证**（通道未挂载）；⑥可用性 `99.9%` —— **未验证**（无 SLI/SLO 采集，只有 `quantwb_up`）。**分位数口径**：`grep -in "p95\|p99\|percentile\|quantile\|histogram" /tmp/m.txt` → **0 命中**；`/metrics` 178 行里延迟只有**均值**（`quantwb_mcp_call_duration_seconds`）。前端亦自述（`gateway.jsx` 渲染文案）「metrics 只有全部调用的平均耗时…未采集单工具 P95」 | 与第一轮同判（未验证）；**新增**：MCP 平均延迟 **2.384 s > 规格 2 s** 是本轮唯一可对照的实测反例；并确认 `/metrics` **无任何分位数口径** |
+| **NFR-SEC §4.2** | 「富途 OpenAPI 的**登录密码和交易解锁密码加密存储**。API Token 通过环境变量或密钥管理服务注入。所有交易操作记录审计日志。支持**多级权限控制**」（spec:357）；「`dsh-harness-mcp-server` 默认绑定到 127.0.0.1」（spec:359） | 🟡 **部分** | 凭据：`platform/server/v3_credentials.py:55`（`_write_file` 原子写 + `0o600`）、`platform/server/futu_openapi.py:29`（`write_private_key`：PEM 校验 + `fsync` + `0o600` 原子写）、`:41` / `:76`（`serialization.load_pem_private_key(..., password=None)` ⇒ **不加密**）；token 中间件 `platform/server/app.py:775` 附近；审计 `platform/server/audit_chain.py:1` + `platform/server/v3_ops.py:1616` 附近；绑定 `platform/server/config.py:13`（`host:"127.0.0.1"`） | **①密码加密存储**：实现**不存密码** —— 通道是 `appkey` 模式（RSA 私钥 PEM + OAuth bearer），**没有**「登录密码 / 交易解锁密码」字段（`grep -rni "解锁密码\|登录密码\|unlock_password\|trade_pwd" platform/server` → 0）。私钥以**明文 PKCS8 PEM**落 `~/.dsh/futu-openapi-key.pem`（`load_pem_private_key(pem, password=None)` ⇒ 无口令保护），文件权限 `-rw-------`（宿主实测）。→ **「加密存储」实为「文件权限保护」，不是加密**；规格该子项按当前通道架构是**被替代**而非实现。②Token：`TUSHARE_TOKEN` 走 env（`platform/server/v3_credentials.py:27` `"env":"TUSHARE_TOKEN"`，env 优先于文件）✅；富途 token 落 `~/.dsh/futu-token`（`-rw-------`）③审计日志：`GET /api/v3/audit?window=120` → `HTTP 200`，真实 entries（见 FR-MON-001）✅；`/api/v3/settings` 实测凭据只回「是否注入 + 掩码尾号」（无明文）✅。④**多级权限控制 ❌**：`grep -rni "\brole\b\|rbac\|多级权限" --include=*.py platform/server` → **0**；现只有「单一 Bearer token 网关 + 页面口令闸门」。⑤`dsh-harness-mcp-server` **未安装**（`ls ~/.dsh/profiles/node_modules/@deepseek-ai/dsh-harness-mcp-server` → No such file），该项不适用；平台自身 `config.py:13` 绑 `127.0.0.1` ✅ | 与第一轮同判（部分）；**新增确定结论**：规格点名的「登录/交易解锁密码」在当前 appkey 通道下**根本不存在**，「加密存储」的实际形态是 0600 明文 PEM |
+| **NFR-COMPAT §4.3** | 「`@deepseek-ai/dsh-tools` 与 MCP 均处于 Developer Preview…集成层需做好版本适配和降级预案，锁定已验证的 API 形态」（spec:363） | 🟡 **部分** | 降级案例 `docs/v3-integration.md` §1.6；`docs/architecture.md` 有意差异清单；自动化门禁 `platform/tests/test_mcp_parity.py`；`platform/install/quant-headless/pnpm-workspace.yaml`（`autoInstallPeers:false` + `nodeLinker:hoisted` 的由来写在注释里，有**真实报错证据**） | 有**真实降级案例 + 文档 + 自动化 parity/schema 测试**；**无 CI 门禁、无 dsh 版本矩阵**（仓库无 `.github/workflows` 命中的 dsh 版本矩阵）。`dsh-tools` 与 MCP 的实际版本：`@deepseek-ai/dsh-mcp-client` `0.1.5-rc.2`（`package.json`），MCP SDK `^1.12.0` | 与第一轮同判 |
+| **NFR-EXT §4.4** | 「数据源适配器采用**插件化设计**。**策略引擎支持热加载**。**执行算法可插拔**」（spec:367） | 🟡 **部分** | 数据源：`platform/server/v3_sources.py`（`Deps` 可注入）、`platform/server/v3_fallback.py:1`（链可编排）；策略注册表：`plugins/core/python/trading_core/strategies.py`（`REGISTRY`）、`platform/server/settings_api.py:213-220`（读 `strategies.REGISTRY`） | 测试 `platform/tests/test_v3_sources.py`（Deps 注入）、`platform/tests/test_v3_fallback.py`（16 例）证明**数据源可插拔** ✅。**策略热加载 ❌**：`grep -rni "热加载\|hot.reload\|hot reload" --include=*.py platform/server` → **0**；`REGISTRY` 是模块级静态字典（`strategies.py`），无运行期 reload 路径。**执行算法可插拔 ❌**：0 命中 | 与第一轮同判 |
+
+#### H. 系统设计条目（规格 §5 / §6 / §8 / §10）
+
+| 编号 | 规格原句（摘录） | 状态 | 实现位置 file:line | 真实证据 | 与第一轮差异 |
+|---|---|---|---|---|---|
+| **DES-5.1** | K8s 集群 + 7 微服务（scheduler/strategy/risk/data/exec/gateway/web）+ Kafka 消息总线 + Redis Cluster + PostgreSQL（spec:375-408） | ⚪ **不适用** | 单容器 + SQLite：`platform/server/v3_db.py:119`（`TABLE_SPECS`）、`platform/deploy/` | 用户显式改写（「不用集群，单容器就行」）；`docs/e2e-and-data-gaps.md` 第四轮 §7.4/§7.5 登记迁移与并发证据；`/metrics` 可见单进程模型（`quantwb_process_start_time_seconds`、`quantwb_process_uptime_seconds`） | 与第一轮一致 |
+| **DES-5.2** | 「Gateway 服务是平台与 Harness 之间的唯一接口。它包含**三个子模块**：MCP Bridge / SDK Client / Headless Runner」（spec:412） | 🟡 **部分** | 同 FR-GATEWAY-001 / 002 / 003 | 实测 `GET /api/v3/gateway` → `mcp=running`（116 工具）、`sdk=unavailable`、`headless=unavailable` → **1/3 挂载** | 与第一轮一致（同源，不重复计分） |
+| **DES-6** | 组合顺序（bundles patch → profile `cordis.patch.yml` → home patch → `--patch`）；量化 system prompt（单笔 2% / 行业 20% / 回撤 15%）（spec:562-618） | ✅ **对齐** | `platform/install/quant-headless/cordis.patch.yml:39-99`（`system-prompt` 行 `personaPrefix`）+ `:6`（组合顺序注释）；阈值同源 `platform/server/v3_ops.py:107` | `platform/install/quant-headless/README.md:155`：`--dump-config` 退出码 0，`personaPrefix` 为量化分析师文本；`LIMITS` 与 spec:600-602 的 2% / 20% / 15% **逐项一致** | 与第一轮一致 |
+| **DES-8.2** | 环境变量表：DSH_HOME / DEEPSEEK_API_KEY / QUANT_MCP_NODE / QUANT_MCP_SERVER / QUANT_MCP_CWD / QUANT_MCP_LOG / FUTU_OPEND_HOST / FUTU_OPEND_PORT / TUSHARE_TOKEN（spec:775-785） | 🟡 **部分** | `platform/server/v3_ops.py:118-120`（`ENV_KEYS` 白名单，`:1470-1471` 只读 `os.environ.get(key)` 上报 `injected/source`）；`platform/server/v3_credentials.py:27`（TUSHARE_TOKEN env 优先）；`platform/server/v3_sources.py:1398`（Tushare HTTP） | **逐项 grep 证据（`platform/server scripts install plugins`，排除 node_modules/dist）**：`DSH_HOME` → 336 处，脚本/进程**真实读取**（`scripts/research_duty.sh:15`、`scripts/futu_auth.py:40`）✅；`TUSHARE_TOKEN` → 29 处，**平台真实读取**（`v3_credentials.resolve_tushare_token(home, os.environ.get)`，`v3_ops.py:1687`）✅；`QUANT_MCP_NODE` / `QUANT_MCP_SERVER` / `QUANT_MCP_CWD` / `QUANT_MCP_LOG` → **各仅 1 处命中，全在 `v3_ops.py:118-119` 的 `ENV_KEYS` 字符串常量里**，**零功能读取** ❌；`FUTU_OPEND_HOST` / `FUTU_OPEND_PORT` → **各仅 1 处命中，同在 `v3_ops.py:119`**，**零功能读取** ❌；`DEEPSEEK_API_KEY` → **仅 1 处命中（`v3_ops.py:118`）**，平台不承载 LLM 循环 → 零功能读取 ❌。实测 `GET /api/v3/settings`（21:2x）→ `env=[{"key":"DSH_HOME","injected":true},{"key":"DEEPSEEK_API_KEY","injected":false}×8]`，`futu.channel="openapi"`、`futu.openapi.mode="appkey"`、`config_keys=["algorithm","app_key","mode","private_key_path"]`。**实际传输 ≠ 规格**：走 **HTTP `/mcp`（streamable-http）**，不是规格 §8.2/§5.2.1 的 **stdio node 进程**（`QUANT_MCP_NODE`+`QUANT_MCP_SERVER`+`QUANT_MCP_CWD` 三件套）——`url` 见 `platform/install/quant-headless/cordis.patch.yml:162` | 与第一轮同判；**本轮把「读没读」查到每一处命中数**：9 个变量里只有 **2 个**被平台功能性读取（`DSH_HOME`、`TUSHARE_TOKEN`），其余 7 个只是「上报注入状态」的字符串 |
+| **DES-8.3** | 「Prometheus + Grafana 监控以下指标」（spec:789）；9 类指标与阈值：Headless 成功率 `<95%`、Headless 平均耗时 `>60s`、SDK 会话活跃数 `>10`、MCP 延迟 `>5s`、MCP 失败率 `>5%`、数据源断连、数据延迟 `>5min`、订单执行延迟 `>1s`、风控阻断突增（spec:791-801） | 🟡 **部分** | `platform/deploy/monitoring/alerts.yml`（**23 条** `alert:` 规则，7 组）、`platform/deploy/monitoring/prometheus.yml`（scrape `127.0.0.1:8397` `/metrics` 15s）、`platform/server/observability.py:831`（`/metrics`） | **逐条映射（规则名或明确缺失）**：①Headless 成功率 `<95%` → **缺失**（`grep -in "headless" alerts.yml` → 0）；②Headless 耗时 `>60s` → **缺失**（0）；③SDK 会话活跃数 `>10` → **缺失**（`grep -in "sdk" alerts.yml` → 0）；④MCP 延迟 `>5s` → **缺失**（无延迟规则，只有 `QuantMcpToolCallFailureRateHigh`）；⑤MCP 失败率 `>5%` → ✅ `QuantMcpToolCallFailureRateHigh`（alerts.yml:90，`for: 10m`）；⑥数据源断连 → ✅ `DataSourceChainUnavailable`（:183）+ `DataSourceFellBackToSecondary`（:204）+ `QuantPushChannelDisconnected`（:430）；⑦数据延迟 `>5min` → **⚠️ 口径不符**：只有 `DataSourceProbeStale`（:222，`time() - quantwb_datasource_probe_timestamp_seconds > 86400`，**24h** 缓存过期，语义是「监控本身静默」而非「数据延迟 5 分钟」）；⑧订单执行延迟 `>1s` → **缺失**（`grep -in "order_exec\|latency" alerts.yml` → 0）；⑨风控阻断突增 → **⚠️ 口径不符**：`RiskBlockedOrderAppeared`（:272，`delta(quantwb_oms_orders{stage="blocked"}[1h]) > 0`，语义是「1 小时出现任何阻断」而非「突增」）。**Grafana 未部署**：`grep -rni grafana`（排除 node_modules/.git）= **8 处，全是文档**；`platform/deploy/monitoring/README.md:350-354` 自述「❌ 没有安装 Prometheus/Grafana/Alertmanager…❌ 没有建 Grafana 面板」 | 与第一轮同判；**本轮给出 9 类逐条映射**：**1 类覆盖、2 类口径不符、6 类缺失**（第一轮说「覆盖 7 类」，与文件实证不符，予以更正） |
+| **DES-10** | 五项关键决策：三通道分工 / Headless 不依赖会话状态 / 工具粒度控制 / 外部熔断保护 / 版本锁定与降级预案（spec:840-848） | 🟡 **部分** | 同 FR-GATEWAY-001~004、FR-TOOLS-003、NFR-COMPAT | 决策 1 **部分**（三通道 1/3 挂载：MCP running、SDK/Headless unavailable）；决策 2 **不成立**（服务内无 Headless，只有外置 `research_duty.sh` 每次新建一次性会话）；决策 3 **未落地**（116 工具直暴露 ≈2 万 token；无 `list_tools`/`call_tool`）；决策 4 **部分**（超时 ✅ `research_duty.sh:17`；并发上限 3 ❌；token 预算 200K ❌；`breaker=null`）；决策 5 **部分**（有真实降级案例与 parity 测试，无 CI 门禁与版本矩阵） | 与第一轮一致 |
+
+### 2.4 「无法验证」项（本轮收敛后仍然存在的）
+
+| 条目 | 为什么仍然无法验证 | 第一轮 → 第二轮 |
+|---|---|---|
+| **NFR-PERF §4.1** 六项延迟/可用性 | 只读审计不做压测；行情/订单延迟**无埋点**；Headless 与 SDK 通道未挂载**无样本**；`/metrics` **无分位数**（只有均值）不足以判阈值。可对照的只有 MCP 均值 2.384 s（已超规格 2 s） | 仍「未验证」；但**新增实测反例** |
+| **FR-EXEC-001 的 live 全生命周期** | live 写自述「未经真实 live 下单验证」（`docs/P4-live-trading.md`），本轮禁写 | 不变 |
+| **FR-DATA-001 条件单的 live 券商往返** | 同上，禁写；只验证到「契约 + 闸门 + 单测」层 | **收敛**：从「未验证/未见实现」变为「契约层已实现、live 往返未验证」 |
+| **Harness 是否真的挂载了 `quantwb` MCP 行**（FR-GATEWAY-001 的运行时事实） | 本轮无法做运行时观测：父会话日志里没有任何 `mcp__quantwb__*` 的 `tool/call`（14 次调用全是 bash/edit/subagent），本 subagent（子代理）会话的工具面也不含这些工具。只能给到**配置级推断**（`serverName: quantwb` + 客户端命名模板）与**文档旁证**（headless 真跑列出 77 个 MCP 工具）。可在 Harness 里跑一次 `research_tasks_list`/任一 `mcp__quantwb__*` 工具或看会话工具清单来直接判定 | 第一轮没有区分「平台 `/mcp` 有 116 条」与「Harness 是否挂了这一行」——本轮明确拆开 |
+| **NFR-SEC §4.2 的「加密」强度** | 宿主文件权限是 0600，但**没有**任何加密实现；「加密存储」这条在 appkey 架构下**没有对应实体**，只能如实记为「不适用/被替代」，不是「验证通过」 | 第一轮只记「0600 非加密」，本轮补上「根因是通道不含密码字段」 |
+| **/mcp 工具面规模对模型的实际影响** | 只能量化 schema 体积（79,624 字符 ≈2 万 token），真实「撑爆」与否取决于模型上下文窗口，本轮未做注入实验 | 第一轮「未做 MCP 握手」→ 本轮**已握手**，规模可量化 |
+
+### 2.5 新发现的缺口（按影响排序）
+
+| # | 新发现 | 影响 | 证据 |
+|---|---|---|---|
+| **N0** | **outbound 反向桥完全不存在**（FR-GATEWAY-001 第三子项）：没有任何机制把 DSH 的 `ctx.tools` 暴露成 MCP 服务器（规格要 `dsh:<toolName>`） | 规格的「双向」只实现了**单向**；外部 MCP 客户端**无法**调用 Harness 侧工具。`FR-GATEWAY-001`/`DES-5.2`/`DES-10` 决策 1 同时受影响 | `grep -rl "serveStdio\|McpServer\|createMcpServer" ~/.dsh/profiles/node_modules/@deepseek-ai/ ~/.dsh/profiles/web/node_modules/@bstester/` → **0**；`@helibeiqi` 未安装；`dsh-harness-mcp-server` 未安装 |
+| **N1** | **前端把不存在的包当成数据源名称展示**：`market.jsx:726-727` / `overview.jsx:536` 的健康卡把平台自身的 workbench 工具面标成「**dsh-quant-data-mcp（workbench 工具面）**」 | 规格点名的 `dsh-quant-data-mcp` **从未接入**（实现层 0 引用），但页面把当前数据源冠以该名 → 验收人极易误判「第 5 个开源源已接入」。属诚实性问题（与第一轮 H 系列同族） | `grep -rn "dsh-quant-data-mcp" --include=* .`（排除 node_modules/.git）→ 16 处：spec 8 / 本文档 3 / **前端 3** / dist 2；`platform/server`+`plugins`+`install` = **0** |
+| **N2** | **`FR-MON-003` 的读取端也缺失**：`headless.last` 在 `v3_ops.py:1932`/`:2088` **硬编码 `[]`**，即使将来有 headless 调用写进 `headless_log` 表，也没有任何端点会读出来 | 补了生产者也没用——读取端要一起补。这是第一轮「生产者缺失」之外的第二半 | `grep -rn "headless_log" --include=*.py .` → 5 处，全在 `v3_db.py` 与 `test_v3_db.py`；`v3_ops.py` 无读取 |
+| **N3** | **`FR-EXEC-003` 的 4 个子项 0 实现**（杠杆率 / 流动性风险 / 绩效归因 / 资金检查），第一轮用「未见实现」一笔带过却维持了「对齐」状态 | 事中风控只覆盖回撤；事后只有统计量、没有归因；事前不校验可用资金。规格 §3.5 的「三段式风控」实际是「一段半」 | `grep -rni "liquidity\|流动性" platform/server` → 0；`grep -rni "attribution\|归因分析" platform/server` → 0；`grep -rni "buying_power\|资金检查" platform/server` → 0；`杠杆` 仅 5 处且全为窝轮请求参数 |
+| **N4** | **MCP 工具面 schema 成本的硬数字**：`tools/list` = **79,624 字符 / 116 条 ≈ 2 万 token**，且**没有** `list_tools`/`call_tool` 发现代理 | 每次请求都要带上全量工具 schema；规格「决策 3：工具粒度控制」明确要避免这件事，当前是**反向** | MCP 握手实测（21:27）：`len(json(tools))` = 79,624；`"list_tools" in names == False`、`"call_tool" in names == False` |
+| **N5** | **仓库工作区与线上预设不一致**：`quant-platform-mcp` 行在**仓库工作区** `agent.cordis.yml:184` 是 `disabled: true`，在**线上安装的预设** `~/.dsh/.agent-presets/dsh-trading-agents/agent.cordis.yml:184` 是 `disabled: false`；两份文件还有另一处注释差异。仓库 HEAD `fa9bc31`（预设）≠ 工作区 `48cd3d7` | 「仓库里看到的」不等于「Harness 实际跑的」：按仓库现状判断会得出「quantwb 工具面未挂载」的相反结论；本轮 FR-GATEWAY-001 的运行时结论因此只能标「无法验证」 | `diff /home/penn/workspace/dsh-trading-agents/agent.cordis.yml ~/.dsh/.agent-presets/dsh-trading-agents/agent.cordis.yml` → `184c184: < disabled: true --- > disabled: false`、`160c160` 注释差异；`git -C ~/.dsh/.agent-presets/dsh-trading-agents log -1` = `fa9bc31` |
+
+### 2.6 本轮对第一轮的「判浅 / 判错」汇总
+
+| 类型 | 条目 | 一句话 |
+|---|---|---|
+| **判错（证据找错文件）** | `FR-TOOLS-002` | 第一轮 grep 只扫 `mcp_tools.py`，`annotations` 实际在 `v3_mcp.py:646-648`；结论由「缺失」改「部分」 |
+| **判宽（把用户豁免扩到整条）** | `FR-GATEWAY-001` | 用户豁免 adapter 载体 ≠ 豁免 outbound/命名契约；结论由「不适用」改「部分」，并暴露 N0 |
+| **判浅（只数域不核名）** | `FR-TOOLS-001` | 域 6/6 ✅ 就当整条对齐，漏核规格表的 13 个方法名（命中 0） |
+| **判浅（说明里写了缺失，状态不降级）** | `FR-EXEC-003` | 「杠杆/流动性未见实现」写进了备注却维持「对齐」 |
+| **证据过期（服务已重启）** | `FR-STRAT-003` | 「`/api/v3/sentiment` 返回 SPA」已失效——现返回真实 JSON 评分 |
+| **证据过期（服务已重启）** | `FR-EXEC-002` | 「行业读数仍是 `no-data`、待重启」已失效——现为 `cache/futu/info_owner_plate`、三市场 `breach:true` |
+| **未验证项可收敛** | `FR-DATA-001` 条件单 | 从「未见实现」收敛为「契约 + 闸门 + 单测已实现，live 往返未验证」 |
+
+## 一、汇总表（**第一轮归档值 —— 已被 §二轮取代，见上**）
+
+> ⚠️ **本节是 2026-09-20 第一轮（快照 `8b75fcc`）的归档结论，保留用于对照，不再作为当前口径。**
+> 修正后的计数与逐条结论见文首「**第二轮核对（基于 `docs/v3-spec.md` 原文）**」。
+> 第一轮与第二轮的差异（4 条状态变化 + 2 条证据级更正）在该节 §2.2 与 §2.6。
 
 规格条目共 **31 条**：功能需求 21（FR-\*）+ 非功能需求 4（NFR-\*）+ 设计条目 6（DES-\*）。
 
@@ -125,38 +300,44 @@
 
 ---
 
-## 三、缺口清单
+## 三、缺口清单（**第二轮：按影响重排**）
 
-### 3.1 规格要求但未实现（真缺口）
+> 排序口径：**影响 = 「规格点名的能力整条不可用」 > 「能力在但口径/覆盖面不足」 > 「命名或文档不一致」**；
+> 同档内按「是否阻塞其它条目」排。第一轮的 G1–G12 编号已重排，旧编号在「前身」列标注。
 
-| # | 缺什么 | 影响 | 建议补齐方式 | 工作量粗估 |
-|---|---|---|---|---|
-| G1 | **SDK JSON-RPC 通道**（FR-GATEWAY-002）：无 `dsh-sdk-jsonrpc-server` 挂载，无 SDK 客户端代码，未安装 `deepseek-harness-sdk` | 「平台前端驱动 Harness 会话」的**人工研究交互通道整条缺**；`决策大脑`页 SDK 区块恒为「不可用」；规格 §7.1 的人工研究数据流走不通 | 在 `quant-headless` 同法建 `sdk` profile（`@deepseek-ai/dsh-sdk-jsonrpc-server` + `dsh-mcp-client`），平台侧加 `HarnessSessionManager`（`initialize`/`session/prompt`/事件流），端点 `POST /api/v3/session/prompt` | **大**（3–5 人日；含 profile 验证 + 事件流前端） |
-| G2 | **Headless 通道与外部熔断**（FR-GATEWAY-003/004）：服务内无 HeadlessRunner；无 08:30/12:00 触发；无事件触发；无并发/费用预算；`breaker=null` | 自动唤醒大脑只剩外置 `research-duty.timer`（周一至五 19:20 单一作业）；L3 日志（FR-MON-003）恒空；规格 §7.2 自动触发数据流不成立 | 把 `scripts/research_duty.sh` 的逻辑收进服务（`HeadlessRunner` + 并发信号量 + 超时 kill + token 预算 + 落 `headless_log`），调度链补 08:30/12:00 两个 job，事件触发挂 `events/risk` 信号 | **中**（2–3 人日，服务内 runner 约 300 行 + 测试） |
-| G3 | **工具注册规范**（FR-TOOLS-002）：无 `isConcurrencySafe`、无 `render` 分离、无等长 null 对齐、无 `skill/quant-research` | 工具输出是原始信封 JSON，模型侧对齐成本高；与规格「AI-native」目标不符 | 在 `mcp_tools` 的 `BoundTool` 上加注解与 `render`；或在工作区 `v3_mcp.py` 桥层为只读路由补 `readOnlyHint`/`render` | **中**（1–2 人日，逐域改写输出契约） |
-| G4 | **工具发现代理**（FR-TOOLS-003）：82 工具直暴露，无 `list_tools`/`call_tool` 间接入口 | 上下文窗口压力（规格决策 3 明确要避免） | 增加 `quant_discover{list_tools,call_tool}` 两个元工具，其余工具按域**按需**注册 | **小–中**（0.5–1 人日） |
-| G5 | **因子三类缺失**（FR-STRAT-001）：成长、质量、另类因子无实现 | 选股只吃动量/波动/趋势/RSI/估值；`basis` 单薄（实测只有 `mom_20`） | 复用富途 `f10_detail`（26 sections）建成长/质量因子；另类用 `capital_flow`/`short_interest`/期权 | **中**（2–3 人日 + 数据校验） |
-| G6 | **事件驱动 / 统计套利策略**（FR-STRAT-002） | 策略族只有动量基线 + ML 三模型 + 参数扫描 | 事件驱动可挂 `events`/`economic_calendar_hot`；统计套利需配对协整（既有 `correlation` 可作基础） | **大**（各 2–4 人日，含 PIT 回测口径） |
-| G7 | **NLP 未挂载 + 事件识别缺失**（FR-STRAT-003） | 情绪因子进不了决策链；`/api/v3/sentiment` 当前 404→SPA | 提交并重启（工作区已注册）；补事件抽取/分类（规则或词表 + 模式） | **小**（挂载 0.5 人日）/ **中**（事件识别 1–2 人日） |
-| G8 | **行业红线在下单闸门仍是 no-data**（FR-EXEC-002，运行进程） | 行业集中度红线**不下闸**，只在观测侧告警；`blocked_industry` 恒 0 | 工作区已接（`v3_ops` 引入 `v3_risk_gate`）→ **只需重启验证** + 补一条端到端断言 | **小**（0.5 人日，含测试） |
-| G9 | **`dsh-quant-data-mcp`**（FR-DATA-002 第 5 源） | A 股免密钥数据面缺一路；现由富途/AKShare 覆盖，实际影响小 | 若要严格对齐：接入该 MCP stdio server 并加进 profile bundles；否则建议**在规格层面注销该条** | **小**（0.5 人日）或**规格修订** |
-| G10 | **`data/cache.py` 唯一读取接口**（FR-DATA-003 命名） | PIT 纪律分散在 `v3_analytics/v3_ml/v3_math`，没有单一入口可审计 | 把 `caches.py` 升级为 `data/cache.py` 语义（PIT 读取唯一入口）并让各模块经它取数 | **中**（1–2 人日，回归面大） |
-| G11 | **多级权限控制**（NFR-SEC §4.2） | 只有「token 网关 + 页面口令闸门」，无角色/权限分级 | 在 `/api/*` 中间件加角色（只读/研究/交易）与端点白名单 | **中**（1–2 人日） |
-| G12 | **性能与非功能未验证**（NFR-PERF §4.1） | 六项延迟/可用性指标无实测基线 | 加只读压测脚本（探针 + 百分位统计）并写入 `/metrics` P95 | **小**（0.5–1 人日） |
+### 3.1 规格要求但未实现（真缺口，按影响排序）
+
+| # | 影响档 | 缺什么 | 规格依据 | 影响 | 建议补齐方式 | 工作量 |
+|---|---|---|---|---|---|---|
+| **G1** | 🔴 整条通道缺失 | **SDK JSON-RPC 会话通道**：服务内无 SDK 客户端、`sdk` profile 的 `cordis.patch.yml` 为空、venv 无 `deepseek_harness` | FR-GATEWAY-002（spec:133-153）、DES-5.2 | 「平台前端驱动 Harness 会话」的**人工研究交互通道整条缺**（§7.1 数据流不成立）；`brain` 页 SDK 区块恒「不可用」 | 包已就位（`@deepseek-ai/dsh-sdk-jsonrpc-server`/`dsh-sdk-app` 已装、`~/.dsh/profiles/sdk` 骨架已建）→ 1 行 patch + 装 `deepseek-harness-sdk` + 写 `HarnessSessionManager` + 事件流端点 | **中**（比第一轮估的 3–5 人日小） |
+| **G2** | 🔴 整条通道缺失 | **outbound 反向 MCP 桥**（把 DSH `ctx.tools` 暴露成 MCP 服务器，命名 `dsh:<toolName>`） | FR-GATEWAY-001 第三段（spec:120）、DES-10 决策 1 | 规格的「双向」只做了单向：外部 MCP 客户端**无法**调用 Harness 工具 | 装回 `@helibeiqi/dsh-cordis-universal-adapter`（本部署实测三处硬错误，见 `docs/v3-integration.md` §1.6）或自研 `ctx.tools.schemas()` → `McpServer` 行 | **中–大** |
+| **G3** | 🔴 整条通道缺失 | **Headless Runner + 调度器 + 外部熔断**：服务内 0 实现；无 08:30/12:00/16:00 headless 触发；无事件/流水线节点触发；无并发上限 3、无 token 预算 200K | FR-GATEWAY-003/004（spec:158-186, 555）、DES-10 决策 2/4 | 自动唤醒大脑只剩外置 `research-duty.timer`（周一–五 19:20 单点）；FR-MON-003 恒空；§7.2 自动触发数据流不成立 | 把 `scripts/research_duty.sh` 逻辑收进服务（`HeadlessRunner` + 信号量 + 超时 kill + token 预算 + 写 `headless_log`），**并补 `v3_ops.py` 的读取端**（见 G9）；调度链补 08:30/12:00 job | **中**（服务内 runner 约 300 行 + 测试） |
+| **G4** | 🟠 能力在、覆盖面严重不足 | **`FR-EXEC-003` 的 4 个子项 0 实现**：杠杆率、流动性风险、绩效归因、资金检查 | FR-EXEC-003（spec:324） | 规格的「事前/事中/事后」三段式实际是「一段半」：事中只有回撤，事后只有统计量没有归因，事前不校验可用资金 | 杠杆率从 `positions`+`equity` 推（保证金/总资产）；流动性用 `capital_flow`+`deals_history` 换手；归因按行业/因子拆解收益；资金检查读 `account_funds` 的可用资金 | **中** |
+| **G5** | 🟠 能力在、覆盖面严重不足 | **六类因子缺 4 类的因子面接入**：成长（`revenue_yoy`/`net_profit_yoy`）、质量（`roe`/`roa`/`gross_margin`）已有实现但未进因子矩阵/流水线；情绪（`v3_sentiment` 已在线）与另类（`capital_flow*`/`short_interest`）是独立工具、不进因子面 | FR-STRAT-001（spec:299） | 实测矩阵只有 14 个因子，覆盖价值（7）+ 动量（3）+ 技术（1）+ 波动/流动性（3）；`basis` 只有 `mom_20` | 把 `plugins/workbench/python/quality.py` 的 5 个基本面因子接进 `factors` 工具面；情绪分作为一列并入 `factors/matrix`；另类用 `capital_flow`/`short_interest` 造横截面因子 | **中** |
+| **G6** | 🟠 能力在、覆盖面严重不足 | **事件驱动 / 统计套利策略 0 实现**（`grep -rni "event_driven"` → 0；`"统计套利\|cointegration\|协整"` → 0） | FR-STRAT-002（spec:303） | 策略族只有动量基线 + ML 三模型 + 参数扫描 | 事件驱动挂 `events`/`economic_calendar_hot`；统计套利需配对协整（`correlation` 可作基础） | **大**（各 2–4 人日，含 PIT 回测口径） |
+| **G7** | 🟠 能力在、覆盖面严重不足 | **参数网格只有 64 格/次**（默认 12），规格要「数千次完整回测」 | FR-STRAT-002（spec:303） | 扫参覆盖不足，`best` 易过拟合单标的；热力图信息量低 | 扩 `v3_analytics.py:940` 的 `_int_list(..., 8)` 上限 + 多标的/多策略网格 + 分片执行；或如实把规格改成「数十–数百次」 | **中** |
+| **G8** | 🟠 能力在、覆盖面严重不足 | **工具发现代理缺失**：无 `list_tools`/`call_tool` 两个间接入口；**116 条工具直暴露**（schema ≈ 79,624 字符 ≈ 2 万 token） | FR-TOOLS-003（spec:265）、DES-10 决策 3 | 与规格「避免上百个工具 schema 撑爆上下文窗口」正面冲突 | 增加 `quant_discover{list_tools, call_tool}` 两个元工具，其余按域**按需**注册（`v3_mcp.py` 已有按路由造工具的机制，可复用） | **小–中** |
+| **G9** | 🟡 接线/读写端缺失 | **`headless_log` 无生产者、也无读取端**（`v3_ops.py:1932/2088` 硬编码 `last: []`） | FR-MON-003（spec:339） | 表结构齐备却永远空；补了生产者也不会被读出来 | 随 G3 一起补：写 `v3_db.append_event(home,"headless_log",…)` + 在 `brain`/`gateway` 读 `v3_db.list_events(home,"headless_log")` | **小**（与 G3 合并） |
+| **G10** | 🟡 接线/读写端缺失 | **`data/cache.py` 唯一 PIT 入口不存在**（`find . -name cache.py` → 0），PIT 约束散在 5 个文件 | FR-DATA-003（spec:288） | ①PIT 不可集中审计；②新读取路径不会自动继承 PIT；③按规格字面找不到验收对象 | 把 `platform/server/caches.py` 升级为 `data/cache.py` 语义（PIT 读取唯一入口）并让各模块经它取数；或在规格层把路径改成实际位置 | **中**（回归面大） |
+| **G11** | 🟡 接线/读写端缺失 | **`dsh-quant-data-mcp` 未接入**（实现层 0 引用），但前端把当前工具面**冠以该名展示** | FR-DATA-002 第 5 行（spec:282-284）、FR-TOOLS-003 | A 股免密钥数据面缺一路（现由富途/AKShare 覆盖，实际影响小）；**但页面命名会让人误判已接入**（新发现 N1） | 接入该 MCP stdio server 并加进 bundles；或在规格层注销该条 **+ 修改前端卡片命名** | **小**（接入） / **极小**（只改命名） |
+| **G12** | 🟡 接线/读写端缺失 | **多级权限控制**（`grep -rni "role\|rbac\|多级权限" platform/server` → 0） | NFR-SEC §4.2（spec:357） | 只有「单一 Bearer token 网关 + 页面口令闸门」，无角色/权限分级 | 在 `/api/*` 中间件加角色（只读/研究/交易）与端点白名单 | **中** |
+| **G13** | ⚪ 命名/文档不一致 | **MCP 方法名契约 0/13 命中**：规格给 `mcp:<域>:<工具>`，实得裸名 + `v3_*`；Harness 侧显示为 `mcp__quantwb__<toolName>` | FR-TOOLS-001（spec:235-249）、FR-GATEWAY-001（spec:118） | 按规格字面检索会找不到任何工具；两套命名并存增加对账成本 | 规格层修订成实际命名；或在桥层加一层别名 | **小**（文档） |
+| **G14** | ⚪ 命名/文档不一致 | **`AI-native` 五条规范缺 4 条**：无 `isConcurrencySafe`、无 `render` 分离、无等长 null 对齐、无 `skill/quant-research` | FR-TOOLS-002（spec:255-259）、附录 A（spec:866-869） | 工具输出是原始信封 JSON，模型侧对齐成本高；与规格「AI-native」目标不符 | 在 `mcp_tools.BoundTool` 上加 `render` 与并发安全标注；或在工作区 `v3_mcp.py` 桥层为只读路由补 `outputSchema`/`render`；建 `skills/quant-research/` | **中** |
+| **G15** | ⚪ 命名/文档不一致 | **监控 9 类里 6 类无规则、2 类口径不符**；Grafana 未部署 | DES-8.3 §8.3（spec:791-801） | 无法覆盖规格点名的告警面 | 补 `Headless 成功率/耗时`、`SDK 会话数`、`MCP 延迟 >5s`、`订单延迟 >1s` 四条规则（需先有对应指标）；把 `DataSourceProbeStale` 与数据延迟 `>5min` 拆开；把 `RiskBlockedOrderAppeared` 改成「突增」（如 `increase(...[1h]) > N`） | **小**（规则） / **中**（补指标） |
+| **G16** | ⚪ 命名/文档不一致 | **NFR §4.1 六项延迟无埋点、`/metrics` 无分位数** | NFR-PERF §4.1（spec:346-353） | 无法判定任何一项延迟阈值（MCP 均值 2.384 s 已超规格 2 s，但没有 P95） | 在工具面埋直方图（`_bucket`）+ 加只读压测脚本写入 P95/P99 | **小–中** |
 
 ### 3.2 规格未要求、但比预期弱（不是缺口，是欠账）
 
 | # | 弱在哪 | 影响 | 建议 | 工作量 |
 |---|---|---|---|---|
-| W1 | **前端硬编码阈值**（`overview.jsx:397/406/413`、`risk.jsx:835/837`、`settings.jsx:1290`、`execution.jsx:395/400`） | 后端改 `LIMITS` 后页面仍显示旧值；`overview.jsx:708` 甚至声称「回撤阈值取自台账」（**不实**） | 改为读 `/api/v3/oms/orders` 的 `industry_limit_pct` 等字段，或新增 `GET /api/v3/risk/limits` | **小**（0.5 人日） |
-| W2 | **加载/失败态渲染成 0**（`gateway.jsx:93-94→107-109`、`tools.jsx:197-200/248/286`、`research.jsx:169-181`） | 请求未回来时页面显示「今日调用 0 次 / 失败 0 次 / 0 ms」，与真实 0 不可区分 | 统一 `fmt.dash` 或显式 `loading`/`error` 分支（`undefined` 在 antd `Statistic` 会渲染成 `0`，见 §五） | **小**（0.5 人日） |
-| W3 | **`strategy.jsx:503-506` 渲染字面量 `null`** | 回测指标缺失时卡片显示 `null%`（antd `Statistic` 对 `null` 走 `String(value)`） | 传 `"—"` 或用 `formatter` | **极小**（0.2 人日） |
-| W4 | **固定文案当成事实**：`settings.jsx:1314`「LIVE 大额订单需双人复核」（**无实现**）、`execution.jsx:34/1042/1066` TTL 回退 120s、`brain.jsx:252`「0 条」、`risk.jsx:686`「满刻度 30%」、`risk.jsx:548-549` 固定「台账只有 1 个点位」 | 用户会把未实现的风控/参数当既有控制 | 加「未实现/未取到」标注，或删除该文案 | **小**（0.5 人日） |
-| W5 | **`/api/v3/settings` 数据源状态自相矛盾**（`v3_ops.py:1323-1325` 写死 `SEC EDGAR available:false`＋「本服务未实现 SEC EDGAR 客户端」；`:1328-1330` 要求 `tushare` **包**可导入才算可用） | 与事实相反：`/api/v3/financials?ticker=AAPL` 实测 `source=sec/companyconcept(us-gaap XBRL)`；Tushare 走 HTTP 不需要包 → 即使配了 token 也可能显示「不可用」 | SEC 改为按 `v3_sources` 真实探测；Tushare 可用性判据去掉 `_module_available('tushare')` | **小**（0.3 人日） |
-| W6 | **`docs/v3-integration.md` 已过时**：§三/§四称页面在 `platform/web/public/v3/`、`/` 307 跳 `/v3/index.html`、`bash platform/tools/verify_pages.sh` | 该目录**已不存在**（`ls platform/web` → No such file）；现为 `platform/web-pro`（AntD Pro，10 页）→ 文档把人引到错路径 | 更新 §二·五/§三/§四 | **小**（0.3 人日） |
-| W7 | **事件驱动/统计套利以外的因子覆盖**（见 G5）与 **杠杆/流动性事中口径**（FR-EXEC-003 子项） | 事中风控只覆盖回撤 | 明确「本期不做」或补读数 | **中** |
-
----
+| W1 | **前端硬编码阈值**（`overview.jsx:397/406/413`、`risk.jsx:835/837`、`settings.jsx:1290`、`execution.jsx:395/400`） | 后端改 `LIMITS` 后页面仍显示旧值；`overview.jsx:708` 甚至声称「回撤阈值取自台账」（**不实**） | 改为读 `/api/v3/oms/orders` 的 `industry_limit_pct` 等字段，或新增 `GET /api/v3/risk/limits` | **小** |
+| W2 | **加载/失败态渲染成 0**（`gateway.jsx:93-94→107-109`、`tools.jsx:197-200/248/286`、`research.jsx:169-181`） | 请求未回来时显示「今日调用 0 次 / 失败 0 次 / 0 ms」，与真实 0 不可区分 | 统一 `fmt.dash` 或显式 `loading`/`error` 分支 | **小** |
+| W3 | **`strategy.jsx:503-506` 渲染字面量 `null`** | 回测指标缺失时卡片显示 `null%` | 传 `"—"` 或用 `formatter` | **极小** |
+| W4 | **固定文案当成事实**：`settings.jsx:1314`「LIVE 大额订单需双人复核」（**无实现**）、`execution.jsx:34/1042/1066` TTL 回退 120s、`brain.jsx:252`「0 条」、`risk.jsx:686`「满刻度 30%」 | 用户会把未实现的风控/参数当既有控制 | 加「未实现/未取到」标注，或删除该文案 | **小** |
+| W5 | **`/api/v3/settings` 数据源状态自相矛盾**（`v3_ops.py:1323-1325` 写死 `SEC EDGAR available:false`；`:1328-1330` 要求 `tushare` **包**可导入） | 与事实相反（实测 `source=sec/companyconcept`；Tushare 走 HTTP 不需要包） | SEC 改为按 `v3_sources` 真实探测；Tushare 判据去掉 `_module_available('tushare')` | **小** |
+| W6 | **新发现 N1：前端把不存在的包当数据源名**（`market.jsx:726-727`、`overview.jsx:536` 的「dsh-quant-data-mcp（workbench 工具面）」） | 验收人会误判第 5 个开源源已接入 | 改成真实名称（如「平台工作台工具面（quantwb MCP）」） | **极小** |
+| W7 | **`docs/v3-integration.md` 已过时**（称页面在 `platform/web/public/v3/`、`/` 307 跳 `/v3/index.html`、`bash platform/tools/verify_pages.sh`） | 该目录已不存在（现为 `platform/web-pro`）→ 文档把人引到错路径 | 更新 §二·五/§三/§四 | **小** |
+| W8 | **杠杆/流动性事中口径**（已升为真缺口 G4）与 **建仓至今无 `blocked_industry` 实例** | 闸门在线但从未实际阻断过一笔（只阻断在「下一个订单」上） | 用一个只读构造订单过 `check_order` 打印 reasons（`platform/deploy/monitoring/verify_industry_gate.py` 已有该脚本） | **极小** |
 
 ## 四、过度实现 / 偏离清单
 
@@ -166,7 +347,7 @@
 | O2 | **V3→MCP 反向桥**（`v3_mcp.py`，把 39 条 `/api/v3/*` 路由暴露成 MCP 工具） | 规格只要「一个平台 MCP server 暴露量化工具」；本实现是**把已存在的 HTTP 面镜像成 MCP**（同一函数对象，无第二份业务逻辑） | `app.py:1032` `v3_mcp.register(app.state.mcp, app)`；**已重启生效**：`tools/list` = 116（77 + 39），只读标注 36 件；对应用户指令「所有跟平台的交互都走 mcp 接口」。adapter 已从 `quant-headless` 全部安装材料中删除 |
 | O3 | **SQLite 持久化替代 PostgreSQL/Redis** | 规格 §5.1 要 PG + Redis；本实现单文件 SQLite + 文件冷备 | 用户授权（「数据库可先用 sqllite」）；`v3_db.py:119` `TABLE_SPECS`；`docs/e2e-and-data-gaps.md` 第四轮 §7 |
 | O4 | **富途限流治理**（令牌桶 + 单飞 + 退避 + 冷却 + 统一 `futu/rate-limited` 信封） | 规格未要求 | `platform/server/v3_ratelimit.py`（833 行）+ `test_v3_ratelimit.py`（40 例）；`app.py:906` `is_futu_endpoint` 分流 |
-| O5 | **三市场过滤 + 分市场基准 + 交易日历/节假日自动获取** | 规格未要求（只泛提「交易日历」） | `?market=SH|HK|US`（`app.py:984-1022`）；`v3_calendar_source.py`（785 行，链：进程内 TTL → 磁盘 → 富途 `info_trading_days` → AKShare → 人工兜底）；实测 `/api/v3/markets/calendar` → `source="platform/market_calendar"`、`holidays_loaded`、`calendar_source` |
+| O5 | **三市场过滤 + 分市场基准 + 交易日历/节假日自动获取** | 规格未要求（只泛提「交易日历」） | `?market=SH\|HK\|US`（`app.py:984-1022`）；`v3_calendar_source.py`（785 行，链：进程内 TTL → 磁盘 → 富途 `info_trading_days` → AKShare → 人工兜底）；实测 `/api/v3/markets/calendar` → `source="platform/market_calendar"`、`holidays_loaded`、`calendar_source` |
 | O6 | **研报页 + PDF/Markdown 导出** | 规格 §3.6 未列研报页 | `v3_research.py:121/160/229`（含服务端 PDF 生成）；前端 `pages/research.jsx`（第 10 页，规格 7 类里没有） |
 | O7 | **ML 用 numpy 实现替代 sklearn/LightGBM** | 规格点名 Lasso/LightGBM/MLP | `v3_ml.py:1`（实现名 `numpy-lasso`/`numpy-gbdt-lite`/`numpy-mlp`），`docs/e2e-and-data-gaps.md` 第五轮如实标注 `impl`；**口径偏离但声明诚实** |
 | O8 | **`source` 字段不按规格写死** | 规格备注写死 `source=futu/quote_history_kline` | 实现上报**真实来源**（`_dominant_source`，逐标的 `sources` 另附）；文档已登记此有意偏离 |
@@ -250,7 +431,10 @@ gateway / tools / settings / research`。结论：**未发现「示例数据」�
 
 ---
 
-## 七、本次未能验证的条目与原因
+## 七、本次未能验证的条目与原因（**第一轮归档；第二轮收敛见文首 §2.4**）
+
+> 第二轮已收敛 1 条（`FR-DATA-001` 条件单 → 契约层已实现），新增 1 条实测反例（MCP 均值延迟 2.384 s > 规格 2 s）；
+> 其余仍无法验证。
 
 | 条目 | 为什么没验证 |
 |---|---|
@@ -264,7 +448,12 @@ gateway / tools / settings / research`。结论：**未发现「示例数据」�
 
 ---
 
-## 八、一页结论
+## 八、一页结论（**第一轮归档；当前口径见文首 §2.1 与 §2.6**）
+
+> 第二轮修正：对齐 5→**3**、部分 21→**25**、缺失 2→**1**、不适用 2→**1**、未验证 1→1；
+> 4 条状态变化（`FR-GATEWAY-001` 部分、`FR-TOOLS-001` 部分、`FR-TOOLS-002` 部分、`FR-EXEC-003` 部分）
+> 与 2 条证据级更正（`FR-STRAT-003` 已上线、`FR-EXEC-002` 行业闸门已在线）。
+> 下为第一轮原文。
 
 1. **「其他能力」整体对齐度：可评 28 条中 26 条对齐或部分对齐（92.9%），完全缺失仅 2 条**——
    `FR-GATEWAY-002`（SDK JSON-RPC 会话通道）与 `FR-TOOLS-002`（AI-native 工具注册规范）。
