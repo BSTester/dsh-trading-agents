@@ -21,16 +21,23 @@
 from __future__ import annotations
 
 import asyncio
+import random
 import time
 from datetime import datetime, timezone
 
 __all__ = [
+    "AKSHARE_RETRY_ATTEMPTS",
+    "AKSHARE_RETRY_BASE_MS",
+    "AKSHARE_RETRY_MAX_MS",
     "CHAIN_SPECS",
+    "RETRYABLE_ERROR_NAMES",
     "attempts_chain",
     "describe_attempts",
     "failure_of",
+    "is_retryable_akshare",
     "probe_chains",
     "register",
+    "retry_akshare",
     "run_chain",
 ]
 
@@ -246,6 +253,158 @@ def last_error(attempts):
         if isinstance(error, dict) and error:
             return dict(error)
     return {"code": "chain/all-failed", "message": "降级链全部失败（无 error 明细）"}
+
+
+# ── AKShare 专用重试策略 ────────────────────────────────────────────────────────
+# 为什么单独一份：富途那条腿已经由 ``v3_ratelimit`` 统一治理（全局限速 + 单飞 + 退避 +
+# 冷却，见 app.py 的 v3_run 接线）；AKShare 是**免密钥的开源腿**，没有 limiter，
+# 而它的上游（东财/新浪）实测会直接 ``RemoteDisconnected`` 断连。这里只做一件小事：
+# 「连接/超时/5xx 才重试、指数退避 + 抖动、业务错误一次都不重试、每次尝试都留痕」。
+#
+# ``run_chain`` 的签名与语义**一字未改**：重试是链里某一级的内部行为，重试耗尽的真实错误
+# 仍以失败信封交给 ``run_chain`` 去降级。
+
+
+#: 默认重试次数（含首次尝试）：3 次 = 首次 + 2 次重试。
+AKSHARE_RETRY_ATTEMPTS = 3
+#: 首次退避基数与单次退避上限（毫秒，指数增长：1200 → 2400 → 4800…）。
+AKSHARE_RETRY_BASE_MS = 1200
+AKSHARE_RETRY_MAX_MS = 8000
+#: 退避抖动比例（在上一步退避量之上叠加 ``[0, 25%)`` 的随机量；注入 ``rand`` 可控）。
+AKSHARE_JITTER_RATIO = 0.25
+#: 值得重试的异常类名（按 ``type(error).__mro__`` 匹配——requests/urllib3/http.client
+#: 各家实现不同，但类名是一致的；``RemoteDisconnected`` 同时是 ``ConnectionResetError``）。
+RETRYABLE_ERROR_NAMES = frozenset({
+    "ConnectionError", "ConnectionResetError", "ConnectionAbortedError",
+    "ConnectionRefusedError", "BrokenPipeError", "RemoteDisconnected",
+    "TimeoutError", "Timeout", "ConnectTimeout", "ReadTimeout",
+    "URLError", "ProtocolError", "IncompleteRead", "ChunkedEncodingError",
+    "NewConnectionError", "MaxRetryError", "ResponseError", "ClosedPoolError",
+})
+
+
+def _http_status(error):
+    """异常里的 HTTP 状态码（``urllib.error.HTTPError.code`` / httpx 的 ``status_code``）。"""
+    for attr in ("status_code", "code", "status"):
+        value = getattr(error, attr, None)
+        if isinstance(value, bool):  # bool 是 int 的子类，别把 True 当 1
+            continue
+        if isinstance(value, int):
+            return value
+    response = getattr(error, "response", None)
+    if response is not None:
+        for attr in ("status_code", "status"):
+            value = getattr(response, attr, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+    return None
+
+
+def is_retryable_akshare(error):
+    """异常是否值得重试（**保守**：只认连接类/超时类/HTTP 5xx）。
+
+    业务性错误（参数错、KeyError、ValueError、HTTP 4xx、解析失败…）→ ``False``：
+    重试它们只会让「参数写错」多打三次上游，且把真实错误码淹没在重试里。
+    """
+    if not isinstance(error, BaseException):
+        return False
+    status = _http_status(error)
+    if isinstance(status, int):
+        return 500 <= status < 600
+    names = {cls.__name__ for cls in type(error).__mro__}
+    return bool(names & RETRYABLE_ERROR_NAMES)
+
+
+def is_empty_akshare_result(value):
+    """空结果判定：``None`` / 空容器 / pandas 的 ``.empty``。
+
+    空结果是**业务结果**（源回应了，只是没有数据）→ 不重试，原样透传给调用方，
+    由调用方按「空结果视同失败」的链纪律去降级或如实报错。
+    """
+    if value is None:
+        return True
+    flag = getattr(value, "empty", None)  # pandas.DataFrame / Series
+    if isinstance(flag, bool):
+        return flag
+    if isinstance(value, (str, bytes, list, tuple, set, frozenset, dict)):
+        return len(value) == 0
+    return False
+
+
+def _akshare_backoff_ms(index, base_ms, max_ms, rand):
+    """第 ``index``（1 起）次失败后的退避毫秒数：指数增长 + ``[0,25%)`` 抖动，封顶 ``max_ms``。"""
+    delay = min(float(max_ms), float(base_ms) * (2 ** (index - 1)))
+    return int(min(float(max_ms), delay + rand() * delay * AKSHARE_JITTER_RATIO))
+
+
+def retry_akshare(call, *, attempts=AKSHARE_RETRY_ATTEMPTS, base_ms=AKSHARE_RETRY_BASE_MS,
+                  max_ms=AKSHARE_RETRY_MAX_MS, sleep=time.sleep, clock=time.monotonic,
+                  rand=None, is_empty=None, budget_ms=None):
+    """带超时/重试地调一次 AKShare 取数 → ``(value, attempts_meta)``。
+
+    规则（与任务书逐条对应）:
+
+      * 只对 ``ConnectionError`` / ``RemoteDisconnected`` / ``TimeoutError`` / ``HTTPError 5xx``
+        重试（``is_retryable_akshare``）；**业务性错误不重试**，一次就返回；
+      * 指数退避 + 抖动（``base_ms`` 起、``max_ms`` 封顶），等待走注入的 ``sleep``
+        （参数是**秒**，与 ``time.sleep`` 一致），耗时走注入的 ``clock``（默认 ``time.monotonic``）；
+      * 成功但**空结果**（``None``/空容器/pandas ``.empty``）→ 不重试，原样返回该值
+        （调用方按链纪律处理，见 ``is_empty_akshare_result``）；
+      * 每次尝试都进 ``attempts_meta``：``{attempt, ok, ms, error?, retryable?, wait_ms?}``；
+      * 全失败 → ``(None, attempts_meta)``；``attempts`` 全部用尽或遇到业务错误都走这条返回，
+        因此调用方永远能拿到「重试了几次、每次多久、真实错误原文」。
+
+    ``rand`` 注入替代 ``random.random``（单测据此断言确定性的退避时间）。
+    ``budget_ms`` 是这一级的**时间预算**（默认 ``None`` = 不设限）：已花时间达到预算就
+    **停止重试**，最后一个 attempt 记 ``stopped='budget'``——上游一次调用可能要几十秒
+    （实测新浪现货接口单次 50s），没有这一层，降级链的墙钟预算就形同虚设。
+    """
+    total = max(1, int(attempts))
+    base = max(0.0, float(base_ms))
+    cap = max(base, float(max_ms))
+    rng = random.random if rand is None else rand
+    empty_of = is_empty_akshare_result if is_empty is None else is_empty
+    budget = None if budget_ms is None else max(0.0, float(budget_ms))
+    meta = []
+    started = clock()
+    for index in range(1, total + 1):
+        begin = clock()
+        try:
+            value = call()
+        except Exception as error:  # noqa: BLE001 —— 上游异常按可重试性分类后留痕
+            elapsed = int((clock() - begin) * 1000)
+            retryable = is_retryable_akshare(error)
+            entry = {
+                "attempt": index,
+                "ok": False,
+                "ms": elapsed,
+                "retryable": retryable,
+                "error": {
+                    "code": "akshare/retryable-error" if retryable else "akshare/business-error",
+                    "message": _error_text(error),
+                },
+            }
+            spent = (clock() - started) * 1000
+            if not retryable or index >= total:
+                meta.append(entry)
+                return None, meta
+            if budget is not None and spent >= budget:
+                # 时间预算用尽：**不再重试**，但也如实说明「是预算停的，不是上游好了/业务错」
+                entry["stopped"] = "budget"
+                entry["budget_ms"] = budget
+                meta.append(entry)
+                return None, meta
+            entry["wait_ms"] = _akshare_backoff_ms(index, base, cap, rng)
+            meta.append(entry)
+            sleep(entry["wait_ms"] / 1000.0)
+            continue
+        elapsed = int((clock() - begin) * 1000)
+        entry = {"attempt": index, "ok": True, "ms": elapsed}
+        if empty_of(value):
+            entry["empty"] = True
+        meta.append(entry)
+        return value, meta
+    return None, meta
 
 
 # ── 探测实现 ────────────────────────────────────────────────────────────────────
@@ -495,6 +654,16 @@ def register(app, v3_run, home, deps=None):
         if not isinstance(chains, list):
             return {"ok": False, "error": {"code": "sources/bad-probe",
                                            "message": f"探测器返回了 {type(chains).__name__}，不是链列表"}}
+        # 规格 §8.3：把这次**真实**探测的结果落盘，供 Prometheus 出口 ``/metrics`` 读取。
+        # 理由：``/metrics`` 抓取路径上**不能**再发起外部探测（富途探测要消耗限流额度，
+        # 用监控触发「被限流」告警是自伤），所以降级链指标只能来自「别人已经探测过的结果」。
+        # best-effort：落盘失败不阻断本响应（与仓库其余留痕同义）。
+        #
+        # 惰性 import 是**必须**的：``server.observability`` → ``server.v3_ops`` →
+        # ``server.v3_universe`` → ``server.v3_quality`` → 本模块，顶层 import 会形成
+        # 循环（本模块此时只初始化到一半，``PROBE_CHAIN_TIMEOUT`` 还不存在）。
+        from server.observability import record_datasource_probe
+        record_datasource_probe(home, chains)
         return {
             "ok": True,
             "as_of": now_iso(),

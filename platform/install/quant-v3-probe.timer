@@ -1,0 +1,25 @@
+# 平台监控探测定时器（规格 §8.3；与 quant-v3-probe.service 配套）
+#
+# 只读探测：本单元只触发两个**取数+写缓存**的端点，不触碰任何交易/写端点。
+#
+# 节奏依据
+# --------
+#   * DataSourceProbeStale / RiskIndustryProbeStale 的阈值是 24h / 6h，30 分钟一次
+#     留有巨大余量（机器重启、单次失败都不会把缓存熬过期）；
+#   * 更频繁没有意义：自选池/持仓/行业映射不会分钟级变化，只会白耗富途配额
+#     （每次刷新会按标的数打 ``info_owner_plate``，见 README 的「代价」一节）。
+# 想改成每天一次：把 OnCalendar 换成 ``*-*-* 08:30:00``（每日一次仍能压住 24h 规则）。
+[Unit]
+Description=quant platform probe refresh timer (metrics cache writer)
+
+[Timer]
+# 每小时的第 0、30 分（= 每 30 分钟一次）
+OnCalendar=*:0/30
+# 抖动 30s：避免与其它整点任务（日历刷新、日报）挤在同一秒打上游
+RandomizedDelaySec=30
+# 关机/睡眠错过触发 → 恢复后补跑一次，避免「机器睡一觉醒来缓存已过期」
+Persistent=true
+Unit=quant-v3-probe.service
+
+[Install]
+WantedBy=timers.target

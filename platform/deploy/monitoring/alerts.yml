@@ -1,0 +1,455 @@
+# 量化交易决策平台 V3 · Prometheus 告警规则（规格 §8.3 监控落地）
+#
+# 先读这一节，再看规则——**每条阈值都写明了依据**，没有拍脑袋的数字。
+#
+# 指标来源（全部来自 ``platform/server/observability.py`` 的 ``GET /metrics``，
+# 该出口只读既有事实，不新增第二事实源）：
+#   * 进程/构建      ← observability 自身
+#   * quantwb_mcp_*  ← server.v3_ops.metrics_snapshot()（工作台工具面唯一计数源）
+#   * futu_*         ← server.v3_ratelimit.metrics_view()（限流治理唯一读数口）
+#   * quantwb_oms_*  ← server.v3_ops.OmsLedger.stage_counts()（本地台账，不调上游）
+#   * quantwb_workbench_* / quantwb_risk_*  ← 后台缓存探测（TTL 见 QUANT_METRICS_PROBE_TTL）
+#   * quantwb_scheduler_* / quantwb_push_*  ← app.state 的调度器与推送运行时（与 /healthz 同源）
+#   * quantwb_datasource_*             ← <DSH_HOME>/v3-datasource-probe.json
+#   * quantwb_risk_industry_*          ← <DSH_HOME>/v3-risk-probe.json
+#                                        （POST /api/v3/metrics/probe/refresh 写）
+#
+# 「探测类指标」的新鲜度必须先于取值判断：quantwb_workbench_*、quantwb_datasource_* 与
+# quantwb_risk_industry_* 来自**缓存探测**，缓存过期时保留旧值（行业取值类指标更严：
+# 超过 QUANT_RISK_PROBE_MAX_AGE 默认 6h 时 /metrics 直接不导出）。因此相关规则一律附带
+# ``time() - <probe>_timestamp_seconds < N`` 守卫，避免拿昨天的快照当今天的结论。
+
+groups:
+  # ═══════════════════════════════════════════════════════════════════════
+  # 1. 服务存活（进程级）
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-availability
+    rules:
+      - alert: QuantWorkbenchDown
+        # ``up`` 是 Prometheus 自己生成的合成指标：抓取目标不可达/超时即为 0。
+        # 阈值 2m：单次抓取抖动（GC、后台探测线程抢占）不该立刻告警；
+        # 连续 2 分钟（8 次抓取）全部失败才判定服务不可用。
+        expr: up{job="quantwb-v3"} == 0
+        for: 2m
+        labels:
+          severity: critical
+          domain: platform
+        annotations:
+          summary: "工作台服务 8397 抓取失败（up == 0）"
+          description: >-
+            Prometheus 连续 2 分钟抓不到 {{ $labels.instance }} 的 /metrics。
+            平台服务可能已退出、端口被占用或进程卡死。
+            排查：``ss -ltnp | grep 8397`` → ``cd platform && ~/.dsh/trading-venv/bin/python -m server.run``。
+            注意：重启由运维统一执行，不要为了消警自动重启。
+
+      - alert: QuantWorkbenchRestartLoop
+        # ``quantwb_process_start_time_seconds`` 是 gauge（启动时间戳），
+        # 进程重启会让它**跳变**，因此用 changes() 数「启动时刻变了多少次」。
+        # 阈值 1h 内 ≥ 1 次重启：平台调度器在进程内按交易日跑作业链，
+        # 重启会中断 tick 并可能重复/漏跑当日作业，一次也值得知道。
+        expr: changes(quantwb_process_start_time_seconds[1h]) > 0
+        for: 0m
+        labels:
+          severity: warning
+          domain: platform
+        annotations:
+          summary: "工作台服务在过去 1 小时内重启过"
+          description: >-
+            quantwb_process_start_time_seconds 在 1 小时内变化了
+            {{ $value | humanize }} 次。当前 uptime
+            {{ with query "quantwb_process_uptime_seconds" }}{{ . | first | value | humanizeDuration }}{{ end }}。
+            重启会打断服务内调度器的作业链；若与 QuantWorkbenchDown 同时出现，
+            优先查崩溃原因（日志 + ``dmesg | tail`` 是否有 OOM）。
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 2. 工作台工具面 / 上游（进程活着 ≠ 工具面可用）
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-workbench-upstream
+    rules:
+      - alert: QuantWorkbenchToolfaceUnreachable
+        # ``quantwb_workbench_up`` 来自后台缓存探测：缓存探测真的调了一次只读工具
+        # （``schedule``），拿不到 ``ok=true`` 信封即为 0。
+        # 守卫 300s：探测 TTL 默认 60s，300s 是 5 个 TTL，足够排除「探测还在飞」。
+        # 阈值 2m：与 QuantWorkbenchDown 同量级，避免同一故障刷两条不同结论的告警。
+        expr: >-
+          quantwb_workbench_up == 0
+          and (time() - quantwb_workbench_probe_timestamp_seconds) < 300
+        for: 2m
+        labels:
+          severity: critical
+          domain: platform
+        annotations:
+          summary: "工作台工具面不可达（进程存活，但工具面调用失败）"
+          description: >-
+            缓存探测里工作台只读工具返回了失败信封（错误原文见
+            ``quantwb_workbench_probe_failed`` 的 error 标签，或直接
+            ``curl -s localhost:8397/api/v3/metrics | jq .workbenchUp``）。
+            常见原因：工作台 store/核心桥接不可用、DSH_HOME 指向错误、Node 侧脚本缺失。
+            页面会显示「无数据源」而不是 0——不要用 0 兜底。
+
+      - alert: QuantMcpToolCallFailureRateHigh
+        # 失败率 = errors / calls，两者同源（mcp 与 wb 读同一份计数）。
+        # 阈值 10%，窗口 10m：工作台工具面是只读数据面，偶发单次失败（上游超时、
+        # 单只标的无权限）属正常；持续 >10% 说明某个数据源或整条通道在坏。
+        # 分母为 0 时 ratio 为 NaN，比较为假，天然不会误报。
+        expr: >-
+          rate(quantwb_mcp_errors_total[10m])
+          / rate(quantwb_mcp_calls_total[10m]) > 0.1
+        for: 10m
+        labels:
+          severity: warning
+          domain: platform
+        annotations:
+          summary: "MCP/工具面调用失败率 > 10%（10m）"
+          description: >-
+            近 10 分钟失败率 {{ $value | humanizePercentage }}。
+            逐工具调用量见 ``quantwb_tool_calls_total``；用
+            ``curl -s localhost:8397/api/v3/metrics | jq .mcp.byTool`` 对照定位到具体工具。
+
+      - alert: QuantHttpErrorRateHigh
+        # v3_ops 注册路由的 HTTP 错误率。阈值 5%（比工具面更严）：这些是本进程自己的
+        # 路由，出错没有「上游抖动」的借口。
+        expr: >-
+          rate(quantwb_http_errors_total[10m])
+          / rate(quantwb_http_requests_total[10m]) > 0.05
+        for: 10m
+        labels:
+          severity: warning
+          domain: platform
+        annotations:
+          summary: "V3 运维面 HTTP 错误率 > 5%（10m）"
+          description: "近 10 分钟错误率 {{ $value | humanizePercentage }}（v3_ops 路由）。"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 3. 富途限流（限流治理的唯一读数口）
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-futu-ratelimit
+    rules:
+      - alert: FutuRateLimited
+        # ``futu_rate_limited_total`` 只在**上游真的回了限流错误**时自增。
+        # 阈值「10 分钟内增速 > 0」：限流器的存在意义就是把命中数压到 0
+        # （默认 rate_per_sec=3.0 / burst=3 / max_concurrency=2，见 v3_ratelimit.DEFAULTS），
+        # 只要出现就说明配置的速率高于上游容忍度，后续调用会开始退避+冷却。
+        expr: increase(futu_rate_limited_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+          domain: futu
+        annotations:
+          summary: "富途接口出现限流命中（10m 内 {{ $value | humanize }} 次）"
+          description: >-
+            上游返回了限流错误。处置：调低 QUANT_FUTU_RATE_PER_SEC（默认 3.0）
+            或调低 QUANT_FUTU_MAX_CONCURRENCY（默认 2），并确认没有旁路调用绕过限流器。
+            相关计数：futu_retries_total（退避重试）、futu_throttle_wait_ms_total（主动等待）。
+
+      - alert: FutuCooldownActive
+        # ``futu_cooldown_remaining_ms > 0`` = 限流器正在熔断等待（连续 3 次限流后
+        # 进入冷却，默认 5000ms，见 cooldown_ms / cooldown_after）。
+        # 阈值 1m：冷却本身只有 5s，持续 >1m 说明在**反复**触发冷却，已不是自愈行为。
+        expr: futu_cooldown_remaining_ms > 0
+        for: 1m
+        labels:
+          severity: critical
+          domain: futu
+        annotations:
+          summary: "富途限流器处于冷却中且已持续 > 1m"
+          description: >-
+            剩余冷却 {{ $value | humanizeDuration }}。冷却期间所有富途只读调用快速失败，
+            行情/持仓/审计页会显示「无数据源 + 真实原因」。
+            处置：先停掉可能的重试风暴（长轮询页面、批量巡检脚本），
+            再按 FutuRateLimited 的说明下调速率上限。
+
+      - alert: FutuRequestQueueBacklog
+        # ``futu_queued`` 是当前排队等待放行的调用数（含单飞 waiter）。
+        # 阈值 5 持续 10m：默认 max_concurrency=2，稳态排队应当是 0～2；
+        # 持续 >5 说明上游普遍变慢而调用量没降，接着就会撞限流。
+        # 这是**先于**限流的预警信号。
+        expr: futu_queued > 5
+        for: 10m
+        labels:
+          severity: warning
+          domain: futu
+        annotations:
+          summary: "富途调用排队积压（queued={{ $value }}，持续 10m）"
+          description: >-
+            当前在飞 futu_in_flight={{ with query "futu_in_flight" }}{{ . | first | value }}{{ end }}，
+            排队 {{ $value }}。上游可能变慢或限流；结合 futu_throttle_wait_ms_total 的增速判断。
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 4. 数据源降级链（指标来自真实探测的落盘缓存，必须带新鲜度守卫）
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-datasource-degradation
+    rules:
+      - alert: DataSourceChainUnavailable
+        # ``quantwb_datasource_available{chain} == 0`` = 该链的**主源与降级源全不可用**
+        # （探测把空结果也视同失败，见 v3_fallback.run_chain 的纪律）。
+        # 守卫 24h：这张缓存由 ``GET /api/v3/sources/status`` 落盘（人工或定时器触发，
+        # 不是每次抓取都探测——富途探测要消耗限流额度）。超过 24h 没探测就没有结论可言，
+        # 此时静默比拿旧结论告警更诚实。
+        expr: >-
+          quantwb_datasource_available == 0
+          and (time() - quantwb_datasource_probe_timestamp_seconds) < 86400
+        for: 15m
+        labels:
+          severity: critical
+          domain: data
+        annotations:
+          summary: "数据源降级链完全不可用：{{ $labels.chain }}"
+          description: >-
+            链 {{ $labels.chain }} 的主源与降级源都没取到数据
+            （最近命中来源见 ``quantwb_datasource_probe_info`` 的 source 标签）。
+            处置：``curl -s 'localhost:8397/api/v3/sources/status?keys={{ $labels.chain }}'``
+            看逐级 attempts 的真实错误原文；页面会显式标注「无数据源」，不要用估算值顶替。
+
+      - alert: DataSourceFellBackToSecondary
+        # ``quantwb_datasource_is_fallback == 1`` = 主源没取到数、由降级源兜住了。
+        # 数据仍然真实（有 as_of 与 source 标注），但「主源坏了」这件事必须被人看见，
+        # 否则降级源一旦也挂就是 DataSourceChainUnavailable。
+        expr: >-
+          quantwb_datasource_is_fallback == 1
+          and (time() - quantwb_datasource_probe_timestamp_seconds) < 86400
+        for: 30m
+        labels:
+          severity: warning
+          domain: data
+        annotations:
+          summary: "数据源已降级到备源：{{ $labels.chain }}"
+          description: >-
+            主源不可用，当前由降级源供数（来源见 quantwb_datasource_probe_info）。
+            若长期停在降级源，需修主源——降级源的口径/时点可能与主源不同，
+            研究结论的可比性会受影响。
+
+      - alert: DataSourceProbeStale
+        # 缓存本身过期（> 24h 未探测）→ 上面两条告警会静默，这是**可见性缺口**，
+        # 必须自己报警，否则「监控不响」会被误读成「一切正常」。
+        expr: >-
+          quantwb_datasource_chains > 0
+          and (time() - quantwb_datasource_probe_timestamp_seconds) > 86400
+        for: 1h
+        labels:
+          severity: info
+          domain: data
+        annotations:
+          summary: "数据源探测缓存已过期 > 24h，降级链告警处于静默状态"
+          description: >-
+            需要有人/定时器跑一次
+            ``curl -s localhost:8397/api/v3/sources/status``（该端点会做真实的
+            主源→降级源逐级探测，最坏 ~45s，见 v3_fallback.PROBE_CHAIN_TIMEOUT）。
+            跑完缓存即刷新，降级链指标恢复有效。
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 5. 风控红线（持仓 / 订单）
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-risk-redlines
+    rules:
+      - alert: RiskDrawdownRedLineBreached
+        # 阈值 15%：这是**平台自己的红线常数**（v3_ops.LIMITS["drawdownPct"] = 15.0），
+        # 不是外部拍的。check_order 在该值上直接判 blocked（强制阻断）。
+        # 指标值来自缓存探测读到的模拟台账 max_drawdown（比例制自动换算成百分数）。
+        expr: quantwb_risk_drawdown_pct >= 15
+        for: 5m
+        labels:
+          severity: critical
+          domain: risk
+        annotations:
+          summary: "模拟台账回撤 {{ $value | humanize }}% 已触及 15% 红线"
+          description: >-
+            平台风控在回撤 >= 15% 时强制阻断新单（v3_ops.check_order）。
+            处置：先看 ``/api/v3/risk/analytics`` 与 ``/api/v3/oms/orders`` 的真实口径，
+            再决定是否人工降仓；**不要**改 LIMITS 常量来消警。
+
+      - alert: RiskDrawdownApproachingRedLine
+        # 阈值 12% = 红线的 80%，留出处置时间（回撤 12%→15% 往往只需一个交易日）。
+        expr: quantwb_risk_drawdown_pct >= 12
+        for: 15m
+        labels:
+          severity: warning
+          domain: risk
+        annotations:
+          summary: "模拟台账回撤 {{ $value | humanize }}%，接近 15% 红线"
+          description: "已到红线的 80%。建议人工复核仓位与止损纪律。"
+
+      - alert: RiskBlockedOrderAppeared
+        # ``quantwb_oms_orders{stage="blocked"}`` 自增 = 有订单被 check_order 判 blocked
+        # （行业集中度 > 20% 或回撤 >= 15%）。这是**风控真的拦下了东西**，
+        # 属于必须被人看到的事件级事实，而不是可以自愈的指标。
+        # 用 delta() 而非 increase()：它是 gauge（台账当前阶段分布），不是计数器。
+        expr: delta(quantwb_oms_orders{stage="blocked"}[1h]) > 0
+        for: 0m
+        labels:
+          severity: critical
+          domain: risk
+        annotations:
+          summary: "过去 1 小时出现被风控强制阻断的订单"
+          description: >-
+            台账 blocked 阶段新增 {{ $value | humanize }} 单。
+            查 ``/api/v3/oms/orders`` 的 stages.blocked 与 reasons 原文。
+
+      - alert: RiskPendingManualConfirmation
+        # ``stage="manual"`` = 超过单笔 2% 红线、需要人工确认的单（v3_ops LIMITS.singlePct）。
+        # 阈值 30m：不是故障，是「有人在等确认」，超半小时说明可能被漏看。
+        expr: quantwb_oms_orders{stage="manual"} > 0
+        for: 30m
+        labels:
+          severity: info
+          domain: risk
+        annotations:
+          summary: "有 {{ $value }} 单等待人工确认，已持续 30 分钟"
+          description: >-
+            单笔占比 > 2% 的订单走人工确认（业务确认 TTL 120s，超时=拒绝 fail-closed）。
+            持续挂着的通常是被拒后重新入账的同一批，核对 ``/api/v3/execution``。
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 5b. 行业集中度红线（指标来自**落盘探测缓存**，抓取路径不发富途探测）
+  #
+  # 数据链路：POST /api/v3/metrics/probe/refresh（或 quant-v3-probe.timer 定时触发）
+  #   → v3_industry.industry_exposure 逐市场只读取数
+  #   → <DSH_HOME>/v3-risk-probe.json
+  #   → GET /metrics 只读该文件 → quantwb_risk_industry_*
+  # 缓存超过 QUANT_RISK_PROBE_MAX_AGE（默认 6h）时 /metrics 根本**不导出**取值类指标，
+  # 因此下面每条取值规则都带 time() 新鲜度守卫（到期后规则不响，而不是拿旧值下结论）。
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-risk-industry
+    rules:
+      - alert: RiskIndustryConcentrationBreached
+        # 阈值 20% = 平台自己的行业集中度红线常数（v3_ops.LIMITS["industryPct"] = 20.0），
+        # 不是外部拍的；check_order 在该值上直接判 blocked。
+        # 守卫 6h = QUANT_RISK_PROBE_MAX_AGE 默认值（缓存更旧时该指标压根不导出）。
+        expr: >-
+          quantwb_risk_industry_pct{scope="max"} > 20
+          and (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
+        for: 5m
+        labels:
+          severity: critical
+          domain: risk
+        annotations:
+          summary: "行业集中度 {{ $value | humanize }}% 超过 20% 红线（scope={{ $labels.scope }}）"
+          description: >-
+            行业暴露最高值 {{ $value | humanize }}% 已超平台 20% 行业集中度红线
+            （最高行业与板块来源见 quantwb_risk_industry_probe_info 的
+            industry / source 标签）。
+            注意：``quantwb_risk_industry_missing > 0`` 时该读数是**下界**（有标的没取到行业分类），
+            真实集中度只会更高。复核用
+            ``curl -s 'localhost:8397/api/v3/risk/industry?market=<市场>&limit_pct=20'``。
+            **已知口径缺口**：平台 ``check_order`` 的 ``context()["industry_pct"]`` 仍是 0.0，
+            所以本告警会响、但下单闸门不会因此阻断——这是**观测先行**，不要靠它消警。
+
+      - alert: RiskIndustryConcentrationApproaching
+        # 阈值 15% = 20% 红线的 75%，留出调整仓位的处置时间（等权 8 只自选池里
+        # 两个同行业标的就会到 25%，集中度是**跳变**的，不是缓慢漂移）。
+        expr: >-
+          quantwb_risk_industry_pct{scope="max"} > 15
+          and (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
+        for: 15m
+        labels:
+          severity: warning
+          domain: risk
+        annotations:
+          summary: "行业集中度 {{ $value | humanize }}%，接近 20% 红线（scope={{ $labels.scope }}）"
+          description: >-
+            已到红线的 75% 以上。行业映射来自富途板块（sources.plate），权重来自平台组合口径——
+            若自选池/持仓刚变动，重跑一次
+            ``curl -fsS -X POST 'localhost:8397/api/v3/metrics/probe/refresh'`` 刷新缓存。
+
+      - alert: RiskIndustryProbeFailed
+        # ``quantwb_risk_industry_probe_failed`` 只在缓存里 error 非空时导出（值恒 1，
+        # 原因在 error 标签）。「该市场本来就没有标的」（industry/no-universe）**不算失败**，
+        # 如实记进缓存的 per_market，不会触发本告警。
+        # 守卫 6h：缓存过期后该 info 指标仍在（时间戳也还在），没有守卫会永远响。
+        expr: >-
+          quantwb_risk_industry_probe_failed == 1
+          and (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
+        for: 15m
+        labels:
+          severity: warning
+          domain: data
+        annotations:
+          summary: "行业暴露探测失败（缓存里的 error 字段非空）"
+          description: >-
+            错误原文见该指标的 error 标签（各市场失败原因合并）。常见原因：富途限流
+            （看 futu_rate_limited_total / futu_cooldown_remaining_ms）、板块接口权限、
+            DSH_HOME 指向错误。探测端点：
+            ``curl -fsS -X POST 'localhost:8397/api/v3/metrics/probe/refresh'``。
+            失败期间 quantwb_risk_industry_pct 可能缺席——缺席不等于「没超限」。
+
+      - alert: RiskIndustryProbeStale
+        # 与 DataSourceProbeStale 同一个存在理由：缓存过期后行业红线告警会静默，
+        # 必须让「监控不响」本身可见，否则会被误读成「一切正常」。
+        expr: >-
+          quantwb_risk_industry_probe_timestamp_seconds > 0
+          and (time() - quantwb_risk_industry_probe_timestamp_seconds) > 21600
+        for: 1h
+        labels:
+          severity: info
+          domain: risk
+        annotations:
+          summary: "行业暴露探测缓存已过期 > 6h，行业红线告警处于静默状态"
+          description: >-
+            需要有人/定时器跑一次
+            ``curl -fsS -X POST 'localhost:8397/api/v3/metrics/probe/refresh'``
+            （真实只读取数，按标的数打富途，最坏一分钟级）。定时器素材见
+            platform/install/quant-v3-probe.timer；跑完缓存即刷新。
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 6. 调度器 / 推送（旁路，但断了会静默降级）
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-scheduler-push
+    rules:
+      - alert: QuantSchedulerThreadDead
+        # 调度器线程负责按交易日历跑作业链（sync→quality→factors_snapshot）。
+        # 线程死了不会有任何其它信号——作业只是「今天不跑」，页面还显示上一次的成功结果。
+        # 因此这条必须存在。阈值 5m：线程随 lifespan 启停，短时抖动不该报。
+        expr: quantwb_scheduler_alive == 0
+        for: 5m
+        labels:
+          severity: critical
+          domain: platform
+        annotations:
+          summary: "服务内调度器线程已停止（作业链不会再触发）"
+          description: >-
+            /healthz 的 scheduler.alive 同步为 false。
+            处置：查服务日志里 lifespan 启动是否异常；重启由运维执行。
+
+      - alert: QuantSchedulerRecentError
+        # ``last_error`` 语义是「最近一次 tick 异常记录，成功**不清除**」
+        # （与 /healthz 同口径，见 server/scheduler.py 的注释）。
+        # 所以这是一条「需要人看过并确认」的告警，不是持续故障——阈值 30m 后
+        # 由人负责 ack，不要靠它自愈。
+        expr: quantwb_scheduler_last_error == 1
+        for: 30m
+        labels:
+          severity: warning
+          domain: platform
+        annotations:
+          summary: "调度器存在未清除的 tick 异常记录"
+          description: >-
+            该标记成功不清除，代表「曾经出过错且还没人处理」。
+            错误原文在 ``curl -s localhost:8397/healthz | jq .scheduler.last_error``，
+            完整 traceback 在服务日志与 kv ``daemon:last_error``。
+
+      - alert: QuantPushChannelDisconnected
+        # 富途 WS 推送是**旁路加速**（事件仅加速 OMS 状态迁移，不作唯一事实源，
+        # 对账兜底轮询保留）。所以断连不致命，但会让成交/委托状态晚一步可见。
+        # 阈值 5m：正常重连是秒级。
+        expr: quantwb_push_connected == 0
+        for: 5m
+        labels:
+          severity: warning
+          domain: futu
+        annotations:
+          summary: "富途 WS 推送通道断开：{{ $labels.channel }}"
+          description: >-
+            channel={{ $labels.channel }} 已断开/未鉴权超过 5 分钟。
+            交易状态仍由对账兜底轮询收敛，不会丢单，但可见性变差。
+            查 ``curl -s localhost:8397/healthz | jq .push``。
+
+      - alert: QuantPushReconnectFlapping
+        # 15 分钟内重连 > 2 次 = 连接不稳（网络抖动或上游主动踢）。
+        expr: increase(quantwb_push_reconnects_total[15m]) > 2
+        for: 0m
+        labels:
+          severity: warning
+          domain: futu
+        annotations:
+          summary: "富途 WS 通道频繁重连：{{ $labels.channel }}"
+          description: "近 15 分钟重连 {{ $value | humanize }} 次，连接质量不稳定。"

@@ -1,0 +1,77 @@
+# 量化交易决策平台 V3 · Prometheus 抓取配置（规格 §8.3 监控落地）
+#
+# 抓取目标：平台服务 http://127.0.0.1:8397 的 Prometheus 文本出口 ``GET /metrics``
+# （实现见 ``platform/server/observability.py``；指标名以该出口的真实输出为准，
+#  完整清单见同目录 README.md 的「指标清单」一节）。
+#
+# 用法（详见同目录 README.md）：
+#   prometheus --config.file=platform/deploy/monitoring/prometheus.yml
+# 或容器（**必须 --network host**，理由见下面 scrape_configs 里的注释）：
+#   docker run --rm -p 9090:9090 --network host \
+#     -v "$PWD/platform/deploy/monitoring:/etc/prometheus:ro" \
+#     prom/prometheus --config.file=/etc/prometheus/prometheus.yml
+
+global:
+  # 15s 与平台侧的探测缓存（QUANT_METRICS_PROBE_TTL，默认 60s）错开一个量级：
+  # 抓取很便宜（只读进程内计数 + 一个本地 JSON），真实探测由缓存决定频率。
+  scrape_interval: 15s
+  # 规则求值间隔：告警的 ``for:`` 都按分钟计，15s 足够且不浪费。
+  evaluation_interval: 15s
+  external_labels:
+    platform: quantwb-v3
+    deployment: local
+
+rule_files:
+  - alerts.yml
+
+# 告警出口。默认**不接** Alertmanager（本机没有），仅靠 Prometheus 自身的
+# ``/alerts`` 页面与日志；要接就把下面取消注释并部署 Alertmanager。
+# alerting:
+#   alertmanagers:
+#     - static_configs:
+#         - targets: ['127.0.0.1:9093']
+
+scrape_configs:
+  - job_name: quantwb-v3
+    metrics_path: /metrics
+    scheme: http
+    scrape_interval: 15s
+    # 必须 > 平台侧一次抓取的最坏耗时。``/metrics`` **从不阻塞**在探测上
+    # （过期缓存交后台线程刷新，当次返回上一次快照），所以正常耗时是毫秒级；
+    # 10s 是给「工作台工具面卡住」这种情况留的余量。
+    scrape_timeout: 10s
+    static_configs:
+      # ── 本机（Prometheus 与平台服务同机）────────────────────────────────
+      - targets: ['127.0.0.1:8397']
+        labels:
+          service: quant-workbench
+          component: platform-api
+          tier: platform
+
+      # ── 容器内抓本机：**必须用 --network host** ──────────────────────────
+      # 平台服务默认只监听回环（``server/config.py``: DEFAULTS["host"]="127.0.0.1"），
+      # 所以 bridge 网络下即使写 host.docker.internal 也**连不上**——host-gateway 是
+      # 宿主在 docker 网桥上的地址，而服务根本没绑到那个地址上。两条可行路径：
+      #
+      #   ① 容器共享宿主网络栈（Linux 推荐，最省事）：
+      #        docker run --rm --network host -v ...:/etc/prometheus:ro prom/prometheus
+      #      此时 127.0.0.1:8397 **就是**宿主回环，下面的 targets 一字不用改。
+      #
+      #   ② 让服务也监听全地址（会扩大暴露面，需自行加防火墙/令牌）：
+      #      平台**没有** host 环境变量（``server/config.py`` 只认 ``TRADING_SERVICE_PORT``
+      #      这一个环境变量），host 只能落配置文件 ``<DSH_HOME>/trading-platform.json``：
+      #        {"service": {"host": "0.0.0.0", "port": 8397}}
+      #      改完需**重启服务**才生效。随后把 targets 改成：
+      #        - targets: ['host.docker.internal:8397']
+      #      且容器需要 extra_hosts: ["host.docker.internal:host-gateway"]（Linux）。
+      #
+      # 注意：``/metrics`` **不在** `/api/` 前缀下，因此不受工作台 Bearer token 中间件
+      # 保护（它是存活探针的同级读端点）。若把平台前置到反向代理后暴露公网，
+      # 请在代理层为 /metrics 单独加访问控制。
+
+  # 自监控：Prometheus 自己的指标（可去掉）
+  - job_name: prometheus
+    static_configs:
+      - targets: ['127.0.0.1:9090']
+        labels:
+          service: prometheus

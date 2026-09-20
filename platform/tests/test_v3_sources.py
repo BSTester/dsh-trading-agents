@@ -25,7 +25,7 @@ import unittest
 from datetime import date, timedelta
 from unittest import mock
 
-from server import v3_sources
+from server import v3_fallback, v3_sources
 
 
 # ── 测试替身 ───────────────────────────────────────────────────────────────────
@@ -776,6 +776,367 @@ class RegisterContractTests(BlockRealNetwork):
             for name, module in saved.items():
                 if module is not None:
                     sys.modules[name] = module
+
+
+# ── AKShare 自动重试（v3_fallback.retry_akshare，2026-09-21）────────────────────
+
+
+class TickingClock:
+    """每次读都前进 ``step`` 秒的假时钟（与 ``time.monotonic`` 同单位，用来断言 ``ms``）。"""
+
+    def __init__(self, step=0.1):
+        self.now = 0.0
+        self.step = step
+
+    def __call__(self):
+        value = self.now
+        self.now += self.step
+        return value
+
+
+def remote_disconnected():
+    """真机实测的上游断连异常（``RemoteDisconnected`` 是 ``ConnectionResetError`` 子类）。"""
+    from http.client import RemoteDisconnected
+
+    return RemoteDisconnected("Remote end closed connection without response")
+
+
+class RetryAkshareTests(unittest.TestCase):
+    """重试策略：连接/超时/5xx 才重试；业务错误与空结果不重试；退避可注入、可断言。"""
+
+    def test_first_failure_then_success_retries_once(self):
+        state = {"calls": 0}
+
+        def flaky():
+            state["calls"] += 1
+            if state["calls"] == 1:
+                raise remote_disconnected()
+            return [{"代码": "600519"}]
+
+        sleeps = []
+        value, meta = v3_fallback.retry_akshare(flaky, sleep=sleeps.append, rand=lambda: 0.0)
+        self.assertEqual(value, [{"代码": "600519"}])
+        self.assertEqual([item["attempt"] for item in meta], [1, 2])
+        self.assertFalse(meta[0]["ok"])
+        self.assertTrue(meta[0]["retryable"])
+        self.assertEqual(meta[0]["wait_ms"], v3_fallback.AKSHARE_RETRY_BASE_MS)
+        self.assertIn("RemoteDisconnected", meta[0]["error"]["message"])
+        self.assertTrue(meta[1]["ok"])
+        self.assertEqual(sleeps, [v3_fallback.AKSHARE_RETRY_BASE_MS / 1000.0])
+
+    def test_three_failures_return_none_with_full_attempts(self):
+        calls = []
+
+        def always():
+            calls.append(1)
+            raise ConnectionError("('Connection aborted.', RemoteDisconnected('x'))")
+
+        value, meta = v3_fallback.retry_akshare(always, attempts=3, base_ms=100, max_ms=250,
+                                               sleep=lambda _s: None, rand=lambda: 0.0)
+        self.assertIsNone(value)
+        self.assertEqual(len(meta), 3)
+        self.assertEqual(len(calls), 3)
+        self.assertEqual([item.get("wait_ms") for item in meta if item.get("wait_ms")], [100, 200],
+                         "第三次用尽即返回，不再等待")
+        for item in meta:
+            self.assertFalse(item["ok"])
+            self.assertIn("RemoteDisconnected", item["error"]["message"])
+
+    def test_business_error_is_not_retried(self):
+        calls = []
+
+        def bad_args():
+            calls.append(1)
+            raise ValueError("symbol 参数非法")
+
+        value, meta = v3_fallback.retry_akshare(bad_args, sleep=lambda _s: (_ for _ in ()).throw(
+            AssertionError("业务错误不得等待退避")), rand=lambda: 0.0)
+        self.assertIsNone(value)
+        self.assertEqual(len(calls), 1, "业务错误只尝试一次")
+        self.assertEqual(len(meta), 1)
+        self.assertFalse(meta[0]["retryable"])
+        self.assertEqual(meta[0]["error"]["code"], "akshare/business-error")
+        self.assertIn("ValueError", meta[0]["error"]["message"])
+        self.assertNotIn("wait_ms", meta[0])
+
+    def test_backoff_is_exponential_with_jitter_and_capped(self):
+        sleeps = []
+
+        def always():
+            raise TimeoutError("read timeout")
+
+        value, meta = v3_fallback.retry_akshare(always, attempts=4, base_ms=100, max_ms=250,
+                                               sleep=sleeps.append, rand=lambda: 0.0)
+        self.assertIsNone(value)
+        self.assertEqual(sleeps, [0.1, 0.2, 0.25], "100 → 200 → 封顶 250")
+        sleeps.clear()
+        v3_fallback.retry_akshare(always, attempts=3, base_ms=100, max_ms=8000,
+                                  sleep=sleeps.append, rand=lambda: 0.5)
+        self.assertEqual(sleeps, [0.112, 0.225], "叠加 [0,25%) 抖动（毫秒取整）")
+
+    def test_ms_comes_from_injected_clock(self):
+        def always():
+            raise TimeoutError("t")
+
+        _value, meta = v3_fallback.retry_akshare(always, attempts=2, base_ms=10,
+                                                sleep=lambda _s: None, clock=TickingClock(0.25),
+                                                rand=lambda: 0.0)
+        self.assertEqual([item["ms"] for item in meta], [250, 250])
+
+    def test_empty_result_is_returned_without_retry(self):
+        calls = []
+
+        def empty():
+            calls.append(1)
+            return []
+
+        value, meta = v3_fallback.retry_akshare(empty, sleep=lambda _s: None)
+        self.assertEqual(value, [])
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(len(meta), 1)
+        self.assertTrue(meta[0]["ok"])
+        self.assertTrue(meta[0]["empty"])
+
+    def test_http_status_classification(self):
+        import urllib.error
+
+        def http(code):
+            return urllib.error.HTTPError("http://x", code, "err", {}, None)
+
+        self.assertTrue(v3_fallback.is_retryable_akshare(http(503)))
+        self.assertTrue(v3_fallback.is_retryable_akshare(remote_disconnected()))
+        self.assertTrue(v3_fallback.is_retryable_akshare(TimeoutError("t")))
+        self.assertFalse(v3_fallback.is_retryable_akshare(http(404)), "4xx 是业务错误，不重试")
+        self.assertFalse(v3_fallback.is_retryable_akshare(ValueError("bad")))
+        self.assertFalse(v3_fallback.is_retryable_akshare(None))
+        self.assertEqual(v3_fallback.RETRYABLE_ERROR_NAMES & {"ConnectionError", "TimeoutError"},
+                         {"ConnectionError", "TimeoutError"})
+
+    def test_budget_stops_retrying_without_dishonest_success(self):
+        calls = []
+
+        def slow():
+            calls.append(1)
+            raise TimeoutError("slow timeout")
+
+        value, meta = v3_fallback.retry_akshare(slow, attempts=5, base_ms=10,
+                                               sleep=lambda _s: None, clock=TickingClock(0.3),
+                                               rand=lambda: 0.0, budget_ms=250)
+        self.assertIsNone(value)
+        self.assertEqual(len(calls), 1, "已花时间达到预算 → 不再重试")
+        self.assertEqual(meta[-1]["stopped"], "budget")
+        self.assertEqual(meta[-1]["budget_ms"], 250)
+        # 没有预算时同样的调用会一直试到 attempts 次
+        _value, meta_all = v3_fallback.retry_akshare(slow, attempts=3, base_ms=10,
+                                                    sleep=lambda _s: None, clock=TickingClock(0.3),
+                                                    rand=lambda: 0.0)
+        self.assertEqual(len(meta_all), 3)
+
+    def test_defaults_match_the_contract(self):
+        self.assertEqual(v3_fallback.AKSHARE_RETRY_ATTEMPTS, 3)
+        self.assertEqual(v3_fallback.AKSHARE_RETRY_BASE_MS, 1200)
+        self.assertEqual(v3_fallback.AKSHARE_RETRY_MAX_MS, 8000)
+
+
+# ── /api/v3/spot 多接口降级（2026-09-21）────────────────────────────────────────
+
+
+def spot_retry(**overrides):
+    """注入式重试参数：不真等、退避确定（单测断言用）。"""
+    options = {"attempts": 2, "base_ms": 10, "sleep": lambda _s: None, "rand": lambda: 0.0}
+    options.update(overrides)
+    return options
+
+
+class FakeSpotAkshare:
+    """假 akshare 现货面：每个接口一份「脚本」（列表按序消费，最后一个重复）。
+
+    脚本项是异常 → 抛；否则作为返回值。未在 ``responses`` 里出现的接口=该版本没有这个函数。
+    """
+
+    def __init__(self, responses=None):
+        self.responses = dict(responses or {})
+        self.calls = []
+        for name in self.responses:
+            setattr(self, name, self._make(name))
+
+    def _make(self, name):
+        queue = list(self.responses[name])
+
+        def func(*_args, **_kwargs):
+            self.calls.append(name)
+            step = queue[0] if len(queue) == 1 else queue.pop(0)
+            if isinstance(step, BaseException):
+                raise step
+            return step
+
+        return func
+
+    def calls_of(self, name):
+        return [item for item in self.calls if item == name]
+
+
+SINA_ROWS = [{"代码": "sh600519", "名称": "贵州茅台", "最新价": 1500.5, "涨跌幅": -1.25,
+              "换手率": 0.42, "市盈率": 22.3, "市净率": 7.8}]
+
+
+class SpotFallbackTests(BlockRealNetwork):
+    def build_spot(self, responses, **deps_kwargs):
+        ak = FakeSpotAkshare(responses)
+        deps_kwargs.setdefault("akshare_retry", spot_retry())
+        self.build(v3_sources.Deps(akshare=ak, home=self.tmp, **deps_kwargs))
+        self.ak = ak
+        return ak
+
+    def test_first_interface_failing_falls_back_in_declared_order(self):
+        self.build_spot({"stock_zh_a_spot_em": [remote_disconnected()],
+                         "stock_sh_a_spot_em": [[{"代码": "600519", "名称": "贵州茅台",
+                                                  "最新价": 1500.5, "涨跌幅": -1.25,
+                                                  "换手率": 0.42, "量比": 1.08,
+                                                  "市盈率-动态": 22.3, "市净率": 7.8}]]})
+        payload = self.call("/api/v3/spot", limit=10)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["source"], "akshare/stock_sh_a_spot_em")
+        self.assertEqual(payload["used_source"], "akshare/stock_sh_a_spot_em")
+        self.assertEqual([item["source"] for item in payload["chain"]],
+                         ["akshare/stock_zh_a_spot_em", "akshare/stock_sh_a_spot_em"])
+        self.assertFalse(payload["chain"][0]["ok"])
+        self.assertTrue(payload["chain"][1]["ok"])
+        # 第一个接口重试了 2 次（attempts=2），明细进 chain[0].attempts
+        self.assertEqual(self.ak.calls_of("stock_zh_a_spot_em"), ["stock_zh_a_spot_em"] * 2)
+        self.assertEqual(len(payload["chain"][0]["attempts"]), 2)
+        self.assertIn("RemoteDisconnected", payload["chain"][0]["error"]["message"])
+        self.assertEqual(payload["rows"][0]["code"], "600519")
+        self.assertEqual(payload["rows"][0]["pe"], 22.3)
+        self.assertEqual(self.ak.calls_of("stock_zh_a_spot"), [], "慢接口不该被白试")
+
+    def test_sina_rows_are_normalized_and_the_slow_interface_goes_last(self):
+        # 只有新浪接口存在（其余版本里没有）→ 命中最后一级，代码归一 + 列名回落
+        self.build_spot({"stock_zh_a_spot": [SINA_ROWS]})
+        payload = self.call("/api/v3/spot", limit=10)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["source"], "akshare/stock_zh_a_spot")
+        self.assertEqual(payload["market_scope"], "A股全市场（新浪，分页接口，最慢）")
+        self.assertEqual([spec["source"] for spec in v3_sources.AKSHARE_SPOT_CHAIN][-1],
+                         "akshare/stock_zh_a_spot", "分页慢接口必须排在链尾")
+        self.assertEqual(payload["rows"][0]["code"], "600519", "sh600519 → 600519")
+        self.assertEqual(payload["rows"][0]["pe"], 22.3, "市盈率 列名回落")
+        self.assertIsNone(payload["rows"][0]["volume_ratio"], "新浪没有量比 → null，不补 0")
+
+    def test_partial_market_fallback_is_labelled_not_mistaken_for_full_market(self):
+        self.build_spot({"stock_zh_a_spot_em": [remote_disconnected()],
+                         "stock_sh_a_spot_em": [remote_disconnected()],
+                         "stock_sz_a_spot_em": [[{"代码": "000001", "名称": "平安银行",
+                                                  "最新价": 10.5}]]})
+        payload = self.call("/api/v3/spot", limit=5)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["source"], "akshare/stock_sz_a_spot_em")
+        self.assertEqual(payload["market_scope"], "深市（分市场接口）")
+        self.assertIn("只覆盖该市场", payload["scope_note"])
+        self.assertEqual([item["source"] for item in payload["chain"]],
+                         ["akshare/stock_zh_a_spot_em", "akshare/stock_sh_a_spot_em",
+                          "akshare/stock_sz_a_spot_em"])
+
+    def test_all_interfaces_fail_reports_every_real_error(self):
+        self.build_spot({"stock_zh_a_spot_em": [remote_disconnected()],
+                         "stock_zh_a_spot": [remote_disconnected()]})
+        payload = self.call("/api/v3/spot", limit=10)
+        detail = self.assert_error(payload, "akshare/")
+        self.assertEqual(detail["code"], "akshare/stock_zh_a_spot_em")
+        self.assertIn("RemoteDisconnected", detail["message"])
+        self.assertIn("降级链", detail["message"])
+        self.assertNotIn("rows", payload)
+        self.assertEqual([item["source"] for item in payload["chain"]],
+                         [spec["source"] for spec in v3_sources.AKSHARE_SPOT_CHAIN])
+        self.assertEqual(payload["error"]["tried"],
+                         [spec["source"] for spec in v3_sources.AKSHARE_SPOT_CHAIN])
+        # 版本里没有的接口如实记 missing-func，而不是记成「也失败了」
+        self.assertEqual(payload["chain"][2]["error"]["code"], "akshare/missing-func")
+        self.assertEqual(payload["chain"][0]["attempts"][0]["attempt"], 1)
+        self.assertTrue(payload["as_of"])
+
+    def test_business_error_is_not_retried_and_next_interface_is_tried(self):
+        self.build_spot({"stock_zh_a_spot_em": [ValueError("symbol 参数非法")],
+                         "stock_sh_a_spot_em": [[{"代码": "600519", "名称": "贵州茅台"}]]})
+        payload = self.call("/api/v3/spot", limit=5)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(self.ak.calls_of("stock_zh_a_spot_em"), ["stock_zh_a_spot_em"],
+                         "业务错误不得重试")
+        self.assertIn("业务错误（不重试）", payload["chain"][0]["error"]["message"])
+
+    def test_budget_marks_remaining_interfaces_as_skipped(self):
+        # 保留真实 sleep（base_ms=50）→ 第一个接口就耗掉 1ms 预算，后续接口应记 skipped。
+        self.build_spot({"stock_zh_a_spot_em": [remote_disconnected()]},
+                        akshare_retry={"attempts": 2, "base_ms": 50, "rand": lambda: 0.0},
+                        env={v3_sources.SPOT_CHAIN_BUDGET_ENV: "1"})
+        payload = self.call("/api/v3/spot", limit=5)
+        self.assertFalse(payload["ok"])
+        skips = payload["chain"][1:]
+        self.assertTrue(skips, payload["chain"])
+        for item in skips:
+            self.assertTrue(item["skipped"], item)
+            self.assertEqual(item["error"]["code"], "chain/timeout")
+        self.assertEqual(self.ak.calls_of("stock_zh_a_spot"), [],
+                         "预算耗尽后不得再试后面的接口")
+
+    def test_success_payload_keeps_contract_and_adds_attempts(self):
+        self.build_spot({"stock_zh_a_spot_em": [[{"代码": "600519", "名称": "贵州茅台",
+                                                  "最新价": 1500.5, "涨跌幅": -1.25,
+                                                  "换手率": 0.42, "量比": 1.08,
+                                                  "市盈率-动态": 22.3, "市净率": 7.8}]]})
+        payload = self.call("/api/v3/spot", limit=20)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["source"], "akshare/stock_zh_a_spot_em")
+        self.assertEqual(payload["market_scope"], "A股全市场")
+        self.assertEqual(sorted(payload["rows"][0]),
+                         ["change_pct", "code", "name", "pb", "pe", "price",
+                          "turnover_rate", "volume_ratio"])
+        self.assertEqual([item["attempt"] for item in payload["attempts"]], [1])
+        self.assertEqual(self.ak.calls_of("stock_zh_a_spot_em"), ["stock_zh_a_spot_em"])
+
+
+class NewsRetryTests(BlockRealNetwork):
+    def test_news_retries_and_exposes_attempts(self):
+        class FlakyNews:
+            def __init__(self):
+                self.calls = []
+                self.queue = [remote_disconnected(), [{"新闻标题": "贵州茅台公告",
+                                                       "新闻内容": "正文",
+                                                       "发布时间": "2026-09-18 09:00:00",
+                                                       "文章来源": "测试源",
+                                                       "新闻链接": "http://e.invalid/1",
+                                                       "关键词": "600519"}]]
+
+            def stock_news_em(self, symbol=None):
+                self.calls.append(symbol)
+                step = self.queue[0] if len(self.queue) == 1 else self.queue.pop(0)
+                if isinstance(step, BaseException):
+                    raise step
+                return step
+
+        ak = FlakyNews()
+        self.build(v3_sources.Deps(akshare=ak, home=self.tmp, akshare_retry=spot_retry()))
+        payload = self.call("/api/v3/news", symbol="SH.600519", limit=10)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["source"], "akshare/stock_news_em")
+        self.assertEqual(ak.calls, ["600519", "600519"], "第一次断连 → 重试一次后成功")
+        self.assertEqual([item["attempt"] for item in payload["attempts"]], [1, 2])
+        self.assertTrue(payload["attempts"][1]["ok"])
+        self.assertEqual(payload["rows"][0]["title"], "贵州茅台公告")
+        self.assertEqual(payload["rows"][0]["keyword"], "600519")
+
+    def test_news_failure_carries_attempts_detail(self):
+        ak = FakeSpotAkshare({"stock_news_em": [remote_disconnected()]})
+        self.build(v3_sources.Deps(akshare=ak, home=self.tmp,
+                                   akshare_retry=spot_retry(attempts=3, base_ms=100)))
+        payload = self.call("/api/v3/news", symbol="600519", limit=10)
+        detail = self.assert_error(payload, "akshare/")
+        self.assertEqual(detail["code"], "akshare/stock_news_em")
+        self.assertIn("尝试 3 次仍失败", detail["message"])
+        self.assertIn("RemoteDisconnected", detail["message"])
+        self.assertEqual(len(detail["attempts"]), 3)
+        self.assertEqual([item["wait_ms"] for item in detail["attempts"][:2]], [100, 200])
+        self.assertEqual(ak.calls_of("stock_news_em"), ["stock_news_em"] * 3)
 
 
 if __name__ == "__main__":

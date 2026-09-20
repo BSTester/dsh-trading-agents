@@ -12,3 +12,9 @@ __pycache__/
 # V3 工作台（Ant Design Pro 版）：依赖与构建产物
 platform/web-pro/node_modules/
 platform/web-pro/dist/
+
+# V3 SQLite 持久化层（server/v3_db.py）：缺省落在 $DSH_HOME，不在仓库；
+# 防止把本地库（QUANT_V3_DATA=platform/data 时）误提交进来。
+*.db
+*.db-wal
+*.db-shm

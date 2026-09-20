@@ -1,0 +1,184 @@
+# 量化交易决策平台 V3 · `quant-headless` profile 的用户 patch 层（规格 §5.2 / §6）
+#
+# 装机顺序（dsh profile boot）：package.json 的 dsh.profile.bundles 逐个 apply，
+# 然后是本文件，最后是任何 --patch overlay。**本文件最后写，所以本文件赢。**
+#   @deepseek-ai/dsh-base      → 共享内核（87 行里的绝大多数）
+#   @deepseek-ai/dsh-headless  → 一次性任务模式（headless-startup / headless-runner）
+#
+# 这一层做三件事，对应规格要求的三块：
+#   ① 量化分析师角色定义   → system-prompt 行的 personaPrefix
+#   ② 风控规则（2%/20%/15%）→ 同上的 personaPrefix 后半段 + 服务侧真实闸门（见文末说明）
+#   ③ 工具白名单           → 关掉不需要的 tool-* 行（**用 shipped 行的 disabled，不新写插件**）
+#
+# ⚠️ 为什么**不**用 @deepseek-ai/dsh-persona 做角色定义（已核实，2026-09-20）
+# ---------------------------------------------------------------------------
+# 该包确实存在于部署里（0.1.5-rc.2），但它的自述写得很清楚：
+#   「`dsh-system-prompt` owns the global persona as its own config, and registers that
+#     section unconditionally — so this row is **scope-only**. Mounted inside an agent
+#     preset it shadows the deployment persona for that one session … mounted globally
+#     it collides with the registry's own registration and fails loud.」
+# 也就是说 `dsh-persona` 是给 **agent preset**（`~/.dsh/.agent-presets/<id>/agent.cordis.yml`，
+# 每会话作用域）用的。本文件是 **profile** 层（进程级全局作用域），在这里挂
+# `dsh-persona` 会与 `system-prompt` 自己的 persona 注册**冲突并报错**。
+# profile 层的正确机制就是 `system-prompt` 行的 `personaPrefix` / `personaSuffix`
+# 配置——这也正是官方 `@deepseek-ai/dsh-headless` 自己用的方式。
+# 若将来要的是「每会话不同人格」，那应该做成 agent preset 而不是 profile。
+
+# ── ① + ② 量化分析师角色 + 风控规则 ──────────────────────────────────────────
+#
+# patch 会**整体替换**该行的 config（不是深合并），所以这里必须把 headless bundle
+# 原本的两项都重新写全，否则会把它们抹掉：
+#   * 原 personaPrefix: "You are a coding agent powered by the {{model}} model."
+#   * 原 personaSuffix: "Your working directory is {{cwd}}."
+# {{model}} / {{cwd}} 是已注册的 prompt 变量（官方 headless bundle 就在用），
+# 必须保留占位符原样，不能提前替换成字面量。
+#
+# 风控数值与平台代码**同源**：`platform/server/v3_ops.py` 的
+# `LIMITS = {"singlePct": 2.0, "industryPct": 20.0, "drawdownPct": 15.0}`。
+# 改这里的数字前请先改那里，否则提示词与真实闸门会漂移。
+- id: system-prompt
+  config:
+    personaPrefix: >-
+      You are a quantitative analyst agent for the Quant Trading Decision Platform V3,
+      powered by the {{model}} model.
+
+      Your job is READ-ONLY research and decision support: market data review, factor and
+      signal inspection, risk analytics, and written research notes. You do not place,
+      modify, or cancel orders, you do not switch trading modes, and you do not execute
+      frozen plans. Those actions exist only in the workbench Web UI behind a human
+      confirmation, and you must never claim to have performed them.
+
+      HARD RISK RULES (these mirror the platform's own gate in server/v3_ops.py
+      check_order / LIMITS — the platform enforces them server-side; restating them here
+      is so you refuse early rather than proposing something that will be blocked):
+        * Single-position limit 2% of NAV. A proposed order above 2% is NOT auto-approved;
+          it requires explicit human confirmation and must be labelled as such.
+        * Industry concentration limit 20%. At or above 20% the platform BLOCKS the order
+          outright. Never propose a trade that breaches it.
+        * Drawdown limit 15%. At or above 15% the platform BLOCKS new orders and risk
+          should be reduced by a human, not by you.
+      If a red line is breached, say so plainly and stop; do not look for a way around it
+      and do not edit configuration to silence a breach.
+
+      DATA HONESTY (platform-wide discipline, see platform/deploy/monitoring/README.md
+      and docs/e2e-and-data-gaps.md): when a data source is unavailable, say it is
+      unavailable and name the reason. Never substitute an estimate, a placeholder, or a
+      zero for missing data — a zero reads as "normal" and is a fabrication. Always carry
+      the source and as_of of anything you report.
+
+      RESEARCH BOUNDARY: you write to the research surface and the rule-candidate pool
+      only. You never enable a strategy; enabling is a human action in the Web UI.
+    # 保留官方 headless 的 suffix（不能丢：{{cwd}} 是运行时工作目录，提示词依赖它）
+    personaSuffix: Your working directory is {{cwd}}.
+
+# ── ③ 工具白名单 ─────────────────────────────────────────────────────────────
+#
+# 做法：**关掉**不在白名单里的 tool-* 行。用 shipped 行的 `disabled: true`，
+# 不新写插件、不改内核——这是 profile 层唯一真实可用的工具面收窄手段。
+#
+# 核实过的现实（2026-09-20）：部署里的 `@deepseek-ai/dsh-tools` **没有** allow/deny
+# 列表配置项，也不存在 `dsh-tool-filter` / `dsh-tool-policy` 之类的过滤插件
+# （`ls node_modules/@deepseek-ai/ | grep -iE 'allow|deny|filter|policy'` 只有
+# sandbox-policy / fs-observation-policy / spill-policy / timeout-policy 等无关行）。
+# 运行时的唯一细粒度扩展点是 `tools/pre-execute` 这个 waterfall 事件
+# （allow / deny / ask 三态），但要用它就得**自己写一个插件包**——那超出了「profile
+# 素材」的范围，所以这里走「按行关停」路线，并把真实边界交给服务侧（见文末）。
+#
+# ── 保留（白名单内）────────────────────────────────────────────────────────
+#   tool-fs           读/写/改文件（研究笔记、报告落盘）
+#   tool-fs-search    glob / grep（读仓库文档与规格）
+#   tool-skill        skill 工具（加载 research-institute 等手册）
+#   skill-filesystem  技能目录（下面覆盖为仓库内目录）
+#   user-questions    ask_user_question（headless 下通常无人应答，但保留不造成伤害）
+#   tool-todo         任务清单（多步研究的进度可见性）
+#   tool-present      交付物声明（该行在 headless 组合里不存在，无需处理）
+#   quant-platform-mcp  ↓ 量化数据/研究工具面（本文件末尾 insert）
+#
+# ── 关停（白名单外）──────────────────────────────────────────────────────────
+
+# 通用 shell：可绕过工具面直接打任意 HTTP（含交易端点）。分析师的取数通道是
+# quantwb MCP 工具面，不是裸 curl。关掉它，工具白名单才真的是一道边界。
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+
+# 后台作业工具：只对 subagent/workflow 的后台子任务有意义，两者都被关掉后它是死面。
+- id: tool-jobs
+  disabled: true
+
+# 委派与编排：子代理/工作流会放大工具面（一个子代理就是一次不受本白名单约束的
+# 新会话面），ralph 是无监督新鲜代理循环。一次性 headless 任务里都不需要。
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-ralph
+  disabled: true
+
+# 长跑目标：goal 会开启跨轮自治续跑，而 headless 是一次性任务、无人复核。
+- id: tool-goal
+  disabled: true
+
+# 外网直连：新闻/公告类数据一律走平台 MCP 工具面（带 source/as_of 标注），
+# 不走模型侧自由抓取——否则同一事实会有两个来源且无法审计。
+# 这三个行是一组：只关 tool-web 会留下悬空的上游 provider 行。
+- id: tool-web
+  disabled: true
+- id: web-search-deepseek
+  disabled: true
+- id: web-fetch-http
+  disabled: true
+- id: web
+  disabled: true
+
+# 注：刻意**没有**关 subagent / subagent-spawn-in-process / subagent-fork-in-process /
+# workflow-worker-thread 这些**服务**行——只关模型可见的 tool-* 行。关服务行会让
+# 其它注入它的行卡在 waiting（"N row(s) did not activate"）。
+
+# ── 与 platform/ 的衔接：量化数据工具面 ──────────────────────────────────────
+#
+# 分析师能看到的量化数据都从平台的 MCP 工具面来（82 个工具，与 HTTP /api/wb/* 同一
+# handle、同一份实现）。@deepseek-ai/dsh-mcp-client 已装在共享目录
+# ~/.dsh/profiles/node_modules/（本 profile 能向上解析到），**无需额外装包**。
+#
+# 与官方 headless profile 的同一处做法一致；差别只在注释口径：这里是只读研究角色，
+# 写端点依旧受服务侧闸门约束（见下）。
+- insert:
+    - id: quant-platform-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: quantwb
+        transport: streamable-http
+        url: http://127.0.0.1:8397/mcp
+        # 平台服务没起时不要让整个 profile 起不来：让工具面缺席，由模型如实报告
+        # 「数据源不可达」，而不是让会话直接崩在启动阶段。
+        failOnStartupError: false
+        # 对齐平台侧 TTL：live 业务确认 120s + 取数余量（见 v3_ops confirmation TTL）。
+        toolCallTimeoutMs: 180000
+
+# 技能目录：指到仓库内的 skills/，让分析师能正经加载手册（与官方 headless profile
+# 指向 agent-presets 的做法同形，这里指向本仓库路径）。
+# ⚠️ 安装到别的机器/别的 DSH_HOME 时，这两个绝对路径需要按实际仓库位置改。
+- id: skill-filesystem
+  config:
+    customSkillDirs:
+      - /home/penn/workspace/dsh-trading-agents/skills/
+      - /home/penn/workspace/dsh-trading-agents/skills/futu-skills/
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 真实边界在哪：**提示词与工具白名单都不是交易边界**
+# ═══════════════════════════════════════════════════════════════════════════
+# 关掉 shell、关掉委派，能减少「分析师乱动手」的面，但真正拦住下单的是服务侧：
+#   * 本 profile 只挂 MCP 客户端行，写端点仍然要求人工在 Web 确认
+#     （store_access.request_confirmation，TTL 120s 超时=拒绝，fail-closed）；
+#   * `confirm-decide` 与设置页两端点**有意不进 MCP 工具面**，所以模型无法自批实盘单、
+#     无法自改凭据（见 docs/architecture.md 与 platform/server/mcp_tools.py）；
+#   * sim→live 切换必须由人在 Web 输入口令，qut-headless 侧没有任何等价通道。
+# 因此：白名单是**纵深**的一层，不是唯一一层。任何一条都不该被当成「所以可以放心」。

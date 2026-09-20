@@ -36,12 +36,15 @@ oms/orders,oms/sync,events,audit,brain}``）。
   如实排除并计数，绝不猜成某个市场（映射口径见 ``server/v3_universe.py``）。
   不传 ``market`` 时行为与历史完全一致。
 
-落盘（均在 ``home`` 下，均为 best-effort，写失败不阻断业务）
------------------------------------------------------------
-* ``<home>/v3-oms-orders.json``    —— OMS 台账（订单实体 + 风控分级 + 状态历史，原子写）
-* ``<home>/v3-oms-sync.jsonl``     —— 每次对账的追加留痕
-* ``<home>/v3-strategy-runs.jsonl``—— **只读**：``/api/v3/brain`` 的最近一轮策略
-  （由 v3_analytics 侧写入；本模块只读最后一条有效记录，读不到即 ``decision=null``）
+落盘（均在 ``home`` 下；自 2026-09-20 起**主存 = ``server.v3_db`` 的 SQLite 表**，
+原文件保留为冷备/兼容镜像；库不可用时读路径回退文件，写失败不阻断业务）
+--------------------------------------------------------------------
+* ``<home>/v3.db``                  —— **主存**：``oms_orders`` / ``oms_sync`` /
+  ``strategy_runs``（只读）等表；路径可用 ``QUANT_V3_DB`` 覆盖
+* ``<home>/v3-oms-orders.json``     —— OMS 台账冷备（订单实体 + 风控分级 + 状态历史，原子写）
+* ``<home>/v3-oms-sync.jsonl``      —— 每次对账的追加留痕（冷备；主存 ``oms_sync`` 表）
+* ``<home>/v3-strategy-runs.jsonl`` —— **只读冷备**：``/api/v3/brain`` 的最近一轮策略
+  （由 v3_analytics 侧写入；本模块优先读库，库空才读这个文件）
 
 测试：``cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_ops -v``
 """
@@ -60,7 +63,7 @@ from pathlib import Path
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from server import mcp_tools, store_access, v3_ratelimit, v3_universe
+from server import mcp_tools, store_access, v3_db, v3_ratelimit, v3_universe
 from server.config import config_path
 
 # ---------------------------------------------------------------------------
@@ -636,15 +639,51 @@ class OmsLedger:
         self.orders_path = self._home / OMS_FILENAME
         self.sync_log_path = self._home / OMS_SYNC_FILENAME
 
-    # ---- 持久化 ----
+    # ---- 持久化（主存 SQLite；文件为冷备/兼容镜像）----
     def read(self):
+        """台账（全量字典）：优先库；库空/不可用 → 回退只读 JSON 文件。"""
+        records = self._read_db()
+        if records is not None:
+            return records
         raw = _read_json_file(self.orders_path)
         orders = raw.get("orders") if isinstance(raw, dict) else None
         if not isinstance(orders, dict):
             return {}
         return {str(key): record for key, record in orders.items() if isinstance(record, dict)}
 
+    def _read_db(self):
+        """库里的台账；库不可用/无记录 → ``None``（调用方回退文件）。
+
+        任何数据库异常都在这里收敛成 ``None``——**接口不会因此 500**，最坏情况是
+        退回「读文件」这条迁移前的路径。
+        """
+        try:
+            rows = v3_db.list_events(self._home, "oms_orders", limit=None, order="asc")
+        except Exception:  # noqa: BLE001 —— 库异常按「库里没有」处理
+            return None
+        if not rows:
+            return None
+        orders = {}
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            identifier = row.get("id")
+            if identifier in (None, ""):
+                continue
+            orders[str(identifier)] = row
+        return orders or None
+
     def write(self, orders):
+        """整表落盘：先写库（逐单 upsert + 清理已不在集合里的行），再原子写文件冷备。
+
+        库写失败**不阻断**（文件仍是完整副本，读路径会回退文件）；文件写失败沿用既有
+        语义（抛给调用方，best-effort 由 ``sync`` 的调用面决定）。
+        """
+        records = [record for record in (orders or {}).values() if isinstance(record, dict)]
+        try:
+            v3_db.replace_events(self._home, "oms_orders", records)
+        except Exception:  # noqa: BLE001 —— 主存失败不清空冷备，绝不把好数据写坏
+            pass
         payload = json.dumps({"version": 1, "updated_at": _now(), "orders": orders},
                              ensure_ascii=False, indent=2) + "\n"
         path = self.orders_path
@@ -664,6 +703,10 @@ class OmsLedger:
             raise
 
     def _append_sync(self, record):
+        try:
+            v3_db.append_event(self._home, "oms_sync", record)
+        except Exception:  # noqa: BLE001 —— 留痕失败不阻断业务
+            pass
         try:
             self.sync_log_path.parent.mkdir(parents=True, exist_ok=True)
             with self.sync_log_path.open("a", encoding="utf-8") as stream:
@@ -939,22 +982,28 @@ def _data_sources(call, home):
 
 
 # ---------------------------------------------------------------------------
-# brain 的最近一轮策略（只读 v3_analytics 的落盘，读不到就 null）
+# brain 的最近一轮策略（优先读库；库空/不可用回退只读 JSONL 冷备）
 # ---------------------------------------------------------------------------
-def last_strategy_run(home, market=None):
-    """``(record|None, path, note)``：读 ``v3-strategy-runs.jsonl`` 最后一条有效记录。
+def _strategy_run_records(home):
+    """``(records, path_label, empty_note)``：主源 = SQLite ``strategy_runs``；否则读 JSONL 冷备。
 
-    ``market`` 给定时优先取带该 ``market`` 标注的最后一条记录；**旧记录没有 ``market``
-    字段时不被隐藏**——文件里一条带市场的记录都没有，就退回最后一条旧记录并把原因
-    写进 ``note``（调用方据此标注 ``decisionMarket: null``）。文件里已有带市场的记录、
-    但没有该市场的 → ``None``（如实说明，不拿别的市场顶替）。
+    ``path_label`` 始终带上 ``v3-strategy-runs.jsonl`` 这个名字（它是这条数据的冷备与
+    兼容读路径），库命中时前缀 ``sqlite:`` 如实标注真实来源。``empty_note`` 仅在
+    records 为空时有值，且与迁移前的两种文案逐字一致（区分「文件不存在」与「文件存在
+    但没有有效记录」）。
     """
-    path = Path(home) / STRATEGY_RUNS_FILENAME
     try:
-        text = path.read_text(encoding="utf-8")
+        records = v3_db.list_events(home, "strategy_runs", limit=None, order="asc")
+    except Exception:  # noqa: BLE001 —— 库不可用按「库里没有」处理，绝不 500
+        records = []
+    legacy = Path(home) / STRATEGY_RUNS_FILENAME
+    if records:
+        return records, f"sqlite:{v3_db.db_path(home)}#strategy_runs（冷备 {legacy}）", None
+    try:
+        text = legacy.read_text(encoding="utf-8")
     except OSError:
-        return None, str(path), "文件不存在或不可读"
-    records = []
+        return [], str(legacy), "文件不存在或不可读"
+    out = []
     for line in text.splitlines():
         line = line.strip()
         if not line:
@@ -964,22 +1013,39 @@ def last_strategy_run(home, market=None):
         except ValueError:
             continue
         if isinstance(record, dict):
-            records.append(record)
+            out.append(record)
+    if not out:
+        return [], str(legacy), "文件存在但没有有效 JSON 记录"
+    return out, str(legacy), None
+
+
+def last_strategy_run(home, market=None):
+    """``(record|None, path, note)``：最近一轮策略流水线记录。
+
+    主源是库里的 ``strategy_runs`` 表（含迁移进来的历史记录），库空/不可用才读
+    ``<home>/v3-strategy-runs.jsonl`` 冷备——因此迁移前的行为逐字段不变。
+
+    ``market`` 给定时优先取带该 ``market`` 标注的最后一条记录；**旧记录没有 ``market``
+    字段时不被隐藏**——一条带市场的记录都没有，就退回最后一条旧记录并把原因写进
+    ``note``（调用方据此标注 ``decisionMarket: null``）。已有带市场的记录、但没有该市场的
+    → ``None``（如实说明，不拿别的市场顶替）。
+    """
+    records, path, empty_note = _strategy_run_records(home)
     if not records:
-        return None, str(path), "文件存在但没有有效 JSON 记录"
+        return None, path, empty_note or "文件不存在或不可读"
     if market is None:
-        return records[-1], str(path), "取最后一条有效记录"
+        return records[-1], path, "取最后一条有效记录"
     matched = [record for record in records
                if str(record.get("market") or "").strip().upper() == market]
     if matched:
-        return matched[-1], str(path), f"取最后一条 market={market} 的记录"
+        return matched[-1], path, f"取最后一条 market={market} 的记录"
     legacy = [record for record in records if record.get("market") in (None, "")]
     if legacy:
-        return legacy[-1], str(path), (
+        return legacy[-1], path, (
             f"文件里没有任何带 market 标注的记录（{len(records)} 条旧记录）→ 取最后一条并标注 "
             f"market=null，未按市场隐藏")
-    return None, str(path), (f"文件里有 {len(records)} 条记录，但没有 market={market} 的"
-                             f"（不拿其它市场的记录顶替）")
+    return None, path, (f"文件里有 {len(records)} 条记录，但没有 market={market} 的"
+                        f"（不拿其它市场的记录顶替）")
 
 
 # ---------------------------------------------------------------------------
@@ -1024,6 +1090,10 @@ def register(app, v3_run, home):
                 **metrics_snapshot(),
                 # 富途限流治理的真实计数（v3_ratelimit 唯一起源；既有字段一字不改，只加这块）
                 "futu": v3_ratelimit.metrics_view(),
+                # SQLite 持久化层的真实读数（v3_db 唯一起源）：路径/体积/各表行数/读写计数/
+                # 已迁移文件。**只加字段**；库不可用时 stats() 内部收敛成 ok=false + error，
+                # 绝不因为这一块把 /api/v3/metrics 打成 500。
+                "db": v3_db.stats(home_path),
                 "oms": ledger.stage_counts(),
                 "sdk": {"status": "unavailable", "reason": SDK_REASON},
                 "generated_at": _now(),

@@ -6,8 +6,9 @@
 
 ``v3_run(name, payload)`` 是主 agent 注入的**同步**回调：按名调用既有 56 工具面的同一份
 ``handle``，返回原始信封 ``{ok, value|error}``，契约上不抛异常。取数一律经它，本模块
-**不新造第二事实源**，也不直连任何数据库/文件（唯一例外是策略流水线结果的落盘与自选池
-配置读取，见下）。
+**不新造第二事实源**，也不直连任何外部数据源（唯一的本地持久化是策略流水线结果——自
+2026-09-20 起主存 ``server.v3_db`` 的 SQLite 表，同一份再追加 JSONL 冷备；另读自选池配置
+``trading-platform.json``，见下）。
 
 纪律（与 ``docs/v3-integration.md`` §五 一致）：
   * 阻塞取数（``v3_run`` → 子进程）全部在 ``asyncio.to_thread`` 里执行，handler 不阻塞事件循环；
@@ -32,6 +33,7 @@
 ``/api/v3/strategy/run``         POST    跑一轮 PDAT→PET 流水线（只出提案）
 ``/api/v3/ml/sweep``             GET     动量策略参数网格扫描（真实回测）
 ``/api/v3/ml/backtest``          POST    单标的动量 long/flat 回测（PIT）
+``/api/v3/ml/models``            GET     ML 策略族（Lasso/GBDT/MLP）与动量基线同口径评估
 ===============================  ======  ================================================
 """
 
@@ -46,12 +48,13 @@ from typing import Optional
 from fastapi import Request
 from starlette.responses import JSONResponse
 
-from server import v3_math, v3_universe
+from server import v3_db, v3_math, v3_ml, v3_universe
 
 __all__ = [
     "STRATEGY_RUNS_FILE",
     "factors_matrix_data",
     "ml_backtest",
+    "ml_models",
     "ml_sweep",
     "read_last_strategy_run",
     "read_watchlist",
@@ -74,6 +77,12 @@ WATCHLIST_LIMIT = 8
 FACTOR_LIMIT = 8
 # 因子矩阵缺省标的数（自选池前 6）。
 FACTOR_DEFAULT_COUNT = 6
+# ML 策略族缺省标的数（该市场宇宙前 6）：池化样本越多越稳，但取数受全局限流器约束。
+ML_UNIVERSE_LIMIT = 6
+# ML 特征回看窗口缺省（与动量基线的窗口语义一致）。
+ML_WINDOW = 20
+# ML 标签前瞻期缺省（t 日特征 → t+horizon 收益）。
+ML_HORIZON = 1
 
 
 # ---------------------------------------------------------------------------
@@ -235,29 +244,50 @@ def strategy_runs_path(home):
 
 
 def append_strategy_run(home, run):
-    """追加一轮流水线结果（一行一条 JSONL）。失败返回错误字典（调用方如实回传）。"""
-    path = strategy_runs_path(home)
+    """追加一轮流水线结果：**主存 SQLite**（``strategy_runs`` 表），同一份再追加 JSONL 冷备。
+
+    返回 ``None`` 或错误字典（调用方如实回传）。只有**两个存储都失败**才算落盘失败——
+    库成功就说明这一轮读得回来（读路径优先库、库空才回退文件）。
+    """
+    db_error = None
     try:
+        v3_db.append_event(home, "strategy_runs", run)
+    except Exception as error:  # noqa: BLE001 —— 数据库失败不能阻断既有文件落盘
+        db_error = error
+    file_error = None
+    try:
+        path = strategy_runs_path(home)
         path.parent.mkdir(parents=True, exist_ok=True)
         with path.open("a", encoding="utf-8") as handle:
             handle.write(json.dumps(run, ensure_ascii=False, allow_nan=False) + "\n")
     except (OSError, ValueError) as error:
-        return {"code": "strategy/persist-failed", "message": str(error)[:300]}
-    return None
+        file_error = error
+    if db_error is None or file_error is None:
+        return None
+    return {"code": "strategy/persist-failed",
+            "message": f"sqlite: {db_error}; file: {file_error}"[:300]}
 
 
-def read_last_strategy_run(home, market=None):
-    """读最后一轮流水线结果；文件不存在/无有效行 → ``None``（从未运行过）。
+def _strategy_run_records(home):
+    """策略轮记录（按写入顺序）+ 来源标注。
 
-    ``market`` 给定时只认 ``run.market`` 等于该市场的记录（旧记录没有 ``market`` 字段，
-    因此**不会被当成该市场的记录**——调用方用 :func:`strategy_markets` 如实说明有哪些市场）。
+    主源 = SQLite（``v3_db``，含迁移进来的历史记录）；库为空/不可用 → **回退只读**
+    ``<home>/v3-strategy-runs.jsonl``（冷备，迁移后仍保留）。回退保证既有行为不变：
+    手写文件、旧实例、库被删掉都能照读。
     """
+    try:
+        records = v3_db.list_events(home, "strategy_runs", limit=None, order="asc")
+    except Exception:  # noqa: BLE001 —— 数据库不可用按「库为空」处理，绝不 500
+        records = []
+    if records:
+        return records, f"sqlite:{v3_db.db_path(home)}#strategy_runs（冷备 {strategy_runs_path(home)}）"
     path = strategy_runs_path(home)
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
-        return None
-    for line in reversed(text.splitlines()):
+        return [], str(path)
+    out = []
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -265,8 +295,19 @@ def read_last_strategy_run(home, market=None):
             value = json.loads(line)
         except ValueError:
             continue
-        if not isinstance(value, dict):
-            continue
+        if isinstance(value, dict):
+            out.append(value)
+    return out, str(path)
+
+
+def read_last_strategy_run(home, market=None):
+    """读最后一轮流水线结果；库与冷备都没有有效记录 → ``None``（从未运行过）。
+
+    ``market`` 给定时只认 ``run.market`` 等于该市场的记录（旧记录没有 ``market`` 字段，
+    因此**不会被当成该市场的记录**——调用方用 :func:`strategy_markets` 如实说明有哪些市场）。
+    """
+    records, _source = _strategy_run_records(home)
+    for value in reversed(records):
         if market is None:
             return value
         label = str(value.get("market") or "").strip().upper()
@@ -277,22 +318,9 @@ def read_last_strategy_run(home, market=None):
 
 def strategy_markets(home):
     """落盘记录里出现过的市场标注（保序、去重；旧记录无标注 → ``None``）。"""
-    path = strategy_runs_path(home)
-    try:
-        text = path.read_text(encoding="utf-8")
-    except OSError:
-        return []
+    records, _source = _strategy_run_records(home)
     labels = []
-    for line in text.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        try:
-            value = json.loads(line)
-        except ValueError:
-            continue
-        if not isinstance(value, dict):
-            continue
+    for value in records:
         label = value.get("market")
         label = str(label).strip().upper() if label not in (None, "") else None
         if label not in labels:
@@ -987,6 +1015,108 @@ def ml_backtest(v3_run, payload=None):
 
 
 # ---------------------------------------------------------------------------
+# 6) GET /api/v3/ml/models
+# ---------------------------------------------------------------------------
+def _dominant_source(sources):
+    """逐标的 ``source`` → 一个代表值；口径不一致时**如实并列**，不挑一个当全部。"""
+    values = sorted({str(value) for value in (sources or {}).values() if value})
+    if not values:
+        return None
+    return values[0] if len(values) == 1 else "+".join(values)
+
+
+def ml_models(v3_run, home, *, market="SH", ticker=None, window=ML_WINDOW,
+              horizon=ML_HORIZON, limit=500, cost_bps=0.0):
+    """ML 策略族（FR-STRAT-002）：Lasso / GBDT / MLP + 现有动量基线，**同口径**评估。
+
+    契约::
+
+        {ok, market, universe_source, universe_note, source, sources, tickers, failures,
+         as_of, generated_at, window, horizon, cost_bps, n_samples, n_train, n_test, split,
+         feature_names, models: [{name, impl, kind, params, metrics, metrics_in_sample,
+                                  per_ticker, coef_top|first_tree|weight_shapes}],
+         baseline: {name: "momentum", impl, params, metrics, metrics_in_sample, per_ticker},
+         backends: {sklearn, lightgbm}, notes: [...]}
+
+    口径与纪律：
+      * 数据只经既有限流器 ``v3_run("series", {ticker, period: "1d", limit})``（**只读**）；
+      * ``ticker`` 缺省用该市场宇宙（``v3_universe.resolve_universe`` 前
+        ``ML_UNIVERSE_LIMIT`` 只）——该市场无宇宙 → ``market/no-universe``；
+      * **PIT 严格**：特征只用 ``≤ t`` 的收盘价，标签为 ``t+horizon`` 收益；
+      * 样本不足（``< v3_ml.MIN_SAMPLES``）→ ``ml/insufficient-sample``
+        （``error.detail = {n_samples, required, window, horizon, tickers}``），**不硬跑**；
+      * 指标一律**样本外**（时序 70/30 留出），三个模型与基线逐项同口径；
+      * 部分标的取数失败**不拖垮**整轮：失败的进 ``failures``（原样带上游错误码），
+        其余标照常训练；**全部失败**才回错误信封；
+      * ``impl`` 如实标注真实实现（本部署无 sklearn/lightgbm → 恒为 ``numpy-*``）。
+    """
+    try:
+        code = v3_universe.normalize_market(market if market is not None else "SH")
+        if code is None:
+            return _error("market/bad-market", "market 需为 SH / HK / US", market=str(market))
+        window = _clamp_int(window, ML_WINDOW, 2, 500)
+        horizon = _clamp_int(horizon, ML_HORIZON, 1, 250)
+        limit = _clamp_int(limit, 500, 60, 2000)
+
+        raw_ticker = str(ticker or "").strip()
+        universe_source = None
+        universe_note = None
+        if raw_ticker:
+            names = [raw_ticker]
+            universe_source = "请求显式 ticker（单标的，不解析市场宇宙）"
+        else:
+            universe = v3_universe.resolve_universe(v3_run, home, code)
+            if universe is None:
+                detail = v3_universe.universe_note(home, code) or ""
+                return _error("market/no-universe",
+                              "该市场没有配置自选池、也没有真实持仓",
+                              market=code, detail=detail)
+            universe_source = universe.get("source")
+            universe_note = universe.get("note")
+            names = list(universe.get("tickers") or [])[:ML_UNIVERSE_LIMIT]
+        if not names:
+            return _error("market/no-universe",
+                          f"该市场（{code}）宇宙为空，无法取数", market=code)
+
+        bars_by_ticker = {}
+        failures = {}
+        sources = {}
+        for name in names:
+            envelope = _call(v3_run, "series",
+                             {"ticker": name, "period": "1d", "limit": limit})
+            if not envelope.get("ok"):
+                failures[name] = _tool_error(envelope)
+                continue
+            value = _value_of(envelope) or {}
+            bars = value.get("bars")
+            bars = bars if isinstance(bars, list) else []
+            if not bars:
+                failures[name] = {"code": "series/empty", "message": "该标的没有返回日 K"}
+                continue
+            bars_by_ticker[name] = bars
+            if value.get("source"):
+                sources[name] = str(value.get("source"))
+        if not bars_by_ticker:
+            first = failures.get(names[0]) or next(iter(failures.values()))
+            return {"ok": False, "error": first, "market": code, "failures": failures}
+
+        try:
+            suite = v3_ml.run_model_suite(bars_by_ticker, window=window, horizon=horizon,
+                                          cost_bps=cost_bps)
+        except v3_ml.InsufficientSample as error:
+            return _error("ml/insufficient-sample", str(error),
+                          market=code, detail=dict(error.detail))
+        return {"ok": True, "market": code,
+                "universe_source": universe_source, "universe_note": universe_note,
+                "source": _dominant_source(sources), "sources": sources,
+                "tickers": sorted(bars_by_ticker.keys()),
+                "failures": failures or None, "requested_tickers": list(names),
+                **suite}
+    except Exception as error:  # noqa: BLE001
+        return _error("v3/internal", error)
+
+
+# ---------------------------------------------------------------------------
 # 路由注册
 # ---------------------------------------------------------------------------
 def _ok(content):
@@ -1079,3 +1209,19 @@ def register(app, v3_run, home):
         if query_market and not str(payload.get("market") or "").strip():
             payload = {**payload, "market": query_market}
         return _ok(await asyncio.to_thread(ml_backtest, v3_run, payload))
+
+    @app.get("/api/v3/ml/models")
+    async def v3_ml_models(market: str = "SH", ticker: str = "", window: int = ML_WINDOW,
+                           horizon: int = ML_HORIZON, limit: int = 500,
+                           cost_bps: float = 0.0):
+        """ML 策略族（Lasso/GBDT/MLP）+ 动量基线的**同口径**样本外评估。
+
+        ``market`` 缺省 ``SH``；``ticker`` 给了就是单标的，否则取该市场宇宙（前 6 只）。
+        样本不足 → ``ml/insufficient-sample``；该市场无宇宙 → ``market/no-universe``。
+        """
+        def work():
+            return ml_models(v3_run, home, market=market or "SH", ticker=ticker,
+                             window=window, horizon=horizon, limit=limit,
+                             cost_bps=cost_bps)
+
+        return _ok(await asyncio.to_thread(work))

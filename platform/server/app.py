@@ -56,7 +56,7 @@ from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
 from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_tools,
-                    oauth_flow, settings_api, store_access, trading, v3_ratelimit)
+                    oauth_flow, settings_api, store_access, trading, v3_db, v3_ratelimit)
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -686,6 +686,10 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
     home = str(home)
+    # SQLite 持久化层（v3_db）：**装配即初始化**——建表 + 迁移既有 JSONL/JSON 台账（幂等，
+    # 不删原文件）。init_db 契约上不抛异常：库不可写时返回 ok=false + error，各接口回退到
+    # 原文件只读路径，服务照常启动（绝不让一块台账把平台带崩）。
+    db_state = v3_db.init_db(home)
     root = Path(dist if dist is not None else DEFAULT_DIST)
     config = load_config(home) if config is None else config
     push = push if push is not None else futu_push.PushRuntime(home=home)
@@ -739,6 +743,7 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
 
     app = FastAPI(docs_url=None, redoc_url=None, openapi_url=None, lifespan=lifespan)
     app.state.home = home
+    app.state.v3_db = db_state
     app.state.dist = str(root)
     app.state.config = config
     app.state.handle = handle
@@ -914,7 +919,11 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     for _v3_module in ("v3_market", "v3_risk", "v3_credentials", "v3_research",
                        "v3_analytics", "v3_ops", "v3_sources",
                        # 2026-09-20：三市场时段、通用降级链与数据源状态、成交质量、行业暴露
-                       "v3_market_calendar", "v3_fallback", "v3_quality", "v3_industry"):
+                       "v3_market_calendar", "v3_fallback", "v3_quality", "v3_industry",
+                       # 2026-09-20：规格 §8.3 监控落地——Prometheus 文本出口 ``/metrics``。
+                       # 必须排在下面的 ``/{path:path}`` 静态兜底之前注册，否则会被 SPA
+                       # 兜底当成静态路径吃掉（返回 index.html，而不是指标文本）。
+                       "observability"):
         try:
             _module = importlib.import_module(f"server.{_v3_module}")
         except ModuleNotFoundError:

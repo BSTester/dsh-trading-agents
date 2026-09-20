@@ -37,7 +37,7 @@ sys.path.insert(0, str(ROOT))
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from server import mcp_tools, v3_ops  # noqa: E402
+from server import mcp_tools, v3_db, v3_ops  # noqa: E402
 
 DAY = "2026-09-19"
 
@@ -571,6 +571,100 @@ class ReportingTests(V3OpsTestCase):
 
 
 # ---------------------------------------------------------------------------
+# SQLite 持久化层接线（v3_db）：只加断言，不改既有用例
+# ---------------------------------------------------------------------------
+class SqlitePersistenceTests(V3OpsTestCase):
+    """OMS 台账/对账留痕/研究决策走库，JSONL/JSON 保留为冷备；库不可用时回退文件。"""
+
+    def test_metrics_exposes_the_db_block(self):
+        v3_db.init_db(self.home)
+        body = self.get("/api/v3/metrics")
+        db = body["db"]
+        for key in ("path", "sizeBytes", "tables", "writes", "reads", "migrated"):
+            self.assertIn(key, db, key)
+        self.assertEqual(db["path"], str(self.home / "v3.db"))
+        self.assertTrue(db["exists"])
+        self.assertGreater(db["sizeBytes"], 0)
+        self.assertEqual(db["tables"]["oms_orders"], 0)
+        self.assertIsInstance(db["migrated"], dict)
+
+    def test_ledger_write_goes_to_the_table_and_the_file_stays_a_mirror(self):
+        ledger = v3_ops.OmsLedger(self.fake, self.home)
+        ledger.write({"A": {"id": "A", "ticker": "SH.600000", "stage": "manual",
+                            "updated_at": "3"}})
+        rows = v3_db.list_events(self.home, "oms_orders", limit=None)
+        self.assertEqual([row["id"] for row in rows], ["A"])
+        self.assertEqual(rows[0]["stage"], "manual")
+        on_disk = json.loads((self.home / v3_ops.OMS_FILENAME).read_text(encoding="utf-8"))
+        self.assertEqual(on_disk["orders"]["A"]["ticker"], "SH.600000",
+                         "冷备 JSON 同步写出（迁移前的外部读者不受影响）")
+        # 库是主源：把冷备改成别的，读回来的还是库里的
+        (self.home / v3_ops.OMS_FILENAME).write_text(
+            json.dumps({"version": 1, "orders": {"Z": {"id": "Z", "ticker": "US.NVDA"}}}),
+            encoding="utf-8")
+        self.assertEqual([row["id"] for row in ledger.list()], ["A"])
+
+    def test_ledger_falls_back_to_the_file_when_the_database_is_unavailable(self):
+        (self.home / v3_ops.OMS_FILENAME).write_text(json.dumps({"version": 1, "orders": {
+            "F": {"id": "F", "ticker": "HK.00700", "stage": "risk_passed",
+                  "updated_at": "9"}}}), encoding="utf-8")
+        with unittest.mock.patch.object(v3_db, "list_events",
+                                        side_effect=v3_db.V3DbError("boom")):
+            body = self.get("/api/v3/oms/orders")
+        self.assertTrue(body["ok"], body)
+        self.assertEqual([row["id"] for row in body["orders"]], ["F"])
+        self.assertEqual(body["stages"], {"risk_passed": 1})
+
+    def test_oms_sync_appends_to_the_table_and_the_jsonl(self):
+        self.fake.values["plan"] = {"ok": True, "value": {"plans": [
+            plan([order("CID-1", qty=100, price=10.0)])]}}
+        result = self.sync()
+        self.assertTrue(result["ok"], result)
+        rows = v3_db.list_events(self.home, "oms_sync", limit=None, order="asc")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["plans"], result["plans"])
+        self.assertEqual(rows[0]["stages"], result["stages"])
+        self.assertEqual(len((self.home / v3_ops.OMS_SYNC_FILENAME)
+                             .read_text(encoding="utf-8").strip().splitlines()), 1)
+        self.assertEqual(v3_db.count_events(self.home, "oms_orders"), 1,
+                         "对账登记的订单同样落库")
+
+    def test_brain_reads_the_database_and_reports_the_real_source(self):
+        v3_db.append_event(self.home, "strategy_runs",
+                           {"run_id": "db-1", "market": "SH"})
+        body = self.get("/api/v3/brain")
+        self.assertEqual(body["decision"], {"run_id": "db-1", "market": "SH"})
+        self.assertIn("sqlite:", body["sources"]["decision"])
+        self.assertIn(v3_ops.STRATEGY_RUNS_FILENAME, body["sources"]["decision"],
+                      "来源标注仍带冷备文件名（既有前端/断言口径不变）")
+
+    def test_brain_still_reads_file_only_records(self):
+        self.write(v3_ops.STRATEGY_RUNS_FILENAME,
+                   json.dumps({"run_id": "file-1"}) + "\n")
+        body = self.get("/api/v3/brain")
+        self.assertEqual(body["decision"], {"run_id": "file-1"})
+
+    def test_migration_feeds_the_existing_endpoints(self):
+        """迁移前就有 OMS 台账/策略轮的 home：init_db 后端点读到的是迁移进来的数据。"""
+        orders = {"M": {"id": "M", "ticker": "SZ.002716", "stage": "manual",
+                        "updated_at": "5",
+                        "risk": {"action": "manual", "reasons": ["占比超限"]}}}
+        (self.home / v3_ops.OMS_FILENAME).write_text(
+            json.dumps({"version": 1, "orders": orders}, ensure_ascii=False), encoding="utf-8")
+        self.write(v3_ops.STRATEGY_RUNS_FILENAME,
+                   json.dumps({"run_id": "legacy-run", "market": "SH"}) + "\n")
+        state = v3_db.init_db(self.home)
+        self.assertEqual(state["tables"]["oms_orders"], 1)
+        self.assertEqual(state["tables"]["strategy_runs"], 1)
+
+        body = self.get("/api/v3/oms/orders?market=SH")
+        self.assertEqual([row["id"] for row in body["orders"]], ["M"])
+        self.assertEqual(body["orders"][0]["risk"]["reasons"], ["占比超限"])
+        self.assertEqual(self.get("/api/v3/brain?market=SH")["decision"]["run_id"],
+                         "legacy-run")
+
+
+# ---------------------------------------------------------------------------
 # market= 过滤（execution / oms/orders / brain）
 # ---------------------------------------------------------------------------
 class MarketScopeTests(V3OpsTestCase):
@@ -935,6 +1029,16 @@ class OverviewMarketScopeTests(unittest.TestCase):
                     "throttleWaitMs", "cooldownUntil", "cooldownRemainingMs",
                     "inFlight", "queued"):
             self.assertIn(key, view)
+
+    def test_app_startup_initializes_the_sqlite_layer(self):
+        """``create_app`` 装配即建库 + 迁移（幂等）：真实 app 分支，不是测试里另写一份。"""
+        state = self.app.state.v3_db
+        self.assertTrue(state["ok"], state)
+        self.assertTrue(state["exists"])
+        self.assertEqual(state["schemaVersion"], v3_db.SCHEMA_VERSION)
+        self.assertTrue((self.home / "v3.db").is_file())
+        again = v3_db.init_db(self.home)
+        self.assertEqual(again["tables"]["schema_version"], 1, "重复 init 不重复记账")
 
 
 if __name__ == "__main__":

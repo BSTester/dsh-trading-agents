@@ -346,6 +346,7 @@ class Deps:
         home=None,
         timeout=None,
         openbb_timeout=None,
+        akshare_retry=None,
     ):
         self._fetch_json = fetch_json
         self._fetch_post = fetch_post
@@ -356,6 +357,10 @@ class Deps:
         self.home = None if home is None else str(home)
         self.timeout = float(timeout if timeout is not None else DEFAULT_TIMEOUT)
         self.openbb_timeout = float(openbb_timeout if openbb_timeout is not None else OPENBB_TIMEOUT)
+        #: AKShare 重试策略覆盖项（``attempts``/``base_ms``/``max_ms``/``sleep``/``clock``/
+        #: ``rand``/``is_empty``），逐项透传给 ``v3_fallback.retry_akshare``。缺省空 dict →
+        #: 用 ``v3_fallback`` 的默认值（3 次 / 1200ms 起 / 8000ms 封顶 / 真 sleep）。
+        self.akshare_retry = dict(akshare_retry or {})
 
     # env -------------------------------------------------------------------
     @property
@@ -453,6 +458,129 @@ def akshare_module(deps):
     return deps.module("akshare", deps._akshare)
 
 
+# ── AKShare 调用护栏：超时 + 自动重试 + 尝试留痕 ────────────────────────────────
+# 治理口径见 ``v3_fallback.retry_akshare``（连接/超时/5xx 重试；业务错误不重试）。
+# 这里只负责「套上 socket 超时护栏 → 调一次 → 把 attempts 明细带回来」。
+
+#: AKShare 现货接口的降级链（**顺序 = 先快后慢、全市场优先**）。
+#: ``stock_zh_a_spot_em`` 是全市场**单请求**接口，排第一；``stock_sh/sz/bj_a_spot_em`` 是
+#: 东财同族的**单请求**分市场接口；``stock_zh_a_spot``（新浪）虽然也是全市场，但它**分页抓
+#: ~70 次请求**（实测单次调用 50~67s），所以排在最后——否则一个慢接口就会吃掉整条链的预算
+#: （2026-09-21 实测：sina 排第二时 /api/v3/spot 要 120s，排最后后约 50s）。
+#: 分市场接口命中时只覆盖一个市场，响应里 ``market_scope``/``scope_note`` 会如实写明，
+#: **绝不冒充全市场**。真机实测五个接口当前全部断连/超时，因此这条链当前的价值是
+#: 「把每个接口的真实错误按顺序留痕」，而不是「碰巧能拿到数据」。
+AKSHARE_SPOT_CHAIN = (
+    {"func": "stock_zh_a_spot_em", "source": "akshare/stock_zh_a_spot_em",
+     "scope": "A股全市场", "scope_full": True},
+    {"func": "stock_sh_a_spot_em", "source": "akshare/stock_sh_a_spot_em",
+     "scope": "沪市（分市场接口）", "scope_full": False},
+    {"func": "stock_sz_a_spot_em", "source": "akshare/stock_sz_a_spot_em",
+     "scope": "深市（分市场接口）", "scope_full": False},
+    {"func": "stock_bj_a_spot_em", "source": "akshare/stock_bj_a_spot_em",
+     "scope": "北交所（分市场接口）", "scope_full": False},
+    {"func": "stock_zh_a_spot", "source": "akshare/stock_zh_a_spot",
+     "scope": "A股全市场（新浪，分页接口，最慢）", "scope_full": True},
+)
+#: 整条现货链的墙钟预算（毫秒）：每个接口各重试 3 次，没有预算会把一个请求拖到几分钟。
+#: 超预算的接口在响应 ``chain`` 里记 ``skipped=true`` + ``chain/timeout``（不假装试过）。
+#: 默认 15000ms：实测 AKShare 现货类接口当前上游全断，45000 会让一次失败请求拖到 52s；
+#: 压到 15s 后约 20s 返回，且**仍然是如实报错**（带试过的接口与真实错误），不牺牲诚实性。
+#: 上游恢复后可用环境变量放宽（例如 60000）以取全量数据。
+SPOT_CHAIN_BUDGET_ENV = "QUANT_AKSHARE_SPOT_BUDGET_MS"
+SPOT_CHAIN_BUDGET_MS = 15000
+
+
+def akshare_retry_options(deps):
+    """AKShare 重试参数：``Deps.akshare_retry`` 的注入项（缺省空 dict → 用默认策略）。"""
+    return dict(getattr(deps, "akshare_retry", None) or {})
+
+
+def spot_chain_budget(deps=None):
+    """现货链墙钟预算（毫秒）：``QUANT_AKSHARE_SPOT_BUDGET_MS``（非法/越界回落默认）。"""
+    raw = None
+    if deps is not None:
+        try:
+            raw = deps.get_env(SPOT_CHAIN_BUDGET_ENV)
+        except Exception:  # noqa: BLE001 —— 假 deps 形态不保证
+            raw = None
+    if raw in (None, ""):
+        return SPOT_CHAIN_BUDGET_MS
+    try:
+        value = int(float(str(raw).strip()))
+    except (TypeError, ValueError):
+        return SPOT_CHAIN_BUDGET_MS
+    return value if value > 0 else SPOT_CHAIN_BUDGET_MS
+
+
+def _akshare_call(deps, func, kwargs=None, budget_ms=None):
+    """调一次 akshare 函数（超时护栏 + 自动重试）→ ``(value, attempts, error)``。
+
+    * ``value is None`` 表示**重试耗尽或业务错误**：``error`` 是第一次尝试的真实错误
+      （``{code,message}``），``attempts`` 是完整重试明细（每次的 ok/ms/error/wait_ms）；
+    * ``value`` 非 ``None`` 时原样返回（含空结果——空结果由调用方按链纪律判失败）；
+    * ``budget_ms`` 透传给 ``retry_akshare``：单级取数的时间预算（降级链整链预算的剩余量）。
+    """
+    from server import v3_fallback  # 局部导入：与 financials_with_chain 同一口径
+
+    def call():
+        with _SocketTimeoutGuard(deps.timeout):
+            return func(**(kwargs or {}))
+
+    value, meta = v3_fallback.retry_akshare(call, budget_ms=budget_ms,
+                                            **akshare_retry_options(deps))
+    if value is not None:
+        return value, meta, None
+    first = next((item.get("error") for item in meta if item.get("error")), None)
+    error = first or {"code": "akshare/all-attempts-failed", "message": "重试全部失败（无错误明细）"}
+    return None, meta, error
+
+
+def _akshare_failure_message(func, error, attempts, total_ms=None):
+    """一句人类可读的失败说明：试了几次、每次等了多久、**真实错误原文**。"""
+    detail = (error or {}).get("message") or "无错误明细"
+    business = bool(attempts) and attempts[0].get("retryable") is False
+    budget_stopped = bool(attempts) and attempts[-1].get("stopped") == "budget"
+    waits = [item.get("wait_ms") for item in (attempts or []) if item.get("wait_ms")]
+    if business:
+        head = f"akshare.{func} 业务错误（不重试）：{detail}"
+    else:
+        head = f"akshare.{func} 尝试 {len(attempts or [])} 次仍失败"
+        if waits:
+            head += f"（退避 {waits} ms）"
+        if budget_stopped:
+            head += (f"；重试被时间预算（{int(attempts[-1].get('budget_ms') or 0)}ms）截断，"
+                     "剩余次数未试")
+    if total_ms is not None:
+        head += f"，本接口合计 {total_ms}ms"
+    return f"{head}：{detail}"
+
+
+def _first_cell(row, *keys):
+    """按优先级取第一个存在的列（AKShare 各接口的中文列名不完全一致）。"""
+    for key in keys:
+        if key in row:
+            return row.get(key)
+    return None
+
+
+def _spot_row(row, spec):
+    """现货行 → 契约行形状（列名按接口差异回落；新浪的 ``sh600519`` 归一成 ``600519``）。"""
+    code = as_text(_first_cell(row, "代码", "symbol", "code"))
+    if spec.get("func") == "stock_zh_a_spot":
+        code = normalize_a_share_symbol(code)
+    return {
+        "code": code,
+        "name": as_text(_first_cell(row, "名称", "name")),
+        "price": as_number(_first_cell(row, "最新价", "trade", "price")),
+        "change_pct": as_number(_first_cell(row, "涨跌幅", "changepercent")),
+        "turnover_rate": as_number(_first_cell(row, "换手率", "turnoverratio")),
+        "volume_ratio": as_number(_first_cell(row, "量比")),
+        "pe": as_number(_first_cell(row, "市盈率-动态", "市盈率", "per")),
+        "pb": as_number(_first_cell(row, "市净率", "pb")),
+    }
+
+
 def normalize_a_share_symbol(raw):
     """``SH.600519`` / ``sh600519`` / ``600519.SH`` → ``600519``（akshare 要裸代码）。"""
     text = as_text(raw)
@@ -501,7 +629,11 @@ def _head(rows, limit):
 
 
 def fetch_news(deps, symbol, limit):
-    """``ak.stock_news_em(symbol=...)`` → 规格行形状（标题/摘要/时间/来源/链接/关键词）。"""
+    """``ak.stock_news_em(symbol=...)`` → 规格行形状（标题/摘要/时间/来源/链接/关键词）。
+
+    上游断连/超时/5xx 由 ``retry_akshare`` 自动重试（指数退避 + 抖动）；业务错误不重试。
+    失败信封里带 ``attempts``（每次的耗时与真实错误），成功信封里也带，便于核对重试开销。
+    """
     code = normalize_a_share_symbol(symbol)
     if not code:
         return envelope_error("akshare/bad-args", "news 需要非空 symbol（如 600519 或 SH.600519）")
@@ -512,11 +644,12 @@ def fetch_news(deps, symbol, limit):
     func = getattr(ak, "stock_news_em", None)
     if not callable(func):
         return envelope_error("akshare/missing-func", "akshare.stock_news_em 不存在（版本不兼容？）")
-    try:
-        with _SocketTimeoutGuard(deps.timeout):
-            frame = func(symbol=code)
-    except Exception as error:  # noqa: BLE001
-        return envelope_error("akshare/stock_news_em", _error_text(error))
+    frame, attempts, error = _akshare_call(deps, func, {"symbol": code})
+    if frame is None:
+        payload = envelope_error("akshare/stock_news_em",
+                                 _akshare_failure_message("stock_news_em", error, attempts))
+        payload["error"]["attempts"] = attempts
+        return payload
     rows = []
     for row in _head(_rows_from_frame(frame), limit):
         rows.append(
@@ -535,42 +668,101 @@ def fetch_news(deps, symbol, limit):
         "source": "akshare/stock_news_em",
         "symbol": code,
         "rows": rows,
+        "attempts": attempts,
     }
 
 
 def fetch_spot(deps, limit):
-    """``ak.stock_zh_a_spot_em()`` → A 股实时快照。
+    """A 股实时快照：**多接口降级 + 自动重试**（``AKSHARE_SPOT_CHAIN``）。
 
-    实测该接口常以 ``RemoteDisconnected`` 直接断连（东财侧限流/风控），此时**如实报错**：
-    不重试成假数据、不返回空 rows 冒充成功。
+    顺序（见 ``AKSHARE_SPOT_CHAIN``，先快后慢、全市场优先）::
+
+        stock_zh_a_spot_em（全市场，单请求）
+        → stock_sh_a_spot_em → stock_sz_a_spot_em → stock_bj_a_spot_em（东财分市场，单请求）
+        → stock_zh_a_spot（新浪全市场，分页 ~70 次请求，最慢，排最后）
+
+    每一级内部走 ``retry_akshare``（连接类/超时/5xx 重试，业务错误与空结果不重试）；
+    整条链有墙钟预算 ``QUANT_AKSHARE_SPOT_BUDGET_MS``（默认 45000ms），超预算的接口在
+    ``chain`` 里记 ``skipped`` + 原因——**不把没试过的接口写成失败**。
+
+    响应契约（只增字段）:
+
+      * 命中：``{ok:true, source, as_of, market_scope, scope_note, rows, chain, attempts}``；
+        降级到分市场接口时 ``market_scope``/``scope_note`` 如实说明**只覆盖一部分市场**。
+      * 全失败：``{ok:false, error:{code,message,attempts}, chain, as_of}``，``message`` 里带
+        **试过的接口顺序**与**真实错误原文**；**绝不返回占位/空 rows 冒充成功**。
     """
+    from server import v3_fallback  # 局部导入：与 financials_with_chain 同一口径
+
+    want = to_int(limit, 20, 1, 500)
     try:
         ak = akshare_module(deps)
     except Exception as error:  # noqa: BLE001
         return envelope_error("akshare/missing", f"akshare 不可用：{_error_text(error)}")
-    func = getattr(ak, "stock_zh_a_spot_em", None)
-    if not callable(func):
-        return envelope_error("akshare/missing-func", "akshare.stock_zh_a_spot_em 不存在（版本不兼容？）")
-    try:
-        with _SocketTimeoutGuard(deps.timeout):
-            frame = func()
-    except Exception as error:  # noqa: BLE001
-        return envelope_error("akshare/stock_zh_a_spot_em", _error_text(error))
-    rows = []
-    for row in _head(_rows_from_frame(frame), limit):
-        rows.append(
-            {
-                "code": as_text(row.get("代码")),
-                "name": as_text(row.get("名称")),
-                "price": as_number(row.get("最新价")),
-                "change_pct": as_number(row.get("涨跌幅")),
-                "turnover_rate": as_number(row.get("换手率")),
-                "volume_ratio": as_number(row.get("量比")),
-                "pe": as_number(row.get("市盈率-动态")),
-                "pb": as_number(row.get("市净率")),
-            }
+    metas = {}
+    budget_ms = spot_chain_budget(deps)
+    chain_started = time.monotonic()
+
+    def link(spec):
+        func = getattr(ak, spec["func"], None)
+        if not callable(func):
+            return envelope_error("akshare/missing-func",
+                                  f"akshare.{spec['func']} 不存在（版本不兼容？）")
+        begin = time.monotonic()
+        # 把「整链剩下的预算」也交给重试层：上游一次调用可能要几十秒，
+        # 只在链级检查预算会让一个慢接口吃掉全部预算（实测新浪现货单次 50s）。
+        remaining_ms = int(budget_ms - (begin - chain_started) * 1000)
+        frame, attempts, error = _akshare_call(deps, func, budget_ms=max(1, remaining_ms))
+        metas[spec["source"]] = attempts
+        if frame is None:
+            return envelope_error(
+                spec["source"],
+                _akshare_failure_message(spec["func"], error, attempts,
+                                         int((time.monotonic() - begin) * 1000)))
+        rows = [_spot_row(row, spec) for row in _head(_rows_from_frame(frame), want)]
+        if not rows:
+            return envelope_error("akshare/no-rows",
+                                  f"akshare.{spec['func']} 未返回任何行（空结果不当可用）")
+        payload = {
+            "ok": True,
+            "as_of": now_iso(),
+            "source": spec["source"],
+            "market_scope": spec["scope"],
+            "scope_note": (f"本响应来自 {spec['source']}（{spec['scope']}）"
+                           + ("" if spec.get("scope_full")
+                              else "；分市场接口**只覆盖该市场**，不是全市场快照")),
+            "rows": rows,
+            "attempts": attempts,
+        }
+        return payload
+
+    chain = [(spec["source"], (lambda spec=spec: link(spec))) for spec in AKSHARE_SPOT_CHAIN]
+    value, used, attempts = v3_fallback.run_chain(chain, timeout=budget_ms / 1000.0)
+    attempts = v3_fallback.attempts_chain(attempts)
+    for item in attempts:
+        detail = metas.get(item.get("source"))
+        if detail is not None:
+            item["attempts"] = detail
+    if value is None:
+        primary = next((item for item in attempts
+                        if item.get("source") == "akshare/stock_zh_a_spot_em"
+                        and item.get("error")), None)
+        error = (primary or {}).get("error") or v3_fallback.last_error(attempts)
+        payload = envelope_error(
+            error.get("code") or "akshare/stock_zh_a_spot_em",
+            f"A 股全市场快照：按顺序试过 {len(attempts)} 个接口全部失败。"
+            f"首个接口的真实错误 {error.get('code')}: {error.get('message')}；"
+            f"降级链：{v3_fallback.describe_attempts(attempts)}",
         )
-    return {"ok": True, "as_of": now_iso(), "source": "akshare/stock_zh_a_spot_em", "rows": rows}
+        payload["as_of"] = now_iso()
+        payload["chain"] = attempts
+        payload["error"]["attempts"] = metas.get("akshare/stock_zh_a_spot_em")
+        payload["error"]["tried"] = [item.get("source") for item in attempts]
+        return payload
+    payload = dict(value)
+    payload["chain"] = attempts
+    payload["used_source"] = used
+    return payload
 
 
 def fetch_kline_akshare(deps, symbol, limit=3):
@@ -592,13 +784,16 @@ def fetch_kline_akshare(deps, symbol, limit=3):
     want = to_int(limit, 3, 1, 500)
     end = date.today()
     start = end - timedelta(days=max(14, want * 3))
-    try:
-        with _SocketTimeoutGuard(deps.timeout):
-            frame = func(symbol=code, period="daily",
-                         start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"),
-                         adjust="qfq")
-    except Exception as error:  # noqa: BLE001 —— 上游断连/限流都在这里如实暴露
-        return envelope_error("akshare/stock_zh_a_hist", _error_text(error))
+    frame, attempts, error = _akshare_call(deps, func, {
+        "symbol": code, "period": "daily",
+        "start_date": start.strftime("%Y%m%d"), "end_date": end.strftime("%Y%m%d"),
+        "adjust": "qfq",
+    })
+    if frame is None:
+        payload = envelope_error("akshare/stock_zh_a_hist",
+                                 _akshare_failure_message("stock_zh_a_hist", error, attempts))
+        payload["error"]["attempts"] = attempts
+        return payload
     rows = []
     for row in _rows_from_frame(frame)[-want:]:
         rows.append(
@@ -614,7 +809,7 @@ def fetch_kline_akshare(deps, symbol, limit=3):
     if not rows:
         return envelope_error("akshare/no-rows", f"akshare.stock_zh_a_hist 未返回 {code} 的任何日 K")
     return {"ok": True, "as_of": now_iso(), "source": "akshare/stock_zh_a_hist",
-            "symbol": code, "bars": rows}
+            "symbol": code, "bars": rows, "attempts": attempts}
 
 
 #: AKShare 财务接口 → 三表的中文报表名（``stock_financial_report_sina`` 的 ``symbol``）。
@@ -739,22 +934,20 @@ def fetch_financials_akshare(deps, ticker, statement, periods):
                 "akshare/missing-func",
                 "akshare.stock_financial_hk_report_em 不存在（该版本不支持港股财务；"
                 "港股财务降级无可用开源源）")
-        try:
-            with _SocketTimeoutGuard(deps.timeout):
-                frame = func(stock=code, symbol=AKSHARE_HK_STATEMENTS[statement], indicator="年度")
-        except Exception as error:  # noqa: BLE001
-            return envelope_error("akshare/stock_financial_hk_report_em", _error_text(error))
+        frame, attempts, error = _akshare_call(deps, func, {
+            "stock": code, "symbol": AKSHARE_HK_STATEMENTS[statement], "indicator": "年度"})
         source = "akshare/stock_financial_hk_report_em"
     else:
         func = getattr(ak, "stock_financial_abstract", None)
         if not callable(func):
             return envelope_error("akshare/missing-func", "akshare.stock_financial_abstract 不存在（版本不兼容？）")
-        try:
-            with _SocketTimeoutGuard(deps.timeout):
-                frame = func(symbol=code)
-        except Exception as error:  # noqa: BLE001
-            return envelope_error("akshare/stock_financial_abstract", _error_text(error))
+        frame, attempts, error = _akshare_call(deps, func, {"symbol": code})
         source = "akshare/stock_financial_abstract"
+    if frame is None:
+        name = "stock_financial_hk_report_em" if market == "HK" else "stock_financial_abstract"
+        payload = envelope_error(source, _akshare_failure_message(name, error, attempts))
+        payload["error"]["attempts"] = attempts
+        return payload
     lines = _lines_from_akshare_frame(frame, want)
     if not lines:
         return envelope_error("akshare/unexpected-shape",
@@ -768,6 +961,7 @@ def fetch_financials_akshare(deps, ticker, statement, periods):
         "source": source,
         "lines": lines,
         "missing": [],
+        "attempts": attempts,
     }
 
 
@@ -1462,7 +1656,11 @@ def register(app, v3_run, home, deps=None):
 
     @app.get("/api/v3/spot")
     async def v3_spot(limit: int = 20):
-        """A 股实时快照。上游常以 RemoteDisconnected 断连——如实报错，不伪造。"""
+        """A 股实时快照：多接口降级（``AKSHARE_SPOT_CHAIN``）+ 自动重试。
+
+        上游实测常以 ``RemoteDisconnected`` 断连——先按退避重试，再按接口顺序降级；
+        全失败时 ``error.message`` 带试过的接口与真实错误原文，**不伪造、不返回空 rows**。
+        """
         try:
             payload = await asyncio.to_thread(fetch_spot, deps, to_int(limit, 20, 1, 500))
         except Exception as error:  # noqa: BLE001

@@ -1,0 +1,44 @@
+# 平台监控探测触发者（规格 §8.3「监控落地」；2026-09-20 补「告警谁触发」的运维缺口）
+#
+# 为什么需要它
+# ------------
+# ``GET /metrics`` 的抓取路径**刻意不发起任何外部探测**：富途调用要过全局限流器，
+# 用监控去触发「被限流」告警是自伤。于是两张落盘缓存只能由「别人探测后写入」：
+#   * <DSH_HOME>/v3-datasource-probe.json  ← GET  /api/v3/sources/status
+#   * <DSH_HOME>/v3-risk-probe.json        ← POST /api/v3/metrics/probe/refresh
+# 没人跑这两个端点时，下面这些告警会**静默**：
+#   DataSourceChainUnavailable / DataSourceFellBackToSecondary /
+#   RiskIndustryConcentrationBreached / RiskIndustryConcentrationApproaching
+# 而 DataSourceProbeStale / RiskIndustryProbeStale 两条 info 规则的存在理由，
+# 就是让「静默」本身可见。本单元就是那个触发者。
+#
+# 只读语义（硬性）
+# ----------------
+# 两个端点都只读取数 + 本地落盘缓存，**不触发任何交易/写端点**：
+# 没有 switch-mode / plan-execute / confirm-decide / trade_* / sim_trade_*。
+#
+# 手动演练（等价于定时器做的事）
+# ------------------------------
+#   curl -fsS -m 60 'http://127.0.0.1:8397/api/v3/sources/status'
+#   curl -fsS -m 120 -X POST 'http://127.0.0.1:8397/api/v3/metrics/probe/refresh'
+#
+# 安装：见同目录 README.md（本仓库只产出素材，**没有** enable/start 任何单元）。
+[Unit]
+Description=quant platform probe refresher (writes /metrics probe caches)
+Documentation=file:%h/dsh-trading-agents/platform/install/README.md
+# 探测打的是本机服务（默认 127.0.0.1:8397）；服务没起就没人应答，curl 会失败并以
+# 非零退出——**不静默成功**（这是有意的：失败要能在 systemctl status 里看见）。
+After=quant-platform.service
+
+[Service]
+Type=oneshot
+# 一条 ExecStart 顺序跑两个探测，并**保留失败**：任一失败 → 退出码非零 → 单元 failed。
+# （systemd 的 oneshot 在某个 ExecStart 失败后会跳过后续 ExecStart，所以这里用 sh -c
+#  串起来，而不是两条 ExecStart：两条缓存必须各自独立地拿到刷新机会。）
+ExecStart=/bin/sh -c 'rc=0; \
+  curl -fsS -m 60 http://127.0.0.1:8397/api/v3/sources/status >/dev/null || rc=1; \
+  curl -fsS -m 120 -X POST http://127.0.0.1:8397/api/v3/metrics/probe/refresh >/dev/null || rc=1; \
+  exit $rc'
+# 端点最坏耗时：sources/status ≈45s（v3_fallback.PROBE_CHAIN_TIMEOUT 逐级探测），
+# 行业探测按标的分市场打富途（SH 自选池 28 只 ⇒ 十秒级，受限流器 pacing）。
+TimeoutStartSec=300

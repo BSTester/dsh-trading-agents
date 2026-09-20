@@ -24,7 +24,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from server import v3_analytics, v3_math
+from server import v3_analytics, v3_db, v3_math
 
 TRADING_DAYS = 252
 
@@ -35,6 +35,7 @@ ROUTES = {
     ("POST", "/api/v3/strategy/run"),
     ("GET", "/api/v3/ml/sweep"),
     ("POST", "/api/v3/ml/backtest"),
+    ("GET", "/api/v3/ml/models"),
 }
 
 
@@ -915,6 +916,38 @@ class TestStrategyRoute(RouteCase):
         self.assertEqual(len(path.read_text(encoding="utf-8").strip().splitlines()), 2)
         self.assertEqual(v3_analytics.strategy_last(self.home)["run"]["universe"], ["C", "D"])
 
+    # ---- SQLite 持久化层（v3_db）的最小断言：只加，不改既有 ----
+    def test_result_is_also_written_to_the_sqlite_table(self):
+        """主存是库里的 ``strategy_runs`` 表；JSONL 是同一份冷备（两者行数一一对应）。"""
+        run = self._run()
+        result = v3_analytics.strategy_run(run, self.home, {"universe": ["A", "B"]})
+        self.assertTrue(result["ok"], result)
+        rows = v3_db.list_events(self.home, "strategy_runs", limit=None, order="asc")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0], result["run"], "库里读到的与响应里的 run 逐字段一致")
+        path = Path(self.home) / v3_analytics.STRATEGY_RUNS_FILE
+        self.assertEqual(len(path.read_text(encoding="utf-8").strip().splitlines()), 1,
+                         "冷备文件同步保留（迁移前的外部读者不受影响）")
+
+    def test_reads_prefer_the_database_over_the_cold_backup(self):
+        """库里都有记录时以库为准：把冷备改成「另一条」，读回的还是库里的那条。"""
+        run = self._run()
+        v3_analytics.strategy_run(run, self.home, {"universe": ["A", "B"]})
+        path = Path(self.home) / v3_analytics.STRATEGY_RUNS_FILE
+        path.write_text(json.dumps({"asOf": "cold-only", "market": "US"}) + "\n",
+                        encoding="utf-8")
+        self.assertEqual(v3_analytics.strategy_last(self.home)["run"]["universe"], ["A", "B"])
+        self.assertEqual(v3_analytics.strategy_markets(self.home), [None])
+
+    def test_file_only_records_are_still_read_when_the_database_is_empty(self):
+        """库为空（未迁移/被删）→ 回退只读旧文件，行为与迁移前逐字段一致。"""
+        path = Path(self.home) / v3_analytics.STRATEGY_RUNS_FILE
+        path.write_text(json.dumps({"asOf": "legacy", "market": "HK"}) + "\n",
+                        encoding="utf-8")
+        self.assertEqual(v3_analytics.read_last_strategy_run(self.home),
+                         {"asOf": "legacy", "market": "HK"})
+        self.assertEqual(v3_analytics.strategy_markets(self.home), ["HK"])
+
     def test_corrupt_lines_are_skipped(self):
         path = Path(self.home) / v3_analytics.STRATEGY_RUNS_FILE
         path.write_text('{"asOf": "first"}\nnot json\n', encoding="utf-8")
@@ -1129,6 +1162,8 @@ class TestRegisterRoutes(RouteCase):
             "/api/v3/strategy": {},
             "/api/v3/ml/sweep": {"ticker": "SH.600519", "windows": "5",
                                  "rebalance": "5", "limit": 500},
+            "/api/v3/ml/models": {"market": "SH", "ticker": "SH.600519",
+                                  "window": 20, "horizon": 1},
         }
         post_body = json.dumps({"ticker": "SH.600519", "universe": ["A", "B"]}).encode()
         for (method, path), function in app.routes.items():
