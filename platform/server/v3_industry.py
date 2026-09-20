@@ -23,6 +23,12 @@
 口径）→ 否则自选池等权（``<home>/trading-platform.json`` 的 ``watchlist``）。
 ``value`` = 权重 × ``equity.current``（拿不到权益 → ``null``，不估算）。
 ``breach = top.weightPct > limit_pct``。
+
+``?market=SH|HK|US``：标的集**复用统一解析** ``server/v3_universe.resolve_universe``
+（配置 ``watchlists.<market>`` → 富途真实持仓）；显式 ``?tickers=`` 仍优先（只按市场过滤
+请求的标的）；该市场既无配置池也无真实持仓 → ``industry/no-universe``（如实报错，不退回
+全部市场）。平台组合里没有该市场标的时，权重改用该市场宇宙等权并在 ``sources.weights``
+写明（否则暴露恒为 0%，等于给假象）。不传 ``market`` 时行为与历史一致。
 """
 from __future__ import annotations
 
@@ -33,7 +39,7 @@ import time as _time
 from datetime import datetime, timezone
 from pathlib import Path
 
-from server import v3_math
+from server import v3_math, v3_universe
 
 __all__ = [
     "INDUSTRY_PLATE_TYPE",
@@ -354,22 +360,52 @@ def industry_exposure(v3_run, home, tickers_raw=None, market="", limit_pct=20, *
         return _error("industry/bad-limit", f"limit_pct 需在 0..100，收到 {limit_value}")
 
     weights, weight_source = resolve_weights(v3_run, home)
-    if not weights:
-        return _error("industry/no-portfolio",
-                      f"无可用组合定义（{weight_source}）——用 ?tickers= 显式指定标的，或先配置自选池")
 
     requested = _tickers_of(tickers_raw)
-    market_code = str(market or "").strip().upper()
-    if market_code and market_code not in MARKETS:
-        return _error("industry/bad-market", f"market 需为 {list(MARKETS)} 之一，收到 {market!r}",
-                      supported=list(MARKETS))
+    market_code = ""
+    if str(market or "").strip():
+        market_code = v3_universe.normalize_market(market)
+        if market_code is None:
+            return _error("industry/bad-market", "market 需为 SH / HK / US",
+                          supported=list(MARKETS))
+    universe_source = None
     if requested:
         if market_code:
-            requested = [ticker for ticker in requested if market_of(ticker) == market_code]
+            requested = [ticker for ticker in requested
+                         if v3_universe.market_of_ticker(ticker) == market_code]
         universe = requested
         notes = [f"标的由 ?tickers= 指定（{len(universe)} 只），权重仍取平台组合口径"]
+        if not weights:
+            return _error("industry/no-portfolio",
+                          f"无可用组合定义（{weight_source}）——用 ?tickers= 显式指定标的，"
+                          f"或先配置自选池")
+    elif market_code:
+        # 统一解析（配置 watchlists.<market> → 富途真实持仓）；无宇宙 → 沿用 industry/no-universe
+        resolved = v3_universe.resolve_universe(v3_run, home, market_code)
+        if resolved is None:
+            detail = v3_universe.universe_note(home, market_code) or ""
+            return _error("industry/no-universe",
+                          f"market={market_code} 既没有配置自选池、也没有真实持仓"
+                          + (f"（{detail}）" if detail else "")
+                          + "——这不是取数失败，而是该市场没有可分析的标的",
+                          market=market_code)
+        universe = [ticker for ticker in (resolved.get("tickers") or [])]
+        universe_source = resolved.get("source")
+        notes = [f"标的取统一解析的 {market_code} 宇宙（{universe_source}），"
+                 f"共 {len(universe)} 只"]
+        if universe and (not weights
+                         or not any(_lookup_weight(weights, ticker) is not None
+                                    for ticker in universe)):
+            # 平台组合里没有该市场标的 → 用该市场宇宙等权（否则暴露恒为 0%，等于给假象）
+            weights = {ticker: 1.0 / len(universe) for ticker in universe}
+            weight_source = (f"{market_code} 市场宇宙等权（{len(universe)} 只）"
+                             f"（平台组合口径：{weight_source}）")
     else:
-        universe = [ticker for ticker in weights if not market_code or market_of(ticker) == market_code]
+        if not weights:
+            return _error("industry/no-portfolio",
+                          f"无可用组合定义（{weight_source}）——用 ?tickers= 显式指定标的，"
+                          f"或先配置自选池")
+        universe = [ticker for ticker in weights]
         notes = []
     if market_code:
         notes.append(f"已按 market={market_code} 过滤（不跨市场合并暴露）")
@@ -446,6 +482,8 @@ def industry_exposure(v3_run, home, tickers_raw=None, market="", limit_pct=20, *
     return {
         "ok": True,
         "as_of": now_iso(),
+        "market": market_code or None,
+        "universe_source": universe_source,
         "limitPct": limit_value,
         "breach": bool(top and top["weightPct"] > limit_value),
         "mapping": mapping,
@@ -455,6 +493,7 @@ def industry_exposure(v3_run, home, tickers_raw=None, market="", limit_pct=20, *
             "plate": "+".join(sources_used),
             "weights": weight_source,
             "nav": "sim-ledger(equity.current)" if nav is not None else None,
+            "universe": universe_source,
         },
         "missing": missing,
         "notes": notes + list(resolver.notes) + [nav_note],

@@ -19,6 +19,7 @@ import {
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { useV3, fmt, noSourceText } from "../services/api.js";
+import { MarketNote, envelopeError, marketLabel, marketTicker, tickerMarket, useMarket } from "../services/marketContext.jsx";
 import { LineChart, Heatmap } from "../components/charts.jsx";
 
 const { Text, Paragraph, Link } = Typography;
@@ -58,13 +59,11 @@ function NoSource({ what, why }) {
 const OK = (env) => Boolean(env && env.ok);
 const rowKey = (...parts) => parts.join("|");
 
-/** 信封错误文案：优先 error.code：message，否则退回 error 或 HTTP 层文案。 */
+/** 信封错误文案：`error.code：error.message` + 有 error.detail 时追加「真实原因」
+ *  （统一口径见 services/marketContext.jsx 的 envelopeError：message 是冻结文案，
+ *  真实原因常在 detail，只显示 message 会把「富途限频」误读成「这个市场没有池子」）。 */
 function envError(env, fallback) {
-  const error = (env && env.error) || {};
-  const code = error.code ? String(error.code) : "";
-  const message = error.message ? String(error.message) : "";
-  if (code || message) return code ? `${code}：${message || fallback || "请求失败"}` : message;
-  return fallback || "接口未返回 error.code/message";
+  return envelopeError(env, fallback || "接口未返回 error.code/message");
 }
 
 /**
@@ -148,22 +147,25 @@ function pipelineDetails(run) {
   };
 }
 
-function PipelineCard({ env, refresh, ticker }) {
+function PipelineCard({ env, refresh, ticker, market }) {
   const run = OK(env) ? env.run : null;
   const [busy, setBusy] = React.useState(false);
   const [note, setNote] = React.useState(null);
   const details = pipelineDetails(run);
+  // run 记录自带 market 时原样显示（服务端按该市场落盘）；未返回则标「未返回」，不臆测
+  const runMarket = run && run.market ? String(run.market) : null;
 
   const runRound = async () => {
     setBusy(true);
-    setNote({ tone: "info", text: "正在跑真实流水线 PDAT→PET（只出调仓建议提案，不下单）…" });
-    const body = await postV3("strategy/run", { topN: 2, window: 20 });
+    setNote({ tone: "info", text: `正在跑真实流水线 PDAT→PET（market=${market}，只出调仓建议提案，不下单）…` });
+    // 研究动作只由人工点击触发；载荷显式带 market，universe 随市场
+    const body = await postV3("strategy/run", { topN: 2, window: 20, market });
     setBusy(false);
     if (OK(body)) {
-      setNote({ tone: "ok", text: `已触发真实流水线：as_of ${fmt.stamp((body.run || {}).asOf)}${body.persistError ? ` · 落盘失败：${body.persistError}` : ""}` });
+      setNote({ tone: "ok", text: `已触发真实流水线（market=${(body.run || {}).market || market}）：as_of ${fmt.stamp((body.run || {}).asOf)}${body.persistError ? ` · 落盘失败：${body.persistError}` : ""}` });
       refresh();
     } else {
-      setNote({ tone: "err", text: `流水线失败：${envError(body, "POST /api/v3/strategy/run 失败")}` });
+      setNote({ tone: "err", text: `流水线失败：${envError(body, `POST /api/v3/strategy/run（market=${market}）失败`)}` });
     }
   };
 
@@ -175,16 +177,22 @@ function PipelineCard({ env, refresh, ticker }) {
         <Space>
           <Text type="secondary" style={{ fontSize: 12 }}>研究轮记录 as_of {run ? fmt.stamp(run.asOf) : "—"}</Text>
           <Button size="small" type="primary" loading={busy} onClick={runRound}
-            title="POST /api/v3/strategy/run {topN:2}：只由人工点击触发，产物是调仓建议提案（不下单）">
+            title={`POST /api/v3/strategy/run {topN:2, window:20, market:${market}}：只由人工点击触发，产物是调仓建议提案（不下单）`}>
             新建研究轮
           </Button>
         </Space>
       }
     >
       {!OK(env) ? (
-        <NoSource what="研究流水线 PDAT→PET" why={envError(env, "GET /api/v3/strategy 取不到：尚无落盘记录，可点「新建研究轮」跑一轮真实流水线")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="研究流水线 PDAT→PET" why={envError(env, `GET /api/v3/strategy?market=${market} 取不到：该市场尚无落盘记录（无自选池/无持仓时服务端返回 market/no-universe），可点「新建研究轮」跑一轮真实流水线`)} />
+          <MarketNote source={`GET /api/v3/strategy?market=${market}`} />
+        </Space>
       ) : !run ? (
-        <NoSource what="研究流水线 PDAT→PET" why="GET /api/v3/strategy 返回 run=null：尚无落盘记录，可点「新建研究轮」跑一轮真实流水线" />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="研究流水线 PDAT→PET" why={`GET /api/v3/strategy?market=${market} 返回 run=null：该市场尚无落盘记录，可点「新建研究轮」跑一轮真实流水线`} />
+          <MarketNote source={`GET /api/v3/strategy?market=${market}`} />
+        </Space>
       ) : (
         <Space direction="vertical" size={10} style={{ width: "100%" }}>
           <Steps
@@ -199,6 +207,7 @@ function PipelineCard({ env, refresh, ticker }) {
           <Descriptions size="small" column={{ xs: 1, sm: 3 }} bordered
             items={[
               { key: "asOf", label: "落盘时间", children: fmt.stamp(run.asOf) },
+              { key: "market", label: "研究轮 market", children: runMarket ? <Tag color="blue">{`${marketLabel(runMarket)}`}</Tag> : "接口未返回（无数据源）" },
               { key: "universe", label: "标的池", children: `${asArray(run.universe).length} 只` },
               { key: "proposals", label: "调仓建议", children: `${asArray(run.proposals).length} 条` },
               { key: "scoreSource", label: "评分来源", children: ((run.stages || {}).PAAT || {}).scoreSource || "—" },
@@ -207,8 +216,9 @@ function PipelineCard({ env, refresh, ticker }) {
             ]}
           />
           <Text type="secondary" style={{ fontSize: 12 }}>
-            口径：/api/v3/strategy 只落盘最后一轮研究记录；本轮回测标的 {ticker || "—"}。该接口**不下单**，PET 产物只是调仓建议提案。
+            口径：/api/v3/strategy 只落盘最后一轮研究记录（本轮 market={runMarket || market}）；本轮回测标的 {ticker || "—"}。该接口**不下单**，PET 产物只是调仓建议提案。
           </Text>
+          <MarketNote source={`GET /api/v3/strategy?market=${market}`} asOf={run.asOf} extra={runMarket ? `记录内 market=${runMarket}` : "记录未返回 market 字段"} />
         </Space>
       )}
       {note ? <Alert style={{ marginTop: 10 }} type={note.tone === "ok" ? "success" : note.tone === "err" ? "error" : "info"} showIcon message={note.text} /> : null}
@@ -218,6 +228,7 @@ function PipelineCard({ env, refresh, ticker }) {
 
 /* ── ② 调仓提案表 ───────────────────────────────────────────────────────── */
 function ProposalsCard({ env }) {
+  const { market } = useMarket();
   const run = OK(env) ? env.run : null;
   const proposals = asArray(run && run.proposals);
   const columns = [
@@ -241,11 +252,24 @@ function ProposalsCard({ env }) {
   ];
   return (
     <ProCard title="调仓提案" bordered extra={<Text type="secondary" style={{ fontSize: 12 }}>来源 /api/v3/strategy · run.proposals（真实流水线产物）</Text>}>
-      {!OK(env) ? <NoSource what="调仓提案" why={envError(env, "GET /api/v3/strategy 取不到")} />
-        : proposals.length === 0 ? <NoSource what="调仓提案" why="本轮流水线 PET 阶段未产出提案（run.proposals 为空）" />
+      {!OK(env) ? (
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="调仓提案" why={envError(env, `GET /api/v3/strategy?market=${market} 取不到`)} />
+          <MarketNote source={`GET /api/v3/strategy?market=${market}`} />
+        </Space>
+      )
+        : proposals.length === 0 ? (
+          <Space direction="vertical" size={6} style={{ width: "100%" }}>
+            <NoSource what="调仓提案" why={`本轮（market=${market}）流水线 PET 阶段未产出提案（run.proposals 为空）`} />
+            <MarketNote source={`GET /api/v3/strategy?market=${market}`} asOf={run && run.asOf} />
+          </Space>
+        )
           : (
-            <Table size="small" rowKey={(record) => rowKey(record.ticker, record.action)} pagination={false}
-              columns={columns} dataSource={proposals} scroll={{ x: 900 }} />
+            <Space direction="vertical" size={6} style={{ width: "100%" }}>
+              <Table size="small" rowKey={(record) => rowKey(record.ticker, record.action)} pagination={false}
+                columns={columns} dataSource={proposals} scroll={{ x: 900 }} />
+              <MarketNote source={`GET /api/v3/strategy?market=${market} · run.proposals`} asOf={run && run.asOf} extra={`提案 ${proposals.length} 条（均为该市场标的池产物）`} />
+            </Space>
           )}
     </ProCard>
   );
@@ -253,6 +277,7 @@ function ProposalsCard({ env }) {
 
 /* ── ③ 因子库表 ─────────────────────────────────────────────────────────── */
 function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) {
+  const { market } = useMarket();
   const matrix = OK(baseEnv) ? baseEnv.matrix : null;
   const tickers = asArray(matrix && matrix.tickers);
   const factors = asArray(matrix && matrix.factors);
@@ -327,7 +352,10 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
   if (!OK(baseEnv)) {
     return (
       <ProCard title="因子库" bordered>
-        <NoSource what="因子库" why={envError(baseEnv, "GET /api/v3/factors/matrix 取不到")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="因子库" why={envError(baseEnv, `GET /api/v3/factors/matrix?market=${market} 取不到`)} />
+          <MarketNote source={`GET /api/v3/factors/matrix?market=${market}`} />
+        </Space>
       </ProCard>
     );
   }
@@ -348,7 +376,10 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
       }
     >
       {factors.length === 0 ? (
-        <NoSource what="因子库" why="factors/matrix 返回的 factors 为空" />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="因子库" why="factors/matrix 返回的 factors 为空" />
+          <MarketNote source={`GET /api/v3/factors/matrix?market=${market}`} />
+        </Space>
       ) : (
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
           <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={data} scroll={{ x: 1200 }} />
@@ -357,6 +388,11 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
             默认基线因子为 mom_20（{(baseIc && baseIc.tickers ? baseIc.tickers.length : 0)} 只标的、{baseIc ? fmt.num(baseIc.observations, 0) : "—"} 期样本）。
             分层年化多空、换手率、相关性本服务未返回，标注「无数据源」而不填占位数字。
           </Text>
+          <MarketNote
+            source={`GET /api/v3/factors/matrix?market=${market}（逐因子 IC 为 ?factor=X&market=${market}）`}
+            asOf={matrix && matrix.as_of}
+            extra={`${tickers.length} 只 × ${factors.length} 因子`}
+          />
         </Space>
       )}
     </ProCard>
@@ -365,6 +401,7 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
 
 /* ── ④ 参数扫描热力图 ───────────────────────────────────────────────────── */
 function HeatmapCard({ env, onRescan, scanning, ticker }) {
+  const { market } = useMarket();
   const sweep = OK(env) ? env : null;
   const grid = asArray(sweep && sweep.grid);
   const best = (sweep && sweep.best) || null;
@@ -386,8 +423,18 @@ function HeatmapCard({ env, onRescan, scanning, ticker }) {
         </Space>
       }
     >
-      {!OK(env) ? <NoSource what="参数扫描热力图" why={envError(env, "GET /api/v3/ml/sweep 未返回参数网格")} />
-        : valid.length === 0 ? <NoSource what="参数扫描热力图" why="ml/sweep 返回的网格里没有有效夏普（全部无效格）" />
+      {!OK(env) ? (
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="参数扫描热力图" why={envError(env, `GET /api/v3/ml/sweep?ticker=${ticker || marketTicker(market)}&market=${market} 未返回参数网格`)} />
+          <MarketNote source={`GET /api/v3/ml/sweep?market=${market}`} extra={`扫描标的 ${ticker || marketTicker(market)}`} />
+        </Space>
+      )
+        : valid.length === 0 ? (
+          <Space direction="vertical" size={6} style={{ width: "100%" }}>
+            <NoSource what="参数扫描热力图" why={`ml/sweep（market=${market}）返回的网格里没有有效夏普（全部无效格）`} />
+            <MarketNote source={`GET /api/v3/ml/sweep?market=${market}`} extra={`扫描标的 ${ticker || marketTicker(market)}`} />
+          </Space>
+        )
           : (
             <Space direction="vertical" size={8} style={{ width: "100%" }}>
               <div style={{ overflowX: "auto" }}>
@@ -397,6 +444,10 @@ function HeatmapCard({ env, onRescan, scanning, ticker }) {
                 共 {grid.length} 组参数（{valid.length} 组有效）· 每格为真实 PIT 日 K 回测夏普；色越暖＝夏普越高，最优格在标题处标注。
                 无效格（回测失败）显示为虚线「—」，不填占位数字。
               </Text>
+              <MarketNote
+                source={`GET /api/v3/ml/sweep?ticker=${ticker || marketTicker(market)}&windows=10,20,30,60&rebalance=5,10,20&market=${market}`}
+                extra={`${grid.length} 组参数（${valid.length} 组有效）`}
+              />
             </Space>
           )}
     </ProCard>
@@ -405,6 +456,7 @@ function HeatmapCard({ env, onRescan, scanning, ticker }) {
 
 /* ── ⑤ 回测曲线 + ⑥ 策略候选（同一份回测/候选状态） ────────────────────── */
 function BacktestCard({ result, busy, onRun, candidate, ticker }) {
+  const { market } = useMarket();
   const env = result && result.env ? result.env : null;
   const metrics = OK(env) ? env.metrics : null;
   const equity = asArray(OK(env) && env.equity);
@@ -431,11 +483,20 @@ function BacktestCard({ result, busy, onRun, candidate, ticker }) {
       }
     >
       {!result ? (
-        <NoSource what="回测曲线" why="尚未提交回测：本页不会自动发起回测；请在「策略候选」选择参数后点「提交回测」" />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="回测曲线" why="尚未提交回测：本页不会自动发起回测；请在「策略候选」选择参数后点「提交回测」" />
+          <MarketNote source={`POST /api/v3/ml/backtest?market=${market}（人工点击才发起）`} extra={`默认标的 ${ticker || marketTicker(market)}`} />
+        </Space>
       ) : !OK(env) ? (
-        <NoSource what="回测曲线" why={envError(env, "POST /api/v3/ml/backtest 失败")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="回测曲线" why={envError(env, `POST /api/v3/ml/backtest（market=${market}）失败`)} />
+          <MarketNote source={`POST /api/v3/ml/backtest?market=${market}`} extra={`标的 ${ticker || marketTicker(market)}`} />
+        </Space>
       ) : points.length < 2 ? (
-        <NoSource what="回测曲线" why={`回测返回的净值点位不足 2 个（${points.length} 个）`} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="回测曲线" why={`回测返回的净值点位不足 2 个（${points.length} 个）`} />
+          <MarketNote source={`POST /api/v3/ml/backtest?market=${market}`} extra={`标的 ${(env && env.ticker) || ticker || marketTicker(market)}`} />
+        </Space>
       ) : (
         <Space direction="vertical" size={10} style={{ width: "100%" }}>
           <Row gutter={[12, 12]}>
@@ -460,6 +521,10 @@ function BacktestCard({ result, busy, onRun, candidate, ticker }) {
           />
           <Alert type="info" showIcon message="基准指数：无数据源"
             description={<Text type="secondary" style={{ fontSize: 12 }}>{noSourceText("基准指数对比", "回测接口只返回单标的策略净值，未返回基准净值序列（/api/v3/risk/analytics 的基准是组合口径，不能当作本回测基准）")}</Text>} />
+          <MarketNote
+            source={`POST /api/v3/ml/backtest（market=${market}，PIT 净值）`}
+            extra={`标的 ${(env && env.ticker) || ticker || marketTicker(market)} · window=${candidate ? candidate.window : "—"} / rebalance=${candidate ? candidate.rebalanceDays : "—"}`}
+          />
         </Space>
       )}
     </ProCard>
@@ -467,6 +532,7 @@ function BacktestCard({ result, busy, onRun, candidate, ticker }) {
 }
 
 function CandidatesCard({ sweepEnv, strategyEnv, selectedKey, onRun }) {
+  const { market } = useMarket();
   const sweep = OK(sweepEnv) ? sweepEnv : null;
   const run = OK(strategyEnv) ? strategyEnv.run : null;
   const grid = asArray(sweep && sweep.grid).filter((cell) => fin(cell.sharpe)).slice().sort((a, b) => Number(b.sharpe) - Number(a.sharpe));
@@ -526,9 +592,19 @@ function CandidatesCard({ sweepEnv, strategyEnv, selectedKey, onRun }) {
       bordered
       extra={<Text type="secondary" style={{ fontSize: 12 }}>真实网格按夏普前 3 + 研究流水线 · 点击「跑该参数回测」即真跑该参数（POST /api/v3/ml/backtest）</Text>}>
       {rows.length === 0
-        ? <NoSource what="策略候选" why={OK(sweepEnv) ? "ml/sweep 网格里没有有效夏普，且 /api/v3/strategy 无落盘研究轮" : envError(sweepEnv, "GET /api/v3/ml/sweep 未返回有效参数网格")} />
-        : <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={rows} scroll={{ x: 1000 }}
-            rowClassName={(record) => (record.key === selectedKey ? "ant-table-row-selected" : "")} />}
+        ? (
+          <Space direction="vertical" size={6} style={{ width: "100%" }}>
+            <NoSource what="策略候选" why={OK(sweepEnv) ? `ml/sweep（market=${market}）网格里没有有效夏普，且 /api/v3/strategy?market=${market} 无落盘研究轮` : envError(sweepEnv, `GET /api/v3/ml/sweep?market=${market} 未返回有效参数网格`)} />
+            <MarketNote source={`GET /api/v3/ml/sweep + GET /api/v3/strategy（均带 market=${market}）`} />
+          </Space>
+        )
+        : (
+          <Space direction="vertical" size={6} style={{ width: "100%" }}>
+            <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={rows} scroll={{ x: 1000 }}
+              rowClassName={(record) => (record.key === selectedKey ? "ant-table-row-selected" : "")} />
+            <MarketNote source={`GET /api/v3/ml/sweep + GET /api/v3/strategy（market=${market}）`} extra={`候选 ${rows.length} 条`} />
+          </Space>
+        )}
     </ProCard>
   );
 }
@@ -558,8 +634,9 @@ function NoSourceCard() {
 
 /* ── 页面 ───────────────────────────────────────────────────────────────── */
 export default function 策略与因子Page() {
-  const strategy = useV3("strategy", {});
-  const baseFactors = useV3("factors/matrix", {});
+  const { market } = useMarket();
+  const strategy = useV3("strategy", { market });
+  const baseFactors = useV3("factors/matrix", { market });
   const [ticker, setTicker] = React.useState(null);
   const [extraIc, setExtraIc] = React.useState({});
   const [loadingIc, setLoadingIc] = React.useState(false);
@@ -570,19 +647,29 @@ export default function 策略与因子Page() {
   const [backtestBusy, setBacktestBusy] = React.useState(false);
   const [candidate, setCandidate] = React.useState(null);
 
-  /* 回测标的 = 研究轮的标的池首只（与 binder 同一口径），随研究轮记录变化。 */
+  /* 回测 / 扫描标的 = 研究轮标的池首只（与 binder 同一口径），但**只认属于当前市场的研究轮**：
+     研究轮自带 market 时以它为准，否则按标的池首只的市场前缀判断。该市场没有可用研究轮时退回
+     该市场默认标的（真实代码），不回退到别的市场；研究轮尚未返回时保持未选（不发起扫描请求）。 */
   React.useEffect(() => {
-    if (!OK(strategy.value)) return;
-    const universe = asArray((strategy.value.run || {}).universe);
-    if (universe.length) setTicker(String(universe[0]));
-  }, [strategy.value]);
+    const run = OK(strategy.value) ? (strategy.value.run || null) : null;
+    const universe = asArray(run && run.universe);
+    const runMarket = run && run.market
+      ? String(run.market).toUpperCase()
+      : (universe.length ? tickerMarket(universe[0]) : null);
+    const usable = universe.length > 0 && (!runMarket || runMarket === market);
+    if (usable) {
+      setTicker(String(universe[0]));
+      return;
+    }
+    setTicker(strategy.value ? marketTicker(market) : null);
+  }, [strategy.value, market]);
 
-  /* 参数网格：真实 GET /api/v3/ml/sweep（只读）。 */
+  /* 参数网格：真实 GET /api/v3/ml/sweep（只读，显式带 market）。 */
   const loadSweep = React.useCallback(async (target) => {
     if (!target) return;
     setSweepLoading(true);
     try {
-      const url = `/api/v3/ml/sweep?ticker=${encodeURIComponent(target)}&windows=10,20,30,60&rebalance=5,10,20&limit=500`;
+      const url = `/api/v3/ml/sweep?ticker=${encodeURIComponent(target)}&windows=10,20,30,60&rebalance=5,10,20&limit=500&market=${encodeURIComponent(market)}`;
       const headers = {};
       try {
         const token = window.localStorage.getItem("trading_token");
@@ -596,7 +683,7 @@ export default function 策略与因子Page() {
     } finally {
       setSweepLoading(false);
     }
-  }, []);
+  }, [market]);
 
   React.useEffect(() => {
     if (ticker) loadSweep(ticker);
@@ -619,7 +706,7 @@ export default function 策略与因子Page() {
               const token = window.localStorage.getItem("trading_token");
               if (token) headers.Authorization = `Bearer ${token}`;
             } catch { /* 未鉴权 */ }
-            const response = await fetch(`/api/v3/factors/matrix?factor=${encodeURIComponent(name)}`, { headers });
+            const response = await fetch(`/api/v3/factors/matrix?factor=${encodeURIComponent(name)}&market=${encodeURIComponent(market)}`, { headers });
             return await response.json();
           } catch (error) {
             return { ok: false, error: { code: "net", message: String((error && error.message) || error) } };
@@ -633,7 +720,7 @@ export default function 策略与因子Page() {
       }
     })();
     return () => { cancelled = true; };
-  }, [baseFactors.value]);
+  }, [baseFactors.value, market]);
 
   const loadedFactors = React.useMemo(() => {
     const baseIc = OK(baseFactors.value) && baseFactors.value.ic && baseFactors.value.ic.ok
@@ -662,7 +749,7 @@ export default function 策略与因子Page() {
             const token = window.localStorage.getItem("trading_token");
             if (token) headers.Authorization = `Bearer ${token}`;
           } catch { /* 未鉴权 */ }
-          const response = await fetch(`/api/v3/factors/matrix?factor=${encodeURIComponent(name)}`, { headers });
+          const response = await fetch(`/api/v3/factors/matrix?factor=${encodeURIComponent(name)}&market=${encodeURIComponent(market)}`, { headers });
           return await response.json();
         } catch (error) {
           return { ok: false, error: { code: "net", message: String((error && error.message) || error) } };
@@ -677,10 +764,11 @@ export default function 策略与因子Page() {
   /* 回测：只由人工点击（「提交回测」/「跑该参数回测」）触发。 */
   const runBacktest = async (row) => {
     if (!row || row.kind !== "sweep") return;
-    const target = ticker || "SH.600000";
+    const target = ticker || marketTicker(market);
     setCandidate(row);
     setBacktestBusy(true);
-    const env = await postV3("ml/backtest", { ticker: target, window: row.window, rebalanceDays: row.rebalanceDays, limit: 500 });
+    // 人工点击才发起；载荷显式带 market（回测标的与市场口径一致）
+    const env = await postV3("ml/backtest", { ticker: target, window: row.window, rebalanceDays: row.rebalanceDays, limit: 500, market });
     setBacktest({ env, at: new Date().toISOString(), row });
     setBacktestBusy(false);
   };
@@ -690,16 +778,19 @@ export default function 策略与因子Page() {
       <Alert
         type="info"
         showIcon
-        message="策略与因子 · 数据全部来自本服务 /api/v3/* 实时接口"
+        message={`策略与因子 · 当前市场：${marketLabel(market)} · 数据全部来自本服务 /api/v3/* 实时接口`}
         description={
           <Text type="secondary" style={{ fontSize: 12 }}>
-            写动作只有两个且都只由人工点击发起：<Text code>POST /api/v3/strategy/run</Text>（跑研究流水线，只出调仓建议提案，<Text strong>不下单</Text>）与{" "}
-            <Text code>POST /api/v3/ml/backtest</Text>（PIT 回测取净值序列）。加载与刷新阶段绝不自动写。取不到的项显式标注「无数据源」并写明原因。
+            本页所有受市场影响的请求都显式带 <Text code>market={market}</Text>（研究流水线 / 因子矩阵 / 参数扫描 / 回测），
+            研究流水线标的池随市场，绝不把「全部市场」当作一档。写动作只有两个且都只由人工点击发起：
+            <Text code>POST /api/v3/strategy/run</Text>（跑研究流水线，只出调仓建议提案，<Text strong>不下单</Text>）与{" "}
+            <Text code>POST /api/v3/ml/backtest</Text>（PIT 回测取净值序列）。加载与刷新阶段绝不自动写。
+            该市场无自选池/无持仓时服务端返回 <Text code>market/no-universe</Text>，本页原样展示原因，不假装跑过。
           </Text>
         }
       />
       <Block title="研究流水线">
-        <PipelineCard env={strategy.value} refresh={strategy.refresh} ticker={ticker} />
+        <PipelineCard env={strategy.value} refresh={strategy.refresh} ticker={ticker} market={market} />
       </Block>
       <Block title="调仓提案">
         <ProposalsCard env={strategy.value} />

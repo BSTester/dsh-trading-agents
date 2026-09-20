@@ -17,6 +17,7 @@ import {
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, postWb, useV3 } from "../services/api.js";
+import { useMarket } from "../services/marketContext.jsx";
 
 const { Text, Paragraph, Link } = Typography;
 
@@ -207,6 +208,20 @@ function NoSource({ what, why, type = "warning" }) {
   return <Alert type={type} showIcon message={noSourceText(what, why)} />;
 }
 
+/**
+ * 口径标注（每个受市场影响的卡片都挂一句）：
+ *   global=true  → 「全局口径，不按市场拆分」（模式 / 台账 / 凭据 / 环境 / 降级链 / 审计）
+ *   global=false → 「当前市场 {label} {market}」（自动流水线策略行按市场分别配置）
+ */
+function ScopeTag({ market, label, global = false, text }) {
+  const scope = text || (global ? "全局口径，不按市场拆分" : `当前市场 ${label} ${market}`);
+  return (
+    <Tag color={global ? "default" : "blue"} style={{ marginInlineEnd: 0 }}>
+      {scope}
+    </Tag>
+  );
+}
+
 /** 中性空态图形：不使用 antd 内置空态图（其 <title> 带通用占位文案），统一用虚线框。 */
 const EMPTY_FRAME = (
   <svg width="48" height="36" viewBox="0 0 48 36" aria-hidden="true">
@@ -228,13 +243,15 @@ function Msg({ message }) {
 }
 
 export default function SettingsPage() {
+  const { market, label } = useMarket();
+  // 全部为全局口径（后端不按市场拆分，页面也不按市场重取）：模式 / 台账 / 环境 / 凭据 / 降级链 / 审计
   const settings = useV3("settings");
   const metrics = useV3("metrics");
   const overview = useV3("overview");
   const orders = useV3("oms/orders");
   const audit = useV3("audit", { window: 120 });
   const credentials = useV3("credentials");
-  // 数据源降级链状态（只读 GET）
+  // 数据源降级链状态（只读 GET；链路为全局口径，不按市场重取）
   const sourcesStatus = useReadV3("sources/status");
 
   const s = settings.value ?? {};
@@ -645,23 +662,39 @@ export default function SettingsPage() {
 
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
+      {/* 页头市场接入点：本页哪些跟随市场、哪些是全局口径 */}
+      <ProCard bordered bodyStyle={{ padding: "10px 16px" }}>
+        <Space size={10} wrap>
+          <ScopeTag market={market} label={label} />
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            {`本页市场接入点：仅「自动流水线」的策略行按市场分别配置（默认新增行 market=SH，可逐行改为 HK / US）；
+            交易模式与台账统计、富途 / 统一授权中心 / 环境变量 / 数据源与降级链 / 审计均为全局口径（不按市场拆分），切换市场不重取这些数据。`}
+          </Text>
+        </Space>
+      </ProCard>
+
       {s.mode_note ? (
         <Alert type="info" showIcon message={String(s.mode_note)} />
       ) : null}
 
-      {/* 1. 交易模式卡 */}
+      {/* 1. 交易模式卡（全局口径：单一模式 + 单一台账） */}
       <ProCard
         title="交易模式"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
             <Tag color={mode === "live" ? "error" : mode === "sim" ? "success" : "default"}>
               {`当前生效：${modeLabel(mode)}`}
             </Tag>
+            <ScopeTag market={market} label={label} global />
             <Text type="secondary" style={{ fontSize: 12 }}>数据来源 /api/v3/settings · /api/v3/overview · /api/v3/oms/orders</Text>
           </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          {`口径：交易模式、台账权益与 OMS 台账统计为全局口径（不按市场拆分）——台账是单一账本，模式是全平台一个开关；
+          按市场查看持仓 / 订单明细见「执行与审批」页（/api/v3/oms/orders?market=${market}），授权凭据本身不分市场。`}
+        </Text>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(280px, 1fr))", gap: 12 }}>
           <div>
             <Space size={8}><Tag color={mode === "sim" ? "success" : "default"}>{mode === "sim" ? "当前生效" : "未生效"}</Tag><Text strong>模拟盘 SIM</Text></Space>
@@ -759,12 +792,13 @@ export default function SettingsPage() {
         </div>
       </ProCard>
 
-      {/* 2. 模式切换审计 */}
+      {/* 2. 模式切换审计（全局审计链） */}
       <ProCard
         title="模式切换审计"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} global />
             <Text type="secondary" style={{ fontSize: 12 }}>
               {auditEntries.length > 0 ? `真实审计链 · 最近 ${auditEntries.length} 条` : "真实审计链 · 当前窗口无记录"}
             </Text>
@@ -772,6 +806,9 @@ export default function SettingsPage() {
           </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：审计链记录全局动作（模式切换等），为全局口径（不按市场拆分）；本卡不按市场重取。
+        </Text>
         {audit.error ? (
           <NoSource what="审计链" why={`/api/v3/audit 取数失败：${audit.error}`} type="error" />
         ) : auditEntries.length === 0 ? (
@@ -800,19 +837,24 @@ export default function SettingsPage() {
         )}
       </ProCard>
 
-      {/* 3. 富途 OpenAPI / OpenD 授权 */}
+      {/* 3. 富途 OpenAPI / OpenD 授权（凭据与通道全局共用；本页无按市场拆分的账户/持仓字段） */}
       <ProCard
         title="富途 OpenAPI / OpenD 授权"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
             <Tag color={futuReady ? "success" : "warning"}>
               {`OpenAPI 凭据${futuReady ? "就绪" : "不可用"} · 连接态由 OpenD 会话决定`}
             </Tag>
+            <ScopeTag market={market} label={label} global />
             <Text type="secondary" style={{ fontSize: 12 }}>行情与交易通道的唯一实盘入口</Text>
           </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          {`口径：凭据（AppKey / 私钥 / OAuth token）与 OpenD 通道全局共用，不按市场拆分；本页不展示按市场拆分的富途账户与持仓
+          （/api/v3/settings 未返回该字段），按市场查看持仓 / 订单请见「执行与审批」页（market=${market}）。`}
+        </Text>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(340px, 1fr))", gap: 12 }}>
           <Descriptions
             size="small"
@@ -1012,14 +1054,22 @@ export default function SettingsPage() {
         </div>
       </ProCard>
 
-      {/* 4. 统一授权中心 */}
+      {/* 4. 统一授权中心（全局口径：凭据按账号 / 环境注入，与市场无关） */}
       <ProCard
         title="统一授权中心"
         bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>
-          {`真实凭据状态 · ${credKeys.length} 项（/api/v3/credentials）· 只显示是否注入与掩码尾号`}
-        </Text>}
+        extra={
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} global />
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {`真实凭据状态 · ${credKeys.length} 项（/api/v3/credentials）· 只显示是否注入与掩码尾号`}
+            </Text>
+          </Space>
+        }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：统一授权中心（Tushare token 等）为全局口径（不按市场拆分）——凭据按账号 / 环境注入，同一份凭据服务全部市场。
+        </Text>
         {credentials.error ? (
           <NoSource what="凭据状态" why={`/api/v3/credentials 取数失败：${credentials.error}`} type="error" />
         ) : credKeys.length === 0 ? (
@@ -1071,7 +1121,8 @@ export default function SettingsPage() {
         title="数据源与降级链"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} global />
             <Text type="secondary" style={{ fontSize: 12 }}>
               {chainPayload ? `真实链状态 · ${chainRows.length} 条 · as_of ${fmt.stamp(chainPayload.as_of)}` : "GET /api/v3/sources/status · 只读"}
             </Text>
@@ -1079,6 +1130,9 @@ export default function SettingsPage() {
           </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：降级链为全局链路（不按市场拆分）——主源 / 降级源对各市场共用，本卡不按市场重取。
+        </Text>
         {chainRows.length > 0 ? (
           <Space size={32} wrap style={{ marginBottom: 12 }}>
             <Statistic title="可用链 / 总链数" value={`${chainAvailable} / ${chainRows.length}`} valueStyle={{ fontSize: 18 }} />
@@ -1183,11 +1237,16 @@ export default function SettingsPage() {
         </Paragraph>
       </ProCard>
 
-      {/* 5. 环境变量与密钥来源 */}
+      {/* 5. 环境变量与密钥来源（全局口径） */}
       <ProCard
         title="环境变量与密钥来源"
         bordered
-        extra={<Tag color={injectedMissing > 0 ? "warning" : "success"}>{`${injectedMissing} 项未注入 / 共 ${envRows.length} 项`}</Tag>}
+        extra={
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} global />
+            <Tag color={injectedMissing > 0 ? "warning" : "success"}>{`${injectedMissing} 项未注入 / 共 ${envRows.length} 项`}</Tag>
+          </Space>
+        }
       >
         {envRows.length === 0 ? (
           <Empty image={EMPTY_FRAME} description={noSourceText("环境变量清单", "/api/v3/settings 未返回 env")} />
@@ -1208,15 +1267,20 @@ export default function SettingsPage() {
         )}
         <Paragraph type="secondary" style={{ fontSize: 11.5, marginTop: 8, marginBottom: 0 }}>
           「未注入」指该变量尚未进入 Harness 运行时环境；本表只显示注入状态与来源，不显示任何变量值。
-          其中 TUSHARE_TOKEN 的已配置状态见上方「统一授权中心」。
+          其中 TUSHARE_TOKEN 的已配置状态见上方「统一授权中心」。本表为全局口径（不按市场拆分）。
         </Paragraph>
       </ProCard>
 
-      {/* 6. 授权与审计策略 */}
+      {/* 6. 授权与审计策略（全局：风控阈值对所有市场统一） */}
       <ProCard
         title="授权与审计策略"
         bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>只读展示 · 由风控引擎统一下发（本页不提供写入）</Text>}
+        extra={
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} global />
+            <Text type="secondary" style={{ fontSize: 12 }}>只读展示 · 由风控引擎统一下发（本页不提供写入）</Text>
+          </Space>
+        }
       >
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
           <Alert
@@ -1253,15 +1317,16 @@ export default function SettingsPage() {
         />
       </ProCard>
 
-      {/* 7. 自动流水线 */}
+      {/* 7. 自动流水线（策略行带 market，按市场分别配置） */}
       <ProCard
         title="自动流水线"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
             <Tag color={auto?.error ? "error" : auto?.enabled ? "success" : "default"}>
               {auto?.error ? "配置非法" : auto?.enabled ? "自动执行已开启" : "自动执行关闭"}
             </Tag>
+            <ScopeTag market={market} label={label} text={`本页当前市场：${label} ${market}（策略行仍可分别配置各市场）`} />
             <Text type="secondary" style={{ fontSize: 12 }}>POST /api/wb/auto_pipeline · 人工点击保存 · 校验复用调度侧同一实现</Text>
           </Space>
         }
@@ -1270,6 +1335,10 @@ export default function SettingsPage() {
           <Text type="secondary">读取中…</Text>
         ) : (
           <Space direction="vertical" size={10} style={{ width: "100%" }}>
+            <Text type="secondary" style={{ fontSize: 11, display: "block" }}>
+              {`口径：自动流水线是全局配置，但每行策略自带 market 字段（SH / HK / US）——本页当前市场为 ${label} ${market}，
+              策略行仍可分别配置各市场，本卡不按当前市场过滤或重写任何策略行。`}
+            </Text>
             <Space size={10} wrap align="center">
               <Switch
                 checked={auto.enabled}
@@ -1298,8 +1367,9 @@ export default function SettingsPage() {
                   style={{ width: 150 }}
                   value={row.market}
                   onChange={(value) => patchStrategy(index, { market: value })}
-                  options={MARKETS.map(([value, label]) => ({ value, label: `${value} · ${label}` }))}
+                  options={MARKETS.map(([value, labelText]) => ({ value, label: `${value} · ${labelText}` }))}
                 />
+                {row.market === market ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>本页当前市场</Tag> : null}
                 <Input
                   size="small"
                   style={{ width: 280 }}
@@ -1336,17 +1406,18 @@ export default function SettingsPage() {
             </Button>
 
             <Space size={12} wrap align="flex-end">
-              {MARKETS.map(([market, label]) => (
-                <div key={market}>
-                  <Text style={{ fontSize: 12 }}>{`执行时刻 · ${label}`}</Text>
+              {MARKETS.map(([marketKey, marketText]) => (
+                <div key={marketKey}>
+                  <Text style={{ fontSize: 12 }}>{`执行时刻 · ${marketText}`}</Text>
+                  {marketKey === market ? <Tag color="blue" style={{ marginInlineStart: 6 }}>本页当前市场</Tag> : null}
                   <br />
                   <Input
                     size="small"
                     style={{ width: 110 }}
                     maxLength={5}
-                    value={auto.exec_at?.[market] ?? ""}
+                    value={auto.exec_at?.[marketKey] ?? ""}
                     placeholder="HH:MM"
-                    onChange={(event) => patchAuto({ exec_at: { ...auto.exec_at, [market]: event.target.value } })}
+                    onChange={(event) => patchAuto({ exec_at: { ...auto.exec_at, [marketKey]: event.target.value } })}
                   />
                 </div>
               ))}
@@ -1389,7 +1460,7 @@ export default function SettingsPage() {
 
       <ProCard bordered>
         <Text type="secondary" style={{ fontSize: 11.5 }}>
-          {`数据来源：/api/v3/settings · /api/v3/credentials · /api/v3/metrics · /api/v3/audit · /api/v3/sources/status；工具 ${fmt.dash(metrics.value?.toolTotal)} 个 · 数据截至 ${fmt.stamp(metrics.value?.generated_at)}；凭据未配置 ${unconfigured} 项（密钥值不在任何位置展示）`}
+          {`数据来源：/api/v3/settings · /api/v3/credentials · /api/v3/metrics · /api/v3/audit · /api/v3/sources/status；工具 ${fmt.dash(metrics.value?.toolTotal)} 个 · 数据截至 ${fmt.stamp(metrics.value?.generated_at)}；凭据未配置 ${unconfigured} 项（密钥值不在任何位置展示）；本页当前市场 ${label} ${market}（仅自动流水线策略行按市场分别配置，其余为全局口径）。`}
         </Text>
       </ProCard>
 

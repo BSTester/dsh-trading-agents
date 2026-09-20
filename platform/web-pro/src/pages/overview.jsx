@@ -26,6 +26,7 @@ import {
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
+import { useMarket } from "../services/marketContext.jsx";
 import { BarList, LineChart } from "../components/charts.jsx";
 
 const { Text, Title } = Typography;
@@ -46,6 +47,24 @@ const numOr = (value, digits = 2) =>
   value === null || value === undefined || value === "" || !Number.isFinite(Number(value))
     ? "—"
     : Number(value).toFixed(digits);
+
+/**
+ * 口径标注（每个受市场影响的卡片都挂一句，避免把全局台账误读成该市场数据）：
+ *   global=true  → 「全局口径，不按市场拆分」（进程级 / 单一台账 / 账号级）
+ *   global=false → 「当前市场 {label} {market}」
+ * text 可覆盖默认文案（例如台账口径的专门说明）。
+ */
+function ScopeTag({ market, label, global = false, text }) {
+  const scope = text || (global ? "全局口径，不按市场拆分" : `当前市场 ${label} ${market}`);
+  return (
+    <Tag color={global ? "default" : "blue"} style={{ marginInlineEnd: 0 }}>
+      {scope}
+    </Tag>
+  );
+}
+
+// KPI 五项全部取自 overview.equity —— 单一台账，后端不按市场拆分权益
+const LEDGER_SCOPE = "台账口径（不按市场拆分）";
 
 function errText(payload, fallback = "接口未返回原因") {
   const error = (payload && payload.error) || {};
@@ -101,7 +120,7 @@ function ChannelCard({ name, subtitle, chip, stats, foot, loading }) {
   );
 }
 
-function KpiCard({ label, value, tone, sub, spark }) {
+function KpiCard({ label, value, tone, sub, spark, scope }) {
   return (
     <Card size="small" styles={{ body: { padding: 14 } }}>
       <Text type="secondary" style={{ fontSize: 12 }}>
@@ -122,17 +141,26 @@ function KpiCard({ label, value, tone, sub, spark }) {
       <Text type="secondary" style={{ fontSize: 11 }}>
         {sub}
       </Text>
+      {scope ? (
+        <Text type="secondary" style={{ fontSize: 10.5, display: "block", marginTop: 2 }}>
+          口径：{scope}
+        </Text>
+      ) : null}
     </Card>
   );
 }
 
 export default function OverviewPage() {
-  const overview = useV3("overview", {});
+  const { market, label } = useMarket();
+  // 按市场过滤（后端支持 market=SH|HK|US）：overview（标的池与市场回显）、
+  // oms/orders（持仓/订单台账，按标的市场）、strategy（研究流水线提案，按标的市场）
+  const overview = useV3("overview", { market }, [market]);
+  const orders = useV3("oms/orders", { market }, [market]);
+  const strategy = useV3("strategy", { market }, [market]);
+  // 全局口径（后端不按市场拆分，页面也不按市场重取）：进程指标、通道探测、settings 环境、审计链
   const metrics = useV3("metrics", {});
   const brain = useV3("brain", {});
   const settings = useV3("settings", {});
-  const orders = useV3("oms/orders", {});
-  const strategy = useV3("strategy", {});
   const audit = useV3("audit", { window: 120 });
 
   const ov = overview.value && overview.value.ok ? overview.value : null;
@@ -142,6 +170,25 @@ export default function OverviewPage() {
   const od = orders.value && orders.value.ok ? orders.value : null;
   const auditRows =
     (audit.value && audit.value.ok && audit.value.data && audit.value.data.entries) || [];
+
+  /* ── 市场回显：接口若给了 market / universe_source / sections.market_scoped 就如实展示 ── */
+  const marketEcho = (ov && ov.market) || null;
+  const universeSource = (ov && ov.universe_source) || null;
+  const marketScopedText = (() => {
+    const value = ov && ov.sections ? ov.sections.market_scoped : null;
+    if (typeof value === "string") return value;
+    if (value && typeof value === "object") {
+      return Object.entries(value)
+        .filter(([, item]) => item === null || item === undefined || typeof item !== "object")
+        .map(([key, item]) => `${key}=${item === null || item === undefined ? "—" : String(item)}`)
+        .join(" · ");
+    }
+    return null;
+  })();
+  // 后端按市场取数失败（含 market/no-universe）时如实带出原因，绝不用旧数据顶替
+  const overviewError = overview.value && overview.value.ok === false ? errText(overview.value) : null;
+  const ordersError = orders.value && orders.value.ok === false ? errText(orders.value) : null;
+  const strategyError = strategy.value && strategy.value.ok === false ? errText(strategy.value) : null;
 
   const refreshAll = () => {
     overview.refresh();
@@ -180,6 +227,7 @@ export default function OverviewPage() {
         ? `台账初始 ${fmt.money(equity.initial)}${dailyAbs === null ? "" : ` · 较前值 ${fmt.signed(dailyAbs, 2)}`}`
         : "台账未返回初始权益",
       spark,
+      scope: LEDGER_SCOPE,
     },
     {
       label: "当日盈亏",
@@ -190,6 +238,7 @@ export default function OverviewPage() {
           ? `台账点位 ${points.length} 个（<2）· 无前一交易日基准，日内涨跌无数据源`
           : `基准 ${prev.t} → ${last.t}（台账回放）`,
       spark,
+      scope: LEDGER_SCOPE,
     },
     {
       label: "年化收益",
@@ -200,11 +249,13 @@ export default function OverviewPage() {
           ? `台账点位不足（${points.length} 个）· 年化无数据源`
           : `${days} 个交易日年化`,
       spark,
+      scope: LEDGER_SCOPE,
     },
     {
       label: "夏普比率",
       value: numOr(equity.sharpe, 2),
       sub: `成交 ${Number.isFinite(Number(equity.trades)) ? equity.trades : "—"} 笔 · 台账回放口径`,
+      scope: LEDGER_SCOPE,
     },
     {
       label: "最大回撤",
@@ -212,6 +263,7 @@ export default function OverviewPage() {
       tone: "amber",
       sub: `阈值 15%${equity.note ? ` · ${String(equity.note).slice(0, 18)}…` : ""}`,
       spark,
+      scope: LEDGER_SCOPE,
     },
   ];
 
@@ -262,12 +314,15 @@ export default function OverviewPage() {
   const brunRaw = br ? br.decision : null;
   const brun = brunRaw && brunRaw.run ? brunRaw.run : brunRaw;
   const run = srun || (brun && brun.asOf ? brun : null);
+  // 流水线节点来自按市场过滤的 /api/v3/strategy；否则回退到全局口径的 brain.decision
+  const runFromStrategy = Boolean(srun);
   const headlessLast =
     (br && Array.isArray(br.headless && br.headless.last) && br.headless.last) || [];
 
   const timelineItems = [];
   if (run && run.asOf) {
     const count = Array.isArray(run.proposals) ? run.proposals.length : 0;
+    const runMarket = run.market ? String(run.market) : null;
     timelineItems.push({
       color: "blue",
       children: (
@@ -280,7 +335,9 @@ export default function OverviewPage() {
           </Space>
           <Text>研究流水线产出 {count} 条调仓建议（PDAT → PET，as_of {fmt.stamp(run.asOf)}）</Text>
           <Text type="secondary" style={{ fontSize: 11 }}>
-            /api/v3/strategy · 待人工审批，研究侧不下单
+            {runFromStrategy
+              ? `/api/v3/strategy?market=${market}（当前市场 ${label} ${market}${runMarket ? ` · 回显 market=${runMarket}` : " · 该轮未记录 market，按后端返回原样展示"}）· 待人工审批，研究侧不下单`
+              : "/api/v3/brain.decision（全局口径，不按市场拆分）· 待人工审批，研究侧不下单"}
           </Text>
         </Space>
       ),
@@ -300,7 +357,7 @@ export default function OverviewPage() {
           </Space>
           <Text>{`${entry.ticker ? `${entry.ticker} · ` : ""}${entry.detail || "—"}`}</Text>
           <Text type="secondary" style={{ fontSize: 11 }}>
-            工作台审计链 /api/v3/audit
+            工作台审计链 /api/v3/audit（全局口径，不按市场拆分）
           </Text>
         </Space>
       ),
@@ -319,7 +376,7 @@ export default function OverviewPage() {
           </Space>
           <Text>{String(item.task || item.name || item.tool || "Headless 任务")}</Text>
           <Text type="secondary" style={{ fontSize: 11 }}>
-            状态 {String(item.status || item.result || "—")}
+            状态 {String(item.status || item.result || "—")} · /api/v3/brain（全局口径，不按市场拆分）
           </Text>
         </Space>
       ),
@@ -339,8 +396,10 @@ export default function OverviewPage() {
       label: "单笔交易上限",
       limit: 2,
       used: singleUsed,
-      why: "工作台订单台账（/api/v3/oms/orders）未返回可比较的单笔金额",
-      source: od ? `${od.nav_source || "台账"} · 分母 ${fmt.money(od.nav)}` : null,
+      why:
+        ordersError ||
+        `当前市场 ${label} ${market} 的订单台账（/api/v3/oms/orders?market=${market}）未返回可比较的单笔金额`,
+      source: od ? `${od.nav_source || "台账"} · 分母 ${fmt.money(od.nav)}（台账口径，不按市场拆分）` : null,
     },
     {
       label: "单一行业暴露上限",
@@ -354,7 +413,7 @@ export default function OverviewPage() {
       limit: 15,
       used: drawdown,
       why: "台账无回撤点位",
-      source: equity.note ? `回撤口径：${equity.note}` : null,
+      source: equity.note ? `回撤口径：${equity.note}（台账口径，不按市场拆分）` : null,
     },
   ];
 
@@ -412,7 +471,7 @@ export default function OverviewPage() {
         extra={
           <Space size={12} wrap>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              平台（身体）× Harness（决策大脑）· 全局运行状态 · 环境 {mode || "—"}
+              平台（身体）× Harness（决策大脑）· 全局运行状态（不按市场拆分）· 环境 {mode || "—"}
             </Text>
             <Badge
               status={mode === "live" ? "error" : "processing"}
@@ -428,13 +487,44 @@ export default function OverviewPage() {
         {overview.error ? (
           <BlockError name="系统概览（/api/v3/overview）" error={overview.error} />
         ) : (
-          <Text type="secondary" style={{ fontSize: 11 }}>
-            数据来源：本服务 /api/v3/*（工作台工具面 / 富途行情 / 台账）· 取不到的项显式标注「无数据源」，页面不含占位数字
-          </Text>
+          <Space direction="vertical" size={4} style={{ width: "100%" }}>
+            {overviewError ? (
+              <Alert
+                type="warning"
+                showIcon
+                message={noSourceText(`当前市场 ${label} ${market} 的系统概览（/api/v3/overview?market=${market}）`, overviewError)}
+              />
+            ) : null}
+            <Space size={8} wrap>
+              <ScopeTag market={market} label={label} />
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                {marketEcho ? `接口回显 market=${String(marketEcho)}` : "接口未回显 market（按请求参数展示）"}
+              </Text>
+              {universeSource ? (
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  {`标的池来源 universe_source=${String(universeSource)}`}
+                </Text>
+              ) : null}
+              {marketScopedText ? (
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  {`sections.market_scoped：${marketScopedText}`}
+                </Text>
+              ) : null}
+            </Space>
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              取数口径：overview / oms/orders / strategy 带 market={market}；metrics / brain / settings / audit
+              为全局口径（不按市场拆分）。数据来源：本服务 /api/v3/*（工作台工具面 / 富途行情 / 台账）·
+              取不到的项显式标注「无数据源」，页面不含占位数字
+            </Text>
+          </Space>
         )}
       </ProCard>
 
-      {/* ① KPI 5 张 */}
+      {/* ① KPI 5 张（全部为台账口径，后端不按市场拆分权益） */}
+      <Text type="secondary" style={{ fontSize: 11 }}>
+        {`口径：KPI 五项（总资产 / 当日盈亏 / 年化收益 / 夏普 / 最大回撤）来自单一台账，为台账口径（不按市场拆分），
+        与上方市场选择无关；按市场过滤的是下面「待人工审批」的订单明细与「风控红线」的订单分子（market=${market}）。`}
+      </Text>
       {overview.error ? null : ov ? (
         <div style={{ display: "grid", gridTemplateColumns: "repeat(5, minmax(0, 1fr))", gap: 12 }}>
           {kpis.map((kpi) => (
@@ -450,7 +540,11 @@ export default function OverviewPage() {
         </ProCard>
       )}
 
-      {/* ② 三通道状态 3 卡 */}
+      {/* ② 三通道状态 3 卡（进程级全局口径） */}
+      <Text type="secondary" style={{ fontSize: 11 }}>
+        {`口径：三通道（MCP Bridge / SDK JSON-RPC / Headless CLI）为进程级全局口径（不按市场拆分），
+        与当前市场 ${label} ${market} 无关；切换市场不会重取本区数据。`}
+      </Text>
       <div style={{ display: "grid", gridTemplateColumns: "repeat(3, minmax(0, 1fr))", gap: 12 }}>
         <ChannelCard
           name="MCP Bridge"
@@ -579,6 +673,18 @@ export default function OverviewPage() {
             </Text>
           }
         >
+          <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+            {`口径：研究流水线节点按当前市场 ${label} ${market} 过滤（/api/v3/strategy?market=${market}）；
+            审计链与 Headless 为全局口径（不按市场拆分）。`}
+          </Text>
+          {strategyError ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 10 }}
+              message={noSourceText(`当前市场 ${label} ${market} 的研究流水线`, strategyError)}
+            />
+          ) : null}
           {strategy.error ? (
             <BlockError name="决策链路（/api/v3/strategy）" error={strategy.error} />
           ) : timelineItems.length === 0 ? (
@@ -588,14 +694,27 @@ export default function OverviewPage() {
               <Timeline items={timelineItems} />
               <Divider style={{ margin: "8px 0" }} />
               <Text type="secondary" style={{ fontSize: 11 }}>
-                本链路 {timelineItems.length} 节点 · 来源：研究流水线 /api/v3/strategy · 工作台审计链 /api/v3/audit
-                {headlessLast.length ? " · Headless /api/v3/brain" : ""}
+                本链路 {timelineItems.length} 节点 · 来源：研究流水线 /api/v3/strategy（当前市场 {label} {market}）· 工作台审计链
+                /api/v3/audit（全局口径，不按市场拆分）
+                {headlessLast.length ? " · Headless /api/v3/brain（全局口径，不按市场拆分）" : ""}
               </Text>
             </>
           )}
         </ProCard>
 
         <ProCard title="风控红线" bordered loading={orders.loading || overview.loading}>
+          <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+            {`口径：订单明细按当前市场 ${label} ${market} 过滤（/api/v3/oms/orders?market=${market}）；
+            单笔占比的分母 NAV 以接口 nav_source 为准（本页不假定它按市场拆分）；回撤阈值取自台账，为台账口径（不按市场拆分）。`}
+          </Text>
+          {ordersError ? (
+            <Alert
+              type="warning"
+              showIcon
+              style={{ marginBottom: 10 }}
+              message={noSourceText(`当前市场 ${label} ${market} 的订单台账`, ordersError)}
+            />
+          ) : null}
           {orders.error ? <BlockError name="风控红线（/api/v3/oms/orders）" error={orders.error} /> : null}
           {redlines.map((row) => {
             const hasValue = row.used !== null && Number.isFinite(Number(row.used));
@@ -638,20 +757,28 @@ export default function OverviewPage() {
           })}
           {od ? (
             <Text type="secondary" style={{ fontSize: 11 }}>
-              台账订单 {orderRows.length} 条（manual {manualOrders.length} 条）· NAV {fmt.money(od.nav)}（
-              {od.nav_source || "—"}）
+              台账订单 {orderRows.length} 条（当前市场 {label} {market} · manual {manualOrders.length} 条）· NAV{" "}
+              {fmt.money(od.nav)}（{od.nav_source || "—"} · 台账口径，不按市场拆分）
             </Text>
           ) : null}
         </ProCard>
       </div>
 
-      {/* ⑤ Agent Loop 实时状态 */}
+      {/* ⑤ Agent Loop 实时状态（进程级全局口径） */}
       <ProCard
         title="Agent Loop 实时状态"
         bordered
         loading={metrics.loading || brain.loading}
-        extra={<Chip ok={false} />}
+        extra={
+          <Space size={8}>
+            <ScopeTag market={market} label={label} global />
+            <Chip ok={false} />
+          </Space>
+        }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：Agent Loop 会话指标与工具调用分布为进程级全局口径（不按市场拆分），不随市场切换而改变。
+        </Text>
         <Descriptions
           size="small"
           column={4}
@@ -697,13 +824,14 @@ export default function OverviewPage() {
         )}
       </ProCard>
 
-      {/* ⑥ 待人工审批 */}
+      {/* ⑥ 待人工审批（按目标标的市场过滤） */}
       <ProCard
         title="待人工审批"
         bordered
         loading={orders.loading}
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} />
             <Tag color={manualOrders.length ? "warning" : "default"}>{manualOrders.length} 条待处理</Tag>
             <Text type="secondary" style={{ fontSize: 11 }}>
               执行入口唯一 · 所有执行动作须经人工审批
@@ -711,12 +839,15 @@ export default function OverviewPage() {
           </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          {`口径：本卡订单明细按当前市场 ${label} ${market} 过滤（/api/v3/oms/orders?market=${market}）；单笔占比的分母为台账 NAV（台账口径，不按市场拆分）。`}
+        </Text>
         {orders.error ? (
           <BlockError name="待人工审批（/api/v3/oms/orders）" error={orders.error} />
         ) : manualOrders.length === 0 ? (
           <NoSource
             what="待人工审批"
-            why={od ? "当前台账没有 manual 阶段订单" : errText(orders.value, "订单台账未返回")}
+            why={od ? `当前市场 ${label} ${market} 的台账没有 manual 阶段订单` : ordersError || errText(orders.value, "订单台账未返回")}
           />
         ) : (
           <div style={{ display: "grid", gridTemplateColumns: "repeat(2, minmax(0, 1fr))", gap: 12 }}>
@@ -762,18 +893,24 @@ export default function OverviewPage() {
         )}
       </ProCard>
 
-      {/* ⑦ 数据源健康 */}
+      {/* ⑦ 数据源健康（全局链路） */}
       <ProCard
         title="数据源健康"
         bordered
         loading={settings.loading || metrics.loading || brain.loading}
         extra={
-          <Text type="secondary" style={{ ...MONO, fontSize: 11 }}>
-            workbench {mt ? (mt.workbenchUp ? "在线" : "不可达") : "—"} · 工具 {fmt.dash(mt && mt.toolTotal)} 个 ·
-            数据时点 {fmt.stamp(ov && ov.generated_at)}
-          </Text>
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} global />
+            <Text type="secondary" style={{ ...MONO, fontSize: 11 }}>
+              workbench {mt ? (mt.workbenchUp ? "在线" : "不可达") : "—"} · 工具 {fmt.dash(mt && mt.toolTotal)} 个 ·
+              数据时点 {fmt.stamp(ov && ov.generated_at)}
+            </Text>
+          </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：数据源探测与环境注入状态为全局口径（不按市场拆分）；本卡不按市场重取。
+        </Text>
         {settings.error ? (
           <BlockError name="数据源健康（/api/v3/settings）" error={settings.error} />
         ) : healthRows.length === 0 ? (
@@ -814,7 +951,7 @@ export default function OverviewPage() {
             ) : null}
             <Text type="secondary" style={{ fontSize: 11, display: "block", marginTop: 6 }}>
               来源 /api/v3/settings（富途 / AKShare / SEC EDGAR / Tushare 探测）+ /api/v3/metrics（workbench
-              工具面）· 未配置的数据源按「未配置」如实展示，不估算可用性
+              工具面）· 全局口径（不按市场拆分）· 未配置的数据源按「未配置」如实展示，不估算可用性
             </Text>
           </>
         )}

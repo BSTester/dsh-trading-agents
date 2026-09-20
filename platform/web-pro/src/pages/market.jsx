@@ -30,6 +30,16 @@ import {
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
+import {
+  MARKETS,
+  MarketNote,
+  envelopeError,
+  marketInfo,
+  marketLabel,
+  marketTicker,
+  tickerMarket,
+  useMarket,
+} from "../services/marketContext.jsx";
 import { CandleChart } from "../components/charts.jsx";
 import DataDomainCard from "../components/dataDomain.jsx";
 
@@ -46,16 +56,12 @@ const C = {
 };
 const MONO = { fontVariantNumeric: "tabular-nums" };
 
-/* ── 三市场（A股 / 港股 / 美股）──────────────────────────────────────────────
- * 默认标的取合约里给定的真实代码；切换市场 = 主图 / 盘口 / 自选 / 因子请求参数一起切。 */
-const MARKETS = [
-  { value: "SH", label: "A股 SH", ticker: "SH.600000", name: "A股" },
-  { value: "HK", label: "港股 HK", ticker: "HK.00700", name: "港股" },
-  { value: "US", label: "美股 US", ticker: "US.NVDA", name: "美股" },
-];
-const MARKET_OPTIONS = MARKETS.map((market) => ({ value: market.value, label: market.label }));
-const marketOf = (value) => MARKETS.find((market) => market.value === value) || MARKETS[0];
-const marketName = (value) => marketOf(value).name;
+/* ── 三市场（A股 / 港股 / 美股）来自统一上下文 services/marketContext.jsx ───────
+ * 本页不再自己持有市场状态：页内 Segmented 与页头 MarketPicker 读写**同一个** useMarket()，
+ * 全站只有一个市场事实源。默认标的取合约里给定的真实代码；切换市场后 K 线 / 盘口 / 自选 /
+ * 因子请求参数一起切。 */
+const MARKET_OPTIONS = MARKETS.map((market) => ({ value: market.key, label: marketLabel(market.key) }));
+const marketName = (value) => marketInfo(value).label;
 
 /** session → 徽章（open 绿 / lunch 琥珀 / pre 蓝 / post 灰 / closed 灰），与接口契约一一对应。 */
 const SESSION_TAG = {
@@ -75,9 +81,11 @@ const SESSION_TEXT = {
 
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
+/** 服务端失败原因：`error.code：error.message` + 有 error.detail 时追加「真实原因」（统一口径见
+ *  services/marketContext.jsx 的 envelopeError）。无该市场池子时页面照原文展示，
+ *  **绝不退回「全部市场」或空表；也不把「富途限频」这类真实原因误读成「这个市场没有池子」。 */
 function errText(payload, fallback = "接口未返回原因") {
-  const error = (payload && payload.error) || {};
-  return String(error.message || error.code || fallback);
+  return envelopeError(payload, fallback);
 }
 
 /* ── 本页新增端点的只读取数（GET /api/v3/*）─────────────────────────────────
@@ -257,9 +265,10 @@ function signalBadge(score) {
 }
 
 export default function MarketPage() {
-  const [market, setMarket] = React.useState("SH");
-  const [ticker, setTicker] = React.useState(marketOf("SH").ticker);
-  const [input, setInput] = React.useState(marketOf("SH").ticker);
+  // 市场来自统一上下文（页头 MarketPicker 与页内 Segmented 同一事实源）
+  const { market, setMarket, label: marketLabelText } = useMarket();
+  const [ticker, setTicker] = React.useState(() => marketTicker(market));
+  const [input, setInput] = React.useState(() => marketTicker(market));
   const [period, setPeriod] = React.useState("1d");
   const [starred, setStarred] = React.useState({});
   const [keyword, setKeyword] = React.useState("");
@@ -268,7 +277,7 @@ export default function MarketPage() {
   const overview = useV3("overview", {});
   const metrics = useV3("metrics", {});
   const brain = useV3("brain", {});
-  // 自选 / 因子请求参数随市场切换（market 一并传给后端；后端未按市场过滤时下面会如实标注）
+  // 自选 / 因子请求参数随市场切换（market 始终显式传给后端，避免「看起来在筛选其实没筛」）
   const watchlist = useV3("market/watchlist", { n: 6, market });
   // 板块只对 A 股请求：其它市场**不发请求**，直接显示无数据源与原因
   const plates = useReadV3("plates", { market: "SH", plate_class: "ALL" }, market === "SH");
@@ -279,7 +288,17 @@ export default function MarketPage() {
   const mt = metrics.value && metrics.value.ok ? metrics.value : null;
   const br = brain.value && brain.value.ok ? brain.value : null;
   const watchRows = asArray(watchlist.value && watchlist.value.ok && watchlist.value.rows);
-  const marketRows = watchRows.filter((row) => String(row.ticker || "").toUpperCase().startsWith(`${market}.`));
+  // 池子来源由服务端给出（配置自选池 / 真实持仓）：有就显示，没有就写「接口未返回」，不臆测
+  const watchUniverse = (watchlist.value && watchlist.value.universe_source) || null;
+  // 归属判定与后端同一口径（A 股 = SH：SH./SZ./BJ. 都算 A 股，见 services/marketContext.jsx）
+  const marketRows = watchRows.filter((row) => tickerMarket(row.ticker) === market);
+
+  // 切换市场（页头或页内）：主图 / 盘口标的回到该市场默认代码，并重新允许「跟随该市场自选首只」
+  React.useEffect(() => {
+    autoRef.current = true;
+    setTicker(marketTicker(market));
+    setInput(marketTicker(market));
+  }, [market]);
 
   // 自选快照到达后，未人工切换过标的时默认跟随**当前市场**的自选首只
   const marketRowsKey = marketRows.map((row) => row.ticker).join(",");
@@ -293,16 +312,17 @@ export default function MarketPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [marketRowsKey, market]);
 
-  const barsHook = useV3("market", { ticker, period, limit: 160 });
+  // K 线 / 盘口都显式带 market（K 线标的本身已含市场前缀，二者一致；后端可据此校验并标 source/as_of）
+  const barsHook = useV3("market", { ticker, period, limit: 160, market });
   const barsData = barsHook.value && barsHook.value.ok ? barsHook.value.data : null;
   const bars = asArray(barsData && barsData.bars);
 
   // 因子矩阵按当前市场的自选标的请求；该市场无自选标的时退化为该市场默认标的
   const factorTickers = marketRows.length
     ? marketRows.map((row) => row.ticker).join(",")
-    : marketOf(market).ticker;
+    : marketTicker(market);
   const factors = useV3("factors/matrix", { tickers: factorTickers, market });
-  const orderbook = useV3("orderbook", { ticker });
+  const orderbook = useV3("orderbook", { ticker, market });
 
   // 交易时段徽章只在只读 GET 上轮询（60s），组件卸载即清理
   React.useEffect(() => {
@@ -331,13 +351,9 @@ export default function MarketPage() {
     setInput(value);
   };
 
-  /** 切市场：主图标的回到该市场默认代码，自选/因子请求参数随之切换。 */
+  /** 切市场：写统一上下文即可（标的默认值 / 自选跟随 / 请求参数都由 market 派生）。 */
   const pickMarket = (next) => {
-    const target = marketOf(String(next || "SH"));
-    autoRef.current = false;
-    setMarket(target.value);
-    setTicker(target.ticker);
-    setInput(target.ticker);
+    setMarket(String(next || "SH"));
   };
 
   /* ── sec-0 交易时段 ── */
@@ -494,7 +510,7 @@ export default function MarketPage() {
 
   const marketTag = (code) => {
     const prefix = String(code || "").split(".")[0];
-    const own = prefix === market;
+    const own = tickerMarket(code) === market;
     return (
       <Tag color={own ? "blue" : "default"} style={{ marginInlineEnd: 6 }}>
         {prefix}
@@ -629,7 +645,7 @@ export default function MarketPage() {
   const factorRows = (factorIndex ? factorIndex.tickers : []).map((code) => ({ ticker: code }));
   const factorOffMarket =
     factorRows.length > 0 &&
-    !factorRows.some((row) => String(row.ticker).toUpperCase().startsWith(`${market}.`));
+    !factorRows.some((row) => tickerMarket(row.ticker) === market);
   const factorTableColumns = [
     {
       title: "代码",
@@ -733,7 +749,7 @@ export default function MarketPage() {
             <Title level={5} style={{ margin: 0 }}>
               行情与信号
             </Title>
-            <Tag color="blue">{`当前市场 ${marketName(market)} ${market}`}</Tag>
+            <Tag color="blue">{`当前市场：${marketLabelText} ${market}`}</Tag>
           </Space>
         }
         extra={
@@ -763,13 +779,13 @@ export default function MarketPage() {
               value={input}
               onChange={(event) => setInput(event.target.value)}
               onSearch={pickTicker}
-              placeholder={`输入代码，如 ${marketOf(market).ticker}`}
+              placeholder={`输入代码，如 ${marketTicker(market)}`}
               style={{ width: 250 }}
               enterButton="切换"
             />
             <Segmented options={PERIODS} value={period} onChange={(value) => setPeriod(String(value))} />
             <Text type="secondary" style={{ ...MONO, fontSize: 12 }}>
-              {`${marketOf(market).label} · 默认标的 ${marketOf(market).ticker}`}
+              {`${marketLabel(market)} · 默认标的 ${marketTicker(market)}`}
             </Text>
           </Space>
 
@@ -883,6 +899,12 @@ export default function MarketPage() {
                 : ` 该市场当前${SESSION_TEXT[session] || "状态未知"}：上列价格为最近收盘，最新 bar 时点为 ${fmt.stamp(lastBar.t)}`}
               {" · MA5 / MA20 为真实收盘均值 · 买卖点信号：无数据源（接口未返回逐 bar 信号）"}
             </Text>
+            <MarketNote
+              source={`/api/v3/market?ticker=${ticker}&period=${period}&market=${market}`}
+              asOf={barsData ? barsData.as_of : null}
+              extra={barsSource ? `K 线来源 ${barsSource}` : null}
+              style={{ display: "block", marginTop: 4 }}
+            />
           </>
         )}
       </ProCard>
@@ -901,7 +923,7 @@ export default function MarketPage() {
               最新 {lastBar ? numOr(lastBar.c) : "—"} · {changePct === null ? "无数据源" : fmt.signed(changePct, 2, "%")}
             </Text>
             <Text type="secondary" style={{ fontSize: 11 }}>
-              /api/v3/orderbook · 富途实时快照
+              {`/api/v3/orderbook?ticker=${ticker}&market=${market} · 富途实时快照`}
             </Text>
           </Space>
         }
@@ -981,6 +1003,12 @@ export default function MarketPage() {
               委托笔数为 0 表示该档上游未披露笔数（原样展示，不填占位）· 委比 / 内外盘：无数据源（快照接口未返回）
               {session !== "open" ? ` · 当前${marketName(market)}${SESSION_TEXT[session] || "状态未知"}，上表为最近一次快照` : ""}
             </Text>
+            <MarketNote
+              source={`/api/v3/orderbook（富途 rt_order_book）`}
+              asOf={orderbook.value && orderbook.value.as_of}
+              extra={`ticker=${ticker}`}
+              style={{ display: "block", marginTop: 4 }}
+            />
           </>
         ) : (
           <NoSource what={`五档盘口（${ticker}）`} why="接口返回的 books 中 ask_list / bid_list 均为空（无可展示档位）" />
@@ -1002,7 +1030,7 @@ export default function MarketPage() {
               style={{ width: 140 }}
             />
             <Text type="secondary" style={{ ...MONO, fontSize: 11 }}>
-              {`${marketName(market)}标的 ${marketRows.length} 只 / 接口返回 ${watchRows.length} 只 · 快照 as_of ${watchRows.length ? fmt.stamp(watchRows[0].asOf) : "—"}`}
+              {`${marketName(market)}标的 ${marketRows.length} 只 / 接口返回 ${watchRows.length} 只 · 自选池来源 ${watchUniverse || "接口未返回"} · 快照 as_of ${watchRows.length ? fmt.stamp(watchRows[0].asOf) : "—"}`}
             </Text>
           </Space>
         }
@@ -1010,10 +1038,17 @@ export default function MarketPage() {
         {watchlist.error ? (
           <BlockError name={`自选行情（/api/v3/market/watchlist · market=${market}）`} error={watchlist.error} />
         ) : watchRows.length === 0 ? (
-          <NoSource
-            what={`${marketName(market)}自选池`}
-            why={errText(watchlist.value, `GET /api/v3/market/watchlist?n=6&market=${market} 未返回任何标的`)}
-          />
+          <>
+            <NoSource
+              what={`${marketName(market)}自选池`}
+              why={errText(watchlist.value, `GET /api/v3/market/watchlist?n=6&market=${market} 未返回任何标的`)}
+            />
+            <MarketNote
+              source={`GET /api/v3/market/watchlist?n=6&market=${market}`}
+              extra="该市场无自选池时服务端返回 ok:false（原样展示，不退回全部市场）"
+              style={{ display: "block", marginTop: 4 }}
+            />
+          </>
         ) : (
           <>
             {watchOffMarket ? (
@@ -1046,6 +1081,12 @@ export default function MarketPage() {
                 ? ` · 取数失败标的：${asArray(watchlist.value.errors).map((item) => item.ticker).join("、")}`
                 : ""}
             </Text>
+            <MarketNote
+              source={`GET /api/v3/market/watchlist?n=6&market=${market}`}
+              asOf={watchRows.length ? watchRows[0].asOf : null}
+              extra={`自选池来源 ${watchUniverse || "接口未返回"} · 接口返回 ${watchRows.length} 只 · 其中 ${marketLabel(market)} ${marketRows.length} 只`}
+              style={{ display: "block", marginTop: 4 }}
+            />
           </>
         )}
       </ProCard>
@@ -1068,10 +1109,16 @@ export default function MarketPage() {
         {factors.error ? (
           <BlockError name={`多因子信号（/api/v3/factors/matrix · market=${market}）`} error={factors.error} />
         ) : !factorIndex ? (
-          <NoSource
-            what={`${marketName(market)}多因子信号`}
-            why={errText(factors.value, `GET /api/v3/factors/matrix?tickers=${factorTickers}&market=${market} 失败`)}
-          />
+          <>
+            <NoSource
+              what={`${marketName(market)}多因子信号`}
+              why={errText(factors.value, `GET /api/v3/factors/matrix?tickers=${factorTickers}&market=${market} 失败`)}
+            />
+            <MarketNote
+              source={`GET /api/v3/factors/matrix?tickers=${factorTickers}&market=${market}`}
+              style={{ display: "block", marginTop: 4 }}
+            />
+          </>
         ) : (
           <>
             {factorOffMarket ? (
@@ -1111,6 +1158,12 @@ export default function MarketPage() {
                   )} · 样本 ${fmt.dash(factors.value.ic.observations)} 期`
                 : ""}
             </Text>
+            <MarketNote
+              source={`GET /api/v3/factors/matrix?tickers=${factorTickers}&market=${market}`}
+              asOf={factorIndex.matrix.as_of}
+              extra={`矩阵来源 ${String(factorIndex.matrix.source || "—")}`}
+              style={{ display: "block", marginTop: 4 }}
+            />
           </>
         )}
       </ProCard>
@@ -1168,6 +1221,12 @@ export default function MarketPage() {
               板块涨跌幅 / 色阶：无数据源（/api/v3/plates 只返回板块清单，涨跌幅需富途实时行情权限）· 来源
               /api/v3/plates?market=SH&plate_class=ALL · 仅 A 股请求，切换市场时不发该请求
             </Text>
+            <MarketNote
+              source="GET /api/v3/plates?market=SH&plate_class=ALL"
+              asOf={plates.value && plates.value.as_of}
+              extra="板块口径只覆盖 A 股：市场不是 SH 时本页不发该请求"
+              style={{ display: "block", marginTop: 4 }}
+            />
           </>
         )}
       </ProCard>

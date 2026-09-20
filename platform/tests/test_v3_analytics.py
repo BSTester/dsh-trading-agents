@@ -104,10 +104,14 @@ class FakeApp:
 
 
 class FakeRequest:
-    """只需 ``await request.body()`` 的最小请求替身。"""
+    """只需 ``await request.body()`` 的最小请求替身（``query_params`` 供 market 回显用）。"""
 
-    def __init__(self, body=b""):
+    query_params: dict = {}
+
+    def __init__(self, body=b"", query_params=None):
         self._body = body
+        if query_params is not None:
+            self.query_params = query_params
 
     async def body(self):
         return self._body
@@ -984,7 +988,11 @@ class TestMlRoutes(RouteCase):
         self.assertEqual(result["metrics"]["days"], 119)
         self.assertEqual(len(result["equity"]), 119)
         self.assertEqual(set(result["equity"][0]), {"t", "value"})
-        self.assertEqual(set(result), {"ok", "ticker", "metrics", "equity"})
+        # market 回显（新增字段，不改既有字段）：标的带市场前缀 → 取前缀
+        self.assertEqual(result["market"], "SH")
+        self.assertIn("market=SH", result["marketNote"])
+        for key in ("ok", "ticker", "metrics", "equity"):
+            self.assertIn(key, result)
 
     def test_backtest_defaults_and_insufficient(self):
         run = FakeRun({"series": series_envelope(self._bars(120))})
@@ -1031,7 +1039,9 @@ class TestRegisterRoutes(RouteCase):
                        "ic": {"ok": True, "value": {"points": [{"t": "2026-09-08", "ic": 0.4}]}},
                        "plan": {"ok": True, "value": {"plans": []}},
                        "equity": {"ok": True, "value": {"current": 500000.0}}})
-        self.write_watchlist(["A", "B"])
+        # 路由缺省 market=SH（既有 A 股口径），所以自选池放真实的 A 股代码
+        # （裸代码 "A"/"B" 会被如实判成美股 → 该市场无池 → market/no-universe）
+        self.write_watchlist(["SH.600000", "SH.600009"])
         app = self._app(run)
 
         risk = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/risk/analytics")](
@@ -1039,6 +1049,8 @@ class TestRegisterRoutes(RouteCase):
         self.assertTrue(risk["ok"], risk)
         self.assertEqual(risk["portfolioSource"], "自选池等权（2 只）")
         self.assertEqual(risk["nav"], 500000.0)
+        self.assertEqual(risk["market"], "SH", "不传 market 时按缺省 SH（A 股口径）")
+        self.assertEqual(risk["universe_source"], "config/trading-platform.json#watchlist")
 
         matrix = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/factors/matrix")](
             tickers="A,B,C", factor="mom_20", forward_days=None, forward=7)))
@@ -1142,6 +1154,343 @@ class TestRegisterRoutes(RouteCase):
         v3_analytics.register(app_one, FakeRun({}), str(first_home))
         v3_analytics.register(app_two, FakeRun({}), str(second_home))
         self.assertIsNot(app_one.routes, app_two.routes)
+
+
+#: 非退化收益序列（基准方差 > 0 且组合与基准有差异，才能算出 beta 与 IR）。
+MARKET_BENCH_RETURNS = [0.01 if index % 2 == 0 else -0.008 for index in range(59)]
+MARKET_PORT_RETURNS = [0.006 if index % 3 == 0 else (-0.004 if index % 3 == 1 else 0.001)
+                       for index in range(59)]
+
+# ---------------------------------------------------------------------------
+# market= 口径（2026-09-20 新增：分析类端点的市场宇宙）
+# ---------------------------------------------------------------------------
+class MarketScopeTests(RouteCase):
+    """``risk/analytics`` / ``factors/matrix`` / ``strategy`` 的 ``market=`` 契约。
+
+    池子统一来自 ``server.v3_universe.resolve_universe``：配置 ``watchlists.<market>`` →
+    富途真实持仓 → 都没有则 ``market/no-universe``（**不退回全部市场**）。
+    """
+
+    def setUp(self):
+        super().setUp()
+        from server import v3_universe
+
+        v3_universe.clear_cache()
+
+    def write_watchlists(self, mapping):
+        path = Path(self.home) / "trading-platform.json"
+        path.write_text(json.dumps({"watchlists": mapping}, ensure_ascii=False), encoding="utf-8")
+
+    def _series(self, closes):
+        def series(payload):
+            return series_envelope(make_bars(closes), ticker=payload["ticker"])
+        return series
+
+    def test_risk_analytics_uses_the_market_universe(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"], "SH": ["SH.600000", "SH.600009"]})
+        run = FakeRun({"series": self._series(closes_from([0.001] * 60)),
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 100.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="HK")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["market"], "HK")
+        self.assertEqual(result["universe_source"], "config/trading-platform.json#watchlists.HK")
+        self.assertEqual(sorted(result["analytics"]["tickers"]), ["HK.00700", "HK.00981"])
+        self.assertEqual(result["portfolioSource"], "自选池等权（2 只）",
+                         "portfolioSource 文案口径不变；market 由 market/universe_source 承载")
+        self.assertIn("market=HK", result["marketNote"])
+
+    def test_risk_analytics_without_a_universe_is_honest(self):
+        self.write_watchlists({"SH": ["SH.600000", "SH.600009"]})
+        run = FakeRun({"series": self._series(closes_from([0.001] * 60)),
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 100.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="US")
+        self.assertError(result, "market/no-universe")
+        self.assertEqual(result["error"]["message"], "该市场没有配置自选池、也没有真实持仓")
+        self.assertIn("没有 watchlists.US", result["error"]["detail"])
+        self.assertEqual(run.payloads("series"), [], "无宇宙时不该逐票取数")
+
+    def test_risk_analytics_bad_market(self):
+        self.assertError(v3_analytics.risk_analytics(FakeRun(), self.home, market="MARS"),
+                         "market/bad-market")
+
+    def test_risk_analytics_frozen_plan_is_filtered_by_market(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"]})
+        plan = {"ok": True, "value": {"plans": [
+            {"plan_id": "PLN-SH", "status": "frozen", "target": {"SH.600000": 1, "SH.600009": 1}},
+            {"plan_id": "PLN-HK", "status": "frozen", "target": {"HK.00700": 1, "HK.00981": 1}}]}}
+        run = FakeRun({"series": self._series(closes_from([0.001] * 60)),
+                       "plan": plan,
+                       "equity": {"ok": True, "value": {"current": 100.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="HK")
+        self.assertTrue(result["ok"], result)
+        self.assertIn("PLN-HK", result["portfolioSource"])
+        self.assertIn("已按 market=HK 过滤", result["portfolioSource"])
+
+    def test_risk_analytics_keeps_legacy_behaviour_without_market(self):
+        self.write_watchlist(["SH.600000", "SH.600009"])
+        run = FakeRun({"series": self._series(closes_from([0.001] * 60)),
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 100.0}}})
+        result = v3_analytics.risk_analytics(run, self.home)
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["market"])
+        self.assertEqual(result["portfolioSource"], "自选池等权（2 只）")
+        self.assertIn("未指定 market", result["marketNote"])
+
+    def test_factors_matrix_uses_the_market_universe(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981", "HK.09988"]})
+        rows = [{"ticker": ticker, "as_of": "2026-09-18", "factors": {"mom_20": 0.04},
+                 "z": {"mom_20": 1.0}} for ticker in ("HK.00700", "HK.00981", "HK.09988")]
+        run = FakeRun({"factors": {"ok": True, "value": {"rows": rows}},
+                       "ic": {"ok": True, "value": {"points": []}}})
+        result = v3_analytics.factors_matrix_data(run, self.home, market="HK")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["market"], "HK")
+        self.assertEqual(result["universe_source"], "config/trading-platform.json#watchlists.HK")
+        self.assertEqual(run.payloads("factors")[0]["tickers"],
+                         ["HK.00700", "HK.00981", "HK.09988"], "6 只上限内全取")
+
+    def test_factors_matrix_explicit_tickers_win_and_market_is_only_a_label(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"]})
+        run = FakeRun({"factors": {"ok": True, "value": {"rows": []}},
+                       "ic": {"ok": True, "value": {"points": []}}})
+        result = v3_analytics.factors_matrix_data(run, self.home, tickers_raw="A,B,C",
+                                                  market="HK")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(run.payloads("factors")[0]["tickers"], ["A", "B", "C"],
+                         "显式 tickers 优先，不被 market 裁剪")
+        self.assertEqual(result["market"], "HK")
+        self.assertIsNone(result["universe_source"])
+        self.assertIn("仅作标注", result["market_filter"])
+
+    def test_factors_matrix_without_a_universe_is_honest(self):
+        self.write_watchlists({"SH": ["SH.600000", "SH.600009"]})
+        result = v3_analytics.factors_matrix_data(FakeRun(), self.home, market="US")
+        self.assertError(result, "market/no-universe")
+
+    def test_strategy_run_records_the_market_and_persists_it(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981", "HK.09988"]})
+        closes = closes_from([0.002 * math.sin(index / 4.0) + 0.001 for index in range(199)])
+
+        def series(payload):
+            return series_envelope(make_bars(closes), ticker=payload["ticker"])
+
+        run = FakeRun({"series": series,
+                       "factors": {"ok": True, "value": {"rows": [
+                           {"ticker": ticker, "as_of": "2026-09-18",
+                            "factors": {"mom_20": 0.04}, "z": {"mom_20": 1.0}}
+                           for ticker in ("HK.00700", "HK.00981", "HK.09988")]}}})
+        result = v3_analytics.strategy_run(run, self.home, {"market": "HK", "topN": 2})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["market"], "HK")
+        self.assertEqual(result["run"]["market"], "HK")
+        self.assertEqual(result["run"]["universe_source"],
+                         "config/trading-platform.json#watchlists.HK")
+        self.assertEqual(result["run"]["universe"], ["HK.00700", "HK.00981", "HK.09988"])
+        # 落盘也带 market（GET /strategy?market= 才能按市场取回）
+        self.assertEqual(v3_analytics.strategy_last(self.home, market="HK")["run"]["market"],
+                         "HK")
+        self.assertEqual(v3_analytics.strategy_markets(self.home), ["HK"])
+
+    def test_strategy_run_without_a_universe_is_honest(self):
+        self.write_watchlists({"SH": ["SH.600000"]})
+        result = v3_analytics.strategy_run(FakeRun(), self.home, {"market": "US"})
+        self.assertError(result, "market/no-universe")
+
+    def test_strategy_last_filters_by_market(self):
+        path = Path(self.home) / v3_analytics.STRATEGY_RUNS_FILE
+        path.write_text(json.dumps({"asOf": "sh-run", "market": "SH"}) + "\n"
+                        + json.dumps({"asOf": "hk-run", "market": "HK"}) + "\n",
+                        encoding="utf-8")
+        self.assertEqual(v3_analytics.strategy_last(self.home, market="SH")["run"]["asOf"],
+                         "sh-run")
+        self.assertEqual(v3_analytics.strategy_last(self.home)["run"]["asOf"], "hk-run",
+                         "不传 market 时仍取最后一条（与历史一致）")
+        missing = v3_analytics.strategy_last(self.home, market="US")
+        self.assertIsNone(missing["run"])
+        self.assertIn("已落盘的市场：SH/HK", missing["note"])
+        self.assertError(v3_analytics.strategy_last(self.home, market="MARS"),
+                         "market/bad-market")
+
+    def test_strategy_last_keeps_legacy_records_visible(self):
+        path = Path(self.home) / v3_analytics.STRATEGY_RUNS_FILE
+        path.write_text(json.dumps({"asOf": "old-run"}) + "\n", encoding="utf-8")
+        result = v3_analytics.strategy_last(self.home, market="SH")
+        self.assertIsNone(result["run"], "旧记录没有 market 标注 → 不当作该市场的记录")
+        self.assertIn("没有带 market 标注", result["note"])
+
+    def test_risk_analytics_uses_the_market_benchmark(self):
+        """HK 组合必须用**港股**基准（HK.800000）算 beta/alpha/IR，不用 SH.000300。"""
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"]})
+
+        def series(payload):
+            returns = (MARKET_BENCH_RETURNS if payload["ticker"] == "HK.800000"
+                       else MARKET_PORT_RETURNS)
+            return series_envelope(make_bars(closes_from(returns)), ticker=payload["ticker"])
+
+        run = FakeRun({"series": series,
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 10.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="HK")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["benchmark"], "HK.800000")
+        self.assertEqual(result["benchmarkTicker"], "HK.800000")
+        self.assertEqual(result["benchmarkSource"], "futu/quote_history_kline")
+        self.assertIn("HK.800000", result["benchmarkNote"])
+        self.assertIn("HK.800000", [payload["ticker"] for payload in run.payloads("series")])
+        self.assertIsNotNone(result["analytics"]["beta"], "有同源基准 → beta 必须算出来")
+        self.assertIsNotNone(result["analytics"]["ir"])
+
+    def test_risk_analytics_falls_back_within_the_market(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"]})
+
+        def series(payload):
+            if payload["ticker"] == "HK.800000":
+                return {"ok": False, "error": {"code": "trading/futu-unavailable",
+                                               "message": "HTTP 403：b'{\"code\":-12006}'"}}
+            returns = (MARKET_BENCH_RETURNS if payload["ticker"] == "HK.800700"
+                       else MARKET_PORT_RETURNS)
+            return series_envelope(make_bars(closes_from(returns)), ticker=payload["ticker"])
+
+        run = FakeRun({"series": series,
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 10.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="HK")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["benchmark"], "HK.800700", "首选限频 → 降级到恒生科技")
+        self.assertIn("-12006", result["benchmarkNote"])
+        self.assertIsNotNone(result["analytics"]["beta"])
+
+    def test_risk_analytics_without_any_benchmark_nulls_the_ratios(self):
+        """该市场基准全不可用 → benchmark=null，beta/alpha/ir 一律 null（不跨市场兜底）。"""
+        self.write_watchlists({"US": ["US.NVDA", "US.MSTR"]})
+
+        def series(payload):
+            if payload["ticker"] not in ("US.NVDA", "US.MSTR"):
+                return {"ok": False, "error": {"code": "trading/futu-unavailable",
+                                               "message": "[errcode=-7] invalid symbol"}}
+            return series_envelope(make_bars(closes_from(MARKET_PORT_RETURNS)),
+                                   ticker=payload["ticker"])
+
+        run = FakeRun({"series": series,
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 10.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="US")
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["benchmark"])
+        self.assertIsNone(result["benchmarkTicker"])
+        self.assertIsNone(result["benchmarkSource"])
+        self.assertIn("基准不可用", result["benchmarkNote"])
+        self.assertIn("US.SPY", result["benchmarkNote"])
+        self.assertIsNone(result["analytics"]["beta"])
+        self.assertIsNone(result["analytics"]["alphaAnnPct"])
+        self.assertIsNone(result["analytics"]["ir"])
+        self.assertIsNone(result["analytics"]["benchmarkAnnReturnPct"])
+        self.assertIsNotNone(result["analytics"]["varDailyPct"], "VaR 与基准无关，照常给出")
+
+    def test_benchmark_that_does_not_align_is_disclosed(self):
+        """基准取到了但与组合交易日无交集（跨市场日历时常见）→ 比值 null + 如实说明。"""
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"]})
+
+        def series(payload):
+            if payload["ticker"] == "HK.800000":
+                return series_envelope(
+                    make_bars(closes_from(MARKET_BENCH_RETURNS), start="2020-01-01"),
+                    ticker=payload["ticker"])
+            return series_envelope(make_bars(closes_from(MARKET_PORT_RETURNS)),
+                                   ticker=payload["ticker"])
+
+        run = FakeRun({"series": series,
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 10.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="HK")
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["benchmark"], "HK.800000")
+        self.assertIsNone(result["analytics"]["beta"])
+        self.assertIn("未对齐", result["benchmarkNote"])
+
+    def test_explicit_benchmark_is_never_rewritten_by_market(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"]})
+
+        def series(payload):
+            return series_envelope(make_bars(closes_from(MARKET_PORT_RETURNS)),
+                                   ticker=payload["ticker"])
+
+        run = FakeRun({"series": series,
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 10.0}}})
+        result = v3_analytics.risk_analytics(run, self.home, market="HK",
+                                             benchmark="SH.000300")
+        self.assertEqual(result["benchmark"], "SH.000300")
+        self.assertIn("显式指定", result["benchmarkNote"])
+        self.assertNotIn("HK.800000", [payload["ticker"] for payload in run.payloads("series")])
+
+    def test_ml_endpoints_echo_market_without_changing_the_data(self):
+        closes = closes_from([0.002 * math.sin(index / 4.0) + 0.001 for index in range(220)])
+
+        def series(payload):
+            return series_envelope(make_bars(closes), ticker=payload["ticker"])
+
+        run = FakeRun({"series": series})
+        sweep = v3_analytics.ml_sweep(run, ticker="HK.00700", market="HK")
+        self.assertTrue(sweep["ok"], sweep)
+        self.assertEqual(sweep["market"], "HK")
+        self.assertIn("market=HK", sweep["marketNote"])
+        # 不传 market 时按标的前缀回显
+        derived = v3_analytics.ml_sweep(run, ticker="US.NVDA")
+        self.assertEqual(derived["market"], "US")
+        bare = v3_analytics.ml_sweep(run, ticker="00700")
+        self.assertIsNone(bare["market"], "裸代码无从判定 → 如实留空")
+        self.assertIn("无法判定", bare["marketNote"])
+        self.assertError(v3_analytics.ml_sweep(run, ticker="HK.00700", market="MARS"),
+                         "market/bad-market")
+
+        backtest = v3_analytics.ml_backtest(run, {"ticker": "HK.00700", "market": "HK"})
+        self.assertTrue(backtest["ok"], backtest)
+        self.assertEqual(backtest["market"], "HK")
+        self.assertIn("metrics", backtest)
+
+    def test_ml_routes_accept_the_market_query_param(self):
+        self.write_watchlists({"HK": ["HK.00700"]})
+        closes = closes_from([0.001] * 60)
+        run = FakeRun({"series": self._series(closes)})
+        app = FakeApp()
+        v3_analytics.register(app, run, self.home)
+        sweep = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/ml/sweep")](
+            ticker="HK.00700", windows="5", rebalance="5", limit=500, market="HK")))
+        self.assertEqual(sweep["market"], "HK")
+        body = json.dumps({"ticker": "SH.600519", "window": 10, "rebalanceDays": 5,
+                           "limit": 500}).encode()
+        backtest = envelope_of(asyncio.run(app.routes[("POST", "/api/v3/ml/backtest")](
+            FakeRequest(body, query_params={"market": "HK"}))))
+        self.assertEqual(backtest["market"], "HK",
+                         "POST 从查询串取 market（前端就是这么传的），且优先于标的前缀")
+
+    def test_routes_pass_market_through(self):
+        self.write_watchlists({"HK": ["HK.00700", "HK.00981"]})
+        closes = closes_from([0.001] * 60)
+        run = FakeRun({"series": self._series(closes),
+                       "factors": {"ok": True, "value": {"rows": []}},
+                       "ic": {"ok": True, "value": {"points": []}},
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 1.0}}})
+        app = FakeApp()
+        v3_analytics.register(app, run, self.home)
+        risk = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/risk/analytics")](
+            limit=250, confidence=0.95, benchmark="SH.000300", weights=None, market="HK")))
+        self.assertEqual(risk["market"], "HK")
+        bad = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/risk/analytics")](
+            limit=250, confidence=0.95, benchmark="SH.000300", weights=None, market="MARS")))
+        self.assertEqual(bad["error"]["code"], "market/bad-market")
+        matrix = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/factors/matrix")](
+            tickers=None, factor="mom_20", forward_days=None, forward=None, market="HK")))
+        self.assertEqual(matrix["market"], "HK")
+        shown = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/strategy")](
+            market="HK")))
+        self.assertEqual(shown["market"], "HK")
+        self.assertIsNone(shown["run"])
 
 
 if __name__ == "__main__":

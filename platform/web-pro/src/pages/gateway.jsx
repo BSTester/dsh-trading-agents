@@ -8,12 +8,31 @@
 //   6. 调用分布（BarList ← /api/v3/metrics 的真实进程内计数）
 // 数据：只走既有读通道 GET /api/v3/*，本页没有任何写动作。
 import React from "react";
-import { Alert, Badge, Descriptions, Empty, Space, Statistic, Table, Tag, Typography } from "antd";
+import { Alert, Badge, Descriptions, Empty, Select, Space, Statistic, Table, Tag, Typography } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
+import { useMarket } from "../services/marketContext.jsx";
 import { BarList } from "../components/charts.jsx";
 
 const { Text, Paragraph } = Typography;
+
+/**
+ * 口径标注（每个受市场影响的卡片都挂一句）：
+ *   global=true  → 「全局口径，不按市场拆分」（三通道 / 熔断 / 调用分布 / 心跳）
+ *   global=false → 「当前市场 {label} {market}」
+ */
+function ScopeTag({ market, label, global = false, text }) {
+  const scope = text || (global ? "全局口径，不按市场拆分" : `当前市场 ${label} ${market}`);
+  return (
+    <Tag color={global ? "default" : "blue"} style={{ marginInlineEnd: 0 }}>
+      {scope}
+    </Tag>
+  );
+}
+
+/** 作业市场的真实取值来自 job 前缀（GLOBAL:enqueue_research:2026-09-19 → GLOBAL）；无前缀显示「—」，不猜。 */
+const MARKET_LABELS = { SH: "A股 SH", HK: "港股 HK", US: "美股 US", GLOBAL: "全局作业" };
+const jobMarketOf = (record) => String(record?.job ?? "").split(":")[0] || "—";
 
 /** 统一「无数据源」区块：措辞来自 api.js 的 noSourceText，页面不自造说法。 */
 function NoSource({ what, why, type = "warning" }) {
@@ -126,8 +145,11 @@ function UnavailableChannelCard({ title, channel, reason, extraRows = [], footer
 }
 
 export default function GatewayPage() {
+  const { market, label } = useMarket();
   const gateway = useV3("gateway");
   const metrics = useV3("metrics");
+  // 调度作业历史的市场筛选（job 前缀；默认「全部市场」，纯前端过滤，不新增请求）
+  const [jobMarket, setJobMarket] = React.useState("ALL");
   const g = gateway.value ?? {};
   const m = metrics.value ?? {};
 
@@ -144,17 +166,30 @@ export default function GatewayPage() {
   const tripped = Boolean(scheduler.kill || scheduler.halt || scheduler.critical);
   const toolCalls = Object.entries(m.mcp?.tools ?? {}).filter(([, value]) => Number.isFinite(Number(value)));
 
+  /* ── 作业市场分布 / 筛选（真实字段：job 前缀，无则不造） ── */
+  const countByMarket = (key) => jobs.filter((record) => jobMarketOf(record) === key).length;
+  const jobMarkets = Array.from(new Set(jobs.map(jobMarketOf))).filter((key) => key && key !== "—").sort();
+  const visibleJobs = jobMarket === "ALL" ? jobs : jobs.filter((record) => jobMarketOf(record) === jobMarket);
+  const jobMarketOptions = [
+    { value: "ALL", label: `全部市场（${jobs.length} 条）` },
+    ...jobMarkets.map((key) => ({
+      value: key,
+      label: `${MARKET_LABELS[key] ?? key}${key === market ? "（本页当前市场）" : ""} · ${countByMarket(key)} 条`,
+    })),
+  ];
+
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
       <ProCard
         title="网关与调度"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
             <Badge
               status={upCount === 3 ? "success" : upCount === 0 ? "error" : "warning"}
               text={`${upCount} / 3 通道可用（MCP ${fmt.dash(statuses[0])} · SDK ${fmt.dash(statuses[1])} · Headless ${fmt.dash(statuses[2])}）`}
             />
+            <ScopeTag market={market} label={label} global />
             <Text type="secondary" style={{ fontSize: 12 }}>数据时点 {fmt.stamp(g.generated_at)}</Text>
           </Space>
         }
@@ -166,10 +201,15 @@ export default function GatewayPage() {
         {!gateway.loading && !gateway.error ? (
           <Descriptions size="small" column={2} items={[
             { key: "src", label: "数据来源", children: <Text code>/api/v3/gateway · /api/v3/metrics</Text> },
+            { key: "scope", label: "市场口径", children: `三通道 / 熔断 / 调用分布为全局口径（不按市场拆分）；调度作业带真实市场前缀，可按市场筛选（本页当前市场 ${label} ${market}）` },
             { key: "hint", label: "通道语义", children: "MCP Bridge 由本服务挂载；SDK JSON-RPC 与 Headless CLI 未挂载（如实标注，不占位）" },
           ]} />
         ) : null}
       </ProCard>
+
+      <Text type="secondary" style={{ fontSize: 11 }}>
+        口径：三通道卡为进程级全局口径（不按市场拆分），与当前市场 {label} {market} 无关；市场只影响下方调度作业历史的筛选视图。
+      </Text>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12 }}>
         <McpChannelCard gateway={g} metrics={m} />
@@ -208,10 +248,16 @@ export default function GatewayPage() {
       <ProCard
         title="Headless 调用日志"
         bordered
-        extra={headlessLast.length === 0
-          ? <Tag color="warning">无数据源 · 本服务未挂载 Headless 子进程</Tag>
-          : <Tag color="success">{`${headlessLast.length} 条`}</Tag>}
+        extra={<Space size={8} wrap>
+          <ScopeTag market={market} label={label} global />
+          {headlessLast.length === 0
+            ? <Tag color="warning">无数据源 · 本服务未挂载 Headless 子进程</Tag>
+            : <Tag color="success">{`${headlessLast.length} 条`}</Tag>}
+        </Space>}
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：Headless 通道为进程级全局口径（不按市场拆分）；「市场」列取记录里真实返回的 market 字段，没有就显示「—」，不推断。
+        </Text>
         {headlessLast.length === 0 ? (
           <Empty
             image={EMPTY_FRAME}
@@ -229,6 +275,7 @@ export default function GatewayPage() {
             locale={emptyTable("Headless 调用日志", "headless.last 为空数组")}
             columns={[
               { title: "时间", render: (_, record) => fmt.stamp(pick(record, ["at", "time", "started_at"])) },
+              { title: "市场", width: 100, render: (_, record) => fmt.dash(pick(record, ["market", "market_group"])) },
               { title: "结果", render: (_, record) => fmt.dash(pick(record, ["result", "status", "ok"])) },
               { title: "exit", render: (_, record) => fmt.dash(pick(record, ["exit_code", "exitCode", "code"])) },
               { title: "耗时(ms)", render: (_, record) => fmt.dash(pick(record, ["durationMs", "ms", "elapsed_ms"])) },
@@ -241,10 +288,17 @@ export default function GatewayPage() {
       <ProCard
         title="调度器"
         bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>
-          {`定时规则 ${rules.length} 条（工具面不提供）· 作业历史 ${jobs.length} 条 · 心跳 ${fmt.dash(heartbeat.heartbeat)}`}
-        </Text>}
+        extra={<Space size={8} wrap>
+          <ScopeTag market={market} label={label} global />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {`定时规则 ${rules.length} 条（工具面不提供）· 作业历史 ${jobs.length} 条 · 心跳 ${fmt.dash(heartbeat.heartbeat)}`}
+          </Text>
+        </Space>}
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          {`口径：调度器与 daemon 心跳为全局调度台账（不按市场拆分）；每条作业带真实市场前缀（SH / HK / US / GLOBAL），
+          下面按该前缀筛选（纯前端过滤，不新增请求）。本页当前市场 ${label} ${market}。`}
+        </Text>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(300px, 1fr))", gap: 12 }}>
           <div>
             <Text strong>daemon 心跳 · 实时</Text>
@@ -260,20 +314,42 @@ export default function GatewayPage() {
             </Space>
           </div>
           <div>
-            <Text strong>{`作业历史 · 最近 ${Math.min(jobs.length, 8)} 次`}</Text>
+            <Space size={8} wrap style={{ justifyContent: "space-between", width: "100%" }}>
+              <Text strong>{`作业历史 · 最近 ${Math.min(visibleJobs.length, 8)} 次`}</Text>
+              <Select size="small" style={{ minWidth: 220 }} value={jobMarket} onChange={setJobMarket} options={jobMarketOptions} />
+            </Space>
+            <Text type="secondary" style={{ fontSize: 11, display: "block", marginTop: 6, fontVariantNumeric: "tabular-nums" }}>
+              {jobMarkets.length === 0
+                ? "作业历史未返回可识别的市场前缀（job 字段）"
+                : `市场分布：${jobMarkets.map((key) => `${key} ${countByMarket(key)}`).join(" · ")} · 来源 schedule.jobs 的 job 前缀`}
+            </Text>
             <div style={{ marginTop: 8 }}>
               {jobs.length === 0 ? (
                 <Empty image={EMPTY_FRAME} description={noSourceText("作业历史", "schedule 工具未返回 jobs")} />
+              ) : visibleJobs.length === 0 ? (
+                <Empty
+                  image={EMPTY_FRAME}
+                  description={noSourceText(`作业历史（市场 ${jobMarket}）`, `schedule.jobs 中没有 job 前缀为 ${jobMarket} 的作业`)}
+                />
               ) : (
                 <Table
                   size="small"
                   rowKey={(record, index) => `${record.job ?? "job"}-${index}`}
-                  dataSource={jobs.slice(0, 8)}
+                  dataSource={visibleJobs.slice(0, 8)}
                   pagination={false}
                   locale={emptyTable("作业历史", "schedule 工具未返回 jobs")}
                   columns={[
                     { title: "作业", render: (_, record) => String(record.job ?? "—").split(":").slice(1).join(":") || String(record.job ?? "—") },
-                    { title: "市场", width: 80, render: (_, record) => String(record.job ?? "").split(":")[0] || "—" },
+                    {
+                      title: "市场",
+                      width: 110,
+                      render: (_, record) => (
+                        <Space size={4}>
+                          <Text style={{ fontSize: 12 }}>{jobMarketOf(record)}</Text>
+                          {jobMarketOf(record) === market ? <Tag color="blue" style={{ marginInlineEnd: 0 }}>当前市场</Tag> : null}
+                        </Space>
+                      ),
+                    },
                     { title: "运行于", width: 170, render: (_, record) => fmt.dash(record.ran) },
                   ]}
                 />
@@ -293,6 +369,7 @@ export default function GatewayPage() {
             ) : null}
             <Paragraph type="secondary" style={{ fontSize: 11.5, marginTop: 8, marginBottom: 0 }}>
               本页调度开关不持久化：工具面没有可写规则表，规则改动只在 install/*.timer 与配置文件里完成。
+              定时规则为全局口径（不按市场拆分），各市场执行时刻由「接入与授权」页的自动流水线配置。
             </Paragraph>
           </div>
         </div>
@@ -302,14 +379,18 @@ export default function GatewayPage() {
         title="熔断保护"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
             <Tag color={tripped ? "error" : "success"}>{tripped ? "熔断已触发" : "未触发 · 保护待命"}</Tag>
+            <ScopeTag market={market} label={label} global />
             <Text type="secondary" style={{ fontSize: 12 }}>
               {`服务端 kill=${scheduler.kill ? "true" : "false"} · halt=${scheduler.halt ? "true" : "false"} · critical=${scheduler.critical ? "true" : "false"}`}
             </Text>
           </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：熔断保护为进程级全局口径（不按市场拆分），一个开关对所有市场生效。
+        </Text>
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
           <NoSource what="并发上限" why="Headless 子进程不自管并发位，工具面无该阈值" />
           <NoSource what="单次超时" why="无 Headless 子进程调度，无超时配置来源" />
@@ -324,21 +405,31 @@ export default function GatewayPage() {
         />
       </ProCard>
 
-      <ProCard title="Profile 与 Bundle" bordered>
+      <ProCard
+        title="Profile 与 Bundle"
+        bordered
+        extra={<ScopeTag market={market} label={label} global />}
+      >
         <NoSource
           what="Profile 与 Bundle"
           why="工具面不返回 bundle 的名称 / 版本 / 条目数 / 加载状态；平台按角色运行，不使用 dsh profile"
         />
         <Paragraph type="secondary" style={{ fontSize: 11.5, marginTop: 10, marginBottom: 0 }}>
-          本页不保留任何占位条目；可用 bundle 清单见 Harness 侧 cordis.yml。
+          本页不保留任何占位条目；可用 bundle 清单见 Harness 侧 cordis.yml。Profile / Bundle 为全局口径（不按市场拆分）。
         </Paragraph>
       </ProCard>
 
       <ProCard
         title="调用分布"
         bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>来源 /api/v3/metrics · 本服务进程内计数</Text>}
+        extra={<Space size={8} wrap>
+          <ScopeTag market={market} label={label} global />
+          <Text type="secondary" style={{ fontSize: 12 }}>来源 /api/v3/metrics · 本服务进程内计数</Text>
+        </Space>}
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：调用分布为进程内计数（全局口径，不按市场拆分）——同一 handle 同时服务各市场工具。
+        </Text>
         {metrics.error ? (
           <NoSource what="调用分布" why={`/api/v3/metrics 取数失败：${metrics.error}`} type="error" />
         ) : toolCalls.length === 0 ? (

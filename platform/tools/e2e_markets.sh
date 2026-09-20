@@ -85,6 +85,61 @@ done
 check "降级链状态" "$BASE/api/v3/sources/status" chains
 
 echo
+echo "== 2) 市场过滤是否真的生效（逐市场断言：返回行必须属于该市场）"
+BODY="" python3 - "$BASE" <<'PYFILTER'
+import json, os, sys, urllib.request
+
+base = sys.argv[1]
+# 市场 → 合法标的前缀（A股含 SH/SZ/BJ；港股 HK.；美股 US.）
+PREFIX = {"SH": ("SH.", "SZ.", "BJ."), "HK": ("HK.",), "US": ("US.",)}
+CHECKS = [
+    ("market/watchlist", "watchlist", "rows"),
+    ("factors/matrix", "factors", "tickers"),
+    ("risk/analytics", "analytics", None),
+    ("execution", "execution", None),
+    ("research", "research", None),
+]
+fail = 0
+for market, prefixes in PREFIX.items():
+    print(f"-- {market}")
+    for path, label, kind in CHECKS:
+        url = f"{base}/api/v3/{path}?{'n=3&' if path.endswith('watchlist') else ''}market={market}"
+        try:
+            with urllib.request.urlopen(url, timeout=180) as response:
+                body = json.loads(response.read().decode("utf-8", "ignore"))
+        except Exception as error:  # noqa: BLE001
+            print(f"   {label:22s} ✗ 请求失败：{str(error)[:70]}")
+            fail += 1
+            continue
+        if not body.get("ok"):
+            code = (body.get("error") or {}).get("code")
+            print(f"   {label:22s} ✓(如实报错) {code}")
+            continue
+        # 断言：返回的标的都属于该市场；不满足即为「传了参数没筛」
+        bad = []
+        if path == "market/watchlist":
+            bad = [r.get("ticker") for r in (body.get("rows") or []) if not str(r.get("ticker", "")).startswith(prefixes)]
+        elif path == "factors/matrix":
+            bad = [t for t in ((body.get("matrix") or {}).get("tickers") or []) if not str(t).startswith(prefixes)]
+        elif path == "risk/analytics":
+            bad = [t for t in ((body.get("analytics") or {}).get("tickers") or {}) if not str(t).startswith(prefixes)]
+        elif path == "execution":
+            oms = body.get("oms") or {}
+            bad = [o.get("ticker") for o in (oms.get("orders") or []) if not str(o.get("ticker", "")).startswith(prefixes)]
+        elif path == "research":
+            bad = [r.get("ticker") for r in ((body.get("runs") or []) + (body.get("reports") or [])) if not str(r.get("ticker", "") or "").startswith(prefixes)]
+        if bad:
+            print(f"   {label:22s} ✗ 过滤未生效：出现跨市场标的 {bad[:3]}")
+            fail += 1
+        else:
+            echo = body.get("universe_source") or body.get("market") or ""
+            print(f"   {label:22s} ✓ 仅含 {market} 标的（{str(echo)[:48]}）")
+print()
+print("过滤结论:", "全部生效" if fail == 0 else f"{fail} 项未生效/失败")
+sys.exit(1 if fail else 0)
+PYFILTER
+
+echo
 echo "== 3) 页面展示（真实浏览器）"
 for page in market execution risk; do
   timeout 240 chromium --headless=new --no-sandbox --disable-gpu --virtual-time-budget=60000 \

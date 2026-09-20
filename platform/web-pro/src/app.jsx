@@ -5,6 +5,7 @@ import React from "react";
 import { ProLayout } from "@ant-design/pro-components";
 import { Badge, Space, Tooltip, Typography } from "antd";
 import { useV3 } from "./services/api.js";
+import { MarketPicker, MarketProvider } from "./services/marketContext.jsx";
 import OverviewPage from "./pages/overview.jsx";
 import BrainPage from "./pages/brain.jsx";
 import MarketPage from "./pages/market.jsx";
@@ -43,13 +44,14 @@ function currentKey() {
   return (window.location.hash.replace(/^#\/?/, "").split("?")[0]) || "overview";
 }
 
-/** 页头：模式徽章 + 数据时点 + 切到设计稿原样版的入口（两版并存，互相可跳） */
+/** 页头：统一市场切换 + 模式徽章 + 数据时点 + 切到设计稿原样版的入口（两版并存，互相可跳） */
 function HeaderExtra({ pageKey }) {
   const overview = useV3("overview", {});
   const mode = overview.value?.mode ?? null;
   const page = PAGES.find((item) => item.key === pageKey);
   return (
     <Space size="middle">
+      <MarketPicker />
       <Tooltip title="数据来自本服务 /api/v3/*；模式以工作台为准">
         <Badge
           status={mode === "live" ? "error" : "processing"}
@@ -72,44 +74,46 @@ export default function Shell() {
   }, []);
   const page = PAGES.find((item) => item.key === key) ?? PAGES[0];
   return (
-    <ProLayout
-      title="量化决策平台 V3 · 工作台"
-      layout="mix"
-      fixSiderbar
-      route={{
-        path: "/",
-        routes: GROUPS.map((group) => ({
-          path: `/${group.cat}`,
-          name: group.cat,
-          routes: group.items.map((item) => ({ path: `/${item.key}`, name: item.name })),
-        })),
-      }}
-      location={{ pathname: `/${page.key}` }}
-      menuItemRender={(item, dom) => (
-        <a
-          href={`#/${String(item.path).replace(/^\//, "")}`}
-          onClick={(event) => {
-            event.preventDefault();
-            const next = String(item.path).replace(/^\//, "");
-            if (PAGES.some((p) => p.key === next)) {
-              window.location.hash = `#/${next}`;
-              setKey(next);
-            }
-          }}
-        >
-          {dom}
-        </a>
-      )}
-      avatarProps={{ render: () => <HeaderExtra pageKey={page.key} /> }}
-      footerRender={() => (
-        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-          数据来源：本服务 /api/v3/*（工作台工具面 / 富途行情 / 台账）· 取不到的项显式标注「无数据源」·
-          执行与授权写动作仅经既有受约束入口
-        </Typography.Text>
-      )}
-    >
-      {page.element}
-    </ProLayout>
+    <MarketProvider>
+      <ProLayout
+        title="量化决策平台 V3 · 工作台"
+        layout="mix"
+        fixSiderbar
+        route={{
+          path: "/",
+          routes: GROUPS.map((group) => ({
+            path: `/${group.cat}`,
+            name: group.cat,
+            routes: group.items.map((item) => ({ path: `/${item.key}`, name: item.name })),
+          })),
+        }}
+        location={{ pathname: `/${page.key}` }}
+        menuItemRender={(item, dom) => (
+          <a
+            href={`#/${String(item.path).replace(/^\//, "")}`}
+            onClick={(event) => {
+              event.preventDefault();
+              const next = String(item.path).replace(/^\//, "");
+              if (PAGES.some((p) => p.key === next)) {
+                window.location.hash = `#/${next}`;
+                setKey(next);
+              }
+            }}
+          >
+            {dom}
+          </a>
+        )}
+        avatarProps={{ render: () => <HeaderExtra pageKey={page.key} /> }}
+        footerRender={() => (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            数据来源：本服务 /api/v3/*（工作台工具面 / 富途行情 / 台账）· 取不到的项显式标注「无数据源」·
+            执行与授权写动作仅经既有受约束入口
+          </Typography.Text>
+        )}
+      >
+        {page.element}
+      </ProLayout>
+    </MarketProvider>
   );
 }
 

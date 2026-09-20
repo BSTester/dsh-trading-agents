@@ -10,13 +10,37 @@
 // 且**只在人点按钮后**发起一次，页面加载零请求写）。
 import React from "react";
 import {
-  Alert, Badge, Button, Descriptions, Empty, Input, Space, Statistic, Tag, Typography,
+  Alert, Badge, Button, Descriptions, Empty, Input, Space, Statistic, Tag, Tooltip, Typography,
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, postWb, useV3 } from "../services/api.js";
+import { useMarket, marketTicker } from "../services/marketContext.jsx";
 import { BarList } from "../components/charts.jsx";
 
 const { Text, Paragraph } = Typography;
+
+/**
+ * 口径标注（每个受市场影响的卡片都挂一句）：工具面是全局的（同一 handle 服务所有市场），
+ * 因此本页全部卡片都是 global=true；market / label 只用于说明当前上下文与代码前缀。
+ */
+function ScopeTag({ market, label, global = true, text }) {
+  const scope = text || (global ? "全局口径（工具面不按市场切分）" : `当前市场 ${label} ${market}`);
+  return (
+    <Tag color={global ? "default" : "blue"} style={{ marginInlineEnd: 0 }}>
+      {scope}
+    </Tag>
+  );
+}
+
+/**
+ * 工具参数里是否含市场口径：只按 /api/v3/tools 返回的原文（名称 + 说明）做关键词提示，
+ * 不解析、不推断参数结构；命中词原样列出，未提及的工具不显示该标记。
+ */
+const MARKET_ARG_WORDS = ["market", "市场", "codes", "code", "ticker", "标的", "前缀"];
+function marketArgWords(tool) {
+  const text = `${tool?.name ?? ""} ${tool?.desc ?? ""}`.toLowerCase();
+  return MARKET_ARG_WORDS.filter((word) => text.includes(word.toLowerCase()));
+}
 
 /** 与设计稿版一致的域中文名（key 来自接口真实返回，这里只是标签映射）。 */
 const DOMAIN_LABELS = {
@@ -85,10 +109,14 @@ function probeBodyText(body) {
 }
 
 export default function ToolsPage() {
+  const { market, label } = useMarket();
+  // 工具目录 / 进程计数不按市场切分：本页不新增任何请求，也不带 market 参数
   const tools = useV3("tools");
   const metrics = useV3("metrics");
   const settings = useV3("settings");
   const gateway = useV3("gateway");
+  // 真实探测调用按当前市场取统一市场上下文的默认标的（SH.600000 / HK.00700 / US.NVDA，与其余页面同一取值）
+  const probeTicker = marketTicker(market);
 
   const [query, setQuery] = React.useState("");
   const [probe, setProbe] = React.useState({ state: "idle" });
@@ -118,7 +146,7 @@ export default function ToolsPage() {
     const seq = ++probeSeq.current;
     setProbe({ state: "loading" });
     const started = Date.now();
-    const args = { ticker: "SH.600519", period: "1d", limit: 20 };
+    const args = { ticker: probeTicker, period: "1d", limit: 20 };
     let timer = null;
     try {
       const timeout = new Promise((resolve) => {
@@ -153,8 +181,17 @@ export default function ToolsPage() {
       <ProCard
         title="工具域治理"
         bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>数据来源 /api/v3/tools · /api/v3/metrics · 工具面进程内计数</Text>}
+        extra={
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} />
+            <Text type="secondary" style={{ fontSize: 12 }}>数据来源 /api/v3/tools · /api/v3/metrics · 工具面进程内计数</Text>
+          </Space>
+        }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          {`口径：工具清单与调用计数为全局口径（工具面不按市场切分）——同一工具面同时服务 A股 / 港股 / 美股，
+          本页不按市场重取，也不向工具面传 market；当前页头市场为 ${label} ${market}，只影响下面「真实探测调用」使用的代码前缀。`}
+        </Text>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 24 }}>
           <Statistic title="工具总数" value={fmt.dash(catalog.total)} valueStyle={{ fontSize: 20 }} />
           <Statistic title="工具域" value={domainKeys.length > 0 ? domainKeys.length : undefined} valueStyle={{ fontSize: 20 }} />
@@ -177,7 +214,8 @@ export default function ToolsPage() {
         title="六大工具域目录"
         bordered
         extra={
-          <Space size={8}>
+          <Space size={8} wrap>
+            <ScopeTag market={market} label={label} />
             <Input
               allowClear
               size="small"
@@ -190,6 +228,10 @@ export default function ToolsPage() {
           </Space>
         }
       >
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：目录为全局口径（工具面不按市场切分）；带「参数含市场」标记的工具，其说明提到市场或带市场前缀的代码
+          （如 SH. / HK. / US.），标注只引用 /api/v3/tools 的原文关键词，不推断参数结构。
+        </Text>
         {tools.loading && domainKeys.length === 0 ? <Text type="secondary">读取中…</Text> : null}
         {!tools.loading && tools.error ? (
           <NoSource what="六大工具域目录" why="目录取数失败（见上）" type="error" />
@@ -223,23 +265,33 @@ export default function ToolsPage() {
                       <Empty image={EMPTY_FRAME} description="无匹配工具（当前搜索词）" />
                     ) : (
                       <div style={{ display: "flex", flexDirection: "column" }}>
-                        {rows.map((tool) => (
-                          <div key={tool.name} style={{ borderTop: "1px dashed #232b37", padding: "7px 0" }}>
-                            <Space size={8} wrap>
-                              <Text code>{tool.name}</Text>
-                              {kindTag(tool.kind)}
-                              <Text type="secondary" style={{ fontSize: 11 }}>
-                                {tool.wb ? `↔ ${tool.wb}` : "· 无工作台对应"}
-                              </Text>
-                              <Text type="secondary" style={{ fontSize: 11 }} title="该工具在本服务进程内的调用次数">
-                                {`今日 ${fmt.dash(callsByTool[tool.name] ?? 0)}`}
-                              </Text>
-                            </Space>
-                            <Paragraph type="secondary" style={{ fontSize: 11.5, margin: "4px 0 0" }}>
-                              {toolDesc(tool.desc) || "—"}
-                            </Paragraph>
-                          </div>
-                        ))}
+                        {rows.map((tool) => {
+                          const words = marketArgWords(tool);
+                          return (
+                            <div key={tool.name} style={{ borderTop: "1px dashed #232b37", padding: "7px 0" }}>
+                              <Space size={8} wrap>
+                                <Text code>{tool.name}</Text>
+                                {kindTag(tool.kind)}
+                                {words.length > 0 ? (
+                                  <Tooltip
+                                    title={`该工具说明里出现：${words.join(" / ")}（来自 /api/v3/tools 原文，参数含市场或带市场前缀的代码）`}
+                                  >
+                                    <Tag color="geekblue" style={{ marginInlineEnd: 0 }}>参数含市场</Tag>
+                                  </Tooltip>
+                                ) : null}
+                                <Text type="secondary" style={{ fontSize: 11 }}>
+                                  {tool.wb ? `↔ ${tool.wb}` : "· 无工作台对应"}
+                                </Text>
+                                <Text type="secondary" style={{ fontSize: 11 }} title="该工具在本服务进程内的调用次数">
+                                  {`今日 ${fmt.dash(callsByTool[tool.name] ?? 0)}`}
+                                </Text>
+                              </Space>
+                              <Paragraph type="secondary" style={{ fontSize: 11.5, margin: "4px 0 0" }}>
+                                {toolDesc(tool.desc) || "—"}
+                              </Paragraph>
+                            </div>
+                          );
+                        })}
                       </div>
                     )}
                   </ProCard>
@@ -253,13 +305,16 @@ export default function ToolsPage() {
       <ProCard
         title="工具发现代理"
         bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>
-          {`目录 ${catalog.total ?? "—"} 个工具 · Schema v3 · 调用 ${fmt.dash(m.mcp?.calls)} 次`}
-        </Text>}
+        extra={<Space size={8} wrap>
+          <ScopeTag market={market} label={label} />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            {`目录 ${catalog.total ?? "—"} 个工具 · Schema v3 · 调用 ${fmt.dash(m.mcp?.calls)} 次`}
+          </Text>
+        </Space>}
       >
         <Paragraph style={{ marginBottom: 8 }}>
           MCP 服务器只暴露 <Text code>list_tools</Text> / <Text code>call_tool</Text> 两个入口，
-          避免上百个工具 schema 撑爆上下文窗口；Harness 先发现、再按名调用。
+          避免上百个工具 schema 撑爆上下文窗口；Harness 先发现、再按名调用。发现代理为全局口径（工具面不按市场切分）。
         </Paragraph>
         <Descriptions size="small" column={2} items={[
           {
@@ -279,7 +334,7 @@ export default function ToolsPage() {
               发起真实探测调用
             </Button>
             <Text type="secondary" style={{ fontSize: 12 }}>
-              只读工具 series（ticker=SH.600519 · period=1d · limit=20）· 仅在人工点击后发起一次
+              {`只读工具 series（ticker=${probeTicker} · 当前市场 ${label} ${market}）· 仅在人工点击后发起一次`}
             </Text>
           </Space>
           {probe.state === "idle" ? (
@@ -309,7 +364,10 @@ export default function ToolsPage() {
       </ProCard>
 
       <ProCard title="平台 MCP 服务器注册" bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>MCP 协议：{fmt.dash(gwChannels.mcp?.protocol)}</Text>}>
+        extra={<Space size={8} wrap>
+          <ScopeTag market={market} label={label} />
+          <Text type="secondary" style={{ fontSize: 12 }}>MCP 协议：{fmt.dash(gwChannels.mcp?.protocol)}</Text>
+        </Space>}>
         <Descriptions size="small" column={2} items={[
           {
             key: "status",
@@ -367,9 +425,15 @@ export default function ToolsPage() {
       </ProCard>
 
       <ProCard title="健康与降级" bordered
-        extra={<Text type="secondary" style={{ fontSize: 12 }}>
-          本服务进程内计数 · {`失败 ${fmt.dash(m.mcp?.errors)} / 调用 ${fmt.dash(m.mcp?.calls)}`}
-        </Text>}>
+        extra={<Space size={8} wrap>
+          <ScopeTag market={market} label={label} />
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            本服务进程内计数 · {`失败 ${fmt.dash(m.mcp?.errors)} / 调用 ${fmt.dash(m.mcp?.calls)}`}
+          </Text>
+        </Space>}>
+        <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
+          口径：调用次数 / 失败次数 / 延迟为进程级全局口径（工具面不按市场切分），不按市场拆分。
+        </Text>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 24 }}>
           <Statistic title="调用次数" value={fmt.dash(m.mcp?.calls)} valueStyle={{ fontSize: 20 }} />
           <Statistic title="失败次数" value={fmt.dash(m.mcp?.errors)} valueStyle={{ fontSize: 20 }} />
@@ -395,13 +459,15 @@ export default function ToolsPage() {
         </div>
         <Paragraph type="secondary" style={{ fontSize: 11.5, marginTop: 10, marginBottom: 0 }}>
           降级预案：连不上时工具静默降级为不可用，不影响其余能力（本页只展示真实计数，不做健康评分推算）。
+          全局口径（工具面不按市场切分），与当前市场 {label} {market} 无关。
         </Paragraph>
       </ProCard>
 
-      <ProCard title="契约说明" bordered>
+      <ProCard title="契约说明" bordered extra={<ScopeTag market={market} label={label} />}>
         <Paragraph style={{ marginBottom: 0 }}>
           每个工具的契约（参数 / 输出 / 对齐规则）会注入系统提示词，因此工具数量需控制在合理范围 ——
           当前目录 <Text strong>{fmt.dash(catalog.total)}</Text> 个工具，长尾需求经 <Text code>call_tool</Text> 间接调用承接。
+          工具面为全局口径（不按市场切分）：既含全局工具，也含按市场或带市场前缀代码取数的工具（已在上方逐条标注「参数含市场」）。
         </Paragraph>
       </ProCard>
     </Space>

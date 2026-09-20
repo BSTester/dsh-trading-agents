@@ -18,11 +18,12 @@
 // 平台不含逐单下单/改单/撤单入口：台账里 stage=manual 只是平台侧台账的审批阶段，不是券商待确认。
 import React from "react";
 import {
-  Alert, Badge, Button, Col, Descriptions, Empty, Form, Input, Modal, Progress, Row, Segmented, Space,
+  Alert, Badge, Button, Col, Descriptions, Empty, Form, Input, Modal, Progress, Row, Space,
   Table, Tag, Timeline, Typography,
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { useV3, useWbAction, postWb, getV3, fmt, noSourceText } from "../services/api.js";
+import { MarketNote, envelopeError, marketLabel, useMarket } from "../services/marketContext.jsx";
 import { BarList } from "../components/charts.jsx";
 
 const { Text, Link } = Typography;
@@ -63,14 +64,10 @@ const OK = (env) => Boolean(env && env.ok);
 const fin = (value) => Number.isFinite(Number(value));
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
-/** 取数失败原因：HTTP 非 2xx（error）与 HTTP 200 的 ok:false 信封都取服务端 code/message 原文。 */
+/** 取数失败原因：HTTP 非 2xx（error）与 HTTP 200 的 ok:false 信封都取服务端 code/message 原文，
+ *  并在有 error.detail 时追加「真实原因」（统一口径见 services/marketContext.jsx 的 envelopeError）。 */
 function envError(env, fallback) {
-  const error = (env && env.error) || {};
-  const code = error.code ? String(error.code) : "";
-  const message = error.message ? String(error.message) : "";
-  if (code || message) return code ? `${code}：${message || fallback || "请求失败"}` : message;
-  if (env && env.ok === false) return fallback || "接口返回 ok:false 但未给出 error.code/message";
-  return fallback || "接口未返回 error.code/message";
+  return envelopeError(env, fallback || "接口未返回 error.code/message");
 }
 
 const stageText = (stage) => ({
@@ -211,6 +208,7 @@ function ReconcileButton() {
 
 /* ── ① 执行入口条 ───────────────────────────────────────────────────────── */
 function ExecHeader({ mode, planEnv, planErr, orders, deals, omsNote, nav, onOpenPlan, confirmPending }) {
+  const { market } = useMarket();
   const planValue = OK(planEnv) ? (planEnv.value || {}) : null;
   const plan = planValue ? asArray(planValue.plans)[0] || null : null;
   const scoped = plan ? asArray(plan.orders) : [];
@@ -283,6 +281,11 @@ function ExecHeader({ mode, planEnv, planErr, orders, deals, omsNote, nav, onOpe
       <Text type="secondary" style={{ fontSize: 12 }}>
         台账 {orders.length} 单 · 冻结计划归属 {frozen.length} 单 · 台账 NAV {fmt.money(nav)}
       </Text>
+      <MarketNote
+        source={`GET /api/v3/execution?market=${market} + GET /api/v3/oms/orders?market=${market}`}
+        extra="台账 / 持仓 / 在途 / 成交均按当前市场过滤，跨市场不合并"
+        style={{ display: "block", marginTop: 6 }}
+      />
     </ProCard>
   );
 }
@@ -290,6 +293,7 @@ function ExecHeader({ mode, planEnv, planErr, orders, deals, omsNote, nav, onOpe
 /* ── ② 订单生命周期看板 ─────────────────────────────────────────────────── */
 const LIFECYCLE = ["信号生成", "风控校验", "审批", "已提交", "部分成交", "全部成交"];
 function LifecycleBoard({ execEnv, orders, audit, stages }) {
+  const { market } = useMarket();
   const exec = OK(execEnv) ? execEnv : null;
   const signals = audit.filter((entry) => String(entry.kind) === "signal");
   const openRows = flatRows(exec && exec.orders_open, ["rows", "orders"]);
@@ -355,12 +359,18 @@ function LifecycleBoard({ execEnv, orders, audit, stages }) {
           );
         })}
       </Row>
+      <MarketNote
+        source={`GET /api/v3/oms/orders?market=${market} + GET /api/v3/execution?market=${market} + /api/v3/audit（全局窗口）`}
+        extra={`该市场台账 ${orders.length} 单`}
+        style={{ display: "block", marginTop: 8 }}
+      />
     </ProCard>
   );
 }
 
 /* ── ③ 分级审批三档 ─────────────────────────────────────────────────────── */
 function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv }) {
+  const { market } = useMarket();
   const auto = orders.filter((order) => String(order.stage) === "risk_passed");
   const manual = orders.filter((order) => String(order.stage) === "manual");
   const blocked = orders.filter((order) => ["blocked", "rejected"].includes(String(order.stage)));
@@ -448,12 +458,18 @@ function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv }) {
           </ProCard>
         </Col>
       </Row>
+      <MarketNote
+        source={`GET /api/v3/oms/orders?market=${market} + GET /api/v3/risk/industry?market=${market}`}
+        extra={`自动执行 ${auto.length} 单 / 人工确认 ${manual.length} 单 / 强制阻断 ${blocked.length} 单（仅当前市场）`}
+        style={{ display: "block", marginTop: 8 }}
+      />
     </ProCard>
   );
 }
 
 /* ── ⑤ 持仓摘要 + 成交质量 ─────────────────────────────────────────────── */
 function HoldingsCard({ execEnv }) {
+  const { market } = useMarket();
   const exec = OK(execEnv) ? execEnv : null;
   const positions = exec ? exec.positions : null;
   const groups = positions && Array.isArray(positions.groups) ? positions.groups : [];
@@ -505,7 +521,10 @@ function HoldingsCard({ execEnv }) {
       style={{ height: "100%" }}
     >
       {!positions ? (
-        <NoSource what="持仓摘要" why={envError(execEnv, "GET /api/v3/execution 未返回 positions")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what={`${marketLabel(market)} 持仓摘要`} why={envError(execEnv, `GET /api/v3/execution?market=${market} 未返回 positions`)} />
+          <MarketNote source={`GET /api/v3/execution?market=${market}`} extra="持仓按市场过滤；账户之间不跨币种合并" />
+        </Space>
       ) : (
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
           <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={data} scroll={{ x: 800 }} />
@@ -514,6 +533,7 @@ function HoldingsCard({ execEnv }) {
               ? accounts.map((group) => `${group.account || group.acc_id} 权益 ${fmt.money(group.total_asset)}（现金 ${fin(group.total_asset) && Number(group.total_asset) ? fmt.pct((Number(group.cash) / Number(group.total_asset)) * 100, 1) : "—"}）`).join(" · ")
               : "无数据源：券商持仓接口未返回账户"}
           </Text>
+          <MarketNote source={`GET /api/v3/execution?market=${market}`} asOf={positions.as_of} extra={`${accounts.length} 个账户 / ${rows.length} 只标的（当前市场）`} />
         </Space>
       )}
     </ProCard>
@@ -524,8 +544,9 @@ function HoldingsCard({ execEnv }) {
  *  口径：委托/成交笔数与名义金额来自券商历史委托与成交流水（sources.orders / sources.deals），
  *  滑点为**近似口径**，服务端在 missing 里给出原文说明，本卡原样展示，不换算、不估算。
  *  失败或空态一律写「无数据源 · 原因」，缺项显示「—」，不填占位数字。
+ *  市场**不再由本卡自己持有**：统一走 services/marketContext.jsx 的 useMarket()，
+ *  与页头 MarketPicker、本页其它模块同一个事实源（避免同页两个市场口径）。
  */
-const MARKETS = ["SH", "HK", "US"];
 
 /** 按市场取成交质量（只用 GET；市场切换或人工刷新才发请求）。 */
 function useQuality(market) {
@@ -602,7 +623,7 @@ function qualityMetricCards(metrics, points, asOf, definitions) {
   );
 }
 
-function QualityCard({ market, onMarket, qualityEnv }) {
+function QualityCard({ market, qualityEnv }) {
   const env = qualityEnv.value;
   const data = OK(env) ? env : null;
   const metrics = data && data.metrics && typeof data.metrics === "object" ? data.metrics : null;
@@ -636,13 +657,8 @@ function QualityCard({ market, onMarket, qualityEnv }) {
       style={{ height: "100%" }}
       extra={
         <Space size={8} wrap>
-          <Segmented
-            size="small"
-            value={market}
-            options={MARKETS}
-            onChange={onMarket}
-            aria-label="成交质量市场切换"
-          />
+          <Tag color="blue">{`当前市场：${marketLabel(market)}`}</Tag>
+          <Text type="secondary" style={{ fontSize: 11 }}>市场由页头统一选择器决定</Text>
           <Button size="small" loading={qualityEnv.loading} onClick={qualityEnv.refresh}
             title="重新读取 GET /api/v3/execution/quality（只读 GET，不写任何状态）">
             刷新
@@ -654,12 +670,13 @@ function QualityCard({ market, onMarket, qualityEnv }) {
         <Empty imageStyle={{ display: "none" }} style={{ margin: 0 }} description={<Text type="secondary">正在读取成交质量…</Text>} />
       ) : !data || !metrics ? (
         <Space direction="vertical" size={6} style={{ width: "100%" }}>
-          <NoSource what={`成交质量 · ${market}`} why={reason} />
+          <NoSource what={`成交质量 · ${marketLabel(market)}`} why={reason} />
           {!data && !qualityEnv.error ? (
             <Text type="secondary" style={{ fontSize: 11 }}>
               成交类数据没有开源替代：当日无委托或券商未返回委托/成交流水时，本卡按原因如实展示，不用估算值顶替。
             </Text>
           ) : null}
+          <MarketNote source={`GET /api/v3/execution/quality?market=${market}&mode=sim`} extra="该市场无成交/委托回报时按原因展示，不跨市场合并" />
         </Space>
       ) : (
         <Space direction="vertical" size={10} style={{ width: "100%" }}>
@@ -703,6 +720,11 @@ function QualityCard({ market, onMarket, qualityEnv }) {
               </Space>
             }
           />
+          <MarketNote
+            source={`GET /api/v3/execution/quality?market=${market}&mode=${String(data.mode || "sim")}`}
+            asOf={data.as_of}
+            extra={`委托来源 ${sources && sources.orders ? String(sources.orders) : "—"} · 成交来源 ${sources && sources.deals ? String(sources.deals) : "—"}（跨市场不合并）`}
+          />
         </Space>
       )}
     </ProCard>
@@ -711,6 +733,7 @@ function QualityCard({ market, onMarket, qualityEnv }) {
 
 /* ── ⑥ 决策链路追溯 ─────────────────────────────────────────────────────── */
 function DecisionTrace({ order, audit, riskCfg, nav, execEnv }) {
+  const { market } = useMarket();
   const [selected, setSelected] = React.useState(null);
   const current = order || null;
   const columns = [
@@ -780,6 +803,10 @@ function DecisionTrace({ order, audit, riskCfg, nav, execEnv }) {
             <Text type="secondary" style={{ fontSize: 12 }}>
               券商在途订单 {openRows.length} 行 · 当日成交 {dealRows.length} 行（/api/v3/execution）
             </Text>
+            <MarketNote
+              source={`GET /api/v3/oms/orders?market=${market} + GET /api/v3/execution?market=${market}`}
+              extra="追溯对象限定在当前市场台账内"
+            />
           </Space>
         </Col>
       </Row>
@@ -1087,8 +1114,11 @@ function ConfirmChannel({ env, envErr, pending, ttlMs, wb, reload, onDecided }) 
 
 /* ── 页面 ───────────────────────────────────────────────────────────────── */
 export default function 执行审批Page() {
-  const exec = useV3("execution", {});
-  const oms = useV3("oms/orders", {});
+  const { market } = useMarket();
+  // 台账 / 持仓 / 在途 / 成交 / 成交质量全部按当前市场过滤：接口缺省值各不相同（有的默认全部），
+  // 所以这里**始终显式带 market**，绝不靠后端默认，也不把「全部市场」当成第四档。
+  const exec = useV3("execution", { market });
+  const oms = useV3("oms/orders", { market });
   const metrics = useV3("metrics", {});
   const audit = useV3("audit", { window: 120 });
   const risk = useV3("risk", {});
@@ -1099,11 +1129,10 @@ export default function 执行审批Page() {
 
   const [modalOpen, setModalOpen] = React.useState(false);
   const [selectedId, setSelectedId] = React.useState(null);
-  // 成交质量：市场切换即按市场取真实成交回报（只读 GET）；默认 SH，与页面其它模块的市场口径一致。
-  const [qualityMarket, setQualityMarket] = React.useState("SH");
-  const quality = useQuality(qualityMarket);
-  // 行业暴露与集中度：与风控页同一只读端点，用于取消「行业分类无数据源」的表述（只读 GET）。
-  const industry = useV3("risk/industry", { limit_pct: 20 });
+  // 成交质量：市场来自统一上下文（页头 MarketPicker）；本卡不再自带市场开关，避免同页两个市场事实源。
+  const quality = useQuality(market);
+  // 行业暴露与集中度：与风控页同一只读端点，用于取消「行业分类无数据源」的表述（只读 GET，带市场）。
+  const industry = useV3("risk/industry", { limit_pct: 20, market });
 
   const ordersEnvelope = OK(oms.value) ? oms.value : (OK(exec.value) && exec.value.oms ? exec.value.oms : null);
   const orders = ordersEnvelope && Array.isArray(ordersEnvelope.orders) ? ordersEnvelope.orders : [];
@@ -1148,7 +1177,10 @@ export default function 执行审批Page() {
         <ProCard title="订单明细" bordered
           extra={<Text type="secondary" style={{ fontSize: 12 }}>订单号/状态/风控来自 /api/v3/oms/orders；成交均价与滑点无数据源</Text>}>
           {orders.length === 0 ? (
-            <NoSource what="订单明细" why={ordersEnvelope ? "OMS 台账无订单（orders 为空）" : envError(oms.value, "GET /api/v3/oms/orders 取不到")} />
+            <Space direction="vertical" size={6} style={{ width: "100%" }}>
+              <NoSource what="订单明细" why={ordersEnvelope ? `当前市场（market=${market}）OMS 台账无订单（orders 为空）` : envError(oms.value, `GET /api/v3/oms/orders?market=${market} 取不到`)} />
+              <MarketNote source={`GET /api/v3/oms/orders?market=${market}`} extra="其它市场的订单不在此列出" />
+            </Space>
           ) : (
             <Table size="small" rowKey={(record) => record.id} pagination={{ pageSize: 10 }} scroll={{ x: 1100 }}
               onRow={(record) => ({ onClick: () => setSelectedId(record.id), style: { cursor: "pointer" } })}
@@ -1170,6 +1202,11 @@ export default function 执行审批Page() {
               ]}
             />
           )}
+          <MarketNote
+            source={`GET /api/v3/oms/orders?market=${market}`}
+            extra={`当前市场台账 ${orders.length} 单（跨市场不合并）`}
+            style={{ display: "block", marginTop: 8 }}
+          />
         </ProCard>
       </Block>
       <Row gutter={[12, 12]}>
@@ -1180,7 +1217,7 @@ export default function 执行审批Page() {
         </Col>
         <Col xs={24} xl={12}>
           <Block title="成交质量">
-            <QualityCard market={qualityMarket} onMarket={setQualityMarket} qualityEnv={quality} />
+            <QualityCard market={market} qualityEnv={quality} />
           </Block>
         </Col>
       </Row>
@@ -1209,8 +1246,8 @@ export default function 执行审批Page() {
         </ProCard>
       </Block>
       <Text type="secondary" style={{ fontSize: 12 }}>
-        数据来源：/api/v3/execution、/api/v3/oms/orders、/api/v3/metrics（{metricsEnv.toolTotal === undefined ? "—" : metricsEnv.toolTotal} 个工具面工具，工作台{metricsEnv.workbenchUp ? "在线" : "不可达"}）、
-        /api/v3/audit 与 /api/wb/plan、/api/wb/confirmation 实时接口 · 持仓 as_of {fmt.stamp(positions && positions.as_of)} · 唯一受约束执行入口（plan-execute + 人工二次确认）。页面不含占位数字。
+        数据来源：/api/v3/execution?market={market}、/api/v3/oms/orders?market={market}、/api/v3/metrics（{metricsEnv.toolTotal === undefined ? "—" : metricsEnv.toolTotal} 个工具面工具，工作台{metricsEnv.workbenchUp ? "在线" : "不可达"}）、
+        /api/v3/audit 与 /api/wb/plan、/api/wb/confirmation 实时接口 · 当前市场：{marketLabel(market)} · 持仓 as_of {fmt.stamp(positions && positions.as_of)} · 唯一受约束执行入口（plan-execute + 人工二次确认）。页面不含占位数字。
         {" "}<Link href="/v3/execution.html">对照设计稿原样版</Link>
       </Text>
       <PlanModal open={modalOpen} onClose={() => setModalOpen(false)} planEnv={plan.value} planErr={planErr}

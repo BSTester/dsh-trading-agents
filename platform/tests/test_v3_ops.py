@@ -566,6 +566,131 @@ class ReportingTests(V3OpsTestCase):
 
 
 # ---------------------------------------------------------------------------
+# market= 过滤（execution / oms/orders / brain）
+# ---------------------------------------------------------------------------
+class MarketScopeTests(V3OpsTestCase):
+    """``?market=`` 只挑分组/台账，不改既有字段；未知市场标识如实计数不猜。"""
+
+    def setUp(self):
+        super().setUp()
+        from server import v3_universe
+
+        v3_universe.clear_cache()
+        self.fake.values["positions"] = {"ok": True, "value": {
+            "mode": "sim", "as_of": DAY, "source": "futu/sim_trade_position_list",
+            "groups": [
+                {"acc_id": "HK-1", "market": 1, "kind": "simulated",
+                 "positions": [{"symbol": "00700", "market_val": 100.0}]},
+                {"acc_id": "SH-1", "market": 3, "kind": "simulated",
+                 "positions": [{"symbol": "600000", "market_val": 200.0}]},
+                {"acc_id": "US-1", "market": 100, "kind": "simulated",
+                 "positions": [{"symbol": "NVDA", "market_val": 300.0}]},
+                {"acc_id": "OPT-1", "market": 9, "kind": "simulated",
+                 "positions": [{"symbol": "00700", "market_val": 400.0}]}]}}
+        self.fake.values["orders_open"] = {"ok": True, "value": {
+            "mode": "sim", "as_of": DAY, "groups": [
+                {"acc_id": "HK-1", "market": "HK", "rows": [{"code": "HK.00700"}]},
+                {"acc_id": "SH-1", "market": "SH", "rows": [{"code": "SH.600000"}]},
+                {"acc_id": "OTHER", "market": "9", "rows": [{"code": "SG.X"}]}]}}
+        self.fake.values["deals_today"] = {"ok": True, "value": {
+            "mode": "sim", "as_of": DAY, "groups": [
+                {"acc_id": "HK-1", "market": "HK", "rows": [{"code": "HK.00700"}]}]}}
+
+    def test_execution_filters_groups_by_market(self):
+        body = self.get("/api/v3/execution?market=HK")
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(body["market"], "HK")
+        self.assertEqual([group["acc_id"] for group in body["positions"]["groups"]], ["HK-1"])
+        self.assertEqual([group["acc_id"] for group in body["orders_open"]["groups"]], ["HK-1"])
+        self.assertEqual([group["acc_id"] for group in body["deals_today"]["groups"]], ["HK-1"])
+        stats = body["filter"]
+        self.assertEqual(stats["positions"]["keptGroups"], 1)
+        self.assertEqual(stats["positions"]["otherMarketGroups"], 2)
+        self.assertEqual(stats["positions"]["unknownMarketGroups"], 1,
+                         "market_id=9（港期权）不猜成港股，如实计入未知")
+        self.assertEqual(stats["positions"]["unknownMarkets"], [9])
+        self.assertEqual(stats["orders_open"]["unknownMarkets"], ["9"])
+        self.assertIn("不跨市场合并", stats["positions"]["note"])
+
+    def test_execution_without_market_is_untouched(self):
+        body = self.get("/api/v3/execution")
+        self.assertEqual(body["positions"], self.fake.values["positions"]["value"],
+                         "不传 market 时 value 原样透传（既有字段一字不改）")
+        self.assertNotIn("market", body)
+        self.assertIsNone(body["oms"]["market"])
+
+    def test_execution_bad_market(self):
+        body = self.get("/api/v3/execution?market=MARS")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"]["code"], "market/bad-market")
+
+    def test_oms_orders_filter_the_ledger_and_the_stage_counts(self):
+        v3_ops.OmsLedger(self.fake, self.home).write({
+            "A": {"id": "A", "ticker": "SZ.002716", "stage": "manual", "updated_at": "3"},
+            "B": {"id": "B", "ticker": "HK.00700", "stage": "risk_passed", "updated_at": "2"},
+            "C": {"id": "C", "ticker": "US.NVDA", "stage": "blocked", "updated_at": "1"},
+            "D": {"id": "D", "ticker": "600000", "stage": "manual", "updated_at": "0"},
+        })
+        body = self.get("/api/v3/oms/orders?market=SH")
+        self.assertEqual([row["id"] for row in body["orders"]], ["A"],
+                         "SZ.002716 属 A 股口径（SH）；裸代码无从判断 → 不计入")
+        self.assertEqual(body["stages"], {"manual": 1}, "stages 随过滤同步")
+        self.assertEqual(body["filter"]["keptOrders"], 1)
+        self.assertEqual(body["filter"]["unattributedOrders"], 1)
+        self.assertEqual(body["filter"]["prefixes"], {"SH": 1, "HK": 1, "US": 1, "unknown": 1})
+
+        untouched = self.get("/api/v3/oms/orders")
+        self.assertEqual(sorted(row["id"] for row in untouched["orders"]),
+                         ["A", "B", "C", "D"])
+        self.assertEqual(untouched["stages"], {"manual": 2, "risk_passed": 1, "blocked": 1})
+        self.assertIsNone(untouched["market"])
+        self.assertNotIn("filter", untouched)
+
+    def test_brain_filters_decision_by_run_market(self):
+        self.write(v3_ops.STRATEGY_RUNS_FILENAME,
+                   json.dumps({"run_id": "sh", "market": "SH"}) + "\n"
+                   + json.dumps({"run_id": "hk", "market": "HK"}) + "\n")
+        self.assertEqual(self.get("/api/v3/brain?market=SH")["decision"]["run_id"], "sh")
+        self.assertEqual(self.get("/api/v3/brain?market=SH")["decisionMarket"], "SH")
+        self.assertEqual(self.get("/api/v3/brain")["decision"]["run_id"], "hk",
+                         "不传 market 时仍取最后一条（与历史一致）")
+        missing = self.get("/api/v3/brain?market=US")
+        self.assertIsNone(missing["decision"])
+        self.assertIn("没有 market=US", missing["sources"]["decision"])
+        bad = self.get("/api/v3/brain?market=MARS")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["error"]["code"], "market/bad-market")
+
+    def test_brain_keeps_legacy_runs_visible_with_a_null_market(self):
+        self.write(v3_ops.STRATEGY_RUNS_FILENAME,
+                   json.dumps({"run_id": "legacy-1"}) + "\n"
+                   + json.dumps({"run_id": "legacy-2"}) + "\n")
+        body = self.get("/api/v3/brain?market=SH")
+        self.assertEqual(body["decision"]["run_id"], "legacy-2",
+                         "旧记录没有 market 字段 → 不按市场隐藏")
+        self.assertIsNone(body["decisionMarket"], "旧记录如实标注 market=null")
+        self.assertIn("没有任何带 market 标注的记录", body["sources"]["decision"])
+
+    def test_filter_helpers_report_unknown_markets(self):
+        value = {"groups": [{"acc_id": "X", "market": "FU", "rows": [{"code": "SG.X"}]},
+                            {"acc_id": "Y", "market": "HK", "rows": [{"code": "HK.00700"}]}]}
+        filtered, stats = v3_ops.filter_grouped_value(value, "HK")
+        self.assertEqual([group["acc_id"] for group in filtered["groups"]], ["Y"])
+        self.assertEqual(stats["unknownMarkets"], ["FU"])
+        self.assertEqual(stats["excludedRows"], 1)
+        self.assertEqual(value["groups"][0]["acc_id"], "X", "原值不被就地修改")
+
+        plan_value = {"plans": [{"plan_id": "P1", "target": {"SH.600000": 1, "SH.600009": 1}},
+                                {"plan_id": "P2", "target": {"HK.00700": 1, "HK.00981": 1}},
+                                {"plan_id": "P3"}]}
+        kept, plan_stats = v3_ops.filter_plan_value(plan_value, "SH")
+        self.assertEqual([plan["plan_id"] for plan in kept["plans"]], ["P1", "P3"],
+                         "无 target 的计划不是市场相关条目 → 保留")
+        self.assertEqual(plan_stats["otherMarketPlans"], 1)
+        self.assertEqual(plan_stats["noTargetPlans"], 1)
+
+
+# ---------------------------------------------------------------------------
 # 纯函数（分级 / NAV 口径）
 # ---------------------------------------------------------------------------
 class UnitTests(unittest.TestCase):

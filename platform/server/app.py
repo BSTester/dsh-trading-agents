@@ -914,8 +914,13 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
             _register(app, v3_run, home)
 
     @app.get("/api/v3/overview")
-    async def v3_overview():
-        """V3 系统概览：台账权益/持仓/今日成交/冻结计划/调度心跳/数据源健康/推送状态。"""
+    async def v3_overview(market: str = ""):
+        """V3 系统概览：台账权益/持仓/今日成交/冻结计划/调度心跳/数据源健康/推送状态。
+
+        ``?market=SH|HK|US``（缺省不过滤，与历史完全一致）：``positions`` 按账户市场过滤、
+        ``plan.plans`` 按目标标的市场过滤；``equity`` 是**单一台账**（跨市场不可拆）→ 保留
+        原值并在 ``sections.market_scoped`` 里说明。过滤实现在 ``server.v3_ops``。
+        """
         wanted = {
             "equity": ("equity", {"window": 60}),
             "positions": ("positions", {}),
@@ -940,14 +945,43 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
             return out, errors
 
         values, errors = await asyncio.to_thread(collect)
-        return JSONResponse(status_code=200, content={
+        content = {
             "ok": True,
             "mode": read_mode(home),
             "generated_at": datetime.now(timezone.utc).isoformat(),
             "source": "platform/v3（复用既有 56 工具面的同一 handle）",
             **values,
             "errors": errors,
-        })
+        }
+        if str(market or "").strip():
+            from server import v3_ops as _v3_ops
+            from server import v3_universe as _v3_universe
+
+            code = _v3_universe.normalize_market(market)
+            if code is None:
+                return JSONResponse(status_code=200, content={
+                    "ok": False,
+                    "error": {"code": "market/bad-market",
+                              "message": "market 需为 SH / HK / US"},
+                })
+            positions, positions_stats = _v3_ops.filter_grouped_value(
+                values.get("positions"), code, note="positions 按账户市场过滤（不跨市场合并）")
+            plan_value, plan_stats = _v3_ops.filter_plan_value(
+                values.get("plan"), code, note="plan.plans 按 target 标的市场过滤")
+            content["market"] = code
+            content["positions"] = positions
+            content["plan"] = plan_value
+            content["filter"] = {"positions": positions_stats, "plan": plan_stats}
+            content["sections"] = {"market_scoped": {
+                "market": code,
+                "positions": "按账户市场（数值 market_id / 市场链名）过滤，不跨市场合并",
+                "plan": "plans 只保留 target 含该市场标的的计划（target 原样不裁剪）",
+                "equity": "equity 为台账口径，未按市场拆分（本地模拟台账不分市场）",
+                "deals_today": "overview 不按市场过滤 deals_today；按市场看成交请用 "
+                               "/api/v3/execution?market=",
+                "schedule": "调度心跳与数据源健康没有市场口径，原样保留",
+            }}
+        return JSONResponse(status_code=200, content=content)
 
     # /mcp：MCP streamable-http 端点（规格 §3.6，SDK 挂载）。
     # 有意差异 10：不用 ``app.mount("/mcp", mcp_app)``——Starlette 的 Mount 只匹配

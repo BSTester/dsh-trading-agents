@@ -195,8 +195,9 @@ def probe_wb(base, endpoint):
 # 对每个市场跑同一组**只读**步骤，输出按市场分组的成功/失败表：
 #   ① series（日 K，富途历史行情）          ② market_snapshot（实时快照，A 股权限 -9 是已知缺口）
 #   ③ quote_history_kline_v2（历史 K 线 v2）④ /api/v3/financials（A股/港股走 f10、美股走 SEC）
-#   ⑤ /api/v3/markets/calendar            ⑥ /api/v3/risk/industry（行业映射与暴露）
-#   ⑦ /api/v3/execution/quality（成交质量，券商委托/成交）
+#   ⑤ **按市场过滤**：/market/watchlist、/factors/matrix、/risk/analytics、/execution、
+#      /research、/risk/industry（每个都带 market=，并核对返回条数与市场一致）
+#   ⑥ /api/v3/markets/calendar            ⑦ /api/v3/execution/quality（成交质量，券商委托/成交）
 # 全部 GET/POST 只读端点；写/交易端点在本模式下**一次都不碰**。
 MARKET_PLAN = {
     "SH": {"quote": "SH.600000", "financials": "SH.600000", "financials_source": "futu/f10_detail/statements"},
@@ -209,10 +210,128 @@ MARKET_STEPS = (
     ("wb", "market_snapshot", "实时快照（A 股已知无实时权限 -9）"),
     ("wb", "quote_history_kline_v2", "历史 K 线 v2（K_DAY 3 根）"),
     ("v3", "financials", "三表（A股/港股 f10、美股 SEC）"),
+    ("v3", "market/watchlist", "自选池（?market=，rows 只含该市场标的）"),
+    ("v3", "factors/matrix", "因子矩阵（?market=，标的取该市场宇宙）"),
+    ("v3", "risk/analytics", "组合风险（?market=，组合＝该市场宇宙等权/该市场计划）"),
+    ("v3", "execution", "执行面（?market=，持仓/在途/成交与台账按市场过滤）"),
+    ("v3", "research", "研报与研究 run（?market=，按 ticker 前缀过滤）"),
+    ("v3", "risk/industry", "行业暴露（?market=，标的复用统一解析）"),
     ("v3", "markets/calendar", "三市场交易时段/节假日"),
-    ("v3", "risk/industry", "行业映射与暴露"),
     ("v3", "execution/quality", "成交质量（委托/成交回报）"),
 )
+
+#: 需要「按市场核对」的步骤（market 过滤 + 条数与市场一致）
+MARKET_SCOPED_STEPS = ("market/watchlist", "factors/matrix", "risk/analytics", "execution",
+                       "research", "risk/industry")
+#: 探针侧的**市场前缀**口径（与 platform/server/v3_universe.py 的公开口径一致：
+#: 数字 market_id 表与 trading_datasource.market_ids 同源；SH/SZ/BJ 同属 A 股＝SH）
+PROBE_SIM_MARKET_IDS = {"SH": 3, "SZ": 3, "BJ": 3, "HK": 1, "US": 100}
+PROBE_A_PREFIXES = ("SH", "SZ", "BJ")
+
+
+def _probe_market_of_label(label):
+    """账户/分组的市场标识 → SH/HK/US；认不出 → None（不猜）。"""
+    if label is None or isinstance(label, bool):
+        return None
+    if isinstance(label, (int, float)) and float(label).is_integer():
+        label = int(label)
+    text = str(label).strip().upper()
+    if text.isdigit():
+        for name, market_id in PROBE_SIM_MARKET_IDS.items():
+            if market_id == int(text):
+                return "SH" if name in PROBE_A_PREFIXES else name
+        return None
+    if text in PROBE_SIM_MARKET_IDS:
+        return "SH" if text in PROBE_A_PREFIXES else text
+    return None
+
+
+def _probe_market_of_ticker(ticker):
+    """标的 → 市场前缀口径；裸代码 → None（无法判定）。"""
+    text = str(ticker or "").strip().upper()
+    if "." not in text:
+        return None
+    head, _, tail = text.partition(".")
+    if head in ("SH", "SZ", "BJ", "HK", "US"):
+        return "SH" if head in PROBE_A_PREFIXES else head
+    if tail in ("SH", "SZ", "BJ", "HK", "US"):
+        return "SH" if tail in PROBE_A_PREFIXES else tail
+    return None
+
+
+def _empty_reason(value, result):
+    """空结果必须给出**真实原因**：从响应里找 errors/filter.note/note/missing。"""
+    texts = []
+    if isinstance(value, dict):
+        for key in ("note", "marketNote", "universe_note"):
+            if isinstance(value.get(key), str) and value[key].strip():
+                texts.append(value[key].strip())
+        errors = value.get("errors")
+        if isinstance(errors, list) and errors:
+            first = errors[0] if isinstance(errors[0], dict) else {"raw": errors[0]}
+            texts.append(f"errors[0]={first.get('ticker') or first.get('tool') or ''}"
+                         f"{first.get('error') or first.get('raw')}")
+        missing = value.get("missing")
+        if isinstance(missing, list) and missing:
+            texts.append(f"missing={str(missing[0])[:120]}")
+        filters = value.get("filter")
+        if isinstance(filters, dict):
+            if isinstance(filters.get("note"), str) and filters["note"].strip():
+                texts.append(filters["note"].strip())
+            for item in filters.values():
+                if isinstance(item, dict) and isinstance(item.get("note"), str) \
+                        and item["note"].strip():
+                    texts.append(item["note"].strip())
+    error = (result or {}).get("error")
+    if isinstance(error, dict) and error.get("message"):
+        texts.append(f"{error.get('code')}：{error.get('message')}")
+    return texts[0] if texts else None
+
+
+def _market_scope(market, step, value, result):
+    """``(ok | None, note)``：核对「返回条数与市场一致」；为空必须带真实原因。"""
+    if step not in MARKET_SCOPED_STEPS:
+        return None, None
+    if result.get("ok") is not True:
+        return None, "如实报错，未核对条数"
+    if not isinstance(value, dict):
+        return False, "响应不是对象，无法核对市场归属"
+    if step == "execution":
+        groups = (value.get("positions") or {}).get("groups") or []
+        labels = [group.get("market") for group in groups if isinstance(group, dict)]
+        foreign = [label for label in labels if _probe_market_of_label(label) not in (None, market)]
+        note = (f"positions 分组={len(groups)} 市场标签={labels} "
+                f"filter={value.get('filter', {}).get('positions', {})}")
+        if foreign:
+            return False, f"{note}｜越界分组={foreign}"
+        if not groups:
+            reason = _empty_reason(value, result)
+            return (bool(reason), f"{note}｜空：{reason or '没有任何原因说明（空壳）'}")
+        return True, note
+    if step == "risk/industry":
+        tickers = list(value.get("universe") or [])
+    elif step == "market/watchlist":
+        tickers = [row.get("ticker") for row in (value.get("rows") or []) if isinstance(row, dict)]
+    elif step == "factors/matrix":
+        tickers = list((value.get("matrix") or {}).get("tickers") or [])
+    elif step == "risk/analytics":
+        tickers = list(((value.get("analytics") or {}).get("tickers") or {}).keys())
+    elif step == "research":
+        rows = list(value.get("runs") or []) + list(value.get("reports") or [])
+        tickers = [row.get("ticker") for row in rows if isinstance(row, dict)]
+    else:
+        return None, None
+    foreign = [ticker for ticker in tickers if _probe_market_of_ticker(ticker) not in (None, market)]
+    unknown = [ticker for ticker in tickers if _probe_market_of_ticker(ticker) is None]
+    source = value.get("universe_source") or value.get("source")
+    note = (f"条数={len(tickers)} market={market} universe_source={source} "
+            f"越界={foreign[:3] or '无'} 无法判定={unknown[:3] or '无'}")
+    if foreign:
+        return False, f"{note}｜过滤后仍含其它市场标的"
+    if not tickers:
+        reason = _empty_reason(value, result)
+        return (bool(reason), f"{note}｜该市场无数据：{reason or '没有任何原因说明（空壳）'}")
+    return True, note
 
 
 def market_wb_payload(market, step, plan):
@@ -242,9 +361,20 @@ def market_v3_query(market, step, plan):
     if step == "markets/calendar":
         return f"markets/calendar?{urlencode({'markets': 'SH,HK,US'})}", 30
     if step == "risk/industry":
-        return f"risk/industry?{urlencode({'limit_pct': 20})}", 120
+        return f"risk/industry?{urlencode({'market': market, 'limit_pct': 20})}", 120
     if step == "execution/quality":
         return f"execution/quality?{urlencode({'market': market, 'mode': 'sim'})}", 90
+    # ── 按市场过滤的只读端点（每个都显式带 market=）──────────────────────────────
+    if step == "market/watchlist":
+        return f"market/watchlist?{urlencode({'market': market, 'n': 6})}", 90
+    if step == "factors/matrix":
+        return f"factors/matrix?{urlencode({'market': market})}", 150
+    if step == "risk/analytics":
+        return f"risk/analytics?{urlencode({'market': market, 'limit': 120})}", 180
+    if step == "execution":
+        return f"execution?{urlencode({'market': market})}", 90
+    if step == "research":
+        return f"research?{urlencode({'market': market})}", 90
     return step, 45
 
 
@@ -276,6 +406,13 @@ def _market_result(base, market, kind, step, plan):
         }
     result["value"] = value
     result["evidence"] = _evidence(step, value)
+    # market= 步骤：核对返回条数与市场一致；不通过则按**探针失败**记（真实响应判定）
+    scope_ok, scope_note = _market_scope(market, step, value, result)
+    result["scope_ok"] = scope_ok
+    result["scope"] = scope_note
+    if result.get("ok") is True and scope_ok is False:
+        result["ok"] = False
+        result["error"] = {"code": "probe/market-scope", "message": scope_note}
     return result
 
 
@@ -313,6 +450,46 @@ def _evidence(step, value):
         metrics = value.get("metrics") or {}
         return (f"orders={metrics.get('orders')} filled={metrics.get('filled')} "
                 f"cancelled={metrics.get('cancelled')} src={value.get('sources', {}).get('orders')}")
+    if step == "market/watchlist":
+        if not isinstance(value, dict):
+            return "—"
+        rows = [row for row in (value.get("rows") or []) if isinstance(row, dict)]
+        return (f"rows={len(rows)} market={value.get('market')} "
+                f"universe_source={value.get('universe_source')} "
+                f"首个={rows[0].get('ticker') if rows else None}")
+    if step == "factors/matrix":
+        if not isinstance(value, dict):
+            return "—"
+        matrix = value.get("matrix") if isinstance(value.get("matrix"), dict) else {}
+        return (f"tickers={len(matrix.get('tickers') or [])} market={value.get('market')} "
+                f"universe_source={value.get('universe_source')}")
+    if step == "risk/analytics":
+        if not isinstance(value, dict):
+            return "—"
+        analytics = value.get("analytics") if isinstance(value.get("analytics"), dict) else {}
+        return (f"成分={len(analytics.get('tickers') or {})} market={value.get('market')} "
+                f"benchmark={value.get('benchmark')} beta={analytics.get('beta')} "
+                f"portfolioSource={value.get('portfolioSource')} "
+                f"varDailyPct={analytics.get('varDailyPct')}")
+    if step == "execution":
+        if not isinstance(value, dict):
+            return "—"
+        groups = ((value.get("positions") or {}).get("groups") or [])
+        return (f"positions分组={len(groups)} 各市场={[g.get('market') for g in groups]} "
+                f"market={value.get('market')} "
+                f"oms订单={len((value.get('oms') or {}).get('orders') or [])}")
+    if step == "research":
+        if not isinstance(value, dict):
+            return "—"
+        return (f"runs={len(value.get('runs') or [])} reports={len(value.get('reports') or [])} "
+                f"market={value.get('market')} filter={value.get('filter', {}).get('keptRuns')}")
+    if step == "risk/industry":
+        if not isinstance(value, dict):
+            return "—"
+        top = value.get("top") or {}
+        return (f"标的={len(value.get('universe') or [])} 行业数={len(value.get('exposures') or [])} "
+                f"top={top.get('industry')}({top.get('weightPct')}%) market={value.get('market')} "
+                f"universe_source={value.get('universe_source')}")
     return "—"
 
 
@@ -349,26 +526,33 @@ def run_market_mode(base, markets):
 def market_report(results):
     """按市场分组渲染文本表 + Markdown。"""
     lines = ["# V3 三市场只读探针（SH / HK / US）", ""]
-    totals = {"ok": 0, "fail": 0}
+    totals = {"ok": 0, "fail": 0, "scope_fail": 0}
     for market, rows in results.items():
         passed = sum(1 for row in rows if row.get("ok") is True)
         failed = sum(1 for row in rows if row.get("ok") is False)
+        scope_failed = sum(1 for row in rows if row.get("scope_ok") is False)
         totals["ok"] += passed
         totals["fail"] += failed
-        lines.append(f"## {market} · 成功 {passed} / 失败 {failed}")
+        totals["scope_fail"] += scope_failed
+        lines.append(f"## {market} · 成功 {passed} / 失败 {failed}"
+                     f"（其中按市场核对不通过 {scope_failed}）")
         lines.append("")
-        lines.append("| 步骤 | 端点 | ok | 耗时 | 来源/证据 | 错误 |")
-        lines.append("|---|---|---|---|---|---|")
+        lines.append("| 步骤 | 端点 | ok | 耗时 | 来源/证据 | 按市场核对 | 错误 |")
+        lines.append("|---|---|---|---|---|---|---|")
         for row in rows:
             error = row.get("error") or {}
             error_text = f"{error.get('code')}：{str(error.get('message') or '')[:120]}" if error else "—"
             endpoint = f"/api/{'wb' if row['kind'] == 'wb' else 'v3'}/{row['step']}"
+            scope = row.get("scope")
+            scope_text = ("—" if scope is None
+                          else f"{'✅' if row.get('scope_ok') else '❌'} {str(scope)[:160]}")
             lines.append(
                 f"| {row.get('label', '-')} | `{endpoint}` | "
                 f"{'✅' if row.get('ok') is True else '❌'} | {row.get('ms')}ms | "
-                f"{row.get('evidence') or '—'} | {error_text} |")
+                f"{row.get('evidence') or '—'} | {scope_text} | {error_text} |")
         lines.append("")
-    lines.insert(2, f"- 总成功 {totals['ok']} · 总失败 {totals['fail']}（表内 ✅/❌ 均为真实响应判定）")
+    lines.insert(2, f"- 总成功 {totals['ok']} · 总失败 {totals['fail']}"
+                    f"（按市场核对不通过 {totals['scope_fail']}；表内 ✅/❌ 均为真实响应判定）")
     return "\n".join(lines)
 
 

@@ -64,6 +64,9 @@ REQUIRED = {
   'settings': ['交易模式', '富途', '授权', '环境变量', '自动流水线'],
 }
 GROUPS = ['监控', '研究', '交易', '系统']
+# 市场过滤不变量：页头市场选择器（A股/港股/美股）必须出现在**每一页**，
+# 否则说明该页没有接入统一市场上下文（无法按市场区分）。
+MARKET_KEYS = ['A股', '港股', '美股']
 
 
 def placeholders(page_html: str):
@@ -99,11 +102,13 @@ for key, design in PAIRS:
 
     left = sorted(t for t in DESIGN_SENTINELS if t not in COLLIDE and present(t))
     groups = sum(1 for g in GROUPS if g in text)
-    bad = ex or crash or blank or left or missing or groups < 4
+    market_missing = [k for k in MARKET_KEYS if k not in text]
+    bad = ex or crash or blank or left or missing or groups < 4 or market_missing
     if bad:
         fail += 1
     print(f"{key:10s} {'✗' if bad else '✓'} 示例={ex} 残留占位={left[:3]} 缺模块={missing} "
-          f"菜单分组={groups}/4 崩溃={crash} 白屏={blank} 文本={len(text)}")
+          f"菜单分组={groups}/4 市场选择器={'有' if not market_missing else '缺' + str(market_missing)} "
+          f"崩溃={crash} 白屏={blank} 文本={len(text)}")
 print()
 print('结论:', '全部通过' if fail == 0 else f'{fail} 页需修')
 sys.exit(1 if fail else 0)

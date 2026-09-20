@@ -248,6 +248,50 @@ class IndustryMappingTests(unittest.TestCase):
         self.assertFalse(payload["ok"])
         self.assertEqual(payload["error"]["code"], "industry/no-universe")
 
+    def test_market_uses_the_unified_universe_resolution(self):
+        """``market=`` 复用 ``v3_universe``：配置 watchlists.HK → 标的取 HK 宇宙。"""
+        from server import v3_universe
+
+        v3_universe.clear_cache()
+        with open(os.path.join(self.tmp, "trading-platform.json"), "w", encoding="utf-8") as handle:
+            json.dump({"watchlists": {"HK": ["HK.00700", "HK.00981", "HK.09988"]}}, handle)
+        payload = self._run({
+            "plan": {"ok": True, "value": {"plans": []}},
+            "info_owner_plate": OWNER_PLATE,
+        }, market="HK")
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["market"], "HK")
+        self.assertEqual(payload["universe"], ["HK.00700", "HK.00981", "HK.09988"])
+        self.assertEqual(payload["universe_source"],
+                         "config/trading-platform.json#watchlists.HK")
+        self.assertEqual(payload["sources"]["universe"],
+                         "config/trading-platform.json#watchlists.HK")
+        self.assertIn("市场宇宙等权", payload["sources"]["weights"],
+                      "平台组合里没有该市场标的 → 用该市场宇宙等权（否则暴露恒 0%）")
+        self.assertTrue(any("统一解析" in note for note in payload["notes"]), payload["notes"])
+        self.assertEqual(len(payload["exposures"]), 1, "三只同属银行 → 聚合为 1 条")
+
+    def test_market_without_a_universe_reports_the_real_reason(self):
+        from server import v3_universe
+
+        v3_universe.clear_cache()
+        payload = self._run({
+            "plan": {"ok": True, "value": {"plans": []}},
+            "info_owner_plate": OWNER_PLATE,
+        }, market="US")
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["error"]["code"], "industry/no-universe")
+        self.assertIn("没有 watchlists.US", payload["error"]["message"])
+        self.assertEqual(payload["error"]["market"], "US")
+
+    def test_explicit_tickers_still_win_over_market(self):
+        payload = self._run({
+            "plan": {"ok": True, "value": {"plans": []}},
+            "info_owner_plate": OWNER_PLATE,
+        }, tickers_raw="SH.600000", market="SH")
+        self.assertEqual(payload["universe"], ["SH.600000"])
+        self.assertTrue(any("tickers= 指定" in note for note in payload["notes"]), payload["notes"])
+
     def test_nav_missing_leaves_value_null(self):
         payload = v3_industry.industry_exposure(
             FakeV3Run({"plan": {"ok": True, "value": {"plans": []}},

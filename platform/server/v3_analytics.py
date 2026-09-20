@@ -14,6 +14,12 @@
   * 任何工具/外部失败都转成 ``{ok: false, error: {code, message}}`` 信封，**不抛 500**；
   * 数值一律实测：取不到就 ``null``/错误码 + 说明，**绝不用估算值顶替**；
   * 只读：不下单、不改单、不切模式。策略流水线的产物只是「提案」，执行仍走工作台受约束入口。
+  * **市场口径（2026-09-20）**：``risk/analytics`` / ``factors/matrix`` / ``strategy`` 支持
+    ``market=SH|HK|US``——池子统一来自 ``server.v3_universe.resolve_universe``（配置
+    ``watchlists.<market>`` → 富途真实持仓 ``account_positions``），该市场无宇宙则
+    ``market/no-universe``（不退回全部市场、不发明自选池）。``risk/analytics`` 与
+    ``factors/matrix`` 的路由缺省 ``SH``（保持既有 A 股口径）；``strategy`` 不传 ``market``
+    时不过滤（与历史一致），``POST strategy/run`` 把 ``market`` 记进落盘记录。
 
 接口清单（契约见各 handler docstring；计算口径见 ``server/v3_math.py``）：
 
@@ -40,7 +46,7 @@ from typing import Optional
 from fastapi import Request
 from starlette.responses import JSONResponse
 
-from server import v3_math
+from server import v3_math, v3_universe
 
 __all__ = [
     "STRATEGY_RUNS_FILE",
@@ -52,6 +58,7 @@ __all__ = [
     "register",
     "risk_analytics",
     "strategy_last",
+    "strategy_markets",
     "strategy_run",
 ]
 
@@ -239,8 +246,12 @@ def append_strategy_run(home, run):
     return None
 
 
-def read_last_strategy_run(home):
-    """读最后一轮流水线结果；文件不存在/无有效行 → ``None``（从未运行过）。"""
+def read_last_strategy_run(home, market=None):
+    """读最后一轮流水线结果；文件不存在/无有效行 → ``None``（从未运行过）。
+
+    ``market`` 给定时只认 ``run.market`` 等于该市场的记录（旧记录没有 ``market`` 字段，
+    因此**不会被当成该市场的记录**——调用方用 :func:`strategy_markets` 如实说明有哪些市场）。
+    """
     path = strategy_runs_path(home)
     try:
         text = path.read_text(encoding="utf-8")
@@ -254,9 +265,39 @@ def read_last_strategy_run(home):
             value = json.loads(line)
         except ValueError:
             continue
-        if isinstance(value, dict):
+        if not isinstance(value, dict):
+            continue
+        if market is None:
+            return value
+        label = str(value.get("market") or "").strip().upper()
+        if label == market:
             return value
     return None
+
+
+def strategy_markets(home):
+    """落盘记录里出现过的市场标注（保序、去重；旧记录无标注 → ``None``）。"""
+    path = strategy_runs_path(home)
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return []
+    labels = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            value = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(value, dict):
+            continue
+        label = value.get("market")
+        label = str(label).strip().upper() if label not in (None, "") else None
+        if label not in labels:
+            labels.append(label)
+    return labels
 
 
 # ---------------------------------------------------------------------------
@@ -315,27 +356,68 @@ def _nav_of(envelope):
     return current
 
 
-def _resolve_portfolio(v3_run, home, explicit):
-    """组合定义：显式权重 → 工作台 frozen 多标的计划 → 自选池等权。
+def _resolve_portfolio(v3_run, home, explicit, market=None):
+    """组合定义：显式权重 → 工作台 frozen 多标的计划 → **该市场宇宙** → 自选池等权。
 
-    返回 ``(weights, source)``；无可用定义时 ``(None, 原因)``（调用方转 ``risk/no-portfolio``）。
+    返回 ``(weights, source, universe_source, error_code)``：
+
+      * ``weights`` 为空时 ``source`` 是真实原因，``error_code`` 为 ``None``
+        （``risk/no-portfolio``）或 ``"market/no-universe"``（market 给定但两级来源都空；
+        此时 ``source`` 里带 ``v3_universe`` 的真实原因，供 ``detail`` 用）。
+      * ``market`` 为 ``None``（不传）时行为与历史完全一致（自选池不过滤）。
     """
     if explicit:
-        return dict(explicit), v3_math.SOURCE_EXPLICIT
+        return dict(explicit), v3_math.SOURCE_EXPLICIT, None, None
     envelope = _call(v3_run, "plan", {})
     value = _value_of(envelope) or {}
     plans = value.get("plans")
-    weights, source = v3_math.pick_frozen_plan_weights(plans if isinstance(plans, list) else [])
-    if weights:
-        return weights, source
-    return v3_math.watchlist_equal_weights(read_watchlist(home), WATCHLIST_LIMIT)
+    plans = plans if isinstance(plans, list) else []
+    if market:
+        # 先按市场筛计划：多市场计划并存时，不能因为「第一个 frozen 计划是别的市场」
+        # 就漏掉本市场的计划（预筛后再取首个 frozen，语义与历史一致）
+        scoped = []
+        for plan in plans:
+            target = plan.get("target") if isinstance(plan, dict) else None
+            if not isinstance(target, dict):
+                continue
+            if any(v3_universe.market_of_ticker(ticker) == market for ticker in target):
+                scoped.append(plan)
+        plans = scoped
+    weights, source = v3_math.pick_frozen_plan_weights(plans)
+    if weights and market:
+        filtered = {ticker: weight for ticker, weight in weights.items()
+                    if v3_universe.market_of_ticker(ticker) == market}
+        if len(filtered) >= 2:
+            return filtered, f"{source}（已按 market={market} 过滤）", None, None
+        # 该市场的 frozen 计划不足 2 只 → 继续看该市场宇宙（不把别的市场混进来）
+    elif weights:
+        return weights, source, None, None
+    if market:
+        universe = v3_universe.resolve_universe(v3_run, home, market)
+        if universe is None:
+            detail = v3_universe.universe_note(home, market) or ""
+            return (None, f"该市场没有配置自选池、也没有真实持仓"
+                          + (f"（{detail}）" if detail else ""), None, "market/no-universe")
+        names = list(universe.get("tickers") or [])[:WATCHLIST_LIMIT]
+        equal, equal_source = v3_math.watchlist_equal_weights(names, WATCHLIST_LIMIT)
+        if equal:
+            # 配置自选池时沿用既有文案（portfolioSource 口径不变）；池子来自真实持仓
+            # （没有配置池）时把来源写进文案，避免把持仓宇宙说成「自选池」
+            source_text = str(universe.get("source") or "")
+            if source_text and not source_text.startswith("config/"):
+                equal_source = f"自选池等权（{len(names)} 只，来源 {source_text}）"
+            return equal, equal_source, universe.get("source"), None
+        return (None, f"该市场宇宙为空（market={market}）", universe.get("source"),
+                "market/no-universe")
+    weights, source = v3_math.watchlist_equal_weights(read_watchlist(home), WATCHLIST_LIMIT)
+    return weights, source, None, None
 
 
 # ---------------------------------------------------------------------------
 # 1) GET /api/v3/risk/analytics
 # ---------------------------------------------------------------------------
-def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark="SH.000300",
-                   weights_raw=None):
+def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
+                   weights_raw=None, market=None):
     """组合风险量（可注入 ``v3_run``/``home``，路由只是它的异步外壳）。
 
     契约（与前端既有实现严格一致）::
@@ -352,6 +434,17 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark="SH.00030
     口径：组合 = 显式 ``weights``（JSON）→ 首个 frozen 且标的数 ≥2 的计划 → 自选池等权；
     逐标的 ``series``（period=1d）与基准按交易日对齐（交集、升序）；历史模拟法 VaR/CVaR；
     Beta/Alpha（年化 252）、IR、最大回撤；Kupiec POF。对齐后 <40 个交易日 → ``risk/insufficient``。
+
+    ``market``（``SH``/``HK``/``US``，路由缺省 ``SH``）：组合＝该市场宇宙等权（或该市场的
+    frozen 计划目标），并回显 ``market`` / ``universe_source``；该市场无宇宙 →
+    ``market/no-universe``（含 ``detail`` 写明真实原因，不退回全部市场）。``market=None``
+    时行为与历史一致（自选池不过滤）——函数级缺省保留给既有调用方与单测。
+
+    ``benchmark``（缺省 ``None``）：显式给定时**原样使用**（不按市场改写）；缺省时
+    ``market`` 给定 → 用 ``v3_universe.benchmark_for`` 实测该市场基准（SH.000300 /
+    HK.800000 / US.SPY 首选，逐级降级），``market=None`` → 沿用历史缺省 ``SH.000300``。
+    该市场基准全部不可用 → **不退回 SH.000300**：``benchmark=null`` + ``benchmarkNote``
+    写明候选，beta/alpha/ir 一律 ``null``（绝不拿 A 股基准算港/美股组合）。
     """
     try:
         limit = _clamp_int(limit, 250, 60, 2000)
@@ -360,6 +453,13 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark="SH.00030
             return _error("risk/bad-confidence", f"confidence 需为数值，收到 {confidence!r}")
         if not 0.0 < level < 1.0:
             return _error("risk/bad-confidence", f"confidence 必须在 (0,1) 内，收到 {level}")
+
+        code = None
+        if market is not None:
+            code = v3_universe.normalize_market(market)
+            if code is None:
+                return _error("market/bad-market", "market 需为 SH / HK / US",
+                              market=str(market))
 
         explicit = None
         if weights_raw not in (None, "", {}):
@@ -374,20 +474,52 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark="SH.00030
                 return _error("bad-request", "weights 需为非空 JSON 对象（{标的: 权重}）")
             explicit = {str(key): value for key, value in explicit.items()}
 
-        weights, source = _resolve_portfolio(v3_run, home, explicit)
+        weights, source, universe_source, error_code = _resolve_portfolio(
+            v3_run, home, explicit, code)
         if not weights:
+            if error_code == "market/no-universe":
+                return _error("market/no-universe",
+                              "该市场没有配置自选池、也没有真实持仓",
+                              market=code, detail=source)
             return _error("risk/no-portfolio", source)
         if len(weights) == 1:
             return _error("risk/single-name",
                           f"组合仅 1 个标的（{source}），单标的组合风险量无横截面意义")
 
-        benchmark_ticker = str(benchmark or "").strip() or "SH.000300"
+        # ── 基准：显式 > 该市场实测基准 > 历史缺省（仅 market 未指定时）────────────
+        benchmark_ticker = str(benchmark or "").strip()
+        benchmark_source = None
+        if benchmark_ticker:
+            benchmark_note = (f"基准由请求显式指定：{benchmark_ticker}"
+                              + ("（显式值优先，不按 market 改写）" if code else ""))
+        elif code:
+            resolved = v3_universe.benchmark_for(code, v3_run)
+            if resolved is None:
+                benchmark_ticker = ""
+                benchmark_note = (v3_universe.benchmark_note(code)
+                                  or f"该市场（{code}）基准不可用")
+            else:
+                benchmark_ticker = resolved["ticker"]
+                benchmark_source = resolved.get("source")
+                benchmark_note = resolved.get("note") or f"基准取自 {benchmark_ticker}"
+        else:
+            benchmark_ticker = "SH.000300"
+            benchmark_note = "未指定 market：沿用历史缺省基准 SH.000300"
+
         tickers = list(weights)
         series_map, series_errors, series_sources = _load_series(v3_run, tickers, limit)
-        bench_envelope = _call(v3_run, "series",
-                               {"ticker": benchmark_ticker, "period": "1d", "limit": limit})
-        bench_ok = bool(bench_envelope.get("ok"))
+        bench_envelope = (_call(v3_run, "series",
+                                {"ticker": benchmark_ticker, "period": "1d", "limit": limit})
+                          if benchmark_ticker else None)
+        bench_ok = bool(bench_envelope and bench_envelope.get("ok"))
         bench_bars = _bars_of(bench_envelope) if bench_ok else None
+        if bench_ok and not benchmark_source:
+            value = _value_of(bench_envelope) or {}
+            benchmark_source = value.get("source") if isinstance(value.get("source"), str) else None
+        if not benchmark_ticker:
+            benchmark_note += "；beta/alpha/ir 与 benchmarkAnnReturnPct 一律返回 null（不跨市场兜底）"
+        elif not bench_ok:
+            benchmark_note += f"；该基准取数失败（{_error_message(bench_envelope)}）→ beta/alpha/ir 返回 null"
         nav = _nav_of(_call(v3_run, "equity", {"window": 30}))
 
         analytics = v3_math.portfolio_risk(
@@ -400,10 +532,24 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark="SH.00030
         if analytics.get("error"):
             return _error("risk/insufficient", analytics["error"])
 
+        if bench_ok and analytics.get("beta") is None:
+            # 基准取到了但比值仍为空：基准与组合的交易日没对齐（跨市场基准常见，例如拿
+            # 沪深 300 给港股组合做基准时两地假期不同），或基准收益方差为 0。如实说明，
+            # 不假装算过——口径与 v3_math.portfolio_risk 的实现一致，不改它的契约。
+            window = analytics.get("window") or {}
+            benchmark_note += (f"；基准取数成功但 beta/alpha/ir 仍为 null：基准与组合的交易日"
+                               f"未对齐（组合窗口 {window.get('from')}..{window.get('to')}）"
+                               f"或基准收益方差为 0 → 请按市场选基准，勿跨市场混用")
+
         return {
             "ok": True,
+            "market": code,
+            "universe_source": universe_source,
             "portfolioSource": source,
+            "benchmark": benchmark_ticker or None,
             "benchmarkTicker": benchmark_ticker if bench_ok else None,
+            "benchmarkSource": benchmark_source,
+            "benchmarkNote": benchmark_note,
             "nav": nav,
             "analytics": analytics,
             "sources": {
@@ -415,6 +561,11 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark="SH.00030
                 f"nav 取 equity.current={nav}（本地模拟台账权益，不代表券商资产）"
                 if nav is not None
                 else "nav 取不到：equity 工具失败或 current 非正（响应中 nav=null，未用估算值顶替）"
+            ),
+            "marketNote": (
+                f"组合＝market={code} 宇宙（来源 {universe_source or source}）；"
+                f"基准 {benchmark_ticker or 'null'}（见 benchmarkNote；beta/alpha/ir 与该基准同源）"
+                if code else "未指定 market：组合口径与历史一致（自选池不过滤）"
             ),
         }
     except Exception as error:  # noqa: BLE001 —— 任何内部异常都进信封，绝不 500
@@ -438,7 +589,8 @@ def _factor_ic(v3_run, names, factor, forward_days):
                             fallback_tickers=tickers)
 
 
-def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward_days=5):
+def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward_days=5,
+                        market=None):
     """横截面因子矩阵 + 因子 IC 序列。
 
     契约::
@@ -448,7 +600,10 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
          ic: {ok, factor, forwardDays, tickers, observations, meanIc, stdIc, ir,
               latestIc, points: [{t, ic}]}}
 
-    标的 2..8：请求显式给（取前 8）→ 否则自选池前 6；不足 2 只 → ``factors/too-few``。
+    标的 2..8：请求显式给（取前 8）→ 否则**该市场宇宙**前 6（``market`` 缺省 SH，
+    与 ``/market/watchlist`` 同一份 ``resolve_universe``）→ 不足 2 只 →
+    ``market/no-universe``（该市场无池）或 ``factors/too-few``。
+    显式 ``tickers=`` 优先，此时 ``market`` **只作标注**（不裁剪请求的标的）。
     矩阵值取 ``factors`` 的 ``z``（缺失格 ``null``）；IC 来自 ``ic`` 工具，缺省
     ``factor=mom_20``、``forward=5``。IC 失败**不拖垮矩阵**：``ic.ok=false`` + ``error``。
     """
@@ -458,29 +613,51 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
         factor = str(factor).strip()
         forward_days = _clamp_int(forward_days, 5, 1, 250)
 
+        code = None
+        if market is not None:
+            code = v3_universe.normalize_market(market)
+            if code is None:
+                return _error("market/bad-market", "market 需为 SH / HK / US",
+                              market=str(market))
+
         if isinstance(tickers_raw, (list, tuple)):
             requested = [str(item).strip() for item in tickers_raw]
         else:
             requested = [item.strip() for item in str(tickers_raw or "").split(",")]
         requested = [item for item in requested if item]
 
-        if len(requested) >= 2:
+        universe_source = None
+        explicit_universe = len(requested) >= 2
+        if explicit_universe:
             names = requested[:FACTOR_LIMIT]
+        elif code:
+            universe = v3_universe.resolve_universe(v3_run, home, code)
+            if universe is None:
+                detail = v3_universe.universe_note(home, code) or ""
+                return _error("market/no-universe",
+                              "该市场没有配置自选池、也没有真实持仓",
+                              market=code, detail=detail)
+            universe_source = universe.get("source")
+            names = list(universe.get("tickers") or [])[:FACTOR_DEFAULT_COUNT]
         else:
             names = read_watchlist(home)[:FACTOR_DEFAULT_COUNT]
         if len(names) < 2:
-            return _error("factors/too-few",
-                          "横截面矩阵需要 2..8 个标的（请求未给 tickers，自选池也不足 2 只）")
+            reason = (f"该市场（{code}）宇宙不足 2 只标的" if code and not explicit_universe
+                      else "横截面矩阵需要 2..8 个标的（请求未给 tickers，自选池也不足 2 只）")
+            return _error("factors/too-few", reason, market=code)
 
         envelope = _call(v3_run, "factors", {"tickers": names})
         if not envelope.get("ok"):
-            return {"ok": False, "error": _tool_error(envelope)}
+            return {"ok": False, "error": _tool_error(envelope), "market": code}
         value = _value_of(envelope) or {}
         rows = value.get("rows")
         matrix = v3_math.factor_matrix(rows if isinstance(rows, list) else [])
         # 工具面逐标的的失败原因照样带出去（矩阵里那一行就是空的，原因不能丢）
         matrix["failures"] = value.get("failures") if isinstance(value.get("failures"), dict) else {}
-        return {"ok": True, "matrix": matrix,
+        return {"ok": True, "market": code, "universe_source": universe_source,
+                "market_filter": ("显式 tickers 优先，market 仅作标注" if explicit_universe
+                                  else "标的取该市场宇宙"),
+                "matrix": matrix,
                 "ic": _factor_ic(v3_run, names, factor, forward_days)}
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
@@ -489,12 +666,33 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
 # ---------------------------------------------------------------------------
 # 3) GET /api/v3/strategy + POST /api/v3/strategy/run
 # ---------------------------------------------------------------------------
-def strategy_last(home):
-    """最后一轮流水线：从未运行过 → ``{ok:true, run:null, note:'尚未运行研究流水线'}``。"""
+def strategy_last(home, market=None):
+    """最后一轮流水线：从未运行过 → ``{ok:true, run:null, note:'尚未运行研究流水线'}``。
+
+    ``market`` 给定时只返回该市场的那一轮（``run.market``），并带 ``market`` 与 ``filter``
+    标注；该市场没有记录 → ``run=null`` + 说明**已落盘的市场**（不臆造）。
+    """
     try:
-        run = read_last_strategy_run(home)
+        code = None
+        if market is not None:
+            code = v3_universe.normalize_market(market)
+            if code is None:
+                return _error("market/bad-market", "market 需为 SH / HK / US",
+                              market=str(market))
+        run = read_last_strategy_run(home, market=code)
         if run:
-            return {"ok": True, "run": run}
+            payload = {"ok": True, "run": run}
+            if code:
+                payload["market"] = code
+                payload["filter"] = f"run.market == {code}"
+            return payload
+        if code:
+            available = [label for label in strategy_markets(home) if label]
+            note = (f"market={code} 没有研究流水线记录"
+                    + (f"（已落盘的市场：{'/'.join(available)}）" if available
+                       else "（文件里没有带 market 标注的记录）"))
+            return {"ok": True, "run": None, "market": code,
+                    "filter": f"run.market == {code}", "note": note}
         return {"ok": True, "run": None, "note": "尚未运行研究流水线"}
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
@@ -574,6 +772,10 @@ def strategy_run(v3_run, home, payload=None):
     **不下单**：PET 产物是「调仓建议提案」（``action_hint`` 明确执行走工作台受约束入口），
     并且只写 ``<home>/v3-strategy-runs.jsonl``。
 
+    ``payload.market``（``SH``/``HK``/``US``）：未给 ``universe`` 时 universe 取该市场宇宙
+    （``resolve_universe``），并把 ``market`` 与 ``universe_source`` 记进 run（响应与落盘
+    都带）；该市场无宇宙 → ``market/no-universe``。未传 ``market`` 时行为与历史一致。
+
     与参考实现 ``pipeline.mjs`` 的有意差异（各一处，均为修掉会自相矛盾的边界）：
       1. ``reduces`` 在 ``len(ranked) <= topN`` 时取**空**（参考实现 ``slice(-0)`` 会退化成
          ``slice(0)``，把刚判为「增持」的标的又列进「减持」）；
@@ -584,6 +786,14 @@ def strategy_run(v3_run, home, payload=None):
         top_n = _clamp_int(payload.get("topN"), 2, 1, 50)
         window = _clamp_int(payload.get("window"), 20, 1, 500)
 
+        code = None
+        raw_market = payload.get("market")
+        if raw_market not in (None, ""):
+            code = v3_universe.normalize_market(raw_market)
+            if code is None:
+                return _error("market/bad-market", "market 需为 SH / HK / US",
+                              market=str(raw_market))
+
         raw_universe = payload.get("universe")
         if isinstance(raw_universe, (list, tuple)):
             universe = [str(item).strip() for item in raw_universe if str(item or "").strip()]
@@ -591,6 +801,16 @@ def strategy_run(v3_run, home, payload=None):
             universe = [item.strip() for item in raw_universe.split(",") if item.strip()]
         else:
             universe = []
+        universe_source = None
+        if not universe and code:
+            resolved = v3_universe.resolve_universe(v3_run, home, code)
+            if resolved is None:
+                detail = v3_universe.universe_note(home, code) or ""
+                return _error("market/no-universe",
+                              "该市场没有配置自选池、也没有真实持仓",
+                              market=code, detail=detail)
+            universe = list(resolved.get("tickers") or [])
+            universe_source = resolved.get("source")
         universe_list = (universe or read_watchlist(home))[:FACTOR_LIMIT]
         if not universe_list:
             return _error("strategy/no-universe",
@@ -655,10 +875,12 @@ def strategy_run(v3_run, home, payload=None):
             })
         stages["PET"] = {"proposals": len(proposals)}
 
-        summary = {"asOf": as_of, "universe": universe_list, "stages": stages,
+        summary = {"asOf": as_of, "universe": universe_list, "market": code,
+                   "universe_source": universe_source, "stages": stages,
                    "proposals": proposals}
         persist_error = append_strategy_run(home, summary)
-        result = {"ok": True, "run": summary}
+        result = {"ok": True, "run": summary, "market": code,
+                  "universe_source": universe_source}
         if persist_error:
             result["persistError"] = persist_error
             result["note"] = "流水线已完成，但结果落盘失败（GET /api/v3/strategy 可能读不到这一轮）"
@@ -670,20 +892,41 @@ def strategy_run(v3_run, home, payload=None):
 # ---------------------------------------------------------------------------
 # 4) GET /api/v3/ml/sweep
 # ---------------------------------------------------------------------------
+def _market_label(ticker, market=None):
+    """单标的端点的 ``market`` 回显：显式请求参数优先，否则取标的自身的市场前缀。
+
+    返回 ``(code|None, note)``——这两个端点是**单标的**口径，market 只作标注（不改变取数）。
+    """
+    raw = "" if market is None else str(market).strip()
+    if raw:
+        code = v3_universe.normalize_market(raw)
+        if code is None:
+            return None, "market 需为 SH / HK / US"
+        return code, f"market={code} 由请求参数回显（单标的端点，market 只作标注，不改变取数）"
+    code = v3_universe.market_of_ticker(ticker)
+    if code:
+        return code, f"market={code} 取目标的市场前缀（单标的端点，market 只作标注）"
+    return None, "market 无法判定（标的没有市场前缀，且请求未给 market）——如实留空，不猜"
+
+
 def ml_sweep(v3_run, ticker="SH.600519", windows_raw="10,20,30,60",
-             rebalance_raw="5,10,20", limit=500):
+             rebalance_raw="5,10,20", limit=500, market=None):
     """参数扫描网格。
 
     契约::
 
-        {ok, ticker, grid: [{window, rebalanceDays, sharpe, annReturnPct,
+        {ok, ticker, market, marketNote, grid: [{window, rebalanceDays, sharpe, annReturnPct,
                              maxDrawdownPct, error?}], best: {...} | null}
 
     ``best`` = Sharpe 最大的**有效**格；全失败 → ``null``。取不到 K 线 → 上游错误信封。
+    ``market`` 只作标注（另加 ``market``/``marketNote``，不改既有字段）。
     """
     try:
         ticker = str(ticker or "").strip() or "SH.600519"
         limit = _clamp_int(limit, 500, 60, 2000)
+        code, market_note = _market_label(ticker, market)
+        if market is not None and str(market).strip() and code is None:
+            return _error("market/bad-market", "market 需为 SH / HK / US", market=str(market))
         windows = _int_list(windows_raw, (10, 20, 30, 60), 1, 500, 8)
         rebalance = _int_list(rebalance_raw, (5, 10, 20), 1, 500, 8)
         if not windows or not rebalance:
@@ -692,9 +935,10 @@ def ml_sweep(v3_run, ticker="SH.600519", windows_raw="10,20,30,60",
         envelope = _call(v3_run, "series",
                          {"ticker": ticker, "period": "1d", "limit": limit})
         if not envelope.get("ok"):
-            return {"ok": False, "error": _tool_error(envelope)}
+            return {"ok": False, "error": _tool_error(envelope), "market": code}
         result = v3_math.param_sweep(_bars_of(envelope), windows, rebalance)
-        return {"ok": True, "ticker": ticker, **result}
+        return {"ok": True, "ticker": ticker, "market": code, "marketNote": market_note,
+                **result}
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
 
@@ -707,17 +951,24 @@ def ml_backtest(v3_run, payload=None):
 
     契约::
 
-        {ok, ticker, metrics: {sharpe, annReturnPct, maxDrawdownPct, signalFlips,
-                               heldDays, flatDays, days, winRatePct},
+        {ok, ticker, market, marketNote,
+         metrics: {sharpe, annReturnPct, maxDrawdownPct, signalFlips,
+                   heldDays, flatDays, days, winRatePct},
          equity: [{t, value}]}
 
     指标按**持仓日**基准（空仓日不计入胜率）；数据不足 → ``backtest/insufficient``。
+    ``payload.market``（或查询参数）只作标注：显式给出即回显，否则取标的的市场前缀
+    （单标的端点，不改取数口径）。
     """
     try:
         payload = payload if isinstance(payload, dict) else {}
         ticker = str(payload.get("ticker") or "").strip()
         if not ticker:
             return _error("bad-request", "ticker 必填")
+        raw_market = payload.get("market")
+        code, market_note = _market_label(ticker, raw_market)
+        if raw_market is not None and str(raw_market).strip() and code is None:
+            return _error("market/bad-market", "market 需为 SH / HK / US", market=str(raw_market))
         limit = _clamp_int(payload.get("limit"), 500, 60, 2000)
         window = _clamp_int(payload.get("window"), 20, 1, 500)
         rebalance_days = _clamp_int(payload.get("rebalanceDays"), 5, 1, 500)
@@ -725,12 +976,12 @@ def ml_backtest(v3_run, payload=None):
         envelope = _call(v3_run, "series",
                          {"ticker": ticker, "period": "1d", "limit": limit})
         if not envelope.get("ok"):
-            return {"ok": False, "error": _tool_error(envelope)}
+            return {"ok": False, "error": _tool_error(envelope), "market": code}
         result = v3_math.backtest_momentum(_bars_of(envelope), window, rebalance_days)
         if result.get("error"):
-            return _error("backtest/insufficient", result["error"])
-        return {"ok": True, "ticker": ticker, "metrics": result["metrics"],
-                "equity": result["equity"]}
+            return _error("backtest/insufficient", result["error"], market=code)
+        return {"ok": True, "ticker": ticker, "market": code, "marketNote": market_note,
+                "metrics": result["metrics"], "equity": result["equity"]}
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
 
@@ -752,32 +1003,46 @@ def register(app, v3_run, home):
 
     @app.get("/api/v3/risk/analytics")
     async def v3_risk_analytics(limit: int = 250, confidence: float = 0.95,
-                                benchmark: str = "SH.000300",
-                                weights: Optional[str] = None):
-        """组合风险量：history-simulation VaR/CVaR + Beta/Alpha/IR + Kupiec POF + 净值曲线。"""
+                                benchmark: Optional[str] = None,
+                                weights: Optional[str] = None, market: str = "SH"):
+        """组合风险量：history-simulation VaR/CVaR + Beta/Alpha/IR + Kupiec POF + 净值曲线。
+
+        ``market`` 缺省 ``SH``（保持既有 A 股口径）；组合＝该市场宇宙等权（或该市场
+        frozen 计划目标）；该市场无宇宙 → ``market/no-universe``。``benchmark`` 缺省
+        按市场实测选取（SH.000300 / HK.800000 / US.SPY，逐级降级；全不可用 → null 且
+        beta/alpha/ir 为 null）；显式给出时原样使用。
+        """
         def work():
             return risk_analytics(v3_run, home, limit=limit, confidence=confidence,
-                                  benchmark=benchmark, weights_raw=weights)
+                                  benchmark=benchmark, weights_raw=weights, market=market)
 
         return _ok(await asyncio.to_thread(work))
 
     @app.get("/api/v3/factors/matrix")
     async def v3_factors_matrix(tickers: Optional[str] = None, factor: str = "mom_20",
                                 forward_days: Optional[int] = None,
-                                forward: Optional[int] = None):
-        """横截面因子 z 矩阵 + 因子 IC 序列（``forward`` 与 ``forward_days`` 都接受，缺省 5）。"""
+                                forward: Optional[int] = None, market: str = "SH"):
+        """横截面因子 z 矩阵 + 因子 IC 序列（``forward`` 与 ``forward_days`` 都接受，缺省 5）。
+
+        ``market`` 缺省 ``SH``：未给 ``tickers`` 时标的取该市场宇宙（与 watchlist 同一份
+        解析）；显式 ``tickers`` 优先（此时 ``market`` 仅作标注）。
+        """
         chosen_forward = forward if forward is not None else forward_days
 
         def work():
             return factors_matrix_data(v3_run, home, tickers_raw=tickers, factor=factor,
-                                       forward_days=chosen_forward if chosen_forward is not None else 5)
+                                       forward_days=chosen_forward if chosen_forward is not None else 5,
+                                       market=market)
 
         return _ok(await asyncio.to_thread(work))
 
     @app.get("/api/v3/strategy")
-    async def v3_strategy_show():
-        """最近一轮研究流水线（从未运行过 → ``run=null`` + 说明）。"""
-        return _ok(await asyncio.to_thread(strategy_last, home))
+    async def v3_strategy_show(market: str = ""):
+        """最近一轮研究流水线（从未运行过 → ``run=null`` + 说明）。
+
+        ``market`` 缺省不下过滤（与历史一致：返回最后一条记录）；给了就只返回该市场那轮。
+        """
+        return _ok(await asyncio.to_thread(strategy_last, home, market or None))
 
     @app.post("/api/v3/strategy/run")
     async def v3_strategy_run(request: Request):
@@ -789,18 +1054,28 @@ def register(app, v3_run, home):
 
     @app.get("/api/v3/ml/sweep")
     async def v3_ml_sweep(ticker: str = "SH.600519", windows: str = "10,20,30,60",
-                          rebalance: str = "5,10,20", limit: int = 500):
-        """动量策略参数网格（真实日 K 回测），``best`` 取 Sharpe 最大的有效格。"""
+                          rebalance: str = "5,10,20", limit: int = 500, market: str = ""):
+        """动量策略参数网格（真实日 K 回测），``best`` 取 Sharpe 最大的有效格。
+
+        ``market`` 只作标注/回显（单标的端点，不改取数口径）。
+        """
         def work():
             return ml_sweep(v3_run, ticker=ticker, windows_raw=windows,
-                            rebalance_raw=rebalance, limit=limit)
+                            rebalance_raw=rebalance, limit=limit,
+                            market=market or None)
 
         return _ok(await asyncio.to_thread(work))
 
     @app.post("/api/v3/ml/backtest")
     async def v3_ml_backtest(request: Request):
-        """单标的动量 long/flat 回测（PIT）；数据不足 → ``backtest/insufficient``。"""
+        """单标的动量 long/flat 回测（PIT）；数据不足 → ``backtest/insufficient``。
+
+        ``market`` 可来自查询参数或请求体，仅作标注/回显。
+        """
         payload = await _read_json_body(request)
         if payload is None:
             return _ok(_error("bad-request", "请求体需为合法 JSON 对象（ticker/window/rebalanceDays/limit）"))
+        query_market = (request.query_params.get("market") or "").strip()
+        if query_market and not str(payload.get("market") or "").strip():
+            payload = {**payload, "market": query_market}
         return _ok(await asyncio.to_thread(ml_backtest, v3_run, payload))

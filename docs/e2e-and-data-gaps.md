@@ -158,3 +158,63 @@ bash platform/tools/verify_pages.sh http://127.0.0.1:8397
 cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests   # 246 OK
 cd .. && node --test tests/*.test.mjs && cd platform/web-pro && npm test        # 73 / 188
 ```
+
+---
+
+# 第三轮：后端市场过滤（`?market=SH|HK|US`）+ 分市场基准（2026-09-20 深夜）
+
+## 一、市场宇宙与过滤（`server/v3_universe.py`）
+
+- 池子优先级（**都是真实来源**）：`<home>/trading-platform.json` 的 `watchlists.<market>` →
+  旧的顶层 `watchlist`（＝A 股口径，**仍按市场过滤**）→ 富途真实持仓 `positions`
+  （数值 `market_id` 1=HK/3=A股/100=US，与 `trading_datasource.market_ids` 同一常量；
+  未登记的 9/10/11/12/13/16 一律不猜、排除并计数）→ 都空 → `None` → 端点回
+  `market/no-universe`（含 `detail` 写明真实原因，不退回全部市场）。
+- 标的归一用 `trading_datasource.market.to_futu_symbol`：实测把持仓裸代码正确归为
+  `HK.00100` / `SH.603993` / `SZ.002475`（A 股按首位分 SH/SZ/BJ；否则 `series` 取不到数）。
+- 进程内 TTL 缓存（`QUOTE_UNIVERSE_TTL_MS`，缺省 60s；失败用更短的负面 TTL），
+  避免密集调用触发富途 `-12006`（HTTP 403）。
+- 逐端点语义与实测见 `docs/v3-integration.md`；探针 `platform/tools/e2e_probe.py --markets SH,HK,US`
+  已加入 watchlist / factors/matrix / risk/analytics / execution / research / risk/industry 六个带
+  `market=` 的步骤，并**核对返回条数与市场一致**（为空必须带真实原因，否则记 `probe/market-scope` 失败）。
+
+## 二、各市场基准与降级（`v3_universe.benchmark_for`）
+
+背景：`risk/analytics` 的 beta/alpha/IR 原来固定用 `SH.000300`，给港/美股组合算会得出误导性结论。
+现在 `?market=` 时按市场**实测探测**基准，候选逐个用 `series` 试（同一份 TTL 缓存）。
+
+候选实测（2026-09-20，`futu/quote_history_kline`，30 根日 K）：
+
+| 候选 | 结果 | 说明 |
+|---|---|---|
+| `SH.000300` | ✅ 30 根 | 沪深 300（A 股唯一候选） |
+| `HK.800000` | ✅ 30 根 | 恒生指数（HK 首选） |
+| `HK.800700` | ✅ 30 根 | 恒生科技指数（HK 降级 1） |
+| `HK.02800` | ✅ 30 根 | 盈富基金 ETF（HK 降级 2） |
+| `US.SPY` | ✅ 30 根 | 标普 500 ETF（US 首选；与仓库 `market.INDEX_SYMBOLS.sp500_proxy` 同源） |
+| `US..IXIC` | ✅ 30 根 | 纳斯达克综合（**双点**写法，US 降级 1） |
+| `US.QQQ` | ✅ 30 根 | 纳指 100 ETF（US 降级 2） |
+| `US..DJI` | ✅ 30 根 | 道琼斯（双点写法，US 降级 3） |
+| `US.SPX` | ❌ `errcode=-7 invalid symbol` | 富途不认（单发复测仍是 -7，**不是**频控） |
+| `US.NDX` | ❌ `errcode=-7 invalid symbol` | 同上 |
+| `US.DJI` | ❌ `errcode=-7 invalid symbol` | 单点写法无效；要双点 `US..DJI` |
+
+最终 `BENCHMARKS`：
+
+```python
+BENCHMARKS = {
+    "SH": ("SH.000300",),
+    "HK": ("HK.800000", "HK.800700", "HK.02800"),
+    "US": ("US.SPY", "US..IXIC", "US.QQQ", "US..DJI"),
+}
+```
+
+- `risk/analytics?market=` 响应新增 `benchmark`（实际使用的代码）、`benchmarkSource`
+  （`futu/quote_history_kline` 等）、`benchmarkNote`（为何选它/为何不可用，含失败候选原文）；
+  beta/alpha/IR 与该基准**同源**。
+- 该市场候选**全部不可用 → `benchmark=null`** + `benchmarkNote` 列出候选与失败原因，
+  同时 `beta`/`alphaAnnPct`/`ir`/`benchmarkAnnReturnPct` 一律 `null`——**不拿 A 股基准硬算**。
+- 显式传 `benchmark=` 时原样使用，不做市场改写。
+- 不传 `market` 时沿用历史缺省 `SH.000300`（既有行为不变）。
+- `ml/sweep`、`ml/backtest` 加 `market` 回显（显式参数优先，否则取标的的市场前缀；单标的端点，
+  只作标注，不改取数口径）。

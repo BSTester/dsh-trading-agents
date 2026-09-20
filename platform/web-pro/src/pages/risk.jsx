@@ -17,6 +17,7 @@ import {
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { useV3, fmt, noSourceText } from "../services/api.js";
+import { MarketNote, envelopeError, marketLabel, marketTicker, useMarket } from "../services/marketContext.jsx";
 import { LineChart, BarList } from "../components/charts.jsx";
 
 const { Text, Link } = Typography;
@@ -52,14 +53,10 @@ const OK = (env) => Boolean(env && env.ok);
 const fin = (value) => Number.isFinite(Number(value));
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
-/** 取数失败原因：HTTP 非 2xx（error）与 HTTP 200 的 ok:false 信封都取服务端 code/message 原文。 */
+/** 取数失败原因：HTTP 非 2xx（error）与 HTTP 200 的 ok:false 信封都取服务端 code/message 原文，
+ *  并在有 error.detail 时追加「真实原因」（统一口径见 services/marketContext.jsx 的 envelopeError）。 */
 function envError(env, fallback) {
-  const error = (env && env.error) || {};
-  const code = error.code ? String(error.code) : "";
-  const message = error.message ? String(error.message) : "";
-  if (code || message) return code ? `${code}：${message || fallback || "请求失败"}` : message;
-  if (env && env.ok === false) return fallback || "接口返回 ok:false 但未给出 error.code/message";
-  return fallback || "接口未返回 error.code/message";
+  return envelopeError(env, fallback || "接口未返回 error.code/message");
 }
 
 /** 负号统一为 U+2212（与设计稿版同一字形口径）。 */
@@ -102,6 +99,7 @@ const industryMappingRows = (env) => {
 
 /** 行业暴露与集中度（BarList + Top + 上限/breach + 映射明细 + missing）。 */
 function IndustryExposureCard({ env }) {
+  const { market } = useMarket();
   const ready = OK(env);
   const rows = industryExposureRows(env);
   const mappingRows = industryMappingRows(env);
@@ -132,7 +130,10 @@ function IndustryExposureCard({ env }) {
   return (
     <Space direction="vertical" size={10} style={{ width: "100%" }}>
       {!ready ? (
-        <NoSource what="行业暴露" why={envError(env, "GET /api/v3/risk/industry 取不到（板块映射或组合权重缺失）")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what={`${marketLabel(market)} 行业暴露`} why={envError(env, `GET /api/v3/risk/industry?market=${market} 取不到（该市场无自选池/无持仓时服务端返回 industry/no-universe；板块映射或组合权重缺失）`)} />
+          <MarketNote source={`GET /api/v3/risk/industry?limit_pct=20&market=${market}`} extra="行业暴露按市场过滤，不跨市场合并" />
+        </Space>
       ) : (
         <>
           <Space size={8} wrap>
@@ -217,6 +218,7 @@ function IndustryExposureCard({ env }) {
               { key: "breach", label: "超限判定 breach", children: breach ? <Tag color="red">true（已超限）</Tag> : <Tag color="green">false（未超限）</Tag> },
             ]}
           />
+          <MarketNote source={`GET /api/v3/risk/industry?limit_pct=20&market=${market}`} asOf={env.as_of} extra={`行业暴露按 market=${market} 过滤，不跨市场合并`} style={{ display: "block" }} />
         </>
       )}
     </Space>
@@ -268,11 +270,20 @@ function positionSummary(positions) {
 
 /* ── ① 指标卡 5 张 ──────────────────────────────────────────────────────── */
 function MetricCards({ env }) {
+  const { market } = useMarket();
   const analytics = OK(env) ? env.analytics : null;
+  // 组合来源 / universe_source：接口返回什么就显示什么（缺失写「未返回」，不臆测）
+  const universeSource =
+    (env && (env.universeSource || env.universe_source)) ||
+    (analytics && (analytics.universeSource || analytics.universe_source)) ||
+    null;
   if (!analytics) {
     return (
       <ProCard title="组合风险量（VaR / CVaR / Beta / Alpha / IR）" bordered>
-        <NoSource what="组合风险量" why={envError(env, "GET /api/v3/risk/analytics 取不到（口径：自选池等权组合，需 ≥40 个对齐交易日）")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="组合风险量" why={envError(env, `GET /api/v3/risk/analytics?market=${market} 取不到（该市场无自选池/无持仓时服务端返回 market/no-universe；口径：市场内等权组合，需 ≥40 个对齐交易日）`)} />
+          <MarketNote source={`GET /api/v3/risk/analytics?limit=250&market=${market}`} extra="组合口径随市场，不跨市场合并" />
+        </Space>
       </ProCard>
     );
   }
@@ -334,7 +345,7 @@ function MetricCards({ env }) {
         <Space size={8} wrap>
           <Tag color="blue">阈值源 /api/v3/risk</Tag>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            组合口径「{env.portfolioSource || "—"}」· 区间 {day(analytics.window && analytics.window.from)} → {day(analytics.window && analytics.window.to)} · {obs === null ? "—" : obs} 个交易日
+            组合口径「{env.portfolioSource || "—"}」· universe_source {universeSource || "接口未返回"} · 区间 {day(analytics.window && analytics.window.from)} → {day(analytics.window && analytics.window.to)} · {obs === null ? "—" : obs} 个交易日
           </Text>
         </Space>
       }
@@ -366,12 +377,18 @@ function MetricCards({ env }) {
           </Text>
         }
       />
+      <MarketNote
+        source={`GET /api/v3/risk/analytics?limit=250&market=${market}`}
+        extra={`组合口径「${env.portfolioSource || "—"}」· universe_source ${universeSource || "接口未返回"}（市场内组合，不跨市场合并）`}
+        style={{ display: "block", marginTop: 8 }}
+      />
     </ProCard>
   );
 }
 
 /* ── ② 三栏：事前 / 事中 / 事后 ─────────────────────────────────────────── */
 function PreTradeCard({ riskEnv, orders, nav, analytics, positions, industryEnv }) {
+  const { market } = useMarket();
   const config = OK(riskEnv) && riskEnv.data ? (riskEnv.data.config || {}) : null;
   if (!config) {
     return (
@@ -480,11 +497,17 @@ function PreTradeCard({ riskEnv, orders, nav, analytics, positions, industryEnv 
         校验 <Text strong>{orders.length}</Text> 单 · 超单笔上限退回人工 <Text strong>{manual}</Text> 单
         {over ? ` · 硬阻断 ${over} 单` : " · 硬阻断 0 单"} · 阈值 5 项 · source {source}
       </Text>
+      <MarketNote
+        source={`GET /api/v3/risk/industry?market=${market} + GET /api/v3/oms/orders?market=${market}`}
+        extra="台账与行业暴露均按市场口径（不跨市场合并）"
+        style={{ display: "block", marginTop: 6 }}
+      />
     </ProCard>
   );
 }
 
 function LiveCard({ analytics, audit, events }) {
+  const { market } = useMarket();
   const stats = analytics ? curveStats(analytics.equityCurve) : null;
   const rows = [];
   for (const entry of asArray(audit).slice(0, 6)) {
@@ -547,11 +570,16 @@ function LiveCard({ analytics, audit, events }) {
           ? <NoSource what="事中事件流" why="审计链与公开披露事件窗口内均无记录" />
           : <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={rows} scroll={{ x: 600 }} />}
       </div>
+      <MarketNote
+        source={`GET /api/v3/risk/analytics?market=${market}（组合读数）· GET /api/v3/events?ticker=该市场标的（公开披露）`}
+        style={{ display: "block", marginTop: 6 }}
+      />
     </ProCard>
   );
 }
 
 function PostTradeCard({ env }) {
+  const { market } = useMarket();
   const analytics = OK(env) ? env.analytics : null;
   const stats = analytics ? curveStats(analytics.equityCurve) : null;
   const kupiec = analytics && analytics.kupiec ? analytics.kupiec : null;
@@ -571,7 +599,10 @@ function PostTradeCard({ env }) {
       style={{ height: "100%" }}
     >
       {!analytics ? (
-        <NoSource what="事后风控" why={envError(env, "GET /api/v3/risk/analytics 取不到（需 ≥40 个对齐交易日）")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what={`${marketLabel(market)} 事后风控`} why={envError(env, `GET /api/v3/risk/analytics?market=${market} 取不到（该市场无池子/无持仓时返回 market/no-universe；需 ≥40 个对齐交易日）`)} />
+          <MarketNote source={`GET /api/v3/risk/analytics?limit=250&market=${market}`} />
+        </Space>
       ) : (
         <Space direction="vertical" size={10} style={{ width: "100%" }}>
           {!kupiec ? (
@@ -624,6 +655,7 @@ function PostTradeCard({ env }) {
               { key: "bench", label: "基准", children: `${analytics.benchmarkTicker || env.benchmarkTicker || "—"} · 基准年化 ${spct(analytics.benchmarkAnnReturnPct, 2)}` },
             ]}
           />
+          <MarketNote source={`GET /api/v3/risk/analytics?limit=250&market=${market}`} extra={`组合口径「${analytics.portfolioSource || "—"}」· 基准 ${analytics.benchmarkTicker || env.benchmarkTicker || "—"}`} style={{ display: "block" }} />
         </Space>
       )}
     </ProCard>
@@ -632,6 +664,7 @@ function PostTradeCard({ env }) {
 
 /* ── ③ 暴露与集中度 ─────────────────────────────────────────────────────── */
 function ExposureCard({ env, riskEnv, ordersEnv, industryEnv }) {
+  const { market } = useMarket();
   const analytics = OK(env) ? env.analytics : null;
   const config = OK(riskEnv) && riskEnv.data ? (riskEnv.data.config || {}) : null;
   const cap = config && fin(config.max_position_pct) ? Number(config.max_position_pct) * 100 : null;
@@ -692,12 +725,18 @@ function ExposureCard({ env, riskEnv, ordersEnv, industryEnv }) {
           </Text>
         }
       />
+      <MarketNote
+        source={`GET /api/v3/risk/analytics?market=${market}（单票集中度）· GET /api/v3/risk/industry?market=${market}（行业暴露）`}
+        extra={`组合口径「${(analytics && analytics.portfolioSource) || "组合口径未知"}」· 按市场过滤，不跨市场合并`}
+        style={{ display: "block", marginTop: 8 }}
+      />
     </ProCard>
   );
 }
 
 /* ── ④ 净值/回撤曲线 ───────────────────────────────────────────────────── */
 function CurveCard({ env }) {
+  const { market } = useMarket();
   const analytics = OK(env) ? env.analytics : null;
   const stats = analytics ? curveStats(analytics.equityCurve) : null;
   const values = stats ? stats.points.map((point) => point.v * 100) : [];
@@ -717,9 +756,15 @@ function CurveCard({ env }) {
       }
     >
       {!analytics ? (
-        <NoSource what="组合净值曲线" why={envError(env, "GET /api/v3/risk/analytics 取不到（对齐后 <40 个交易日）")} />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what={`${marketLabel(market)} 组合净值曲线`} why={envError(env, `GET /api/v3/risk/analytics?market=${market} 取不到（该市场无池子/无持仓时返回 market/no-universe；对齐后 <40 个交易日同样取不到）`)} />
+          <MarketNote source={`GET /api/v3/risk/analytics?limit=250&market=${market}`} />
+        </Space>
       ) : !stats ? (
-        <NoSource what="组合净值曲线" why="/api/v3/risk/analytics.equityCurve 取不到（对齐后 <40 个交易日）" />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what={`${marketLabel(market)} 组合净值曲线`} why={`GET /api/v3/risk/analytics?market=${market} 的 equityCurve 取不到（对齐后 <40 个交易日）`} />
+          <MarketNote source={`GET /api/v3/risk/analytics?limit=250&market=${market}`} />
+        </Space>
       ) : (
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
           <LineChart values={values} height={220} labels={[day(stats.first.t), day(stats.last.t)]}
@@ -729,6 +774,7 @@ function CurveCard({ env }) {
             区间最大回撤 {pct(analytics.maxDrawdownPct)}（峰值 {day(stats.peakAt.t)}，谷底 {day(stats.trough.t)}）。
             工作台未提供逐日回撤序列与阈值触发事件，故不绘制阈值线与触发点。
           </Text>
+          <MarketNote source={`GET /api/v3/risk/analytics?limit=250&market=${market}`} extra={`组合口径「${analytics.portfolioSource || "—"}」`} />
         </Space>
       )}
     </ProCard>
@@ -737,6 +783,7 @@ function CurveCard({ env }) {
 
 /* ── ⑤ 风控规则表 ───────────────────────────────────────────────────────── */
 function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
+  const { market } = useMarket();
   const config = OK(riskEnv) && riskEnv.data ? (riskEnv.data.config || {}) : null;
   const analytics = OK(env) ? env.analytics : null;
   if (!config) {
@@ -850,6 +897,10 @@ function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
           阈值来自交易平台风控配置（{source}），带「无数据源」的当前值表示工具面确实没有对应读数，不用估算值顶替；
           本控制台不提供规则编辑入口——阈值修改只经工作台受约束入口并留审计痕迹。本台账 {orders.length} 单中 {hit} 单未自动放行。
         </Text>
+        <MarketNote
+          source={`GET /api/v3/risk（阈值配置，全局）· 当前值取自 market=${market} 的组合读数与台账`}
+          extra="阈值本身是平台级配置；「当前值」列按当前市场计算"
+        />
       </Space>
     </ProCard>
   );
@@ -857,6 +908,7 @@ function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
 
 /* ── ⑥ 阻断记录 ─────────────────────────────────────────────────────────── */
 function BlocksCard({ orders }) {
+  const { market } = useMarket();
   const rows = orders
     .filter((order) => (order.risk && order.risk.action !== "auto") || ["blocked", "manual", "rejected"].includes(String(order.stage)))
     .slice()
@@ -885,7 +937,10 @@ function BlocksCard({ orders }) {
       extra={<Text type="secondary" style={{ fontSize: 12 }}>台账 {rows.length} 条 · 硬阻断 {blocked} 条 · 已拒绝 {rejected} 条 · 全量留痕</Text>}
     >
       {rows.length === 0 ? (
-        <NoSource what="阻断/退回记录" why="OMS 台账无 blocked/rejected 阶段订单（本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders 台账为准）" />
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what={`${marketLabel(market)} 阻断/退回记录`} why={`当前市场（market=${market}）的 OMS 台账无 blocked/rejected 阶段订单（本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders?market=${market} 台账为准）`} />
+          <MarketNote source={`GET /api/v3/oms/orders?market=${market}`} extra="跨市场不合并：其他市场的阻断记录不在此列出" />
+        </Space>
       ) : (
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
           <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={data} scroll={{ x: 900 }} />
@@ -893,6 +948,7 @@ function BlocksCard({ orders }) {
             口径：stage 为 manual/blocked/rejected 的订单（当前台账 {rows.length} 单；manual＝超单笔上限退回人工确认）。
             本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders 台账为准。
           </Text>
+          <MarketNote source={`GET /api/v3/oms/orders?market=${market}`} extra={`该市场台账 ${rows.length} 条（跨市场不合并）`} />
         </Space>
       )}
     </ProCard>
@@ -924,14 +980,16 @@ function NoSourceCard() {
 
 /* ── 页面 ───────────────────────────────────────────────────────────────── */
 export default function 风险监控Page() {
-  const analytics = useV3("risk/analytics", { limit: 250 });
+  const { market } = useMarket();
+  // 组合口径随市场：组合风险量 / 行业暴露 / 持仓来源都显式带 market（后端缺省值各不相同，绝不靠默认）
+  const analytics = useV3("risk/analytics", { limit: 250, market });
   const risk = useV3("risk", {});
-  const ordersEnv = useV3("oms/orders", {});
-  const execution = useV3("execution", {});
+  const ordersEnv = useV3("oms/orders", { market });
+  const execution = useV3("execution", { market });
   const audit = useV3("audit", { window: 120 });
-  const strategy = useV3("strategy", {});
-  // 行业暴露与集中度：只读 GET；limit_pct=20 为单一行业暴露红线（与风控页红线口径一致）。
-  const industry = useV3("risk/industry", { limit_pct: 20 });
+  const strategy = useV3("strategy", { market });
+  // 行业暴露与集中度：只读 GET；limit_pct=20 为单一行业暴露红线（与风控页红线口径一致），按市场过滤。
+  const industry = useV3("risk/industry", { limit_pct: 20, market });
 
   const orders = OK(ordersEnv.value) && Array.isArray(ordersEnv.value.orders) ? ordersEnv.value.orders : [];
   const nav = OK(analytics.value) && fin(analytics.value.nav)
@@ -939,22 +997,31 @@ export default function 风险监控Page() {
     : (OK(ordersEnv.value) && fin(ordersEnv.value.nav) ? Number(ordersEnv.value.nav) : null);
   const positions = OK(execution.value) ? execution.value.positions : null;
   const universe = OK(strategy.value) ? asArray((strategy.value.run || {}).universe) : [];
-  const eventsTicker = universe.length ? String(universe[0]) : "SH.600000";
+  // 事件标的跟随市场：该市场无落盘研究轮时退回该市场默认标的（真实代码），不落到别的市场
+  const eventsTicker = universe.length ? String(universe[0]) : marketTicker(market);
   const events = useV3("events", { ticker: eventsTicker, window: 180 });
   const auditEntries = OK(audit.value) && audit.value.data ? asArray(audit.value.data.entries) : [];
   const eventRows = OK(events.value) && events.value.data ? asArray(events.value.data.events) : [];
   const mode = (positions && positions.mode) || "sim";
+  const universeSource =
+    (OK(analytics.value) && (analytics.value.universeSource || analytics.value.universe_source)) ||
+    (OK(strategy.value) && (strategy.value.universeSource || strategy.value.universe_source)) ||
+    null;
 
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
       <Alert
         type="info"
         showIcon
-        message={`风险监控 · ${String(mode).toUpperCase()} 环境 · 数据全部来自本服务 /api/v3/* 实时接口`}
+        message={`风险监控 · ${String(mode).toUpperCase()} 环境 · 当前市场：${marketLabel(market)} · 数据全部来自本服务 /api/v3/* 实时接口`}
         description={
           <Text type="secondary" style={{ fontSize: 12 }}>
-            组合口径「{OK(analytics.value) ? analytics.value.portfolioSource || "—" : "—"}」· 基准 {OK(analytics.value) ? analytics.value.benchmarkTicker || "—" : "—"} ·
-            台账权益 {nav === null ? "—" : fmt.money(nav)}（本地模拟台账，不代表券商资产）。本页没有任何写动作：阈值修改只经工作台受约束入口并留审计痕迹。
+            组合口径「{OK(analytics.value) ? analytics.value.portfolioSource || "—" : "—"}」· universe_source {universeSource || "接口未返回"} ·
+            基准 {OK(analytics.value) ? analytics.value.benchmarkTicker || "—" : "—"} ·
+            台账权益 {nav === null ? "—" : fmt.money(nav)}（本地模拟台账，不代表券商资产）。
+            本页受市场影响的请求都显式带 <Text code>market={market}</Text>（组合风险量 / 行业暴露 / 持仓来源 / 台账订单），
+            绝不把「全部市场」当作一档；该市场无池子/无持仓时服务端返回 <Text code>market/no-universe</Text> 或{" "}
+            <Text code>industry/no-universe</Text>，本页照原文展示。本页没有任何写动作：阈值修改只经工作台受约束入口并留审计痕迹。
           </Text>
         }
       />

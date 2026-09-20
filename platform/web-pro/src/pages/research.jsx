@@ -12,9 +12,29 @@ import React from "react";
 import { Alert, Badge, Button, Col, DatePicker, Descriptions, Empty, Input, Row, Select, Space, Table, Tag, Tooltip, Typography } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
+import { MarketNote, envelopeError, marketLabel, tickerMarket, useMarket } from "../services/marketContext.jsx";
 import { Markdown } from "../lib/markdown.jsx";
 
 const { Text } = Typography;
+
+/** 标的是否属于当前市场：前缀可判定时严格过滤；无法判定归属的行保留（不臆测、不替它选市场）。 */
+function inMarket(ticker, market) {
+  const owner = tickerMarket(ticker);
+  return owner === null || owner === market;
+}
+
+/** 值勤任务的市场：task.market 缺失时不臆测归属，保留展示。 */
+function taskInMarket(task, market) {
+  const owner = String(task?.market ?? "").trim().toUpperCase();
+  if (!owner) return true;
+  return owner === market;
+}
+
+/** 信封失败原因（HTTP 200 + ok:false）：`error.code：error.message` + 有 error.detail 时追加
+ *  「真实原因」（统一口径见 services/marketContext.jsx 的 envelopeError）。 */
+function envErr(env) {
+  return envelopeError(env, "接口未返回 error.code/message");
+}
 
 /** run 状态展示：服务端只给 running/completed/cancelled；running 且超 2 小时按「已中断」派生展示
  *  （与工作台既有口径一致：只改读视图，不改写磁盘数据）。 */
@@ -43,18 +63,22 @@ function ratingTag(report) {
 }
 
 export default function ResearchPage() {
-  const research = useV3("research", {});
-  const tasks = useV3("research/tasks", {});
+  const { market } = useMarket();
+  // 研报 / 研究 run / 值勤队列都按当前市场取（显式带 market；该市场没有研报是空态，不是「无数据源」）
+  const research = useV3("research", { market });
+  const tasks = useV3("research/tasks", { market });
   const [selectedId, setSelectedId] = React.useState(null);
   // 筛选：标的 / 评级 / 时间范围 / 关键词（只作用于列表与导出目标，不改动后端数据）
   const [filters, setFilters] = React.useState({ ticker: null, rating: null, range: null, keyword: "" });
   const [exporting, setExporting] = React.useState(null);
 
-  const reports = Array.isArray(research.value?.reports) ? research.value.reports : [];
-  const runs = Array.isArray(research.value?.runs) ? research.value.runs : [];
-  const previews = Array.isArray(research.value?.previews) ? research.value.previews : [];
-  const activity = Array.isArray(research.value?.activity) ? research.value.activity : [];
-  const queue = Array.isArray(tasks.value?.tasks) ? tasks.value.tasks : [];
+  // 页内再按标的所属市场收敛一次：后端已按 market 过滤，这里保证「同屏只有一个市场」的口径；
+  // 前缀无法判定归属的行保留原样，不臆测。
+  const reports = (Array.isArray(research.value?.reports) ? research.value.reports : []).filter((item) => inMarket(item.ticker, market));
+  const runs = (Array.isArray(research.value?.runs) ? research.value.runs : []).filter((run) => inMarket(run.ticker, market));
+  const previews = (Array.isArray(research.value?.previews) ? research.value.previews : []).filter((row) => inMarket(row.value?.ticker ?? row.value?.symbol, market));
+  const activity = (Array.isArray(research.value?.activity) ? research.value.activity : []).filter((row) => inMarket(row.ticker, market));
+  const queue = (Array.isArray(tasks.value?.tasks) ? tasks.value.tasks : []).filter((task) => taskInMarket(task, market));
   const allTickers = [...new Set(reports.map((item) => item.ticker).filter(Boolean))];
   const allRatings = [...new Set(reports.map((item) => item.rating_label ?? item.rating).filter(Boolean))];
   const filtered = reports.filter((item) => {
@@ -119,24 +143,31 @@ export default function ResearchPage() {
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
       {research.error ? <Alert type="error" showIcon message="研报数据读取失败" description={String(research.error)} /> : null}
+      {research.value && research.value.ok === false ? (
+        <Alert type="warning" showIcon
+          message={`研报数据：${marketLabel(market)} 取不到`}
+          description={<Text type="secondary" style={{ fontSize: 12 }}>{envErr(research.value)}（原文来自 GET /api/v3/research?market={market}）</Text>} />
+      ) : null}
       {research.value?.recording_error ? (
         <Alert type="warning" showIcon message="工作台记录写入异常" description={String(research.value.recording_error)} />
       ) : null}
 
       <Alert type="info" showIcon
-        message="研报由 Harness 对话生成，本页只读查看"
+        message={`研报由 Harness 对话生成，本页只读查看 · 当前市场：${marketLabel(market)}`}
         description={
           <Text type="secondary" style={{ fontSize: 12 }}>
             「出一份研报 / 深度分析某标的」在对话里由 trading-agents 技能执行（12 角色 / 6 阶段：4 分析师 →
             多空辩论 → 研究经理裁决 → 交易员提案 → 风控辩论 → 组合经理终审），终审后经
             <Text code>research_publish</Text>落库；本页只展示已发布结果与量化预览，不提供生成按钮、不下单、不启用策略。
+            研报 / 研究 run 按标的所属市场过滤（显式带 <Text code>market={market}</Text>），值勤队列按 <Text code>task.market</Text> 过滤；
+            该市场没有研报是空态（不是「无数据源」），切换页头市场即可查看其它市场。
           </Text>
         } />
 
       <ProCard bordered>
         <Row gutter={[12, 12]}>
           {[
-            { title: "已发布研报", value: reports.length, hint: "research_publish 落库的记录" },
+            { title: "已发布研报", value: reports.length, hint: `research_publish 落库 · 当前市场 ${market}` },
             { title: "研究 run", value: runs.length, hint: running > 0 ? `其中进行中 ${running}` : "无进行中" },
             { title: "量化预览", value: previews.length, hint: "signal / backtest / report" },
             { title: "活动流", value: activity.length, hint: "工作台记录的事件" },
@@ -153,6 +184,12 @@ export default function ResearchPage() {
           模式 {fmt.dash(research.value?.mode)} · 快照时间 {fmt.stamp(research.value?.generated_at)} · 来源 {fmt.dash(research.value?.source)}
           {research.value?.notice ? ` · notice：${research.value.notice}` : ""}
         </Text>
+        <MarketNote
+          source={`GET /api/v3/research?market=${market} + GET /api/v3/research/tasks?market=${market}`}
+          asOf={research.value?.generated_at}
+          extra="研报 / 研究 run 按标的所属市场过滤，值勤队列按 task.market 过滤"
+          style={{ display: "block", marginTop: 4 }}
+        />
       </ProCard>
 
       <Row gutter={[12, 12]}>
@@ -186,7 +223,7 @@ export default function ResearchPage() {
             <Table
               size="small" rowKey={(row) => row.id} loading={research.loading}
               dataSource={filtered} pagination={false}
-              locale={{ emptyText: <Empty imageStyle={{ display: "none" }} description="尚无已发布研报（在对话里让 trading-agents 出一份）" /> }}
+              locale={{ emptyText: <Empty imageStyle={{ display: "none" }} description={`${marketLabel(market)} 暂无已发布研报（研报按标的所属市场过滤，不是「无数据源」；可在对话里让 trading-agents 出一份，或切换市场查看其它市场）`} /> }}
               onRow={(row) => ({ onClick: () => setSelectedId(row.id), style: { cursor: "pointer" } })}
               columns={[
                 { title: "标的", dataIndex: "ticker", width: 110 },
@@ -194,6 +231,11 @@ export default function ResearchPage() {
                 { title: "发布时间", dataIndex: "published_at", width: 150, render: (v) => fmt.stamp(v) },
                 { title: "来源数", width: 80, render: (_, row) => (row.sources ?? []).length },
               ]} />
+            <MarketNote
+              source={`GET /api/v3/research?market=${market} · reports`}
+              extra={`${marketLabel(market)} 研报 ${reports.length} 篇（按标的所属市场过滤）`}
+              style={{ display: "block", marginTop: 8 }}
+            />
           </ProCard>
         </Col>
         <Col xs={24} lg={15}>
@@ -226,7 +268,10 @@ export default function ResearchPage() {
                   ]} />
               </Space>
             ) : (
-              <Empty imageStyle={{ display: "none" }} description={noSourceText("研报正文", "尚无已发布研报")} />
+              <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                <Empty imageStyle={{ display: "none" }} description={`${marketLabel(market)} 暂无选中研报：该市场没有已发布研报（按标的所属市场过滤，不是「无数据源」）`} />
+                <MarketNote source={`GET /api/v3/research?market=${market} · reports`} />
+              </Space>
             )}
           </ProCard>
         </Col>
@@ -234,7 +279,7 @@ export default function ResearchPage() {
 
       <ProCard title="研究 run（记录进度与中断）" bordered>
         <Table size="small" rowKey={(row) => row.id} loading={research.loading} dataSource={runs} pagination={false}
-          locale={{ emptyText: "尚无研究 run 记录" }}
+          locale={{ emptyText: `${marketLabel(market)} 暂无研究 run 记录（按标的所属市场过滤）` }}
           columns={[
             { title: "run id", dataIndex: "id", width: 300, render: (v) => <Text code>{v}</Text> },
             { title: "标的", dataIndex: "ticker", width: 110 },
@@ -251,13 +296,18 @@ export default function ResearchPage() {
         <Text type="secondary" style={{ fontSize: 11 }}>
           被中断的会话会永久停在 running：在对话里用 research_cancel（list / cancel / cancel_stale）处理；本页只展示。
         </Text>
+        <MarketNote
+          source={`GET /api/v3/research?market=${market} · runs`}
+          extra={`${marketLabel(market)} 研究 run ${runs.length} 条（按标的所属市场过滤）`}
+          style={{ display: "block", marginTop: 4 }}
+        />
       </ProCard>
 
       <Row gutter={[12, 12]}>
         <Col xs={24} lg={12}>
           <ProCard title="量化预览（不下单）" bordered>
             <Table size="small" rowKey={(row) => row.id} loading={research.loading} dataSource={previews} pagination={false}
-              locale={{ emptyText: "尚无量化预览" }}
+              locale={{ emptyText: `${marketLabel(market)} 暂无量化预览（按标的所属市场过滤）` }}
               columns={[
                 { title: "时间", dataIndex: "at", width: 150, render: (v) => fmt.stamp(v) },
                 { title: "类型", dataIndex: "kind", width: 90, render: (v) => <Tag>{fmt.dash(v)}</Tag> },
@@ -268,26 +318,34 @@ export default function ResearchPage() {
             <Text type="secondary" style={{ fontSize: 11 }}>
               预览来自 quant_signal / quant_backtest / quant_report 等只读调用，仅作研究记录，不代表已下单或已启用策略。
             </Text>
+            <MarketNote source={`GET /api/v3/research?market=${market} · previews`} extra={`${previews.length} 条（当前市场）`} style={{ display: "block", marginTop: 4 }} />
           </ProCard>
         </Col>
         <Col xs={24} lg={12}>
           <ProCard title="活动流" bordered>
             <Table size="small" rowKey={(row) => row.id} loading={research.loading} dataSource={activity.slice(0, 15)} pagination={false}
-              locale={{ emptyText: "尚无活动记录" }}
+              locale={{ emptyText: `${marketLabel(market)} 暂无活动记录（按标的所属市场过滤）` }}
               columns={[
                 { title: "时间", dataIndex: "at", width: 150, render: (v) => fmt.stamp(v) },
                 { title: "事件", dataIndex: "kind", width: 150 },
                 { title: "标的", dataIndex: "ticker", width: 110, render: (v) => fmt.dash(v) },
               ]} />
+            <MarketNote source={`GET /api/v3/research?market=${market} · activity`} extra={`显示 ${Math.min(15, activity.length)}/${activity.length} 条（当前市场）`} style={{ display: "block", marginTop: 4 }} />
           </ProCard>
         </Col>
       </Row>
 
       <ProCard title="值勤研究队列（daily_brief / factor_patrol / mining_round）" bordered
         extra={<Text type="secondary" style={{ fontSize: 11 }}>消费入口：install/research-duty.timer → dsh --profile headless</Text>}>
-        {tasks.error ? <Alert type="warning" showIcon message={noSourceText("值勤队列", String(tasks.error))} /> : (
+        {tasks.error || (tasks.value && tasks.value.ok === false) ? (
+          <Space direction="vertical" size={6} style={{ width: "100%" }}>
+            <Alert type="warning" showIcon
+              message={noSourceText("值勤队列", tasks.error ? String(tasks.error) : envErr(tasks.value))} />
+            <MarketNote source={`GET /api/v3/research/tasks?market=${market}`} />
+          </Space>
+        ) : (
           <Table size="small" rowKey={(row) => row.task_id} loading={tasks.loading} dataSource={queue} pagination={false}
-            locale={{ emptyText: "队列为空" }}
+            locale={{ emptyText: `${marketLabel(market)} 队列为空（按 task.market 过滤）` }}
             columns={[
               { title: "任务", dataIndex: "task_id", width: 260, render: (v) => <Text code>{v}</Text> },
               { title: "类型", dataIndex: "kind", width: 130, render: (v) => <Tag color="blue">{fmt.dash(v)}</Tag> },
@@ -300,6 +358,11 @@ export default function ResearchPage() {
         <Text type="secondary" style={{ fontSize: 11 }}>
           队列由基础链作业按交易日入队；领取与回报（claim / report）只进 Harness 工具面——本页只读清单，不领取、不回报。
         </Text>
+        <MarketNote
+          source={`GET /api/v3/research/tasks?market=${market}`}
+          extra={`${queue.length} 条（按 task.market = ${market} 过滤）`}
+          style={{ display: "block", marginTop: 4 }}
+        />
       </ProCard>
     </Space>
   );

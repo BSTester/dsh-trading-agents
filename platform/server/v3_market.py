@@ -8,9 +8,16 @@
 数据诚实：富途账号未开通实时行情权限时 ``rt_order_book`` 返回 ``errcode=-9``，本层
 **原样透传错误**（``ok=false`` + 真实 message），让页面显示「无数据源 + 原因」而不是
 编造盘口。
+
+市场口径（2026-09-20 新增）：``/market/watchlist`` 支持 ``?market=SH|HK|US``（缺省 ``SH``），
+池子来自 ``server/v3_universe.resolve_universe``（配置 ``watchlists.<market>`` → 富途真实
+持仓 ``account_positions``，**不发明自选池**）；``rows`` 只含该市场标的，响应带 ``market``
+与 ``universe_source``；该市场既无配置池也无真实持仓 → ``market/no-universe``（含 ``detail``
+写明真实原因），不给空数组冒充成功。
 """
 import asyncio
-import json
+
+from server import v3_universe
 
 # 周期 → 工作台 series 的 period 取值（工作台只认这几个，其余原样传入由工作台校验）
 PERIODS = {"1d": "1d", "5m": "5m", "60m": "60m", "15m": "15m", "30m": "30m", "1w": "1w", "1M": "1M"}
@@ -70,16 +77,27 @@ def register(app, v3_run, home):
 
     # ── 自选池快照（逐票最近日 K + 因子）────────────────────────────────────
     @app.get("/api/v3/market/watchlist")
-    async def v3_watchlist(n: int = 6):
+    async def v3_watchlist(n: int = 6, market: str = "SH"):
+        """该市场的池子快照：池子取统一解析（配置 → 真实持仓），``rows`` 只含本市场标的。"""
 
         def build():
-            # 自选池按平台配置读（工具面 watchlist_list 需要 group_name，配置是唯一事实源）
+            code = v3_universe.normalize_market(market)
+            if code is None:
+                return {"ok": False, "error": {"code": "market/bad-market",
+                                               "message": "market 需为 SH / HK / US"}}
+            universe = v3_universe.resolve_universe(call, home, code)
+            if universe is None:
+                error = {"code": "market/no-universe",
+                         "message": "该市场没有配置自选池、也没有真实持仓"}
+                detail = v3_universe.universe_note(home, code)
+                if detail:
+                    error["detail"] = detail
+                return {"ok": False, "error": error}
             try:
-                with open(f"{home}/trading-platform.json", encoding="utf-8") as handle:
-                    tickers = (json.load(handle).get("watchlist") or [])[: max(1, min(int(n), 20))]
-            except Exception as error:  # noqa: BLE001
-                return {"ok": False, "error": {"code": "market/no-watchlist",
-                                               "message": f"自选池不可读：{str(error)[:120]}"}}
+                limit = max(1, min(int(n), 20))
+            except (TypeError, ValueError):
+                limit = 6
+            tickers = list(universe.get("tickers") or [])[:limit]
             rows, errors, source = [], [], None
             for ticker in tickers:
                 envelope = call("series", {"ticker": ticker, "period": "1d", "limit": 30})
@@ -102,7 +120,10 @@ def register(app, v3_run, home):
                     "mom20Pct": mom,
                     "asOf": bars[-1].get("t"),
                 })
-            return {"ok": True, "rows": rows, "errors": errors,
+            return {"ok": True, "market": code,
+                    "universe_source": universe.get("source"),
+                    "universe_note": universe.get("note"),
+                    "rows": rows, "errors": errors,
                     "sources": {"kline": source or "futu/quote_history_kline",
                                 "factors": "workbench/factors"}}
 

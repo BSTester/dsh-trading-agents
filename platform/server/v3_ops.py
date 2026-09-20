@@ -27,6 +27,11 @@ oms/orders,oms/sync,events,audit,brain}``）。
 * **进程内计数**：模块级计数器在**每次 v3_run 调用**时累加。``mcp`` 与 ``wb`` 两个视图读
   同一份计数（两处本来就是同一个 handle 的同一批调用，不做第二事实源）；``http`` 只统计
   本模块注册的路由（进程内计数，不引 Prometheus）。
+* **市场过滤（2026-09-20）**：``execution`` / ``oms/orders`` / ``brain``（以及 ``app.py`` 的
+  ``overview``）支持 ``?market=SH|HK|US``——只挑分组/台账行，**既有字段一字不改**，
+  另加 ``market`` 与 ``filter`` 真实计数；未登记的市场标识（``market_id`` 9/10/…）
+  如实排除并计数，绝不猜成某个市场（映射口径见 ``server/v3_universe.py``）。
+  不传 ``market`` 时行为与历史完全一致。
 
 落盘（均在 ``home`` 下，均为 best-effort，写失败不阻断业务）
 -----------------------------------------------------------
@@ -52,7 +57,7 @@ from pathlib import Path
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from server import mcp_tools, store_access
+from server import mcp_tools, store_access, v3_universe
 from server.config import config_path
 
 # ---------------------------------------------------------------------------
@@ -444,6 +449,138 @@ def _symbol_matches(row_symbol, wanted_symbol):
     return row_symbol.split(".")[-1] == wanted_symbol.split(".")[-1]
 
 
+# ---------------------------------------------------------------------------
+# 按市场过滤（``?market=SH|HK|US``；不改任何既有字段，只挑分组/行并在 filter 里如实计数）
+# ---------------------------------------------------------------------------
+#: 分组里可能承载行的键（positions / orders_open 用 positions·rows，成交/委托用 rows）
+GROUP_ROW_KEYS = ("positions", "rows", "deals", "orders")
+
+
+def _group_rows(group):
+    """分组 → ``(行列表, 行所在的键)``；没有行的分组 → ``([], None)``。"""
+    for key in GROUP_ROW_KEYS:
+        rows = group.get(key)
+        if isinstance(rows, list):
+            return [row for row in rows if isinstance(row, dict)], key
+    return [], None
+
+
+def _row_market(row):
+    """行 → 市场口径（按标的归一后取前缀）；无法判定 → ``None``（不猜）。"""
+    symbol = None
+    for key in ("symbol", "code", "ticker", "stock_code"):
+        value = row.get(key)
+        if value not in (None, ""):
+            symbol = value
+            break
+    ticker = v3_universe.canonical_ticker(symbol)
+    if ticker is None:
+        return None
+    return v3_universe.market_of_ticker(ticker)
+
+
+def filter_grouped_value(value, market, note=None):
+    """``positions``/``orders_open``/``deals_today`` 的 value → 只保留该市场的账户分组。
+
+    返回 ``(value, stats)``：命中市场的分组原样保留（行不动）。分两种「不确定」：
+
+      * 上游**声明了**市场但不在已知口径内（``market_id`` 9/10/11/12/13/16）→ **不猜市场**，
+        整组排除并计入 ``unknownMarketGroups`` / ``unknownMarkets``（上游原值）；
+      * 分组**没有**市场声明（实盘账户 ``market=null``）→ 逐行按标的自身前缀归因，
+        只保留命中该市场的行（``attributedByRowPrefix``）；一行都归不了也计入未知。
+
+    ``value`` 不是分组结构 → 原样返回并在 ``note`` 里说明（不静默丢弃）。
+    """
+    stats = {"field": "groups[].market", "market": market, "groups": 0, "keptGroups": 0,
+             "otherMarketGroups": 0, "unknownMarketGroups": 0, "keptRows": 0,
+             "excludedRows": 0, "attributedByRowPrefix": 0, "otherMarkets": [],
+             "unknownMarkets": [], "note": note}
+    if not isinstance(value, dict):
+        stats["note"] = "上游 value 不是对象 → 未过滤，原样返回"
+        return value, stats
+    groups = value.get("groups")
+    if not isinstance(groups, list):
+        stats["note"] = "上游没有 groups 字段（未按账户分组）→ 未过滤，原样返回"
+        return value, stats
+    stats["groups"] = len(groups)
+    kept = []
+    for group in groups:
+        if not isinstance(group, dict):
+            continue
+        rows, rows_key = _group_rows(group)
+        raw_label = group.get("market")
+        declared = raw_label not in (None, "")
+        label = v3_universe.market_of_account_label(raw_label)
+        if declared and label is None:
+            # 上游声明了市场但不在已知口径内（如 market_id 9/10/11/12/13/16）：
+            # **不猜成某个市场**，如实排除并在 unknownMarkets 里列出上游原值。
+            stats["unknownMarketGroups"] += 1
+            stats["excludedRows"] += len(rows)
+            if raw_label not in stats["unknownMarkets"]:
+                stats["unknownMarkets"].append(raw_label)
+            continue
+        if label is None:
+            # 分组**没有**市场声明（实盘账户 market=null）→ 逐行按标的自身前缀归因
+            matched = [row for row in rows if _row_market(row) == market]
+            if matched and rows_key:
+                kept.append({**group, rows_key: matched})
+                stats["keptGroups"] += 1
+                stats["keptRows"] += len(matched)
+                stats["excludedRows"] += len(rows) - len(matched)
+                stats["attributedByRowPrefix"] += 1
+            else:
+                stats["unknownMarketGroups"] += 1
+                stats["excludedRows"] += len(rows)
+                raw = group.get("market")
+                if raw not in stats["unknownMarkets"]:
+                    stats["unknownMarkets"].append(raw)
+            continue
+        if label != market:
+            stats["otherMarketGroups"] += 1
+            stats["excludedRows"] += len(rows)
+            if label not in stats["otherMarkets"]:
+                stats["otherMarkets"].append(label)
+            continue
+        kept.append(group)
+        stats["keptGroups"] += 1
+        stats["keptRows"] += len(rows)
+    return {**value, "groups": kept}, stats
+
+
+def filter_plan_value(value, market, note=None):
+    """``plan`` 的 value → ``plans`` 只保留「``target`` 里含该市场标的」的计划。
+
+    ``target`` **原样保留**（不裁剪权重，否则一份计划的权重和就不再是 1）；
+    没有 ``target`` 字段的计划同样保留（它不是市场相关条目，隐藏反而丢信息）。
+    """
+    stats = {"field": "plans[].target", "market": market, "plans": 0, "keptPlans": 0,
+             "otherMarketPlans": 0, "noTargetPlans": 0, "note": note}
+    if not isinstance(value, dict):
+        stats["note"] = "上游 value 不是对象 → 未过滤，原样返回"
+        return value, stats
+    plans = value.get("plans")
+    if not isinstance(plans, list):
+        stats["note"] = "上游没有 plans 字段 → 未过滤，原样返回"
+        return value, stats
+    stats["plans"] = len(plans)
+    kept = []
+    for plan in plans:
+        if not isinstance(plan, dict):
+            continue
+        target = plan.get("target")
+        if not isinstance(target, dict) or not target:
+            kept.append(plan)
+            stats["noTargetPlans"] += 1
+            continue
+        markets = {v3_universe.market_of_ticker(ticker) for ticker in target}
+        if market in markets:
+            kept.append(plan)
+            stats["keptPlans"] += 1
+        else:
+            stats["otherMarketPlans"] += 1
+    return {**value, "plans": kept}, stats
+
+
 def open_hit(rows, order_id, symbol, side, qty):
     """在途订单命中（client_order_id / 备注单号 / 同标的同方向同数量）。"""
     wanted_symbol = _norm_symbol(symbol)
@@ -520,13 +657,37 @@ class OmsLedger:
             counts[stage] = counts.get(stage, 0) + 1
         return counts
 
-    def stage_counts(self):
+    def stage_counts(self, market=None):
+        if market:
+            return self.stage_counts_of({record.get("id"): record for record in self.list(market)})
         return self.stage_counts_of(self.read())
 
-    def list(self):
+    def list(self, market=None):
+        """台账订单（按 ``updated_at`` 倒序）；``market`` 给定时按订单标的的市场前缀过滤。"""
         records = list(self.read().values())
+        if market:
+            records = [record for record in records
+                       if v3_universe.market_of_ticker(record.get("ticker")) == market]
         records.sort(key=lambda record: str(record.get("updated_at") or ""), reverse=True)
         return records
+
+    def market_filter_stats(self, market):
+        """台账按市场过滤的真实计数（台账订单的市场前缀分布，供前端核对）。"""
+        records = list(self.read().values())
+        stats = {"field": "orders[].ticker", "market": market, "orders": len(records),
+                 "keptOrders": 0, "otherOrders": 0, "unattributedOrders": 0,
+                 "prefixes": {}}
+        for record in records:
+            prefix = v3_universe.market_of_ticker(record.get("ticker"))
+            label = prefix or "unknown"
+            stats["prefixes"][label] = stats["prefixes"].get(label, 0) + 1
+            if prefix == market:
+                stats["keptOrders"] += 1
+            elif prefix is None:
+                stats["unattributedOrders"] += 1
+            else:
+                stats["otherOrders"] += 1
+        return stats
 
     # ---- 工作台上下文（NAV / 回撤 / 在途 / 待确认）----
     def context(self):
@@ -655,9 +816,10 @@ class OmsLedger:
         self._append_sync(result)
         return {"ok": True, **result}
 
-    def view(self, context=None):
+    def view(self, context=None, market=None):
+        """OMS 台账视图；``market`` 给定时 ``orders`` 与 ``stages`` 同步按市场过滤。"""
         context = context if context is not None else self.context()
-        return {
+        payload = {
             "note": OMS_NOTE,
             "confirmation": context["confirmation"],
             "nav": context["nav"],
@@ -665,9 +827,13 @@ class OmsLedger:
             "drawdown_pct": context["drawdown_pct"],
             "drawdown_source": context["drawdown_source"],
             "industry_source": context["industry_source"],
-            "stages": self.stage_counts(),
-            "orders": self.list()[:20],
+            "stages": self.stage_counts(market),
+            "orders": self.list(market)[:20],
+            "market": market,
         }
+        if market:
+            payload["filter"] = self.market_filter_stats(market)
+        return payload
 
 
 # ---------------------------------------------------------------------------
@@ -752,14 +918,21 @@ def _data_sources(call, home):
 # ---------------------------------------------------------------------------
 # brain 的最近一轮策略（只读 v3_analytics 的落盘，读不到就 null）
 # ---------------------------------------------------------------------------
-def last_strategy_run(home):
-    """``(record|None, path, note)``：读 ``v3-strategy-runs.jsonl`` 最后一条有效记录。"""
+def last_strategy_run(home, market=None):
+    """``(record|None, path, note)``：读 ``v3-strategy-runs.jsonl`` 最后一条有效记录。
+
+    ``market`` 给定时优先取带该 ``market`` 标注的最后一条记录；**旧记录没有 ``market``
+    字段时不被隐藏**——文件里一条带市场的记录都没有，就退回最后一条旧记录并把原因
+    写进 ``note``（调用方据此标注 ``decisionMarket: null``）。文件里已有带市场的记录、
+    但没有该市场的 → ``None``（如实说明，不拿别的市场顶替）。
+    """
     path = Path(home) / STRATEGY_RUNS_FILENAME
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
         return None, str(path), "文件不存在或不可读"
-    for line in reversed(text.splitlines()):
+    records = []
+    for line in text.splitlines():
         line = line.strip()
         if not line:
             continue
@@ -768,8 +941,22 @@ def last_strategy_run(home):
         except ValueError:
             continue
         if isinstance(record, dict):
-            return record, str(path), "取最后一条有效记录"
-    return None, str(path), "文件存在但没有有效 JSON 记录"
+            records.append(record)
+    if not records:
+        return None, str(path), "文件存在但没有有效 JSON 记录"
+    if market is None:
+        return records[-1], str(path), "取最后一条有效记录"
+    matched = [record for record in records
+               if str(record.get("market") or "").strip().upper() == market]
+    if matched:
+        return matched[-1], str(path), f"取最后一条 market={market} 的记录"
+    legacy = [record for record in records if record.get("market") in (None, "")]
+    if legacy:
+        return legacy[-1], str(path), (
+            f"文件里没有任何带 market 标注的记录（{len(records)} 条旧记录）→ 取最后一条并标注 "
+            f"market=null，未按市场隐藏")
+    return None, str(path), (f"文件里有 {len(records)} 条记录，但没有 market={market} 的"
+                             f"（不拿其它市场的记录顶替）")
 
 
 # ---------------------------------------------------------------------------
@@ -893,8 +1080,17 @@ def register(app, v3_run, home):
 
     # ── 5. 执行（持仓 / 在途 / 今日成交 / OMS 台账）────────────────────────────
     @app.get("/api/v3/execution")
-    async def v3_execution():
+    async def v3_execution(market: str = ""):
+        """执行面只读视图；``?market=SH|HK|US`` 时按市场账户过滤持仓/在途/今日成交与台账。
+
+        不传 ``market`` → 与历史完全一致（全部市场合并展示，value 原样透传）。
+        """
         def build():
+            code = None
+            if str(market or "").strip():
+                code = v3_universe.normalize_market(market)
+                if code is None:
+                    return _failure("market/bad-market", "market 需为 SH / HK / US")
             context = ledger.context()
             deals = call("deals_today", {})
             errors = [{"tool": name, "error": envelope.get("error")}
@@ -904,20 +1100,41 @@ def register(app, v3_run, home):
                                              ("confirmation", context["confirmation_envelope"]),
                                              ("deals_today", deals))
                       if not (isinstance(envelope, dict) and envelope.get("ok"))]
-            return {
+            payload = {
                 "ok": True,
                 "positions": _value_or_none(context["positions"]),
                 "orders_open": _value_or_none(context["orders_open"]),
                 "deals_today": _value_or_none(deals),
-                "oms": ledger.view(context),
+                "oms": ledger.view(context, code),
                 "errors": errors,
             }
+            if code:
+                filters = {}
+                for key, envelope in (("positions", context["positions"]),
+                                      ("orders_open", context["orders_open"]),
+                                      ("deals_today", deals)):
+                    value = _value_or_none(envelope)
+                    filtered, stats = filter_grouped_value(
+                        value, code, note=f"{key} 按账户市场过滤（不跨市场合并）")
+                    payload[key] = filtered
+                    filters[key] = stats
+                payload["market"] = code
+                payload["filter"] = filters
+            return payload
         return await respond(build)
 
     # ── 6. OMS 台账 / 对账 ───────────────────────────────────────────────────
     @app.get("/api/v3/oms/orders")
-    async def v3_oms_orders():
-        return await respond(lambda: {"ok": True, **ledger.view()})
+    async def v3_oms_orders(request: Request):
+        def build():
+            raw = (request.query_params.get("market") or "").strip()
+            code = None
+            if raw:
+                code = v3_universe.normalize_market(raw)
+                if code is None:
+                    return _failure("market/bad-market", "market 需为 SH / HK / US")
+            return {"ok": True, **ledger.view(market=code)}
+        return await respond(build)
 
     @app.post("/api/v3/oms/sync")
     async def v3_oms_sync():
@@ -963,11 +1180,19 @@ def register(app, v3_run, home):
 
     # ── 9. 智能决策（SDK/Headless 无数据源，如实标注）─────────────────────────
     @app.get("/api/v3/brain")
-    async def v3_brain():
+    async def v3_brain(market: str = ""):
+        """``?market=`` 只过滤 ``decision``（最近一轮策略）：``run.market`` 匹配才取；
+        旧记录没有 ``market`` 字段 → **不按市场隐藏**，取最后一条并标注 ``decisionMarket:null``。
+        """
         def build():
-            decision, decision_path, decision_note = last_strategy_run(home_path)
+            code = None
+            if str(market or "").strip():
+                code = v3_universe.normalize_market(market)
+                if code is None:
+                    return _failure("market/bad-market", "market 需为 SH / HK / US")
+            decision, decision_path, decision_note = last_strategy_run(home_path, code)
             sources = call("sources", {})
-            return {
+            payload = {
                 "ok": True,
                 "headless": {"today": {"total": 0, "success": 0, "failed": 0, "avgMs": 0,
                                        "killed": 0},
@@ -976,6 +1201,8 @@ def register(app, v3_run, home):
                 "sdk": {"status": "unavailable", "reason": SDK_REASON, "serverInfo": None,
                         "route": None, "lastTurn": None, "turns": [], "events": []},
                 "decision": decision,
+                "decisionMarket": ((decision or {}).get("market") or None)
+                                  if isinstance(decision, dict) else None,
                 "sources": {
                     "decision": (f"{decision_path}（{decision_note}）" if decision is not None
                                  else f"无数据源（{decision_path}：{decision_note}）"),
@@ -986,6 +1213,11 @@ def register(app, v3_run, home):
                                   "error": sources.get("error")},
                 },
             }
+            if code:
+                payload["market"] = code
+                payload["filter"] = {"field": "v3-strategy-runs.jsonl[].market", "market": code,
+                                     "note": decision_note}
+            return payload
         return await respond(build)
 
     return {"ledger": ledger, "catalog": catalog, "total": total, "call": call}
@@ -1009,6 +1241,7 @@ def _make_caller(v3_run):
 
 
 __all__ = ["register", "build_catalog", "catalog_total", "check_order", "domain_of",
-           "last_strategy_run", "metrics_snapshot", "OmsLedger", "open_hit",
+           "filter_grouped_value", "filter_plan_value", "last_strategy_run",
+           "metrics_snapshot", "OmsLedger", "open_hit",
            "positions_nav", "reset_counters", "DOMAINS", "ENV_KEYS", "LIMITS", "STAGES",
            "V3_LOCAL_TOOLS", "WB_TOOL_NAMES"]
