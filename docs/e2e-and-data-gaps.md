@@ -218,3 +218,215 @@ BENCHMARKS = {
 - 不传 `market` 时沿用历史缺省 `SH.000300`（既有行为不变）。
 - `ml/sweep`、`ml/backtest` 加 `market` 回显（显式参数优先，否则取标的的市场前缀；单标的端点，
   只作标注，不改取数口径）。
+
+---
+
+# 第四轮：富途限流治理（全局限速 + 单飞 + 退避 + 冷却）+ overview 按市场看成交（2026-09-21）
+
+背景（实测）：连续密集真机请求会让富途返回 **`-12006`（请求过于频繁）**（表现为 HTTP 403），
+另有 `-12009` / HTTP 439。治理前这些错误被**原样透传**——例如 `market/no-universe` 的
+`error.detail` 里写着「positions 取数失败…[errcode=439]」，用户会误读成「没有数据」。
+本轮把富途调用收敛到**一个**限流器，并把限流明确成独立错误码。
+
+## 一、实现与接入（`platform/server/v3_ratelimit.py`，全站唯一实现）
+
+四项治理能力，全部在同一个进程级 limiter 上（`v3_ratelimit.get_limiter()`）：
+
+| 能力 | 行为 | 计数 |
+|---|---|---|
+| 全局限速 | 令牌桶 `rate_per_sec`（默认 3）+ 突发额度 `burst`（默认 3）；超出的调用**等待** | `throttleWaitMs`（等待毫秒累计） |
+| 并发上限 | 同时在飞的真实请求 ≤ `max_concurrency`（默认 2），其余排队（释放时**直接转交**槽） | `inFlight` / `queued` |
+| 单飞 | 同 key（`工具名 + 稳定序列化参数`）并发调用**共享同一次真实请求**，其余复用结果 | `coalesced` |
+| 退避重试 | 识别到限流 → 指数退避 + 抖动（`base_backoff_ms` 起、`max_backoff_ms` 封顶），最多 `QUANT_FUTU_RETRY`（默认 2）次 | `retries` |
+| 冷却 | 连续 `cooldown_after`（默认 3）次限流错误 → `cooldown_ms`（默认 5000）冷却，期内**不发请求**、直接返回限流错误 | `cooldownUntil` |
+
+**接入点（app.py 的 V3 接线处，一处收口）**：
+
+- `v3_run(name, payload)`：命中富途只读集合 → `v3_ratelimit.futu_run(limiter, endpoint, payload, call)`；
+  否则（本地台账 `plan`/`equity`/`audit`/`schedule`/`rules`…）**原样直通**，不被无谓限速。
+- `_wb_http(endpoint, payload)`：HTTP-only 读端点同一份口径（如数据面 `info_rehab`）。
+- 集合 `FUTU_TOOL_NAMES` = store_access 的 `FUTU_ENDPOINTS` + `WP8_MARKET_ENDPOINTS` +
+  `WP8_TRADE_ENDPOINTS` + `WP12_ENDPOINTS`（去掉写类 `modify_user_security`）+ WP7 账户只读
+  + 实测触达富途的复合端点（`series`/`positions`/`snapshot`/`sources`/`factors`/`ic`/
+  `correlation`/`sensitivity`/`events`/`instrument`/`quality`）。
+- **写/交易端点永不在集合里**（`switch-mode`/`plan-execute`/`confirm-decide`/`trade_*`/
+  `sim_trade_*`/`modify_user_security`/`push_subscribe`…），有单测钉住。
+- 运维可加：`QUANT_FUTU_EXTRA_TOOLS=a,b`（逗号分隔）把额外工具名纳入同一限流器。
+
+`/api/v3/metrics` 新增一块（**只加字段，既有字段一字不改**）：
+
+```json
+"futu": {"enabled": true, "calls": 40, "coalesced": 4, "retries": 2, "rateLimited": 3,
+         "throttleWaitMs": 478.105, "cooldownUntil": 1789891310455,
+         "cooldownRemainingMs": 4139, "inFlight": 0, "queued": 0}
+```
+
+- `calls` = 进入 limiter 的调用数；`coalesced` = 因单飞**没有发请求**的调用数；
+  `throttleWaitMs` = 限速 + 并发槽等待的毫秒累计（不含退避等待，退避看 `retries`）；
+  `cooldownUntil` = 冷却结束的**墙钟毫秒**（未冷却为 0），`cooldownRemainingMs` = 剩余毫秒。
+
+## 二、配置项（环境变量，全部带默认；`QUANT_FUTU_RATELIMIT=0` 整体关闭）
+
+| 环境变量 | 默认 | 含义 |
+|---|---|---|
+| `QUANT_FUTU_RATELIMIT` | `1`（开） | `0`/`false`/`off`/`no` → **整体关闭**（直通、不计数、不等待） |
+| `QUANT_FUTU_RATE_PER_SEC` | `3` | 令牌桶速率（个/秒） |
+| `QUANT_FUTU_BURST` | `3` | 令牌桶容量（突发额度） |
+| `QUANT_FUTU_MAX_CONCURRENCY` | `2` | 同时在飞的真实请求上限 |
+| `QUANT_FUTU_BACKOFF_BASE_MS` | `400` | 首次退避基数（指数增长：400 / 800 / 1600…） |
+| `QUANT_FUTU_BACKOFF_MAX_MS` | `8000` | 单次退避上限 |
+| `QUANT_FUTU_COOLDOWN_MS` | `5000` | 冷却时长 |
+| `QUANT_FUTU_COOLDOWN_AFTER` | `3` | 连续 N 次限流错误后进入冷却 |
+| `QUANT_FUTU_RETRY` | `2` | 限流错误后的最大重试次数 |
+| `QUANT_FUTU_EXTRA_TOOLS` | （空） | 额外声明为富途只读的工具名（逗号分隔） |
+
+非法/越界的环境值**回落默认**（不抛异常、不把服务带崩），有单测。
+
+## 三、错误码映射与统一信封
+
+识别（`is_rate_limit_error` / `upstream_code_of`）：
+
+| 上游写法 | 识别条件 | `detail.upstream` |
+|---|---|---|
+| `-12006` / `12006` | 数字边界匹配（含 `HTTP 403：{"code":-12006}`） | `-12006` |
+| `-12009` / `12009` | 同上 | `-12009` |
+| `439` | `errcode=439` / `retcode: 439` / `status=439` / `[439]` | `439` |
+| `HTTP 403` | **只在同时含 `12006` 时**才算（裸 403 判为权限类，不误判成限流） | `-12006` |
+| `futu/rate-limited` | 内层调用已被本模块限流（外层再看到同一事实） | 内层码优先，无码则 `futu/rate-limited` |
+| 文字特征 | `请求过于频繁`/`请求频繁`/`频率限制`/`超出频率`/`限流`/`rate limit`/`too many requests`… | `text` |
+
+重试耗尽（或冷却期拒绝）时**返回**（不抛）统一信封，非限流错误**原样透传**（业务错误一字不改）：
+
+```json
+{"ok": false, "error": {"code": "futu/rate-limited",
+  "message": "富途接口限流（上游 -12006），已退避重试 2 次仍失败，请稍后重试",
+  "detail": {"upstream": "-12006", "retry_after_ms": 5200, "retries": 2, "cooldown": true,
+             "reason": "非预期响应（HTTP 403）：b'{\"code\":-12006...}'"},
+  "retry_after_ms": 5200}}
+```
+
+- `detail.reason` 保留**上游原文**（截断 300 字符）——前端已按
+  「富途接口限流… · 真实原因：{…}」渲染，不再出现「取数失败 → 以为没有数据」。
+- `retry_after_ms`：冷却中 = **剩余冷却毫秒**；否则 = 建议的**下一次退避量**
+  （400→800→1600… 经抖动后取值，封顶 `BACKOFF_MAX_MS`）。
+- 计次口径：**每次退避重试也算一次连续限流错误**，所以一次「重试耗尽」的调用本身
+  就可能（在 `cooldown_after=3` 时）触发冷却——与任务书样例信封（`retries:2, cooldown:true`）同形。
+
+## 四、离线单测（`platform/tests/test_v3_ratelimit.py`，40 例，注入假时钟/假 sleep/假 rand）
+
+覆盖：令牌桶限速等待与 `throttleWaitMs` 累计；并发上限（4 线程实测峰值 in-flight=2、2 个排队）；
+**单飞**（同步 5 并发 → 1 次真实调用；异步 5 并发 → 1 次真实调用）；限流→退避→成功；
+指数退避 + 封顶；重试耗尽 → 统一信封；冷却期内不发请求 + `retry_after_ms` 递减 + 到期恢复；
+非限流异常照抛 / 业务错误信封原样透传；**`ok=true` 的成功信封绝不被改写成限流错误**
+（真机教训，见第五节）；`QUANT_FUTU_RATELIMIT=0` 直通；`stats()` 字段齐全；
+嵌套调用不争槽自锁；识别矩阵；只读集合不含写端点；环境变量默认/覆盖/非法回落。
+另在 `tests/test_v3_ops.py` 的 `OverviewMarketScopeTests` 里用真实 app.py 分支验 overview 市场过滤。
+
+```
+cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_ratelimit -v   # 40 OK
+cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests              # 355 OK
+cd . && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests                     # 2428 OK
+```
+
+## 五、真机实测（TestClient 独立实例，未触碰 8397 服务；只读）
+
+> 全部用 `create_app` + `TestClient`（不进 lifespan，因此不起调度器/推送），同一个
+> `DSH_HOME`、同一个真实富途上游。运行脚本：`/tmp/v3_verify_ratelimit.py`（一次性验证脚本，
+> 不入库）。
+
+**1) 冷却触发 → 冷却期拒绝（不发请求）→ 到期自动恢复**（默认配置 3/s、burst 3、并发 2、退避 400ms、冷却 5s）：
+
+```
+/api/v3/overview?market=US  ok=True 20755ms
+  metrics.futu = {"calls":16,"coalesced":0,"retries":2,"rateLimited":3,
+                  "throttleWaitMs":478.105,"cooldownRemainingMs":4554}
+
+突发 24 个 series（6 线程，冷却期内）: failed 24/24
+  {"code":"futu/rate-limited","message":"富途接口限流冷却中（上游 text），请约 4.5s 后重试",
+   "detail":{"upstream":"text","retry_after_ms":4490,"retries":0,"cooldown":true},
+   "retry_after_ms":4490}        # 每个 64~118ms 返回 —— **没有发上游请求**
+  … 24 个信封的 retry_after_ms 4497 → 4439 随时钟递减
+
+冷却结束复测: ok=True 46ms source=futu/quote_history_kline cooldownRemainingMs=0   ← 自动恢复
+```
+
+**2) 这次触发暴露并修掉了一个真问题（重要）**：把 `detail.reason`（上游原文，截断 300 字符）
+补全之后就看清了触发源——它**不是**顶层失败，而是 `deals_today` **成功信封**（`ok=true`）的
+`value` 里，某个模拟账户分组的取数失败原因带着限流文字：
+
+```
+"reason": "{\"ok\": true, \"value\": {\"mode\": \"sim\",
+           \"source\": \"futu/sim_trade_order_list(derived)\", ... \"groups\":
+           [{\"acc_id\": \"6683018\", \"market\": \"1…
+```
+
+即**上游确实在按频率拒绝**（账户级），但外层这次调用本身是成功的。旧实现把它当限流错误
+重试并把**已经取到的数据**改写成了限流信封——这是错的。修复两条：
+
+- `is_rate_limit_error`：`ok=true` 的信封**一律不算**限流（成功的 value 里可以有子项的限流说明）；
+- `detail.reason`：取不到 `error.message` 时退回收敛后的原文，保证「真实原因」永远可见。
+
+修复后同场景复测（4 轮，含 24 次 series 并发 / 12 次重复并发 / 48 次 25req·s⁻¹ 突发）：
+`rateLimited=0, retries=0`，全部成功，`deals_today` 正常返回真实派生数据
+（`source=futu/sim_trade_order_list(derived)`）而不再被改写。
+
+**3) 单飞（生产并发下真实合并）**：`coalesced` 多轮非零实测——
+`4`、`5`、`6`、`11`、`12`（8 个并发聚合请求把 12 次内层取数合并）、**`27`**
+（30 次重复 `f10_detail` + 18 次重复 `execution/quality` 里 27 次内层取数被合并）。
+
+**4) 非限流错误原样透传（真机反证）**：48 次突发里有 9 次失败，全部是
+`sec/unknown-ticker`（美股 SEC 业务错误）——`rateLimited=0`、`retries=0`，
+既没有重试也没有被改写成限流信封。
+
+**5) 限速与延迟代价**：默认 3/s 下 40~51 次富途调用累计 `throttleWaitMs` 10~45s
+（累计值，含并发等待；24 次 series 单次最长约 2s，全部成功）。
+`/api/v3/overview?market=US` 端到端耗时对比（同一时段、同一 home、只读）：
+
+| 实例 | 耗时 |
+|---|---|
+| 运行中的 8397（旧代码，无限流器） | 6.89s / 6.53s（两次） |
+| TestClient 新实例（含限流器） | 6.7~7.0s（其中限流等待 `throttleWaitMs` 0.4~0.8s） |
+
+即：overview 的耗时主体是聚合取数本身（`snapshot`/`sources` 探测），限流器一次调用只加
+数百毫秒。对延迟敏感的场景可上调 `QUANT_FUTU_RATE_PER_SEC`/`BURST`，或按需用
+`QUANT_FUTU_RATELIMIT=0` 关闭。
+
+**6) 未观察到项（如实记录，不编造）**：修复后的 5 轮真机突发（25~30 req·s⁻¹、8~12 并发、
+累计 200+ 次只读调用）**没有抓到顶层的上游 `-12006` / `-12009` / `439`**——上游是否限流
+取决于当时的整体负载（这台机器上还有运行中的 8397 服务与其他探针在打同一个上游）。
+因此：**统一信封的 `-12006` 形态、`retry_after_ms` 递减、冷却与恢复语义由离线单测逐条钉住**
+（`tests/test_v3_ratelimit.py`），真机抓到的是 `futu/rate-limited` 冷却/重试耗尽信封与
+`metrics.futu` 的真实计数；`coalesced`（单飞）与 `rateLimited`（识别）在真机上都拿到过非零值。
+
+## 六、overview 按市场看成交（`GET /api/v3/overview?market=SH|HK|US`）
+
+- `deals_today` 现在**也按市场过滤**（原来只有 `positions`/`plan`）：口径**复用**
+  `v3_universe.market_of_account_label`（其白名单就是 `v3_quality.MARKET_TRD_CODES`），
+  不另造第二套映射；实现是 `v3_ops.filter_deals_value`（内部走同一个 `filter_grouped_value`）。
+- 响应新增 `filter.deals = {market, kept, excluded, unknownMarketGroups}`：
+  `kept`/`excluded` 是**成交笔数**，`unknownMarketGroups` 是无法归因市场的分组数（**不猜**，
+  例如 `market_id=9/10/11/12/13/16`）。
+- `sections.market_scoped.deals_today` 改为事实描述（「已按账户市场过滤…」），
+  `sections.market_scoped.equity` 仍保留「equity 为台账口径，未按市场拆分」。
+- **不传 `market` 时行为与历史完全一致**（无 `filter`/`sections`/`market` 字段，`deals_today` 原样透传）。
+
+真机三市场实测（同一实例，只读）：
+
+```
+不传 market: groups = HK:0 / SH:0 / 9:0 / 10:0 / 11:0 / 12:0 / 13:0 / US:0 / 16:0   filter.deals = null
+?market=SH : groups = [SH 3182575]  filter.deals = {"market":"SH","kept":0,"excluded":0,"unknownMarketGroups":6}
+?market=HK : groups = [HK 9393]     filter.deals = {"market":"HK","kept":0,"excluded":0,"unknownMarketGroups":6}
+?market=US : groups = [US 11587526] filter.deals = {"market":"US","kept":0,"excluded":0,"unknownMarketGroups":6}
+```
+
+（当日模拟盘无成交 → `kept=0`；`excluded=0` 是因为被排除的是**未知市场分组**，
+它们计进 `unknownMarketGroups`（`market_id` 9/10/11/12/13/16）而不是按「其他市场」排除。
+`unknownMarketGroups` 是**逐次如实计数**：不同轮次实测到 6 / 5 / 1——上游按账户返回时，
+个别账户的失败会进 `errors` 而不是 `groups`（工具自身行为），分组集合因此逐次不同，
+这里不做任何平滑或补齐。
+真机当日无成交，`kept>0` / `excluded>0` / 「分组无 market 声明 → 逐行按标的前缀归因」
+这三条路径由 `tests/test_v3_ops.py::OverviewMarketScopeTests` 的夹具逐值钉住。）
+
+兼容性证据：`tests/test_v3_ops.py` 的 `OverviewMarketScopeTests` 用
+patch `create_handler` 的离线装配跑**真实 app.py 分支**，断言不传 market 时
+`deals_today`/`positions`/`plan` 与原始 value 相等且无 `market`/`filter`/`sections` 字段。

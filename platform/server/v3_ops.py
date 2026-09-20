@@ -26,7 +26,10 @@ oms/orders,oms/sync,events,audit,brain}``）。
   响应仍是审计工具的真实信封。
 * **进程内计数**：模块级计数器在**每次 v3_run 调用**时累加。``mcp`` 与 ``wb`` 两个视图读
   同一份计数（两处本来就是同一个 handle 的同一批调用，不做第二事实源）；``http`` 只统计
-  本模块注册的路由（进程内计数，不引 Prometheus）。
+  本模块注册的路由（进程内计数，不引 Prometheus）。``/api/v3/metrics`` 另加 ``futu``
+  一块（``server/v3_ratelimit.metrics_view()``：calls/coalesced/retries/rateLimited/
+  throttleWaitMs/cooldownUntil/inFlight/queued）——**真实计数**，是本进程富途限流治理的
+  唯一读数口。
 * **市场过滤（2026-09-20）**：``execution`` / ``oms/orders`` / ``brain``（以及 ``app.py`` 的
   ``overview``）支持 ``?market=SH|HK|US``——只挑分组/台账行，**既有字段一字不改**，
   另加 ``market`` 与 ``filter`` 真实计数；未登记的市场标识（``market_id`` 9/10/…）
@@ -57,7 +60,7 @@ from pathlib import Path
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from server import mcp_tools, store_access, v3_universe
+from server import mcp_tools, store_access, v3_ratelimit, v3_universe
 from server.config import config_path
 
 # ---------------------------------------------------------------------------
@@ -581,6 +584,26 @@ def filter_plan_value(value, market, note=None):
     return {**value, "plans": kept}, stats
 
 
+def filter_deals_value(value, market):
+    """``deals_today`` 的 value → 只保留该市场的成交分组；返回 ``(value, filter.deals)``。
+
+    口径**复用**，不另造：账户/分组声明的市场标识（``market`` 数值 ``market_id``、
+    数字字符串、``SH``/``HK``/``US`` 链名）经 ``v3_universe.market_of_account_label``
+    归一——那一份的白名单就是 ``v3_quality.MARKET_TRD_CODES``。未知/未登记的标识
+    （``market_id`` 9/10/…）**不猜市场**，整组排除并计入 ``unknownMarketGroups``。
+
+    统计 ``{market, kept, excluded, unknownMarketGroups}``：``kept``/``excluded`` 是
+    **成交笔数**（分组里的行数）——「按市场看成交」要看的就是笔数；需要分组级明细
+    （``keptGroups``/``attributedByRowPrefix``/``unknownMarkets``…）直接用
+    ``filter_grouped_value``，本函数只暴露契约要求的 4 个计数，不造第二份统计。
+    """
+    filtered, stats = filter_grouped_value(value, market, note="deals_today 按账户市场过滤")
+    return filtered, {"market": market,
+                      "kept": stats["keptRows"],
+                      "excluded": stats["excludedRows"],
+                      "unknownMarketGroups": stats["unknownMarketGroups"]}
+
+
 def open_hit(rows, order_id, symbol, side, qty):
     """在途订单命中（client_order_id / 备注单号 / 同标的同方向同数量）。"""
     wanted_symbol = _norm_symbol(symbol)
@@ -999,6 +1022,8 @@ def register(app, v3_run, home):
                 "toolDomains": len(DOMAINS),
                 "workbenchUp": workbench_up,
                 **metrics_snapshot(),
+                # 富途限流治理的真实计数（v3_ratelimit 唯一起源；既有字段一字不改，只加这块）
+                "futu": v3_ratelimit.metrics_view(),
                 "oms": ledger.stage_counts(),
                 "sdk": {"status": "unavailable", "reason": SDK_REASON},
                 "generated_at": _now(),

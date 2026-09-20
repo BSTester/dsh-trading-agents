@@ -56,7 +56,7 @@ from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
 from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_tools,
-                    oauth_flow, settings_api, store_access, trading)
+                    oauth_flow, settings_api, store_access, trading, v3_ratelimit)
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -877,7 +877,7 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # 不新造第二事实源）。V3 页面只读；执行入口仍在工作台 Web。
     v3_tools = {tool.definition.name: tool for tool in bound_tools}
 
-    def v3_run(name, payload=None):
+    def _raw_v3_run(name, payload=None):
         """按名调用既有工具面，返回原始信封 {ok, value|error}（不抛异常）。"""
         tool = v3_tools.get(name)
         if tool is None:
@@ -887,11 +887,29 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         except Exception as error:  # noqa: BLE001 —— 与工具面口径一致：失败进 error 信封
             return {"ok": False, "error": {"code": "v3/tool-failed", "message": str(error)[:300]}}
 
+    # 富途限流治理（v3_ratelimit = 全站唯一实现）：V3 子模块的**只读**取数里凡是触达富途的
+    # 工具（或 HTTP-only 端点）都过 limiter——令牌桶限速 + 并发上限 + 同键单飞 + 限流退避重试
+    # + 连续限流冷却；重试耗尽返回统一 `futu/rate-limited` 信封（不再是「取数失败…errcode=439」
+    # 那种会被误读成「没有数据」的泛化错误）。本地台账类工具（plan/equity/audit/schedule/…）
+    # 与**全部写/交易端点**原样直通（写端点永不在富途只读集合内）。
+    _futu_limiter = v3_ratelimit.get_limiter()
+
+    def v3_run(name, payload=None):
+        """V3 子模块取数入口：富途只读工具过全局限流器，其余原样直通。"""
+        tool = v3_tools.get(name)
+        endpoint = getattr(getattr(tool, "definition", None), "endpoint", None) or name
+        if not v3_ratelimit.is_futu_endpoint(endpoint):
+            return _raw_v3_run(name, payload)
+        return v3_ratelimit.futu_run(_futu_limiter, endpoint, payload,
+                                     lambda: _raw_v3_run(name, payload))
+
     # V3 子模块自动接线（分析 / 运维 / 外部数据源 / 密钥 / 行情 / 研报）：
     # 各自提供 register(app, v3_run, home[, wb_http])；wb_http 为既有 HTTP 端点面的处理器
     # （仅供 HTTP-only 读端点使用，例如研究值勤队列 research-tasks-list）。
     def _wb_http(endpoint, payload=None):
-        return handle(endpoint, payload or {})
+        # 与 v3_run 同一份限流口径：HTTP-only 端点里触达富途的（如数据面 info_rehab）同样受治理。
+        return v3_ratelimit.futu_run(_futu_limiter, endpoint, payload,
+                                     lambda: handle(endpoint, payload or {}))
 
     for _v3_module in ("v3_market", "v3_risk", "v3_credentials", "v3_research",
                        "v3_analytics", "v3_ops", "v3_sources",
@@ -918,7 +936,8 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         """V3 系统概览：台账权益/持仓/今日成交/冻结计划/调度心跳/数据源健康/推送状态。
 
         ``?market=SH|HK|US``（缺省不过滤，与历史完全一致）：``positions`` 按账户市场过滤、
-        ``plan.plans`` 按目标标的市场过滤；``equity`` 是**单一台账**（跨市场不可拆）→ 保留
+        ``plan.plans`` 按目标标的市场过滤、``deals_today`` 按账户市场过滤（2026-09-20 加强，
+        口径与 positions 同一份）；``equity`` 是**单一台账**（跨市场不可拆）→ 保留
         原值并在 ``sections.market_scoped`` 里说明。过滤实现在 ``server.v3_ops``。
         """
         wanted = {
@@ -968,17 +987,28 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
                 values.get("positions"), code, note="positions 按账户市场过滤（不跨市场合并）")
             plan_value, plan_stats = _v3_ops.filter_plan_value(
                 values.get("plan"), code, note="plan.plans 按 target 标的市场过滤")
+            # deals_today 同样按市场过滤（2026-09-20 加强）：口径是 accounts/链名 → 市场，
+            # 与 positions 复用**同一份** v3_quality.MARKET_TRD_CODES + v3_universe
+            # （market_of_account_label），不另造第二套映射。不传 market 时整段不执行，
+            # 行为与历史完全一致。
+            deals_value, deals_stats = _v3_ops.filter_deals_value(
+                values.get("deals_today"), code)
             content["market"] = code
             content["positions"] = positions
             content["plan"] = plan_value
-            content["filter"] = {"positions": positions_stats, "plan": plan_stats}
+            content["deals_today"] = deals_value
+            content["filter"] = {"positions": positions_stats, "plan": plan_stats,
+                                 "deals": deals_stats}
             content["sections"] = {"market_scoped": {
                 "market": code,
                 "positions": "按账户市场（数值 market_id / 市场链名）过滤，不跨市场合并",
                 "plan": "plans 只保留 target 含该市场标的的计划（target 原样不裁剪）",
                 "equity": "equity 为台账口径，未按市场拆分（本地模拟台账不分市场）",
-                "deals_today": "overview 不按市场过滤 deals_today；按市场看成交请用 "
-                               "/api/v3/execution?market=",
+                "deals_today": "已按账户市场过滤：只保留分组 market 属于该市场的成交"
+                               "（口径同 positions——v3_quality.MARKET_TRD_CODES + "
+                               "v3_universe.market_of_account_label；filter.deals 里 "
+                               "kept/excluded 是成交笔数，unknownMarketGroups 是无法归因"
+                               "市场的分组数，不猜）",
                 "schedule": "调度心跳与数据源健康没有市场口径，原样保留",
             }}
         return JSONResponse(status_code=200, content=content)

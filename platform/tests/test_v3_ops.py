@@ -20,7 +20,9 @@
 
 运行：``cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_ops -v``
 """
+import copy
 import json
+import logging
 import os
 import shutil
 import sys
@@ -132,8 +134,11 @@ class MetricsTests(V3OpsTestCase):
     def test_shape_counters_and_sdk_honesty(self):
         body = self.get("/api/v3/metrics")
         for key in ("ok", "toolTotal", "toolDomains", "workbenchUp", "mcp", "wb", "http",
-                    "oms", "sdk", "generated_at"):
+                    "oms", "sdk", "generated_at", "futu"):
             self.assertIn(key, body)
+        for key in ("enabled", "calls", "coalesced", "retries", "rateLimited",
+                    "throttleWaitMs", "cooldownUntil", "inFlight", "queued"):
+            self.assertIn(key, body["futu"], "metrics.futu 是限流治理的真实读数口")
         self.assertTrue(body["ok"])
         self.assertEqual(body["toolTotal"], v3_ops.catalog_total())
         self.assertEqual(body["toolDomains"], 6)
@@ -743,6 +748,193 @@ class UnitTests(unittest.TestCase):
         self.assertTrue(set(v3_ops.WB_TOOL_NAMES) <= names)
         self.assertEqual(len(v3_ops.WB_TOOL_NAMES), len(mcp_tools.TOOLS))
         self.assertEqual(v3_ops.catalog_total(catalog), len(mcp_tools.TOOLS) + 5)
+
+
+# ---------------------------------------------------------------------------
+# /api/v3/overview?market=（deals_today 也按市场过滤，2026-09-20 加强）
+# ---------------------------------------------------------------------------
+class _DummyScheduler:
+    """只为装配 create_app：不起线程、不做任何事（limits 由 lifespan 驱动，本测试不进）。"""
+
+    def start(self):
+        return None
+
+    def stop(self):
+        return None
+
+
+class _DummyPush:
+    quote_cache = None
+
+
+class OverviewMarketScopeTests(unittest.TestCase):
+    """``GET /api/v3/overview?market=``：positions / plan / **deals_today** 同口径过滤。
+
+    装配方式：patch ``server.app.create_handler`` 返回记录型假 handle（离线、零网络），
+    其余 V3 子模块照常自动接线——因此**同一个** app.py 市场分支与
+    ``v3_ops.filter_deals_value`` 都被真实跑到，而不是测试里重写一份逻辑。
+    """
+
+    def setUp(self):
+        from server import app as app_module
+        from server import v3_ratelimit, v3_universe
+
+        self.app_module = app_module
+        self.ratelimit = v3_ratelimit
+        v3_universe.clear_cache()
+        # 本环境的 httpx 日志器名是 ``httpx2``（装配链里还顺手 basicConfig 了 root）
+        self._loggers = [logging.getLogger("httpx"), logging.getLogger("httpx2")]
+        for logger in self._loggers:
+            self.addCleanup(logger.setLevel, logger.level)
+        root_logger = logging.getLogger()
+        self._root_level = root_logger.level
+        self._root_handlers = list(root_logger.handlers)
+        self.addCleanup(self._restore_root_logging)
+        self.home = Path(tempfile.mkdtemp(prefix="v3-overview-"))
+        self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
+        # 每个用例一份干净 limiter：app.py 接线时抓到它，/api/v3/metrics 读的也是它。
+        self.limiter = v3_ratelimit.FutuLimiter(rate_per_sec=1000.0, burst=1000)
+        v3_ratelimit.reset_limiter(self.limiter)
+        self.addCleanup(v3_ratelimit.reset_limiter, None)
+
+        self.raw = {
+            "equity": {"ok": True, "value": {"current": 100000.0, "mode": "sim"}},
+            "positions": {"ok": True, "value": {
+                "mode": "sim", "as_of": DAY, "source": "futu/sim_trade_position_list",
+                "groups": [
+                    {"acc_id": "HK-1", "market": 1,
+                     "positions": [{"symbol": "00700", "market_val": 100.0}]},
+                    {"acc_id": "SH-1", "market": 3,
+                     "positions": [{"symbol": "600000", "market_val": 200.0}]},
+                    {"acc_id": "OPT-1", "market": 9,
+                     "positions": [{"symbol": "00700", "market_val": 400.0}]}]}},
+            "deals_today": {"ok": True, "value": {
+                "mode": "sim", "as_of": DAY, "source": "futu/sim_trade_order_list(derived)",
+                "groups": [
+                    {"acc_id": "HK-1", "market": "HK",
+                     "rows": [{"deal_id": "D1", "code": "HK.00700"}]},
+                    {"acc_id": "SH-1", "market": "SH",
+                     "rows": [{"deal_id": "D2", "code": "SH.600000"},
+                              {"deal_id": "D3", "code": "SH.600009"}]},
+                    {"acc_id": "OPT-1", "market": "9",
+                     "rows": [{"deal_id": "D4", "code": "SG.X"}]},
+                    # 实盘账户分组没有 market 声明 → 逐行按标的前缀归因（同一份口径）
+                    {"acc_id": "LIVE-1",
+                     "rows": [{"deal_id": "D5", "code": "HK.00700"},
+                              {"deal_id": "D6", "code": "SH.600000"}]}]}},
+            "plan": {"ok": True, "value": {"plans": [
+                {"plan_id": "P-HK", "target": {"HK.00700": 1}},
+                {"plan_id": "P-SH", "target": {"SH.600000": 1}}]}},
+            "schedule": {"ok": True, "value": {"heartbeat": {"at": DAY}}},
+            "sources": {"ok": True, "value": {"channels": []}},
+            "snapshot": {"ok": True, "value": {"mode": "sim"}},
+            "push_status": {"ok": True, "value": {"enabled": False}},
+        }
+        self.handle_calls = []
+
+        def fake_handle(endpoint, payload=None):
+            self.handle_calls.append((endpoint, dict(payload or {})))
+            if endpoint not in self.raw:
+                return {"ok": False, "error": {"code": "trading/unknown-endpoint",
+                                               "message": endpoint}}
+            return copy.deepcopy(self.raw[endpoint])
+
+        self.handle = fake_handle
+        patcher = unittest.mock.patch.object(app_module, "create_handler",
+                                             lambda *args, **kwargs: fake_handle)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.app = app_module.create_app(home=str(self.home), dist=str(self.home), config={},
+                                         scheduler=_DummyScheduler(), futu=object(),
+                                         push=_DummyPush())
+        # 装配链把 root 拉到 INFO 并加了 handler——装配之后再静音，避免测试输出刷屏。
+        for logger in self._loggers:
+            logger.setLevel(logging.WARNING)
+        self.client = TestClient(self.app)
+
+    def _restore_root_logging(self):
+        """装配链的 basicConfig 会往 root 加 handler/改级别——收尾还原，别污染后续用例输出。"""
+        root_logger = logging.getLogger()
+        for handler in list(root_logger.handlers):
+            if handler not in self._root_handlers:
+                root_logger.removeHandler(handler)
+        root_logger.setLevel(self._root_level)
+
+    def get(self, path):
+        response = self.client.get(path)
+        self.assertEqual(response.status_code, 200, response.text)
+        return response.json()
+
+    def test_overview_market_filters_deals_today(self):
+        body = self.get("/api/v3/overview?market=HK")
+        self.assertTrue(body["ok"], body)
+        self.assertEqual(body["market"], "HK")
+        self.assertEqual([g["acc_id"] for g in body["deals_today"]["groups"]],
+                         ["HK-1", "LIVE-1"],
+                         "LIVE-1 没有 market 声明 → 只保留按标的前缀归到 HK 的行")
+        self.assertEqual([row["deal_id"] for row
+                          in body["deals_today"]["groups"][0]["rows"]], ["D1"])
+        self.assertEqual([row["deal_id"] for row
+                          in body["deals_today"]["groups"][1]["rows"]], ["D5"],
+                         "无市场声明的分组逐行归因（SH.600000 被排除）")
+        self.assertEqual(body["filter"]["deals"],
+                         {"market": "HK", "kept": 2, "excluded": 4,
+                          "unknownMarketGroups": 1},
+                         "kept/excluded 是成交笔数；market_id=9 不猜市场，如实计未知")
+        self.assertEqual([g["acc_id"] for g in body["positions"]["groups"]], ["HK-1"])
+        self.assertEqual(body["filter"]["positions"]["keptGroups"], 1)
+        self.assertEqual([p["plan_id"] for p in body["plan"]["plans"]], ["P-HK"])
+        self.assertEqual(body["filter"]["plan"]["keptPlans"], 1)
+
+    def test_overview_sections_say_deals_is_market_scoped(self):
+        body = self.get("/api/v3/overview?market=HK")
+        sections = body["sections"]["market_scoped"]
+        self.assertIn("已按账户市场过滤", sections["deals_today"])
+        self.assertNotIn("不按市场过滤", sections["deals_today"])
+        self.assertIn("台账口径", sections["equity"])
+        self.assertIn("未按市场拆分", sections["equity"])
+        self.assertEqual(body["equity"], self.raw["equity"]["value"],
+                         "equity 是单一台账：原样保留，不按市场拆分")
+
+    def test_overview_counts_an_empty_market_honestly(self):
+        body = self.get("/api/v3/overview?market=US")
+        self.assertEqual(body["deals_today"]["groups"], [])
+        self.assertEqual(body["filter"]["deals"],
+                         {"market": "US", "kept": 0, "excluded": 6,
+                          "unknownMarketGroups": 2},
+                         "OPT-1（market_id=9）与 LIVE-1（无声明且一行都归不到 US）"
+                         "都如实计未知，绝不错归到某个市场")
+
+    def test_overview_without_market_is_untouched(self):
+        body = self.get("/api/v3/overview")
+        self.assertEqual(body["deals_today"], self.raw["deals_today"]["value"],
+                         "不传 market 时 deals_today 原样透传（与历史完全一致）")
+        self.assertEqual(body["positions"], self.raw["positions"]["value"])
+        self.assertEqual(body["plan"], self.raw["plan"]["value"])
+        self.assertNotIn("market", body)
+        self.assertNotIn("filter", body)
+        self.assertNotIn("sections", body)
+
+    def test_overview_bad_market(self):
+        body = self.get("/api/v3/overview?market=MARS")
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"]["code"], "market/bad-market")
+
+    def test_overview_futu_tools_go_through_the_limiter(self):
+        marker = len(self.handle_calls)
+        self.get("/api/v3/overview?market=HK")
+        endpoints = [endpoint for endpoint, _ in self.handle_calls[marker:]]
+        futu = [endpoint for endpoint in endpoints if self.ratelimit.is_futu_tool(endpoint)]
+        self.assertTrue(futu, f"overview 里应有富途工具：{endpoints}")
+        for local in ("equity", "plan", "schedule"):
+            self.assertNotIn(local, futu, f"{local} 是本地台账工具，不进限流器")
+        view = self.get("/api/v3/metrics")["futu"]
+        self.assertEqual(view["calls"], len(futu), "限流器计数 = 富途工具调用数")
+        self.assertEqual(view["inFlight"], 0)
+        for key in ("enabled", "calls", "coalesced", "retries", "rateLimited",
+                    "throttleWaitMs", "cooldownUntil", "cooldownRemainingMs",
+                    "inFlight", "queued"):
+            self.assertIn(key, view)
 
 
 if __name__ == "__main__":
