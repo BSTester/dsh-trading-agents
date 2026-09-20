@@ -179,18 +179,19 @@ class WebTtlMirrorTests(unittest.TestCase):
     与 WP8 实时直通族）不在本测试范围，避免把既有其它口径一并锁死。
     """
 
-    # 设计稿版控制台是无模块经典脚本，**没有客户端 TTL 缓存表**：
-    # 原 AntD 客户端 api.js 的 TTL 镜像随该客户端一并删除，改为钉住「控制台不引入缓存表」。
-    V3_SHARED = _REPO / "platform" / "web" / "public" / "v3" / "shared.js"
+    # 现行 V3 工作台（platform/web-pro）的客户端层每次取数都直连 /api/v3/*，
+    # **没有客户端 TTL 缓存表**：原 AntD 客户端的 TTL 镜像已随旧版删除，
+    # 这里钉住「控制台不引入缓存表」这一更强性质（不可能与服务端 TTL 漂移）。
+    V3_SHARED = _REPO / "platform" / "web-pro" / "src" / "services" / "api.js"
     #: JS 数字字面量（允许下划线分隔，如 21_600_000）；键名可含数字（''f10_detail''）——
     #: 必须以字母开头，否则 '_detail' 这类子串会被误当键名。
     _ENTRY_RE = re.compile(r"([a-z][a-z_0-9]*):\s*([0-9_]+)\s*,")
 
     def _web_ttls(self):
-        """设计稿版控制台**不应**有客户端 TTL 表：返回空表即表示「无第二份 TTL 事实源」。
+        """工作台**不应**有客户端 TTL 表：返回空表即表示「无第二份 TTL 事实源」。
 
-        原实现解析 AntD 客户端 api.js 的 TTL_MS 表并与服务端逐项比对；该客户端已随旧版
-        删除。现在钉住的是更强的性质：控制台侧不存在 TTL 表，因此不可能与服务端漂移。
+        原实现解析旧客户端的 TTL_MS 表并与服务端逐项比对；该客户端已随旧版删除。
+        现在钉住的是更强的性质：控制台侧不存在 TTL 表，因此不可能与服务端漂移。
         """
         text = self.V3_SHARED.read_text(encoding="utf-8")
         self.assertNotIn("TTL_MS", text, "控制台不应引入客户端 TTL 缓存表")

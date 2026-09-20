@@ -1,7 +1,7 @@
 """WP24 锁定测试：标的联想候选的跨语言镜像 + snapshot 关注池载荷。
 
 本次改动把「代码 → 富途 MARKET.CODE」的归一规则**抄了一份到前端**
-（``platform/web/lib/services/symbols.js``）：输入框要能在用户敲代码时立刻给出候选，
+（``platform/js/services/symbols.js``）：输入框要能在用户敲代码时立刻给出候选，
 而候选值必须是带前缀的写法（``SH.600519``），所以前端必须本地归一。规则在后端已有唯一
 实现 ``trading_datasource.market.to_futu_symbol``——抄一份就有漂移风险：后端改了 6 位数字
 的首位分档（6/9→SH、4/8→BJ）、或改了港股补零位数，前端会继续按旧规则产出**看起来正常
@@ -33,7 +33,7 @@ sys.path.insert(0, str(ROOT / "platform"))
 from trading_datasource.market import to_futu_symbol  # noqa: E402
 from trading_core.watchlist import watchlist_symbols  # noqa: E402
 
-SYMBOLS_JS = ROOT / "platform" / "web" / "lib" / "services" / "symbols.js"  # 共享契约源（随 UI 一起搬到 lib/）
+SYMBOLS_JS = ROOT / "platform" / "js" / "services" / "symbols.js"  # 共享契约源（随 UI 一起搬到 lib/）
 
 
 def _js_source():

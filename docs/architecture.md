@@ -317,7 +317,7 @@ futu → AKShare → Yahoo）、`last30days`（可选组件，未安装即缺席
 
 | 层 | 位置 | 作用 |
 |---|---|---|
-| 客户端内存缓存 | `platform/web/lib/services/api.js`（按接口 TTL，对齐旧 client.js） | 切页签、重开页面不再重复请求 |
+| 客户端内存缓存 | `platform/js/services/api.js`（按接口 TTL，对齐旧 client.js） | 切页签、重开页面不再重复请求 |
 | 服务 TTL 缓存 | `platform/server/caches.py` 的 `CACHE_TTL_MS`（按接口粒度，1–30 分钟） | 即使客户端重新请求也不会重跑取数 |
 
 `_refresh: true` 是显式旁路标记（不参与各接口的字段校验）；页面的「刷新」按钮会清空

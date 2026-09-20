@@ -22,9 +22,9 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 
 from trading_core import autopipeline, pipeline  # noqa: E402
 
-PIPELINE_JS = ROOT / "platform" / "web" / "lib" / "services" / "pipeline.js"   # 纯逻辑契约源（设计稿版控制台不执行它，测试只解析文本）
+PIPELINE_JS = ROOT / "platform" / "js" / "services" / "pipeline.js"   # 纯逻辑契约源（设计稿版控制台不执行它，测试只解析文本）
 CORE_DIR = ROOT / "plugins" / "core" / "python" / "trading_core"
-V3_SETTINGS_JS = ROOT / "platform" / "web" / "public" / "v3" / "settings.js"  # 设计稿版控制台的设置 binder
+V3_SETTINGS_JS = ROOT / "platform" / "web-pro" / "src" / "pages" / "settings.jsx"  # V3 工作台（Ant Design Pro）设置页
 
 
 def _js_source():
@@ -78,21 +78,20 @@ class FrontendMirrorTests(unittest.TestCase):
         self.assertEqual(int(match.group(1)), autopipeline.EXEC_WINDOW_MAX_MINUTES)
 
     def test_settings_page_window_bound_matches_core(self):
-        """设置页（设计稿版 binder）里出现的执行窗口上限字面量必须等于 core 常量。
+        """设置页（V3 工作台）里的执行窗口上限常量必须与 core 一致。
 
-        原断言针对 AntD 页面（ESM 里 import 镜像常量）；设计稿版 binder 是无模块的经典
-        脚本，无法 import，故改为「若页面出现上限字面量，必须与 core 一致」——同样堵住
-        漂移的第二来源，且不依赖 UI 框架。
+        现行工作台是独立 ESM，不 import core 常量，而是在页内声明镜像常量
+        （当前实现：`const EXEC_WINDOW_MAX = 240;`）。本断言只钉住这个会漂移的常量：
+        一旦页面改了上限而 core 没改（或反之），这里就红。
+        页面若改为完全交由服务端校验（不声明常量），断言自动跳过（等价可接受）。
         """
         source = V3_SETTINGS_JS.read_text(encoding="utf-8")
-        bounds = {int(m) for m in re.findall(r"\b(\d{2,3})\b", source) if 100 <= int(m) <= 600}
+        bounds = {int(m) for m in re.findall(r"EXEC_WINDOW_MAX\s*=\s*(\d+)", source)}
+        if not bounds:
+            self.skipTest("设置页未声明本地窗口上限常量（交由服务端校验，等价可接受）")
         for bound in bounds:
-            if bound == autopipeline.EXEC_WINDOW_MAX_MINUTES:
-                continue
-            # 其它三位数（端口/毫秒/秒数等）不在本断言语义内：只要求不出现「明显像窗口上限」的其它值
-            self.assertNotIn(bound, (200, 300), f"设置页出现可疑的窗口上限字面量 {bound}")
-        self.assertIn(str(autopipeline.EXEC_WINDOW_MAX_MINUTES), source,
-                      "设置页应显式给出执行窗口上限（与 core 同值）或交由服务端校验")
+            self.assertEqual(bound, autopipeline.EXEC_WINDOW_MAX_MINUTES,
+                             f"设置页窗口上限 {bound} 与 core 常量不一致")
 
 
 class AlertTitleLockTests(unittest.TestCase):

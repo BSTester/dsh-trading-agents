@@ -27,7 +27,7 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 
 from trading_core import autopipeline, daemon, pipeline, planner, store  # noqa: E402
 
-PIPELINE_JS = ROOT / "platform" / "web" / "lib" / "services" / "pipeline.js"   # 纯逻辑契约源（设计稿版控制台不执行它，测试只解析文本）
+PIPELINE_JS = ROOT / "platform" / "js" / "services" / "pipeline.js"   # 纯逻辑契约源（设计稿版控制台不执行它，测试只解析文本）
 APP_JSX = None  # 原 AntD 应用的 app.jsx 已删除（见 V3 控制台改造）；依赖它的断言在下方显式 skip
 
 
@@ -59,7 +59,7 @@ def _page_keys():
     """已停用：原 AntD 应用（app.jsx）已删除，哈希路由页面集合不再存在。
 
     设计稿版控制台是 9 个独立 HTML 页面（/v3/<page>.html），页面集合由
-    platform/web/tests/v3-console.test.mjs 钉住。
+    platform/web-pro/tests/console-parity.test.mjs 钉住。
     """
     raise unittest.SkipTest("app.jsx 已随 AntD 应用删除；页面集合改由 v3-console.test.mjs 钉住")
     source = APP_JSX.read_text(encoding="utf-8")

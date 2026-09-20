@@ -1,9 +1,9 @@
 import { defineConfig } from "vite";
 import react from "@vitejs/plugin-react";
 
-// base=/pro/：构建产物由 FastAPI 在 /pro/* 下直接服务（与设计稿版 /v3/ 并存）
+// base=/：构建产物由 FastAPI 在**根路径**直接服务（设计稿原样版已删除）
 export default defineConfig({
-  base: "/pro/",
+  base: "/",
   plugins: [react()],
   build: { outDir: "dist", emptyOutDir: true, chunkSizeWarningLimit: 3000 },
 });

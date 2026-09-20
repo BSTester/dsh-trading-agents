@@ -10,7 +10,7 @@
  *   ② 页面事实：真 Chromium（CDP）加载 `http://127.0.0.1:8397/#/<route>`，抓取 antd
  *      Statistic / Descriptions / Table 的**标签→渲染文本**（含 `—` 的单元格），
  *      以及内容区全文（排除「原始返回」折叠块，那是 JSON 逃生口，不该按展示文本判）；
- *   ③ 判定：按 `EXPECT` 里的**格式契约**（与 `platform/web/lib/services/formatCore.js`
+ *   ③ 判定：按 `EXPECT` 里的**格式契约**（与 `platform/js/services/formatCore.js`
  *      同一口径）算出「后端值应显示成什么」，与渲染文本比对，给出判定码。
  *
  * 判定码（每条都在报告里带后端值/渲染值/说明，不做无证据的结论）：
@@ -52,7 +52,7 @@ import { pathToFileURL } from "node:url";
 // 负责把它与这份真实实现锁在一起（工具不能靠引用被测实现来自证正确）。
 import {
   clockText, dayText, minuteText, numText, pctOfText, stampText,
-} from "../platform/web/lib/services/formatCore.js";
+} from "../platform/js/services/formatCore.js";
 
 const BASE = process.env.AUDIT_BASE ?? "http://127.0.0.1:8397";
 const CHROME = process.env.AUDIT_CHROME

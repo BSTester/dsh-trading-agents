@@ -21,7 +21,7 @@
 
 ### 1. `TUSHARE_TOKEN`（唯一必须的密钥）—— **可在页面上配置**
 
-**方式 A（推荐，无需碰命令行）**：打开 `/v3/settings.html`（接入与授权）→「密钥与授权」卡片 →
+**方式 A（推荐，无需碰命令行）**：打开 `#/settings`（接入与授权）→「密钥与授权」卡片 →
 粘贴 token → **保存** → 点 **测试连通性**（真实调用 Tushare `trade_cal`，返回延迟与上游消息）。
 
 - 凭据落 `<DSH_HOME>/v3-credentials.json`，**0600**，原子写；
@@ -64,16 +64,21 @@ curl -s "localhost:8397/api/v3/tushare?api=income&ts_code=600519.SH&period=20260
 - 若需要：`~/.dsh/trading-venv/bin/pip install openbb`（体积较大，且需与 Python 3.13 兼容）。
 - 未安装时 `/api/v3/openbb` 返回 `openbb/unavailable`，**不发请求**。
 
-## 二·五、两种前端实现（同一套后端与数据）
+## 二·五、前端：Ant Design Pro 工作台（挂在根路径）
 
-| 版本 | 访问 | 实现 | 构建 |
-|---|---|---|---|
-| **设计稿原样版**（基准） | `http://127.0.0.1:8397/v3/<page>.html`（根路径 `/` → 307 跳此） | OpenDesign 设计稿的 HTML/CSS **原样**（`platform/web/public/v3/`）+ 每页一个数据 binder；`platform/tools/compare_with_design.sh` 逐字节校验与设计稿一致 | **无构建**（静态文件直服） |
-| **Ant Design Pro 工作台** | `http://127.0.0.1:8397/pro/#/<key>` | `platform/web-pro`（Vite + React + antd + pro-components，`base=/pro/`）；菜单分组（监控/研究/交易/系统）与功能模块与设计稿版**一一对应** | `cd platform/web-pro && npm run build`（产物 `dist/`，由 FastAPI 在 `/pro/*` 下服务，未命中回落 index.html） |
+V3 工作台是 `platform/web-pro`（Vite + React18 + antd5 + @ant-design/pro-components）的构建产物，
+由 FastAPI 在**根路径**直接服务：
 
-两版**共用同一套接口**：读 `GET /api/v3/*`，写 `POST /api/wb/*`（受约束入口）。
-两版页头/顶栏互相提供跳转链接（设计稿版的链接由 `shared.js` 运行时注入，不改设计稿 HTML）。
-约定一致：取不到显式「无数据源 + 原因」，**任何一版都不出现示例/占位数据**；密钥只显示状态与掩码。
+```bash
+cd platform/web-pro && npm run build        # 产物 dist/（改页面后必须重新构建）
+cd platform && ~/.dsh/trading-venv/bin/python -m server.run   # http://127.0.0.1:8397
+```
+
+- 入口：`http://127.0.0.1:8397/` → 9 个页面走 hash 路由 `#/<key>`（overview/brain/market/strategy/
+  risk/execution/gateway/tools/settings）
+- 菜单分组与设计稿导航一致：监控 · 研究 · 交易 · 系统
+- 数据只有两条通道：读 `GET /api/v3/*`、写 `POST /api/wb/*`（受约束入口）；缺失数据源显式标注，无占位数据
+- 历史 URL `/v3/*`、`/pro/*` 已随旧版删除，但静态兜底会回落工作台首页，不会死链
 
 ## 三、页面与接口对应
 
@@ -84,15 +89,15 @@ V3 控制台是 **OpenDesign 设计稿的 HTML/CSS 原样页面**（`platform/we
 
 | 页面（hash 路由） | 接口 |
 |---|---|
-| `/v3/index.html` 系统概览 | `/api/v3/overview` |
-| `/v3/brain.html` 决策大脑 | `/api/v3/brain` |
-| `/v3/market.html` 行情与信号 | `/api/v3/market`、`/market/watchlist`、`/factors/matrix`、`/plates`、`/orderbook` |
-| `/v3/strategy.html` 策略与因子 | `/api/v3/strategy`、`/factors/matrix`、`/ml/sweep`、`/ml/backtest` |
-| `/v3/risk.html` 风险监控 | `/api/v3/risk/analytics`、`/risk`、`/oms/orders`、`/events` |
-| `/v3/execution.html` 执行与审批 | `/api/v3/execution`、`/oms/orders`、`/audit` |
-| `/v3/gateway.html` 网关与调度 | `/api/v3/gateway`、`/metrics` |
-| `/v3/tools.html` 工具域治理 | `/api/v3/tools`、`/metrics` |
-| `/v3/settings.html` 接入与授权 | `/api/v3/settings`、`/metrics`、`/news`、`/financials`、`/tushare`、`/openbb` |
+| `#/overview` 系统概览 | `/api/v3/overview` |
+| `#/brain` 决策大脑 | `/api/v3/brain` |
+| `#/market` 行情与信号 | `/api/v3/market`、`/market/watchlist`、`/factors/matrix`、`/plates`、`/orderbook` |
+| `#/strategy` 策略与因子 | `/api/v3/strategy`、`/factors/matrix`、`/ml/sweep`、`/ml/backtest` |
+| `#/risk` 风险监控 | `/api/v3/risk/analytics`、`/risk`、`/oms/orders`、`/events` |
+| `#/execution` 执行与审批 | `/api/v3/execution`、`/oms/orders`、`/audit` |
+| `#/gateway` 网关与调度 | `/api/v3/gateway`、`/metrics` |
+| `#/tools` 工具域治理 | `/api/v3/tools`、`/metrics` |
+| `#/settings` 接入与授权 | `/api/v3/settings`、`/metrics`、`/news`、`/financials`、`/tushare`、`/openbb` |
 
 ## 四、部署与自检
 
@@ -102,10 +107,8 @@ V3 控制台是 **OpenDesign 设计稿的 HTML/CSS 原样页面**（`platform/we
 # 服务（构建产物在 platform/web/dist，FastAPI 静态兜底直接打开）
 cd platform && ~/.dsh/trading-venv/bin/python -m server.run     # http://127.0.0.1:8397
 
-# 逐页验收（无「示例」、无设计稿残留占位数字、真实值命中、设计结构锚点、无崩溃）
-bash platform/tools/verify_v3_pages.sh http://127.0.0.1:8397
-# 设计稿保真度（服务端 HTML 与设计稿源文件逐字节一致）
-bash platform/tools/compare_with_design.sh http://127.0.0.1:8397
+# 逐页验收（9 路由：无「示例」、无设计稿残留占位数字、关键模块命中、菜单分组可见、无崩溃/白屏）
+bash platform/tools/verify_pages.sh http://127.0.0.1:8397
 ```
 
 ## 五、诚实性约定（实现层面强制）

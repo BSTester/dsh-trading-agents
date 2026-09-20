@@ -183,8 +183,7 @@ Harness 会用原生工具与子代理完成四位分析师报告、多空辩论
 ├── agent.cordis.yml / preset.yml / AGENTS.md   # 对话模式组合 / 模式元数据 / 工程级常驻指令
 ├── skills/     # trading-agents、quant-trading、research-institute、futu-skills（+ 可选 last30days-bridge）
 ├── plugins/    # 库 datasource、core；插件 engine、fin-data、workbench、futu-keepalive、platform-autostart
-├── platform/   # server/（FastAPI 单进程）+ web/（设计稿原样版 V3：public/v3，无构建）
-│              #   + web-pro/（Ant Design Pro 工作台：/pro/*，需 npm run build）
+├── platform/   # server/（FastAPI 单进程）+ web-pro/（V3 工作台：Ant Design Pro，产物挂根路径）
 ├── scripts/    # install_plugins.py（安装自检）、platform_service.sh（启停）、e2e_*（验收）、futu_auth.py
 ├── install/    # systemd 单元（research-duty.*）、HARNESS_SETUP.md 与 install.sh / install.ps1
 ├── tests/      # Python / Node 两套测试（前端测试在 platform/web/tests/）

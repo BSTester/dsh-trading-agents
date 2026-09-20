@@ -77,9 +77,9 @@ MIME = {
 }
 
 MAX_PAYLOAD = 1024 * 1024  # 与 Node 原实现（已退役）collectBody 默认上限一致
-#: 静态根：V3 控制台是设计稿原样页面（platform/web/public/v3），**没有构建步骤**——
-#: 页面即服务文件（对照 platform/tools/compare_with_design.sh 的逐字节保真校验）。
-DEFAULT_DIST = Path(__file__).resolve().parent.parent / "web" / "public"
+#: 静态根：V3 工作台（Ant Design Pro 版，platform/web-pro）构建产物，挂在**根路径**。
+#: 构建：cd platform/web-pro && npm run build（产物 dist/，由本服务在 / 下直接服务）。
+DEFAULT_DIST = Path(__file__).resolve().parent.parent / "web-pro" / "dist"
 
 # 兜底路由的方法面：Node 原实现（已退役）对每个路径段都只按「是不是 POST/GET」分派，
 # 其余方法一律落统一信封，因此这里收全 HTTP 方法，绝不再落到 Starlette 的默认 405。
@@ -942,39 +942,6 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # 精确命中（见 guard 的「等值或前缀」说明）。
     app.router.routes.extend(mcp_app.routes)
 
-    # V3 工作台（Ant Design Pro 版）静态服务：/pro/* ← platform/web-pro/dist
-    # 与设计稿原样版（/v3/*）并存：同一套 /api/v3 与 /api/wb 接口，两种前端实现。
-    pro_root = Path(__file__).resolve().parent.parent / "web-pro" / "dist"
-
-    @app.get("/pro")
-    async def pro_root_redirect():
-        from fastapi.responses import RedirectResponse
-
-        return RedirectResponse(url="/pro/", status_code=307)
-
-    @app.get("/pro/{path:path}")
-    async def pro_static(path: str):
-        """AntD 工作台静态文件；未命中的路径回落 index.html（hash 路由，无服务端路由需求）。"""
-        from fastapi.responses import FileResponse, PlainTextResponse
-
-        if not pro_root.exists():
-            return PlainTextResponse("工作台未构建：cd platform/web-pro && npm run build", status_code=503)
-        candidate = (pro_root / path).resolve()
-        if str(candidate).startswith(str(pro_root.resolve())) and candidate.is_file():
-            return FileResponse(candidate)
-        return FileResponse(pro_root / "index.html")
-
-    @app.get("/")
-    async def v3_console_root():
-        """根路径 → V3 控制台首页（设计稿原样页面）。
-
-        AntD 版工作台仍在 ``/index.html``；V3 控制台是设计稿的 HTML/CSS 原样页面
-        （菜单、布局、卡片、图表形态与设计稿完全一致），数据由 /api/v3/* 注入。
-        """
-        from fastapi.responses import RedirectResponse
-
-        return RedirectResponse(url="/v3/index.html", status_code=307)
-
     @app.get("/{path:path}")
     async def static_files(path: str):
         """Node 原实现（已退役）：GET 走静态托管 + SPA 兜底。"""
@@ -1031,7 +998,7 @@ def _serve_static_sync(root, url_path):
             target = index
         else:
             return error_envelope("trading/not-found",
-                                  "前端未构建（npm --prefix platform/web run build）", 404)
+                                  "前端未构建（npm --prefix platform/web-pro run build）", 404)
     try:
         content = Path(target).read_bytes()
     except OSError as error:

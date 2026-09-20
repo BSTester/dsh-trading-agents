@@ -28,6 +28,7 @@ import {
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
 import { CandleChart } from "../components/charts.jsx";
+import DataDomainCard from "../components/dataDomain.jsx";
 
 const { Text, Title } = Typography;
 
@@ -803,6 +804,8 @@ export default function MarketPage() {
           </>
         )}
       </ProCard>
+      {/* 数据域：把后端外部数据源端点（news/financials/tushare/openbb/spot）全部对到界面 */}
+      <DataDomainCard />
     </Space>
   );
 }

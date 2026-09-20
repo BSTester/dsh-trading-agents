@@ -12,7 +12,7 @@
 页面上只是「没动静」——没有任何线索指向真正的原因。本文件把「选项化」与「写入侧
 fail-closed 校验」两件事钉住：
 
-  * ``FrontendStrategyMirrorTests`` —— ``platform/web/lib/services/strategies.js`` 的
+  * ``FrontendStrategyMirrorTests`` —— ``platform/js/services/strategies.js`` 的
     内置策略清单与 core ``REGISTRY`` 的**漂移锁**（正则解析 JS 源码 + Python 常量比对，
     沿用 ``tests/test_wp10_locks.py`` 手法：不相信「记得同步」）；
   * ``SettingsPageControlTests`` —— 设置页那 4 个字段不再是自由文本框的结构锁
@@ -44,8 +44,8 @@ from server import settings_api  # noqa: E402
 from server.store_access import WorkbenchError  # noqa: E402
 from trading_core import autopipeline, rule_engine, store, strategies, watchlist  # noqa: E402
 
-STRATEGIES_JS = ROOT / "platform" / "web" / "lib" / "services" / "strategies.js"
-PIPELINE_JS = ROOT / "platform" / "web" / "lib" / "services" / "pipeline.js"   # 纯逻辑契约源（设计稿版控制台不执行它，测试只解析文本）
+STRATEGIES_JS = ROOT / "platform" / "js" / "services" / "strategies.js"
+PIPELINE_JS = ROOT / "platform" / "js" / "services" / "pipeline.js"   # 纯逻辑契约源（设计稿版控制台不执行它，测试只解析文本）
 SETTINGS_JSX = None  # 原 AntD 设置页已删除；控件形状断言见下方 skip（服务端校验仍在）
 
 #: BUILTIN_STRATEGIES 的条目形状（一字不差地要求 id/label/note 三个键：
@@ -131,7 +131,7 @@ class FrontendStrategyMirrorTests(unittest.TestCase):
 
 @unittest.skip("原断言锁定 AntD 设置页的控件形状（Select/TimePicker）；该页已随旧版删除，"
                "设计稿版设置 binder 用原生 select/input + datalist 建议，形状断言无对应物。"
-               "服务端校验（执行窗口 1..240、时刻格式、白名单键）与 platform/web/tests/v3-console.test.mjs "
+               "服务端校验（执行窗口 1..240、时刻格式、白名单键）与 platform/web-pro/tests/console-parity.test.mjs "
                "的结构不变量仍在，漂移风险已由服务端拦下。")
 class SettingsPageControlTests(unittest.TestCase):
     """（已停用）设置页控件形状锁：4 个配置字段不得退回自由文本框。"""

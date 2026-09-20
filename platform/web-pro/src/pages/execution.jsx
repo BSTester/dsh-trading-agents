@@ -150,6 +150,62 @@ function useWbRead(tool) {
   return { ...state, refresh: run };
 }
 
+
+/* ── 与工作台对账：POST /api/v3/oms/sync（把工作台 frozen 计划订单登记/更新到台账并回读状态） ──
+ *  这是本页第二个动作按钮，同样**只在人工点击后发起**；失败按 error.code：message 展示。 */
+function useReconcile() {
+  const [state, setState] = React.useState({ busy: false, result: null, error: null });
+  const run = React.useCallback(async () => {
+    setState({ busy: true, result: null, error: null });
+    try {
+      const response = await fetch("/api/v3/oms/sync", {
+        method: "POST",
+        headers: (() => {
+          const headers = { "content-type": "application/json" };
+          try {
+            const token = localStorage.getItem("trading_token");
+            if (token) headers.Authorization = `Bearer ${token}`;
+          } catch { /* localStorage 不可用按未鉴权 */ }
+          return headers;
+        })(),
+        body: "{}",
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok || (body && body.ok === false)) {
+        setState({ busy: false, result: null, error: body?.error ?? { code: `http-${response.status}`, message: "对账失败" } });
+        return;
+      }
+      setState({ busy: false, result: body, error: null });
+    } catch (error) {
+      setState({ busy: false, result: null, error: { code: "net", message: String(error.message || error) } });
+    }
+  }, []);
+  return { ...state, run };
+}
+
+function ReconcileButton() {
+  const { busy, result, error, run } = useReconcile();
+  return (
+    <Space direction="vertical" size={4} style={{ width: "100%" }}>
+      <Space size={8} wrap>
+        <Button size="small" loading={busy} onClick={run}
+          title="POST /api/v3/oms/sync：把工作台 frozen 计划订单登记/更新到 OMS 台账并回读确认状态">
+          与工作台对账
+        </Button>
+        <Text type="secondary" style={{ fontSize: 11 }}>
+          对账只读工作台的 frozen 计划并更新**平台台账**；不下单、不改变券商侧状态
+        </Text>
+      </Space>
+      {error ? <Text type="danger" style={{ fontSize: 11 }}>{`${error.code ?? "错误"}：${error.message ?? ""}`}</Text> : null}
+      {result && result.nav !== undefined ? (
+        <Text type="secondary" style={{ fontSize: 11 }}>
+          {`对账完成 · NAV ${result.nav ?? "—"} · 台账 ${(result.orders ?? []).length} 单 · 阶段 ${Object.entries(result.stages ?? {}).map(([k, v]) => `${k}=${v}`).join(" ")}`}
+        </Text>
+      ) : null}
+    </Space>
+  );
+}
+
 /* ── ① 执行入口条 ───────────────────────────────────────────────────────── */
 function ExecHeader({ mode, planEnv, planErr, orders, deals, omsNote, nav, onOpenPlan, confirmPending }) {
   const planValue = OK(planEnv) ? (planEnv.value || {}) : null;
@@ -174,6 +230,7 @@ function ExecHeader({ mode, planEnv, planErr, orders, deals, omsNote, nav, onOpe
             title="打开冻结计划执行弹窗：plan-execute 只在人工二次确认后写入指令文件；LIVE 需逐字口令「确认执行」">
             打开冻结计划执行
           </Button>
+          <ReconcileButton />
         </Space>
       }
     >

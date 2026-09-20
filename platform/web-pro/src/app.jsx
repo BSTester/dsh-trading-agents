@@ -3,7 +3,7 @@
 // 路由用 hash（#/<key>），因此不需要服务端 SPA 回退。
 import React from "react";
 import { ProLayout } from "@ant-design/pro-components";
-import { Badge, Button, Space, Tooltip, Typography } from "antd";
+import { Badge, Space, Tooltip, Typography } from "antd";
 import { useV3 } from "./services/api.js";
 import OverviewPage from "./pages/overview.jsx";
 import BrainPage from "./pages/brain.jsx";
@@ -18,21 +18,21 @@ import SettingsPage from "./pages/settings.jsx";
 // 分组与顺序 = 设计稿左侧导航（/v3/*.html 的 .nav-group/.nav-cat）
 const GROUPS = [
   { cat: "监控", items: [
-    { key: "overview", name: "系统概览", element: <OverviewPage />, file: "index.html" },
-    { key: "brain", name: "决策大脑", element: <BrainPage />, file: "brain.html" },
+    { key: "overview", name: "系统概览", element: <OverviewPage /> },
+    { key: "brain", name: "决策大脑", element: <BrainPage /> },
   ] },
   { cat: "研究", items: [
-    { key: "market", name: "行情与信号", element: <MarketPage />, file: "market.html" },
-    { key: "strategy", name: "策略与因子", element: <StrategyPage />, file: "strategy.html" },
+    { key: "market", name: "行情与信号", element: <MarketPage /> },
+    { key: "strategy", name: "策略与因子", element: <StrategyPage /> },
   ] },
   { cat: "交易", items: [
-    { key: "risk", name: "风险监控", element: <RiskPage />, file: "risk.html" },
-    { key: "execution", name: "执行与审批", element: <ExecutionPage />, file: "execution.html" },
+    { key: "risk", name: "风险监控", element: <RiskPage /> },
+    { key: "execution", name: "执行与审批", element: <ExecutionPage /> },
   ] },
   { cat: "系统", items: [
-    { key: "gateway", name: "网关与调度", element: <GatewayPage />, file: "gateway.html" },
-    { key: "tools", name: "工具域治理", element: <ToolsPage />, file: "tools.html" },
-    { key: "settings", name: "接入与授权", element: <SettingsPage />, file: "settings.html" },
+    { key: "gateway", name: "网关与调度", element: <GatewayPage /> },
+    { key: "tools", name: "工具域治理", element: <ToolsPage /> },
+    { key: "settings", name: "接入与授权", element: <SettingsPage /> },
   ] },
 ];
 const PAGES = GROUPS.flatMap((group) => group.items);
@@ -57,11 +57,6 @@ function HeaderExtra({ pageKey }) {
       <Typography.Text type="secondary" style={{ fontSize: 12 }}>
         {overview.value?.generated_at ? `数据时点 ${String(overview.value.generated_at).slice(0, 19)}` : "数据时点 —"}
       </Typography.Text>
-      <Tooltip title="同一套数据与功能，设计稿原样版（HTML/CSS 逐字节一致）">
-        <Button size="small" onClick={() => { if (page) window.location.href = `/v3/${page.file}`; }}>
-          切到设计稿原样版
-        </Button>
-      </Tooltip>
     </Space>
   );
 }

@@ -18,9 +18,8 @@ const GROUPS = [
   ["系统", ["gateway", "tools", "settings"]],
 ];
 const PAGES = GROUPS.flatMap(([, keys]) => keys);
-const DESIGN_PAGES = ["index", "brain", "market", "strategy", "risk", "execution", "gateway", "tools", "settings"];
 
-test("菜单分组与页面集合与设计稿版一致（4 组 9 页）", () => {
+test("菜单分组与页面集合（4 组 9 页，与设计稿导航一致）", () => {
   const app = read("app.jsx");
   for (const [cat] of GROUPS) {
     assert.ok(app.includes(`cat: "${cat}"`), `app.jsx 缺分组 ${cat}`);
@@ -90,11 +89,3 @@ test("项目不引入设计稿版之外的新运行时依赖", () => {
   assert.ok(existsSync(join(SRC, "components", "charts.jsx")), "缺少共享图表组件");
 });
 
-test("设计稿版与工作台两套页面文件都在（两版并存）", () => {
-  const designDir = join(HERE, "..", "..", "web", "public", "v3");
-  for (const page of DESIGN_PAGES) {
-    assert.ok(existsSync(join(designDir, `${page}.html`)), `设计稿版缺 ${page}.html`);
-    assert.ok(existsSync(join(designDir, `${page}.js`)), `设计稿版缺 ${page}.js`);
-  }
-  assert.ok(existsSync(join(designDir, "shared.js")), "设计稿版缺 shared.js");
-});

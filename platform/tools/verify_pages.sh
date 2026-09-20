@@ -1,16 +1,15 @@
 #!/usr/bin/env bash
-# Ant Design Pro 工作台逐页验收：http://127.0.0.1:8397/pro/#/<key>
+# V3 工作台（Ant Design Pro，挂在根路径）逐页验收：http://127.0.0.1:8397/#/<key>
 #
 # 断言（与设计稿版的 verify_v3_pages.sh 同口径，保证两版都能被机械验收）：
 #   1) 9 个路由都能渲染（非白屏、无运行时崩溃）；
 #   2) DOM 无「示例」字样；
-#   3) **设计稿源文件里的数字型占位串不再出现**（从 web/public/v3/<page>.html 提取，自动跟随设计稿）；
+#   3) 设计稿里的数字型占位串不再出现（清单静态固化：原设计稿已删除，数值取自其历史 HTML）；
 #   4) 每页的关键模块标题命中（与设计稿版功能一一对应的证据）；
 #   5) 分组菜单（监控/研究/交易/系统）在页面内可见。
 #      bash platform/tools/verify_pro_pages.sh [base-url]
 set -u
 BASE="${1:-http://127.0.0.1:8397}"
-SRC="$(cd "$(dirname "$0")/../web/public/v3" && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
@@ -20,16 +19,29 @@ for pair in $ROUTES; do
   key="${pair%%:*}"
   timeout 240 chromium --headless=new --no-sandbox --disable-gpu --hide-scrollbars \
     --virtual-time-budget=60000 --window-size=1920,2400 \
-    --screenshot="$TMP/$key.png" --dump-dom "$BASE/pro/#/$key" > "$TMP/$key.html" 2>/dev/null
+    --screenshot="$TMP/$key.png" --dump-dom "$BASE/#/$key" > "$TMP/$key.html" 2>/dev/null
 done
 
-python3 - "$TMP" "$SRC" <<'PY'
+python3 - "$TMP" <<'PY'
 import pathlib, re, sys
 
-tmp, src = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])
+tmp = pathlib.Path(sys.argv[1])
 PAIRS = [('overview','index'),('brain','brain'),('market','market'),('strategy','strategy'),
          ('risk','risk'),('execution','execution'),('gateway','gateway'),('tools','tools'),
          ('settings','settings')]
+# 与**真实数据**碰撞、已逐条人工取证的设计稿数字（登记后不再作为硬哨兵）：
+#   0.8%/99.2% 真实成功率与失败率；0.25 真实信号阈值与 z 值；0.58/1.00/1.24/1.38/0.42 真实网格夏普或
+#   真实风控数值；0.71 真实手续费 190.71 子串；25.4%/2.4% 页面真实文案；0.92 market 真实因子 z 值
+#   （+0.92 / 0.921 子串）与 strategy 真实网格夏普（-0.92）
+COLLIDE = {'25.4%', '2.4%', '0.25', '0.58', '1.00', '1.24', '1.24%', '0.71', '0.8%', '99.2%',
+           '0.38', '0.42', '0.92'}
+# 设计稿里的数字型占位串（原 platform/web/public/v3/*.html 已随该版本删除，此处静态固化）
+DESIGN_SENTINELS = [
+    '1,024,380', '1,030,771', '18.4%', '1.86', '−6.3%', '99.2%', '1,284', '1.8 s', '11 / 1',
+    '12,480', '49,152', '4,182', '¥26,750', '¥18,420', '300750.SZ', 'EX20260919',
+    '¥56,900', '¥2,845,600', '¥2,845,312', '¥12,847,532', '8****@futu', '12:14:02', '14:32:05',
+    'turn 3/12', '2025-06-13', '2026-09-12', 'PLN-20260919-0830', 'mining-2026-09-19',
+]
 # 与设计稿版一致的占位比对规则（阈值类同值整数不参与）
 ALLOW = {'2%', '15%', '20%', '5', '3', '100%', '0%'}
 # 与真实数据碰撞的设计稿数字（在 verify_v3_pages.sh 中已逐条人工核对）
@@ -84,8 +96,7 @@ for key, design in PAIRS:
     def present(token: str) -> bool:
         return re.search(r'(?<![\d.,])' + re.escape(token) + r'(?![\d])', text) is not None
 
-    design_file = src / f'{design}.html'
-    left = sorted(t for t in placeholders(design_file.read_text(encoding='utf-8')) if present(t)) if design_file.exists() else []
+    left = sorted(t for t in DESIGN_SENTINELS if t not in COLLIDE and present(t))
     groups = sum(1 for g in GROUPS if g in text)
     bad = ex or crash or blank or left or missing or groups < 4
     if bad:
