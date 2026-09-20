@@ -32,6 +32,7 @@ import time
 import unittest
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]  # platform/
 sys.path.insert(0, str(ROOT))
@@ -144,6 +145,21 @@ def wb_ok(name="schedule", value=None):
     return {name: {"ok": True, "value": value if value is not None else {}}}
 
 
+class _FakeToolManager:
+    def __init__(self, names):
+        self.names = list(names)
+
+    def list_tools(self):
+        return [SimpleNamespace(name=name) for name in self.names]
+
+
+class _FakeMcpServer:
+    """MCP SDK ``MCPServer`` 的最小替身：只需要注册表能被同步读出来。"""
+
+    def __init__(self, names):
+        self._tool_manager = _FakeToolManager(names)
+
+
 class ObservabilityTestCase(unittest.TestCase):
     def setUp(self):
         v3_ops.reset_counters()
@@ -218,10 +234,46 @@ class ProcessTests(ObservabilityTestCase):
     def test_up_and_build_info(self):
         text = self.metrics()
         self.assertEqual(sample_value(text, "quantwb_up"), 1.0)
-        self.assertEqual(sample_value(text, "quantwb_tools"), float(v3_ops.catalog_total()))
+        # 工具面**两个口径分开报**（同一 family 的两条标签样本）：
+        #   scope="mcp"    = MCP 注册表真值（与 tools/list 同源，含桥接的 v3_* 工具）；
+        #   scope="domain" = 六域工具目录条目数（77 平台工具 + 5 个本地计算）。
+        # 断言只绑**运行时读数**，不锁 82/116 常量——装配一变（新增桥接工具）常量断言就假绿。
+        surface = v3_ops.mcp_tool_surface(self.app)
+        self.assertEqual(sample_value(text, "quantwb_tools", 'scope="mcp"'),
+                         float(surface["mcp_total"]))
+        self.assertEqual(sample_value(text, "quantwb_tools", 'scope="domain"'),
+                         float(v3_ops.catalog_total()))
         self.assertEqual(sample_value(text, "quantwb_build_info"), 1.0)
+        # build_info 的 tools 标签锁的是**六域目录**口径（HELP 里已写明），不是 MCP 面
         self.assertIn('tools="%d"' % v3_ops.catalog_total(), text)
         self.assertIn('domains="6"', text)
+
+    def test_tool_scope_family_is_contiguous_and_explained(self):
+        """两条 scope 样本必须同 family 连续出现，且 HELP 写清口径差异（否则读者必然混淆）。"""
+        text = self.metrics()
+        families, errors = parse_exposition(text)
+        self.assertEqual(errors, [], f"exposition format 违规：{errors}")
+        samples = [labels for labels in families["quantwb_tools"]["samples"]]
+        self.assertEqual(samples, ['quantwb_tools{scope="mcp"}',
+                                   'quantwb_tools{scope="domain"}'])
+        help_line = [line for line in text.splitlines()
+                     if line.startswith("# HELP quantwb_tools ")][0]
+        self.assertIn("scope=\"mcp\"", help_line)
+        self.assertIn("scope=\"domain\"", help_line)
+        self.assertIn("v3_*", help_line)
+        self.assertIn("mcp_tools.TOOLS", help_line)
+        self.assertIn("不可互相替代", help_line)
+
+    def test_mcp_scope_follows_the_registry_not_a_constant(self):
+        """``scope="mcp"`` 必须跟着 MCP 注册表走：注册表里有几件就报几件。"""
+        names = [f"tool_{index}" for index in range(13)]
+        self.app.state.mcp = _FakeMcpServer(names)
+        self.app.state.mcp_tools = names[:10]
+        self.app.state.v3_mcp_tools = names[10:]
+        text = self.metrics()
+        self.assertEqual(sample_value(text, "quantwb_tools", 'scope="mcp"'), 13.0)
+        self.assertEqual(sample_value(text, "quantwb_tools", 'scope="domain"'),
+                         float(v3_ops.catalog_total()))
 
     def test_start_time_and_uptime_are_real(self):
         text = self.metrics()

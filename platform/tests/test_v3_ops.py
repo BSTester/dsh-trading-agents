@@ -27,9 +27,11 @@ import os
 import shutil
 import sys
 import tempfile
+import time
 import unittest
 import unittest.mock
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[1]  # platform/
 sys.path.insert(0, str(ROOT))
@@ -37,9 +39,10 @@ sys.path.insert(0, str(ROOT))
 from fastapi import FastAPI  # noqa: E402
 from fastapi.testclient import TestClient  # noqa: E402
 
-from server import mcp_tools, v3_db, v3_ops  # noqa: E402
+from server import mcp_tools, observability, v3_db, v3_ops  # noqa: E402
 
 DAY = "2026-09-19"
+PROBE_AS_OF = "2026-09-20T12:00:00+00:00"
 
 
 def base_values(**overrides):
@@ -101,14 +104,63 @@ class FakeWorkbench:
         return [payload for call, payload in self.calls if call == name]
 
 
+class FakeHttpProbe:
+    """数据源**能力探测**的离线替身（默认端点可达；可切成失败）。
+
+    为什么必须有这个替身：数据源可用性的判据已从「包能不能 import」改成「真发一次 HTTP
+    探测 / 认最近一次真实调用」——单测绝不能因此真的打上游（否则用例变成有网才绿）。
+    """
+
+    def __init__(self, reachable=True, evidence=None, status=200):
+        self.reachable = bool(reachable)
+        self.status = status
+        self.evidence = evidence
+        self.calls = []
+
+    def __call__(self, url, headers=None, timeout=None):
+        self.calls.append({"url": url, "headers": dict(headers or {}), "timeout": timeout})
+        ok = self.reachable and self.status is not None and 200 <= self.status < 400
+        if self.evidence is not None:
+            evidence = self.evidence
+        elif not self.reachable:
+            evidence = "URLError: <urlopen error [Errno -3] Temporary failure in name resolution>"
+        elif ok:
+            evidence = f"HTTP {self.status}（GET {url}，首段 4096 字节）"
+        else:
+            evidence = f"HTTP {self.status}（GET {url}）——端点可达但返回了错误码"
+        return {"ok": ok,
+                "reachable": self.reachable,
+                "status": self.status,
+                "evidence": evidence,
+                "as_of": PROBE_AS_OF}
+
+
+class FakeToolManager:
+    def __init__(self, names):
+        self.names = list(names)
+
+    def list_tools(self):
+        return [SimpleNamespace(name=name) for name in self.names]
+
+
+class FakeMcpServer:
+    """MCP SDK ``MCPServer`` 的最小替身：只需要注册表能被同步读出来。"""
+
+    def __init__(self, names):
+        self._tool_manager = FakeToolManager(names)
+
+
 class V3OpsTestCase(unittest.TestCase):
     def setUp(self):
         v3_ops.reset_counters()
+        v3_ops.reset_source_probes()  # 能力探测有 TTL 进程内缓存：用例之间必须清干净
         self.home = Path(tempfile.mkdtemp(prefix="v3-ops-"))
         self.addCleanup(shutil.rmtree, self.home, ignore_errors=True)
         self.fake = FakeWorkbench(base_values())
+        self.http_probe = FakeHttpProbe()
         self.app = FastAPI()
-        v3_ops.register(self.app, self.fake, str(self.home))
+        v3_ops.register(self.app, self.fake, str(self.home),
+                        deps={"http_probe": self.http_probe})
         self.client = TestClient(self.app)
 
     def get(self, path):
@@ -183,7 +235,15 @@ class GatewayTests(V3OpsTestCase):
         self.assertTrue(body["ok"])
         channels = body["channels"]
         self.assertEqual(channels["mcp"]["status"], "running")
-        self.assertEqual(channels["mcp"]["tools"], v3_ops.catalog_total())
+        # 工具数**不锁常量**：既有 ``tools`` 与新增 ``tools_total`` 都必须等于**运行时**
+        # 读出的 MCP 工具面（注册表长度随 app.py 的装配变化：77 → 116），而
+        # ``tools_domain_catalog`` 是六域目录（77+5）。锁死 82/116 会在下次装配变更时假绿。
+        surface = v3_ops.mcp_tool_surface(self.app)
+        self.assertEqual(channels["mcp"]["tools"], surface["mcp_total"])
+        self.assertEqual(channels["mcp"]["tools_total"], surface["mcp_total"])
+        self.assertEqual(channels["mcp"]["tools_domain_catalog"], v3_ops.catalog_total())
+        self.assertEqual(channels["mcp"]["tools_bridge"], surface["bridge"])
+        self.assertIn("mcp_tools.TOOLS", channels["mcp"]["tools_source"])
         self.assertIn("MCP", channels["mcp"]["protocol"])
         self.assertEqual(channels["sdk"]["status"], "unavailable")
         self.assertEqual(channels["sdk"]["reason"], "本服务未挂载 SDK JSON-RPC 通道")
@@ -208,6 +268,37 @@ class GatewayTests(V3OpsTestCase):
         self.assertIsNone(body["headless"]["breaker"])
         self.assertEqual(body["headless"]["last"], [])
         self.assertIn("generated_at", body)
+
+    def test_mcp_tool_total_tracks_live_registry(self):
+        """口径必须是**动态真值**：注册表里有多少就报多少（绝不写死 82 / 116）。"""
+        names = [f"wb_{index}" for index in range(7)] + [f"v3_{index}" for index in range(3)]
+        self.app.state.mcp = FakeMcpServer(names)
+        self.app.state.mcp_tools = names[:7]
+        self.app.state.v3_mcp_tools = names[7:]
+        mcp = self.get("/api/v3/gateway")["channels"]["mcp"]
+        self.assertEqual(mcp["tools_total"], 10)
+        self.assertEqual(mcp["tools"], 10)
+        self.assertEqual(mcp["tools_bridge"], 3)
+        self.assertEqual(mcp["tools_domain_catalog"], v3_ops.catalog_total())
+        self.assertNotEqual(mcp["tools_total"], mcp["tools_domain_catalog"],
+                            "两个口径本来就不同（注册表 vs 六域目录），必须分开报")
+        self.assertIn("list_tools", mcp["tools_source"])
+
+        # 注册表变长 → 读数跟着变（证明来源是注册表而不是常量）
+        self.app.state.mcp = FakeMcpServer(names + ["v3_extra"])
+        again = self.get("/api/v3/gateway")["channels"]["mcp"]
+        self.assertEqual(again["tools_total"], 11)
+        self.assertEqual(again["tools"], 11)
+
+    def test_mcp_tool_total_falls_back_to_binding_lists(self):
+        """注册表不可读时退到 app.py 的两份装配名单，并在 source 里如实标注。"""
+        self.app.state.mcp_tools = [f"wb_{index}" for index in range(77)]
+        self.app.state.v3_mcp_tools = [f"v3_{index}" for index in range(39)]
+        mcp = self.get("/api/v3/gateway")["channels"]["mcp"]
+        self.assertEqual(mcp["tools_total"], 116)
+        self.assertEqual(mcp["tools_bridge"], 39)
+        self.assertEqual(mcp["tools_domain_catalog"], v3_ops.catalog_total())
+        self.assertIn("app.state", mcp["tools_source"])
 
     def test_schedule_failure_is_disclosed(self):
         self.fake.values["schedule"] = {"ok": False,
@@ -332,9 +423,138 @@ class SettingsTests(V3OpsTestCase):
         names = [row["name"] for row in body["data_sources"]]
         self.assertEqual(len(names), 5)
         self.assertTrue(any("workbench" in name for name in names))
+        # 每一行都必须自带证据来源与时间（口径可追，不允许「写死的可用性」）
+        for row in body["data_sources"]:
+            self.assertIn("source", row, row["name"])
+            self.assertIn("as_of", row, row["name"])
+            self.assertTrue(row["source"], row["name"])
+            self.assertTrue(row["as_of"], row["name"])
+
+    def test_sec_edgar_availability_comes_from_capability_probe(self):
+        """SEC EDGAR 的可用性 = 真实探测结果，**不是**写死的「本服务未实现」。"""
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            body = self.get("/api/v3/settings")
+        edgar = [row for row in body["data_sources"] if "SEC EDGAR" in row["name"]][0]
+        self.assertTrue(edgar["available"])
+        self.assertIn("companyconcept", edgar["detail"])
+        self.assertIn("HTTP 200", edgar["detail"])
+        self.assertEqual(edgar["source"], "http-probe:data.sec.gov")
+        self.assertEqual(edgar["as_of"], PROBE_AS_OF)
+        # 探测打的是真实取数端点（v3_sources.SEC_CONCEPT_URL），不是随便一个 URL
+        self.assertEqual(len(self.http_probe.calls), 1)
+        self.assertIn("/api/xbrl/companyconcept/", self.http_probe.calls[0]["url"])
+        self.assertIn("user-agent", self.http_probe.calls[0]["headers"])
+
+    def test_sec_edgar_probe_failure_reports_real_reason_and_as_of(self):
+        """探测失败 → 如实写失败原因 + as_of；**绝不**写成「服务未实现」这类写死结论。"""
+        self.http_probe.reachable = False
+        v3_ops.reset_source_probes()
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            body = self.get("/api/v3/settings")
         edgar = [row for row in body["data_sources"] if "SEC EDGAR" in row["name"]][0]
         self.assertFalse(edgar["available"])
-        self.assertIn("无数据源", edgar["detail"])
+        self.assertIn("name resolution", edgar["detail"])
+        self.assertIn("HTTP 能力探测失败", edgar["detail"])
+        self.assertEqual(edgar["as_of"], PROBE_AS_OF)
+        self.assertNotIn("未实现", edgar["detail"])
+
+    def test_sec_edgar_distinguishes_reachable_from_available(self):
+        """端点可达但返回 4xx ≠ 可用，也 ≠ 网络不通：三种事实分开报，不合并成一句「不可用」。"""
+        self.http_probe.status = 403
+        v3_ops.reset_source_probes()
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            body = self.get("/api/v3/settings")
+        edgar = [row for row in body["data_sources"] if "SEC EDGAR" in row["name"]][0]
+        self.assertFalse(edgar["available"], "拿到 403 不算可用")
+        self.assertIn("端点本身可达", edgar["detail"])
+        self.assertIn("HTTP 403", edgar["detail"])
+        self.assertIn("不是「服务未实现」", edgar["detail"])
+
+    def test_sec_edgar_prefers_last_real_call_evidence(self):
+        """有落盘的真实调用证据（/api/v3/sources/status 写入）时，不再另发 HTTP 探测。"""
+        self.write("v3-datasource-probe.json", json.dumps({
+            "version": 1, "probed_at": 1789000000.0, "probed_at_iso": DAY + "T08:00:00+00:00",
+            "chains": [{"key": "financials_us", "label": "美股财务报表",
+                        "primary": "sec/companyconcept(us-gaap XBRL)",
+                        "fallback": "openbb/equity.fundamental", "available": True,
+                        "last_source": "sec/companyconcept(us-gaap XBRL)",
+                        "chain_size": 2, "error": None}]}))
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            body = self.get("/api/v3/settings")
+        edgar = [row for row in body["data_sources"] if "SEC EDGAR" in row["name"]][0]
+        self.assertTrue(edgar["available"])
+        self.assertEqual(edgar["as_of"], DAY + "T08:00:00+00:00")
+        self.assertIn("sec/companyconcept", edgar["source"])
+        self.assertIn("sec/companyconcept", edgar["detail"])
+        self.assertEqual(self.http_probe.calls, [],
+                         "已有真实调用证据就不该再打一次上游（设置页会被反复打开）")
+
+    def test_sec_edgar_reports_recorded_failure(self):
+        self.write("v3-datasource-probe.json", json.dumps({
+            "version": 1, "probed_at": 1789000000.0, "probed_at_iso": DAY + "T08:00:00+00:00",
+            "chains": [{"key": "financials_us", "available": False,
+                        "last_source": "sec/companyconcept(us-gaap XBRL)",
+                        "error": {"code": "sec/network", "message": "connection reset by peer"}}]}))
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            body = self.get("/api/v3/settings")
+        edgar = [row for row in body["data_sources"] if "SEC EDGAR" in row["name"]][0]
+        self.assertFalse(edgar["available"])
+        self.assertIn("connection reset by peer", edgar["detail"])
+        self.assertIn(DAY, edgar["detail"])
+        self.assertIn("重跑", edgar["detail"])
+
+    def test_tushare_availability_is_token_times_reachability(self):
+        """Tushare 判据 = 凭据就绪 × 端点 HTTP 可达；**与 tushare 包能否 import 无关**。"""
+        def tushare_row(body):
+            return [row for row in body["data_sources"] if row["name"] == "Tushare Pro"][0]
+
+        # 1) 未配置凭据 → 不发任何请求（如实说明「未探测」）
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            body = self.get("/api/v3/settings")
+        row = tushare_row(body)
+        self.assertFalse(row["available"])
+        self.assertIn("未注入", row["detail"])
+        self.assertEqual(row["source"], "credentials:未配置")
+        self.assertEqual([call for call in self.http_probe.calls
+                          if "tushare" in call["url"]], [],
+                         "没有凭据就不该对 tushare 发任何请求")
+
+        # 2) 凭据就绪 + 端点可达 → 可用；且**包不可导入也照样可用**（这正是修掉的那条错判据）
+        self.http_probe.reachable = True
+        v3_ops.reset_source_probes()
+        with unittest.mock.patch.dict(os.environ, {"TUSHARE_TOKEN": "t" * 32}, clear=True):
+            with unittest.mock.patch.object(v3_ops, "_module_available", return_value=False):
+                body = self.get("/api/v3/settings")
+        row = tushare_row(body)
+        self.assertTrue(row["available"], "实现走 HTTP，不需要 tushare 包")
+        self.assertEqual(row["source"], "http-probe:api.tushare.pro + credentials")
+        self.assertEqual(row["as_of"], PROBE_AS_OF)
+        self.assertIn("环境变量 TUSHARE_TOKEN", row["detail"])
+        self.assertIn("未做真实取数验证", row["detail"])
+        self.assertEqual([call["url"] for call in self.http_probe.calls
+                          if "tushare" in call["url"]], [v3_ops.TUSHARE_PROBE_URL])
+        self.assertNotIn("包", row["detail"])
+
+        # 3) 凭据就绪但端点不可达 → 如实报失败原因
+        v3_ops.reset_source_probes()
+        self.http_probe.reachable = False
+        with unittest.mock.patch.dict(os.environ, {"TUSHARE_TOKEN": "t" * 32}, clear=True):
+            body = self.get("/api/v3/settings")
+        row = tushare_row(body)
+        self.assertFalse(row["available"])
+        self.assertIn("不可达", row["detail"])
+        self.assertIn("name resolution", row["detail"])
+
+    def test_data_source_probe_is_cached_within_ttl(self):
+        """设置页会被反复打开：TTL 内复用同一份探测结果（as_of 也不刷新），不重复打上游。"""
+        with unittest.mock.patch.dict(os.environ, {}, clear=True):
+            first = self.get("/api/v3/settings")
+            second = self.get("/api/v3/settings")
+        self.assertEqual(len(self.http_probe.calls), 1, "TTL 内不该重复探测 SEC")
+        first_edgar = [row for row in first["data_sources"] if "SEC EDGAR" in row["name"]][0]
+        second_edgar = [row for row in second["data_sources"] if "SEC EDGAR" in row["name"]][0]
+        self.assertEqual(first_edgar["as_of"], second_edgar["as_of"],
+                         "复用缓存时不得把 as_of 刷成「刚刚测过」")
 
     def test_trading_mode_reads_service_mode_file(self):
         # 服务真实模式 = 模式文件 trading-account-mode（store_access.read_mode 的口径）
@@ -428,9 +648,14 @@ class ExecutionTests(V3OpsTestCase):
         self.assertEqual(by_id["CID-SMALL"]["stage"], "risk_passed")
         self.assertEqual(by_id["CID-BIG"]["risk"]["action"], "manual")
         self.assertEqual(by_id["CID-BIG"]["stage"], "manual")
-        self.assertEqual(by_id["CID-BIG"]["risk"]["reasons"],
-                         ["单笔占比 20.00% > 2%，需人工确认"])
-        self.assertEqual(by_id["CID-BIG"]["industry_source"], v3_ops.INDUSTRY_SOURCE)
+        # 单笔原因仍在，且**额外的**行业原因必须显式写明「不可用 → 未参与阻断」（fail-open 留痕）
+        self.assertEqual(by_id["CID-BIG"]["risk"]["reasons"][0],
+                         "单笔占比 20.00% > 2%，需人工确认")
+        self.assertTrue(any(reason.startswith("行业暴露数据不可用，未参与阻断")
+                            for reason in by_id["CID-BIG"]["risk"]["reasons"]))
+        self.assertEqual(by_id["CID-BIG"]["risk"]["rule"], "single-order")
+        self.assertEqual(by_id["CID-BIG"]["industry_source"], "no-data")
+        self.assertIsNone(by_id["CID-BIG"]["industry_pct"])
 
         # 回撤触及 15% 红线 → 全部 blocked（红线优先，覆盖单笔结论）
         self.fake.values["equity"] = {"ok": True,
@@ -499,6 +724,208 @@ class ExecutionTests(V3OpsTestCase):
         self.assertEqual(by_id["CID-A"]["plan_status"], "frozen")
         self.assertEqual(by_id["CID-B"]["plan_status"], "executed")
         self.assertEqual(by_id["CID-B"]["stage"], "filled")
+
+
+# ---------------------------------------------------------------------------
+# 6.5 行业闸门前的历史判定：视图层归一化（只读；不回写、不重判）
+# ---------------------------------------------------------------------------
+class LegacyIndustryViewTests(V3OpsTestCase):
+    """2026-09-19 落盘的 10 笔存量订单带的是**闸门前的判定快照**（``industry_pct=0.0``
+    + ``industry_source="no-data（工具面无行业分类数据源…）"``、``risk``/``history`` 无
+    ``rule``/``industry_*``）。两处不诚实：那句「工具面无行业分类数据源」在
+    ``futu/info_owner_plate`` 接通后已失效；``0.0`` 会被读成「该单行业暴露 0%」，
+    而事实是**当时没有行业读数**。
+
+    本用例集钉住三件事：① 闸门前的旧记录 → 视图 ``industry_pct is None`` + legacy 标记
+    + 文案不再出现那句失效断言；② 闸门后的新记录字段原样（真实读数 + 来源 + as_of + rule）；
+    ③ 原始 ``risk`` / ``history`` 与磁盘/库里的原文一个字都不被改写。
+    """
+
+    #: 与真实存量单逐字段同形（``~/.dsh/v3-oms-orders.json`` 实测快照，2026-09-19T19:15:06Z）。
+    LEGACY_SOURCE = "no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对）"
+
+    def legacy_record(self, identifier="CID-LEGACY"):
+        return {
+            "id": identifier, "plan_id": "PLN-20260918-SIM-12FB", "plan_status": "frozen",
+            "mode": "sim", "strategy_id": "mom_20", "ticker": "SH.600000", "side": "BUY",
+            "qty": 3300.0, "price": 9.07, "value": 29931.0, "broker_order_id": None,
+            "stage": "manual",
+            "risk": {"action": "manual", "reasons": ["单笔占比 6.90% > 2%，需人工确认"]},
+            "nav_used": 100000.0, "nav_source": "sim-ledger(equity.current)",
+            "drawdown_used": 3.0, "drawdown_source": "sim-ledger(max_drawdown)",
+            "industry_pct": 0.0, "industry_source": self.LEGACY_SOURCE,
+            "open_hit": False, "first_seen_at": "2026-09-19T12:25:45.641546+00:00",
+            "updated_at": "2026-09-19T19:15:06.630146+00:00",
+            "history": [
+                {"at": "2026-09-19T12:25:45.641546+00:00", "stage": "manual",
+                 "reasons": ["单笔占比 6.90% > 2%，需人工确认"]},
+                {"at": "2026-09-19T19:15:06.630146+00:00", "stage": "manual",
+                 "reasons": ["单笔占比 6.90% > 2%，需人工确认"]},
+            ],
+        }
+
+    def write_legacy_ledger(self, identifier="CID-LEGACY"):
+        record = self.legacy_record(identifier)
+        path = self.write(v3_ops.OMS_FILENAME,
+                          json.dumps({"version": 1, "orders": {identifier: record}},
+                                     ensure_ascii=False))
+        return record, path
+
+    def fresh_probe_payload(self, pct=37.5, industry="股份制银行Ⅱ", market="SH"):
+        """一份**新鲜**的落盘行业读数（真实格式：``~/.dsh/v3-risk-probe.json`` 的字段面）。"""
+        return {
+            "version": 1, "generated_at": time.time(),
+            "generated_at_iso": "2026-09-20T12:00:00+00:00", "limit_pct": 20.0,
+            "markets": [market], "market": market, "top_industry": industry,
+            "top_weight_pct": pct, "breach": pct > 20.0,
+            "source": "futu/info_owner_plate", "missing": 0,
+            "per_market": {market: {
+                "market": market, "ok": True, "top_industry": industry,
+                "top_weight_pct": pct, "breach": pct > 20.0,
+                "source": "futu/info_owner_plate", "missing": 0, "universe": 28,
+                "weight_source": "platform/portfolio（自选池等权）", "error": None,
+                "no_data": False}},
+            "error": None,
+        }
+
+    # ---- ① 闸门前的旧记录 ----
+    def test_pre_gate_record_is_normalized_in_the_view(self):
+        original, path = self.write_legacy_ledger()
+        on_disk_before = path.read_text(encoding="utf-8")
+
+        body = self.get("/api/v3/oms/orders")
+        order_view = body["orders"][0]
+        # 0.0 → None（不是「行业暴露 0%」）
+        self.assertIsNone(order_view["industry_pct"],
+                          "闸门前没有行业读数，必须是 None 而不是 0.0")
+        # 显式自解释标记
+        self.assertTrue(order_view["legacy_pre_gate"])
+        self.assertFalse(order_view["industry_graded"])
+        # 如实文案；**不再出现**那句已失效的断言
+        self.assertEqual(order_view["industry_source"], v3_ops.LEGACY_INDUSTRY_SOURCE)
+        self.assertIn("历史判定", order_view["industry_source"])
+        whole = json.dumps(order_view, ensure_ascii=False)
+        self.assertNotIn("工具面无行业分类数据源", whole)
+        self.assertIn("未包含行业红线", order_view["industry_note"])
+        # 历史是历史：原始 reasons / history 一个字不动
+        self.assertEqual(order_view["risk"], original["risk"])
+        self.assertEqual(order_view["history"], original["history"])
+        self.assertEqual(order_view["risk"]["reasons"], original["risk"]["reasons"])
+        self.assertNotIn("rule", order_view["risk"], "视图不得补写历史 risk.rule")
+        # 视图归一化是纯读：磁盘原文逐字节不变（绝不回写）
+        self.assertEqual(path.read_text(encoding="utf-8"), on_disk_before,
+                         "视图层归一化不得回写台账文件")
+        # 同源的 /api/v3/execution 视图走同一函数 → 口径不可能漂移
+        execution = self.get("/api/v3/execution")["oms"]["orders"][0]
+        self.assertIsNone(execution["industry_pct"])
+        self.assertTrue(execution["legacy_pre_gate"])
+        self.assertEqual(execution["history"], original["history"])
+        # 阶段计数只看 stage，不受归一化影响
+        self.assertEqual(body["stages"], {"manual": 1})
+
+    def test_pre_gate_normalization_does_not_rewrite_the_database(self):
+        """落库的存量单同样只在返回视图里归一化，库里 payload 原样。"""
+        record = self.legacy_record("CID-DB")
+        v3_db.append_event(self.home, "oms_orders", record)
+        stored_before = v3_db.list_events(self.home, "oms_orders", limit=None)
+
+        body = self.get("/api/v3/oms/orders")
+        self.assertIsNone(body["orders"][0]["industry_pct"])
+
+        stored_after = v3_db.list_events(self.home, "oms_orders", limit=None)
+        self.assertEqual(stored_after, stored_before, "归一化不得回写数据库")
+        self.assertEqual(stored_after[0]["industry_pct"], 0.0,
+                         "库里的历史原文仍是 0.0（历史是历史）")
+        self.assertIn("工具面无行业分类数据源", stored_after[0]["industry_source"])
+
+    # ---- ② 闸门后的新记录 ----
+    def test_post_gate_record_keeps_its_real_reading(self):
+        self.write(observability.RISK_PROBE_FILENAME,
+                   json.dumps(self.fresh_probe_payload(), ensure_ascii=False))
+        self.fake.values["plan"] = {"ok": True, "value": {"plans": [plan([
+            order("CID-NEW", symbol="SH.600000", qty=100, price=10.0)])]}}
+        synced = self.sync()
+        self.assertTrue(synced["ok"], synced)
+        self.assertEqual(synced["industry_pct"], 37.5)
+        self.assertEqual(synced["industry_source"], "cache/futu/info_owner_plate")
+
+        row = {item["id"]: item for item in self.get("/api/v3/oms/orders")["orders"]}["CID-NEW"]
+        # 真实字段原样
+        self.assertEqual(row["industry_pct"], 37.5)
+        self.assertEqual(row["industry_source"], "cache/futu/info_owner_plate")
+        self.assertEqual(row["industry_as_of"], "2026-09-20T12:00:00+00:00")
+        # 37.5% > 20% 上限 → 行业红线**真的**参与并阻断（与历史判定的「未含行业红线」对照）
+        self.assertEqual(row["risk"]["rule"], "industry-red-line")
+        self.assertEqual(row["stage"], "blocked_industry")
+        self.assertIsNotNone(row["industry_probe_age_ms"])
+        # 只追加两个自解释标记，不改任何既有值
+        self.assertFalse(row["legacy_pre_gate"])
+        self.assertTrue(row["industry_graded"])
+        self.assertNotIn("industry_note", row)
+        # 留痕也带闸门标记（闸门后的记录天然不会被误判成历史）
+        self.assertEqual(row["history"][-1]["rule"], "industry-red-line")
+        self.assertEqual(row["history"][-1]["industry_source"],
+                         "cache/futu/info_owner_plate")
+        # 「字段原样」逐字段核对：视图 = 落盘原文 + 两个标记，别的一个字段都没被碰
+        stored = json.loads((self.home / v3_ops.OMS_FILENAME)
+                            .read_text(encoding="utf-8"))["orders"]["CID-NEW"]
+        self.assertEqual({key: value for key, value in row.items()
+                          if key not in ("industry_graded", "legacy_pre_gate")}, stored)
+        self.assertEqual(sorted(set(row) - set(stored)),
+                         ["industry_graded", "legacy_pre_gate"],
+                         "闸门后的新记录只允许追加这两个标记")
+
+    def test_post_gate_record_without_a_reading_is_not_called_legacy(self):
+        """闸门后 + 没有新鲜读数 → 真实字段 ``industry_pct=None`` / ``no-data``，不是历史判定。"""
+        self.fake.values["plan"] = {"ok": True, "value": {"plans": [plan([order("CID-G")])]}}
+        self.sync()
+        row = self.get("/api/v3/oms/orders")["orders"][0]
+        self.assertIsNone(row["industry_pct"])
+        self.assertEqual(row["industry_source"], v3_ops.INDUSTRY_SOURCE)
+        self.assertNotEqual(row["industry_source"], v3_ops.LEGACY_INDUSTRY_SOURCE)
+        self.assertFalse(row["legacy_pre_gate"])
+        self.assertTrue(row["industry_graded"],
+                        "fail-open 也是「经闸门的判定」（reasons 里已写明未参与阻断）")
+
+    # ---- ③ 判据本身：结构性、可解释、不猜时间戳 ----
+    def test_legacy_judgement_is_structural_not_timestamp_based(self):
+        legacy = self.legacy_record()
+        self.assertTrue(v3_ops.legacy_pre_gate(legacy))
+        # 只要有了闸门留痕（risk.rule / history[].industry_*）就不再是历史判定——判据不看时间
+        with_rule = copy.deepcopy(legacy)
+        with_rule["industry_source"] = "cache/futu/info_owner_plate"
+        with_rule["industry_pct"] = 37.5
+        with_rule["risk"]["rule"] = "single-order"
+        self.assertFalse(v3_ops.legacy_pre_gate(with_rule))
+        # 留痕里带了 industry_* 同样如此
+        with_trail = copy.deepcopy(with_rule)
+        with_trail["risk"] = {"action": "manual", "reasons": ["x"]}
+        with_trail["history"][-1]["industry_source"] = "cache/futu/info_owner_plate"
+        self.assertFalse(v3_ops.legacy_pre_gate(with_trail))
+        with_trail_rule = copy.deepcopy(with_trail)
+        with_trail_rule["history"][-1].pop("industry_source")
+        with_trail_rule["history"][-1]["rule"] = "single-order"
+        self.assertFalse(v3_ops.legacy_pre_gate(with_trail_rule))
+        # 那句失效断言单独出现也足以认定（当前实现已不可能产生它）
+        self.assertTrue(v3_ops.legacy_pre_gate({
+            "industry_source": self.LEGACY_SOURCE, "risk": {"rule": "within-limits"}}))
+        # 压根没有分级留痕的迁移数据 → **不**下「历史判定」结论（无从谈含不含行业红线）
+        self.assertFalse(v3_ops.legacy_pre_gate({"id": "M", "stage": "manual",
+                                                 "updated_at": "5"}))
+        self.assertFalse(v3_ops.legacy_pre_gate({"id": "M",
+                                                 "risk": {"action": "manual",
+                                                          "reasons": ["x"],
+                                                          "rule": "single-order"}}))
+        self.assertFalse(v3_ops.legacy_pre_gate(None))
+
+    def test_order_view_returns_a_copy(self):
+        record = self.legacy_record()
+        view = v3_ops.order_view(record)
+        view["industry_source"] = "tampered"
+        view["history"].append({"at": "now"})
+        self.assertEqual(record["industry_source"], self.LEGACY_SOURCE)
+        self.assertEqual(len(record["history"]), 2, "视图是副本：改它不得动到原始记录")
+        self.assertEqual(record["industry_pct"], 0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -800,9 +1227,18 @@ class UnitTests(unittest.TestCase):
         self.assertIn("单笔占比 10.00%", reasons[0])
         self.assertEqual(v3_ops.check_order(1000.0, 0)[0], "manual")
         self.assertEqual(v3_ops.check_order(1000.0, 100000.0, drawdown_pct=15.0)[0], "blocked")
-        self.assertEqual(v3_ops.check_order(1000.0, 100000.0, industry_pct=25.0)[0], "blocked")
+        # 行业红线**单独成态**（action=blocked_industry）——便于 metric/审计区分是哪条红线
+        self.assertEqual(v3_ops.check_order(1000.0, 100000.0, industry_pct=25.0)[0],
+                         "blocked_industry")
+        self.assertEqual(v3_ops.check_order(1000.0, 100000.0, industry_pct=20.0)[0], "auto",
+                         "== 20% 不阻断（只有 > 才阻断）")
         # 红线优先于单笔结论：blocked 覆盖 manual
         self.assertEqual(v3_ops.check_order(50000.0, 100000.0, drawdown_pct=20.0)[0], "blocked")
+        # 无行业读数 → fail-open（不阻断），但 reasons 必须写明
+        action, reasons = v3_ops.check_order(1000.0, 100000.0, industry_pct=None,
+                                             industry_source="no-data")
+        self.assertEqual(action, "auto")
+        self.assertTrue(any("未参与阻断" in reason for reason in reasons))
 
     def test_positions_nav_single_currency_only(self):
         single = {"ok": True, "value": {"groups": [{"acc_id": "A", "market": "SH", "positions": [

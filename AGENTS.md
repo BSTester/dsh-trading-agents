@@ -39,7 +39,8 @@
 
 - **分支**：本仓库直接提交 `main`（既有惯例）；每次提交保持三套测试全绿。
 - **测试**：`~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests`、
-  `node --test tests/*.test.mjs`、`cd platform/web && npm test`。
+  `node --test tests/*.test.mjs`、`cd platform/web-pro && npm test`（工作台是 antd pro 单页，
+  由 FastAPI 挂在根路径 `/`；构建串行：`flock /tmp/probuild.lock npm run build`）。
 - **交易边界**：任何下单/改单/撤单/切模式/执行计划都只经工作台受约束入口；
   研究侧（值班模式、研究院）**永不下单、永不启用策略**——启用只能由人在 Web 点批准。
 - **数据诚实**：取不到数据就说取不到，标注来源与 as_of，不用估算值替代。

@@ -56,7 +56,8 @@ from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
 from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_tools,
-                    oauth_flow, settings_api, store_access, trading, v3_db, v3_ratelimit)
+                    oauth_flow, settings_api, store_access, trading, v3_db, v3_mcp,
+                    v3_ratelimit)
 from server.config import load_config
 from server.store_access import WorkbenchError
 
@@ -917,7 +918,7 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
                                      lambda: handle(endpoint, payload or {}))
 
     for _v3_module in ("v3_market", "v3_risk", "v3_credentials", "v3_research",
-                       "v3_analytics", "v3_ops", "v3_sources",
+                       "v3_analytics", "v3_ops", "v3_sources", "v3_nlp",
                        # 2026-09-20：三市场时段、通用降级链与数据源状态、成交质量、行业暴露
                        "v3_market_calendar", "v3_fallback", "v3_quality", "v3_industry",
                        # 2026-09-20：规格 §8.3 监控落地——Prometheus 文本出口 ``/metrics``。
@@ -1021,6 +1022,16 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
                 "schedule": "调度心跳与数据源健康没有市场口径，原样保留",
             }}
         return JSONResponse(status_code=200, content=content)
+
+    # ── V3 → MCP 桥（平台 MCP 单一交互面）──────────────────────────────────────
+    # 到这里为止 /api/v3/* 的路由已经全部登记完（子模块 + 上面的 overview），因此可以按
+    # **路由表本身**造工具：每条路由一件 MCP 工具，调用体直接 await 同一条路由的 endpoint
+    # 函数（同一个函数对象 → 同一份限流/缓存/信封，不存在第二份业务逻辑）。
+    # 注册在 ``streamable_http_app()`` 之后也成立：SDK 的 tools/list 与 tools/call 都从
+    # 同一个 ToolManager 现读，工具集在进程存活期内只增不减。
+    v3_bridge, v3_tool_names = v3_mcp.register(app.state.mcp, app)
+    app.state.v3_mcp_bridge = v3_bridge
+    app.state.v3_mcp_tools = v3_tool_names
 
     # /mcp：MCP streamable-http 端点（规格 §3.6，SDK 挂载）。
     # 有意差异 10：不用 ``app.mount("/mcp", mcp_app)``——Starlette 的 Mount 只匹配

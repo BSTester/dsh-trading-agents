@@ -500,10 +500,30 @@ function BacktestCard({ result, busy, onRun, candidate, ticker }) {
       ) : (
         <Space direction="vertical" size={10} style={{ width: "100%" }}>
           <Row gutter={[12, 12]}>
-            <Col xs={12} md={6}><Statistic title="年化收益" value={fin(metrics.annReturnPct) ? Number(metrics.annReturnPct) : null} precision={2} suffix="%" valueStyle={{ color: (metrics.annReturnPct ?? 0) >= 0 ? "#3fb950" : "#f8514d", fontSize: 18 }} /></Col>
-            <Col xs={12} md={6}><Statistic title="夏普" value={fin(metrics.sharpe) ? Number(metrics.sharpe) : null} precision={3} valueStyle={{ fontSize: 18 }} /></Col>
-            <Col xs={12} md={6}><Statistic title="最大回撤" value={fin(metrics.maxDrawdownPct) ? Number(metrics.maxDrawdownPct) : null} precision={2} suffix="%" valueStyle={{ color: "#f8514d", fontSize: 18 }} /></Col>
-            <Col xs={12} md={6}><Statistic title="胜率" value={fin(metrics.winRatePct) ? Number(metrics.winRatePct) : null} precision={1} suffix="%" valueStyle={{ fontSize: 18 }} /></Col>
+            {[
+              { title: "年化收益", value: metrics.annReturnPct, precision: 2, suffix: "%", tone: true },
+              { title: "夏普", value: metrics.sharpe, precision: 3, suffix: null, tone: false },
+              { title: "最大回撤", value: metrics.maxDrawdownPct, precision: 2, suffix: "%", tone: "down" },
+              { title: "胜率", value: metrics.winRatePct, precision: 1, suffix: "%", tone: false },
+            ].map((card) => {
+              // antd Statistic 的 value 默认是 0（`undefined`→0）、`null` 会被 String() 渲染成字面量
+              // `null`（带 suffix 就是 `null%`）。缺失一律显式传「—」并去掉 suffix/颜色。
+              const has = fin(card.value);
+              const tone = card.tone === true
+                ? (Number(card.value) >= 0 ? "#3fb950" : "#f8514d")
+                : card.tone === "down" ? "#f8514d" : undefined;
+              return (
+                <Col key={card.title} xs={12} md={6}>
+                  <Statistic
+                    title={card.title}
+                    value={has ? Number(card.value) : "—"}
+                    precision={has ? card.precision : undefined}
+                    suffix={has && card.suffix ? card.suffix : undefined}
+                    valueStyle={{ color: has ? tone : undefined, fontSize: 18 }}
+                  />
+                </Col>
+              );
+            })}
           </Row>
           <LineChart values={rebased} height={200} labels={[points[0].t, points[points.length - 1].t]}
             name={`${(env && env.ticker) || ticker || "标的"} 策略净值（起点归一 100）`} />

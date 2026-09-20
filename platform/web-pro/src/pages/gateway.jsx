@@ -11,6 +11,8 @@ import React from "react";
 import { Alert, Badge, Descriptions, Empty, Select, Space, Statistic, Table, Tag, Typography } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
+import { STAT, statNote, statNotes, statState, statText } from "../lib/stat-core.js";
+import { industryGateView, probeAgeText } from "../lib/risk-labels.js";
 import { useMarket } from "../services/marketContext.jsx";
 import { BarList } from "../components/charts.jsx";
 
@@ -87,27 +89,77 @@ function Stat({ label, value, suffix, hint }) {
   );
 }
 
-/** 三通道之一：MCP Bridge（真实运行态与计数）。 */
-function McpChannelCard({ gateway, metrics }) {
+/**
+ * 三通道之一：MCP Bridge（真实运行态与计数）。
+ *
+ * 计数三态（数字诚实性）：`/api/v3/metrics` 加载中/取失败时**不得**显示 0——
+ * `0` 只能表示「接口确实返回 0」。因此走 stat-core 的四态判定，
+ * 非真实读数一律渲染 `—` 并在卡内列出原因（`metricsEnv` 传 useV3 的返回对象）。
+ */
+function McpChannelCard({ gateway, metrics, metricsEnv }) {
   const mcp = gateway.channels?.mcp ?? {};
-  const calls = Number(metrics.mcp?.calls ?? 0);
-  const errors = Number(metrics.mcp?.errors ?? 0);
-  const successRate = calls > 0 ? `${(((calls - errors) / calls) * 100).toFixed(1)}%` : "—";
+  const metricsState = metricsEnv ?? {};
+  const callsStat = statState(metricsState, metrics.mcp?.calls, {
+    missingReason: "/api/v3/metrics 未返回 mcp.calls",
+  });
+  const errorsStat = statState(metricsState, metrics.mcp?.errors, {
+    missingReason: "/api/v3/metrics 未返回 mcp.errors",
+  });
+  const avgStat = statState(metricsState, metrics.mcp?.avgMs, {
+    missingReason: "/api/v3/metrics 未返回 mcp.avgMs",
+  });
+  const calls = callsStat.state === STAT.VALUE ? Number(callsStat.value) : null;
+  const errors = errorsStat.state === STAT.VALUE ? Number(errorsStat.value) : null;
+  const successRate = calls !== null && calls > 0 ? `${(((calls - errors) / calls) * 100).toFixed(1)}%` : "—";
+  const notes = statNotes([["今日调用", callsStat], ["失败次数", errorsStat], ["平均延迟", avgStat]]);
   return (
     <ProCard
       title={<Space size={8}>MCP Bridge {channelTag(mcp.status)}</Space>}
       bordered
-      extra={<Text type="secondary" style={{ fontSize: 11 }}>工具 {fmt.dash(mcp.tools ?? metrics.toolTotal)} 个</Text>}
+      extra={<Text type="secondary" style={{ fontSize: 11 }}>MCP 工具面 {fmt.dash(mcp.tools_total ?? mcp.tools ?? metrics.mcpToolTotal)} 个</Text>}
     >
       <Descriptions size="small" column={1} items={[
         { key: "protocol", label: "协议标识", children: fmt.dash(mcp.protocol) },
       ]} />
       <div style={{ display: "flex", flexWrap: "wrap", gap: 18, marginTop: 10 }}>
-        <Stat label="已注册工具" value={fmt.dash(mcp.tools ?? metrics.toolTotal)} suffix="个" />
-        <Stat label="今日调用" value={calls} suffix="次" hint="进程内计数" />
-        <Stat label="成功率" value={successRate} hint={`失败 ${errors} 次`} />
-        <Stat label="平均延迟" value={Number(metrics.mcp?.avgMs ?? 0)} suffix="ms" hint="metrics 无 P95 口径" />
+        <Stat
+          label="MCP 工具面"
+          value={fmt.dash(mcp.tools_total ?? mcp.tools ?? metrics.mcpToolTotal)}
+          suffix="个"
+          hint={mcp.tools_source ? `来源：${mcp.tools_source}` : "与 MCP tools/list 同源"}
+        />
+        <Stat
+          label="平台工具目录"
+          value={fmt.dash(mcp.tools_domain_catalog ?? metrics.toolTotal)}
+          suffix="个"
+          hint="六域目录口径，与 MCP 工具面不是同一个数"
+        />
+        <Stat
+          label="今日调用"
+          value={statText(callsStat)}
+          suffix={callsStat.state === STAT.VALUE ? "次" : undefined}
+          hint={statNote(callsStat) ?? "进程内计数"}
+        />
+        <Stat
+          label="成功率"
+          value={successRate}
+          hint={errorsStat.state === STAT.VALUE ? `失败 ${errors} 次` : statNote(errorsStat)}
+        />
+        <Stat
+          label="平均延迟"
+          value={statText(avgStat)}
+          suffix={avgStat.state === STAT.VALUE ? "ms" : undefined}
+          hint={statNote(avgStat) ?? "metrics 无 P95 口径"}
+        />
       </div>
+      {notes.length > 0 ? (
+        <Alert
+          style={{ marginTop: 10 }}
+          type={metricsState.error ? "error" : "warning"}
+          showIcon
+          message={`运行计数暂无读数（不是 0） · ${notes.join("；")}`}
+        />
+      ) : null}
       <Paragraph type="secondary" style={{ fontSize: 11.5, marginTop: 10, marginBottom: 0 }}>
         MCP 服务端状态机只有 start / stop / update 三个动作，没有状态查询端点；
         此处按 <Text code>{`channels.mcp.status=${fmt.dash(mcp.status)}`}</Text> 标注。
@@ -165,6 +217,8 @@ export default function GatewayPage() {
   const today = g.headless?.today ?? {};
   const tripped = Boolean(scheduler.kill || scheduler.halt || scheduler.critical);
   const toolCalls = Object.entries(m.mcp?.tools ?? {}).filter(([, value]) => Number.isFinite(Number(value)));
+  // 行业红线下单前闸门（/api/v3/metrics.industryGate）：failOpen=true 表示当前不阻断
+  const gateView = industryGateView(metrics.value?.industryGate);
 
   /* ── 作业市场分布 / 筛选（真实字段：job 前缀，无则不造） ── */
   const countByMarket = (key) => jobs.filter((record) => jobMarketOf(record) === key).length;
@@ -212,7 +266,7 @@ export default function GatewayPage() {
       </Text>
 
       <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(320px, 1fr))", gap: 12 }}>
-        <McpChannelCard gateway={g} metrics={m} />
+        <McpChannelCard gateway={g} metrics={m} metricsEnv={metrics} />
         <UnavailableChannelCard
           title="SDK JSON-RPC"
           channel={channels.sdk}
@@ -391,6 +445,24 @@ export default function GatewayPage() {
         <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
           口径：熔断保护为进程级全局口径（不按市场拆分），一个开关对所有市场生效。
         </Text>
+        {/* 行业红线下单前闸门的 fail-open 窗口：这是熔断/保护面的真实缺口，必须可见 */}
+        <Alert
+          type={gateView.available && gateView.failOpen ? "warning" : "info"}
+          showIcon
+          style={{ marginBottom: 10 }}
+          message={gateView.available
+            ? (gateView.failOpen
+              ? "行业红线下单前闸门：当前 fail-open（未参与阻断）"
+              : `行业红线下单前闸门：已生效 · 当前读数 ${fmt.pct(gateView.pct, 2)}（${gateView.top || "—"}）· 上限 ${fmt.pct(gateView.limitPct, 0)}`)
+            : "行业红线下单前闸门：读数不可用（未取得 industryGate）"}
+          description={
+            <Text type="secondary" style={{ fontSize: 11.5 }}>
+              {gateView.available && !gateView.failOpen
+                ? `来源 ${gateView.source || "—"} · as_of ${fmt.stamp(gateView.asOf)} · 探测年龄 ${probeAgeText(gateView.probeAgeMs)} · 单一行业暴露 > 上限 → stage=blocked_industry（risk.rule=industry-red-line）强制阻断`
+                : gateView.reason}
+            </Text>
+          }
+        />
         <div style={{ display: "grid", gridTemplateColumns: "repeat(auto-fit, minmax(260px, 1fr))", gap: 12 }}>
           <NoSource what="并发上限" why="Headless 子进程不自管并发位，工具面无该阈值" />
           <NoSource what="单次超时" why="无 Headless 子进程调度，无超时配置来源" />
@@ -432,6 +504,8 @@ export default function GatewayPage() {
         </Text>
         {metrics.error ? (
           <NoSource what="调用分布" why={`/api/v3/metrics 取数失败：${metrics.error}`} type="error" />
+        ) : metrics.loading && !metrics.value ? (
+          <Text type="secondary">读取中…（/api/v3/metrics 未返回前不显示任何计数，避免把「未取到」读成 0）</Text>
         ) : toolCalls.length === 0 ? (
           <Empty
             image={EMPTY_FRAME}

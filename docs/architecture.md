@@ -20,6 +20,14 @@
 > **当前计数：quantwb 工具面 77（72 端点工具 + 5 维护）、服务端点 82**——工具面按
 > **三档**治理（见「富途数据面」节）：直通 11 / 聚合 2 / HTTP-only 3（数据面内），
 > 另有值班队列 `research-tasks-list` 整体排除（WP15）。
+> **统计口径（2026-09-20 实测，四个数字别混）**：① `POST /api/wb/snapshot` 的
+> `value.endpoints` 长度 = **82**（工作台 HTTP 端点表）；② MCP `/mcp` 的 `tools/list`
+> = **77**（72 端点工具 + 5 维护；运行进程尚未挂载 `v3_mcp` 反向桥）；③ `/api/v3/*`
+> HTTP 路由 = **39**（源码快照）；④ 六域工具目录（`/api/v3/tools` 的 `total`、
+> `/metrics.toolTotal`、`/api/v3/gateway.channels.mcp.tools`）= **82** =
+> 工作台 77 工具 + 5 个 V3 本地计算（`v3_ops.V3_LOCAL_TOOLS`，这 5 个**没有**
+> `/api/wb/*` 端点）。桥接挂载后 MCP 工具数应为 77 + 39 = **116**。
+> 口径与逐条实测命令见 `docs/v3-integration.md` §1.5；历史「56 工具」写法已作废。
 > **WP15（已交付，2026-09-16）：值班研究员（L3）**——`research_tasks` 状态机（任务 1）、
 > `enqueue-research` 入基础 GLOBAL 链（任务 2，审查 A-2 后时点 = 对账 19:00 之后 19:05，
 > 保证当日 digest 先落库）、领取/回报/列表三端点 + 工具面两条

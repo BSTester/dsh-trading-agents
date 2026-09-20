@@ -523,7 +523,9 @@ node scripts/audit_page_fields.mjs --pages options --symbol HK.09961 \
    （页面上的「原始返回（核对用）」折叠块是同一份事实。）
 3. 改完页面**必须重建静态产物**，否则浏览器加载的还是旧代码：
    ```bash
-   # V3 控制台无构建步骤：改 platform/web/public/v3/** 即刻生效（静态文件直读），服务不用重启
+   # V3 工作台是 Ant Design Pro 单页（platform/web-pro），**有构建步骤**：
+   # 改完 src/** 必须重新构建，否则浏览器加载的还是旧产物（服务不用重启，FastAPI 直接读 dist/）
+   cd platform/web-pro && flock /tmp/probuild.lock npm run build   # 串行构建，避免与他人的构建互踩
    node scripts/audit_page_fields.mjs --pages <页>  # 复跑该页，退出码 0 即闭环
    ```
 

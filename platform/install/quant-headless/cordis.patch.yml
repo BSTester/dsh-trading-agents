@@ -142,11 +142,14 @@
 # workflow-worker-thread 这些**服务**行——只关模型可见的 tool-* 行。关服务行会让
 # 其它注入它的行卡在 waiting（"N row(s) did not activate"）。
 
-# ── 与 platform/ 的衔接：量化数据工具面 ──────────────────────────────────────
+# ── 与 platform/ 的衔接：量化数据工具面（**唯一**交互面）────────────────────
 #
-# 分析师能看到的量化数据都从平台的 MCP 工具面来（82 个工具，与 HTTP /api/wb/* 同一
-# handle、同一份实现）。@deepseek-ai/dsh-mcp-client 已装在共享目录
-# ~/.dsh/profiles/node_modules/（本 profile 能向上解析到），**无需额外装包**。
+# 分析师能看到的量化数据都从平台的 MCP 工具面来：既有 77 个工作台工具 + `/api/v3/*`
+# 路由桥接出的 `v3_*` 工具（随路由表，当前 39 个，合计 116 个），同一个 `/mcp` 端点、
+# 同一份服务端实现（桥接不复制业务逻辑，见 server/v3_mcp.py 与 docs/v3-integration.md）。
+# 双方交互只此一条：**不挂任何第三方 adapter/桥接包**。
+# @deepseek-ai/dsh-mcp-client 已装在共享目录 ~/.dsh/profiles/node_modules/
+# （本 profile 能向上解析到），**无需额外装包**。
 #
 # 与官方 headless profile 的同一处做法一致；差别只在注释口径：这里是只读研究角色，
 # 写端点依旧受服务侧闸门约束（见下）。

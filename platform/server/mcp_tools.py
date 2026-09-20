@@ -63,6 +63,7 @@
 #     随即变单分支，且 ``description``/``minimum``/``maximum`` 仍在分支上——代价不是「丢失
 #     可选字段描述/区间」，而是 null 分支消失、显式 null 改由 schema 层拒绝（与 Node/zod
 #     ``.optional()`` 趋同），因此要重新核对 27 个工具的载荷语义。本次补遗只披露，不改。
+import contextlib
 import inspect
 import json
 import warnings
@@ -791,7 +792,7 @@ TOOLS = (
         "option_screen",
         "期权筛选器（服务端经富途实时获取）：filter 对象必须含**形状正确**的 field_filter"
         "（int 字段用 1 占位、string 字段用非空串、嵌套字段用非空对象；空数组会被上游 -3"
-        "拒绝）与非空 strategy；可选 limit/next_key/sort_obj。**真机验证过的最小示例**："
+        "拒绝）与非空 strategy；可选 limit/next_key/sort_obj。**真机验证过的最小合法载荷**："
         '{"filter": {"strategy": {"market_category_list": [0], "filter_group_list": '
         '[{"option_list": [{"indicator_type": 1003, "indicator_value": {"value_list": [1]}}]}]}, '
         '"field_filter": {"option_type": 1, "volume": 1, "implied_volatility": 1}, "limit": 3}}'
@@ -1366,6 +1367,19 @@ def _bind(definition, handle, store_api):
     return tool
 
 
+@contextlib.contextmanager
+def schema_warning_filter():
+    """UNSET 哨兵默认值的告警定点静音（本模块与 V3 桥接注册面共用同一份口径）。
+
+    UNSET 哨兵默认值不是 JSON 可序列化的：pydantic 生成 inputSchema 时会警告并把 default
+    排除掉——排除正是我们想要的（可选字段与 z.optional() 同形，不出现伪造的
+    ``default:null``），所以只在此处定点静音，不扩大到全局。
+    """
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore", PydanticJsonSchemaWarning)
+        yield
+
+
 def register(server: MCPServer, handle, store_api=None):
     """把 56 个工具注册进 ``MCPServer``，返回绑定后的工具清单（``app.state.mcp_tools``）。
 
@@ -1373,19 +1387,15 @@ def register(server: MCPServer, handle, store_api=None):
     （此时维护工具调用会抛 AttributeError，并按程序异常包成 tool-failed）。
     """
     bound = build_tools(handle, store_api)
-    with warnings.catch_warnings():
-        # UNSET 哨兵默认值不是 JSON 可序列化的：pydantic 生成 inputSchema 时会警告并把 default
-        # 排除掉——排除正是我们想要的（可选字段与 z.optional() 同形，不出现伪造的 default:null），
-        # 所以只在此处定点静音，不扩大到全局。
-        warnings.simplefilter("ignore", PydanticJsonSchemaWarning)
+    with schema_warning_filter():
         for tool in bound:
             server.add_tool(tool.fn, name=tool.name, description=tool.description,
                             structured_output=False)
-        _forbid_extra_fields(server)
+        forbid_extra_fields(server)
     return bound
 
 
-def _forbid_extra_fields(server, own_names=TOOL_NAMES):
+def forbid_extra_fields(server, own_names=TOOL_NAMES):
     """规格 §3.6：inputSchema 必须 ``additionalProperties:false``（超集字段在 schema 层拒绝）。
 
     SDK 的公开注册面用固定 config 的 ``ArgModelBase`` 建参模型，没有注入 ``extra=forbid`` 的
@@ -1414,8 +1424,9 @@ def _forbid_extra_fields(server, own_names=TOOL_NAMES):
 
 __all__ = [
     "ENDPOINT_TOOL_ENDPOINTS", "INVALID_OPERATION_CODE", "LIVE_SWITCH_CODE", "LIVE_SWITCH_MESSAGE",
-    "MCP_EXCLUDED_ENDPOINTS", "SERVER_NAME", "SERVER_VERSION", "StoreApi", "TOOLS", "TOOL_COUNT",
-    "TOOL_FAILED_CODE", "TOOL_NAME_BLACKLIST", "TOOL_NAMES", "BoundTool", "Param",
-    "ToolDefinition", "build_tools", "dispatch", "failure", "is_blacklisted", "payload_of",
-    "register", "result_payload", "tool_result",
+    "MCP_EXCLUDED_ENDPOINTS", "MESSAGE_LIMIT", "SERVER_NAME", "SERVER_VERSION", "StoreApi",
+    "TOOLS", "TOOL_COUNT", "TOOL_FAILED_CODE", "TOOL_NAME_BLACKLIST", "TOOL_NAMES", "UNSET",
+    "BoundTool", "Param", "ToolDefinition", "build_tools", "dispatch", "failure",
+    "forbid_extra_fields", "is_blacklisted", "payload_of", "register", "result_payload",
+    "schema_warning_filter", "tool_result",
 ]

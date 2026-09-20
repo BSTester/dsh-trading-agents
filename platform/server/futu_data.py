@@ -994,7 +994,7 @@ class FutuData:
         field_filter = _require_dict(
             screen.get("field_filter"),
             "option_screen 必须带非空 field_filter（省略时上游只返回 4 个默认字段、其余全 null）。"
-            f"可用最小示例：{OPTION_SCREEN_EXAMPLE}")
+            f"可用最小合法载荷：{OPTION_SCREEN_EXAMPLE}")
         bad = sorted(key for key, value in field_filter.items()
                      if not _is_field_filter_placeholder(value))
         if bad:
@@ -1002,7 +1002,7 @@ class FutuData:
                 f"option_screen 的 field_filter 值形状非法：{bad}"
                 "（int 字段用 1 占位、string 字段用非空字符串、嵌套字段用非空对象；"
                 "空数组/空对象/0 会被上游 -3 拒绝）。"
-                f"可用最小示例：{OPTION_SCREEN_EXAMPLE}")
+                f"可用最小合法载荷：{OPTION_SCREEN_EXAMPLE}")
         _require_dict(screen.get("strategy"),
                       "option_screen 必须带非空 strategy（上游必填；形如 "
                       '{"market_category_list": [1], "filter_group_list": '

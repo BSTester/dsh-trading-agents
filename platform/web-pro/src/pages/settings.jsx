@@ -7,7 +7,9 @@
 //      （私钥与密钥绝不回显、保存后清空输入）
 //   4. 统一授权中心：GET /api/v3/credentials 的真实状态表 + Tushare token 可配置（保存 / 测试 / 清除）
 //   5. 环境变量与密钥来源：settings.env 只显示「是否注入 + 来源」，绝不显示值
-//   6. 授权与审计策略：阈值 2% / 20% / 15% + 只读降级说明（只读展示，不下发）
+//   6. 授权与审计策略：阈值 2% / 20% / 15%**逐条标注来源**（行业上限有接口字段
+//      `/api/v3/risk/industry.limitPct`；单笔与回撤后端未暴露字段 → 标「默认阈值·内置常量」）
+//      + 只读降级说明；「双人复核」如实写「未启用」（全仓库无实现）
 //   7. 自动流水线：开关 + 策略行（可增删）+ 三市场 exec_at + exec_window_minutes + reconcile_at + 保存
 // 写动作纪律：全部只在人工点击后发起；口令与格式校验在发请求之前；加载时只发空载荷「读状态」。
 import React from "react";
@@ -198,6 +200,9 @@ function autoDraft(config) {
     })),
     exec_at: Object.fromEntries(MARKETS.map(([market]) => [market, execAt[market] ?? ""])),
     exec_window_minutes: Number.isInteger(src.exec_window_minutes) ? src.exec_window_minutes : 30,
+    // 上面这个 30 是**表单默认值**（配置里没写时用），不是服务端读数——
+    // 页面必须标出来，否则会被读成「已生效的配置」；保存后会真写回（:587）。
+    exec_window_default: !Number.isInteger(src.exec_window_minutes),
     reconcile_at: typeof src.reconcile_at === "string" ? src.reconcile_at : "",
     error: src.error ?? null,
   };
@@ -1287,7 +1292,7 @@ export default function SettingsPage() {
             type="info"
             showIcon
             message="自动执行 · 阈值内"
-            description={`单笔 ≤ 2% · 行业 ≤ 20% · 回撤 ≤ 15%（v3_ops.LIMITS），当前模式 ${String(mode || "—").toUpperCase()}`}
+            description={`单笔 ≤ 2% · 行业 ≤ 20% · 回撤 ≤ 15%（默认阈值 · 后端 v3_ops.LIMITS 内置常量；本页未从接口读取——实测 /api/v3/oms/orders 不返回单笔/回撤阈值字段，行业上限的真实字段在 /api/v3/risk/industry.limitPct）· 当前模式 ${String(mode || "—").toUpperCase()}`}
           />
           <Alert
             type="warning"
@@ -1311,7 +1316,7 @@ export default function SettingsPage() {
             { key: "level", label: "审计日志级别", children: <Tag color="blue">审计链完整（/api/v3/audit）</Tag> },
             { key: "retention", label: "审计保留期", children: <Text type="secondary">无数据源（工具面不返回保留期策略）</Text> },
             { key: "rotate", label: "审批口令轮换时间", children: <Text type="secondary">无数据源（轮换由工作台 Web 的口令闸门负责，时间不在工具面）</Text> },
-            { key: "dual", label: "双人复核", children: "LIVE 大额订单需双人复核后执行（阈值由风控引擎统一下发，本页只读展示）" },
+            { key: "dual", label: "双人复核", children: <Text type="secondary">未启用（本仓库 platform/server 与 scripts 全域无「双人复核」实现，接口与配置里也没有对应字段；此处此前宣称 LIVE 大额订单需先过双人复核，属于不存在的能力，已撤下该文案）</Text> },
             { key: "ops", label: "策略开关", children: <Text type="secondary">无数据源（开关由风控引擎下发，工具面无写入通道）</Text> },
           ]}
         />
@@ -1422,7 +1427,7 @@ export default function SettingsPage() {
                 </div>
               ))}
               <div>
-                <Text style={{ fontSize: 12 }}>{`执行窗口（分钟，1–${EXEC_WINDOW_MAX}）`}</Text>
+                <Text style={{ fontSize: 12 }}>{`执行窗口（分钟，1–${EXEC_WINDOW_MAX}）${auto.exec_window_default ? " · 当前为表单默认值 30（配置里未设置）" : ""}`}</Text>
                 <br />
                 <InputNumber
                   size="small"

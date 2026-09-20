@@ -19,11 +19,12 @@
 import React from "react";
 import {
   Alert, Badge, Button, Col, Descriptions, Empty, Form, Input, Modal, Progress, Row, Space,
-  Table, Tag, Timeline, Typography,
+  Table, Tag, Timeline, Tooltip, Typography,
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { useV3, useWbAction, postWb, getV3, fmt, noSourceText } from "../services/api.js";
 import { MarketNote, envelopeError, marketLabel, useMarket } from "../services/marketContext.jsx";
+import { industryGateView, isBlockedStage, orderIndustryView, probeAgeText, ruleLabel, stageLabel, stageTone } from "../lib/risk-labels.js";
 import { BarList } from "../components/charts.jsx";
 
 const { Text, Link } = Typography;
@@ -31,7 +32,8 @@ const { Text, Link } = Typography;
 /* ── 常量（与 binder / 服务端契约一字不差） ─────────────────────────────── */
 const PLAN_CONFIRM_WORD = "确认执行";   // LIVE 逐字口令（app.py:534-535）
 const ARM_TTL_MS = 20000;               // 待确认态存活窗口：过期即撤销，避免「很久以前那一次点击」被兑现
-const FALLBACK_TTL_SECONDS = 120;       // confirmation.ttl_ms 缺失时的展示兜底
+// 注意：**没有**「服务端 TTL 回退值」。`confirmation.ttl_ms` 缺失时页面显示
+// 「—（未取到）」，不得用前端常量（曾为 120s）冒充服务端 TTL。
 
 /* ── 通用小工具（单块失败只影响该块） ───────────────────────────────────── */
 class Block extends React.Component {
@@ -70,12 +72,10 @@ function envError(env, fallback) {
   return envelopeError(env, fallback || "接口未返回 error.code/message");
 }
 
-const stageText = (stage) => ({
-  manual: "待审批", blocked: "已阻断", risk_passed: "风控通过", submitted: "已提交",
-  filled: "全部成交", rejected: "已拒绝", partial: "部分成交",
-}[String(stage)] || String(stage || "未知"));
-const stageColor = (stage) => (stage === "manual" ? "gold" : stage === "blocked" || stage === "rejected" ? "red"
-  : stage === "filled" ? "green" : "blue");
+// 阶段 / 规则标签与颜色统一走 lib/risk-labels.js（后端新增 blocked_industry 态时，
+// 旧的字面量比较会把行业红线阻断渲染成灰色 —— 那是真实缺陷，不是配色偏好）。
+const stageText = stageLabel;
+const stageColor = stageTone;
 const sideText = (side) => (String(side).toUpperCase() === "BUY" ? "买入" : "卖出");
 const shortId = (id) => (String(id || "—").length > 14 ? `${String(id).slice(0, 8)}…${String(id).slice(-4)}` : String(id || "—"));
 
@@ -306,7 +306,7 @@ function LifecycleBoard({ execEnv, orders, audit, stages }) {
       : { count: 0, cards: [], why: "审计链窗口内无量化信号" },
     风控校验: byStage("risk_passed").length
       ? { count: byStage("risk_passed").length, cards: byStage("risk_passed").slice(0, 2).map((order) => ({ title: order.ticker, extra: `${sideText(order.side)} · ${fmt.num(order.qty, 0)} 股`, time: fmt.stamp(order.updated_at) })) }
-      : { count: 0, cards: [], why: "台账无 risk_passed 阶段订单（超单笔上限的订单全部退回 manual）" },
+      : { count: 0, cards: [], why: `台账无 risk_passed 阶段订单（超单笔上限退回 manual${byStage("blocked_industry").length ? `；单一行业暴露超限被闸门阻断 ${byStage("blocked_industry").length} 单（stage=blocked_industry）` : ""}）` },
     审批: byStage("manual").length
       ? { count: byStage("manual").length, cards: byStage("manual").slice(0, 2).map((order) => ({ title: order.ticker, extra: `${sideText(order.side)} · ${fmt.money(order.value)}`, time: fmt.stamp(order.updated_at) })), color: "gold" }
       : { count: 0, cards: [], why: "台账无 manual 阶段订单" },
@@ -369,12 +369,25 @@ function LifecycleBoard({ execEnv, orders, audit, stages }) {
 }
 
 /* ── ③ 分级审批三档 ─────────────────────────────────────────────────────── */
-function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv }) {
+function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv, gateView }) {
   const { market } = useMarket();
   const auto = orders.filter((order) => String(order.stage) === "risk_passed");
   const manual = orders.filter((order) => String(order.stage) === "manual");
-  const blocked = orders.filter((order) => ["blocked", "rejected"].includes(String(order.stage)));
+  // 强制阻断同时含回撤红线（blocked）与**行业红线**（blocked_industry）——后端 2026-09-20 起
+  // 行业超限单独成态；旧过滤只认 blocked，会把行业红线阻断漏掉。券商/通道拒绝（rejected）
+  // 沿用原口径一并列出，但标签区分（见 orderCard）。
+  const blocked = orders.filter((order) => isBlockedStage(order.stage) || isBlockedStage(order.risk && order.risk.action)
+    || String(order.stage) === "rejected");
   const limit = riskCfg && fin(riskCfg.risk_per_trade) ? Number(riskCfg.risk_per_trade) * 100 : null;
+  /* 单笔下单上限（OMS check_order）后端**没有**独立字段，阈值只出现在台账判定理由原文里
+   * （如「单笔占比 6.90% > 2%，需人工确认」）。这里从台账原文回读，回读不到就写「未回读」，
+   * 不再用前端字面量 2% 冒充接口阈值。 */
+  const reasonText = orders.map((order) => asArray(order.risk && order.risk.reasons).join("；")).join("；");
+  const limitMatch = reasonText.match(/[>＞]\s*([0-9.]+)\s*%/);
+  const singleLimitPct = limitMatch ? Number(limitMatch[1]) : null;
+  const singleLimitText = singleLimitPct === null
+    ? "—（未从台账回读到阈值；后端默认 2%，为内置常量）"
+    : fmt.pct(singleLimitPct, 0);
   const first = manual[0] || null;
   const orderCard = (order) => (
     <div key={order.id || order.ticker} style={{ border: "1px solid #232b37", borderRadius: 6, padding: "8px 10px", marginTop: 6 }}>
@@ -384,7 +397,12 @@ function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv }) {
         <Tag color={stageColor(order.stage)}>{stageText(order.stage)}</Tag>
       </Space>
       <div><Text type="secondary" style={{ fontSize: 11 }}>订单号 {order.id || "—"}</Text></div>
-      <div><Text type="secondary" style={{ fontSize: 11 }}>风控结论 {asArray(order.risk && order.risk.reasons).join("；") || "未给出原因"}</Text></div>
+      <div>
+        <Text type="secondary" style={{ fontSize: 11 }}>
+          {`风控判定 ${ruleLabel(order.risk && order.risk.rule) || "未返回 rule 字段"} · `}
+          {asArray(order.risk && order.risk.reasons).join("；") || "未给出原因"}
+        </Text>
+      </div>
       <div><Text type="secondary" style={{ fontSize: 11 }}>计划 {order.plan_id || "—"} · NAV {fmt.money(order.nav_used)}（{order.nav_source || "—"}）· {fmt.stamp(order.updated_at || order.first_seen_at)}</Text></div>
     </div>
   );
@@ -392,12 +410,12 @@ function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv }) {
     <ProCard
       title="分级审批"
       bordered
-      extra={<Text type="secondary" style={{ fontSize: 12 }}>台账口径 /api/v3/oms/orders · 自动放行仅发生在单笔占比 ≤ 2% 且未触红线时</Text>}
+      extra={<Text type="secondary" style={{ fontSize: 12 }}>台账口径 /api/v3/oms/orders · 自动放行仅发生在单笔占比 ≤ {singleLimitText} 且未触红线时</Text>}
     >
       <Row gutter={[12, 12]}>
         <Col xs={24} lg={8}>
           <ProCard size="small" bordered title={<Space size={6}><Text style={{ fontSize: 12 }}>自动执行</Text><Tag color={auto.length ? "green" : "blue"}>台账 {auto.length} 单</Tag></Space>}
-            subTitle={<Text type="secondary" style={{ fontSize: 11 }}>规则依据 · 单笔 ≤ 权益 2%（OMS check_order）· 风险预算 {fmt.pct(limit, 1)}</Text>}>
+            subTitle={<Text type="secondary" style={{ fontSize: 11 }}>规则依据 · 单笔 ≤ 权益 {singleLimitText}（OMS check_order）· 风险预算 {fmt.pct(limit, 1)}</Text>}>
             {auto.length === 0
               ? <Text type="secondary" style={{ fontSize: 11 }}>{noSourceText("自动执行订单", "台账 stage 分布无 risk_passed/auto（当前订单全部超单笔上限，退回人工确认）")}</Text>
               : <Space direction="vertical" size={4} style={{ width: "100%" }}>{auto.slice(0, 3).map(orderCard)}</Space>}
@@ -443,15 +461,34 @@ function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv }) {
             subTitle={<Text type="secondary" style={{ fontSize: 11 }}>强制阻断无操作入口 · 全程留痕可追溯（/api/v3/oms/orders）</Text>}>
             <Tag color={industryEnv && OK(industryEnv) ? (industryEnv.breach ? "red" : "blue") : undefined}>
               {industryEnv && OK(industryEnv)
-                ? `行业暴露 ${fmt.pct(industryEnv.top && industryEnv.top.weightPct, 2)} · 上限 ${fmt.pct(industryEnv.limitPct, 0)} · ${industryEnv.breach ? "超限（人工核对）" : "未超限"}（/api/v3/risk/industry）`
+                ? `行业暴露 ${fmt.pct(industryEnv.top && industryEnv.top.weightPct, 2)} · 上限 ${fmt.pct(industryEnv.limitPct, 0)} · ${industryEnv.breach ? "超限（下单前闸门强制阻断）" : "未超限"}（/api/v3/risk/industry）`
                 : noSourceText("行业分类", envError(industryEnv, "GET /api/v3/risk/industry 取不到"))}
             </Tag>
+            {gateView ? (
+              <div style={{ marginTop: 4 }}>
+                {gateView.available && gateView.hasReading ? (
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    {`下单前闸门读数：行业 ${fmt.pct(gateView.pct, 2)}（${gateView.top || "—"}，上限 ${fmt.pct(gateView.limitPct, 0)}）· 来源 ${gateView.source || "—"} · as_of ${fmt.stamp(gateView.asOf)} · 探测年龄 ${probeAgeText(gateView.probeAgeMs)}${gateView.missing ? ` · ${gateView.missing} 只标的未取到行业分类（读数为下界）` : ""}`}
+                  </Text>
+                ) : (
+                  <Alert
+                    type={gateView.available && gateView.failOpen ? "warning" : "info"}
+                    showIcon
+                    style={{ marginTop: 4 }}
+                    message={gateView.available && gateView.failOpen
+                      ? "行业红线当前未参与阻断（fail-open）——这是真实的风险窗口，不是「暴露 0%」"
+                      : "行业闸门读数不可用（本服务进程未返回 industryGate）"}
+                    description={<Text type="secondary" style={{ fontSize: 11 }}>{gateView.reason}</Text>}
+                  />
+                )}
+              </div>
+            ) : null}
             <div style={{ marginTop: 6 }}>
               {blocked.length > 0
                 ? <Space direction="vertical" size={4} style={{ width: "100%" }}>{blocked.slice(0, 3).map(orderCard)}</Space>
                 : (
                   <Text type="secondary" style={{ fontSize: 11 }}>
-                    {noSourceText("强制阻断订单", "OMS 台账 0 条 blocked/rejected 订单；硬阻断只能来自单笔占比与回撤红线，行业上限只做展示与人工核对，未接入自动阻断")}
+                    {noSourceText("强制阻断订单", `OMS 台账 0 条 blocked/blocked_industry/rejected 订单；硬阻断来自两条下单前红线：单笔占比 > 单笔上限退回人工（manual）、单一行业暴露 > 上限 → blocked_industry、回撤 ≥ 阈值 → blocked`)}
                   </Text>
                 )}
             </div>
@@ -746,6 +783,8 @@ function DecisionTrace({ order, audit, riskCfg, nav, execEnv }) {
     { title: "计划", dataIndex: "plan_id", width: 190, render: (value) => <Text type="secondary" style={{ fontSize: 11 }}>{String(value || "—")}</Text> },
   ];
   const history = asArray(current && current.history);
+  // 逐单行业读数：闸门前的历史判定绝不渲染成「0.00%」（详见 lib/risk-labels.js）
+  const industryOfOrder = orderIndustryView(current);
   const events = OK(execEnv) ? execEnv : null;
   const openRows = flatRows(events && events.orders_open, ["rows", "orders"]);
   const dealRows = flatRows(events && events.deals_today, ["rows", "deals"]);
@@ -766,7 +805,25 @@ function DecisionTrace({ order, audit, riskCfg, nav, execEnv }) {
           { key: "sentiment", label: "情绪评分", children: <Text type="secondary">{noSourceText("情绪/情感评分", "工具面无情绪评分数据源")}</Text> },
           { key: "market", label: "盘中市场状态", children: <Text type="secondary">{noSourceText("盘中市场状态快照", "工具面无盘中市场状态数据源")}</Text> },
           { key: "param", label: "计划参数", children: current ? `计划 ${current.plan_id || "—"} · plan_status ${current.plan_status || "—"} · mode ${current.mode || "—"}` : "—" },
-          { key: "risk", label: "风控阈值口径", children: current ? `NAV ${fmt.money(current.nav_used)}（${current.nav_source || "—"}）· 回撤 ${fmt.pct(current.drawdown_used)}（${current.drawdown_source || "—"}）· 行业 ${fmt.pct(current.industry_pct)}（工具面无行业分类，不参与阻断）· 单笔上限 ${riskCfg && fin(riskCfg.risk_per_trade) ? fmt.pct(Number(riskCfg.risk_per_trade) * 100, 1) : "—"}（风险预算）· NAV ${fin(nav) ? fmt.money(nav) : "—"}` : "—" },
+          { key: "risk", label: "风控阈值口径", children: current ? (
+            <Space direction="vertical" size={0}>
+              <Text style={{ fontSize: 12 }}>
+                {`NAV ${fmt.money(current.nav_used)}（${current.nav_source || "—"}）· ` +
+                  `回撤 ${fmt.pct(current.drawdown_used)}（${current.drawdown_source || "—"}）· `}
+                <Tooltip title={industryOfOrder.note || industryOfOrder.sourceLine}>
+                  <Text style={{ fontSize: 12, borderBottom: "1px dotted #8b949e" }}>
+                    {industryOfOrder.text}
+                  </Text>
+                </Tooltip>
+                {` · 判定规则 ${ruleLabel(current.risk && current.risk.rule) || "未返回 rule 字段"} · ` +
+                  `单笔风险预算 ${riskCfg && fin(riskCfg.risk_per_trade) ? fmt.pct(Number(riskCfg.risk_per_trade) * 100, 1) : "—"}（config.risk_per_trade）`}
+              </Text>
+              <Text type="secondary" style={{ fontSize: 11 }}>{industryOfOrder.sourceLine}</Text>
+              {industryOfOrder.note ? (
+                <Text type="secondary" style={{ fontSize: 11 }}>{industryOfOrder.note}</Text>
+              ) : null}
+            </Space>
+          ) : "—" },
           { key: "traceid", label: "逐单 trace id", children: <Text type="secondary">{noSourceText("逐单决策 trace id", "OMS 台账只有计划号，无逐单 trace id")}</Text> },
         ]}
       />
@@ -779,7 +836,7 @@ function DecisionTrace({ order, audit, riskCfg, nav, execEnv }) {
             <Timeline style={{ marginTop: 8 }}
               items={history.map((record, index) => ({
                 key: `${record.at}-${index}`,
-                color: record.stage === "manual" ? "orange" : ["blocked", "rejected"].includes(String(record.stage)) ? "red" : record.stage === "filled" ? "green" : "blue",
+                color: record.stage === "manual" ? "orange" : (isBlockedStage(record.stage) || String(record.stage) === "rejected") ? "red" : record.stage === "filled" ? "green" : "blue",
                 children: (
                   <Space direction="vertical" size={0}>
                     <Text style={{ fontSize: 12 }}>{fmt.stamp(record.at)} · {stageText(record.stage)}</Text>
@@ -1039,7 +1096,10 @@ function ConfirmChannel({ env, envErr, pending, ttlMs, wb, reload, onDecided }) 
     }
   };
 
-  const ttlSeconds = fin(ttlMs) ? Math.round(Number(ttlMs) / 1000) : FALLBACK_TTL_SECONDS;
+  // 服务端 TTL 只能来自 `confirmation.ttl_ms`；取不到就是「未取到」，不编一个数出来
+  // （此前缺失时回退 120s，等于把前端常量当成服务端 TTL 展示）。
+  const ttlSeconds = fin(ttlMs) && Number(ttlMs) > 0 ? Math.round(Number(ttlMs) / 1000) : null;
+  const ttlText = ttlSeconds === null ? "—（未取到 confirmation.ttl_ms）" : `${ttlSeconds} 秒`;
   const fields = pending && pending.summary && Array.isArray(pending.summary.fields) ? pending.summary.fields : [];
   return (
     <ProCard
@@ -1063,7 +1123,7 @@ function ConfirmChannel({ env, envErr, pending, ttlMs, wb, reload, onDecided }) 
             <Button disabled>拒绝</Button>
           </Space>
           <Text type="secondary" style={{ fontSize: 12 }}>
-            TTL {ttlSeconds} 秒：到期或未作答一律按拒绝处理（fail-closed）。口径区分：台账 stage=manual 是平台侧台账审批阶段，不是券商待确认。
+            TTL {ttlText}：到期或未作答一律按拒绝处理（fail-closed）。口径区分：台账 stage=manual 是平台侧台账审批阶段，不是券商待确认。
           </Text>
           {msg ? <Alert type={msg.tone === "ok" ? "success" : msg.tone === "err" ? "error" : "warning"} showIcon message={msg.text} /> : null}
         </Space>
@@ -1103,7 +1163,7 @@ function ConfirmChannel({ env, envErr, pending, ttlMs, wb, reload, onDecided }) 
           </Space>
           <Text type="secondary" style={{ fontSize: 12 }}>
             批准是唯一能授权实盘操作的通道：决策载荷只有 {"{id, decision}"}，本页不能填写任何下单参数。首次点击只进入待确认态，
-            <Text strong>第二次点击才提交</Text>；决定后立刻重读 confirmation。TTL {ttlSeconds} 秒，到期或未知一律按拒绝（fail-closed）。
+            <Text strong>第二次点击才提交</Text>；决定后立刻重读 confirmation。TTL {ttlText}，到期或未知一律按拒绝（fail-closed）。
           </Text>
           {msg ? <Alert type={msg.tone === "ok" ? "success" : msg.tone === "err" ? "error" : "warning"} showIcon message={msg.text} /> : null}
         </Space>
@@ -1132,7 +1192,8 @@ export default function 执行审批Page() {
   // 成交质量：市场来自统一上下文（页头 MarketPicker）；本卡不再自带市场开关，避免同页两个市场事实源。
   const quality = useQuality(market);
   // 行业暴露与集中度：与风控页同一只读端点，用于取消「行业分类无数据源」的表述（只读 GET，带市场）。
-  const industry = useV3("risk/industry", { limit_pct: 20, market });
+  // 不传 limit_pct：红线取服务端默认（后端签名 limit_pct 默认 20），页面显示的 limitPct 才是服务端读数。
+  const industry = useV3("risk/industry", { market });
 
   const ordersEnvelope = OK(oms.value) ? oms.value : (OK(exec.value) && exec.value.oms ? exec.value.oms : null);
   const orders = ordersEnvelope && Array.isArray(ordersEnvelope.orders) ? ordersEnvelope.orders : [];
@@ -1159,9 +1220,24 @@ export default function 执行审批Page() {
   }, [plan.refresh, confirmation.refresh]);
 
   const metricsEnv = OK(metrics.value) ? metrics.value : {};
+  // 行业闸门读数（/api/v3/metrics.industryGate）：fail-open 是真实风险窗口，页面必须显式提示
+  const gateView = industryGateView(metricsEnv.industryGate);
 
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
+      {gateView.available && gateView.failOpen ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="行业集中度红线当前未参与下单前阻断（fail-open）"
+          description={
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              原因：{gateView.reason}。这是真实的风险窗口——没有新鲜行业读数时闸门按 fail-open 放行，
+              订单 reasons 里会写明「行业暴露数据不可用，未参与阻断」；恢复读数后行业 &gt; {fmt.pct(gateView.limitPct, 0)} 将直接判 <Text code>stage=blocked_industry</Text>。
+            </Text>
+          }
+        />
+      ) : null}
       <Block title="执行入口条">
         <ExecHeader mode={mode} planEnv={plan.value} planErr={planErr} orders={orders} deals={dealRows} nav={nav}
           omsNote={ordersEnvelope && ordersEnvelope.note ? ordersEnvelope.note : null}
@@ -1171,7 +1247,8 @@ export default function 执行审批Page() {
         <LifecycleBoard execEnv={exec.value} orders={orders} audit={auditEntries} stages={stages} />
       </Block>
       <Block title="分级审批">
-        <ApprovalGrades orders={orders} riskCfg={riskCfg} nav={nav} onOpenPlan={() => setModalOpen(true)} industryEnv={industry.value} />
+        <ApprovalGrades orders={orders} riskCfg={riskCfg} nav={nav} onOpenPlan={() => setModalOpen(true)} industryEnv={industry.value}
+          gateView={gateView} />
       </Block>
       <Block title="订单明细">
         <ProCard title="订单明细" bordered

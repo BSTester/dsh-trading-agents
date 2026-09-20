@@ -249,7 +249,11 @@ export default function BrainPage() {
             <b style={MONO}>{String(paat.scoreSource || "—")}</b>
           </Text>
           <Text type="secondary" style={{ fontSize: 11 }}>
-            因子错误：{paat.factorsError ? String(paat.factorsError) : "0 条"}
+            {`因子错误：${paat.factorsError === undefined
+              ? "—（PAAT 未返回 factorsError 字段）"
+              : paat.factorsError
+                ? String(paat.factorsError)
+                : "0 条（接口返回 null）"}`}
           </Text>
         </Space>
       ),
@@ -373,7 +377,7 @@ export default function BrainPage() {
       title: "建议操作",
       dataIndex: "action_hint",
       width: 220,
-      render: (value) => <Text type="secondary" style={{ fontSize: 11 }}>{String(value || "经人工审批后执行")}</Text>,
+      render: (value) => <Text type="secondary" style={{ fontSize: 11 }}>{value ? String(value) : "—（接口未返回 action_hint）"}</Text>,
     },
   ];
 
@@ -800,7 +804,7 @@ export default function BrainPage() {
                       <Text strong>{fmt.dash(item.action)}</Text> 目标权重 <span style={MONO}>{numOr(item.targetWeightPct, 1)}%</span> · 风险{" "}
                       <span style={MONO}>{fmt.dash(item.riskLevel)}</span>：{String(item.basis || "—")}
                       <Text type="secondary" style={{ display: "block", fontSize: 11 }}>
-                        {String(item.action_hint || "经人工审批后执行")}
+                        {item.action_hint ? String(item.action_hint) : "—（接口未返回 action_hint，本页不代平台给执行建议）"}
                       </Text>
                     </li>
                   ))}

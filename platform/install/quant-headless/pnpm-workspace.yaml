@@ -1,26 +1,19 @@
 # 本 profile 的 pnpm 工作区设置（与官方 headless/sdk/web 三个 profile 逐字一致）
 #
-# 为什么必须有这个文件——它是**实测出来的**，不是抄来的：
-#   `dsh plugin --profile <name> add <pkg>` 实际是把参数转发给 pnpm 在 profile 目录里跑。
-#   pnpm 默认 `autoInstallPeers: true`，会把包的 peerDependency 也去 registry 装一遍。
-#   2026-09-20 在临时 DSH_HOME 里实测（未加本文件）：
+# 三项设置的由来（都是实测结论，不是抄来的）：
+#   * `dsh plugin --profile <name> add <pkg>` 实际是把参数转发给 pnpm 在 profile 目录里跑；
+#     pnpm 默认 `autoInstallPeers: true`，会把被安装包的 peerDependency 也去 registry 装一遍。
+#   * 而 `@deepseek-ai/dsh-tools` / `@deepseek-ai/cordis` 的 npm **latest** 标签停在 0.0.x-rc，
+#     任何声明 `>=0.1.0` 的 peer 都会让安装以 `ERR_PNPM_NO_MATCHING_VERSION` 失败
+#     （满足 `>=0.1.0` 的是 **next** 标签 0.1.5-rc.2）。关掉 autoInstallPeers 后 pnpm 不再去
+#     registry 找 peer，而是沿用共享目录（`$DSH_HOME/profiles/node_modules`）里**已装好**的
+#     0.1.5-rc.2。完整真实报错见 `docs/v3-integration.md`（「弃用第三方 adapter」一节）。
+#   * `nodeLinker: hoisted`：与既有共享 node_modules 的扁平布局一致（没有 .pnpm 虚拟 store），
+#     这样 profile 目录能向上解析到共享包，而不必每个 profile 各装一份 249 个包。
 #
-#     $ dsh plugin --profile quant-headless add @helibeiqi/dsh-cordis-universal-adapter
-#     ERR_PNPM_NO_MATCHING_VERSION  No matching version found for
-#       @deepseek-ai/dsh-tools@>=0.1.0 while fetching it from https://registry.npmjs.org/
-#     The latest release of @deepseek-ai/dsh-tools is "0.0.1-rc.1".
-#     Other releases are:
-#       * next: 0.1.5-rc.2
-#       * alpha: 0.1.6-alpha.2
-#
-#   原因：该 adapter 声明 peerDependencies `@deepseek-ai/dsh-tools: ">=0.1.0"` 与
-#   `@deepseek-ai/cordis: ">=0.1.0"`，而这两个包的 npm **latest** 标签停在 0.0.x-rc，
-#   不满足 `>=0.1.0`（满足的是 `next` 标签 0.1.5-rc.2）。**autoInstallPeers 开着就必然失败。**
-#   关掉它之后，pnpm 不再去 registry 找 peer，而是沿用共享目录
-#   （`$DSH_HOME/profiles/node_modules`）里**已装好**的 0.1.5-rc.2，安装即成功。
-#
-# `nodeLinker: hoisted`：与既有共享 node_modules 的扁平布局一致（没有 .pnpm 虚拟store），
-# 这样 profile 目录能向上解析到共享包，而不必每个 profile 各装一份 249 个包。
+# 本 profile 的工具面**不依赖任何第三方插件包**：`cordis.patch.yml` 只 insert 一行官方
+# `@deepseek-ai/dsh-mcp-client`（已装在 ~/.dsh/profiles/node_modules/，无需再装）。
+# 保留本文件是为了让将来任何 `dsh plugin add` 不落入上面的 autoInstallPeers 坑。
 packages:
   - .
 

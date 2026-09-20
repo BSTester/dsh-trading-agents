@@ -15,7 +15,8 @@
   * 端点：``rules`` 只读（空载荷白名单、不进缓存、库零变化）；``rules-decide`` 动作端点
     （字段白名单挡死 spec 字段与 by、业务拒绝落 trading/invalid-operation、真的写库）；
   * 工具面：``rules`` 进面、``rules-decide`` **不进**（模型不得自批）；
-    端点 82 / 工具 77 / 端点工具集 ≡ 端点清单 − 排除集。
+    端点 82 / 工作台基础工具 77（``mcp_tools.TOOL_COUNT`` 仍是这个基础注册表的 77；另有
+    V3 桥接 39 件 → MCP 面 116，见 ``tests/test_wp6_mcp.py``）/ 端点工具集 ≡ 端点清单 − 排除集。
 """
 import io
 import inspect
@@ -729,6 +730,8 @@ class RulesListFilterTest(ApproveBase):
 
 class RulesSurfaceTest(ApproveBase):
     def test_tool_and_endpoint_counts(self):
+        # mcp_tools 是**工作台基础注册表**（77 件）；V3 桥接 39 件在 v3_mcp，MCP 面 116
+        # 由 tests/test_wp6_mcp.py 锁定。
         self.assertEqual(mcp_tools.TOOL_COUNT, 77)
         self.assertEqual(len(mcp_tools.TOOLS), 77)
         self.assertEqual(len(store_access.endpoints()), 82)
@@ -757,6 +760,7 @@ class RulesSurfaceTest(ApproveBase):
                          set(rule_engine.RULE_STATUSES))
 
     def test_tool_budget_unchanged(self):
+        # 预算 ≤80 是对**基础注册表**的约束（V3 桥接面按 /api/v3/* 路由表构造，不计入这个预算）
         self.assertLessEqual(mcp_tools.TOOL_COUNT, 80)
 
 

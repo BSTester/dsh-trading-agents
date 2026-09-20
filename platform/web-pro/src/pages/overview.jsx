@@ -3,7 +3,9 @@
 //   ① KPI 5 张（总资产 / 当日盈亏 / 年化收益 / 夏普比率 / 最大回撤）
 //   ② 三通道状态 3 卡（MCP Bridge / SDK JSON-RPC / Headless CLI）
 //   ③ 决策链路时间线（研究流水线产出 + 审计链 + Headless last）
-//   ④ 风控红线 3 条（单笔上限 2% / 单一行业暴露 20% / 最大回撤阈值 15%）
+//   ④ 风控红线 3 条（单笔 / 单一行业暴露 / 最大回撤）——**阈值来源逐条标注**：
+//      行业上限读 `GET /api/v3/risk/industry.limitPct`（真实字段）；
+//      单笔与回撤后端无阈值字段，如实标注「默认阈值（内置常量 v3_ops.LIMITS）」，不谎称取自台账
 //   ⑤ Agent Loop 实时状态（turn/token/模型/推理强度 + 工具调用 Top5）
 //   ⑥ 待人工审批（oms/orders stage=manual 真实订单）
 //   ⑦ 数据源健康（workbench / 富途 / AKShare / SEC EDGAR / Tushare 真实探测）
@@ -26,6 +28,7 @@ import {
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
+import { industryGateView, probeAgeText } from "../lib/risk-labels.js";
 import { useMarket } from "../services/marketContext.jsx";
 import { BarList, LineChart } from "../components/charts.jsx";
 
@@ -65,6 +68,26 @@ function ScopeTag({ market, label, global = false, text }) {
 
 // KPI 五项全部取自 overview.equity —— 单一台账，后端不按市场拆分权益
 const LEDGER_SCOPE = "台账口径（不按市场拆分）";
+
+/* ── 风控红线阈值口径（数字诚实性）─────────────────────────────────────────
+ * 平台真实红线在**后端常量**里：`platform/server/v3_ops.py`
+ * `LIMITS = {"singlePct": 2.0, "industryPct": 20.0, "drawdownPct": 15.0}`。
+ * 页面按「接口字段 → 台账原文 → 内置常量」三级取值，并**逐行标注实际用了哪一级**：
+ *   * 行业上限：接口字段（`/api/v3/metrics.industryGate.industryLimitPct`，
+ *     退化 `/api/v3/risk/industry.limitPct`）——两个都是后端真值；
+ *   * 单笔 / 回撤：后端**没有**独立阈值字段（实测 `/api/v3/oms/orders` 只有
+ *     nav / drawdown_pct / drawdown_source / industry_* 与订单 `risk.reasons`），
+ *     所以从台账判定理由原文回读闸门**真正应用过**的值
+ *     （「单笔占比 6.90% > 2%，需人工确认」「回撤 16.0% 触及 15% 红线」）；
+ *   * 两者都拿不到时才用内置常量，并标注「默认阈值（内置常量 v3_ops.LIMITS）」。
+ * 注意 `/api/v3/risk` 的 `data.config` 是**工作台 risk 工具**的仓位配置
+ * （实测 `risk_per_trade=1% / max_position_pct=25% / daily_loss_limit_pct=3%`），
+ * 与这套红线**不是一回事**，因此**不能**拿它顶替 2% / 20% / 15%。
+ * 之前这里把 `limit: 2 / 20 / 15` 直接当数据渲染，并在 `:708` 声称「回撤阈值取自
+ * 台账」——后者与代码不符（不实声明），本轮一并改正。
+ */
+const BUILTIN_LIMITS = { singlePct: 2, drawdownPct: 15 };
+const BUILTIN_LIMIT_LABEL = "默认阈值（内置常量 v3_ops.LIMITS，后端未暴露字段）";
 
 function errText(payload, fallback = "接口未返回原因") {
   const error = (payload && payload.error) || {};
@@ -162,6 +185,8 @@ export default function OverviewPage() {
   const brain = useV3("brain", {});
   const settings = useV3("settings", {});
   const audit = useV3("audit", { window: 120 });
+  // 行业红线上限的真实来源（`limitPct` 是接口字段）；其它两条红线后端无字段，见 BUILTIN_LIMITS
+  const industry = useV3("risk/industry", { market }, [market]);
 
   const ov = overview.value && overview.value.ok ? overview.value : null;
   const mt = metrics.value && metrics.value.ok ? metrics.value : null;
@@ -198,6 +223,7 @@ export default function OverviewPage() {
     orders.refresh();
     strategy.refresh();
     audit.refresh();
+    industry.refresh();
   };
 
   /* ── ① KPI：全部来自 overview.equity（台账权益 / 回撤 / 夏普 / 成交笔数） ── */
@@ -261,7 +287,7 @@ export default function OverviewPage() {
       label: "最大回撤",
       value: drawdown === null ? "—" : `−${fmt.num(drawdown, 2)}%`,
       tone: "amber",
-      sub: `阈值 15%${equity.note ? ` · ${String(equity.note).slice(0, 18)}…` : ""}`,
+      sub: `阈值 ${BUILTIN_LIMITS.drawdownPct}%（默认阈值·内置常量，后端未暴露字段）${equity.note ? ` · ${String(equity.note).slice(0, 18)}…` : ""}`,
       spark,
       scope: LEDGER_SCOPE,
     },
@@ -383,7 +409,15 @@ export default function OverviewPage() {
     });
   }
 
-  /* ── ④ 风控红线三条（单笔 2% / 行业 20% / 回撤 15%） ── */
+  /* ── ④ 风控红线三条 ──
+   * 阈值来源优先级（逐条如实标注，**不把内置常量说成接口读数**）：
+   *   ① 接口字段：行业上限取 `/api/v3/metrics.industryGate.industryLimitPct`，
+   *      退化到 `/api/v3/risk/industry.limitPct`（两个都是后端真值）；
+   *   ② 台账 `risk.reasons` 原文回读：闸门真正应用过的单笔 / 回撤阈值（形如
+   *      「单笔占比 6.90% > 2%，需人工确认」「回撤 16.0% 触及 15% 红线」）；
+   *   ③ 都取不到时才用内置常量，并**逐行标注**「默认阈值（内置常量）」。
+   * 来源：`platform/server/v3_ops.py` 的 `LIMITS` / `check_order` / `OmsLedger.gate_view()`。
+   */
   const nav = Number(equity.current != null ? equity.current : od && od.nav ? od.nav : 0);
   const orderRows = (od && Array.isArray(od.orders) && od.orders) || [];
   const maxSingle =
@@ -391,10 +425,40 @@ export default function OverviewPage() {
       ? orderRows.reduce((max, order) => Math.max(max, (Number(order.value || 0) / nav) * 100), 0)
       : null;
   const singleUsed = maxSingle !== null && maxSingle > 0 ? maxSingle : null;
+
+  const gate = metrics.value?.industryGate ?? null;
+  const gateLimit = gate && Number.isFinite(Number(gate.industryLimitPct)) ? Number(gate.industryLimitPct) : null;
+  const industryLimit = gateLimit
+    ?? (Number.isFinite(Number(industry.value?.limitPct)) && industry.value?.limitPct !== null
+      ? Number(industry.value.limitPct)
+      : null);
+  const industryLimitSource = gateLimit !== null
+    ? "GET /api/v3/metrics.industryGate.industryLimitPct（后端 LIMITS.industryPct）"
+    : industryLimit !== null
+      ? "GET /api/v3/risk/industry.limitPct（后端 LIMITS.industryPct）"
+      : industry.error
+        ? `取不到（取数失败：${industry.error}）`
+        : industry.loading
+          ? "加载中…"
+          : "两个接口都未返回行业上限字段";
+
+  // 台账 reasons 原文回读（与风控页同一口径）：只有闸门真跑过才会有这两个数
+  const ledgerReasonText = orderRows
+    .map((order) => (order.risk && Array.isArray(order.risk.reasons) ? order.risk.reasons.join("；") : ""))
+    .join("；");
+  const singleMatch = ledgerReasonText.match(/单笔占比[^>＞]*[>＞]\s*([0-9.]+)\s*%/);
+  const drawdownMatch = ledgerReasonText.match(/触及\s*([0-9.]+)\s*%\s*红线/);
+  const singleLimit = singleMatch ? Number(singleMatch[1]) : null;
+  const drawdownLimit = drawdownMatch ? Number(drawdownMatch[1]) : null;
   const redlines = [
     {
       label: "单笔交易上限",
-      limit: 2,
+      limit: singleLimit ?? BUILTIN_LIMITS.singlePct,
+      limitKind: singleLimit === null ? "builtin" : "ledger",
+      limitSource: singleLimit === null
+        ? BUILTIN_LIMIT_LABEL
+        : `台账 risk.reasons 原文回读「> ${singleLimit}%」（下单前闸门实际应用值）`,
+      limitBuiltin: singleLimit === null,
       used: singleUsed,
       why:
         ordersError ||
@@ -403,19 +467,42 @@ export default function OverviewPage() {
     },
     {
       label: "单一行业暴露上限",
-      limit: 20,
-      used: null,
-      why: (od && od.industry_source) || "行业维度敞口工作台未提供（工具面无行业分类数据源）",
-      source: null,
+      limit: industryLimit,
+      limitKind: "field",
+      limitSource: industryLimitSource,
+      limitBuiltin: false,
+      // 当前值：闸门读数优先（industryGate.industryPct，含来源与探测年龄），否则 /api/v3/risk/industry.top.weightPct
+      used: gate && gate.industryPct !== null && gate.industryPct !== undefined && Number.isFinite(Number(gate.industryPct))
+        ? Number(gate.industryPct)
+        : (Number.isFinite(Number(industry.value?.top?.weightPct)) ? Number(industry.value.top.weightPct) : null),
+      why: industry.error
+        ? `GET /api/v3/risk/industry?market=${market} 取数失败：${industry.error}`
+        : industry.loading
+          ? "加载中…（行业读数未返回前不给判定）"
+          : "接口未返回行业读数（该市场无自选池 / 无持仓时服务端返回 industry/no-universe）",
+      source: gate && gate.industrySource
+        ? `闸门读数来源 ${gate.industrySource}${gate.industryTop ? ` · Top 行业 ${gate.industryTop}` : ""} · as_of ${fmt.stamp(gate.industryAsOf)} · 探测年龄 ${probeAgeText(gate.industryProbeAgeMs)}`
+        : industry.value?.top?.industry
+          ? `当前 Top 行业 ${industry.value.top.industry} · as_of ${fmt.stamp(industry.value.as_of)} · breach=${industry.value.breach === true}`
+          : null,
     },
     {
       label: "最大回撤阈值",
-      limit: 15,
+      limit: drawdownLimit ?? BUILTIN_LIMITS.drawdownPct,
+      limitKind: drawdownLimit === null ? "builtin" : "ledger",
+      limitSource: drawdownLimit === null
+        ? BUILTIN_LIMIT_LABEL
+        : `台账 risk.reasons 原文回读「触及 ${drawdownLimit}% 红线」（下单前闸门实际应用值）`,
+      limitBuiltin: drawdownLimit === null,
       used: drawdown,
-      why: "台账无回撤点位",
+      // 台账只给**回撤点位**（overview.equity.max_drawdown），**不给阈值**；
+      // 此前这里写「台账无回撤点位」也不准确，如实改成阈值来源逐条标注在行上。
+      why: "台账只返回回撤点位，不返回回撤阈值（阈值需上述两个来源之一，否则为内置常量）",
       source: equity.note ? `回撤口径：${equity.note}（台账口径，不按市场拆分）` : null,
     },
   ];
+  // 行业闸门 fail-open：真实风险窗口，页面必须显式提示（不是装饰）
+  const gateView = industryGateView(gate);
 
   /* ── ⑤ Agent Loop：SDK 会话未挂载 → 会话指标无数据源；工具调用 Top5 为真实计数 ── */
   const topTools = [
@@ -458,6 +545,46 @@ export default function OverviewPage() {
 
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
+      {/* 行业闸门风险窗口：fail-open 时下单前不阻断，这是必须让人看见的真实状态 */}
+      {gateView.available && gateView.failOpen ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="行业集中度红线当前未参与下单前阻断（fail-open）"
+          description={
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              原因：{gateView.reason}。恢复新鲜读数后，单一行业暴露 &gt;{" "}
+              {gateView.limitPct === null ? "上限" : `${gateView.limitPct}%`} 的订单将由闸门判{" "}
+              <Text code>stage=blocked_industry</Text> 强制阻断。本提示来自 /api/v3/metrics.industryGate.failOpen。
+            </Text>
+          }
+        />
+      ) : null}
+      {gateView.available && !gateView.failOpen ? (
+        <Alert
+          type="info"
+          showIcon
+          message={`行业红线已接入下单前闸门：当前读数 ${fmt.pct(gateView.pct, 2)}（${gateView.top || "—"}）· 上限 ${fmt.pct(gateView.limitPct, 0)} · ${gateView.breach ? "已超限，新订单将被强制阻断" : "未超限"}`}
+          description={
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              来源 {gateView.source || "—"} · as_of {fmt.stamp(gateView.asOf)} · 探测年龄 {probeAgeText(gateView.probeAgeMs)}
+              {gateView.missing ? ` · ${gateView.missing} 只标的未取到行业分类（读数只是下界，真实暴露可能更高）` : ""}
+            </Text>
+          }
+        />
+      ) : null}
+      {!gateView.available ? (
+        <Alert
+          type="info"
+          showIcon
+          message="行业闸门读数不可用（未取得 industryGate）"
+          description={
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {gateView.reason}。本页因此不展示闸门聚合读数；行业暴露明细仍取 /api/v3/risk/industry。
+            </Text>
+          }
+        />
+      ) : null}
       {/* 页头：模式 / 数据截至 / 刷新（对应设计稿 .page-tools） */}
       <ProCard
         bordered
@@ -705,7 +832,9 @@ export default function OverviewPage() {
         <ProCard title="风控红线" bordered loading={orders.loading || overview.loading}>
           <Text type="secondary" style={{ fontSize: 11, display: "block", marginBottom: 8 }}>
             {`口径：订单明细按当前市场 ${label} ${market} 过滤（/api/v3/oms/orders?market=${market}）；
-            单笔占比的分母 NAV 以接口 nav_source 为准（本页不假定它按市场拆分）；回撤阈值取自台账，为台账口径（不按市场拆分）。`}
+            单笔占比的分母 NAV 以接口 nav_source 为准（本页不假定它按市场拆分）。
+            每行「上限」旁标注阈值来源：接口字段（industryGate.industryLimitPct / risk/industry.limitPct）、
+            台账原文（从订单 risk.reasons 回读闸门实际应用值）、或内置常量（后端未暴露且台账未回读到，按 v3_ops.LIMITS 标注）。`}
           </Text>
           {ordersError ? (
             <Alert
@@ -717,14 +846,24 @@ export default function OverviewPage() {
           ) : null}
           {orders.error ? <BlockError name="风控红线（/api/v3/oms/orders）" error={orders.error} /> : null}
           {redlines.map((row) => {
-            const hasValue = row.used !== null && Number.isFinite(Number(row.used));
-            const ratio = hasValue ? Math.min(100, (Number(row.used) / row.limit) * 100) : 0;
+            const hasLimit = row.limit !== null && Number.isFinite(Number(row.limit));
+            const hasValue = hasLimit && row.used !== null && Number.isFinite(Number(row.used));
+            const ratio = hasValue ? Math.min(100, (Number(row.used) / Number(row.limit)) * 100) : 0;
             const stroke = !hasValue ? C.faint : ratio >= 100 ? C.down : ratio >= 70 ? C.amber : C.up;
             return (
               <div key={row.label} style={{ marginBottom: 14 }}>
                 <Space style={{ width: "100%", justifyContent: "space-between" }}>
                   <Text>{row.label}</Text>
-                  <Text style={{ ...MONO, color: C.muted }}>上限 {row.limit}%</Text>
+                  <Space size={6}>
+                    <Text style={{ ...MONO, color: C.muted }}>
+                      上限 {hasLimit ? `${row.limit}%` : "—"}
+                    </Text>
+                    <Tooltip title={row.limitSource}>
+                      <Text type="secondary" style={{ fontSize: 10.5 }}>
+                        {row.limitKind === "field" ? "接口字段" : row.limitKind === "ledger" ? "台账原文" : "内置常量"}
+                      </Text>
+                    </Tooltip>
+                  </Space>
                 </Space>
                 <Progress
                   percent={Number(ratio.toFixed(1))}
@@ -743,12 +882,15 @@ export default function OverviewPage() {
                 {hasValue ? (
                   <Text type="secondary" style={{ fontSize: 11 }}>
                     {ratio >= 100 ? "已越过阈值，需人工核对" : ratio >= 70 ? "接近阈值" : "阈值内"}
+                    {` · 阈值来源：${row.limitSource}`}
                     {row.source ? ` · ${row.source}` : ""}
                   </Text>
                 ) : (
-                  <Tooltip title={row.why}>
+                  <Tooltip title={hasLimit ? row.why : row.limitSource}>
                     <Text type="secondary" style={{ fontSize: 11 }}>
-                      {noSourceText(row.label, row.why)}
+                      {hasLimit
+                        ? noSourceText(row.label, row.why)
+                        : noSourceText(`${row.label}的上限`, `${row.limitSource}（阈值都取不到，故不给当前判定）`)}
                     </Text>
                   </Tooltip>
                 )}
@@ -879,7 +1021,9 @@ export default function OverviewPage() {
                       {fmt.dash(order.mode)}
                     </Text>
                     <Text style={{ fontSize: 12 }}>
-                      风控：{((order.risk && order.risk.reasons) || ["阈值内"]).join("；")}
+                      风控：{Array.isArray(order.risk && order.risk.reasons) && order.risk.reasons.length > 0
+                        ? order.risk.reasons.join("；")
+                        : "未返回判定依据（订单 risk.reasons 缺失，本页不代平台下结论）"}
                     </Text>
                     <Text type="secondary" style={{ ...MONO, fontSize: 11 }}>
                       单笔占比 {numOr(share, 2)}% {order.nav_source ? `（${order.nav_source}）` : ""}· 首次进入{" "}

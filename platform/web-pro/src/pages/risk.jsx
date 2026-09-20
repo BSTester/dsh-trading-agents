@@ -7,8 +7,13 @@
 //   ③ 暴露与集中度（行业暴露 BarList + 映射明细 ← risk/industry；单票集中度 ← analytics.tickers）
 //   ④ 净值/回撤曲线（LineChart ← analytics.equityCurve）
 //   ⑤ 风控规则表（阈值 + 来源 + 状态，含单一行业暴露上限 ← risk/industry）
-//   ⑥ 阻断记录（OMS 未自动放行订单，无则空态）
+//   ⑥ 阻断记录（OMS 未自动放行订单：manual / blocked_industry / blocked / rejected）
 //   ⑦ 无数据源项：行业/因子/个股归因、逐标的 ATR、杠杆率、流动性评分、逐日 VaR 序列
+//
+// 行业红线（2026-09-20 后端接闸门后）：单一行业暴露 > 上限 → `stage=blocked_industry` +
+// `risk.rule=industry-red-line` **下单前强制阻断**；读数取 `/api/v3/metrics.industryGate`
+// （含 industrySource / industryAsOf / industryProbeAgeMs / failOpen）。`industry_source=no-data`
+// 时闸门 **fail-open**（不阻断但订单 reasons 写明原因）——本页必须显式提示，且**不显示 0%**。
 //
 // 本页**没有任何写动作**：全部是 GET /api/v3/*（useV3 读），不提供规则编辑入口。
 import React from "react";
@@ -18,6 +23,7 @@ import {
 import { ProCard } from "@ant-design/pro-components";
 import { useV3, fmt, noSourceText } from "../services/api.js";
 import { MarketNote, envelopeError, marketLabel, marketTicker, useMarket } from "../services/marketContext.jsx";
+import { industryGateView, isBlockedStage, probeAgeText, ruleLabel, stageLabel, stageTone } from "../lib/risk-labels.js";
 import { LineChart, BarList } from "../components/charts.jsx";
 
 const { Text, Link } = Typography;
@@ -429,7 +435,9 @@ function PreTradeCard({ riskEnv, orders, nav, analytics, positions, industryEnv 
     {
       key: "order",
       label: "单笔下单上限",
-      threshold: singleLimit === null ? "≤ 权益 2%（OMS check_order 口径，未从台账回读到阈值）" : `≤ 权益 ${pct(singleLimit, 0)}（OMS check_order 口径）`,
+      threshold: singleLimit === null
+        ? "≤ 权益 —（台账 reasons 未回读到阈值；后端默认 2%，为内置常量）"
+        : `≤ 权益 ${pct(singleLimit, 0)}（阈值从台账 risk.reasons 原文回读）`,
       note: maxOrder ? `台账最大单笔 ${pct(singleRatio)}（${maxOrder.ticker} ${maxOrder.side} ${fmt.num(maxOrder.qty, 0)} 股 / ${fmt.money(maxOrder.value)}）` : "台账无订单",
       tone: singleLimit !== null && singleRatio !== null && singleRatio > singleLimit ? ["red", "超限"] : ["green", "正常"],
     },
@@ -463,8 +471,8 @@ function PreTradeCard({ riskEnv, orders, nav, analytics, positions, industryEnv 
           : `≤ 组合净值 ${pct(industryLimit, 0)}（/api/v3/risk/industry.limitPct）`)
         : `上限：无数据源 · ${envError(industryEnv, "GET /api/v3/risk/industry 取不到")}`,
       note: industryTop
-        ? `当前 Top 行业 ${industryTop.industry} ${pct(industryTop.weightPct, 2)}（权重来源 ${(industryEnv.sources && industryEnv.sources.weights) || "—"}）· as_of ${fmt.stamp(industryEnv.as_of)}`
-        : (industryReady ? "服务端未返回 exposures/top（板块映射或组合权重为空）" : "行业暴露取不到，红线需人工核对"),
+        ? `当前 Top 行业 ${industryTop.industry} ${pct(industryTop.weightPct, 2)}（权重来源 ${(industryEnv.sources && industryEnv.sources.weights) || "—"}）· as_of ${fmt.stamp(industryEnv.as_of)} · 已接入下单前闸门（> ${industryLimit === null ? "上限" : pct(industryLimit, 0)} → stage=blocked_industry 强制阻断）`
+        : (industryReady ? "服务端未返回 exposures/top（板块映射或组合权重为空）" : "行业暴露取不到：该读数不参与下单前阻断（fail-open），订单 reasons 会写明原因"),
       tone: !industryTop || industryLimit === null
         ? ["default", "无数据"]
         : (industryBreach || industryTop.weightPct > industryLimit ? ["red", "超限"] : ["green", "正常"]),
@@ -506,7 +514,7 @@ function PreTradeCard({ riskEnv, orders, nav, analytics, positions, industryEnv 
   );
 }
 
-function LiveCard({ analytics, audit, events }) {
+function LiveCard({ analytics, audit, events, ledger }) {
   const { market } = useMarket();
   const stats = analytics ? curveStats(analytics.equityCurve) : null;
   const rows = [];
@@ -545,8 +553,18 @@ function LiveCard({ analytics, audit, events }) {
       <Row gutter={[8, 8]}>
         <Col span={8}>
           <Text style={{ fontSize: 12 }} type="secondary">台账最大回撤</Text>
-          <div style={{ fontSize: 16, color: "#8b97a5" }}>—</div>
-          <Text type="secondary" style={{ fontSize: 11 }}>{noSourceText("台账逐日权益", "equity 台账只有 1 个点位，无法算回撤")}</Text>
+          {/* 台账读数来自 /api/v3/overview.equity（points 与 max_drawdown 都是真实字段），
+              不再写死「只有 1 个点位，无法算回撤」这种会随数据变化的断言。 */}
+          <div style={{ fontSize: 16, color: "#f8514d" }}>
+            {ledger && ledger.maxDrawdown !== null ? pct(ledger.maxDrawdown) : "—"}
+          </div>
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            {ledger === null
+              ? noSourceText("台账逐日权益", "本页未取到 /api/v3/overview.equity（加载中或取数失败）")
+              : ledger.maxDrawdown === null
+                ? noSourceText("台账最大回撤", `equity 台账点位 ${ledger.points} 个，接口未返回 max_drawdown`)
+                : `台账点位 ${ledger.points} 个 · 来源 /api/v3/overview.equity.max_drawdown（台账口径，不按市场拆分）`}
+          </Text>
         </Col>
         <Col span={8}>
           <Text style={{ fontSize: 12 }} type="secondary">组合区间最大回撤</Text>
@@ -677,13 +695,18 @@ function ExposureCard({ env, riskEnv, ordersEnv, industryEnv }) {
   const industryTop = industryReady && industryEnv.top && fin(industryEnv.top.weightPct) ? Number(industryEnv.top.weightPct) : null;
   const industryLimit = industryReady && fin(industryEnv.limitPct) ? Number(industryEnv.limitPct) : null;
   const industryBreach = industryReady ? Boolean(industryEnv.breach) : false;
+  /* 条形「满刻度」= 传给 BarList 的 max，**图注必须等于实际刻度**（此前图注写死一个固定百分数，
+   * 但 BarList 不传 max（自动缩放到当前最大值）→ 图注与图形不一致）。这里显式取 ≥30% 的
+   * 整十刻度并传给 BarList，图注引用同一变量，两者不可能再漂移。 */
+  const entryMax = entries.length ? Math.max(...entries.map(([, weight]) => weight)) : 0;
+  const barScalePct = Math.max(30, Math.ceil(entryMax / 10) * 10);
   return (
     <ProCard
       title="暴露与集中度"
       bordered
       extra={
         <Text type="secondary" style={{ fontSize: 12 }}>
-          ┊ {cap === null ? "—" : cap.toFixed(0)}% 单票上限 · 满刻度 30% · 来源 /api/v3/risk/analytics
+          {`┊ ${cap === null ? "—" : cap.toFixed(0)}% 单票上限（/api/v3/risk 的 config.max_position_pct）· 条形满刻度 ${barScalePct}%（固定刻度，与条形同一变量）· 单票权重源 /api/v3/risk/analytics.tickers`}
         </Text>
       }
     >
@@ -703,8 +726,11 @@ function ExposureCard({ env, riskEnv, ordersEnv, industryEnv }) {
             {entries.length === 0 ? (
               <NoSource what="单票集中度" why="组合权重取不到（/api/v3/risk/analytics.tickers 为空）" />
             ) : (
-              <BarList items={entries.map(([ticker, weight]) => [`${ticker} 等权`, fmt.num(weight, 2)])} />
+              <BarList max={barScalePct} items={entries.map(([ticker, weight]) => [`${ticker} 等权`, fmt.num(weight, 2)])} />
             )}
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              {`条形按固定满刻度 ${barScalePct}% 绘制（超过该刻度的条形顶格显示）；图注与图形取同一变量，不存在两套刻度。`}
+            </Text>
           </Space>
         </Col>
       </Row>
@@ -713,14 +739,15 @@ function ExposureCard({ env, riskEnv, ordersEnv, industryEnv }) {
         type={industryBreach ? "error" : industryReady ? "info" : "warning"}
         showIcon
         message={industryReady
-          ? `行业集中度红线：≤ ${industryLimit === null ? "—" : pct(industryLimit, 0)}（接口 limit_pct）· 当前 Top 行业 ${industryEnv.top && industryEnv.top.industry ? industryEnv.top.industry : "—"} ${industryTop === null ? "—" : pct(industryTop, 2)} · ${industryBreach ? "已超限（需人工处置）" : "未超限"}`
+          ? `行业集中度红线：≤ ${industryLimit === null ? "—" : pct(industryLimit, 0)}（接口 limit_pct）· 当前 Top 行业 ${industryEnv.top && industryEnv.top.industry ? industryEnv.top.industry : "—"} ${industryTop === null ? "—" : pct(industryTop, 2)} · ${industryBreach ? "已超限：下单前闸门按 stage=blocked_industry 强制阻断" : "未超限"}`
           : `行业集中度红线：无数据源 · ${envError(industryEnv, "GET /api/v3/risk/industry 取不到")}`}
         description={
           <Text type="secondary" style={{ fontSize: 12 }}>
             单票上限：{cap === null ? "无数据源（config.max_position_pct 未返回）" : `≤ 组合权益 ${pct(cap, 0)}（config.max_position_pct）`}；
             单票权重口径＝组合内权重（{(analytics && analytics.portfolioSource) || "组合口径未知"}，共 {entries.length} 个标的）。
             行业暴露与映射明细来自 /api/v3/risk/industry（板块 {industryReady && industryEnv.sources && industryEnv.sources.plate ? industryEnv.sources.plate : "—"}）；
-            行业红线只做展示与人工核对，OMS 台账的 industry_source={String(industrySource || "no-data").slice(0, 12)}，超限不自动阻断订单。
+            <Text strong>行业红线已接入下单前闸门</Text>：单一行业暴露 &gt; 上限 → <Text code>stage=blocked_industry</Text>（<Text code>risk.rule=industry-red-line</Text>）强制阻断；
+            OMS 台账当前 industry_source={String(industrySource || "no-data").slice(0, 12)}——为 <Text code>no-data</Text> 时闸门按 <Text strong>fail-open</Text> 处理（不阻断，但订单 reasons 写明「未参与阻断」）。
             杠杆率 / 流动性评分：{noSourceText("杠杆率与流动性评分", "positions 不返回融资余额与盘口深度")}。
           </Text>
         }
@@ -798,6 +825,15 @@ function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
   const heaviest = weights.slice().sort((a, b) => b[1] - a[1])[0] || null;
   const maxOrder = orders.reduce((acc, order) => (fin(order.value) && (!acc || Number(order.value) > Number(acc.value)) ? order : acc), null);
   const singleRatio = maxOrder && fin(nav) && Number(nav) ? (Number(maxOrder.value) / Number(nav)) * 100 : null;
+  /* 单笔下单上限的真实来源：后端**没有**暴露 `single_pct` 字段（实测 `/api/v3/oms/orders`
+   * 只有 nav / drawdown_* / industry_* 与订单 `risk.reasons`），阈值只以自由文本形式出现在
+   * 台账自己的判定理由里（如「单笔占比 6.90% > 2%，需人工确认」）。因此这里从**台账原文**
+   * 回读阈值；回读不到就显示「—」并注明内置常量，**不用前端字面量冒充接口阈值**
+   * （此前 `threshold: "≤ 权益 2%"` + `singleRatio > 2` 判定「正常/超限」就是这么错的，
+   * 而同页 PreTradeCard 已经诚实写了「未从台账回读到阈值」）。 */
+  const reasonText = orders.map((order) => asArray(order.risk && order.risk.reasons).join("；")).join("；");
+  const limitMatch = reasonText.match(/[>＞]\s*([0-9.]+)\s*%/);
+  const singleLimit = limitMatch ? Number(limitMatch[1]) : null;
   // 单一行业暴露上限：当前值取 /api/v3/risk/industry.top.weightPct（此前显示「无数据源」）；breach 时标红。
   const industryReady = OK(industryEnv);
   const industryRows = industryExposureRows(industryEnv);
@@ -832,9 +868,13 @@ function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
     {
       key: "order",
       name: "单笔下单上限",
-      threshold: "≤ 权益 2%（OMS check_order 口径）",
+      threshold: singleLimit === null
+        ? "≤ 权益 —（台账 reasons 未回读到阈值；后端默认 2%，为内置常量，非接口字段）"
+        : `≤ 权益 ${pct(singleLimit, 0)}（从台账 risk.reasons 原文回读）`,
       current: singleRatio === null ? "—" : pct(singleRatio),
-      tone: singleRatio !== null && singleRatio > 2 ? { color: "red", text: "超限" } : { color: "green", text: "正常" },
+      tone: singleLimit === null || singleRatio === null
+        ? { color: undefined, text: "无数据" }
+        : (singleRatio > singleLimit ? { color: "red", text: "超限" } : { color: "green", text: "正常" }),
       source: maxOrder ? `台账最大单笔 ${maxOrder.ticker} ${fmt.money(maxOrder.value)}` : "台账无订单",
       updated: "无数据源",
     },
@@ -884,7 +924,7 @@ function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
     { title: "最近更新", dataIndex: "updated", width: 110, render: (value) => <Text type="secondary" style={{ fontSize: 12 }}>{String(value)}</Text> },
     { title: "操作", key: "action", width: 130, render: () => <Text type="secondary" style={{ fontSize: 12 }}>本控制台无编辑入口</Text> },
   ];
-  const hit = orders.filter((order) => order.stage === "manual" || order.stage === "blocked").length;
+  const hit = orders.filter((order) => order.stage === "manual" || isBlockedStage(order.stage)).length;
   return (
     <ProCard
       title="风控规则"
@@ -895,7 +935,10 @@ function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
         <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={rows} scroll={{ x: 1000 }} />
         <Text type="secondary" style={{ fontSize: 12 }}>
           阈值来自交易平台风控配置（{source}），带「无数据源」的当前值表示工具面确实没有对应读数，不用估算值顶替；
-          本控制台不提供规则编辑入口——阈值修改只经工作台受约束入口并留审计痕迹。本台账 {orders.length} 单中 {hit} 单未自动放行。
+          本控制台不提供规则编辑入口——阈值修改只经工作台受约束入口并留审计痕迹。本台账 {orders.length} 单中 {hit} 单未自动放行
+          （{`manual ${orders.filter((o) => o.stage === "manual").length} 单（超单笔上限退回人工）· blocked/blocked_industry ${orders.filter((o) => isBlockedStage(o.stage)).length} 单（硬阻断）`}）。
+          下单前闸门的三种非放行结论：<Text code>manual</Text>（单笔超限）/ <Text code>blocked_industry</Text>（行业红线）/
+          <Text code>blocked</Text>（回撤红线），分别对应 <Text code>risk.rule</Text> 的 single-order / industry-red-line / drawdown-red-line。
         </Text>
         <MarketNote
           source={`GET /api/v3/risk（阈值配置，全局）· 当前值取自 market=${market} 的组合读数与台账`}
@@ -907,10 +950,10 @@ function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
 }
 
 /* ── ⑥ 阻断记录 ─────────────────────────────────────────────────────────── */
-function BlocksCard({ orders }) {
+function BlocksCard({ orders, gateView }) {
   const { market } = useMarket();
   const rows = orders
-    .filter((order) => (order.risk && order.risk.action !== "auto") || ["blocked", "manual", "rejected"].includes(String(order.stage)))
+    .filter((order) => (order.risk && order.risk.action !== "auto") || isBlockedStage(order.stage) || ["manual", "rejected"].includes(String(order.stage)))
     .slice()
     .sort((a, b) => Number(b.value || 0) - Number(a.value || 0));
   const columns = [
@@ -924,18 +967,33 @@ function BlocksCard({ orders }) {
     key: order.id || `${order.ticker}-${order.first_seen_at}`,
     at: order.updated_at || order.first_seen_at,
     ticker: order.ticker,
-    rule: order.stage === "blocked" ? "红线强制阻断" : order.stage === "rejected" ? "券商/通道拒绝" : "单笔下单上限",
+    // `risk.rule` 是后端的机器码（industry-red-line / drawdown-red-line / single-order /
+    // within-limits），翻译成人话；没有 rule 字段时退回按 stage 推断，并写明推断来源。
+    rule: ruleLabel(order.risk && order.risk.rule)
+      || (isBlockedStage(order.stage)
+        ? `红线强制阻断（${stageLabel(order.stage)}；台账未写 risk.rule）`
+        : order.stage === "rejected" ? "券商/通道拒绝" : "单笔下单上限（超单笔占比）"),
     reasons: asArray(order.risk && order.risk.reasons).join("；") || "未给出原因",
-    reported: order.stage === "blocked" ? { color: "red", text: "已阻断" } : { color: "blue", text: "已登记" },
+    reported: isBlockedStage(order.stage) ? { color: "red", text: "已阻断" } : { color: "blue", text: "已登记" },
   }));
-  const blocked = rows.filter((order) => order.stage === "blocked").length;
+  const blocked = rows.filter((order) => isBlockedStage(order.stage)).length;
   const rejected = rows.filter((order) => order.stage === "rejected").length;
+  const industryBlocked = rows.filter((order) => String(order.stage) === "blocked_industry").length;
   return (
     <ProCard
       title="阻断记录"
       bordered
-      extra={<Text type="secondary" style={{ fontSize: 12 }}>台账 {rows.length} 条 · 硬阻断 {blocked} 条 · 已拒绝 {rejected} 条 · 全量留痕</Text>}
+      extra={<Text type="secondary" style={{ fontSize: 12 }}>台账 {rows.length} 条 · 硬阻断 {blocked} 条（含行业红线 {industryBlocked} 条）· 已拒绝 {rejected} 条 · 全量留痕</Text>}
     >
+      {gateView && gateView.available && gateView.failOpen ? (
+        <Alert
+          type="warning"
+          showIcon
+          style={{ marginBottom: 8 }}
+          message="行业红线当前未参与阻断（fail-open）：台账不会出现 industry-red-line 阻断"
+          description={<Text type="secondary" style={{ fontSize: 11.5 }}>{gateView.reason}</Text>}
+        />
+      ) : null}
       {rows.length === 0 ? (
         <Space direction="vertical" size={6} style={{ width: "100%" }}>
           <NoSource what={`${marketLabel(market)} 阻断/退回记录`} why={`当前市场（market=${market}）的 OMS 台账无 blocked/rejected 阶段订单（本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders?market=${market} 台账为准）`} />
@@ -945,8 +1003,10 @@ function BlocksCard({ orders }) {
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
           <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={data} scroll={{ x: 900 }} />
           <Text type="secondary" style={{ fontSize: 12 }}>
-            口径：stage 为 manual/blocked/rejected 的订单（当前台账 {rows.length} 单；manual＝超单笔上限退回人工确认）。
-            本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders 台账为准。
+            {`口径：stage 为 manual / blocked / blocked_industry / rejected 的订单（当前台账 ${rows.length} 单）。
+            manual＝单笔占比超上限退回人工确认；blocked_industry＝单一行业暴露超上限被下单前闸门强制阻断；
+            blocked＝回撤触及红线强制阻断；rejected＝券商/通道拒绝。触发规则列优先取后端 risk.rule 原文。
+            本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders 台账为准。`}
           </Text>
           <MarketNote source={`GET /api/v3/oms/orders?market=${market}`} extra={`该市场台账 ${rows.length} 条（跨市场不合并）`} />
         </Space>
@@ -988,8 +1048,15 @@ export default function 风险监控Page() {
   const execution = useV3("execution", { market });
   const audit = useV3("audit", { window: 120 });
   const strategy = useV3("strategy", { market });
-  // 行业暴露与集中度：只读 GET；limit_pct=20 为单一行业暴露红线（与风控页红线口径一致），按市场过滤。
-  const industry = useV3("risk/industry", { limit_pct: 20, market });
+  // 台账权益序列（只用于「台账最大回撤」一栏的真实点位数；不参与任何阈值判定）
+  const overview = useV3("overview", { market }, [market]);
+  // 行业暴露与集中度：只读 GET。**不从前端传 limit_pct**——红线值取服务端默认
+  // （后端签名 `limit_pct: float = 20`），页面显示的 `limitPct` 因此是服务端读数，
+  // 而不是「前端传 20、接口原样回显」的循环（此前传 `limit_pct: 20`，属于自证）。
+  const industry = useV3("risk/industry", { market });
+  // 行业闸门（下单前阻断）读数：/api/v3/metrics.industryGate（阈值 + 读数 + 来源 + 探测年龄 + failOpen）
+  const metrics = useV3("metrics", {});
+  const gateView = industryGateView(OK(metrics.value) ? metrics.value.industryGate : undefined);
 
   const orders = OK(ordersEnv.value) && Array.isArray(ordersEnv.value.orders) ? ordersEnv.value.orders : [];
   const nav = OK(analytics.value) && fin(analytics.value.nav)
@@ -1025,6 +1092,28 @@ export default function 风险监控Page() {
           </Text>
         }
       />
+      {gateView.available && gateView.failOpen ? (
+        <Alert
+          type="warning"
+          showIcon
+          message="行业集中度红线当前未参与下单前阻断（fail-open）"
+          description={
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              原因：{gateView.reason}。这是真实风险窗口：没有新鲜行业读数时订单不会被行业红线拦下，
+              但订单 <Text code>reasons</Text> 会写明「行业暴露数据不可用，未参与阻断」；读数恢复后
+              行业 &gt; {gateView.limitPct === null ? "上限" : fmt.pct(gateView.limitPct, 0)} 将判 <Text code>stage=blocked_industry</Text>。
+            </Text>
+          }
+        />
+      ) : null}
+      {!gateView.available ? (
+        <Alert
+          type="info"
+          showIcon
+          message="行业闸门读数不可用（未取得 industryGate）"
+          description={<Text type="secondary" style={{ fontSize: 12 }}>{gateView.reason}；本页因此不展示闸门聚合计数，行业暴露明细仍取 /api/v3/risk/industry。</Text>}
+        />
+      ) : null}
       <Block title="指标卡">
         <MetricCards env={analytics.value} />
       </Block>
@@ -1036,7 +1125,15 @@ export default function 风险监控Page() {
         </Col>
         <Col xs={24} xl={8}>
           <Block title="事中风控">
-            <LiveCard analytics={OK(analytics.value) ? analytics.value.analytics : null} audit={auditEntries} events={eventRows} />
+            <LiveCard analytics={OK(analytics.value) ? analytics.value.analytics : null} audit={auditEntries} events={eventRows}
+              ledger={OK(overview.value) && overview.value.equity
+                ? {
+                    points: Array.isArray(overview.value.equity.points) ? overview.value.equity.points.length : 0,
+                    maxDrawdown: fin(overview.value.equity.max_drawdown)
+                      ? Math.abs(Number(overview.value.equity.max_drawdown)) * 100
+                      : null,
+                  }
+                : null} />
           </Block>
         </Col>
         <Col xs={24} xl={8}>
@@ -1055,7 +1152,7 @@ export default function 风险监控Page() {
         <RulesCard riskEnv={risk.value} orders={orders} nav={nav} env={analytics.value} industryEnv={industry.value} />
       </Block>
       <Block title="阻断记录">
-        <BlocksCard orders={orders} />
+        <BlocksCard orders={orders} gateView={gateView} />
       </Block>
       <Block title="无数据源项">
         <NoSourceCard />

@@ -13,8 +13,9 @@
 结果——任何一侧改了规则，这张表先红。
 
 第二半：``snapshot`` 载荷必须带 ``watchlist``（前端全局轮询它取关注池候选，不新增端点：
-端点数 82 与 MCP 工具数 77 是锁定不变式，见 tests/test_wp6_store_access.py 与
-tests/test_wp8_tool_locks.py）。
+端点数 82 与工作台基础工具面 77（``mcp_tools.TOOL_COUNT``）是锁定不变式，见
+``tests/test_wp6_store_access.py`` 与 ``tests/test_wp6_mcp.py``；MCP 面另有 V3 桥接 39 件，
+合计 116——桥接面由 ``/api/v3/*`` 路由装配，不改动这份 77 件的基础面）。
 """
 import json
 import re

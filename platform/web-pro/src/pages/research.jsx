@@ -12,6 +12,7 @@ import React from "react";
 import { Alert, Badge, Button, Col, DatePicker, Descriptions, Empty, Input, Row, Select, Space, Table, Tag, Tooltip, Typography } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
+import { STAT, statNotes, statState, statText } from "../lib/stat-core.js";
 import { MarketNote, envelopeError, marketLabel, tickerMarket, useMarket } from "../services/marketContext.jsx";
 import { Markdown } from "../lib/markdown.jsx";
 
@@ -140,6 +141,30 @@ export default function ResearchPage() {
   };
   const running = runs.filter((run) => runStatus(run).raw === "running").length;
 
+  /* ── 顶部计数三态（数字诚实性）─────────────────────────────────────────────
+   * 两个信封（research / research/tasks）都可能「加载中」「HTTP 失败」「HTTP 200 + ok:false」，
+   * 此前无论哪种，五个计数都直接渲染 `数组.length`＝0，与「该市场确实 0 篇研报」不可区分。
+   * 这里统一走 stat-core：非真实读数渲染 `—`，并在下方列出每一项的原因。
+   */
+  const envOf = (env) => ({
+    loading: env.loading,
+    error: env.error || (env.value && env.value.ok === false ? envErr(env.value) : undefined),
+  });
+  const researchEnv = envOf(research);
+  const tasksEnv = envOf(tasks);
+  const counters = [
+    { title: "已发布研报", value: reports.length, env: researchEnv, hint: `research_publish 落库 · 当前市场 ${market}` },
+    { title: "研究 run", value: runs.length, env: researchEnv, hint: running > 0 ? `其中进行中 ${running}` : "无进行中" },
+    { title: "量化预览", value: previews.length, env: researchEnv, hint: "signal / backtest / report" },
+    { title: "活动流", value: activity.length, env: researchEnv, hint: "工作台记录的事件" },
+    { title: "值勤队列", value: queue.length, env: tasksEnv, hint: "docs：日报/因子巡检/周度挖掘" },
+  ].map((item) => ({
+    ...item,
+    state: statState(item.env, item.value, { missingReason: "接口未返回该桶" }),
+  }));
+  const counterNotes = statNotes(counters.map((item) => [item.title, item.state]));
+  const counterFailed = counters.some((item) => item.state.state === STAT.ERROR);
+
   return (
     <Space direction="vertical" size={12} style={{ width: "100%" }}>
       {research.error ? <Alert type="error" showIcon message="研报数据读取失败" description={String(research.error)} /> : null}
@@ -166,20 +191,25 @@ export default function ResearchPage() {
 
       <ProCard bordered>
         <Row gutter={[12, 12]}>
-          {[
-            { title: "已发布研报", value: reports.length, hint: `research_publish 落库 · 当前市场 ${market}` },
-            { title: "研究 run", value: runs.length, hint: running > 0 ? `其中进行中 ${running}` : "无进行中" },
-            { title: "量化预览", value: previews.length, hint: "signal / backtest / report" },
-            { title: "活动流", value: activity.length, hint: "工作台记录的事件" },
-            { title: "值勤队列", value: queue.length, hint: "docs：日报/因子巡检/周度挖掘" },
-          ].map((item) => (
+          {counters.map((item) => (
             <Col key={item.title} xs={12} md={4}>
               <Text type="secondary" style={{ fontSize: 12 }}>{item.title}</Text>
-              <div style={{ fontSize: 20, fontVariantNumeric: "tabular-nums" }}>{item.value}</div>
-              <Text type="secondary" style={{ fontSize: 11 }}>{item.hint}</Text>
+              <div style={{ fontSize: 20, fontVariantNumeric: "tabular-nums" }}>{statText(item.state)}</div>
+              <Text type="secondary" style={{ fontSize: 11 }}>
+                {item.state.state === STAT.VALUE ? item.hint : item.state.reason}
+              </Text>
             </Col>
           ))}
         </Row>
+        {counterNotes.length > 0 ? (
+          <Alert
+            style={{ marginTop: 10 }}
+            type={counterFailed ? "error" : "warning"}
+            showIcon
+            message={`有 ${counterNotes.length} 项暂无读数（显示「—」，不是 0）`}
+            description={<Text type="secondary" style={{ fontSize: 11.5 }}>{counterNotes.join("；")}</Text>}
+          />
+        ) : null}
         <Text type="secondary" style={{ fontSize: 11 }}>
           模式 {fmt.dash(research.value?.mode)} · 快照时间 {fmt.stamp(research.value?.generated_at)} · 来源 {fmt.dash(research.value?.source)}
           {research.value?.notice ? ` · notice：${research.value.notice}` : ""}

@@ -8,6 +8,10 @@
 ```
 
 - 覆盖 **32 个 `/api/v3/*` 路由 + 82 个 `/api/wb/<endpoint>` 端点**，共 113 项；
+  > 通道口径（2026-09-20 补充）：本节的探针走的是**平台自己的 HTTP 面**（前端与运维口径）。
+  > **Agent/调度侧与平台的所有交互只走 MCP**（`/mcp`，见 `docs/v3-integration.md` §一）：
+  > `/api/v3/*` 路由已被 `server/v3_mcp.py` **原样桥接**成 `v3_*` MCP 工具
+  > （同一 handler 函数对象，因此下面每一条 HTTP 结论都等价于对应 MCP 工具的结论）。
 - **只读纪律**：写/交易端点（`switch-mode`、`plan-execute`、`confirm-decide`、`trade_*`、
   `sim_trade_*`、`modify_user_security`、`push_subscribe`、`rules-decide`、`research-tasks-*`、
   `oms/sync`、`strategy/run`）**一律跳过**，不触发；
@@ -1356,4 +1360,740 @@ quantwb_risk_single_order_pct_max 18.348499     # ← 台账里真有一张待�
 4. **运行中的 8397 仍是改动前的进程**：`POST /api/v3/metrics/probe/refresh` 与新的
    `quantwb_risk_industry_*` 要等主 agent 重启后才在线上生效。本轮的端到端证据来自
    独立 `create_app` + `TestClient`（真应用、真接线、真富途只读，只是不跑 lifespan）。
+
+
+## 十、NLP 情绪引擎（规格 FR-STRAT-003，2026-09-20）
+
+把资讯变成**可用的情绪因子**：`platform/server/v3_nlp.py`（唯一实现）+ 只读端点
+`GET /api/v3/sentiment?symbol=&market=&days=&limit=`。纯标准库 + 无三方依赖
+（**不装** jieba/torch/transformers/sklearn）——切分与打分都是自己实现的。
+
+接线（对并发改动最小）：端点由 `v3_nlp.register(app, v3_run, home)` **自带 router** 注册，
+`server/app.py` 的 V3 子模块自动装配循环里只多了一个模块名 `"v3_nlp"`（一行）。
+取新闻**只惰性复用** `server.v3_sources` 的公开面（`fetch_news` / `Deps` / `detect_market` /
+`normalize_a_share_symbol`），`v3_sources.py` / `v3_analytics.py` **一行未改**。
+
+### 10.1 词典：自研 306 条（≥150 的要求）
+
+`DEFAULT_LEXICON: dict[str, float]`，按极性分组构造，**不抓取任何网络词典**：
+
+| 分组 | 条数 | 极性区间 | 例 |
+|---|---|---|---|
+| `STRONG_POSITIVE` | 34 | +0.60 ~ +1.00 | 一字涨停 0.95、重大利好 0.95、历史新高 0.90、扭亏为盈 0.85、超预期 0.75 |
+| `POSITIVE` | 55 | +0.45 ~ +0.80 | 买入评级 0.70、景气度提升 0.70、订单充足 0.65、回购 0.60、增持 0.60 |
+| `WEAK_POSITIVE` | 44 | +0.35 ~ +0.60 | 增长 0.55、改善 0.50、纳入指数 0.50、补贴 0.45、合作 0.40 |
+| `STRONG_NEGATIVE` | 44 | −1.00 ~ −0.60 | 财务造假 −1.00、退市 −1.00、立案调查 −0.95、债务违约 −0.95、爆仓 −0.90 |
+| `NEGATIVE` | 62 | −0.90 ~ −0.50 | 巨亏 −0.90、商誉减值 −0.80、下调评级 −0.75、不及预期 −0.70、减持 −0.60 |
+| `WEAK_NEGATIVE` | 67 | −0.80 ~ −0.30 | 危机 −0.80、踩雷 −0.75、停产 −0.75、净流出 −0.55、承压 −0.50 |
+
+（六组合计 306 条，词条互不重复；`NEGATORS` 24 个、`INTENSIFIERS` 42 个
+（放大 32 / 削弱 10）不计入这 306。）
+
+说明：分组是**构造时的分类**，合并进 `DEFAULT_LEXICON` 后是一个扁平表（键唯一）。
+另有 `NEGATORS`（不/未/未能/无/难以/否认/避免…）与 `INTENSIFIERS`
+（放大 >1：大幅 1.6/显著 1.5/急剧 1.7；削弱 <1：略微 0.6/小幅 0.7/有所 0.75）。
+
+两个刻意的构造决定：
+
+1. **复合词整体收**：「不及预期」「超预期」「低于预期」是完整词条，**不靠**「不 + 预期」
+   的单字规则复原——中文里这类词的否定语义在词内，拆开就错；
+2. **程度词必须入典**：「非常」如果不收，会被切成否定词 `非` + 未登录字，把
+   「非常大幅增长」判成负面（这是实测踩到过的坑，词典里已有注释钉住）。
+
+### 10.2 算法与公式
+
+**切分** `segment(text) → list[str]`：最大正向匹配 + 词典优先（词表 = 情绪词典 ∪
+否定词 ∪ 程度副词，按长度降序贪心），未命中的汉字串**退化到字符 bigram 并每次前进
+1 个字符**（这样"公司业绩大幅增长"里 `大幅`/`增长` 仍会被后续位置捕获），空白/标点各自
+成 token（同时是作用域断点），ASCII 字母数字串（`20%`/`1.6T`）不被拆。
+
+**单文档分**（`score_text`）：
+
+```
+w = polarity × Π(程度因子) × (被否定 ? −0.65 : 1)      # w 截断到 ±1.5
+d = (Σw / Σ|w|) × (1 − e^(−Σ|w| / 2))                 # 方向 × 证据量置信（饱和）
+```
+
+`Σw/Σ|w|` 是「有符号占比」（正负相抵自然趋 0），`1−e^(−mass/2)` 是证据量饱和函数
+（`mass = Σ|w|`）。修饰词只绑定**最近的一个**词典词条，遇到标点/空白即断开（`MODIFIER_WINDOW=3`）。
+
+**多文档分**（`score_documents`，时间半衰）：
+
+```
+w_i = 0.5 ^ (age_i / half_life_hours)                 # 默认 48h：两天前的资讯权重减半
+s   = Σ(d_i × w_i) / Σ(w_i)     ← 只对**命中过词典**的文档求和
+coverage = scored / documents
+```
+
+**因子出口** `sentiment_factor(bars_by_ticker, docs_by_ticker, *, window=20, half_life_hours=48)`：
+按每只标的最近 `window` 根 K 线做**PIT 截断**（只用窗口内的资讯），返回
+`{"tickers": {t: {"score", "coverage", "documents", "window_from"}}, "as_of", "method", …}`。
+
+### 10.3 口径（必须分辨的三种「没有分」）
+
+| 情形 | `score` | `coverage` | 语义 |
+|---|---|---|---|
+| 窗口内 0 条资讯 | `null` | `null` | 没材料，`notes` 写「该标的近 N 天无资讯」 |
+| 有资讯、无一命中词典 | `null` | `0.0` | 词典读不懂这批文本（如全繁体） |
+| 命中但正负相抵 | `0.0` 附近的实数 | >0 | **真的有中性结论** |
+
+**`score=null` 与 `score=0` 语义完全不同**，前端/因子层必须区分——这一条有专门单测
+（`test_no_hits_returns_none_not_zero` / `test_empty_documents_return_null_not_zero`）。
+缺时间戳的资讯不丢弃、按 `as_of` 计权（`w=1.0`）并在 `undated` 里计数、`notes` 里写明。
+
+### 10.4 真机真实输出（只读；独立 `create_app` + `TestClient`，临时 home，未重启 8397）
+
+四只真实标的、真实 AKShare 资讯（东财 `stock_news_em`，经 `retry_akshare`）：
+
+| 标的 | documents | scored | score | coverage | top_terms |
+|---|---|---|---|---|---|
+| `600519` 贵州茅台 | 7 | 4 | **−0.1056** | 0.571 | 被执行 −2.10(×3)、净流入 +0.55、承压 −0.50、龙头 +0.40 |
+| `SH.600000` 浦发银行 | 7 | 3 | **−0.4100** | 0.429 | 净流出 −1.65(×3)、质押 −1.00(×2)、下跌 −0.50 |
+| `US.NVDA` 英伟达 | 8 | 3 | **−0.3116** | 0.375 | 下跌 −1.00(×2)、减持 −0.60、套现 −0.60、上涨 +0.50、走高 +0.45 |
+| `HK.00700` 腾讯控股 | 5 | 5 | **+0.6757** | 1.000 | 回购 +17.16(×28)、下跌 −1.50(×3)、上涨 +1.00(×2) |
+
+原始新闻标题（窗口内，逐条可核）：
+
+```text
+600519  2026-09-16 18:06:11  贵州茅台被执行158万元？公司回应
+600519  2026-09-16 21:17:00  被执行158万元？贵州茅台：系第三方公司内部合同纠纷，法院认定公司不承担任何责任
+600519  2026-09-16 16:42:00  主力动向：9月16日特大单净流入367.77亿元      → top_term 净流入
+SH.600000 2026-09-18 17:41:00 银行行业今日净流出资金3.15亿元，交通银行等5股净流出资金超3000万元 → 净流出
+SH.600000 2026-09-17 21:02:00 盛新锂能：关于控股股东的一致行动人进行股份质押的公告 → 质押
+US.NVDA  2026-09-20 00:04:51 黄仁勋减持英伟达？被代扣4.57万股用于缴税 CFO套现765万美元 → 减持/套现
+US.NVDA  2026-09-16 23:07:12 美股石油股普跌 西方石油跌5%              → 下跌（行业性，非 NVDA 自身）
+HK.00700 2026-09-18 21:25:00 腾讯控股00700.HK连续25日回购，累计回购1017.60万股 → 回购（连续 → 程度因子 1.15）
+```
+
+`per_day` 也如实给到日粒度（例：`600519` 09-16 三条 = −0.1861、09-20 两条 = −0.0403；
+09-17/09-14 的资讯一条也没命中词典 → 该日 `score=null`，**不是 0**）。
+
+**真实错误路径**（不是构造的）：`SZ.399999`（识别得出市场、上游不认这个代码）返回
+
+```json
+{"ok": false, "documents": 0, "score": null,
+ "error": {"code": "akshare/stock_news_em",
+           "message": "akshare.stock_news_em 业务错误（不重试）：KeyError: 'code'：KeyError: 'code'"},
+ "chain": [{"source": "akshare/stock_news_em", "ok": false, ...}]}
+```
+
+—— 上游真实异常原文 + 取数链留痕，**不返回 0 分**、不返回空壳成功。
+
+### 10.5 与外部情绪源（工作台 `sentiment-history`）对照
+
+同一台机器上另一条独立链路：WP11 采集作业把 `fin_news`（富途 moomoo）/`fin_sentiment`
+（X + Reddit）/`last30days`（Reddit 聚类）落进 `trading.sqlite:sentiment_snapshots`，
+由 `POST /api/wb/sentiment-history`（经 `trading_core sentiment-history`）读回。
+`~/.dsh/trading-data/trading.sqlite` 现已有 2026-09-18 的 **5 只标的 / 11 条记录**。
+
+以 `SH.600000` 为例（同一天、同一标的）：
+
+| | 本引擎（AKShare 东财） | 外部源（`sentiment-history`） |
+|---|---|---|
+| 语料 | 近 7 天 7 条，简体新闻（多为**行业/资金流**稿） | 同一采集日 8 条 `fin_news`（富途 moomoo，**繁体**）+ 8 条 X + 9 条 Reddit 聚类 |
+| 分数 | `−0.4100`（coverage 0.429） | 源自己不产出分数（只有原始 payload），**无法直接比分数** |
+| 命中 | 净流出/质押/下跌 | 引擎对这批繁体标题：`scored=0`、`coverage=0.0`、`score=null` |
+| 可解释性 | `top_terms` + `per_day` + `hits`（词/极性/权重） | 只有 `payload.items[]` 原始条目，无可解释分 |
+
+实测差异（三条，都不是猜的）：
+
+1. **字形**：富途给的标题是**繁体**（`浦發銀行…歸母淨利潤…同比增長4.08%`），自研词典是简体，
+   因此本引擎对它 `coverage=0`——不是「判成中性」，是 `score=null`（诚实地说读不懂）。
+   对照实测：同一句话简体 `净利润…同比增长` → `+0.2404`（命中 `增长`），繁体 → `null`（0 命中）。
+   5 只标的 40 条繁体标题合计 `coverage=0.225`（只有 `下降/下滑/增加/提升/事故` 这类
+   简繁同形的词能命中）。
+2. **召回口径**：AKShare 走的是东财**关键字全文搜索**，会把只提到代码的行业稿算进来
+   （`银行行业今日净流出…`、甚至标题里出现「600000**股**」的回购公告），precision 明显偏低；
+   富途 `fin_news` 是按标的关键字匹配的新闻流，更贴标的但也更少。
+3. **外部源的社交面噪声极大**：`fin_sentiment`/`last30days` 里 X 抓的是 `$SH`（一只美股 ETF）
+   与 `$SEDG/$SJM`，Reddit 聚类是「圣经研究」和「希伯来文元音」——与浦发银行毫无关系。
+   本引擎**不碰**社交面，因此没有这类噪声，但也因此拿不到社交情绪（能力取舍，不是优点）。
+
+### 10.6 离线单测
+
+`platform/tests/test_v3_nlp.py`，**56 例全绿**（`setUp` 把 `socket.connect` /
+`create_connection` / `urllib.request.urlopen` / `httpx.Client` 全部封死，漏注入的取数会
+显式 AssertionError，**不打网络**）。覆盖点：词典规模与极性方向、切分（最长匹配/bigram
+退化/ASCII 串/自定义词典）、正面/负面判定、`hits` 可解释、**无命中 → None**、
+否定翻转与衰减、**标点断作用域**、程度放大（`大幅增长` > `增长`）与削弱、覆盖率计算、
+时间半衰（同一对正负文档只交换时间 → 符号跟着翻）、中性文档不稀释分数、
+`undated` 计数、`top_terms` 排序、`parse_time` 格式与不猜时间、`sentiment_factor` 的
+K 线窗口截断、端点无新闻 → `score=null`、上游失败 → 错误信封 + `chain`、
+空 symbol 不触达 akshare、`days`/`limit` 夹紧、`register` 三位置参数契约。
+
+### 10.7 限制（如实列出，不掩盖）
+
+1. **繁体未支持**：词典是简体，港股/美股若走繁体源会 `coverage≈0`（当前 AKShare 源是简体，
+   所以线上不受影响；一旦换成富途 `fin_news` 就会撞上，见 10.5-1）；
+2. **分词是「最大正向匹配 + bigram 退化」，不是真分词**：未登录词会被切成 bigram，
+   因此偶发**跨词误配**（`绩不` 之类不会命中，但像 `增收`/`减亏` 这种切法依赖词典是否收全）；
+   没有词性、没有句法，**否定作用域只按「最近词条 + 不跨标点」近似**；
+3. **讽刺 / 反语 / 引用**完全不处理：`贵州茅台：法院认定公司不承担任何责任` 里的
+   `被执行`（3 次命中）仍按负面计——这是真机输出里 `600519 = −0.1056` 的主要来源，
+   语义上该文其实是**澄清**（利好）。词典法读不出这层；
+4. **领域词/新词**：词典 306 条覆盖不到的长尾（新业务、监管新词、公司黑话）会漏，
+   漏了只体现在 `coverage` 上；`coverage < 0.5` 时 `notes` 会明确提示
+   「分数只代表命中词典的 N 篇，不代表全部资讯」；
+5. **单字否定词有误伤**：`非`（非公开发行）、`无`（无锡）、`不`（不锈钢）在未登录语境里
+   可能把后一个词条误翻转；`低于`/`不足` 同表，靠 `低于预期` 这类复合词条优先匹配缓解；
+6. **代码数字误命中**：东财关键字搜索会把标题里出现 `600000股` 的文章算作该标的的资讯
+   （实测 `力源信息：8月12日回购公司股份600000股`）——这是**上游召回**问题，本引擎
+   只按给定语料打分，不做标的归属校验；因子层用 `coverage` + `documents` 自行把关；
+7. **无情绪强度标定**：极性值/程度因子是人工先验，**没有对抗标签做过校准**（没有标注集、
+   没有 sklearn），因此分数只可用于横截面排序/阈值分档，**不可当概率读**；
+8. **`limit` 只影响请求条数**：`stock_news_em` 实测每页 10 条，`limit>10` 不会拿到更多历史
+   （更长的窗口需要接 Tushare/富途历史资讯，本轮没做）。
+
+### 10.8 未接线部分（本轮不做，如实登记）
+
+* 情绪因子**没有进因子矩阵/策略**：`sentiment_factor()` 是可用出口，但
+  `/api/v3/factors/matrix` 与 PDAT/PET 流水线尚未消费它（加因子=改策略口径，需人工批准）；
+* 富途 `info_search`（`quote_news_search`）实测**恒空**（`docs/TOOL-LIMITS.md` 已登记：
+  两侧通道都归一化为 `{"news_list": []}`），所以端点的新闻面**只用 AKShare**，
+  没有写「富途主源 + AKShare 兜底」的假降级链（主源恒空时那条链只会制造噪音）；
+* 运行中的 8397 进程**还没有这个路由**：`/api/v3/sentiment` 要等主 agent 重启后才在线
+  生效（本轮真机证据来自独立 `create_app` + `TestClient`，同一份代码、真实网络、真实只读）。
+
+---
+
+# 行业集中度 / 单笔 / 最大回撤：**下单前闸门真正接入**（2026-09-20 第二轮）
+
+上一轮（§九）只做到「观测先行」：`GET /api/v3/risk/industry` 能取到真实行业暴露、
+`/metrics` 也导出了 `quantwb_risk_industry_pct`，但 `v3_ops.OmsLedger.context()["industry_pct"]`
+**恒为常量 `0.0`**，所以 `check_order` 不会因为行业集中度拦任何单——告警响、闸门不响。
+本轮把这条口径接进判定链，**观测与闸门从此共用同一个事实源**。
+
+## 十一、闸门接法（数据面 / 判定面 / 留痕面）
+
+### 11.1 数据面：`platform/server/v3_risk_gate.py`（新增）
+
+`industry_context(home, market=None, *, max_age_ms=None, wb_call=None)` 是**唯一**的行业
+读数入口，按优先级取三级来源，**绝不估算、绝不跨市场合并**：
+
+| 级别 | 来源 | 条件 | `industry_source` |
+|---|---|---|---|
+| 1 | 落盘探测缓存 `<home>/v3-risk-probe.json` | 缓存新鲜（`now - generated_at <= QUANT_RISK_PROBE_MAX_AGE`，默认 6h） | `cache/futu/info_owner_plate` |
+| 2 | 现取一次 `v3_industry.industry_exposure`（板块映射过 `v3_ratelimit`） | 缓存缺失/损坏/过期，且调用方给了 `wb_call` | `fetch/futu/info_owner_plate` |
+| 3 | 无读数 | 上面两条都不行 | `no-data`（`industry_pct=None`） |
+
+新鲜度常量与 `/metrics` **同源**（`observability.risk_probe_max_age()`，环境变量
+`QUANT_RISK_PROBE_MAX_AGE`，默认 `21600` 秒）——测试 `test_max_age_default_matches_observability`
+把这条同源关系钉住，防止闸门与观测各持一套口径。
+
+返回信封（全部可进 `risk` 与 `history` 留痕）：`market`、`industry_pct`、`industry_source`、
+`as_of`/`as_of_epoch`/`probe_age_ms`、`stale`、`top_industry`、`missing`、`universe`、
+`limit_pct`、`breach`、`reason`、`cache_state`（`fresh`/`stale`/`missing`/`invalid`/
+`unreadable`/`fetched`）、`origin`（`cache`/`fetch`/`none`）。
+
+### 11.2 判定面：`v3_ops.check_order`（纯函数，判定顺序固定）
+
+| 顺序 | 条件 | 结果 | 说明 |
+|---|---|---|---|
+| 1 | NAV ≤ 0 或金额 ≤ 0 | `manual` | 不折算，保守退回人工确认（既有行为） |
+| 2 | 单笔占比 > `LIMITS["singlePct"]`（2%） | `manual` | **维持现状** |
+| 3 | **行业读数 > `LIMITS["industryPct"]`（20%）** | `blocked_industry`（硬阻断） | **本轮接入** |
+| 4 | 回撤 ≥ `LIMITS["drawdownPct"]`（15%） | `blocked`（硬阻断） | **维持现状** |
+
+* **`>` 才阻断**：`industry_pct == 20.0` 不阻断（边界用测试钉住）；
+* 行业阻断**单独成态** `stage="blocked_industry"`（`STAGES` 里新增一项，**只加不删**）：
+  20% 行业红线与 15% 回撤红线都是硬阻断，但「哪条规则拦的」必须一眼可读，
+  否则事后只能靠 reasons 文本猜；`risk.rule` 同步给 `industry-red-line` /
+  `drawdown-red-line` / `single-order` / `within-limits`；
+* 行业原因原文带齐溯源信息：
+  `单一行业暴露 37.5% > 20%（top=股份制银行Ⅱ，来源 cache/futu/info_owner_plate，as_of 2026-09-20T09:58:52.053639+00:00，市场 SH，探测年龄 3463s），强制阻断`；
+* **多市场隔离**：台账订单按标的前缀（`v3_universe.market_of_ticker`）归市场，取**该市场**
+  的暴露，跨市场不合并；`_industry_contexts` 只为**本次对账真的有订单**的市场现取
+  （每个市场至多一次），所以「缓存新鲜」时一次上游都不打、「全是 SH 单」时不会顺手去探测
+  HK/US。标的认不出市场前缀（裸代码）→ 取本次读到的各市场**最严**读数，并在
+  `industry_reason` 里写明「认不出市场前缀 → 取最严」，不静默合并。
+
+### 11.3 留痕面：`history` / `/api/v3/metrics`
+
+* 台账 `history[]` 每条追加 `rule`、`changed`（是否状态演进）、`reasons`，以及
+  `industry_pct`、`industry_source`、`industry_top`、`industry_market`、`industry_as_of`、
+  `industry_probe_age_ms`、`industry_missing`、`industry_universe`、`industry_reason`
+  ——**既有 `at`/`stage`/`reasons` 一个不动**，历史保留条数 10 → 20；
+* `/api/v3/metrics` 新增 `industryGate`（只加字段）：`blockedIndustry`（台账里
+  `stage="blocked_industry"` 的单数）、`blockedByIndustry` / `blockedByDrawdown`（按规则计数）、
+  `industryPct` / `industrySource` / `industryTop` / `industryAsOf` / `industryProbeAgeMs` /
+  `industryMissing` / `perMarket` / `failOpen` / `industryLimitPct`；
+  **抓取路径只读落盘缓存、零工具调用**（与 `observability._render_risk_industry` 同一纪律，
+  测试断言 `/api/v3/metrics` 不增加任何 `v3_run` 计数）；
+* `/api/v3/oms/orders` 视图补 `industry_pct` / `industry_source` / `industry_top` /
+  `industry_market` / `industry_as_of` / `industry_missing` / `industry_markets`（逐市场信封）/
+  `industry_limit_pct`；对账结果 `oms/sync` 补 `industry_pct` / `industry_top` /
+  `industry_as_of` / `industry_missing` / `industry_markets` / `industry_error`。
+  `stages`/`orders` 响应结构**不变**（只是 `stages` 里多一个可能的键）。
+
+## 十二、fail-open：为什么缺数据不阻断，以及它的风险
+
+**决策**：行业数据不可用（缓存缺失/损坏/过期且现取失败）时**不阻断**（`industry_pct=None`
+按「无读数」处理，回落到单笔/回撤两条既有红线），但**必须显式留痕**：
+
+```
+行业暴露数据不可用，未参与阻断（原因：现取失败（探测缓存已过期（93164s > 21600s），
+过期读数不作为结论；industry/no-universe: market=SH 既没有配置自选池、也没有真实持仓…
+——这不是取数失败，而是该市场没有可分析的标的））
+```
+
+`risk.industry_source` 同时写 `no-data`，`industry_reason` 写原始原因。
+
+**理由**：
+
+1. **缺数据 ≠ 超限**。「没有读数」当成 100% 会阻断**一切**（包括与行业集中度无关的
+   小单），等于用监控故障停掉整个执行面；当成 0% 又静默放行——两者都是编造，
+   故取「不阻断 + 强制留痕 + 指标可告警」这一档；
+2. **与现状一致且可回退**：行业接入前该读数恒为 `0.0`（= 不阻断），fail-open 不引入
+   *新的* 阻断面，闸门失效时行为回落到改动前；
+3. **缺数据的可见性由观测面兜底**：`quantwb_risk_industry_probe_timestamp_seconds` 的
+   新鲜度守卫、`RiskIndustryProbeStale`（> 6h，info）、`RiskIndustryProbeFailed`
+   （warning）三条告警本来就是为「探测挂了」准备的；本轮把 `industryGate.failOpen`
+   也放进 `/api/v3/metrics`，规则可以直接读。
+
+**风险（如实列出，不掩盖）**：
+
+1. **fail-open 窗口内行业红线不设防**：缓存过期 + 富途不可用时，超限的组合照样能过闸门
+   （只受单笔 2% 与回撤 15% 约束）。要收口，需把 `QUANT_RISK_PROBE_MAX_AGE` 调小
+   （见 §14）或把 `industryGate.failOpen==1` 接成 critical 告警 + 人工冻结；
+2. **探测器的权重口径不是「实时持仓权重」**：`industry_exposure` 的权重来自 frozen 计划 /
+   自选池等权 / 市场宇宙等权（`sources.weights` 字段写明），不是券商实时持仓市值。
+   因此它衡量的是**平台组合口径**的行业集中度，不是账户真实市值口径——这条差异
+   在接闸门前就存在，本轮没有改变它，也没有假装它不存在；
+3. **单市场映射失败的读数只是下界**：`missing` 非空时真实暴露可能更高，此时 reasons
+   会加一句「当前读数是**下界**，真实暴露可能更高」，但**判定仍按读数走**——
+   读数 18% + missing 3 只会放行并留痕，不会因为「可能更高」而阻断（这是有意的：
+   避免用不确定性当阻断理由）；
+4. **unattributed 标的取最严市场**：裸代码订单按各市场最高暴露判定，可能比它的真实
+   市场更严（偏保守，不偏宽松）；
+5. **运行中的 8397 是改动前的进程**：线上要到主 agent 统一重启后才生效
+   （本轮真机证据是「真实缓存 + 构造订单过 `check_order`/`_upsert`」的只读验证，
+   见 §13）。
+
+## 十三、真实放行/阻断样例（真机只读，含 reasons 原文）
+
+脚本：`platform/deploy/monitoring/verify_industry_gate.py`（只读 `~/.dsh/v3-risk-probe.json`，
+台账用内存构造值，不写盘、不下单）。真机缓存（2026-09-20T09:58:52Z，年龄 0.95h < 6h，
+`cache_state=fresh`）实测：
+
+```
+$ cd platform && ~/.dsh/trading-venv/bin/python -B deploy/monitoring/verify_industry_gate.py
+=== 0. 落盘探测缓存（真实读数） ===
+generated_at=1789898332.0536346 (2026-09-20T09:58:52.053639+00:00) limit_pct=20.0
+max_age_s=21600 age_h=0.95
+  HK: top=半导体 40.0% breach=True source=futu/info_owner_plate missing=0 universe=5
+  SH: top=股份制银行Ⅱ 37.5% breach=True source=futu/info_owner_plate missing=0 universe=28
+  US: top=半导体 50.0% breach=True source=futu/info_owner_plate missing=0 universe=2
+
+=== 2. 构造订单过「下单前闸门」 ===
+[SH-1pct] SH.600000 value=1000 (1.00% NAV) 行业读数=37.5%（股份制银行Ⅱ）
+  action=blocked_industry stage=blocked_industry
+  reason: 单一行业暴露 37.5% > 20%（top=股份制银行Ⅱ，来源 cache/futu/info_owner_plate，
+          as_of 2026-09-20T09:58:52.053639+00:00，市场 SH，探测年龄 3463s），强制阻断
+[HK-1pct] HK.00700 value=1000 (1.00% NAV) 行业读数=40.0%（半导体）
+  action=blocked_industry stage=blocked_industry
+  reason: 单一行业暴露 40.0% > 20%（top=半导体，来源 cache/futu/info_owner_plate，…，市场 HK…），强制阻断
+[US-1pct] US.NVDA value=1000 (1.00% NAV) 行业读数=50.0%（半导体）
+  action=blocked_industry stage=blocked_industry
+  reason: 单一行业暴露 50.0% > 20%（top=半导体，来源 cache/futu/info_owner_plate，…，市场 US…），强制阻断
+[RAW-no-prefix] 600000 value=1000 (1.00% NAV) 行业读数=50.0%（半导体）
+  action=blocked_industry stage=blocked_industry
+  reason: 单一行业暴露 50.0% > 20%（…，探测年龄 3463s），强制阻断
+```
+
+> **真实数据的一个诚实现象**：这份缓存里 **SH 37.5% / HK 40% / US 50% 三个市场全部
+> 超 20%**，所以真机口径下「放行样例」在当前组合里**不存在**——三市场单子全被硬阻断。
+> 放行路径由离线单测覆盖（`test_reading_but_not_breaching_is_auto`：15% → `risk_passed`；
+> `test_limit_boundary_equal_is_not_blocked`：20% 整 → 不阻断）。
+
+阻断单的台账留痕（`_upsert` 内存对象，真实字段）：
+
+```json
+{
+  "id": "AUDIT-SH-40pct",
+  "stage": "blocked_industry",
+  "industry_pct": 37.5,
+  "industry_source": "cache/futu/info_owner_plate",
+  "industry_top": "股份制银行Ⅱ",
+  "industry_as_of": "2026-09-20T09:58:52.053639+00:00",
+  "risk": {"action": "blocked_industry", "rule": "industry-red-line",
+           "industry_source": "cache/futu/info_owner_plate", "industry_pct": 37.5,
+           "reasons": ["单笔占比 40.00% > 2%，需人工确认",
+                       "单一行业暴露 37.5% > 20%（top=股份制银行Ⅱ，来源 cache/futu/info_owner_plate，as_of 2026-09-20T09:58:52.053639+00:00，市场 SH，探测年龄 3463s），强制阻断"]},
+  "history": [{"at": "2026-09-20T10:56:08.370122+00:00", "stage": "blocked_industry",
+               "rule": "industry-red-line", "changed": true,
+               "industry_pct": 37.5, "industry_source": "cache/futu/info_owner_plate",
+               "industry_top": "股份制银行Ⅱ", "industry_market": "SH",
+               "industry_as_of": "2026-09-20T09:58:52.053639+00:00",
+               "industry_probe_age_ms": 3436311.6998672485, "industry_missing": 0,
+               "industry_universe": 28, "industry_reason": null,
+               "reasons": ["…同上两条…"]}]
+}
+```
+
+fail-open 真机样例（把最大年龄压到 1ms 模拟过期）：
+
+```
+=== 4. fail-open：把最大年龄压到 1ms（模拟缓存过期）→ 不阻断但必须留痕 ===
+cache_state=stale industry_pct=None industry_source=no-data
+reason=探测缓存已过期（3447s > 0s），过期读数不作为结论
+check_order → action=auto（不阻断）
+reasons=['行业暴露数据不可用，未参与阻断（原因：探测缓存已过期（3447s > 0s），过期读数不作为结论）']
+
+=== 5. /api/v3/metrics 口径（gate_view，只读缓存、零工具调用） ===
+{"blockedIndustry": 0, "blockedByIndustry": 0, "blockedByDrawdown": 0,
+ "industryLimitPct": 20.0, "industryPct": 50.0,
+ "industrySource": "cache/futu/info_owner_plate", "industryTop": "半导体",
+ "industryAsOf": "2026-09-20T09:58:52.053639+00:00", "industryMissing": 0,
+ "perMarket": {"HK": 40.0, "SH": 37.5, "US": 50.0}, "failOpen": false}
+```
+
+线上服务（**改动前的进程**）对照：`/api/v3/oms/orders` 仍返回旧的
+`"industry_source": "no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对）"`、
+无 `industryGate` 字段；`/api/v3/risk/industry?market=SH&limit_pct=20` 的真实读数
+`breach=true, top={"industry":"股份制银行Ⅱ","weightPct":37.5}, missing=[]`——重启后两者
+才会来自同一份落盘缓存。
+
+## 十四、怎么调阈值与最大年龄
+
+| 想改什么 | 改哪里 | 影响 |
+|---|---|---|
+| 行业红线（默认 20%） | `platform/server/v3_ops.py` 的 `LIMITS["industryPct"]` | 闸门判定 + `/metrics` 的 `industryLimitPct`；**探测落盘时的 `limit_pct` 是探测当刻的快照**，改常量后应重跑一次 `POST /api/v3/metrics/probe/refresh` 让两者一致（`tests/test_observability.py` 的 `test_industry_redline_rules_match_the_platform_limit` 把 `alerts.yml` 的 20 与 `LIMITS["industryPct"]` 钉在一起） |
+| 单笔红线（默认 2%） | `LIMITS["singlePct"]` | `manual` 档（不阻断） |
+| 回撤红线（默认 15%） | `LIMITS["drawdownPct"]` | `blocked` 档（硬阻断） |
+| 探测缓存最大可信年龄（默认 6h） | 环境变量 `QUANT_RISK_PROBE_MAX_AGE`（秒） | **同时**影响闸门读数是否可用与 `/metrics` 是否导出取值类指标；调小会让 fail-open 窗口更短但更容易在探测漏跑时进入 fail-open |
+| 现取开关 | 调用方是否传 `wb_call` | `OmsLedger.sync` 会传（缓存不可用时现取一次）；`/api/v3/metrics`、`/api/v3/oms/orders` 视图**只读缓存**，永不因看板刷新去打富途 |
+
+> 调阈值时**不要**顺手删/改告警规则里的 `20`：`alerts.yml` 的阈值与 `LIMITS` 由测试
+> 交叉校验（改常量后规则会测挂），这是有意为之的防漂移。
+
+## 十五、测试
+
+```bash
+cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_risk_gate -v   # 28 OK
+cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests             # 643 OK（含并行其他轮）
+node --test tests/*.test.mjs                                                              # 73 pass
+```
+
+基线口径：本轮开工时 `discover -s tests` 为 **545 OK**、`node --test tests/*.test.mjs`
+为 **73 pass**；完工复跑为 **643 OK**（= 545 + 本轮新增 28 + 并行其他 agent 同期的用例）
+与 **73 pass**（本轮不改前端/JS）。
+
+`tests/test_v3_risk_gate.py` 覆盖：缓存命中阻断（并断言**零上游调用**）、缓存过期 + 现取成功
+阻断、现取失败 → fail-open + reasons 写明不可用、`industry_pct == limit` 边界、单笔/回撤不回归、
+多市场隔离（SH 超限不影响 HK 单）、裸代码取最严、`history` 留痕字段齐全、`missing` 作下界标注、
+`generated_at` 缺失/非法不猜时刻、新鲜度常量与 `observability` 同源、`/api/v3/metrics` 计数
+且不触发探测。
+
+## 十六、未解决项（如实记录）
+
+1. **线上生效要等重启**：运行中的 8397 仍是旧进程（`industryGate` / 新 `industry_source`
+   都要重启后才有）；
+2. ~~**未接前端**：`platform/web-pro/src/pages/execution.jsx` / `risk.jsx` 里仍写着
+   「行业上限只做展示与人工核对，未接入自动阻断」~~ —— **已由前端修复轮收口**
+   （2026-09-20，见 §十七）：过时文案已删；`stage="blocked_industry"` 与 `blocked` 同等按
+   红色阻断渲染；`risk.rule` 机器码翻成中文；`/metrics.industryGate` 的读数（含
+   `industrySource` / `industryAsOf` / `industryProbeAgeMs` / `missing`）上屏；
+   `failOpen=true` 时概览/网关/风控/执行四页给可见告警，且 `industry_pct=None` 一律显示
+   「无读数」而不是 0%；阈值改为「接口字段 → 台账 `risk.reasons` 原文回读 → 内置常量（逐行标注）」三级取值；
+3. **探测心跳依赖定时器**：`platform/install/quant-v3-probe.timer` 仍未 enable/start，
+   缓存过期即 fail-open（可观测：`failOpen=true` + `RiskIndustryProbeStale`）；
+4. **权重口径仍是平台组合口径**（见 §12-2），不是券商实时持仓市值；
+5. **回测/研究侧不经过这道闸门**：`check_order` 只服务 OMS 台账登记（`plan` 的 frozen 计划
+   订单），工作台 Web 的 `plan_execute` 仍走它自己的口令 + 人工确认链路——本闸门是
+   **平台侧登记的判定与留痕**，不是券商端的拒单。
+
+---
+
+# 数字诚实性修复（前端 10 页 + 文档口径，2026-09-20）
+
+**红线口径**：页面上不得出现任何会被读成真实数据的回退值 / 占位数字；不得出现「示例数据」
+字样；缺数据必须显式说「不可用 / 加载中」并给出**原因**。真 0 与「没有数据」必须可区分。
+
+**三态判定规则（统一实现 `platform/web-pro/src/lib/stat-core.js`，可被 `node --test` 直测）**
+
+| 状态 | 触发条件 | 页面渲染 | 原因文案 |
+|---|---|---|---|
+| `loading` | 请求在途（`useV3().loading`） | `—` | 「加载中…」 |
+| `error` | 请求抛错或信封 `ok:false` | `—` | 「取数失败：<服务端原文>」 |
+| `missing` | 请求成功但字段为 `null`/`undefined`/`""` | `—` | 调用方给出（字段名 + 为什么没有） |
+| `value` | 请求成功且字段有值（**含 0**） | 接口返回值 | 无 |
+
+为什么必须显式做：antd `Statistic` 的 `value` 解构默认是 **0**
+（`node_modules/antd/es/statistic/Statistic.js`），`value={undefined}` 会被渲染成 `0`；
+`value={null}` 走 `String(value)`（`node_modules/antd/es/statistic/Number.js`）被渲染成字面量
+`null`（带 `suffix="%"` 就是 `null%`）。**两条都是实测行为，不是推测。**
+
+## 17.1 逐条：修前现象 → 修后行为
+
+| # | 文件:行（修前定位） | 修前渲染什么 | 修后渲染什么 | 判定规则 |
+|---|---|---|---|---|
+| H1 | `pages/gateway.jsx:93-94` → `:107-109` | metrics 未回来时 MCP 卡显示「今日调用 0 次 / 失败 0 次 / 平均延迟 0 ms」 | 「今日调用 —」「成功率 —」「平均延迟 —」，卡内 `Alert` 列出**每项原因**（加载中 / 取数失败原文 / 字段缺失） | 三态；真 0 仍显示 0 并保留「进程内计数」脚注 |
+| H2 | `pages/tools.jsx:197-200` | 4 项 `Statistic` 收 `undefined` → 加载中显示 `0` | 显式 `—`，总览条下方汇总「有 N 项暂无读数（显示「—」，不是 0）」+ 逐项原因 | 三态 |
+| H3 | `pages/tools.jsx:248→:259`、`:286` | metrics 失败时每个域/每个工具都显示「今日 0」 | 域卡与工具行「今日 —」；metrics 取到时，计数表里**没有该工具名 = 该工具 0 次调用**（后端只在首次调用建条目），此时才显示真 0 | 三态；缺失=真 0 只在「表语义就是计数器」时成立 |
+| H4 | `pages/strategy.jsx:503-506` | 回测指标缺失显示字面量 `null%` / `null` | 显式 `—`，且**同时去掉 `suffix` 与颜色**（避免 `—%` 与假红绿） | 有值才给数字/单位/色 |
+| H5 | `pages/overview.jsx:397/406/413` → `:727` | 硬编码 `limit: 2/20/15` 以「上限 x%」当数据渲染 | 逐行标注来源 chip：**接口字段**（行业 ← `metrics.industryGate.industryLimitPct`，退化 `risk/industry.limitPct`）/ **台账原文**（单笔、回撤 ← 订单 `risk.reasons` 回读闸门实际应用值）/ **内置常量**（两者都取不到时，按 `v3_ops.LIMITS` 标注） | 接口字段 → 台账原文 → 内置常量 三级，每级显式上屏 |
+| H6 | `pages/overview.jsx:708` | 文案「回撤阈值取自台账，为台账口径」——与代码不符（15 是常量） | 改为逐行来源标注；回撤无 reasons 回读时明确写「默认阈值（内置常量 v3_ops.LIMITS，后端未暴露字段）」 | 不实声明删除；来源必须与取值路径一致 |
+| H7 | `pages/overview.jsx:882` | `risk.reasons` 缺失时断言「阈值内」 | 「未返回判定依据（订单 risk.reasons 缺失，本页不代平台下结论）」 | 缺依据不得下结论 |
+| H8 | `pages/risk.jsx:835/837`（规则表）+ `:432`（事前风控） | `threshold: "≤ 权益 2%"` + `singleRatio > 2` 判定「正常/超限」——用前端字面量当接口阈值 | 阈值从台账 `risk.reasons` 原文回读（「单笔占比 6.90% > 2%，需人工确认」→ 2%），显示「阈值从台账 risk.reasons 原文回读」；回读不到则「≤ 权益 —（台账 reasons 未回读到阈值；后端默认 2%，为内置常量）」并显示「无数据」，**不再凭空判「正常」** | 判定只用后端读数/阈值；无阈值→`无数据` |
+| H9 | `pages/risk.jsx:686` | 图注「满刻度 30%」但 `BarList` 不传 `max`（自动缩放） | 图注与条形**共用同一变量** `barScalePct = max(30, ceil(最大值/10)*10)`，并显示「条形按固定满刻度 N% 绘制……不存在两套刻度」 | 文案与图形同源 |
+| H10 | `pages/execution.jsx:34` → `:1042` → `:1066` | `FALLBACK_TTL_SECONDS = 120` 缺失时显示「TTL 120 秒」，把前端常量当服务端 TTL | `FALLBACK_TTL_SECONDS` 已删；缺失时显示「TTL —（未取到 confirmation.ttl_ms）」。实测服务端返回 `ttl_ms=120000` → 显示「TTL 120 秒」（此时是**真实服务端值**） | 只显示服务端值，取不到就说取不到 |
+| H11 | `pages/settings.jsx:1314` | 「LIVE 大额订单需双人复核后执行」——`platform/server` 与 `scripts` 全域**无实现** | 「未启用（本仓库 platform/server 与 scripts 全域无「双人复核」实现，接口与配置里也没有对应字段；此处此前宣称 LIVE 大额订单需先过双人复核，属于不存在的能力，已撤下该文案）」 | 不得宣称不存在的能力 |
+| H12 | `pages/settings.jsx:1290`；`pages/execution.jsx:395/400/401` | 「单笔 ≤ 2% · 行业 ≤ 20% · 回撤 ≤ 15%（v3_ops.LIMITS）」读起来像接口读数 | 「默认阈值 · 后端 v3_ops.LIMITS 内置常量；本页未从接口读取——实测 /api/v3/oms/orders 不返回单笔/回撤阈值字段，行业上限的真实字段在 /api/v3/risk/industry.limitPct」；execution 的单笔 2% 改为台账 reasons 回读 | 同 H5 |
+| H13 | `pages/tools.jsx:73-81` | 用码位 `String.fromCharCode(0x793A,0x4F8B)` 拼词再把上游说明里的该词替换成「样例」 | 替换逻辑与码位构造**整体删除**；`toolDesc` 只做 markdown `**` 强调符归一化，其余逐字等于 `/api/v3/tools` 返回。实测 DOM 现含上游原文「真机验证过的最小示例」，且不再出现「样例」 | 显示文本必须与上游数据一致 |
+| H14 | `pages/research.jsx:169-181` | 加载中/取失败时五个计数全显示 `0` | 五个计数三态化（`—` + 逐项原因），并在卡内汇总「有 N 项暂无读数（显示「—」，不是 0）」；`ok:false` 信封也计入失败态 | 三态 |
+| H15 | `pages/brain.jsx:252/376/803` | `factorsError` 缺失一律「0 条」；`action_hint` 缺失时编出「经人工审批后执行」 | 「—（PAAT 未返回 factorsError 字段）」/「0 条（接口返回 null）」；「—（接口未返回 action_hint，本页不代平台给执行建议）」 | 缺字段不编内容 |
+| H16 | `pages/risk.jsx:549` | 固定断言「equity 台账只有 1 个点位，无法算回撤」 | 台账最大回撤改读 `/api/v3/overview.equity.max_drawdown`（真实字段，实测 0.00%），并显示真实点位个数与来源 | 断言必须由读数派生 |
+| H17 | `pages/settings.jsx:202` | `exec_window_minutes` 缺失时表单填 30，无任何标注（会被读成已生效配置） | 该字段旁标注「· 当前为表单默认值 30（配置里未设置）」 | 默认配置必须标「默认值」 |
+
+## 17.2 行业闸门（`blocked_industry`）的前端适配
+
+后端 2026-09-20 新增第三个风控态与 `industryGate` 读数（见 §十一～§十三）后，前端原先按
+`stage === "blocked"` 字面量判色，`blocked_industry` 会落成**灰色**——与「行业超限被强制阻断」
+的事实相反。本轮统一收口到 `platform/web-pro/src/lib/risk-labels.js`：
+
+| 契约 | 前端行为 |
+|---|---|
+| `stage="blocked_industry"` | 标签「行业红线阻断」+ **红色**（`stageTone` 与 `blocked` 同级）；「强制阻断」卡与「阻断记录」表都把它计入 |
+| `risk.rule` ∈ `industry-red-line` / `drawdown-red-line` / `single-order` / `within-limits` | 翻成「行业红线 / 回撤红线 / 单笔超限 / 阈值内」；未知规则**原样显示**（不硬翻） |
+| `industryGate.industryPct === null`（`industry_source="no-data"`） | 显示「无读数 → 行业红线**未参与阻断**（fail-open），不是「暴露 0%」」，**不显示 0%** |
+| `industryGate.industrySource/industryAsOf/industryProbeAgeMs/missing` | 逐项上屏（来源 + as_of + 探测年龄；`missing>0` 标注「读数只是下界，真实暴露可能更高」） |
+| `industryGate.failOpen === true` | 概览 / 网关 / 风控 / 执行四页给**可见告警**（真实风险窗口，不是装饰） |
+| `industryGate` 缺失（旧进程） | 如实显示「未取得 industryGate（本服务进程可能早于行业闸门改动）」——**不猜、不补默认值** |
+
+**运行进程现状（实测）**：8397 仍是闸门改动前的进程，`/api/v3/metrics` **没有** `industryGate`，
+`/api/v3/oms/orders` 也**没有** `industry_limit_pct`，`industry_source` 仍是
+`no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对）`。因此页面当前落在
+「未取得 industryGate」这一支，**不得**据此宣称闸门已生效——重启后才会切到真实读数分支。
+
+## 17.3 验证（真实输出）
+
+```
+$ cd platform/web-pro && flock /tmp/probuild.lock npm run build
+vite v6.4.3 building for production...
+✓ 3872 modules transformed.
+dist/assets/index-Bpjsc4Nj.js  1,857.84 kB │ gzip: 573.63 kB
+✓ built in 1m 22s
+
+$ node --test tests/*.test.mjs
+# tests 211
+# pass 211
+# fail 0
+```
+
+* 基线 188 通过 → 现 **211 通过 0 失败**（新增 `tests/stat-honesty.test.mjs` 23 例：
+  三态纯函数 + 上述 H1–H17 与闸门 G1–G6 的源码级回归，防止回退值复活）；
+* 构建产物已由运行中的 8397 直接服务（`GET /` 引用 `assets/index-Bpjsc4Nj.js`，
+  该静态资源 `200`），无需重启服务；
+* 真实浏览器（`chromium --headless=new --dump-dom`）逐页取 DOM 复核：`tools` 页出现上游原文
+  「真机验证过的最小示例」且「样例」为 0 次；`overview` 三条红线分别显示
+  「上限 2% / 台账原文」「上限 20% / 接口字段」「上限 15% / 内置常量」；`risk` 页台账最大回撤
+  显示 `0.00%` + 「台账点位 1 个 · 来源 /api/v3/overview.equity.max_drawdown」；`settings` 页
+  「双人复核」显示「未启用」；`execution` 页 TTL 显示服务端真实值 120 秒。
+
+## 17.4 用词冲突（如实登记，未擅自改测试）
+
+任务书要求 tools 页加「暂无数据」说明；仓库既有契约测试
+`tests/console-parity.test.mjs:75-83` 明确**禁止**页面出现「暂无数据」「演示数据」「mock」「dummy」，
+只允许统一措辞「无数据源 + 原因」（`services/api.js` 的 `noSourceText`）。两者冲突时按**更严**
+的一侧执行：本轮统一用「暂无读数（显示「—」，不是 0）」+ 逐项原因表达同一语义，
+既满足「缺数据必须显式说明并给原因」的红线，也不破坏既有测试不变量。
+
+## 17.5 已知副作用：`platform/tools/verify_pages.sh` 的 DOM 断言
+
+该脚本断言「DOM 无「示例」字样」。H13 改为原样显示上游文本后，tools 页会渲染出
+`/api/v3/tools` 原文里的「真机验证过的最小示例」，脚本这一条会**红**。
+按用户口径（禁的是「示例数据」这层语义标识，不是上游文本本身）这是预期行为；
+该脚本不在本轮允许改动的路径（`platform/web-pro/src/**` 与 `docs/*.md`）内，故仅登记，
+建议后续把断言从「DOM 不含该二字」改为「DOM 不含「示例数据」这一语义标识 + 上游原文需带来源标注」。
+
+---
+
+# 数字诚实性（续）：行业闸门**前**的历史判定 —— 视图层归一化，不回写、不重判（2026-09-20）
+
+**红线口径**：页面上不得出现把「当时没有读数」说成「该单行业暴露 0%」的数字，也不得复述
+已经被现实验伪的断言。真 0 与「没有数据」必须可区分（与 §17 同一条红线）。
+
+## 18.1 现象（真实数据，实测）
+
+`GET /api/v3/oms/orders` 的 10 笔存量订单（2026-09-19 落盘）带的是**闸门上线前**的判定快照：
+
+```json
+{
+  "id": "6da8323efdb14620aa3b0fe7c48b5bbe", "ticker": "SZ.002716", "stage": "manual",
+  "industry_pct": 0.0,
+  "industry_source": "no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对）",
+  "risk": { "action": "manual", "reasons": ["单笔占比 6.90% > 2%，需人工确认"] },
+  "history": [{ "at": "2026-09-19T12:25:45.643351+00:00", "stage": "manual",
+                "reasons": ["单笔占比 6.90% > 2%，需人工确认"] }]
+}
+```
+
+（`risk` 无 `rule`，`history` 条目无 `rule` / `changed` / `industry_*`。）
+
+两处不诚实：
+
+1. 那句「**工具面无行业分类数据源**」**现在已经不成立**——`v3_risk_gate.industry_context`
+   已接通 `futu/info_owner_plate` 真实行业映射（实测 SH 37.5% / HK 40% / US 50%，
+   `~/.dsh/v3-risk-probe.json`），台账里的这句是**已失效的断言**；
+2. `industry_pct: 0.0` 在页面上会被读成「该单行业暴露 0%」，而事实是**当时没有行业读数**。
+
+## 18.2 判据：结构性、可解释，**不猜时间戳**
+
+`platform/server/v3_ops.py:163` 的 `legacy_pre_gate(record)` 认定「闸门前的历史判定」当且仅当：
+
+| # | 判据 | 为什么可信 |
+|---|---|---|
+| 1 | `industry_source` 含 `LEGACY_INDUSTRY_SOURCE_TEXT`（`"工具面无行业分类数据源"`，`v3_ops.py:153`） | 当前实现只会写 `cache/futu/...` / `fetch/...` / `no-data`，这句话**已不可能由现在的代码产生** |
+| 2 | 记录**有分级留痕**（`risk.action` 或非空 `history`），但整条记录没有任何闸门标记（`risk.rule` / `history[].rule` / `history[].industry_*`） | `risk.rule` 与 `history[].rule` / `history[].industry_*` 与行业闸门是**同一次改动**引入的（版本库事实，见下） |
+
+判据 2 的证据（可复核）：
+
+```
+$ git show HEAD:platform/server/v3_ops.py | grep -n '"risk": {\|history.append'
+844:            "risk": {"action": action, "reasons": list(reasons)},
+825:        history.append({"at": stamp, "stage": stage, "reasons": list(reasons)})
+```
+
+而当前工作区（闸门改动后）是 `risk` 带 `rule`/`industry_*`、`history` 条目带
+`rule`/`changed`/`industry_*`。**因此「有没有闸门标记」与「是不是闸门前的判定」是同一件事**，
+不需要也不应该硬编码一个上线时刻去比较 `updated_at`（闸门没有落盘的生效时间标记，猜一个时刻
+等于把猜测当证据）。这也是本次任务书留的口子：「若判断闸门前的判定无法与上线后区分，
+如实说明」——**能区分**，依据是上面的版本库事实而不是时间戳。
+
+边界：连分级留痕都没有的记录（例如从冷备迁移进来、只有 `id/ticker/stage` 的条目）
+**不**判为历史判定，视图也不替它下任何结论（无从谈「含不含行业红线」）。
+
+## 18.3 实现位置
+
+| 层 | 文件:行 | 做了什么 |
+|---|---|---|
+| 判据 + 视图归一（纯函数） | `platform/server/v3_ops.py:153-226` | `LEGACY_INDUSTRY_SOURCE_TEXT` / `LEGACY_INDUSTRY_SOURCE` / `LEGACY_INDUSTRY_NOTE`、`legacy_pre_gate()`、`order_view()` |
+| 接进返回视图 | `platform/server/v3_ops.py:1400` | `OmsLedger.view()` 的 `orders` 逐单过 `order_view()`；`/api/v3/oms/orders` 与 `/api/v3/execution` **同走这一条**，口径不可能漂移 |
+| 前端纯函数 | `platform/web-pro/src/lib/risk-labels.js:145-220` | `orderIndustryView(order)`：历史判定 / 真读数 / `null` fail-open / 无字段 四种如实渲染；旧后端兜底只认那句失效断言 |
+| 前端渲染 | `platform/web-pro/src/pages/execution.jsx:787, 813-825` | 「风控阈值口径」改用 `orderIndustryView`：主文案 + 悬停说明 + 可见说明行 |
+
+`order_view()` 对**闸门前的历史判定**做三件事（磁盘/库一个字不动）：
+
+* `industry_pct` → `None`（**不是 `0.0`**）；
+* `industry_source` → `"历史判定（该单登记于行业闸门上线前，当时无行业读数）"`
+  （**不再出现**「工具面无行业分类数据源」）；
+* 追加 `industry_note`（说明该判定未包含行业红线）。
+
+对**闸门后的新订单**只**追加**两个自解释标记（不改任何既有字段的值）：
+`industry_graded: true` / `legacy_pre_gate: false`。`risk` / `history` 原文一律不动。
+
+## 18.4 改前 / 改后（真实响应片段）
+
+**改前**（运行中的 8397，改动前的进程；`curl -s http://127.0.0.1:8397/api/v3/oms/orders`）：
+
+```json
+{"id": "6da8323efdb14620aa3b0fe7c48b5bbe", "ticker": "SZ.002716", "stage": "manual",
+ "industry_pct": 0.0,
+ "industry_source": "no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对）",
+ "risk": {"action": "manual", "reasons": ["单笔占比 6.90% > 2%，需人工确认"]}}
+```
+
+**改后**（同一笔存量单；把真实台账**复制**到临时 home、用 `TestClient` 走 8397 同一份代码路径，
+未触碰运行中的服务与真实数据）：
+
+```json
+{"industry_pct": null,
+ "industry_source": "历史判定（该单登记于行业闸门上线前，当时无行业读数）",
+ "industry_graded": false,
+ "legacy_pre_gate": true,
+ "industry_note": "该判定未包含行业红线：登记时行业闸门尚未接入，台账没有行业读数——这里的「—」是「当时没读到」，不是「行业暴露 0%」。原始 risk.reasons / history 原样保留，本视图不回写、不重判。",
+ "risk": {"action": "manual", "reasons": ["单笔占比 6.90% > 2%，需人工确认"]},
+ "history": [{"at": "2026-09-19T12:25:45.643351+00:00", "stage": "manual",
+              "reasons": ["单笔占比 6.90% > 2%，需人工确认"]}]}
+```
+
+同一次运行里核对：磁盘冷备里的 `industry_pct` 仍是 `0.0`、`history` / `risk` 与视图逐字段相同
+（**未回写、未重判**），且视图 JSON 里 `工具面无行业分类数据源` 出现次数为 **0**。
+
+**闸门后的新单（可构造，同一临时 home）**：注入一份新鲜的落盘读数
+（SH 37.5% / `futu/info_owner_plate`）后 `sync` 登记一单：
+
+```json
+{"id": "CID-NEW", "stage": "blocked_industry",
+ "industry_pct": 37.5, "industry_source": "cache/futu/info_owner_plate",
+ "industry_as_of": "2026-09-20T12:00:00+00:00", "industry_probe_age_ms": 13.9,
+ "industry_graded": true, "legacy_pre_gate": false,
+ "risk": {"action": "blocked_industry", "rule": "industry-red-line",
+          "reasons": ["单一行业暴露 37.5% > 20%（top=股份制银行Ⅱ，来源 cache/futu/info_owner_plate，as_of 2026-09-20T12:00:00+00:00，市场 SH，探测年龄 0s），强制阻断"]}}
+```
+
+真实字段（读数 / 来源 / as_of / 探测年龄 / `rule`）原样，只多了两个标记——
+**闸门后的新单不受影响**。
+
+## 18.5 前端渲染改前 → 改后
+
+| 订单 | 改前渲染 | 改后渲染 |
+|---|---|---|
+| 存量单（`industry_pct=0.0`） | `行业 0.00%（来源 no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对））` | `行业暴露 — · 历史判定（未含行业红线）` + 悬停/说明行：`来源 历史判定（该单登记于行业闸门上线前，当时无行业读数）` + `该判定未包含行业红线：…（原始 reasons/history 原样保留）` |
+| 闸门后新单（37.5%） | `行业 37.50%（来源 cache/futu/info_owner_plate · as_of …）` | 不变，另加 `· 探测年龄 14s` |
+| 闸门后无读数（`industry_pct=null`） | `行业 无读数（来源 no-data） → 行业红线未参与阻断（fail-open）` | `行业暴露 — · 未参与阻断（fail-open）`（`null` **不**显示 0.00%） |
+| 闸门后真实读数为 0 | `行业 0.00%` | 仍 `行业暴露 0.00%`（**真 0 必须保留**，不能一刀切） |
+| 台账无 `industry_*` 字段 | `行业 无读数（来源 no-data）` | `行业暴露 — · 台账未记录行业读数`（**不**冒充 fail-open / 历史判定） |
+
+页面**不再**内联 `fmt.pct(current.industry_pct)`：源码级回归断言
+`platform/web-pro/tests/legacy-industry.test.mjs:162` 钉住这一点。
+
+「改前」一列是**旧表达式 + 真实 `fmt.pct` + 真实台账值**跑出来的确定结果
+（`node -e "import('./src/services/api.js')…"` → `行业 0.00%（来源 no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对））`），
+不是事后描述。「改后」一列是**真实页面 DOM**（`chromium --headless=new --dump-dom
+http://127.0.0.1:8397/#/execution`，构建产物已由 8397 静态服务、后端仍是旧进程 →
+走前端兜底分支）：
+
+```html
+<span style="font-size:12px; border-bottom:1px dotted rgb(139,148,158);">行业暴露 — · 历史判定（未含行业红线）</span>
+ · 判定规则 未返回 rule 字段 · 单笔风险预算 1.0%（config.risk_per_trade）
+<span style="font-size:11px;">来源 历史判定（该单登记于行业闸门上线前，当时无行业读数）</span>
+<span style="font-size:11px;">该判定未包含行业红线：登记时行业闸门尚未接入，台账没有行业读数——这里的「—」是「当时没读到」，不是「行业暴露 0%」。原始 risk.reasons / history 原样保留（未回写、未重判）。</span>
+```
+
+整页 DOM 里 `行业暴露 0.00%` 出现 **0** 次、`工具面无行业分类数据源` 出现 **0** 次。
+
+## 18.6 测试（真实输出）
+
+```
+$ cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests
+Ran 660 tests in 125.607s
+OK                       # 基线 654 OK, 1 skipped → 660 OK（新增 LegacyIndustryViewTests 6 例）
+
+$ cd platform/web-pro && node --test tests/*.test.mjs
+# tests 222
+# pass 222
+# fail 0                # 基线 211 → 222（新增 tests/legacy-industry.test.mjs 11 例）
+
+$ cd platform/web-pro && flock /tmp/probuild.lock npm run build
+✓ built                # vite build 成功
+```
+
+新增覆盖：
+
+* Python `platform/tests/test_v3_ops.py:732`（`LegacyIndustryViewTests`）：
+  ① 闸门前的旧记录 → 视图 `industry_pct is None` + `legacy_pre_gate` + `industry_graded=false`
+  + 文案不含「工具面无行业分类数据源」，且**磁盘文件逐字节不变**；
+  ② 落库的存量单 → 库里 `payload` 与 `industry_pct=0.0` 原样（不回写库）；
+  ③ 闸门后的新记录（真实读数 37.5% + `rule=industry-red-line`）字段原样，只多两个标记；
+  ④ 闸门后无读数 → `no-data` + `industry_graded=true`，**不**被判成历史判定；
+  ⑤ 判据是结构性的（加 `risk.rule` / `history[].industry_*` 即不再判为历史；无分级留痕的迁移数据不判）；
+  ⑥ `order_view` 返回副本，改视图不动原始记录。
+* 前端 `platform/web-pro/tests/legacy-industry.test.mjs`：
+  A1–A8 纯函数（旧记录→「—」+ 历史判定且**不出现 0.00%**、后端已归一化的视图同结果、
+  真读数照常、`null`→fail-open、**真 0 仍显示 0.00%**、无字段如实说「未记录」、非对象不抛、
+  兜底识别不看时间戳）；B1–B3 源码级（执行页确实走 `orderIndustryView`、内联
+  `fmt.pct(current.industry_pct)` 不再出现、说明行可见而非只藏悬停）。
+
+## 18.7 未解决项（如实登记）
+
+* **运行中的 8397 仍是改动前的进程**：改动落地后需要由主 agent 统一重启才能看到新视图与
+  新构建产物生效；在此之前真实端点仍返回 §18.4 的「改前」形状。前端对旧后端有兜底
+  （按那句失效断言识别），所以**即使不重启，存量单也不会再被渲染成 0.00%**。
+* **不会重判历史**：视图**只**说明「当时没有行业读数」，不会拿今天的 37.5%/40%/50%
+  去回填这 10 笔存量单的 `industry_pct`——那会把「今天的读数」伪装成「当时的判定」。
+  若需要「按今天的行业读数回看这批存量单会怎样」，只能作为**新的**只读分析另开一块，
+  并显式标注数据时刻，不属于本次归一化。
+* 行业读数目前只覆盖平台自选池口径（`cache/futu/info_owner_plate` + 平台组合权重），
+  不是全账户持仓的行业暴露；这一缺口见 §三「缺失数据源清单」。
 

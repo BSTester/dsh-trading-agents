@@ -10,6 +10,7 @@
 | `prometheus.yml` | 抓取配置：目标 `127.0.0.1:8397`、路径 `/metrics`、间隔 15s |
 | `alerts.yml` | 23 条告警规则（7 组），每条阈值都写明依据 |
 | `dump_metrics.py` | 离线导出 `/metrics` 文本，供 `promtool check metrics` 自检（服务没起也能校验） |
+| `verify_industry_gate.py` | **真机只读**验证行业红线闸门：读真实 `~/.dsh/v3-risk-probe.json`、用构造订单过 `check_order`/`_upsert`，打印真实 reasons/history 与 fail-open 样例（不下单、不写盘） |
 | `README.md` | 本文件 |
 
 ---
@@ -176,7 +177,8 @@ alerting:
 | `quantwb_process_start_time_seconds` | gauge | 进程启动的 Unix 时间戳（重启检测靠它） |
 | `quantwb_process_uptime_seconds` | gauge | 已运行秒数 |
 | `quantwb_build_info{version,tools,domains}` | gauge | 构建信息，值恒为 1 |
-| `quantwb_tools` | gauge | 工具面工具总数（`mcp_tools.TOOLS` 导入枚举） |
+| `quantwb_tools{scope="mcp"}` | gauge | **MCP 工具面真值**（`MCPServer` 注册表动态读取，与 `/mcp` 的 `tools/list` 同源；含 `v3_*` 桥接工具） |
+| `quantwb_tools{scope="domain"}` | gauge | 六域工具目录数（`mcp_tools.TOOLS` 枚举，77 代理 + 5 本地计算）；**口径不同，不可与 mcp 相加或互相替代** |
 
 ### 工具面 / HTTP
 
@@ -267,10 +269,20 @@ alerting:
 3. **过期即没有结论**：缓存超过 `QUANT_RISK_PROBE_MAX_AGE`（默认 `21600` 秒 = 6h）时，
    只导出 `..._probe_timestamp_seconds`（让「过期」可见），**不导出取值类指标**。
 
-> **已知口径缺口（重要）**：平台 `v3_ops.OmsLedger.context()["industry_pct"]` 仍是常量
-> `0.0`（`INDUSTRY_SOURCE` 仍写着 `no-data`）。也就是说本组指标是**观测先行**：
-> `RiskIndustryConcentrationBreached` 会响，但 `check_order` 不会因此阻断下单。
-> 要让红线真正拦单，需要把 `context()` 接到同一份行业暴露口径（属交易路径改动，本轮**没做**）。
+> **口径状态（2026-09-20 第二轮更新：观测先行 → 闸门生效）**：`v3_ops.OmsLedger` 不再用
+> 常量 `0.0` 充当行业读数——`context()` / `check_order` 通过
+> `server/v3_risk_gate.industry_context()` 读**同一份落盘探测缓存**（同一新鲜度常量
+> `QUANT_RISK_PROBE_MAX_AGE`），行业超限会产生 `stage="blocked_industry"` 的硬阻断，
+> 原因原文带 top 行业 / 来源 / `as_of` / 市场 / 探测年龄。
+> 本组指标的语义因此从「仅供参考」升级为「与闸门同源」：`quantwb_risk_industry_pct`
+> 与 OMS 台账里的 `industry_pct` 是同一份缓存的同一读数；台账侧新增计数见
+> `/api/v3/metrics` 的 `industryGate`（`blockedIndustry` / `blockedByIndustry` /
+> `failOpen` / `perMarket`）。
+> **fail-open（有意为之）**：缓存过期/缺失且现取失败时**不阻断**，但订单 `reasons` 里必须
+> 写明「行业暴露数据不可用，未参与阻断（原因：…）」——缺数据既不能静默放行、也不能
+> 变成全量阻断。因此 `quantwb_risk_industry_probe_*` 的新鲜度告警现在是**闸门可用性**
+> 告警，不只是观测告警。接法、fail-open 风险与调参见 `docs/e2e-and-data-gaps.md`
+> §十一～§十四。
 
 ---
 
@@ -307,8 +319,10 @@ alerting:
 
 > 第 1 条**已更正**：上一轮写的「平台拿不到行业分类数据」不再成立（`docs/e2e-and-data-gaps.md`
 > 的「行业分类与行业暴露」一节与本文 §6 都按此更新）。
-> **仍需注意**：行业口径只用于**观测**——`check_order` 的 `context()["industry_pct"]` 仍是 0.0，
-> 行业红线目前不会真的阻断下单（见上节「已知口径缺口」）。
+> **2026-09-20 第二轮**：闸门也已接同一口径——`check_order` 对 `industry_pct > 20%` 直接
+> 硬阻断（`stage="blocked_industry"`），没有新鲜读数时 fail-open 但强制留痕。
+> 即：这一条从「观测」升级为「观测 + 阻断」，见上节「口径状态」与
+> `docs/e2e-and-data-gaps.md` §十一～§十三。
 
 ---
 
@@ -325,7 +339,7 @@ alerting:
 | `QuantSchedulerThreadDead` | 服务日志里 lifespan 启动是否异常；调度器死了作业链会静默停摆 |
 | `QuantSchedulerRecentError` | `curl -s localhost:8397/healthz \| jq .scheduler.last_error`；该标记成功**不清除**，属「需人确认」 |
 | `DataSourceProbeStale` | 跑一次 `curl -s localhost:8397/api/v3/sources/status` 刷新缓存 |
-| `RiskIndustryConcentrationBreached` / `RiskIndustryConcentrationApproaching` | `curl -s 'localhost:8397/api/v3/risk/industry?market=<SH\|HK\|US>&limit_pct=20'` 看 `exposures`/`missing`/`breach`；缓存是否新鲜看 `quantwb_risk_industry_probe_timestamp_seconds`；**不要**改 `LIMITS` 常量消警；记住下单闸门**还没**接这条口径（观测先行） |
+| `RiskIndustryConcentrationBreached` / `RiskIndustryConcentrationApproaching` | `curl -s 'localhost:8397/api/v3/risk/industry?market=<SH\|HK\|US>&limit_pct=20'` 看 `exposures`/`missing`/`breach`；缓存是否新鲜看 `quantwb_risk_industry_probe_timestamp_seconds`；**不要**改 `LIMITS` 常量消警。**闸门已接同一口径**：超限会让台账 `stage="blocked_industry"`，先看 `/api/v3/oms/orders?market=<M>` 的 `industry_pct`/`industry_source` 与订单 `risk.reasons` 原文，再决定是调仓还是调阈值（调阈值见 `docs/e2e-and-data-gaps.md` §十四） |
 | `RiskIndustryProbeFailed` | 错误原文在 `quantwb_risk_industry_probe_failed` 的 `error` 标签；先查 `futu_rate_limited_total` / `futu_cooldown_remaining_ms`（限流是首要怀疑） |
 | `RiskIndustryProbeStale` | 跑 `curl -fsS -X POST 'localhost:8397/api/v3/metrics/probe/refresh'`；长效办法是装 `platform/install/quant-v3-probe.timer` |
 
@@ -339,8 +353,9 @@ alerting:
 - ❌ 没有建 Grafana 面板（任务书只要求 prometheus + alerts + README；Grafana 面板属可选，
   且本机没有 Grafana 可校验——**未产出未校验的东西**）；
 - ❌ 没有接真实通知通道（飞书/邮件），告警止于 Prometheus `/alerts` 与日志；
-- ✅ 已覆盖行业集中度红线（`quantwb_risk_industry_pct` + 探测写入器），但**仅观测**：
-  `v3_ops` 的 `context()["industry_pct"]` 仍是 0.0，红线下单阻断未接（不在本轮范围）；
+- ✅ 已覆盖行业集中度红线（`quantwb_risk_industry_pct` + 探测写入器），且**已接闸门**：
+  `check_order` 读同一份落盘缓存，超限 → `stage="blocked_industry"`；缺读数 → fail-open
+  + 强制留痕（`/api/v3/metrics` 的 `industryGate.failOpen` 可告警）；
 - ⚠️ 降级链/行业探测的**自动触发**只到「素材」为止：定时器单元已写好，**没有安装、没有
   enable**。不装会怎样见 `platform/install/README.md`——`DataSourceProbeStale` /
   `RiskIndustryProbeStale` 会响（这是有意的：让静默本身可见）。

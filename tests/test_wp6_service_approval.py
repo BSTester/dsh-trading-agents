@@ -10,12 +10,15 @@
     （trading/live-switch-web-only），且该分支不触达 handle、不触达 store（记录型替身零调用）；
   * R4 —— 服务层 ``plan_execute``：live 无口令拒、带口令 → queued+nonce、指令文件含
     plan_hash/expected_mode 且无口令字段、action 四映射、白名单外 action 拒；
-  * R5 —— 工具面封闭：tools/list 恰 59（WP8 任务 6 起）、名单 ≡ mcp_tools 清单、端点工具集 ≡
-    store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS（60 − 5 = 55，排除 confirm-decide、
-    设置页三端点 openapi_config/openapi_test/openapi_oauth 与 auto_pipeline）、
-    输入字段与规格 §3.2（含 20b confirmation）/§3.4 逐项一致、无黑名单名、未知名不触达 handle；
-    增补 5 个维护工具在真 run 的临时 store 上的全量行为（status/runs/cancel_run/cancel_stale/
-    prune_runs）与 ``hours`` 阈值语义（锚 ``scripts/workbench_admin.mjs`` 的 ``hoursArg``）；
+  * R5 —— 工具面封闭：MCP 面 116 = **工作台基础 77**（tools/list 逐名 ≡ ``mcp_tools`` 清单，
+    ``mcp_tools.TOOL_COUNT`` 仍是这个基础注册表的 77）+ **V3 桥接 39**（``/api/v3/*`` 路由
+    经 ``v3_mcp`` 桥接，全部 ``v3_`` 前缀、只读标注 36 件、与路由表一一对应）；基础面端点
+    工具集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS（60 − 5 = 55，排除
+    confirm-decide、设置页三端点 openapi_config/openapi_test/openapi_oauth 与 auto_pipeline）、
+    输入字段与规格 §3.2（含 20b confirmation）/§3.4 逐项一致、两层都无黑名单名、未知名不触达
+    handle；增补 5 个维护工具在真 run 的临时 store 上的全量行为
+    （status/runs/cancel_run/cancel_stale/prune_runs）与 ``hours`` 阈值语义
+    （锚 ``scripts/workbench_admin.mjs`` 的 ``hoursArg``）；
   * R6 —— HTTP 与 MCP 同源：``app.state.handle`` 同一实例、同一 TTL 缓存、同一 payload 同结果。
 
 MCP 会话客户端（``mcp.client.streamable_http``）只在真进程 loopback 场景才有意义，本文件走
@@ -39,7 +42,22 @@ from fastapi.testclient import TestClient  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 
 from server import app as app_module  # noqa: E402
-from server import caches, mcp_tools, store_access  # noqa: E402
+from server import caches, mcp_tools, store_access, v3_mcp  # noqa: E402
+
+# ---------------------------------------------------------------------------
+# 仓库级锁定契约：MCP 面 = 工作台基础工具面 + V3 桥接面（2026-09-20 起）
+# ---------------------------------------------------------------------------
+# 与 tests/test_wp6_mcp.py 各自独立写死同一组数字（两份分别钉，任一份漂了都会红）。
+# 注意 ``app.state.mcp_tools`` 只是**基础注册表**的绑定清单；桥接面在
+# ``app.state.v3_mcp_tools`` / ``app.state.v3_mcp_bridge``。
+BASE_TOOLS = 77           # 工作台基础工具面（mcp_tools.TOOLS；逐名 + 逐件 schema 锁定）
+V3_BRIDGE_TOOLS = 39      # V3 桥接面（/api/v3/* 每条路由一件；全部 v3_ 前缀）
+V3_READONLY_TOOLS = 36    # 桥接面里标 readOnlyHint 的件数（写类 3 件 = 39 - 36）
+MCP_SURFACE = 116         # tools/list 的总数 = BASE_TOOLS + V3_BRIDGE_TOOLS
+#: 桥接面里**不**标只读的三件（逐名钉死，防「悄悄把写类标成只读」）。
+V3_NON_READONLY = frozenset({"v3_strategy_run", "v3_oms_sync", "v3_credentials"})
+V3_PREFIX = "v3_"
+V3_ROUTE_PREFIX = "/api/v3/"
 
 # R4 的动作 → 指令类型（规格 §8.2 五种指令里服务面可达的四种）。
 ACTION_COMMANDS = {"execute": "execute_plan", "cancel": "cancel_plan",
@@ -403,8 +421,10 @@ class R2ConfirmationTests(Base):
         self.assertIn("confirmation_expired", self.activity_kinds())
 
     def test_confirmation_read_tool_is_present_and_confirm_decide_is_absent(self):
+        # app.state.mcp_tools 是**基础注册表**的绑定清单（77 件）；MCP 面总数（含 V3 桥接
+        # 39 件 = 116）由 R5ToolSurfaceTests 锁定。
         names = [tool.name for tool in self.app.state.mcp_tools]
-        self.assertEqual(len(names), 77)
+        self.assertEqual(len(names), BASE_TOOLS)
         self.assertIn("confirmation", names)
         self.assertNotIn("confirm_decide", names)
         self.assertNotIn("confirm-decide", names)
@@ -596,7 +616,8 @@ class R4PlanExecuteTests(Base):
 
 
 class R5ToolSurfaceTests(Base):
-    """R5：工具面封闭（恰 74 / 端点对等 − 排除集 / 输入字段 / 黑名单 / 未知名不触达 handle）。"""
+    """R5：工具面封闭（MCP 面 116 = 工作台基础 77 + V3 桥接 39 / 端点对等 − 排除集 /
+    输入字段 / 黑名单 / 未知名不触达 handle）。"""
 
     def setUp(self):
         super().setUp()
@@ -605,12 +626,47 @@ class R5ToolSurfaceTests(Base):
     def registered(self):
         return asyncio.run(self.app.state.mcp.list_tools())
 
-    def test_exactly_74_tools_with_the_declared_names(self):
+    def v3_route_paths(self):
+        """``/api/v3/*`` 路由表（去重排序）——桥接面的唯一事实来源。"""
+        return sorted({route.path for route in self.app.routes
+                       if getattr(route, "path", "").startswith(V3_ROUTE_PREFIX)})
+
+    def test_exactly_116_tools_with_the_declared_names(self):
+        """MCP 面 ≡ 基础 77 件（逐名，一字未变）++ V3 桥接 39 件（全部 ``v3_`` 前缀）。
+
+        锁定三件事：总数 116、两份清单都与装配结果逐项相等、桥接面与 ``/api/v3/*`` 路由表
+        一一对应（不重复实现平台侧双射，直接复用 ``app.state.v3_mcp_bridge``）。
+        """
         tools = self.registered()
-        self.assertEqual(len(tools), 77)
-        self.assertEqual(len(tools), mcp_tools.TOOL_COUNT)
-        self.assertEqual([tool.name for tool in tools],
-                         [definition.name for definition in mcp_tools.TOOLS])
+        names = [tool.name for tool in tools]
+        self.assertEqual(MCP_SURFACE, BASE_TOOLS + V3_BRIDGE_TOOLS)
+        self.assertEqual(len(tools), MCP_SURFACE)
+        self.assertEqual(len(set(names)), MCP_SURFACE, "工具名必须唯一（两层不得重名）")
+
+        self.assertEqual(mcp_tools.TOOL_COUNT, BASE_TOOLS)
+        base_names = [definition.name for definition in mcp_tools.TOOLS]
+        self.assertEqual(len(base_names), BASE_TOOLS)
+        bridge = self.app.state.v3_mcp_bridge
+        bridge_names = list(bridge.names)
+        self.assertEqual(len(bridge_names), V3_BRIDGE_TOOLS)
+        self.assertTrue(all(name.startswith(V3_PREFIX) for name in bridge_names))
+        # 顺序同样锁定：tools/list ≡ 基础清单 ++ 桥接清单（不多不少、不混序）
+        self.assertEqual(names, base_names + bridge_names)
+
+        routes = self.v3_route_paths()
+        self.assertEqual(sorted(bridge.paths), routes)
+        self.assertEqual(sorted(bridge_names),
+                         sorted(v3_mcp.tool_name(path) for path in routes))
+        self.assertEqual(len(bridge.definitions), len(bridge.paths))
+
+        # 只读标注：桥接面 36 只读 + 3 写类逐名（服务端模型属性名是 snake_case）
+        readonly = {tool.name for tool in tools
+                    if tool.name.startswith(V3_PREFIX)
+                    and getattr(tool.annotations, "read_only_hint", None) is True}
+        self.assertEqual(len(readonly), V3_READONLY_TOOLS)
+        self.assertEqual(set(bridge_names) - readonly, set(V3_NON_READONLY))
+        self.assertEqual(set(V3_NON_READONLY),
+                         {v3_mcp.tool_name(path) for path in v3_mcp.NON_READONLY_PATHS})
 
     def test_confirm_decide_is_not_a_tool_and_never_reaches_any_channel(self):
         """不变式 1（规格 §5.1 A7）：``confirm-decide`` 绝不进 MCP 工具面。
@@ -663,16 +719,30 @@ class R5ToolSurfaceTests(Base):
                              set(optional), name)
 
     def test_published_schemas_are_closed(self):
-        definitions = {definition.name: definition for definition in mcp_tools.TOOLS}
-        for tool in self.registered():
-            definition = definitions[tool.name]
-            schema = tool.input_schema
-            self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
-            self.assertIs(schema.get("additionalProperties"), False, tool.name)
-            self.assertEqual({param.name for param in definition.params if param.required},
-                             set(schema.get("required", [])), tool.name)
+        """两层都要封闭：基础 77 件对 ``mcp_tools.TOOLS``、桥接 39 件对 ``v3_mcp`` 的装配结果。
+
+        不放宽：每件工具都断言 ``additionalProperties:false`` + 字段集/必填集与
+        ``ToolDefinition`` 逐项相等（字段集漂一格就红）。
+        """
+        tools = self.registered()
+        bridge = self.app.state.v3_mcp_bridge
+        layers = (
+            ("base", [tool for tool in tools if not tool.name.startswith(V3_PREFIX)],
+             {definition.name: definition for definition in mcp_tools.TOOLS}),
+            ("v3", [tool for tool in tools if tool.name.startswith(V3_PREFIX)],
+             {definition.name: definition for definition in bridge.definitions}),
+        )
+        for label, surface, definitions in layers:
+            self.assertEqual(len(surface), len(definitions), label)
+            for tool in surface:
+                definition = definitions[tool.name]
+                schema = tool.input_schema
+                self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
+                self.assertIs(schema.get("additionalProperties"), False, tool.name)
+                self.assertEqual({param.name for param in definition.params if param.required},
+                                 set(schema.get("required", [])), tool.name)
         # 动作字段是枚举：白名单外 action 在 schema 层就被拒（handler 白名单是第二道）
-        execute = next(tool for tool in self.registered() if tool.name == "plan_execute")
+        execute = next(tool for tool in tools if tool.name == "plan_execute")
         self.assertEqual(execute.input_schema["properties"]["action"]["anyOf"][0]["enum"],
                          ["execute", "cancel", "kill", "unkill"])
 
@@ -701,16 +771,17 @@ class R5ToolSurfaceTests(Base):
         self.assertIsNot(before.get("additionalProperties"), False)
         mcp_tools.register(server, recording_handle()[0], mcp_tools.StoreApi(self.home))
         schemas = {tool.name: tool.input_schema for tool in asyncio.run(server.list_tools())}
-        self.assertEqual(len(schemas), 78)  # 77 本模块工具 + 1 外来工具
+        self.assertEqual(len(schemas), 78)  # 77 工作台基础工具 + 1 外来工具
         self.assertEqual(schemas["foreign_tool"], before,
-                         "本模块只应封闭自己注册的 74 个工具")
+                         "本模块只应封闭自己注册的 77 个工具")
         self.assertIs(schemas["series"]["additionalProperties"], False)
 
     def test_unknown_tool_never_reaches_the_handle(self):
         handle, calls = recording_handle()
         server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
         mcp_tools.register(server, handle, mcp_tools.StoreApi(self.home))
-        self.assertEqual(len(asyncio.run(server.list_tools())), 77)
+        # 这里只注册**基础面**（V3 桥接是 create_app 的活，见 v3_mcp.register）
+        self.assertEqual(len(asyncio.run(server.list_tools())), BASE_TOOLS)
         with self.assertRaises(Exception) as caught:
             asyncio.run(server.call_tool("not_a_tool", {}))
         self.assertIn("not_a_tool", str(caught.exception))
@@ -839,7 +910,8 @@ class R6SameSourceTests(Base):
         self.client = self.client(self.app)
 
     def test_every_tool_shares_the_app_handle(self):
-        self.assertEqual(len(self.app.state.mcp_tools), 77)
+        # 基础面 77 件都挂 app.state.handle；桥接面在 app.state.v3_mcp_bridge（不并进这份清单）。
+        self.assertEqual(len(self.app.state.mcp_tools), BASE_TOOLS)
         for tool in self.app.state.mcp_tools:
             self.assertIs(tool.handle, self.app.state.handle, tool.name)
 

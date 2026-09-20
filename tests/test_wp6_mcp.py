@@ -3,11 +3,15 @@
 起**真实** uvicorn 线程（``TRADING_SERVICE_PORT=0`` + 临时 ``DSH_HOME``），用官方 ``mcp``
 Python 客户端的 streamable-http 传输连 ``/mcp``，逐条钉死：
 
-  * S1 —— initialize → tools/list 恰 41（WP8 富途直通起）、名单与 ``mcp_tools.TOOLS`` 一致，且每个工具的
-    inputSchema 字段集/必填集与规格清单逐项一致（additionalProperties:false）；工具面
-    **不含** ``confirm_decide``（人工批准通道，规格 §5.1 A7），含只读的 ``confirmation``；
+  * S1 —— initialize → tools/list 恰 **116**，且这个总数被拆成两份分别钉死：
+    **工作台基础 77 件**（``mcp_tools.TOOLS``，逐名 + 逐件 inputSchema 字段集/必填集
+    ≡ 规格清单，additionalProperties:false，一字未变）+ **V3 桥接 39 件**
+    （``/api/v3/*`` 路由经 ``v3_mcp.register`` 桥接，全部 ``v3_`` 前缀、与路由表一一对应、
+    只读标注 36 件）；工具面**不含** ``confirm_decide``（人工批准通道，规格 §5.1 A7），
+    含只读的 ``confirmation``；
     另有取值域断言：``series.limit`` 的 ``20..2000`` 与 ``series.period`` 的六值枚举
-    （可选字段落在 ``anyOf`` 的基类型分支上，见 ``non_null_branch``）；
+    （可选字段落在 ``anyOf`` 的基类型分支上，见 ``non_null_branch``），基础面与桥接面
+    逐件同样校验；
   * S2 —— call snapshot → ok；call switch_mode(live, confirmation=「确认实盘」) →
     ``trading/live-switch-web-only``，随后 store 模式仍 sim、模式文件未被创建；
   * S3 —— call plan_execute(plan_hash="nope") → queued+nonce（校验在 daemon），指令文件落盘；
@@ -43,12 +47,27 @@ from mcp import ClientSession  # noqa: E402
 from mcp.client.streamable_http import streamable_http_client  # noqa: E402
 
 from server import app as app_module  # noqa: E402
-from server import caches, mcp_tools, run, store_access  # noqa: E402
+from server import caches, mcp_tools, run, store_access, v3_mcp  # noqa: E402
 from server.config import load_config  # noqa: E402
 
 START_TIMEOUT = 20
 STABLE_SNAPSHOT_FIELDS = ("mode", "version", "endpoints", "in_flight", "notice")
 NULL_BRANCH = {"type": "null"}
+
+# ---------------------------------------------------------------------------
+# 仓库级锁定契约：MCP 面 = 工作台基础工具面 + V3 桥接面（2026-09-20 起）
+# ---------------------------------------------------------------------------
+# 三类数字分别写死并互相校验（BASE_TOOLS + V3_BRIDGE_TOOLS == MCP_SURFACE），任何一个漂了
+# 这里先红。``mcp_tools.TOOL_COUNT`` **仍是基础注册表的 77**，不是 MCP 面总数——桥接面由
+# ``platform/server/v3_mcp.py`` 按 ``/api/v3/*`` 路由表装配，不并入基础注册表。
+BASE_TOOLS = 77           # 工作台基础工具面（mcp_tools.TOOLS；逐名 + 逐件 schema 锁定）
+V3_BRIDGE_TOOLS = 39      # V3 桥接面（/api/v3/* 每条路由一件；全部 v3_ 前缀）
+V3_READONLY_TOOLS = 36    # 桥接面里标 readOnlyHint 的件数（写类 3 件 = 39 - 36）
+MCP_SURFACE = 116         # tools/list 的总数 = BASE_TOOLS + V3_BRIDGE_TOOLS
+#: 桥接面里**不**标只读的三件（逐名钉死，防「悄悄把写类标成只读」）。
+V3_NON_READONLY = frozenset({"v3_strategy_run", "v3_oms_sync", "v3_credentials"})
+V3_PREFIX = "v3_"
+V3_ROUTE_PREFIX = "/api/v3/"
 
 
 def non_null_branch(schema):
@@ -156,7 +175,15 @@ class McpProtocolSmoke(unittest.TestCase):
     # ---- S1 ----
 
     def test_s1_initialize_and_tool_surface(self):
-        """initialize → tools/list 恰 74；名单与输入字段集逐个对齐规格清单（WP7/WP8/WP10/WP11/WP12 增量）。"""
+        """initialize → tools/list 恰 116 = 工作台基础 77 + V3 桥接 39；两份分别逐件钉死。
+
+        基础 77 件：名单 ≡ ``mcp_tools.TOOLS``（逐名、逐件 schema 与规格清单同形），
+        ``mcp_tools.TOOL_COUNT`` 仍是这个基础注册表的 77。
+        桥接 39 件：全部 ``v3_`` 前缀；与 ``/api/v3/*`` 路由表一一对应（同一份装配结果
+        ``app.state.v3_mcp_bridge``）；只读标注 36 件、写类 3 件逐名；字段集/必填集 ≡ 桥的
+        ``ToolDefinition``。
+        名单顺序也锁定：``tools/list`` ≡ 基础清单 ++ 桥接清单（不重名、不混序、不多不少）。
+        """
         async def runner():
             async with streamable_http_client(self.url) as (read, write):
                 async with ClientSession(read, write) as session:
@@ -167,22 +194,62 @@ class McpProtocolSmoke(unittest.TestCase):
         init, listing = asyncio.run(runner())
         self.assertEqual(init.server_info.name, mcp_tools.SERVER_NAME)
         names = [tool.name for tool in listing.tools]
-        self.assertEqual(len(names), 77)
-        self.assertEqual(len(names), mcp_tools.TOOL_COUNT)
-        self.assertEqual(names, [definition.name for definition in mcp_tools.TOOLS])
+
+        # 契约常量自洽 + 基础注册表口径（TOOL_COUNT == 基础面，不是 MCP 面总数）
+        self.assertEqual(MCP_SURFACE, BASE_TOOLS + V3_BRIDGE_TOOLS)
+        self.assertEqual(mcp_tools.TOOL_COUNT, BASE_TOOLS)
+        base_names = [definition.name for definition in mcp_tools.TOOLS]
+        self.assertEqual(len(base_names), BASE_TOOLS)
+        bridge = self.app.state.v3_mcp_bridge
+        bridge_names = list(bridge.names)
+        self.assertEqual(len(bridge_names), V3_BRIDGE_TOOLS)
+        self.assertTrue(all(name.startswith(V3_PREFIX) for name in bridge_names))
+
+        # MCP 面：不多不少地包含既有 77 件，且与桥接面零重名
+        self.assertEqual(len(names), MCP_SURFACE)
+        self.assertEqual(len(set(names)), len(names), "工具名必须唯一")
+        self.assertEqual(names, base_names + bridge_names)
+        self.assertEqual(set(names), set(base_names) | set(bridge_names))
+
+        # 桥接面 ⇄ /api/v3/* 路由表一一对应（复用 create_app 的装配结果，不重复实现平台侧双射）
+        routes = sorted({route.path for route in self.app.routes
+                         if getattr(route, "path", "").startswith(V3_ROUTE_PREFIX)})
+        self.assertEqual(sorted(bridge.paths), routes)
+        self.assertEqual(sorted(bridge_names),
+                         sorted(v3_mcp.tool_name(path) for path in routes))
+        self.assertEqual(len(bridge.definitions), len(bridge.paths))
+
+        # 只读标注：桥接面 36 只读 + 3 写类逐名（annotations 是线格式模型，属性名 snake_case）
+        readonly = {tool.name for tool in listing.tools
+                    if tool.name.startswith(V3_PREFIX)
+                    and getattr(tool.annotations, "read_only_hint", None) is True}
+        self.assertEqual(len(readonly), V3_READONLY_TOOLS)
+        self.assertEqual(set(bridge_names) - readonly, set(V3_NON_READONLY))
+        self.assertEqual(set(V3_NON_READONLY),
+                         {v3_mcp.tool_name(path) for path in v3_mcp.NON_READONLY_PATHS})
+
         # 不变式 1：唯一能批准实盘操作的通道绝不进工具面（两种写法都不允许出现）
         self.assertNotIn("confirm_decide", names)
         self.assertNotIn("confirm-decide", names)
         self.assertIn("confirmation", names)
-        definitions = {definition.name: definition for definition in mcp_tools.TOOLS}
-        for tool in listing.tools:
-            definition = definitions[tool.name]
-            schema = tool.input_schema
-            self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
-            self.assertEqual({param.name for param in definition.params if param.required},
-                             set(schema.get("required", [])), tool.name)
-            self.assertIs(schema.get("additionalProperties"), False, tool.name)
-            self.assertFalse(mcp_tools.is_blacklisted(tool.name), tool.name)
+
+        # 分层逐件封闭：基础层对 mcp_tools.TOOLS、桥接层对 bridge.definitions，两份都不许漏
+        layers = (
+            ("base", [tool for tool in listing.tools if not tool.name.startswith(V3_PREFIX)],
+             {definition.name: definition for definition in mcp_tools.TOOLS}),
+            ("v3", [tool for tool in listing.tools if tool.name.startswith(V3_PREFIX)],
+             {definition.name: definition for definition in bridge.definitions}),
+        )
+        for label, surface, definitions in layers:
+            self.assertEqual(len(surface), len(definitions), label)
+            for tool in surface:
+                definition = definitions[tool.name]
+                schema = tool.input_schema
+                self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
+                self.assertEqual({param.name for param in definition.params if param.required},
+                                 set(schema.get("required", [])), tool.name)
+                self.assertIs(schema.get("additionalProperties"), False, tool.name)
+                self.assertFalse(mcp_tools.is_blacklisted(tool.name), tool.name)
 
     def test_s1_confirmation_tool_is_read_only(self):
         """``confirmation`` 读工具：无待确认时 pending=null，且它是只读的（不触达批准）。"""
@@ -222,14 +289,25 @@ class McpProtocolSmoke(unittest.TestCase):
 
         # 取值域与清单同源：任何带 minimum/maximum 的字段都必须逐值出现在发布 schema 上
         # （当前只有 series.limit 带区间；加了新区间字段而没落到 schema 时这里立刻红）。
-        definitions = {definition.name: definition for definition in mcp_tools.TOOLS}
-        for tool in listing.tools:
-            for param in definitions[tool.name].params:
-                branch = non_null_branch(tool.input_schema["properties"][param.name])
-                if param.minimum is not None:
-                    self.assertEqual(branch.get("minimum"), param.minimum, tool.name)
-                if param.maximum is not None:
-                    self.assertEqual(branch.get("maximum"), param.maximum, tool.name)
+        # 基础层与桥接层分别对各自的 ToolDefinition 校验（两份都是装配期同一份清单）。
+        bridge = self.app.state.v3_mcp_bridge
+        layers = (
+            ({definition.name: definition for definition in mcp_tools.TOOLS},
+             [tool for tool in listing.tools if not tool.name.startswith(V3_PREFIX)]),
+            ({definition.name: definition for definition in bridge.definitions},
+             [tool for tool in listing.tools if tool.name.startswith(V3_PREFIX)]),
+        )
+        checked = 0
+        for definitions, surface in layers:
+            for tool in surface:
+                for param in definitions[tool.name].params:
+                    branch = non_null_branch(tool.input_schema["properties"][param.name])
+                    if param.minimum is not None:
+                        self.assertEqual(branch.get("minimum"), param.minimum, tool.name)
+                    if param.maximum is not None:
+                        self.assertEqual(branch.get("maximum"), param.maximum, tool.name)
+                    checked += 1
+        self.assertGreater(checked, 0)
 
     # ---- S2 ----
 

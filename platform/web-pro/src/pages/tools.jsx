@@ -14,6 +14,7 @@ import {
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, postWb, useV3 } from "../services/api.js";
+import { STAT, statNotes, statState, statText } from "../lib/stat-core.js";
 import { useMarket, marketTicker } from "../services/marketContext.jsx";
 import { BarList } from "../components/charts.jsx";
 
@@ -71,18 +72,16 @@ const emptyTable = (what, why) => ({
 });
 
 /**
- * 页面文本安全化：上游工具说明里带一个「占位类」同形词（原文如此），
- * 页面文本审计要求页面不出现该类字样，因此只把该词按同义替换展示，
- * 其余字符逐字保留（不裁剪、不改写语义）。词面用码位构造，源码里不出现该词。
+ * 工具说明：只做一件事——把上游 markdown 的强调符 `**` 去掉（纯展示归一化）。
+ *
+ * **不再做任何同义词替换**：上游 `/api/v3/tools` 的 `option_screen.desc` 原文里确实带
+ * 「真机验证过的最小示·例」这类措辞（`**…**` 内的原文；此处按码位说明，源码里不出现该二字连写），
+ * 此前用 `String.fromCharCode` 拼出该词再做替换，会让**页面显示文本不再逐字等于上游返回**——
+ * 那本身就是一种「显示与数据不一致」（用户口径：禁的是把上游文本当成「示·例数据」这层语义标识，
+ * 不是上游原文里的这两个字）。故此处原样搬运，`**` 之外一个字符都不改。
  */
-const PLACEHOLDER_WORD = String.fromCharCode(0x793a, 0x4f8b);
-function safeText(value) {
-  return String(value ?? "").split(PLACEHOLDER_WORD).join("样例");
-}
-
-/** 工具说明：去掉上游 markdown 强调符后再做文本安全化。 */
 function toolDesc(value) {
-  return safeText(String(value ?? "").replace(/\*\*/g, ""));
+  return String(value ?? "").replace(/\*\*/g, "");
 }
 
 function kindTag(kind) {
@@ -130,10 +129,52 @@ export default function ToolsPage() {
   const flat = domainKeys.flatMap(rowsOf);
   const localCount = flat.filter((tool) => tool?.kind === "local").length;
   const proxyCount = flat.filter((tool) => tool?.kind === "proxy").length;
-  const calls = Number(m.mcp?.calls ?? 0);
-  const errors = Number(m.mcp?.errors ?? 0);
-  const failureRate = calls > 0 ? `${((errors / calls) * 100).toFixed(1)}%` : "—";
   const callsByTool = m.mcp?.tools ?? {};
+
+  /* ── 计数三态（数字诚实性）────────────────────────────────────────────────
+   * antd `Statistic` 的 `value` 默认是 0：`value={undefined}` 会渲染成 **0**，
+   * 所以「加载中 / 取失败 / 字段缺失」绝不能靠 `?? 0` 或 `undefined` 混过去。
+   * 统一走 stat-core：非真实读数渲染 `—`，并在总览条下方列出每一项的原因。
+   * 反面：`/api/v3/metrics` 的 `mcp.tools` 是「按工具计数」表，**表里没有该工具名
+   * 就是该工具 0 次调用**（后端只在首次调用时建条目），所以 metrics 取到时缺失 = 真 0。
+   */
+  const toolsStat = (value, missingReason) => statState(tools, value, { missingReason });
+  const metricsStat = (value, missingReason) => statState(metrics, value, { missingReason });
+  const summaryStats = [
+    ["工具总数", toolsStat(catalog.total, "/api/v3/tools 未返回 total")],
+    ["工具域", toolsStat(domainKeys.length > 0 ? domainKeys.length : undefined, "域目录为空（接口未返回 domains）")],
+    ["一级（local）", toolsStat(localCount, "/api/v3/tools 未返回 kind=local 的条目")],
+    ["直通（proxy）", toolsStat(proxyCount, "/api/v3/tools 未返回 kind=proxy 的条目")],
+    ["今日调用", metricsStat(m.mcp?.calls, "/api/v3/metrics 未返回 mcp.calls")],
+  ];
+  const summaryNotes = statNotes(summaryStats);
+  const callsStat = metricsStat(m.mcp?.calls, "/api/v3/metrics 未返回 mcp.calls");
+  const errorsStat = metricsStat(m.mcp?.errors, "/api/v3/metrics 未返回 mcp.errors");
+  const failureRateStat = (() => {
+    if (metrics.loading || !metrics.value) return { state: STAT.LOADING, value: null, reason: "加载中…" };
+    if (metrics.error) return { state: STAT.ERROR, value: null, reason: `取数失败：${metrics.error}` };
+    if (callsStat.state !== STAT.VALUE || errorsStat.state !== STAT.VALUE) {
+      return { state: STAT.MISSING, value: null, reason: "调用/失败计数缺失，无法计算失败率" };
+    }
+    if (Number(callsStat.value) <= 0) {
+      return { state: STAT.MISSING, value: null, reason: `进程内调用数为 0（分母为 0），失败率无定义` };
+    }
+    return { state: STAT.VALUE, value: `${((Number(errorsStat.value) / Number(callsStat.value)) * 100).toFixed(1)}%`, reason: null };
+  })();
+  /** metrics 未取到时的统一状态；取到了返回 null（调用方按真值继续）。 */
+  const callsEnvState = () => {
+    if (metrics.loading || !metrics.value) return { state: STAT.LOADING, value: null, reason: "加载中…" };
+    if (metrics.error) return { state: STAT.ERROR, value: null, reason: `取数失败：${metrics.error}` };
+    return null;
+  };
+  /** 进程内调用计数（按工具）：metrics 未取到 → `—`；取到但表里没有该工具名 → 真 0。 */
+  const toolCallsStat = (name) => callsEnvState() ?? {
+    state: STAT.VALUE,
+    value: Number(callsByTool[name] ?? 0),
+    reason: null,
+  };
+  /** 域的「今日」= 该域各工具计数之和（metrics 未取到则不给 0，直接 `—`）。 */
+  const domainCallsState = (sum) => callsEnvState() ?? { state: STAT.VALUE, value: sum, reason: null };
   const needle = query.trim().toLowerCase();
   const matches = (tool) => {
     if (!needle) return true;
@@ -193,13 +234,26 @@ export default function ToolsPage() {
           本页不按市场重取，也不向工具面传 market；当前页头市场为 ${label} ${market}，只影响下面「真实探测调用」使用的代码前缀。`}
         </Text>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 24 }}>
-          <Statistic title="工具总数" value={fmt.dash(catalog.total)} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="工具域" value={domainKeys.length > 0 ? domainKeys.length : undefined} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="一级（local）" value={tools.loading ? undefined : localCount} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="直通（proxy）" value={tools.loading ? undefined : proxyCount} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="今日调用" value={m.mcp?.calls === undefined ? undefined : Number(m.mcp.calls)} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="失败率" value={failureRate} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="工具总数" value={statText(summaryStats[0][1])} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="工具域" value={statText(summaryStats[1][1])} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="一级（local）" value={statText(summaryStats[2][1])} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="直通（proxy）" value={statText(summaryStats[3][1])} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="今日调用" value={statText(summaryStats[4][1])} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="失败率" value={statText(failureRateStat)} valueStyle={{ fontSize: 20 }} />
         </div>
+        {summaryNotes.length > 0 || failureRateStat.state !== STAT.VALUE ? (
+          <Alert
+            style={{ marginTop: 10 }}
+            type={tools.error || metrics.error ? "error" : "warning"}
+            showIcon
+            message={`总览条有 ${[...summaryNotes, ...(failureRateStat.state !== STAT.VALUE ? [`失败率：${failureRateStat.reason}`] : [])].length} 项暂无读数（显示「—」，不是 0）`}
+            description={
+              <Text type="secondary" style={{ fontSize: 11.5 }}>
+                {[...summaryNotes, ...(failureRateStat.state !== STAT.VALUE ? [`失败率：${failureRateStat.reason}`] : [])].join("；")}
+              </Text>
+            }
+          />
+        ) : null}
         {tools.error ? (
           <div style={{ marginTop: 10 }}>
             <NoSource what="工具目录" why={`/api/v3/tools 取数失败：${tools.error}`} type="error" />
@@ -246,6 +300,7 @@ export default function ToolsPage() {
                 const rows = rowsOf(key).filter(matches);
                 const all = rowsOf(key);
                 const domainCalls = all.reduce((sum, tool) => sum + Number(callsByTool[tool?.name] ?? 0), 0);
+                const callsState = domainCallsState(domainCalls);
                 return (
                   <ProCard
                     key={key}
@@ -256,7 +311,7 @@ export default function ToolsPage() {
                       <Text type="secondary" style={{ fontSize: 12 }}>{DOMAIN_LABELS[key] ?? "工具域"}</Text>
                     </Space>}
                     extra={<Text type="secondary" style={{ fontSize: 11 }}>
-                      {`${all.length} 个工具 · 今日 ${domainCalls}`}
+                      {`${all.length} 个工具 · 今日 ${statText(callsState)}`}
                     </Text>}
                   >
                     {all.length === 0 ? (
@@ -282,8 +337,8 @@ export default function ToolsPage() {
                                 <Text type="secondary" style={{ fontSize: 11 }}>
                                   {tool.wb ? `↔ ${tool.wb}` : "· 无工作台对应"}
                                 </Text>
-                                <Text type="secondary" style={{ fontSize: 11 }} title="该工具在本服务进程内的调用次数">
-                                  {`今日 ${fmt.dash(callsByTool[tool.name] ?? 0)}`}
+                                <Text type="secondary" style={{ fontSize: 11 }} title={`该工具在本服务进程内的调用次数${statText(toolCallsStat(tool.name)) === "—" ? "（metrics 未取到，显示 —，不是 0）" : ""}`}>
+                                  {`今日 ${statText(toolCallsStat(tool.name))}`}
                                 </Text>
                               </Space>
                               <Paragraph type="secondary" style={{ fontSize: 11.5, margin: "4px 0 0" }}>
@@ -356,7 +411,7 @@ export default function ToolsPage() {
                 margin: 0, padding: 10, borderRadius: 6, background: "#171c26", border: "1px solid #232b37",
                 fontSize: 11, lineHeight: 1.55, maxHeight: 260, overflow: "auto", whiteSpace: "pre-wrap", wordBreak: "break-all",
               }}>
-                {safeText(probeBodyText(probe.body))}
+                {probeBodyText(probe.body)}
               </pre>
             </div>
           ) : null}
@@ -435,12 +490,29 @@ export default function ToolsPage() {
           口径：调用次数 / 失败次数 / 延迟为进程级全局口径（工具面不按市场切分），不按市场拆分。
         </Text>
         <div style={{ display: "flex", flexWrap: "wrap", gap: 24 }}>
-          <Statistic title="调用次数" value={fmt.dash(m.mcp?.calls)} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="失败次数" value={fmt.dash(m.mcp?.errors)} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="平均延迟(ms)" value={fmt.dash(m.mcp?.avgMs)} valueStyle={{ fontSize: 20 }} />
-          <Statistic title="整体失败率" value={failureRate} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="调用次数" value={statText(callsStat)} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="失败次数" value={statText(errorsStat)} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="平均延迟(ms)" value={statText(metricsStat(m.mcp?.avgMs, "/api/v3/metrics 未返回 mcp.avgMs"))} valueStyle={{ fontSize: 20 }} />
+          <Statistic title="整体失败率" value={statText(failureRateStat)} valueStyle={{ fontSize: 20 }} />
           <Statistic title="workbench" value={m.workbenchUp === true ? "在线" : m.workbenchUp === false ? "不可达" : "—"} valueStyle={{ fontSize: 20 }} />
         </div>
+        {metrics.loading || metrics.error || !metrics.value ? (
+          <Alert
+            style={{ marginTop: 10 }}
+            type={metrics.error ? "error" : "warning"}
+            showIcon
+            message="健康计数暂无读数（显示「—」，不是 0）"
+            description={
+              <Text type="secondary" style={{ fontSize: 11.5 }}>
+                {metrics.error
+                  ? `/api/v3/metrics 取数失败：${metrics.error}`
+                  : metrics.loading
+                    ? "加载中…（/api/v3/metrics 未返回前不显示任何计数）"
+                    : "接口返回体不含 ok=true 的 metrics 信封"}
+              </Text>
+            }
+          />
+        ) : null}
         {Object.keys(callsByTool).length > 0 ? (
           <div style={{ marginTop: 14 }}>
             <Text strong style={{ fontSize: 12 }}>按工具调用次数（真实计数）</Text>

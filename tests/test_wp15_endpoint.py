@@ -11,7 +11,9 @@
     → 领取**拒绝**（ComputeError）+ **critical 告警** + 任务状态不变（pending，不被领走）；
   * 端点声明：三项进 ``endpoints()``、绝不进缓存；``list`` **HTTP-only**（不在工具面）；
   * 工具面：``research_tasks_claim``/``research_tasks_report`` 进面（L3 执行体是 Harness
-    会话，经 MCP 调用最顺；受控写但非交易写），工具 77 / 对等性不变式 / 预算 ≤80；
+    会话，经 MCP 调用最顺；受控写但非交易写），工作台基础工具 77（``mcp_tools.TOOL_COUNT``；
+    另有 V3 桥接 39 件 → MCP 面 116，见 ``tests/test_wp6_mcp.py``）/ 对等性不变式 /
+    基础注册表预算 ≤80（该预算只算基础注册表，桥接面不计入）；
   * skill 值班模式手册：三 kind 处理步骤、循环领取至 null、**禁用写端点清单**、产物只进
     研究页/候选池。
 """
@@ -343,7 +345,7 @@ class HttpRouteTests(QueueEndpointBase):
 
 
 # ---------------------------------------------------------------------------
-# ⑥ 工具面：两项进面、list 不进、对等性与预算
+# ⑥ 工具面：两项进面、list 不进、对等性与预算（预算只算基础注册表）
 # ---------------------------------------------------------------------------
 
 class ToolSurfaceTests(unittest.TestCase):
@@ -353,6 +355,8 @@ class ToolSurfaceTests(unittest.TestCase):
         self.assertIn("research_tasks_report", names)
         self.assertNotIn("research_tasks_list", names)
         self.assertIn("research-tasks-list", mcp_tools.MCP_EXCLUDED_ENDPOINTS)
+        # mcp_tools 是**工作台基础注册表**（77 件）；V3 桥接 39 件在 v3_mcp，不并进这里
+        # → MCP 面 116 由 tests/test_wp6_mcp.py 锁定。
         self.assertEqual(mcp_tools.TOOL_COUNT, 77)
         self.assertEqual(len(mcp_tools.TOOLS), 77)
 
@@ -367,6 +371,8 @@ class ToolSurfaceTests(unittest.TestCase):
         self.assertEqual(forwarded,
                          set(store_access.endpoints())
                          - set(mcp_tools.MCP_EXCLUDED_ENDPOINTS))
+        # 预算 ≤80 是对**基础注册表**的约束（mcp_tools.TOOL_COUNT==77）；V3 桥接面按路由表
+        # 构造、不与基础注册表抢预算，它自己的件数由 tests/test_wp6_mcp.py 逐件锁定。
         self.assertLessEqual(mcp_tools.TOOL_COUNT, 80)
 
 

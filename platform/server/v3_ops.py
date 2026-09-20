@@ -13,6 +13,16 @@ oms/orders,oms/sync,events,audit,brain}``）。
 * **工具面**：本模块不复制任何业务逻辑，也不硬编码工具名——工具清单来自
   ``server.mcp_tools.TOOLS`` 的导入枚举，域归类复用 V3 原型（已退役）的工具域归类
   的 ``domainOf`` 规则。
+* **工具数两个口径（2026-09-20 修正）**：六域工具目录（``catalog_total`` = 工作台 77 +
+  5 个本地计算）与 **MCP 工具面**（``tools/list`` 的真值，另有 app.py 桥接的 ``v3_*``
+  工具）**不是同一个数**，历史上两处都只报目录数、字段名却叫 ``tools``，读起来就是错的。
+  现在 ``/api/v3/gateway`` 报 ``tools_total``（MCP 真值，动态取自 ``app.state.mcp`` 的注册表，
+  另附 ``tools_domain_catalog`` / ``tools_bridge`` / ``tools_source``），``/metrics`` 用
+  ``quantwb_tools{scope="mcp"|"domain"}`` 分口径暴露——**两边都不写死常量**。
+* **数据源可用性（2026-09-20 修正）**：判据是**能力探测 / 最近一次真实调用的 source**，
+  不是「某个 Python 包能否 import」（SEC EDGAR 走 HTTPS、Tushare 走 HTTP，都不需要包）。
+  探测的真值放在 ``source``/``as_of``/``detail`` 三个字段里；失败如实写原因，绝不写死
+  「不可用」。
 * **通道**：本服务**没有** SDK JSON-RPC 通道、也**没有** Headless CLI 子进程通道。
   相关字段一律 ``status="unavailable"`` + ``reason``，绝不用编造的会话/成功率填充
   （``headless.today`` 恒为零计数、``breaker=null``、``last=[]``、``turns=[]``）。
@@ -49,6 +59,7 @@ oms/orders,oms/sync,events,audit,brain}``）。
 测试：``cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_ops -v``
 """
 import asyncio
+import copy
 import importlib.util
 import json
 import os
@@ -57,13 +68,15 @@ import re
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import Request
 from fastapi.responses import JSONResponse
 
-from server import mcp_tools, store_access, v3_db, v3_ratelimit, v3_universe
+from server import mcp_tools, store_access, v3_db, v3_ratelimit, v3_risk_gate, v3_universe
 from server.config import config_path
 
 # ---------------------------------------------------------------------------
@@ -93,8 +106,13 @@ V3_LOCAL_TOOLS = (
 #: 风控阈值（与 V3 原型（已退役）实现 的 DEFAULT_LIMITS 逐项一致）
 LIMITS = {"singlePct": 2.0, "industryPct": 20.0, "drawdownPct": 15.0}
 
-#: OMS 生命周期阶段（与 V3 原型（已退役）实现 的 KANBAN 六态一致）
-STAGES = ("risk_passed", "manual", "blocked", "submitted", "filled", "rejected")
+#: OMS 生命周期阶段（与 V3 原型（已退役）实现 的 KANBAN 六态一致）+ 行业红线单列一态
+STAGES = ("risk_passed", "manual", "blocked", "blocked_industry", "submitted", "filled",
+          "rejected")
+
+#: action → 触发规则名（审计留痕用；写 ``history[].rule`` 与 ``risk.rule``，既有字段不变）
+_RULE_OF_ACTION = {"auto": "within-limits", "manual": "single-order",
+                   "blocked": "drawdown-red-line", "blocked_industry": "industry-red-line"}
 
 #: 设置页环境变量清单（任务书 §4）：只报「是否注入 + 来源」，**绝不出值**
 ENV_KEYS = ("DSH_HOME", "DEEPSEEK_API_KEY", "QUANT_MCP_NODE", "QUANT_MCP_SERVER",
@@ -121,7 +139,92 @@ MODE_NOTE = ("模式切换（sim/live）沿用既有工作台 Web 闸门：switc
              "V3.0 不另开口子。")
 OMS_NOTE = ("执行入口只有一个：既有工作台 Web 的「执行已冻结计划」（plan_execute）+ 人工确认"
             "（live 需口令「确认执行」）。V3 只登记、风控分级、对账与展示，不提供任何下单通道。")
-INDUSTRY_SOURCE = "no-data（工具面无行业分类数据源，按 0% 不阻断；行业红线需人工核对）"
+#: 「没有新鲜行业读数」时 ``industry_source`` 的取值。**只用 ``no-data`` 这一个词**：
+#: 既有的长句子已删除（它写着「按 0% 不阻断」，而当前实现是「无读数 → fail-open，且必留痕」，
+#: 语义不同，留着会误导审计）。真实读数的来源由 ``v3_risk_gate.industry_context`` 给出
+#: （``cache/futu/info_owner_plate`` / ``fetch/...`` / ``no-data``）。
+INDUSTRY_SOURCE = "no-data"
+
+#: 行业闸门上线**之前**落盘的 ``industry_source`` 原文（``HEAD`` 版 v3_ops.py 的
+#: ``INDUSTRY_SOURCE`` 常量值，2026-09-19 的 10 笔存量订单就是这个字符串）。
+#: 这句话**现在是失效断言**：它写着「工具面无行业分类数据源」，而 2026-09-20 起
+#: ``v3_risk_gate.industry_context`` 已能给出真实行业映射（``cache/futu/info_owner_plate``，
+#: 实测 SH 37.5% / HK 40% / US 50%）。它同时是识别「闸门前的历史判定」的第一判据。
+LEGACY_INDUSTRY_SOURCE_TEXT = "工具面无行业分类数据源"
+
+#: 历史判定在**视图层**的如实文案（替换上面那句已失效的断言；磁盘上的原文一个字都不动）。
+LEGACY_INDUSTRY_SOURCE = "历史判定（该单登记于行业闸门上线前，当时无行业读数）"
+#: 历史判定的说明：为什么 ``industry_pct`` 是 ``null`` 而不是 ``0.0``。
+LEGACY_INDUSTRY_NOTE = ("该判定未包含行业红线：登记时行业闸门尚未接入，台账没有行业读数——"
+                        "这里的「—」是「当时没读到」，不是「行业暴露 0%」。"
+                        "原始 risk.reasons / history 原样保留，本视图不回写、不重判。")
+
+
+def legacy_pre_gate(record):
+    """该台账订单是否为**行业闸门上线前**落盘的历史判定（只读判据，可解释、不猜时间戳）。
+
+    判据（任一命中即认定「历史判定」）::
+
+        1. ``industry_source`` 含 :data:`LEGACY_INDUSTRY_SOURCE_TEXT`——当前实现
+           （``v3_risk_gate``）只会写 ``cache/futu/...`` / ``fetch/...`` / ``no-data``，
+           这句话已不可能由现在的代码产生；
+        2. 记录**有分级留痕**（``risk.action`` 或非空 ``history``），但整条记录没有任何
+           闸门标记（``risk.rule`` / ``history[].rule`` / ``history[].industry_*``）。
+
+    判据 2 的根据是版本库事实而不是猜测：``risk.rule`` 与 ``history[].rule`` /
+    ``history[].industry_*`` 与行业闸门是**同一次改动**引入的
+    （``git show HEAD:platform/server/v3_ops.py`` 里 ``"risk": {"action", "reasons"}``、
+    ``history.append({"at", "stage", "reasons"})``，都没有 rule 字段）。
+
+    为什么不用「落盘时间早于某个常量」：闸门没有落盘的生效时间标记，硬编码一个时刻等于猜。
+    连分级留痕都没有的记录（入库的迁移数据）**不算**历史判定——那时无从谈「含不含行业红线」，
+    本函数返回 ``False``，视图不对它下任何结论。
+    """
+    if not isinstance(record, dict):
+        return False
+    if LEGACY_INDUSTRY_SOURCE_TEXT in str(record.get("industry_source") or ""):
+        return True
+    risk = record.get("risk") if isinstance(record.get("risk"), dict) else {}
+    history = [entry for entry in (record.get("history") or []) if isinstance(entry, dict)]
+    if not risk.get("action") and not history:
+        return False  # 没有分级留痕 → 不是「闸门前的判定」，无可归一化
+    if "rule" in risk:
+        return False
+    if any("rule" in entry or any(str(key).startswith("industry_") for key in entry)
+           for entry in history):
+        return False
+    return True
+
+
+def order_view(record):
+    """台账订单 → **返回视图**（视图层归一化，绝不回写磁盘/库）。
+
+    闸门后的新订单**原样返回**，只**追加**两个自解释标记（不改任何既有字段的值）：
+    ``industry_graded`` / ``legacy_pre_gate``。闸门前的历史判定额外做三处改写：
+
+    * ``industry_pct`` → ``None``（**不是 0.0**：当时没有行业读数，0.0 会被读成
+      「该单行业暴露 0%」，与事实相反）；
+    * ``industry_source`` → :data:`LEGACY_INDUSTRY_SOURCE`（如实说明这是历史判定，
+      **不再出现**「工具面无行业分类数据源」这句已失效的断言）；
+    * 追加 ``industry_note`` 说明该判定未包含行业红线。
+
+    ``risk`` / ``history`` 原文一个字不动（历史是历史）。返回的是副本，调用方改它
+    不会影响库/文件里的原始记录。
+    """
+    if not isinstance(record, dict):
+        return record
+    view = copy.deepcopy(record)
+    if not legacy_pre_gate(record):
+        view["industry_graded"] = True
+        view["legacy_pre_gate"] = False
+        return view
+    view["industry_pct"] = None
+    view["industry_source"] = LEGACY_INDUSTRY_SOURCE
+    view["industry_graded"] = False
+    view["legacy_pre_gate"] = True
+    view["industry_note"] = LEGACY_INDUSTRY_NOTE
+    return view
+
 
 # ---------------------------------------------------------------------------
 # 工具面元数据（唯一事实来源：mcp_tools.TOOLS 的导入枚举，绝不硬编码名字）
@@ -172,6 +275,88 @@ def build_catalog():
 def catalog_total(catalog=None):
     catalog = catalog if catalog is not None else build_catalog()
     return sum(len(rows) for rows in catalog.values())
+
+
+# ---------------------------------------------------------------------------
+# MCP 工具面真值（**动态取自注册表**，绝不写死常量）
+#
+# 为什么单列一层：六域工具目录（``catalog_total`` = 工作台 77 + 5 个本地计算）与 MCP
+# ``tools/list`` 的真实工具面**不是同一个数**——``app.py`` 在路由登记完之后还会把
+# ``/api/v3/*`` 路由桥成 ``v3_*`` MCP 工具（``v3_mcp.register``），桥接后的注册表才是
+# MCP 客户端真正能列出的工具面。两个口径都必须可读，且必须各自标明来源，故这里只回
+# 「注册表的真实长度」+「目录长度」，由调用方（``/api/v3/gateway``、``/metrics``）分别标注。
+# ---------------------------------------------------------------------------
+def _state_names(state, attr):
+    """``app.state.<attr>`` 里的名字序列；缺失/非序列返回 ``None``（不是空列表——空列表是事实）。"""
+    value = getattr(state, attr, None)
+    if value is None or isinstance(value, (str, bytes)):
+        return None
+    try:
+        names = [str(item) for item in value if str(item or "")]
+    except TypeError:
+        return None
+    return names
+
+
+def _registry_names(server):
+    """从 MCP SDK 的 ``ToolManager`` 同步读回工具名（与 ``tools/list`` 读的是同一注册表）。
+
+    用 ``_tool_manager.list_tools()`` 而不是 ``MCPServer.list_tools()``：后者是协程，而
+    ``build()`` 跑在 ``asyncio.to_thread`` 的工作线程里（没有事件循环）；两者底下的注册表
+    同一个，注册表在进程存活期内**只增不减**，因此这里的读数与 ``tools/list`` 必然一致。
+    """
+    lister = getattr(getattr(server, "_tool_manager", None), "list_tools", None)
+    if not callable(lister):
+        return None
+    try:
+        infos = lister()
+    except Exception:  # noqa: BLE001 —— 读不到注册表就退到下一级兜底，绝不猜数
+        return None
+    names = [str(getattr(info, "name", "") or "") for info in infos or ()]
+    names = [name for name in names if name]
+    return names or None
+
+
+def mcp_tool_surface(app=None):
+    """``{mcp_total, domain_catalog, bridge, source}``——两个口径 + 各自的真值来源。
+
+    * ``mcp_total``：**MCP 工具面**（``tools/list`` 会列出的工具数），动态取自注册表；
+    * ``domain_catalog``：平台六域工具目录条目数（``catalog_total()``，**不是** MCP 面）；
+    * ``bridge``：桥接进 MCP 的 ``v3_*`` 工具数（``app.state.v3_mcp_tools``，未知则 ``None``）。
+
+    真值优先级（每一级都在 ``source`` 里如实标注）：
+      1. ``app.state.mcp`` 的 SDK 注册表（生产路径：bridge 在 ``create_app`` 里装配）；
+      2. ``app.state.mcp_tools`` + ``app.state.v3_mcp_tools``（app.py 装配时的两份绑定名单）；
+      3. ``mcp_tools.TOOLS`` 导入枚举——此时 MCP 桥尚未装配，``mcp_total`` **只是工作台面**，
+         ``source`` 明写这一点，绝不把它冒充成 MCP 工具面。
+    """
+    catalog = catalog_total()
+    state = getattr(app, "state", None)
+    registry = _registry_names(getattr(state, "mcp", None))
+    bridge_names = _state_names(state, "v3_mcp_tools")
+    bound_names = _state_names(state, "mcp_tools")
+    if registry is not None:
+        return {
+            "mcp_total": len(registry),
+            "domain_catalog": catalog,
+            "bridge": None if bridge_names is None else len(bridge_names),
+            "source": "MCP 注册表（MCPServer._tool_manager.list_tools()，与 tools/list 同源）",
+        }
+    if bound_names is not None and bridge_names is not None:
+        return {
+            "mcp_total": len(bound_names) + len(bridge_names),
+            "domain_catalog": catalog,
+            "bridge": len(bridge_names),
+            "source": ("app.state.mcp_tools + app.state.v3_mcp_tools（app.py 装配名单；"
+                       "注册表对象不可读）"),
+        }
+    return {
+        "mcp_total": len(WB_TOOL_NAMES),
+        "domain_catalog": catalog,
+        "bridge": None if bridge_names is None else len(bridge_names),
+        "source": ("mcp_tools.TOOLS 导入枚举（MCP 桥尚未装配，此数只是工作台工具面，"
+                   "不是 MCP tools/list 的真值）"),
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -306,8 +491,32 @@ def _read_mode(home):
 # ---------------------------------------------------------------------------
 # 风控分级（risk.mjs ``checkOrder`` 的 Python 等价物，阈值同源）
 # ---------------------------------------------------------------------------
-def check_order(value, nav, industry_pct=0.0, drawdown_pct=0.0, limits=None):
-    """返回 ``(action, reasons)``；action ∈ auto / manual / blocked。"""
+def check_order(value, nav, industry_pct=0.0, drawdown_pct=0.0, limits=None,
+                industry_source=None, industry_top=None, industry_as_of=None,
+                industry_probe_age_ms=None, industry_missing=None, industry_universe=None,
+                industry_market=None, industry_reason=None):
+    """下单前风控分级（纯函数）。返回 ``(action, reasons)``。
+
+    action ∈ ``auto`` / ``manual`` / ``blocked``（回撤红线）/ ``blocked_industry``（行业红线）。
+
+    判定顺序（后者覆盖前者，行业/回撤红线优先于单笔结论）
+    ----------------------------------------------------
+    1. 缺 NAV 或金额 → ``manual``（不折算，保守退回人工确认）；
+    2. 单笔占比 > ``LIMITS["singlePct"]``(2%) → ``manual``；
+    3. **行业集中度** > ``LIMITS["industryPct"]``(20%) → ``blocked_industry``；
+       无读数（``industry_pct=None``）→ **fail-open**（不阻断），但必须留痕
+       「行业暴露数据不可用，未参与阻断（原因：…）」；
+    4. 回撤 ≥ ``LIMITS["drawdownPct"]``(15%) → ``blocked``。
+
+    行业参数（``industry_*``）来自 :func:`server.v3_risk_gate.industry_context`，只用于
+    **措辞与留痕**（读数、来源、as_of、缺失数），阈值判定仍只看 ``industry_pct``：
+
+    * ``industry_source``：读数来源（``cache/futu/info_owner_plate`` / ``fetch/...`` /
+      ``no-data``）——写进原因原文，避免「阻断了一个不知道哪来的数」；
+    * ``industry_missing`` > 0：上游有标的没取到行业分类 → 读数只是**下界**，必须标注；
+    * **历史调用口径不变**：完全不传任何 ``industry_*``（``industry_pct`` 取默认 ``0.0``）
+      时不做行业判定、不产生行业原因——与闸门接入前逐字段一致。
+    """
     limits = limits or LIMITS
     reasons = []
     action = "auto"
@@ -321,16 +530,85 @@ def check_order(value, nav, industry_pct=0.0, drawdown_pct=0.0, limits=None):
     else:
         action = "manual"
         reasons.append("缺少市值或订单金额，无法自动判定")
-    industry_pct = _number(industry_pct) or 0.0
-    if industry_pct > limits["industryPct"]:
-        action = "blocked"
-        reasons.append(f"行业集中度 {industry_pct:.1f}% > "
-                       f"{limits['industryPct']:.0f}% 红线，强制阻断")
+
+    industry_pct = _number(industry_pct)
+    # 「提供了行业口径」的判据：没有读数 + 没有来源/原因 = 调用方压根没接行业口径（历史行为）
+    has_industry = not (industry_pct is None and industry_source is None
+                        and industry_reason is None)
+    no_data = has_industry and (industry_pct is None or str(industry_source or "") == "no-data")
+    if industry_pct is not None and has_industry and not no_data:
+        limit = _number(limits["industryPct"]) or 0.0
+        context_bits = []
+        if industry_top:
+            context_bits.append(f"top={industry_top}")
+        context_bits.append(f"来源 {industry_source or 'unknown'}")
+        if industry_as_of:
+            context_bits.append(f"as_of {industry_as_of}")
+        if industry_market:
+            context_bits.append(f"市场 {industry_market}")
+        if industry_probe_age_ms is not None:
+            context_bits.append(f"探测年龄 {float(industry_probe_age_ms) / 1000.0:.0f}s")
+        text = (f"单一行业暴露 {industry_pct:.1f}% > {limit:.0f}%（"
+                + "，".join(context_bits) + "）")
+        if industry_pct > limit:
+            action = "blocked_industry"
+            reasons.append(text + "，强制阻断")
+        elif (isinstance(industry_missing, (int, float))
+              and not isinstance(industry_missing, bool) and industry_missing >= 1):
+            reasons.append(text + "（未超限，但读数只是下界）")
+        missing_note = _industry_missing_note(industry_missing, industry_universe)
+        if missing_note:
+            reasons.append(missing_note)
+    elif no_data:
+        detail = industry_reason or f"无新鲜行业读数（来源 {industry_source or 'no-data'}）"
+        reasons.append(f"行业暴露数据不可用，未参与阻断（原因：{detail}）")
+
     drawdown_pct = abs(_number(drawdown_pct) or 0.0)
     if drawdown_pct >= limits["drawdownPct"]:
         action = "blocked"
         reasons.append(f"回撤 {drawdown_pct:.1f}% 触及 {limits['drawdownPct']:.0f}% 红线，强制阻断")
     return action, reasons
+
+
+def _industry_missing_note(missing, universe):
+    """``missing`` 非空 → 读数只是下界（数据质量提示；不改判定，只留痕）。"""
+    if isinstance(missing, bool) or not isinstance(missing, (int, float)) or missing < 1:
+        return None
+    covered = (f"（{universe:.0f} 只标的）" if isinstance(universe, (int, float))
+               and not isinstance(universe, bool) else "")
+    return (f"行业暴露数据不完整：{missing:.0f} 只标的未取到行业分类{covered}，"
+            f"当前读数是**下界**，真实暴露可能更高")
+
+
+def risk_reasons_detail(action, reasons, context, industry=None):
+    """把一次分级压成**审计留痕行**（台账 ``history`` 的字段面，只加不删既有键）。
+
+    ``context`` 是 :meth:`OmsLedger.context` 的返回值；``industry`` 是
+    ``v3_risk_gate.industry_context`` 的读数信封（可为 ``None``）。返回的字典同时带上
+    ``rule``/``readings``，便于事后回答「阻断时看的是哪个数、哪个来源、哪一刻」。
+    """
+    industry = industry if isinstance(industry, dict) else {}
+    return {
+        "action": action,
+        "rule": ("industry-red-line" if action == "blocked_industry"
+                 else ("drawdown-red-line" if action == "blocked"
+                       else ("single-order" if action == "manual" else "within-limits"))),
+        "reasons": list(reasons),
+        "readings": {
+            "nav": context.get("nav"),
+            "nav_source": context.get("nav_source"),
+            "drawdown_pct": context.get("drawdown_pct"),
+            "drawdown_source": context.get("drawdown_source"),
+            "industry_pct": context.get("industry_pct"),
+            "industry_source": context.get("industry_source"),
+            "industry_top": industry.get("top_industry"),
+            "industry_market": industry.get("market"),
+            "industry_as_of": industry.get("as_of"),
+            "industry_probe_age_ms": industry.get("probe_age_ms"),
+            "industry_missing": industry.get("missing"),
+            "industry_universe": industry.get("universe"),
+        },
+    }
 
 
 _SIDE_ALIASES = {"BUY": "BUY", "B": "BUY", "买入": "BUY", "LONG": "BUY",
@@ -755,8 +1033,18 @@ class OmsLedger:
                 stats["otherOrders"] += 1
         return stats
 
-    # ---- 工作台上下文（NAV / 回撤 / 在途 / 待确认）----
-    def context(self):
+    # ---- 工作台上下文（NAV / 回撤 / 在途 / 待确认 / 行业暴露）----
+    def industry_context(self, market=None, *, wb_call=None, max_age_ms=None, now=None):
+        """某市场的行业集中度读数（``v3_risk_gate.industry_context`` 的台账封装）。
+
+        ``wb_call`` 给了就允许「缓存不可用时现取一次」（只读，板块映射过 v3_ratelimit）；
+        不给则**只读缓存**，没有读数就按 fail-open 返回 no-data 信封。
+        """
+        return v3_risk_gate.industry_context(self._home, market, wb_call=wb_call,
+                                            max_age_ms=max_age_ms, now=now)
+
+    def context(self, *, industry=None, industry_wb_call=None, now=None):
+        """台账上下文。``industry`` 是这个市场的行业读数（``None`` → 现读一次，只读缓存）。"""
         equity = self._call("equity", {"window": 30})
         positions = self._call("positions", {})
         orders_open = self._call("orders_open", {})
@@ -785,13 +1073,26 @@ class OmsLedger:
         if isinstance(confirmation, dict) and confirmation.get("ok"):
             confirmation_value = confirmation.get("value")
 
+        if industry is None:
+            industry = self.industry_context(None, wb_call=industry_wb_call, now=now)
+        industry_pct = _number(industry.get("industry_pct"))
+
         return {
             "nav": nav,
             "nav_source": nav_source,
             "drawdown_pct": drawdown_pct,
             "drawdown_source": drawdown_source,
-            "industry_pct": 0.0,
-            "industry_source": INDUSTRY_SOURCE,
+            # 行业读数：None = 没有读数（fail-open），**不是** 0%
+            "industry_pct": industry_pct,
+            "industry_source": industry.get("industry_source") or INDUSTRY_SOURCE,
+            "industry_top": industry.get("top_industry"),
+            "industry_market": industry.get("market"),
+            "industry_as_of": industry.get("as_of"),
+            "industry_probe_age_ms": industry.get("probe_age_ms"),
+            "industry_missing": industry.get("missing"),
+            "industry_universe": industry.get("universe"),
+            "industry_reason": industry.get("reason"),
+            "industry": dict(industry),
             "open_rows": _open_rows(orders_open),
             "equity": equity,
             "positions": positions,
@@ -800,7 +1101,7 @@ class OmsLedger:
             "confirmation_envelope": confirmation,
         }
 
-    def _upsert(self, orders, order, context, plan_record):
+    def _upsert(self, orders, order, context, plan_record, industry=None):
         plan_id = str(plan_record.get("plan_id") or "")
         symbol = str(order.get("symbol") or "")
         side = str(order.get("side") or "")
@@ -809,11 +1110,22 @@ class OmsLedger:
         value = qty * price
         order_id = str(order.get("client_order_id")
                        or f"{plan_id}-{symbol}-{side}")
-        action, reasons = check_order(value, context["nav"], context["industry_pct"],
-                                      context["drawdown_pct"])
+        action, reasons = check_order(
+            value, context["nav"], context["industry_pct"], context["drawdown_pct"],
+            industry_source=context.get("industry_source"),
+            industry_top=context.get("industry_top"),
+            industry_as_of=context.get("industry_as_of"),
+            industry_probe_age_ms=context.get("industry_probe_age_ms"),
+            industry_missing=context.get("industry_missing"),
+            industry_universe=context.get("industry_universe"),
+            industry_market=context.get("industry_market"),
+            industry_reason=context.get("industry_reason"))
         if action == "manual" and context["nav"] <= 0:
             reasons.append(f"NAV 不可用（{context['nav_source']}）：不折算，保守退回人工确认")
-        stage = {"blocked": "blocked", "manual": "manual"}.get(action, "risk_passed")
+        # 行业红线阻断**单独成态**（blocked_industry）：单一行业 20% 与最大回撤 15% 都是硬阻断，
+        # 但「哪个规则拦的」必须能一眼看出（否则事后只能靠 reasons 文本猜）。
+        stage = {"blocked_industry": "blocked_industry", "blocked": "blocked",
+                 "manual": "manual"}.get(action, "risk_passed")
         broker_order_id = order.get("broker_order_id") or None
         status = str(order.get("status") or "")
         hit = open_hit(context["open_rows"], order_id, symbol, side, qty)
@@ -827,7 +1139,13 @@ class OmsLedger:
         existing = orders.get(order_id) or {}
         stamp = _now()
         history = list(existing.get("history") or [])
-        history.append({"at": stamp, "stage": stage, "reasons": list(reasons)})
+        previous_stage = existing.get("stage")
+        trail = {"at": stamp, "stage": stage, "rule": _RULE_OF_ACTION.get(action, "unknown"),
+                 "changed": previous_stage != stage, "reasons": list(reasons)}
+        trail.update(v3_risk_gate.industry_trail(industry) if industry is not None
+                     else {"industry_pct": context["industry_pct"],
+                           "industry_source": context["industry_source"]})
+        history.append(trail)
         record = {
             "id": order_id,
             "plan_id": plan_id,
@@ -841,50 +1159,228 @@ class OmsLedger:
             "value": value,
             "broker_order_id": broker_order_id,
             "stage": stage,
-            "risk": {"action": action, "reasons": list(reasons)},
+            "risk": {"action": action, "reasons": list(reasons),
+                     "rule": _RULE_OF_ACTION.get(action, "unknown"),
+                     "industry_source": context.get("industry_source"),
+                     "industry_pct": context["industry_pct"],
+                     "industry_top": context.get("industry_top"),
+                     "industry_as_of": context.get("industry_as_of"),
+                     "industry_missing": context.get("industry_missing"),
+                     "industry_reason": context.get("industry_reason")},
             "nav_used": context["nav"],
             "nav_source": context["nav_source"],
             "drawdown_used": context["drawdown_pct"],
             "drawdown_source": context["drawdown_source"],
             "industry_pct": context["industry_pct"],
             "industry_source": context["industry_source"],
+            "industry_top": context.get("industry_top"),
+            "industry_as_of": context.get("industry_as_of"),
+            "industry_probe_age_ms": context.get("industry_probe_age_ms"),
+            "industry_missing": context.get("industry_missing"),
+            "industry_reason": context.get("industry_reason"),
             "open_hit": bool(hit),
             "first_seen_at": existing.get("first_seen_at") or stamp,
             "updated_at": stamp,
-            "history": history[-10:],
+            "history": history[-20:],
         }
         orders[order_id] = record
         return record
 
     def sync(self):
-        """重新对账：``plan`` → 登记/分级 → 与 ``orders_open`` 命中 → 落盘。"""
+        """重新对账：``plan`` → 登记/分级 → 与 ``orders_open`` 命中 → 落盘。
+
+        行业暴露按**订单所属市场**取（``_industry_contexts``），跨市场不合并；每个市场
+        至多现取一次（缓存新鲜则一次上游都不打）。
+        """
         plan = self._call("plan", {})
         if not isinstance(plan, dict) or not plan.get("ok"):
             return {"ok": False, "error": (plan or {}).get("error")
                     or {"code": "wb/error", "message": "plan 取数失败"}}
-        context = self.context()
         value = plan.get("value") if isinstance(plan.get("value"), dict) else {}
         plans = [row for row in (value.get("plans") or []) if isinstance(row, dict)]
+        contexts, industry_error, industry_base = self._industry_contexts(plans=plans)
         orders = self.read()
         seen = []
         for plan_record in plans:
             for order in plan_record.get("orders") or []:
                 if not isinstance(order, dict):
                     continue
-                record = self._upsert(orders, order, context, plan_record)
+                market = v3_risk_gate.market_of_order(order.get("symbol"))
+                industry = contexts.get(v3_risk_gate.industry_context_key(market))
+                record = self._upsert(orders, order, context=industry["context"],
+                                      plan_record=plan_record, industry=industry)
                 seen.append(record["id"])
         self.write(orders)
+        # 结果里的行业读数 = 本次实际读到的各市场里**最严**的那个（一个都没读到 → 如实 null）
+        strictest = None
+        for item in contexts.values():
+            pct = _number(item.get("industry_pct"))
+            if pct is None:
+                continue
+            if strictest is None or pct > _number(strictest["industry_pct"]):
+                strictest = item
+        base = industry_base["context"]
         result = {"at": _now(), "plans": len(plans), "orders": len(seen),
-                  "nav": context["nav"], "nav_source": context["nav_source"],
-                  "drawdown_pct": context["drawdown_pct"],
-                  "industry_source": context["industry_source"],
+                  "nav": base["nav"], "nav_source": base["nav_source"],
+                  "drawdown_pct": base["drawdown_pct"],
+                  "industry_source": (strictest["industry_source"] if strictest
+                                      else INDUSTRY_SOURCE),
+                  "industry_pct": _number(strictest["industry_pct"]) if strictest else None,
+                  "industry_top": strictest.get("top_industry") if strictest else None,
+                  "industry_as_of": strictest.get("as_of") if strictest else None,
+                  "industry_missing": strictest.get("missing") if strictest else None,
+                  "industry_markets": {key: item.get("industry_source")
+                                       for key, item in sorted(contexts.items())},
+                  "industry_error": industry_error,
                   "stages": self.stage_counts_of(orders)}
         self._append_sync(result)
         return {"ok": True, **result}
 
+    # ---- 行业读数：缓存快照（不打上游）与对账分级（可现取一次）----
+    def industry_readings(self, market=None, *, max_age_ms=None, now=None):
+        """``(逐市场读数, 最严读数)``——**只读落盘缓存**，不调任何工具面函数。
+
+        视图/指标/``/api/v3/metrics`` 都走这条路径，所以刷新看板**永远不会**去探测富途
+        （与 ``observability._render_risk_industry`` 同一纪律）。``market`` 给定时
+        ``最严读数`` 就是该市场的读数（认不出市场前缀的订单另走
+        :meth:`_industry_contexts` 的 ``unknown`` 口径）。
+        """
+        markets = {}
+        for code in v3_universe.MARKETS:
+            markets[code] = self.industry_context(code, max_age_ms=max_age_ms, now=now)
+        usable = [envelope for envelope in markets.values()
+                  if _number(envelope.get("industry_pct")) is not None]
+        if market is not None:
+            strictest = markets.get(market)
+            if strictest is None:
+                strictest = self.industry_context(market, max_age_ms=max_age_ms, now=now)
+                markets = dict(markets, **{market: strictest})
+        else:
+            strictest = (max(usable, key=lambda item: _number(item["industry_pct"]))
+                         if usable else None)
+        return markets, (strictest or self.industry_context(None, max_age_ms=max_age_ms,
+                                                            now=now))
+
+    def industry_view_context(self, market=None, *, context=None, now=None):
+        """视图/指标用上下文：``context`` 给定（``/api/v3/execution`` 已取过）则复用，
+        否则只补行业块（NAV/回撤字段在 ``context`` 为 ``None`` 时**不出值**）。
+
+        行业口径与对账完全同源（``industry_context``），因此**缓存过期 → 视图也会如实
+        显示 no-data**，不会拿一个 6 小时前的暴露冒充现读数。
+        """
+        now = time.time() if now is None else float(now)
+        markets, picked = self.industry_readings(market, now=now)
+        out = dict(context or {})
+        out.update({
+            "industry_pct": _number(picked.get("industry_pct")),
+            "industry_source": picked.get("industry_source") or INDUSTRY_SOURCE,
+            "industry_top": picked.get("top_industry"),
+            "industry_market": picked.get("market"),
+            "industry_as_of": picked.get("as_of"),
+            "industry_probe_age_ms": picked.get("probe_age_ms"),
+            "industry_missing": picked.get("missing"),
+            "industry_universe": picked.get("universe"),
+            "industry_reason": picked.get("reason"),
+            "industry": dict(picked),
+            "industry_markets": {key: dict(envelope) for key, envelope in markets.items()},
+        })
+        return out
+
+    def _industry_contexts(self, plans=None, *, wb_call=None, now=None):
+        """按**本次对账涉及的市场**取行业读数；返回 ``(contexts, error, base)``。
+
+        ``contexts`` 的键是计划里涉及的 ``SH``/``HK``/``US`` 与 ``unknown``（认不出市场
+        前缀的订单 → 取本次读到的各市场**最严**，理由写在读数的 ``reason`` 里、
+        不跨市场合并暴露）。只为**计划里真的有订单**的市场现取（每个市场至多一次，
+        ``wb_call`` 即 ``v3_run``：只读工具 + 全局限流器，缺省为 ``self._call``）——
+        因此「缓存新鲜」时一次上游都不打、「全是 SH 单」时不会顺手去探测 HK/US。
+        NAV/回撤来自**同一份**基准上下文（懒取一次，不因市场而异），行业块逐市场替换。
+        """
+        now = time.time() if now is None else float(now)
+        cache = {}
+        errors = []
+        store = {"base": None}
+
+        def base_context():
+            """NAV/回撤基准上下文：**懒取一次**（只有真的要分级/展示时才打工具面）。"""
+            if store["base"] is None:
+                store["base"] = self.context(now=now)
+            return store["base"]
+
+        def wrap(acquired):
+            context = dict(base_context())
+            context.update({
+                "industry_pct": _number(acquired.get("industry_pct")),
+                "industry_source": acquired.get("industry_source") or INDUSTRY_SOURCE,
+                "industry_top": acquired.get("top_industry"),
+                "industry_market": acquired.get("market"),
+                "industry_as_of": acquired.get("as_of"),
+                "industry_probe_age_ms": acquired.get("probe_age_ms"),
+                "industry_missing": acquired.get("missing"),
+                "industry_universe": acquired.get("universe"),
+                "industry_reason": acquired.get("reason"),
+                "industry": dict(acquired),
+            })
+            key = v3_risk_gate.industry_context_key(acquired.get("market"))
+            cache[key] = dict(acquired, context=context)
+            if acquired.get("reason") and acquired.get("industry_pct") is None:
+                errors.append(f"{key}: {acquired['reason']}")
+            return cache[key]
+
+        fetch = self._call if wb_call is None else wb_call
+        symbols = [order.get("symbol")
+                   for plan_record in (plans or [])
+                   for order in (plan_record.get("orders") or [])
+                   if isinstance(order, dict)]
+        needed = []
+        for symbol in symbols:
+            market = v3_risk_gate.market_of_order(symbol)
+            if market is not None and market not in needed:
+                needed.append(market)
+        for market in needed:
+            wrap(self.industry_context(market, wb_call=fetch, now=now))
+        # 认不出市场前缀的订单：在**本次读到的**市场里取最严（不跨市场合并暴露）
+        strict = None
+        for key, item in cache.items():
+            if key == v3_risk_gate.MARKET_UNKNOWN:
+                continue
+            pct = _number(item.get("industry_pct"))
+            if pct is None:
+                continue
+            if strict is None or pct > _number(strict["industry_pct"]):
+                strict = item
+        if strict is None:
+            fallback = dict(self.industry_context(None, wb_call=None, now=now))
+            fallback["reason"] = (fallback.get("reason")
+                                  or "本次对账没有可归市场的标的，也未读到任何市场读数")
+            cache[v3_risk_gate.MARKET_UNKNOWN] = wrap(fallback)
+        else:
+            derived = dict(strict)
+            derived["market"] = None
+            derived["reason"] = (f"订单标的认不出市场前缀 → 取本次读到的各市场最严读数"
+                                 f"（{strict.get('market')} 的 {strict.get('top_industry')}）")
+            context = dict(strict["context"])
+            context["industry_market"] = None
+            context["industry_reason"] = derived["reason"]
+            context["industry"] = dict(derived)
+            derived["context"] = context
+            cache[v3_risk_gate.MARKET_UNKNOWN] = derived
+        return cache, ("；".join(errors) if errors else None), cache[v3_risk_gate.MARKET_UNKNOWN]
+
     def view(self, context=None, market=None):
-        """OMS 台账视图；``market`` 给定时 ``orders`` 与 ``stages`` 同步按市场过滤。"""
-        context = context if context is not None else self.context()
+        """OMS 台账视图；``market`` 给定时 ``orders`` 与 ``stages`` 同步按市场过滤。
+
+        ``context`` 给定时（``/api/v3/execution`` 已经取过一份）复用它；否则取一份
+        NAV/回撤上下文再补行业块——行业块走**只读落盘缓存**的
+        :meth:`industry_view_context`，不会为了看板去探测富途。
+
+        ``orders`` 逐单过 :func:`order_view`：闸门前的历史判定在**视图层**归一化
+        （``industry_pct=None`` + ``legacy_pre_gate``），磁盘/库里的原始记录与原始
+        ``reasons`` / ``history`` 一个字不动。``/api/v3/execution`` 与本端点同走此函数，
+        两处口径不可能漂移。
+        """
+        if context is None:
+            context = self.industry_view_context(context=self.context())
         payload = {
             "note": OMS_NOTE,
             "confirmation": context["confirmation"],
@@ -893,13 +1389,55 @@ class OmsLedger:
             "drawdown_pct": context["drawdown_pct"],
             "drawdown_source": context["drawdown_source"],
             "industry_source": context["industry_source"],
+            "industry_pct": context["industry_pct"],
+            "industry_top": context.get("industry_top"),
+            "industry_market": context.get("industry_market"),
+            "industry_as_of": context.get("industry_as_of"),
+            "industry_missing": context.get("industry_missing"),
+            "industry_markets": context.get("industry_markets"),
+            "industry_limit_pct": _number(LIMITS["industryPct"]),
             "stages": self.stage_counts(market),
-            "orders": self.list(market)[:20],
+            "orders": [order_view(record) for record in self.list(market)[:20]],
             "market": market,
         }
         if market:
             payload["filter"] = self.market_filter_stats(market)
         return payload
+
+    def gate_view(self):
+        """``/api/v3/metrics`` 的行业闸门读数（**只加字段**；抓取路径**不打任何上游**）。
+
+        ``blockedIndustry`` = 台账里 ``stage="blocked_industry"`` 的单数（真被行业红线拦下的
+        那些）；``industry`` 块是**落盘缓存**的读数状态（``industryPct=null`` +
+        ``industrySource="no-data"`` 表示没有新鲜读数、闸门 fail-open）。抓取路径只读缓存、
+        不发起任何工具调用（与 ``observability._render_risk_industry`` 同一纪律）。
+        """
+        orders = self.read()
+        # 只读落盘缓存：**不调用任何工具面函数**（刷新看板绝不去探测富途）
+        markets, picked = self.industry_readings()
+        return {
+            "blockedIndustry": sum(1 for record in orders.values()
+                                   if str(record.get("stage")) == "blocked_industry"),
+            "blockedByIndustry": sum(1 for record in orders.values()
+                                     if str((record.get("risk") or {}).get("rule"))
+                                     == "industry-red-line"),
+            "blockedByDrawdown": sum(1 for record in orders.values()
+                                     if str((record.get("risk") or {}).get("rule"))
+                                     == "drawdown-red-line"),
+            "industryLimitPct": _number(LIMITS["industryPct"]),
+            "industryPct": _number(picked.get("industry_pct")),
+            "industrySource": picked.get("industry_source") or INDUSTRY_SOURCE,
+            "industryTop": picked.get("top_industry"),
+            "industryAsOf": picked.get("as_of"),
+            "industryProbeAgeMs": picked.get("probe_age_ms"),
+            "industryMissing": picked.get("missing"),
+            "perMarket": {key: envelope.get("industry_pct")
+                          for key, envelope in sorted(markets.items())},
+            "failOpen": _number(picked.get("industry_pct")) is None,
+            "note": ("单一行业 > 20% → stage=blocked_industry（硬阻断）；没有新鲜读数时 "
+                     "fail-open 不阻断，但订单 reasons 里会写明「数据不可用，未参与阻断」"),
+        }
+
 
 
 # ---------------------------------------------------------------------------
@@ -951,33 +1489,258 @@ def _module_available(name):
         return False
 
 
-def _data_sources(call, home):
-    """五个数据源的真实可用性（能探测就探测，测不到就说测不到）。"""
+# ---------------------------------------------------------------------------
+# 数据源**能力探测**（真发一次 HTTP，而不是「某个 Python 包能不能 import」）
+#
+# 纪律：探测结果必须带 ``as_of`` 与真实失败原因；**任何**「不可用」的结论都要能追到一次
+# 真实调用/真实探测，绝不允许写死文本（2026-09-20 修正：SEC 与 Tushare 两条曾与之相反）。
+# 探测结果按 TTL 缓存：设置页会被反复打开，不能每次都打上游；TTL 内复用**同一份**结果
+# （连它的 ``as_of`` 一起复用），绝不假装刚刚探测过。
+# ---------------------------------------------------------------------------
+SOURCE_PROBE_TTL_ENV = "QUANT_SOURCE_PROBE_TTL"
+DEFAULT_SOURCE_PROBE_TTL = 600.0
+SOURCE_PROBE_TIMEOUT_ENV = "QUANT_SOURCE_PROBE_TIMEOUT"
+DEFAULT_SOURCE_PROBE_TIMEOUT = 6.0
+#: 落盘探测证据的新鲜窗口：超过它仍可用（是真实调用结果），只是会在 detail 里注明年龄。
+SOURCE_PROBE_EVIDENCE_MAX_AGE = 3600.0
+
+#: Tushare 真实取数端点（与 ``v3_credentials.TUSHARE_ENDPOINT`` 同一地址；这里只做可达性探测）。
+TUSHARE_PROBE_URL = "http://api.tushare.pro"
+#: SEC XBRL 探测参数：与 ``GET /api/v3/financials?ticker=AAPL`` 同一条路径（Apple CIK=0000320193）。
+SEC_PROBE_CIK = 320193
+SEC_PROBE_TAG = "Revenues"
+
+_SOURCE_PROBE_LOCK = threading.Lock()
+_SOURCE_PROBE_CACHE = {}
+
+
+def reset_source_probes():
+    """清空能力探测缓存（测试用；生产不需要——TTL 到期自然重探）。"""
+    with _SOURCE_PROBE_LOCK:
+        _SOURCE_PROBE_CACHE.clear()
+
+
+def _env_positive_float(name, default):
+    raw = os.environ.get(name)
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    return value if value > 0 else default
+
+
+def _source_probe_ttl():
+    return _env_positive_float(SOURCE_PROBE_TTL_ENV, DEFAULT_SOURCE_PROBE_TTL)
+
+
+def _source_probe_timeout():
+    return _env_positive_float(SOURCE_PROBE_TIMEOUT_ENV, DEFAULT_SOURCE_PROBE_TIMEOUT)
+
+
+def _http_probe(url, headers=None, timeout=None):
+    """真发一次 GET，返回 ``{ok, reachable, status, evidence, as_of}``。
+
+    ``reachable`` = HTTP 层拿到了响应（**4xx/5xx 也算**：端点在、只是路径/鉴权不对）；
+    ``ok`` = 拿到了 2xx（才够格把数据源判成可用）。两者分开报：笼统写成「不可用」正是
+    本次要修掉的不诚实，而把 403 当成「可用」同样是自欺。
+    """
+    as_of = _now()
+    seconds = _source_probe_timeout() if timeout is None else float(timeout)
+    request = urllib.request.Request(url, headers=dict(headers or {}))
+    try:
+        with urllib.request.urlopen(request, timeout=seconds) as response:  # noqa: S310 —— 公开只读端点
+            status = int(getattr(response, "status", 0) or 0)
+            chunk = response.read(4096)
+    except urllib.error.HTTPError as error:
+        return {"ok": False, "reachable": True, "status": int(error.code), "as_of": as_of,
+                "evidence": f"HTTP {error.code}（GET {url}）——端点可达但返回了错误码"}
+    except Exception as error:  # noqa: BLE001 —— 网络/超时/DNS/证书：原因逐字带回
+        return {"ok": False, "reachable": False, "status": None, "as_of": as_of,
+                "evidence": f"{type(error).__name__}: {error}"[:200]}
+    return {"ok": 200 <= status < 400, "reachable": True, "status": status, "as_of": as_of,
+            "evidence": f"HTTP {status}（GET {url}，首段 {len(chunk)} 字节）"}
+
+
+def _probe_cached(key, probe):
+    """带 TTL 的能力探测：TTL 内复用同一份真实结果（``as_of`` 不刷新）。"""
+    ttl = _source_probe_ttl()
+    now = time.monotonic()
+    with _SOURCE_PROBE_LOCK:
+        entry = _SOURCE_PROBE_CACHE.get(key)
+    if entry is not None and (now - entry["at"]) < ttl:
+        return dict(entry["result"])
+    result = probe()
+    with _SOURCE_PROBE_LOCK:
+        _SOURCE_PROBE_CACHE[key] = {"at": now, "result": dict(result)}
+    return dict(result)
+
+
+def _load_datasource_probe(home):
+    """读**落盘**的数据源降级链探测结果（写方 = ``GET /api/v3/sources/status``）。
+
+    惰性 import ``server.observability``：它在模块级 import 本模块，顶层 import 会成环。
+    读不到不算错误（返回 ``None``）——此时调用方退回实时探测。
+    """
+    try:
+        from server import observability  # noqa: PLC0415 —— 只为打断导入环
+        return observability.load_datasource_probe(home)
+    except Exception:  # noqa: BLE001 —— 探测缓存的读取绝不阻断设置页
+        return None
+
+
+def _chain_row(probe, key):
+    if not isinstance(probe, dict):
+        return None
+    for row in probe.get("chains") or []:
+        if isinstance(row, dict) and row.get("key") == key:
+            return row
+    return None
+
+
+def _evidence_age(probe):
+    """落盘探测证据的年龄（秒）；没有时间戳返回 ``None``（不猜）。"""
+    stamped = probe.get("probed_at") if isinstance(probe, dict) else None
+    try:
+        return max(0.0, time.time() - float(stamped))
+    except (TypeError, ValueError):
+        return None
+
+
+def _age_text(seconds):
+    if seconds is None:
+        return "时间戳缺失"
+    if seconds < 120:
+        return f"{int(seconds)} 秒前"
+    if seconds < 7200:
+        return f"{seconds / 60:.0f} 分钟前"
+    return f"{seconds / 3600:.1f} 小时前"
+
+
+def _sec_probe_request():
+    """SEC 探测用的 ``(url, headers)``——端点/UA 取自 ``v3_sources``（不另造第二份常量）。"""
+    from server import v3_sources  # noqa: PLC0415 —— 惰性 import，避免模块级环
+    url = v3_sources.SEC_CONCEPT_URL.format(cik=SEC_PROBE_CIK, tag=SEC_PROBE_TAG)
+    return url, {"user-agent": v3_sources.DEFAULT_SEC_UA, "accept": "application/json"}
+
+
+def _sec_edgar_row(home, http_probe):
+    """SEC EDGAR 的可用性：**先认最近一次真实调用命中的 source**，没有证据才真发一次 HTTP。
+
+    为什么这样判：三表美股走 HTTPS ``sec/companyconcept``（``v3_sources.SecSource``），
+    与任何 Python 包无关；「本服务未实现」是写死的错话（``GET /api/v3/financials?ticker=AAPL``
+    实测返回 ``source=sec/companyconcept(us-gaap XBRL)``）。
+    """
+    name = "SEC EDGAR（美股 XBRL 公开面）"
+    probe = _load_datasource_probe(home)
+    row = _chain_row(probe, "financials_us")
+    as_of = probe.get("probed_at_iso") if isinstance(probe, dict) else None
+    if row is not None and row.get("available"):
+        hit = str(row.get("last_source") or "").strip() or "unknown"
+        age = _evidence_age(probe)
+        stale_note = ""
+        if age is None or age > SOURCE_PROBE_EVIDENCE_MAX_AGE:
+            stale_note = (f"；注意该证据已过期（{_age_text(age)}），"
+                          "重跑 GET /api/v3/sources/status 可刷新")
+        return {"name": name, "available": True, "as_of": as_of,
+                "source": f"datasource-probe:financials_us→{hit}",
+                "detail": (f"最近一次真实调用成功：{hit}（落盘于 {as_of or '时间戳缺失'}，"
+                           f"{_age_text(age)}，/api/v3/sources/status 写入）；"
+                           f"实现 = HTTPS companyconcept（us-gaap XBRL），"
+                           f"核对入口 GET /api/v3/financials?ticker=AAPL"
+                           + stale_note)}
+    if row is not None:
+        age = _evidence_age(probe)
+        return {"name": name, "available": False, "as_of": as_of,
+                "source": "datasource-probe:financials_us",
+                "detail": (f"最近一次真实调用失败（落盘于 {as_of or '时间戳缺失'}，"
+                           f"{_age_text(age)}）：{_error_text(row)}；"
+                           "这不等于永久不可用——重跑 GET /api/v3/sources/status 会重新探测")}
+    url, headers = _sec_probe_request()
+    result = _probe_cached("sec-edgar", lambda: http_probe(url, headers=headers))
+    if result.get("ok"):
+        return {"name": name, "available": True, "as_of": result.get("as_of"),
+                "source": "http-probe:data.sec.gov",
+                "detail": (f"HTTP 能力探测通过：{result.get('evidence')}；"
+                           "（尚无落盘的真实调用证据，故本次为端点可达性验证，"
+                           "完整取数以 GET /api/v3/financials?ticker=AAPL 的 source 为准）")}
+    if result.get("reachable"):
+        return {"name": name, "available": False, "as_of": result.get("as_of"),
+                "source": "http-probe:data.sec.gov",
+                "detail": (f"HTTP 能力探测未通过：{result.get('evidence')}；"
+                           "端点本身可达，失败原因是上面的状态码（可能 UA/权限/路径变化），"
+                           "不是「服务未实现」")}
+    return {"name": name, "available": False, "as_of": result.get("as_of"),
+            "source": "http-probe:data.sec.gov",
+            "detail": (f"HTTP 能力探测失败：{result.get('evidence')}；"
+                       "失败原因如上（网络/超时/DNS 等），重试或用 "
+                       "GET /api/v3/sources/status 刷新落盘的真实调用证据")}
+
+
+def _tushare_row(home, http_probe):
+    """Tushare Pro 的可用性 = **凭据就绪 × 端点 HTTP 可达**；与 ``tushare`` 包无关。
+
+    实现走 ``POST http://api.tushare.pro``（``v3_sources.fetch_tushare``），因此
+    「tushare 包能否 import」从来不是判据（2026-09-20 修正）。未配置凭据时**不发任何请求**。
+    """
+    from server import v3_credentials  # noqa: PLC0415 —— 与 v3_sources 同一份凭据解析
+    name = "Tushare Pro"
+    token, token_source = v3_credentials.resolve_tushare_token(home, os.environ.get)
+    if not token:
+        return {"name": name, "available": False, "as_of": _now(),
+                "source": "credentials:未配置",
+                "detail": ("TUSHARE_TOKEN 未注入（环境变量与页面配置 v3-credentials.json 都没有）"
+                           "→ 按既有纪律不发任何请求，故**未探测**端点可达性；"
+                           "实现走 POST http://api.tushare.pro，与 tushare 包是否可导入无关")}
+    result = _probe_cached("tushare", lambda: http_probe(TUSHARE_PROBE_URL))
+    if result.get("ok"):
+        verdict = "HTTP 可达（2xx）"
+    elif result.get("reachable"):
+        verdict = f"HTTP 可达但返回 {result.get('status')}（不判为可用）"
+    else:
+        verdict = "HTTP 不可达"
+    return {"name": name, "available": bool(result.get("ok")), "as_of": result.get("as_of"),
+            "source": "http-probe:api.tushare.pro + credentials",
+            "detail": (f"凭据就绪（{token_source}）× 端点 {verdict}：{result.get('evidence')}；"
+                       "本次**未做真实取数验证**（不消耗上游积分）——真实可用性以 "
+                       "GET /api/v3/tushare 的 source 或 "
+                       "POST /api/v3/credentials(action=test) 的结果为准")}
+
+
+def _data_sources(call, home, http_probe=None):
+    """五个数据源的真实可用性：能探测就探测，测不到就说清**为什么**并带上 ``as_of``。
+
+    判据一律是**能力/真实调用结果**，不是包导入（AKShare 一条除外——它在**本进程内**被
+    import 调用，importlib 探测与实现语义一致，故保留）。
+    """
+    probe = http_probe or _http_probe
+    checked_at = _now()
     sources = call("sources", {})
     sources_detail = (f"sources 工具：ok={bool(sources.get('ok'))}"
                       + ("" if sources.get("ok") else f"（{_error_text(sources)}）"))
     credential = _read_json_file(Path(home) / CREDENTIAL_FILENAME)
     openapi_mode = credential.get("mode") if isinstance(credential, dict) else None
-    tushare_token = bool(os.environ.get("TUSHARE_TOKEN"))
     return [
         {"name": "workbench 工具面（/api/wb/* 与 MCP /mcp 同一 handle）",
          "available": bool(sources.get("ok")),
-         "detail": sources_detail},
+         "detail": sources_detail,
+         "source": "v3_run:schedule/sources（本次请求实时调用）",
+         "as_of": checked_at},
         {"name": "富途 OpenAPI / OpenD",
          "available": isinstance(credential, dict) and openapi_mode in ("oauth", "appkey"),
          "detail": (f"~/{CREDENTIAL_FILENAME}：mode={openapi_mode!r}"
                     f"（{len(credential) if isinstance(credential, dict) else 0} 个键）；"
-                    f"channel={_futu_status(home)['channel']}")},
+                    f"channel={_futu_status(home)['channel']}"),
+         "source": f"credentials:{CREDENTIAL_FILENAME}",
+         "as_of": checked_at},
         {"name": "AKShare（trading-venv 内公开端点）",
          "available": _module_available("akshare"),
-         "detail": "importlib 探测本服务进程内是否可导入 akshare；实际取数由工作台/分析层执行"},
-        {"name": "SEC EDGAR（美股 XBRL 公开面）",
-         "available": False,
-         "detail": "无数据源：本服务未实现 SEC EDGAR 客户端（不发起该外部调用，也不估算）"},
-        {"name": "Tushare Pro",
-         "available": tushare_token and _module_available("tushare"),
-         "detail": (f"TUSHARE_TOKEN {'已注入' if tushare_token else '未注入'}；"
-                    f"tushare 包 {'可导入' if _module_available('tushare') else '不可导入'}")},
+         "detail": ("importlib 探测本服务进程内是否可导入 akshare（AKShare 由**本进程**调用，"
+                    "故 import 探测与实现语义一致）；真实取数结果见 "
+                    "GET /api/v3/sources/status 的 kline/spot 链"),
+         "source": "importlib:akshare",
+         "as_of": checked_at},
+        _sec_edgar_row(home, probe),
+        _tushare_row(home, probe),
     ]
 
 
@@ -1051,8 +1814,14 @@ def last_strategy_run(home, market=None):
 # ---------------------------------------------------------------------------
 # 注册（app.py 的自动接线点）
 # ---------------------------------------------------------------------------
-def register(app, v3_run, home):
-    """注册 `/api/v3/*` 运维/通道/治理路由。返回内部句柄（app.py 忽略返回值）。"""
+def register(app, v3_run, home, deps=None):
+    """注册 `/api/v3/*` 运维/通道/治理路由。返回内部句柄（app.py 忽略返回值）。
+
+    ``deps`` 仅供测试注入（app.py 只按位置传三个参数，故缺省即生产行为）：
+    ``http_probe`` 替换数据源能力探测的真发 HTTP 实现（签名 ``(url, headers=, timeout=)``）。
+    """
+    deps = deps or {}
+    http_probe = deps.get("http_probe")
     home_path = Path(home)
     ledger = OmsLedger(_make_caller(v3_run), home_path)
     catalog = build_catalog()
@@ -1082,10 +1851,17 @@ def register(app, v3_run, home):
     async def v3_metrics():
         def build():
             workbench_up = bool(call("schedule", {}).get("ok"))
+            # 工具面**动态真值**（每个请求现读注册表；数量随装配变化而变化，绝不写死常量）
+            surface = mcp_tool_surface(app)
             return {
                 "ok": True,
+                # 既有字段：六域工具目录条目数（mcp_tools.TOOLS 导入枚举 + 5 个本地计算）
                 "toolTotal": total,
                 "toolDomains": len(DOMAINS),
+                # 新增字段：MCP 工具面真值（tools/list 会列出的工具数，含 v3_* 桥接工具）
+                "mcpToolTotal": surface["mcp_total"],
+                "mcpToolSurface": {"bridge": surface["bridge"], "source": surface["source"],
+                                   "domainCatalog": surface["domain_catalog"]},
                 "workbenchUp": workbench_up,
                 **metrics_snapshot(),
                 # 富途限流治理的真实计数（v3_ratelimit 唯一起源；既有字段一字不改，只加这块）
@@ -1095,6 +1871,9 @@ def register(app, v3_run, home):
                 # 绝不因为这一块把 /api/v3/metrics 打成 500。
                 "db": v3_db.stats(home_path),
                 "oms": ledger.stage_counts(),
+                # 行业红线闸门读数（只加字段）：台账里因**单一行业超限**被阻断的单数、
+                # 当前参与判定的行业读数与来源（None = 没有新鲜读数 → fail-open，不阻断）。
+                "industryGate": ledger.gate_view(),
                 "sdk": {"status": "unavailable", "reason": SDK_REASON},
                 "generated_at": _now(),
             }
@@ -1114,10 +1893,25 @@ def register(app, v3_run, home):
                     "故 rules 恒为空数组；recent 取 schedule.jobs 的真实运行时间。")
             if not schedule.get("ok"):
                 note += f" schedule 工具取数失败：{_error_text(schedule)}"
+            # MCP 工具面真值：每个请求现读注册表（重启后 v3_* 桥接工具一并计入）
+            surface = mcp_tool_surface(app)
             return {
                 "ok": True,
                 "channels": {
-                    "mcp": {"status": "running", "protocol": MCP_PROTOCOL, "tools": total},
+                    "mcp": {
+                        "status": "running", "protocol": MCP_PROTOCOL,
+                        # 既有字段 ``tools``：语义更正为「MCP 工具面」真值（= ``tools_total``）。
+                        # 它历史上报的是六域目录数（77+5），与 ``tools/list`` 的真值不是同一个
+                        # 口径——两个数上下并列而字段名不区分，正是本次要修掉的不诚实。
+                        "tools": surface["mcp_total"],
+                        # 真实 MCP 工具面（``tools/list`` 会列出的工具数，**动态取自注册表**）
+                        "tools_total": surface["mcp_total"],
+                        # 既有六域工具目录数（平台 77 工具 + 5 个本地计算）——**不是** MCP 面
+                        "tools_domain_catalog": surface["domain_catalog"],
+                        # 桥接进 MCP 的 ``v3_*`` 工具数（null = 桥未装配，不猜）
+                        "tools_bridge": surface["bridge"],
+                        "tools_source": surface["source"],
+                    },
                     "sdk": {"status": "unavailable", "reason": SDK_REASON,
                             "protocol": SDK_PROTOCOL},
                     "headless": {"status": "unavailable", "reason": HEADLESS_REASON,
@@ -1169,7 +1963,7 @@ def register(app, v3_run, home):
                 "trading_mode": mode,
                 "futu": _futu_status(home_path),
                 "env": _env_status(home_path),
-                "data_sources": _data_sources(call, home_path),
+                "data_sources": _data_sources(call, home_path, http_probe=http_probe),
             }
         return await respond(build)
 

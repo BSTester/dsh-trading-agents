@@ -520,7 +520,7 @@ def probe_industry_exposure(v3_run, home, markets=None, limit_pct=RISK_PROBE_LIM
 # ---------------------------------------------------------------------------
 # 指标装配
 # ---------------------------------------------------------------------------
-def _render_process(writer, started_at):
+def _render_process(writer, started_at, app=None):
     writer.gauge("quantwb_up", "1 = 本服务正在提供 /metrics（抓取成功即代表进程存活）", 1)
     uptime = max(0.0, time.time() - started_at)
     writer.gauge("quantwb_process_start_time_seconds",
@@ -528,12 +528,24 @@ def _render_process(writer, started_at):
     writer.gauge("quantwb_process_uptime_seconds",
                  "服务进程已运行秒数（与 start_time 同源，便于人读）", uptime)
     total = v3_ops.catalog_total()
+    # 工具面两个口径**都从运行时读**（绝不写死）：``mcp`` 取自 MCP 注册表（与 ``tools/list``
+    # 同源，含 app.py 装配的 v3_* 桥接工具），``domain`` 是六域工具目录条目数。
+    surface = v3_ops.mcp_tool_surface(app)
     writer.gauge("quantwb_build_info",
-                 "构建信息常量标签（值恒为 1，用于 join 与版本核对）", 1,
+                 "构建信息常量标签（值恒为 1，用于 join 与版本核对）；tools 标签是**六域目录**"
+                 "条目数（mcp_tools.TOOLS 导入枚举 + 5 个 V3 本地计算），MCP 工具面见 "
+                 "quantwb_tools{scope=\"mcp\"}", 1,
                  labels=(("version", os.environ.get(VERSION_ENV) or DEFAULT_VERSION),
                          ("tools", total), ("domains", len(v3_ops.DOMAINS))))
-    writer.gauge("quantwb_tools", "工作台工具面工具总数（mcp_tools.TOOLS 导入枚举）",
-                 total)
+    # 同一 family 的两条样本必须**紧挨着**写（exposition format 要求 family 连续）；
+    # HELP 里写清两个口径的差异，避免「82 与 116 哪个是真工具数」这种混淆。
+    tools_help = ("工具面数量，按口径分标签：scope=\"mcp\" = MCP 注册表里真实可列出的工具数"
+                  "（与 MCP tools/list 同源，含桥接的 v3_* 工具）；scope=\"domain\" = 平台六域"
+                  "工具目录条目数（mcp_tools.TOOLS 导入枚举 + 5 个 V3 本地计算）。"
+                  "两者不可相加、不可互相替代")
+    writer.gauge("quantwb_tools", tools_help, surface["mcp_total"],
+                 labels=(("scope", "mcp"),))
+    writer.gauge("quantwb_tools", tools_help, total, labels=(("scope", "domain"),))
 
 
 def _render_traffic(writer, snapshot):
@@ -768,7 +780,7 @@ def build_metrics_text(home, *, probe_cache=None, started_at=None, app=None):
     """
     cache = probe_cache if probe_cache is not None else _CACHE
     writer = _Writer()
-    _render_process(writer, started_at if started_at is not None else _STARTED_AT)
+    _render_process(writer, started_at if started_at is not None else _STARTED_AT, app)
     _render_traffic(writer, v3_ops.metrics_snapshot())
     _render_futu(writer, v3_ratelimit.metrics_view())
     try:
