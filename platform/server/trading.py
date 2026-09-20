@@ -73,6 +73,8 @@ except ImportError:
 from server import futu_data
 from server import store_access
 from server.store_access import WorkbenchError
+# FR-DATA-003：历史数据读取的唯一入口（PIT）。本模块的本地日线风险基准价经它取数。
+from server.data import cache as pit_cache
 # 市场口径常量：规范模块唯一实现（WP13 审查 M1）——本模块与 trading_core.broker 都从这里取，
 # 不再各存镜像。``market_ids`` 是零依赖纯常量模块（不拉起 futu_mcp 会话）。
 from trading_datasource.market_ids import OPENAPI_ENABLE_MARKET, SIM_MARKET_IDS, sim_market_id
@@ -367,11 +369,20 @@ def _local_close(conn, symbol, today):
 
     口径与 ``daemon._last_close`` 逐字一致——市价类订单的风险基准价从这里取，属于**已同步
     的真事实**，而不是闸门凭空编造的价格。
+
+    FR-DATA-003 迁移：读取改走 PIT 唯一入口 ``server.data.cache.read_bars``
+    （``AS_OF_INCLUSIVE``，``ts <= today`` 的语义与原来逐字一致）。**显式 ``cache=False``**
+    ——这是下单前风控的价格基准，必须拿最新读数，不允许 TTL 陈旧值；但 PIT 闸门照样生效，
+    所以「唯一入口」没有被绕过（理由同步写在 ``server/data/cache.py`` 模块 docstring 三
+    与 ``docs/e2e-and-data-gaps.md``）。
     """
     try:
-        bars = core_store.read_bars(conn, symbol, "1d", today, limit=1)
+        envelope = pit_cache.read_bars(str(today), pit_cache.AS_OF_INCLUSIVE, symbol=symbol,
+                                       conn=conn, period="1d", limit=1, cache=False,
+                                       source="trading-data/trading.sqlite:bars")
     except Exception:  # noqa: BLE001 —— 日历/库表缺失 → 视为「本地无基准」（fail-closed）
         return None
+    bars = envelope.get("bars") or []
     if not bars:
         return None
     close = bars[-1].get("c")

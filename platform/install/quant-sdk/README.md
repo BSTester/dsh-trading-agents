@@ -5,6 +5,11 @@
 「启用」一节拷进 `$DSH_HOME/profiles/` 才生效。**本次没有写入线上 `~/.dsh/profiles/`**
 （理由见 §六），真机验证在**独立 `DSH_HOME`（`/tmp/dsh-quant-sdk-iso`）**里做，详见 §四。
 
+> **2026-09-21 更新**：线上 `~/.dsh/profiles/quant-sdk` **已按 §一「方式 B」装成常驻 profile，
+> 并用线上平台自己的 `POST /api/v3/sdk/prompt` 真机跑通**（真实握手报文 + 一次最小提示的真实
+> usage + 模型自述工具面）——原始输出、既有 profile 未变的证据、以及**一个未解决项**
+> （`discovery` 工具面下 `call_tool` 代理绕过白名单）全部在 **§八**。
+
 | 文件 | 作用 |
 |---|---|
 | `package.json` | profile 元数据；`dsh.profile.bundles` = `dsh-base` + `dsh-sdk-app`（都真实存在） |
@@ -170,8 +175,9 @@ grep -n 'sdk-jsonrpc-server' -A3 $HOME/.dsh/profiles/node_modules/@deepseek-ai/d
 | 层 | 机制 | 关掉了什么 | 关不掉什么 |
 |---|---|---|---|
 | ① profile 行关停 | `disabled: true`（14 行） | 本地 `tool-bash` / `tool-pwsh` / `tool-jobs` / 委派 / 编排 / goal / 外网直连 | 任何 MCP 工具 |
-| ② MCP 客户端行 | 只挂 `quant-platform-mcp`（一行） | ——（桌面唯一入口） | 单行无法按工具收窄 |
+| ② MCP 客户端行 | 只挂 `quant-platform-mcp`（一行，**指向只读面 `/mcp/ro`**，2026-09-21 起） | ——（桌面唯一入口） | 单行无法按工具收窄 |
 | ③ **白名单闸门插件** | `ctx.tools.guard()`（单调拒绝）+ `ctx.tools.restrict({deny})`（按 agent 摘除可见工具） | **`trade_*` / `sim_trade_*` / `plan_execute` / `switch_mode` / `push_*` / `research_tasks_*` / `admin_cancel*` / `admin_prune*` / `v3_credentials` / `v3_oms_sync` / `v3_strategy_run` / `v3_sdk_*`** | —— |
+| ④ **服务侧只读面**（2026-09-21 补） | 平台 `/mcp/ro` 端点：`call_tool` 转发前按注册表 annotations 判定，非只读内层工具回 `mcp/denied-by-policy`（handler 零调用） | **所有**经代理转发的写类内层调用（含将来新增、插件名单尚未跟上的写工具——缺省被拒，fail-closed） | 直连 4 件与只读 `v3_*`（本就该可用）；值班链走的全局 `/mcp` 不在本 profile 工具面里 |
 
 拒绝集的**真值来自平台自己的常量**（`v3_ops.WRITE_TOOLS` +
 `mcp_tools.MCP_EXCLUDED_ENDPOINTS − readOnlyExcluded` + `tools/e2e_probe.WRITE_ENDPOINTS`），
@@ -352,6 +358,9 @@ STOP: {"ok": true, "state": "stopped", "exit_code": 0, "forced": false, "shutdow
 
 ## 六、为什么默认**不**写进线上 `~/.dsh/profiles/`
 
+> §六 是**素材方**的默认立场（写于 2026-09-20）。2026-09-21 运维按 §一「方式 B」把它装成了常驻
+> profile——那次动作与原始输出见 **§八**；本节保留原理由，不改写历史。
+
 1. 本目录是**素材**，装到哪里是部署方的决定；直接写线上会让「仓库里有什么」与「机器上装了什么」
    不再一一对应，手改的 profile 也不会随仓库更新。
 2. 线上 `~/.dsh/profiles/` 被官方 `headless`/`sdk`/`web` 共用，其中 `web` 挂着交易插件栈
@@ -375,3 +384,213 @@ STOP: {"ok": true, "state": "stopped", "exit_code": 0, "forced": false, "shutdow
 | `tests/test_v3_sdk.py::RealMachineTest` skipped | 默认 skip（要真机进程与模型路由） | `QUANT_SDK_REAL=1 QUANT_SDK_REAL_HOME=/tmp/dsh-quant-sdk-iso python -m unittest tests.test_v3_sdk` |
 | `session "<id>" already exists`（`-32603`） | 该 `DSH_HOME` 的会话存储里已有同名会话；协议无 resume/close | 换一个 `session_id`，或在**同一 runtime 进程内**复用（§4.3）；平台的 `session_id` 不要当跨进程主键 |
 | 改了 `tool-whitelist/index.js` 但白名单行为没变 | `dsh plugin add file:…` 是 **pnpm 拷贝**，不是软链；pnpm 见版本没变会说 `Already up to date` | `rm -rf $DSH_HOME/profiles/quant-sdk/node_modules/quant-tool-whitelist $DSH_HOME/profiles/quant-sdk/pnpm-lock.yaml` 后重跑 `dsh plugin add`（或用 `link:` 装成软链，开发期更省事） |
+
+---
+
+## 八、线上安装与真机验证（2026-09-21 实测）
+
+**装之前**：`GET /api/v3/sdk/status` = `state=stopped`、`protocol_match=false`、`handshake={"state":"none"}`、
+`counters` 全 0。**装之后**：线上平台自己起进程、握手、下发提示词、收回事件流与 usage（见 8.3–8.5）。
+
+### 8.1 安装动作（加法式；4 个文件 + 1 个 file: 插件）
+
+```console
+$ mkdir -p ~/.dsh/profiles/quant-sdk
+$ cp platform/install/quant-sdk/{package.json,cordis.yml,cordis.patch.yml,pnpm-workspace.yaml} \
+     ~/.dsh/profiles/quant-sdk/
+$ DSH_HOME=$HOME/.dsh dsh plugin --profile quant-sdk add \
+      file:$PWD/platform/install/quant-sdk/tool-whitelist
+Progress: resolved 1, reused 0, downloaded 0, added 0
+ WARN  Issues with peer dependencies found
+.
+└─┬ quant-tool-whitelist 0.1.0
+  └── ✕ missing peer @deepseek-ai/cordis@^4.0.2
+
+dependencies:
++ quant-tool-whitelist file:/home/penn/workspace/dsh-trading-agents/platform/install/quant-sdk/tool-whitelist
+
+Packages: +1
+Progress: resolved 1, reused 1, downloaded 0, added 1, done
+Done in 7.6s using pnpm v10.17.1
+$ echo $?
+0
+```
+
+* **`file:` 安装成功，且全程离线**（`downloaded 0` / `reused 1`）——`pnpm-workspace.yaml` 的
+  `autoInstallPeers: false` 起了作用；那条 `missing peer @deepseek-ai/cordis@^4.0.2` 是**预期警告**，
+  运行期从共享目录 `~/.dsh/profiles/node_modules/@deepseek-ai/cordis` 解析。
+* `dsh` 在 stderr 上给了一句 **`warning: quant-tool-whitelist declares no dsh.bundle — installed as
+  a plain dependency, not a profile layer`**：这是**正确**行为（它是被 patch 里
+  `quant-sdk-tool-whitelist` 行按名字挂载的插件，不是 bundle），不是错误。
+* 落盘结果：`node_modules/quant-tool-whitelist/`（**pnpm 拷贝**，不是软链）；
+  `index.js` 的 sha1 `dc2e04faf3adfbb866d77d7056a02fec8103a530` 与仓库素材**相同**；
+  多出 `pnpm-lock.yaml`（`importers..dependencies.quant-tool-whitelist.specifier =
+  file:/home/penn/workspace/dsh-trading-agents/platform/install/quant-sdk/tool-whitelist`）。
+* profile 里的 sha1：`cordis.patch.yml 8b44ba96555fd32be908bfd49d834c86d47e41df`、
+  `cordis.yml e63968eb42fef4ebee81f811f400da71ad9ba9e5`（与 quant-headless 同一份空根）。
+
+**既有 profile 未被改动**：`headless`(5 文件)/`sdk`(4)/`web`(45)/共享 `node_modules`(608) 的
+逐文件清单 sha1 安装前、安装后、全部验证之后**三次相同**，目录 mtime 也逐字相同——
+完整表格见 `platform/install/quant-headless/README.md` §6.2（同一台机器、同一次动作）。
+
+### 8.2 `dsh --profile quant-sdk --dump-config`
+
+```console
+$ dsh --profile quant-sdk --dump-config > /tmp/dump-sdk.txt; echo "exit_code=$?"
+exit_code=0
+$ wc -l < /tmp/dump-sdk.txt
+393
+$ grep -nE 'jsonrpc|maxTokensAsSuccess|quant-platform-mcp|quant-sdk-tool-whitelist|allowExtra|denyExtra' /tmp/dump-sdk.txt
+373:- id: sdk-jsonrpc-server
+374:  name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+379:    maxTokensAsSuccess: false
+381:- id: quant-platform-mcp
+389:- id: quant-sdk-tool-whitelist
+392:    allowExtra: []
+393:    denyExtra: !!js process.env.QUANT_SDK_TOOL_DENY || ''
+```
+
+`disabled: true` 共 **17** 行（14 行来自本目录 patch 的 `disabledRows` + `hmr` / `session-title-llm` /
+`skill-badge` 三行是 bundle 自己关的），id 逐个：
+`hmr, session-title-llm, tool-bash, tool-pwsh, tool-jobs, skill-badge, tool-subagent-control,
+tool-subagent-list-agents, tool-subagent, tool-subagent-fork, tool-workflow, tool-goal, tool-ralph,
+web, web-search-deepseek, web-fetch-http, tool-web`。
+`!js` 表达式按**未求值原文**打印（`--dump-config` 不做求值），运行期由 loader 求值——这是正常的。
+
+> ⚠️ 顺带记一个**素材笔误**（本轮未改，因为它不影响启动）：`cordis.patch.yml` 的
+> `skill-filesystem` 第二个路径写的是
+> `/home/penn/workspace/dsh-trading-agents/futu-skills/`，而仓库里实际是
+> `skills/futu-skills/`（`futu-skills` 在仓库根**不存在**）。`--dump-config` 与真机握手/提示都没有
+> 因此报错（技能目录缺失不致命），但该目录下的技能在线上 SDK 会话里**加载不到**——建议改成
+> `.../skills/futu-skills/`。
+
+### 8.3 线上握手（**真实报文**，`POST /api/v3/sdk/prompt {action:"start"}`）
+
+```console
+$ curl -s -X POST http://127.0.0.1:8397/api/v3/sdk/prompt -H 'Content-Type: application/json' \
+    -d '{"action":"start","session_id":"quant-live-1","confirmation":"确认下发"}'
+{
+  "ok": true,
+  "steps": [
+    {"step": "spawn", "ok": true, "pid": 315177,
+     "argv": ["dsh", "--profile", "quant-sdk"]},
+    {"step": "initialize", "ok": true,
+     "handshake": {"state": "ok",
+                   "expected": "deepseek-harness-sdk-runtime",
+                   "observed": "deepseek-harness-sdk-runtime",
+                   "version": "0.0.1",
+                   "protocol_match": true,
+                   "elapsed_ms": 27063,
+                   "params": {"cwd": "/home/penn/workspace/dsh-trading-agents/platform",
+                              "provider": "deepseek-official", "model": "deepseek-flash"},
+                   "at": "2026-09-20T16:12:18.962722+00:00",
+                   "spec": "docs/v3-spec.md FR-GATEWAY-002 / §5.2.2"}}
+  ],
+  "action": "start", "session_id": "quant-live-1", "state": "running",
+  "audit_path": "/home/penn/.dsh/v3-sdk-audit.jsonl"
+}
+```
+
+* 冷启动 + 握手 **27.1 s**（`elapsed_ms=27063`），`dsh_home=/home/penn/.dsh`、`profile=quant-sdk`
+  ——即**线上 home 的线上 profile**，不是隔离目录。
+* `protocol_match: true` 来自 `observed` 与 `expected` **逐字相同**
+  （`deepseek-harness-sdk-runtime`，`version 0.0.1`）；不符时客户端会 fail-closed 拒发提示词。
+* 帧计数（GET `/status`）：`responses=1`、`framer.frames=1`、`malformed_lines=0`、`overflows=0`。
+* `stderr_tail` 此刻为空——插件诊断在 `agent/created` 时打印，要等第一条提示词（见 8.4）。
+
+### 8.4 一次最小真实提示（**真的花了 token**）
+
+```console
+$ curl -s -X POST http://127.0.0.1:8397/api/v3/sdk/prompt -H 'Content-Type: application/json' \
+    -d '{"prompt":"只回复 OK，不要调用任何工具","session_id":"quant-live-1","confirmation":"确认下发"}'
+```
+
+入队回执（**receipt 原文**）：
+
+```json
+{"ok": true, "session_id": "quant-live-1", "queue_id": "q_1", "state": "sent", "position": 1,
+ "message_id": "eaa2646b-9caf-45d6-a401-fcad3fdd9878", "chars": 15,
+ "sha256": "ad2a676a242003913d98e329cc0273bfa9888ff5855b66e38692c9b0c044ead1"}
+```
+
+`GET /api/v3/sdk/sessions?session=quant-live-1` 的事件流（`cursor` = 客户端游标，**流式**收到）：
+
+```text
+1 permission/preset   2 sandbox/mode      3 approval/policy   4 agent/inbox/spliced
+5 turn/start          6 agent/inbox/spliced 7 step/start       8 system/message
+9 user/message ("只回复 OK，不要调用任何工具")
+10-12 user/message (AGENTS.md / runtime context / skills 注入)
+13 request/header     14 request/context   15 session/title    16 assistant/message ("OK")
+17 step/end           18 turn/end ({"kind": "completed"})
+```
+
+模型的回答与**真实 token 账**（`assistant/message` 的 `usage`，原文）：
+
+```json
+{"inputTokens": 8367, "outputTokens": 2, "totalTokens": 8497,
+ "cacheReadTokens": 128, "reasoningTokens": 0}
+```
+
+会话状态转换 `running`（16:12:30.34Z）→ `idle`（16:12:35.04Z），`status_events=2`；
+`prompts_total=1`、`prompts=1`（`state=done`、`turns_after=1`）。收尾时 `/status`：
+`state=running`（runtime 进程仍在）、`protocol_match=true`、`responses=3`、`notifications=20`、
+`session_events=18`、`framer.frames=23`、`malformed_lines=0`、`frame_overflows=0`。
+
+审计落库（`~/.dsh/v3-sdk-audit.jsonl`，**口令校验通过、动作被记录**）：
+
+```json
+{"action":"start","session_id":"quant-live-1","accepted":true,"passphrase_ok":true,
+ "pid":315177,"handshake_state":"ok","protocol_match":true,
+ "at":"2026-09-20T16:12:18.963406+00:00"}
+{"action":"prompt","session_id":"quant-live-1","accepted":true,"passphrase_ok":true,
+ "prompt_chars":15,"prompt_preview":"只回复 OK，不要调用任何工具",
+ "prompt_sha256":"ad2a676a242003913d98e329cc0273bfa9888ff5855b66e38692c9b0c044ead1",
+ "message_id":"eaa2646b-9caf-45d6-a401-fcad3fdd9878","queue_id":"q_1",
+ "at":"2026-09-20T16:12:30.502812+00:00"}
+```
+
+### 8.5 该会话看不到写/交易工具（两条独立证据）
+
+**① 模型自述**（同一进程内第二条最小提示：「只列出你当前可用的 MCP 工具名…不要调用任何工具」，
+`receipt.queue_id=q_2`、`message_id=90f220c4-7133-4e41-8417-67c19803083d`）——**原文**：
+
+> 当前会话中我直接可见的 MCP 工具名（`mcp__` 开头，共 6 个）：
+> 1. `mcp__quantwb__admin_status` 2. `mcp__quantwb__call_tool` 3. `mcp__quantwb__list_tools`
+> 4. `mcp__quantwb__snapshot` 5. `mcp__quantwb__v3_gateway` 6. `mcp__quantwb__v3_tools`
+>
+> 关于 `trade_place` / `trade_modify` / `trade_cancel` / `plan_execute` / `switch_mode`：
+> 在这 6 个直连工具名里**一个都没有**。（……）`mcp__quantwb__call_tool` 是转发器，可调用平台
+> 工具面里的任意工具；（……）我没有看到任何直连的下单/改单/撤单/切模式/执行计划入口。
+
+**② 插件侧诊断**（`GET /api/v3/sdk/status` 的 `stderr_tail`，**原文**）：
+
+```text
+[quant-tool-whitelist] agent quant-live-1: 工具面无需收窄（0 命中）
+```
+
+——插件**活着且在跑**（它在 `agent/created` 时打了这句），只是因为缺省 `discovery` 工具面里
+**本来没有**任何写工具名可摘，所以命中 0。`/status` 的 `whitelist.catalog_total=125`、
+`allowed_total=106`、`denied_total=19`（`denied` 里逐条给出 `trade_place`（前缀 `trade_*`）、
+`plan_execute`（精确名）等**判定理由**）。
+
+### 8.6 本节未解决项（如实登记）
+
+1. **`discovery` 面下 `call_tool` 绕过白名单**（与 `quant-headless` 同一个缺口，见其 README §6.6）：
+   可见工具面里的 `mcp__quantwb__call_tool` 不在 `DENY_NAMES`/`DENY_PREFIXES`/`DENY_SUBSTRINGS`
+   任何一条里，`guard` 只看**外层工具名**，所以它能被用来转发 `trade_place`、`research_tasks_claim`
+   等写工具。**服务侧真闸门仍在**（写端点要人工在 Web 确认、`confirm-decide` 不进工具面、
+   `v3_credentials` 在桥内封死），但**「白名单已排除全部写工具」这句话在当前默认模式下不成立**——
+   要成立就得把拒绝判据下沉到服务侧按**内层 name** 判（同 §6.6(f) 的建议）。
+   → **2026-09-21 已修复**：只读面 `/mcp/ro` 已实现，本 profile 的 `quant-platform-mcp` 已指向
+   它（服务侧按注册表 annotations 拒绝写类内层转发，返回 `mcp/denied-by-policy`、handler 零调用）；
+   与 `quant-tool-whitelist` 插件互为纵深（插件摘可见写名，服务侧拦一切经代理的写转发）。
+   服务重启后生效；原理与代价见 `quant-headless` README「一之补二」与 `docs/v3-integration.md` §1.5.5。
+2. **模型自述不能当作安全证明**：8.5 ① 是模型自己指出的边界（它明确说不做臆测），本轮也没有在
+   SDK 会话里真的去转发一次写工具（有意不做：避免像 headless 那条路一样真领走队列任务）。
+3. **线上 runtime 仍在运行**（`pid 315177`，`state=running`）：平台**没有** stop 端点
+   （`/api/v3/sdk/*` 只有 status/sessions/prompt），本轮**没有重启 8397**；如需停机，重启平台
+   服务会让 `atexit` 收掉子进程，或直接 `kill 315177`。空闲 runtime 不发请求、不产生费用。
+4. **`skill-filesystem` 路径笔误**（见 8.2 末）：`futu-skills/` 应为 `skills/futu-skills/`，本轮未改。
+   → **2026-09-21 已改**：`cordis.patch.yml` 的 `customSkillDirs` 已改为
+   `/home/penn/workspace/dsh-trading-agents/skills/futu-skills/`（线上 profile 目录是拷贝，
+   下次部署时要同步重新拷入）。

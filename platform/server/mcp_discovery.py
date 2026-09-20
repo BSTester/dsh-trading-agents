@@ -68,6 +68,26 @@ schema 大，且调用前本就该先知道标的存在（``list_tools`` 一次�
 闸门同一份实现）。**基础面在 MCP 上本来就没有发布 readOnlyHint**（注册时不带 annotations），
 所以本模块也**不替它发明**：这类工具的 ``readOnly`` 如实为 ``null``（未知），不写
 ``true``/``false`` 冒充已知——卡片只做导航，真实语义始终由被转发的那份实现决定。
+
+只读面 ``/mcp/ro``（服务侧硬边界；2026-09-21 漏洞修复）
+--------------------------------------------------------
+**漏洞（真机已复现、已有真实后果）**：缺省 discovery 面下，写/交易工具的唯一到达路径是
+``call_tool`` 转发；而 Harness 侧白名单钩子按**工具名**匹配（``mcp__quantwb__trade_place``
+等 42 项），对 ``mcp__quantwb__call_tool`` 这个入口既不在名单里、也**看不到被转发的内层
+名字**——于是 ``call_tool(name="research_tasks_claim")`` 一路到达平台实现。2026-09-21
+00:01Z 的一次线上 quant-headless 决策唤醒就是这样**误领了 2 条值班任务**（该 profile 的
+42 项白名单明明禁止它）。全局禁止 ``call_tool`` 不可行：官方 ``headless`` profile 的值班链
+（``research_duty.sh``）经同一个全局 ``/mcp`` 用 ``research_tasks_claim/report``。
+
+**修法**：新增第二个 MCP 端点 ``/mcp/ro``（同一实现、同一目录，表面强制 discovery 形态），
+差异只有一条：**``call_tool`` 只放行注册表 annotations 标注 ``readOnlyHint=True`` 的内层
+工具**（判定现读 ``registry_annotations``——注册表即唯一事实源，**不维护第二份名单**；
+4 件直连保留件是既有 ``DIRECT_KEEP`` 常量，本就已整体暴露在本面上，一并放行）。被拒调用
+返回 ``mcp/denied-by-policy``（isError=false 的业务失败信封），发生在实参校验**之前**、
+handler 调用**之前**（测试用 spy 断言零调用）。``list_tools`` 照常检索全目录（「看到」不等于
+「能调」），但每张非放行卡片标注 ``roCallable=false`` + 「只读面不可调用」，避免模型反复尝试。
+两个决策 profile（quant-headless / quant-sdk）的 ``quant-platform-mcp`` 指到 ``/mcp/ro``；
+值班链用的官方 ``headless`` profile 走全局 ``/mcp``，不受影响。
 """
 import inspect
 import os
@@ -104,6 +124,17 @@ WORKBENCH_DOMAIN = "workbench"
 
 #: 目录/检索结果的固定域清单（六域 + workbench）。
 DOMAINS = tuple(v3_ops.DOMAINS) + (WORKBENCH_DOMAIN,)
+
+# ---------------------------------------------------------------------------
+# 只读面 /mcp/ro（漏洞修复：见模块 docstring「只读面」一节）
+# ---------------------------------------------------------------------------
+#: 第二个 MCP 端点的路径（与 ``/mcp`` 同一实现、同一目录；app.py 用它作 streamable_http_path）。
+READONLY_SURFACE_PATH = "/mcp/ro"
+#: 只读面 ``call_tool`` 的拒绝码/文案（写类内层工具一律拒绝，先于实参校验与 handler）。
+DENIED_BY_POLICY_CODE = "mcp/denied-by-policy"
+DENIED_BY_POLICY_MESSAGE = "该工具不是只读，只读面 /mcp/ro 不放行；需要写操作请由人在工作台完成"
+#: 只读面 ``list_tools`` 卡片对非放行工具的标注（与拒绝码同一条边界的导航面）。
+RO_NOT_CALLABLE = "只读面不可调用"
 
 
 class SurfaceError(ValueError):
@@ -263,8 +294,12 @@ def page_cards(cards, offset=0, limit=DEFAULT_PAGE):
 class DiscoveryProxy:
     """发现代理：目录来自既有注册表，转发交给同一批已注册函数对象。"""
 
-    def __init__(self, base_tools, bridge, base_definitions=None):
-        """``base_tools``：``mcp_tools.build_tools`` 的产物（含 ``.fn``）；``bridge``：V3Bridge。"""
+    def __init__(self, base_tools, bridge, base_definitions=None, ro_allowed=None):
+        """``base_tools``：``mcp_tools.build_tools`` 的产物（含 ``.fn``）；``bridge``：V3Bridge。
+
+        ``ro_allowed``：只读面 ``/mcp/ro`` 的 call_tool 放行名集（None = 未配置 → **空集**，
+        此时代理若被用作只读面会拒绝一切转发——fail-closed；``/mcp`` 面从不读这个集合）。
+        """
         self.base_tools = {tool.name: tool for tool in base_tools}
         self.bridge = bridge
         self.base_definitions = tuple(
@@ -272,6 +307,9 @@ class DiscoveryProxy:
         self.catalog = build_catalog(self.base_definitions, bridge)
         #: discovery 模式下从注册面移出的工具名（``register`` 填；``direct`` 模式为空）。
         self.dropped = ()
+        self.ro_allowed = frozenset(ro_allowed or ())
+        #: 只读面判据的注册表 annotations 快照（``register_readonly`` 填；裸代理为空）。
+        self.ro_annotations = {}
         self._validate_catalog()
 
     # -- 装配期自检：直连保留名必须真实存在；代理入口名不得撞既有名 ------------------
@@ -305,8 +343,15 @@ class DiscoveryProxy:
             return (f"域 {domain!r} 里没有工具；可用域：{'/'.join(DOMAINS)}")
         return f"工具目录为空（目录来自注册表，共 {len(self.catalog)} 件）"
 
-    def search(self, domain=None, prefix=None, keyword=None, limit=DEFAULT_PAGE, offset=0):
-        """``list_tools`` 的载荷构造（纯函数，便于测试直接断言）。"""
+    def search(self, domain=None, prefix=None, keyword=None, limit=DEFAULT_PAGE, offset=0,
+               ro=False):
+        """``list_tools`` 的载荷构造（纯函数，便于测试直接断言）。
+
+        ``ro=True``（只读面 ``/mcp/ro``）时目录**照常全量检索**（「看到」不等于「能调」），
+        但每张卡片追加 ``roCallable``（本面 ``call_tool`` 是否放行，与 ``readonly_denial``
+        同一个集合判定），非放行卡片再标注 ``roNote``（「只读面不可调用」）——避免模型对着
+        目录反复尝试注定被拒的调用。
+        """
         if domain and domain not in DOMAINS:
             return mcp_tools.failure(
                 "mcp/unknown-domain",
@@ -330,6 +375,17 @@ class DiscoveryProxy:
             "source": ("目录 = mcp_tools.TOOLS + v3_mcp.V3Bridge.definitions"
                        "（两个既有注册表，无第二份清单）"),
         }
+        if ro:
+            payload["surface"] = {"path": READONLY_SURFACE_PATH, "readOnlyOnly": True}
+            payload["note"] += ("；本面是只读面 /mcp/ro：call_tool 只放行 roCallable=true 的工具"
+                               "（注册表 readOnlyHint 标注 + 直连保留件），其余一律 "
+                               "mcp/denied-by-policy")
+            for card in payload["cards"]:
+                allowed = card["name"] in self.ro_allowed
+                card["roCallable"] = allowed
+                if not allowed:
+                    card["roNote"] = (f"{RO_NOT_CALLABLE}：{DENIED_BY_POLICY_MESSAGE}"
+                                      "（卡片字段 roCallable=false 即注定被拒，不要尝试）")
         if next_offset is not None:
             payload["next_offset"] = next_offset
         if not cards:
@@ -337,6 +393,20 @@ class DiscoveryProxy:
         return payload
 
     # -- 转发 ------------------------------------------------------------------
+    def readonly_denial(self, name):
+        """只读面 ``call_tool`` 的闸门：非放行内层工具 → ``mcp/denied-by-policy`` 信封，否则 ``None``。
+
+        判据是 ``ro_allowed``（注册表 annotations 的 ``readOnlyHint=True`` ∪ ``DIRECT_KEEP``，
+        见 ``readonly_allow_set``），**先于**实参校验与 handler 调用（测试用 spy 断言零调用）。
+        未知工具名在这里放行到 ``call``，由它回 ``mcp/unknown-tool``（错误语义归那一层）。
+        """
+        if name in self.ro_allowed or self.catalog.get(name) is None:
+            return None
+        return mcp_tools.failure(
+            DENIED_BY_POLICY_CODE,
+            f"{DENIED_BY_POLICY_MESSAGE}（call_tool 名 {name!r} 的注册表 annotations 没有 "
+            "readOnlyHint=true；只读面用 list_tools 卡片的 roCallable 字段区分可转发/不可转发）")
+
     def unknown_tool(self, name):
         """未知工具名 → 明确错误（含「可用 list_tools 检索」提示，绝不静默返回空）。"""
         return mcp_tools.failure(
@@ -437,8 +507,11 @@ def call_tool_signature():
     ]
 
 
-def list_tools_binding(proxy):
-    """``list_tools`` 的注册函数（``__signature__`` 表达字段集，与直连面同一手法）。"""
+def list_tools_binding(proxy, ro=False):
+    """``list_tools`` 的注册函数（``__signature__`` 表达字段集，与直连面同一手法）。
+
+    ``ro=True``：只读面的检索入口——同一份目录，卡片带 ``roCallable``/``roNote`` 标注。
+    """
     def fn(**kwargs):
         provided = {key: value for key, value in kwargs.items()
                     if value is not mcp_tools.UNSET}
@@ -446,32 +519,52 @@ def list_tools_binding(proxy):
             domain=provided.get("domain"), prefix=provided.get("prefix"),
             keyword=provided.get("keyword"),
             limit=provided.get("limit") or DEFAULT_PAGE,
-            offset=provided.get("offset") or 0)
+            offset=provided.get("offset") or 0, ro=ro)
         return mcp_tools.tool_result(payload, is_error=False)
 
     fn.__name__ = LIST_TOOL
-    fn.__doc__ = ("检索平台工具面：按关键词/域/前缀过滤，返回精简卡片"
-                  "（名字 + 一句话用途 + 必填参数名，不含完整 schema），支持分页。"
-                  f"缺省一页 {DEFAULT_PAGE} 张；确认工具名后用 call_tool 调用。")
+    if ro:
+        fn.__doc__ = ("检索平台工具面（只读面 /mcp/ro 版）：按关键词/域/前缀过滤，返回精简卡片"
+                      "（名字 + 一句话用途 + 必填参数名，不含完整 schema），支持分页。"
+                      "每张卡片带 roCallable：false 的卡片标注「只读面不可调用」——本面 call_tool "
+                      "只放行只读工具，需要写操作请由人在工作台完成。")
+    else:
+        fn.__doc__ = ("检索平台工具面：按关键词/域/前缀过滤，返回精简卡片"
+                      "（名字 + 一句话用途 + 必填参数名，不含完整 schema），支持分页。"
+                      f"缺省一页 {DEFAULT_PAGE} 张；确认工具名后用 call_tool 调用。")
     fn.__signature__ = inspect.Signature(
         [param.parameter() for param in list_tools_signature()])
     return fn
 
 
-def call_tool_binding(proxy):
-    """``call_tool`` 的注册函数（转发给同一实现，返回同一信封）。"""
+def call_tool_binding(proxy, ro=False):
+    """``call_tool`` 的注册函数（转发给同一实现，返回同一信封）。
+
+    ``ro=True``：只读面的转发入口——转发**之前**先过 ``proxy.readonly_denial`` 闸门
+    （注册表 annotations 判定），非只读内层工具回 ``mcp/denied-by-policy``，绝不触达实现。
+    """
     async def fn(**kwargs):
         provided = {key: value for key, value in kwargs.items()
                     if value is not mcp_tools.UNSET}
-        result, _card, _target = await proxy.call(provided.get("name"),
-                                                 provided.get("arguments"))
+        name = provided.get("name")
+        if ro:
+            denial = proxy.readonly_denial(name)
+            if denial is not None:
+                return mcp_tools.tool_result(denial, is_error=False)
+        result, _card, _target = await proxy.call(name, provided.get("arguments"))
         return result
 
     fn.__name__ = CALL_TOOL
-    fn.__doc__ = ("转发调用平台工具面里的任意工具（与直连工具**同一份实现**、同一信封）："
-                  "name 必须精确匹配（先用 list_tools 检索），arguments 是实参对象。"
-                  "业务失败仍是正常工具结果（isError=false）；未知工具名返回 "
-                  "mcp/unknown-tool 并提示检索。")
+    if ro:
+        fn.__doc__ = ("转发调用平台工具面里的**只读**工具（与直连工具**同一份实现**、同一信封）："
+                      "name 必须精确匹配（先用 list_tools 检索，卡片 roCallable=true 才可调用），"
+                      "arguments 是实参对象。非只读工具一律 mcp/denied-by-policy（只读面 /mcp/ro "
+                      "不放行；需要写操作请由人在工作台完成）；未知工具名返回 mcp/unknown-tool。")
+    else:
+        fn.__doc__ = ("转发调用平台工具面里的任意工具（与直连工具**同一份实现**、同一信封）："
+                      "name 必须精确匹配（先用 list_tools 检索），arguments 是实参对象。"
+                      "业务失败仍是正常工具结果（isError=false）；未知工具名返回 "
+                      "mcp/unknown-tool 并提示检索。")
     fn.__signature__ = inspect.Signature(
         [param.parameter() for param in call_tool_signature()])
     return fn
@@ -528,6 +621,75 @@ def register(server, base_tools, bridge):
     return proxy
 
 
+def registry_annotations(server):
+    """``MCPServer`` 注册表现读 ``{name: ToolAnnotations|None}``（只读面判据的唯一事实源）。
+
+    读的是 ToolManager 里每件 ``Tool.annotations``——即**注册时真正传进去的**标注
+    （桥接面 ``v3_mcp.register`` 按是否写类给 ``readOnlyHint``；基础面注册时不带，
+    如实为 ``None``）。不在这里重推、不维护第二份名单。
+    """
+    return {tool.name: tool.annotations for tool in server._tool_manager.list_tools()}  # noqa: SLF001
+
+
+def readonly_allow_set(annotations):
+    """注册表 annotations 快照 → 只读面 ``call_tool`` 的放行名集（frozenset）。
+
+    * ``readOnlyHint is True`` 的名字放行——判据就是注册表标注本身；
+    * ``DIRECT_KEEP`` 四件一并放行：它们是 discovery 面自己的保留常量（模块 docstring：
+      「四件都是只读、无副作用」），在只读面上**本来就整体直连暴露**——拒绝它们的
+      ``call_tool`` 路径保护不了任何东西，只会制造「直连能调、转发被拒」的假边界；
+      基础面不发布 annotations，所以不能靠标注识别它们。
+    * 其余（含全部基础面写/非写工具与桥接写类）一律不在集合里 → ``mcp/denied-by-policy``。
+      基础面只读工具（``series`` 等）因**没有只读标注**也被拒——这是 fail-closed 的代价，
+      取数走 ``v3_*`` 只读桥接件（``v3_market``/``v3_news``/…），README 有说明。
+    """
+    allowed = {name for name, ann in annotations.items()
+               if ann is not None and ann.read_only_hint is True}
+    allowed.update(DIRECT_KEEP)
+    return frozenset(allowed)
+
+
+def register_readonly(server, base_tools, bridge, annotations):
+    """只读面 ``/mcp/ro`` 的注册：discovery 形态 + ``call_tool`` 只放行只读内层工具。
+
+    ``server`` 是**第二个** ``MCPServer``（与 ``/mcp`` 的实例互不相干，注册面从零开始，
+    因此不存在「移出」——只登记 6 件：4 件直连保留 + 2 个代理入口）。直连保留件复用
+    **同一个函数对象与同一份 annotations**（``bridge.bound`` / ``base_tools``，标注取
+    ``annotations`` 快照），代理入口的 ``call_tool`` 带 ``readonly_denial`` 闸门。
+    返回 ``DiscoveryProxy``（``ro_allowed`` 已按 ``readonly_allow_set`` 配好）。
+    """
+    from mcp.types import ToolAnnotations
+
+    proxy = DiscoveryProxy(base_tools, bridge, ro_allowed=readonly_allow_set(annotations))
+    proxy.ro_annotations = dict(annotations)  # 快照留档（测试核对推导用；快照先于 discovery 移出）
+    base_by_name = {tool.name: tool for tool in base_tools}
+    list_fn = list_tools_binding(proxy, ro=True)
+    call_fn = call_tool_binding(proxy, ro=True)
+    with mcp_tools.schema_warning_filter():
+        for name in DIRECT_KEEP:
+            if name in bridge.bound:
+                bound = bridge.bound[name]  # v3_* 保留件：装配时缓存的同一函数对象
+            elif name in base_by_name:
+                bound = base_by_name[name].fn  # 基础面保留件：注册面同一个函数对象
+            else:
+                raise AssertionError(f"DIRECT_KEEP 的 {name} 不在任何注册表里")  # pragma: no cover
+            server.add_tool(bound, name=name, description=bound.__doc__,
+                            annotations=annotations.get(name), structured_output=False)
+        server.add_tool(list_fn, name=LIST_TOOL, description=list_fn.__doc__,
+                        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                                    idempotentHint=True, openWorldHint=False),
+                        structured_output=False)
+        # 只读面的 call_tool 本身**只会**转发只读工具（闸门在绑定里）——因此这里如实标
+        # readOnlyHint=True（与 /mcp 面的 call_tool=False 相反，语义各自诚实）。
+        server.add_tool(call_fn, name=CALL_TOOL, description=call_fn.__doc__,
+                        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                                    idempotentHint=False, openWorldHint=True),
+                        structured_output=False)
+        mcp_tools.forbid_extra_fields(server, PROXY_NAMES + DIRECT_KEEP)
+    proxy.dropped = ()  # 只读面从一开始就只注册 6 件，没有「移出」动作
+    return proxy
+
+
 def surface_names(server):
     """当前 ``MCPServer`` 上真实注册的工具名（装配后自检/报告用）。"""
     import asyncio
@@ -535,9 +697,11 @@ def surface_names(server):
 
 
 __all__ = [
-    "CALL_TOOL", "DEFAULT_PAGE", "DEFAULT_SURFACE", "DIRECT", "DIRECT_KEEP", "DISCOVERY",
-    "DOMAINS", "DiscoveryProxy", "LIST_TOOL", "MAX_PAGE", "PROXY_NAMES", "SURFACE_ENV",
-    "SURFACES", "SurfaceError", "ToolCard", "WORKBENCH_DOMAIN", "build_catalog",
+    "CALL_TOOL", "DENIED_BY_POLICY_CODE", "DENIED_BY_POLICY_MESSAGE", "DEFAULT_PAGE",
+    "DEFAULT_SURFACE", "DIRECT", "DIRECT_KEEP", "DISCOVERY", "DOMAINS", "DiscoveryProxy",
+    "LIST_TOOL", "MAX_PAGE", "PROXY_NAMES", "READONLY_SURFACE_PATH", "RO_NOT_CALLABLE",
+    "SURFACE_ENV", "SURFACES", "SurfaceError", "ToolCard", "WORKBENCH_DOMAIN", "build_catalog",
     "call_tool_binding", "call_tool_signature", "list_tools_binding", "list_tools_signature",
-    "match_cards", "page_cards", "purpose_of", "register", "resolve_surface", "surface_names",
+    "match_cards", "page_cards", "purpose_of", "readonly_allow_set", "register",
+    "register_readonly", "registry_annotations", "resolve_surface", "surface_names",
 ]

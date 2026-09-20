@@ -28,20 +28,41 @@
 路径                              方法    用途
 ===============================  ======  ================================================
 ``/api/v3/risk/analytics``       GET     组合 VaR/CVaR/Beta/Alpha/IR/Kupiec + 净值曲线
-``/api/v3/factors/matrix``       GET     横截面因子 z 矩阵 + 因子 IC 序列
+                                        + ``risk_detail``（FR-EXEC-003：杠杆率 / 流动性 /
+                                        绩效归因 / 资金检查；``?details=false`` 可关）
+``/api/v3/factors/matrix``       GET     横截面因子 z 矩阵（价量 + 估值 + 质量/成长/情绪/
+                                        另类）+ 因子 IC + 逐因子覆盖率
+``/api/v3/factors/registry``     GET     因子注册表（六类 + 真实数据源 + PIT 口径）+ 覆盖率
+``/api/v3/risk/funding-check``   GET     事前风控·资金检查（只读）：订单金额 vs 真实购买力
 ``/api/v3/strategy``             GET     最近一轮研究流水线结果
 ``/api/v3/strategy/run``         POST    跑一轮 PDAT→PET 流水线（只出提案）
 ``/api/v3/ml/sweep``             GET     动量策略参数网格扫描（真实回测）
 ``/api/v3/ml/backtest``          POST    单标的动量 long/flat 回测（PIT）
 ``/api/v3/ml/models``            GET     ML 策略族（Lasso/GBDT/MLP）与动量基线同口径评估
 ===============================  ======  ================================================
+
+新增因子类别（FR-STRAT-001 补全，2026-09-20）与**真实数据源 / PIT 口径**见
+:data:`FACTOR_REGISTRY`；本模块**不另造第二事实源**：质量/成长读本地
+``trading-data/trading.sqlite`` 的 ``fundamentals``（只认 ``announced_at ≤ as_of`` 的行，
+与 ``trading_core.store.read_fundamentals`` 同一 WHERE 条件，只读打开、不跑 migrate），
+情绪读 ``sentiment_snapshots`` 原文经 ``server.v3_nlp`` 离线复算，另类走既有富途工具
+（``capital_flow_history`` / ``short_interest``）。取不到的标的在矩阵里就是 ``null`` +
+``factorsMissing`` 里的原因，**绝不用均值/0 填充**。
+
+**FR-DATA-003（2026-09-20，PIT 收敛）**：上面这些「历史数据读取 + PIT 过滤」的实现细节
+（``announced_at <= as_of``、``period_end <= as_of``、``date <= as_of``、日 K 的
+``ts <= as_of``）**已全部搬进** ``server.data.cache``（PIT 唯一入口）。本模块只按业务口径
+消费它的信封（``as_of`` / ``source`` / ``rows_used`` / ``window`` / 缺失原因），不再自己写
+SQL 过滤，也不再自己开只读连接；「哪些路径有意不走 TTL」在 ``server/data/cache.py`` 的
+模块 docstring 第三节逐条写明。
 """
 
 import asyncio
 import json
+import math
 import os
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Optional
 
@@ -49,13 +70,23 @@ from fastapi import Request
 from starlette.responses import JSONResponse
 
 from server import v3_db, v3_math, v3_ml, v3_universe
+# FR-DATA-003：历史数据读取一律经 ``server.data.cache``（PIT 唯一入口）。本模块不再自己
+# 写 ``announced_at <= as_of`` / ``date <= as_of`` / ``ts <= today`` 的过滤，也不自己开
+# 只读连接——口径与连接方式都收敛到那一个模块。
+from server.data import cache as pit_cache
 
 __all__ = [
     "STRATEGY_RUNS_FILE",
+    "FACTOR_REGISTRY",
+    "factor_registry_data",
     "factors_matrix_data",
+    "funding_check_data",
+    "liquidity_risk",
     "ml_backtest",
     "ml_models",
     "ml_sweep",
+    "portfolio_attribution",
+    "portfolio_leverage",
     "read_last_strategy_run",
     "read_watchlist",
     "register",
@@ -331,7 +362,7 @@ def strategy_markets(home):
 # ---------------------------------------------------------------------------
 # 工作台取数
 # ---------------------------------------------------------------------------
-def _load_series(v3_run, tickers, limit):
+def _load_series(v3_run, tickers, limit, *, as_of=None, mode=None):
     """并发取多标的日 K（参考实现用 ``Promise.all``；这里并发度上限 8）。
 
     返回 ``(bars_by_ticker, errors, sources)``：
@@ -339,37 +370,99 @@ def _load_series(v3_run, tickers, limit):
       * ``errors``：``[{"ticker": ..., "error": "<message>"}]``——失败就报，不静默补数；
       * ``sources``：``{ticker: <source 字符串>}``，工具面自报的数据源（如
         ``futu/quote_history_kline``），用于在响应里如实标注取数来源。
+
+    FR-DATA-003 迁移：取到的 K 线**必须**过 ``server.data.cache`` 的 PIT 闸门
+    （``as_of`` 缺省 = 今天 UTC，``AS_OF_INCLUSIVE``）。上游工具面的错误码/消息仍旧原样
+    带进 ``errors``（经 ``PitSourceError`` 透传），不因为多了一层就吞原因。
     """
     bars_by_ticker = {}
     errors = []
     sources = {}
     if not tickers:
         return bars_by_ticker, errors, sources
+    as_of = as_of or _series_as_of()
+    mode = mode or pit_cache.AS_OF_INCLUSIVE
 
-    def fetch(ticker):
-        return ticker, _call(v3_run, "series", {"ticker": ticker, "period": "1d", "limit": limit})
+    def fetch(symbol):
+        envelope = _call(v3_run, "series",
+                         {"ticker": symbol, "period": "1d", "limit": limit})
+        if not envelope.get("ok"):
+            error = _tool_error(envelope)
+            raise pit_cache.PitSourceError(_error_message(envelope),
+                                           code=error.get("code") or "wb/error")
+        value = _value_of(envelope) or {}
+        bars = value.get("bars")
+        source = value.get("source")
+        return (bars if isinstance(bars, list) else []), (source or None)
+
+    def worker(ticker):
+        try:
+            envelope = pit_cache.read_bars(as_of, mode, symbol=ticker, fetch=fetch,
+                                           period="1d", source="futu/series(1d)")
+        except pit_cache.PitSourceError as error:
+            return ticker, None, str(error)
+        return ticker, envelope, None
 
     workers = max(1, min(8, len(tickers)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v3-series") as pool:
-        results = list(pool.map(fetch, tickers))
+        results = list(pool.map(worker, tickers))
 
-    for ticker, envelope in results:
-        if envelope.get("ok"):
-            value = _value_of(envelope) or {}
-            bars = value.get("bars")
-            bars_by_ticker[ticker] = bars if isinstance(bars, list) else []
-            source = value.get("source")
-            if isinstance(source, str) and source:
-                sources[ticker] = source
-        else:
+    for ticker, envelope, error in results:
+        if envelope is None:
             bars_by_ticker[ticker] = []
-            errors.append({"ticker": ticker, "error": _error_message(envelope)})
+            errors.append({"ticker": ticker, "error": error})
+            continue
+        bars_by_ticker[ticker] = list(envelope.get("bars") or [])
+        source = envelope.get("source")
+        if isinstance(source, str) and source:
+            sources[ticker] = source
     return bars_by_ticker, errors, sources
 
 
+def _series_as_of():
+    """工具面 K 线读数的 ``as_of``（``YYYY-MM-DD``，UTC 当天）。
+
+    ``series`` 工具**不接受** ``as_of``（它返回「到现在为止最近的 N 根」），所以这里取
+    请求发起时的 UTC 日期作 PIT 上界：正常的日 K 都在它之内，而任何**晚于今天**的时间戳
+    （上游脏数据/时区错位）会被闸门挡掉并计数——这比不过闸门要严格，且对干净数据零影响。
+    """
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _pit_series_envelope(v3_run, ticker, limit):
+    """``series`` 工具信封的 **PIT 版本**：错误分支原样返回上游信封，成功分支的 bars 过闸门。
+
+    迁移前，单标的取数直接 ``_call(v3_run, "series", …)``；现在同一处**必须**经
+    ``server.data.cache`` 的 PIT 闸门（``as_of`` = 今天 UTC，``AS_OF_INCLUSIVE``）。
+    保持**工具面信封形状**（``{"ok", "value": {"bars", "source"}}`` / ``{"ok": False,
+    "error"}``）是刻意的：调用方的 ``_tool_error`` / ``_bars_of`` / ``_error_message``
+    三个分支一个字都不用改，上游错误码也不会在迁移中被抹平。
+    """
+    envelope = _call(v3_run, "series", {"ticker": ticker, "period": "1d", "limit": limit})
+    if not envelope.get("ok"):
+        return envelope
+    value = _value_of(envelope) or {}
+    bars = value.get("bars")
+    bars = bars if isinstance(bars, list) else []
+    visible, _stats = pit_cache.pit_rows(bars, _series_as_of(),
+                                         pit_cache.AS_OF_INCLUSIVE, key="t")
+    return {"ok": True, "value": {**value, "bars": visible}}
+
+
 def _kline_source(sources):
-    """把逐标的 source 收成一个可展示的字符串；一个都没有 → ``None``（不写死常量）。"""
-    unique = sorted({value for value in (sources or {}).values() if value})
+    """把逐标的 source 收成一个可展示的字符串；一个都没有 → ``None``（不写死常量）。
+
+    ``sources`` 可能是 ``{ticker: source}``（本模块 ``_load_series`` 的形状）或工具面
+    ``factors`` 直接回给我们的 **source 列表**（``bars.py`` 的 ``sources`` 字段）——
+    两种形状都认，不因为形状差异把整个响应打成 ``v3/internal``。
+    """
+    if isinstance(sources, dict):
+        values = list(sources.values())
+    elif isinstance(sources, (list, tuple, set)):
+        values = list(sources)
+    else:
+        values = []
+    unique = sorted({str(value) for value in values if value})
     if not unique:
         return None
     return unique[0] if len(unique) == 1 else " + ".join(unique)
@@ -445,7 +538,7 @@ def _resolve_portfolio(v3_run, home, explicit, market=None):
 # 1) GET /api/v3/risk/analytics
 # ---------------------------------------------------------------------------
 def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
-                   weights_raw=None, market=None):
+                   weights_raw=None, market=None, details=True):
     """组合风险量（可注入 ``v3_run``/``home``，路由只是它的异步外壳）。
 
     契约（与前端既有实现严格一致）::
@@ -457,7 +550,8 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
                      beta, alphaAnnPct, ir, benchmarkAnnReturnPct,
                      kupiec: {lr, pValue, breaches, observations, pass},
                      equityCurve: [{t, v}], method},
-         sources: {kline, nav, errors}, navNote}
+         sources: {kline, nav, errors}, navNote,
+         risk_detail: {leverage, liquidity, attribution, fundsCheck, errors}}
 
     口径：组合 = 显式 ``weights``（JSON）→ 首个 frozen 且标的数 ≥2 的计划 → 自选池等权；
     逐标的 ``series``（period=1d）与基准按交易日对齐（交集、升序）；历史模拟法 VaR/CVaR；
@@ -473,6 +567,12 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
     HK.800000 / US.SPY 首选，逐级降级），``market=None`` → 沿用历史缺省 ``SH.000300``。
     该市场基准全部不可用 → **不退回 SH.000300**：``benchmark=null`` + ``benchmarkNote``
     写明候选，beta/alpha/ir 一律 ``null``（绝不拿 A 股基准算港/美股组合）。
+
+    ``details``（缺省 ``True``）：是否附带 **FR-EXEC-003 补全块** ``risk_detail``——
+    杠杆率（真实资金字段推导，缺融资字段即 no-data）/ 流动性风险（订单金额 / 近 20 日 ADV）/
+    绩效归因（逐标的 + 行业；因子维度如实缺失）/ 资金检查（``account_funds`` 购买力读数）。
+    该块**只读、不改任何既有阈值判定**；``details=False`` 时响应与历史逐字段一致（单测用）。
+    任何一条子项失败都只进 ``risk_detail.errors``，绝不影响既有的 VaR/CVaR 主区块。
     """
     try:
         limit = _clamp_int(limit, 250, 60, 2000)
@@ -536,8 +636,8 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
 
         tickers = list(weights)
         series_map, series_errors, series_sources = _load_series(v3_run, tickers, limit)
-        bench_envelope = (_call(v3_run, "series",
-                                {"ticker": benchmark_ticker, "period": "1d", "limit": limit})
+        # FR-DATA-003：基准 K 线同样经 PIT 唯一入口（错误信封原样保留）。
+        bench_envelope = (_pit_series_envelope(v3_run, benchmark_ticker, limit)
                           if benchmark_ticker else None)
         bench_ok = bool(bench_envelope and bench_envelope.get("ok"))
         bench_bars = _bars_of(bench_envelope) if bench_ok else None
@@ -595,9 +695,110 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
                 f"基准 {benchmark_ticker or 'null'}（见 benchmarkNote；beta/alpha/ir 与该基准同源）"
                 if code else "未指定 market：组合口径与历史一致（自选池不过滤）"
             ),
+            **({"risk_detail": _safe_risk_detail(v3_run, home, code, weights, series_map,
+                                                 series_sources, analytics, nav)}
+               if details else {}),
         }
     except Exception as error:  # noqa: BLE001 —— 任何内部异常都进信封，绝不 500
         return _error("v3/internal", error)
+
+
+def _safe_risk_detail(v3_run, home, code, weights, series_map, series_sources, analytics, nav):
+    """``_risk_detail_block`` 的**外层兜底**：补全块再坏也不能把主区块变成错误信封。"""
+    try:
+        return _risk_detail_block(v3_run, home, code, weights, series_map, series_sources,
+                                  analytics, nav)
+    except Exception as error:  # noqa: BLE001
+        return {"leverage": None, "liquidity": None, "attribution": None,
+                "fundsCheck": None,
+                "errors": [{"item": "risk_detail", "error": f"{type(error).__name__}: {error}"}],
+                "note": "FR-EXEC-003 补全块整体失败 → 四个子项一律 null（主区块不受影响）"}
+
+
+def _risk_detail_block(v3_run, home, code, weights, series_map, series_sources, analytics, nav):
+    """FR-EXEC-003 补全块的装配（**只读**）：杠杆率 / 流动性 / 归因 / 资金检查。
+
+    每一项都**独立失败**：异常只进 ``errors``，不拖垮其他项，也不改既有 VaR 主区块。
+    订单金额口径：单笔金额用一个可解释的**名义单** —— 组合等权目标权重下、按
+    单笔上限（``v3_ops.LIMITS['singlePct']``，缺省 2%）计的名义订单额；资金检查与流动性
+    都按它算（页面/响应里写明是「名义单」而不是真实待执行订单，避免读成真实委托）。
+    """
+    errors = []
+    detail = {"nominalOrderNote": None, "leverage": None, "liquidity": None,
+              "attribution": None, "fundsCheck": None}
+
+    equity_for_nominal = nav if isinstance(nav, (int, float)) and nav > 0 else None
+    nominal = None
+    if equity_for_nominal:
+        nominal = equity_for_nominal * 0.02
+        detail["nominalOrderNote"] = (
+            f"名义单金额 = NAV {equity_for_nominal} × 单笔上限 2%（v3_ops.LIMITS.singlePct）"
+            f"= {v3_math.round_half_up(nominal, 2)}；本块是**读数 + 分级建议**，不代表任何真实委托")
+    else:
+        detail["nominalOrderNote"] = ("NAV 不可用 → 名义单金额为 null，流动性/资金检查两项"
+                                      "各按其缺失原因返回 null（不估算）")
+
+    funds_envelope = _call(v3_run, "account_funds", {})
+    positions_envelope = _call(v3_run, "positions", {})
+
+    # ① 杠杆率
+    try:
+        detail["leverage"] = portfolio_leverage(v3_run, market=code,
+                                                funds_envelope=funds_envelope,
+                                                positions_envelope=positions_envelope)
+    except Exception as error:  # noqa: BLE001
+        errors.append({"item": "leverage", "error": f"{type(error).__name__}: {error}"})
+        detail["leverage"] = {"error": {"code": "leverage/internal", "message": str(error)},
+                             "leverage_ratio_pct": None,
+                             "note": "杠杆率计算内部异常 → null（不估算）"}
+
+    # ② 流动性风险：取组合里权重最大的标的（名义单打在该标的上）
+    try:
+        target = None
+        if series_map:
+            target = max(weights, key=lambda ticker: v3_math.to_float(weights[ticker]) or 0.0)
+        bars = list(series_map.get(target) or []) if target else []
+        detail["liquidity"] = liquidity_risk(nominal, bars, market=code, ticker=target,
+                                             order_note=detail["nominalOrderNote"])
+        detail["liquidity"]["portfolioOrderValue"] = None if nominal is None else \
+            v3_math.round_half_up(nominal, 2)
+        if not target:
+            detail["liquidity"]["reason"] = "组合里没有可用的 K 线 → 无法算 ADV"
+    except Exception as error:  # noqa: BLE001
+        errors.append({"item": "liquidity", "error": f"{type(error).__name__}: {error}"})
+        detail["liquidity"] = {"grade": "no-data", "participation_pct": None,
+                               "reason": f"流动性计算内部异常：{error}"}
+
+    # ③ 绩效归因（逐标的 + 行业；行业映射由调用方按需注入 —— 这里只做逐标的 + 缺失说明）
+    try:
+        detail["attribution"] = portfolio_attribution(positions_envelope, market=code)
+    except Exception as error:  # noqa: BLE001
+        errors.append({"item": "attribution", "error": f"{type(error).__name__}: {error}"})
+        detail["attribution"] = {"byTicker": [], "byIndustry": None, "byFactor": None,
+                                 "error": {"code": "attribution/internal", "message": str(error)}}
+
+    # ④ 资金检查
+    try:
+        detail["fundsCheck"] = funding_check_data(
+            v3_run, order_value=nominal, market=code, funds_envelope=funds_envelope)
+        detail["fundsCheck"]["orderValueSource"] = detail["nominalOrderNote"]
+    except Exception as error:  # noqa: BLE001
+        errors.append({"item": "fundsCheck", "error": f"{type(error).__name__}: {error}"})
+        detail["fundsCheck"] = {"ok": False, "action": "unknown", "orderValue": nominal,
+                                "reason": f"资金检查内部异常：{error}"}
+
+    detail["errors"] = errors
+    detail["sources"] = {
+        "leverage": (detail["leverage"] or {}).get("source"),
+        "liquidity": ((detail["liquidity"] or {}).get("adv_source")),
+        "attribution": (detail["attribution"] or {}).get("source"),
+        "fundsCheck": (detail["fundsCheck"] or {}).get("source"),
+        "kline": _kline_source(series_sources),
+    }
+    detail["note"] = ("FR-EXEC-003 补全块：杠杆率=持仓市值/总资产（上游无融资负债字段 → 该项 null）；"
+                      "流动性=名义单金额/近 20 日 ADV；归因=券商持仓未实现盈亏（因子维度缺 PIT 敞口）；"
+                      "资金检查=订单金额 vs account_funds 购买力。全部只读，不参与也不改既有下单前闸门。")
+    return detail
 
 
 # ---------------------------------------------------------------------------
@@ -618,13 +819,18 @@ def _factor_ic(v3_run, names, factor, forward_days):
 
 
 def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward_days=5,
-                        market=None):
-    """横截面因子矩阵 + 因子 IC 序列。
+                        market=None, classes=None, as_of=None, include_sentiment=True):
+    """横截面因子矩阵 + 因子 IC 序列 + **新四类因子**（FR-STRAT-001 补全）。
 
     契约::
 
-        {ok, matrix: {as_of, source, tickers[], factors[], matrix[][],
-                      raw: [{ticker, factors}]},
+        {ok, market, universe_source, market_filter,
+         matrix: {as_of, source, tickers[], factors[], matrix[][],
+                  raw: [{ticker, factors}], failures},
+         factors: [{key, class, classLabel, source, pit, direction, covered, total,
+                    coveragePct, tickers, missingTickers}],
+         factorsMissing: [{key, reason}],
+         sources: {kline, quality, growth, sentiment, alternative},
          ic: {ok, factor, forwardDays, tickers, observations, meanIc, stdIc, ir,
               latestIc, points: [{t, ic}]}}
 
@@ -634,13 +840,32 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
     显式 ``tickers=`` 优先，此时 ``market`` **只作标注**（不裁剪请求的标的）。
     矩阵值取 ``factors`` 的 ``z``（缺失格 ``null``）；IC 来自 ``ic`` 工具，缺省
     ``factor=mom_20``、``forward=5``。IC 失败**不拖垮矩阵**：``ic.ok=false`` + ``error``。
+
+    ``classes``：要并入矩阵的新因子类别（``quality`` / ``growth`` / ``sentiment`` /
+    ``alternative``，逗号分隔或列表；``all`` = 四类全要，缺省）。价量 + 估值列（工作台
+    ``factors`` 的 z）**恒定保留**——历史调用零改动。
+
+      * 质量（``gross_margin`` / ``net_margin``）与成长（``revenue_yoy`` / ``net_profit_yoy``）：
+        读本地交易库 ``fundamentals``，**只认 ``announced_at ≤ as_of`` 的行**（PIT）；
+        缺公告日、缺同期基期的因子在矩阵里就是 ``null``，原因进 ``factorsMissing``。
+      * 情绪（``sentiment``）：``store.sentiment_snapshots`` 的落库原文经 ``v3_nlp``
+        离线复算（时间基准 = ``as_of`` 当日 00:00 UTC）。在线口径见 ``GET /api/v3/sentiment``。
+      * 另类（``capital_flow`` / ``short_interest``）：既有富途工具**实时**取数（受全局限流
+        约束，故**缺省不并入**——需要时显式 ``classes=alternative`` 或 ``classes=all``）。
+        A 股无卖空数据是上游事实，进 ``factorsMissing`` 而不是填 0。
+
+    新因子一律作为**横截面 z**（截断 ±3）并入 ``matrix.matrix``，并按
+    :data:`FACTOR_REGISTRY` 的 ``direction`` 参与 ``strategy_run`` 的扩展综合分；
+    ``as_of`` 显式给出时用它做 PIT 上界（缺省 = 今天，UTC）。
     """
     try:
         if factor is None or str(factor).strip() == "":
             factor = "mom_20"
         factor = str(factor).strip()
         forward_days = _clamp_int(forward_days, 5, 1, 250)
+        pit_date = _pit_date(as_of)
 
+        wanted = _factor_classes(classes)
         code = None
         if market is not None:
             code = v3_universe.normalize_market(market)
@@ -679,16 +904,212 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
             return {"ok": False, "error": _tool_error(envelope), "market": code}
         value = _value_of(envelope) or {}
         rows = value.get("rows")
-        matrix = v3_math.factor_matrix(rows if isinstance(rows, list) else [])
+        base_rows = [row for row in (rows if isinstance(rows, list) else [])
+                     if isinstance(row, dict)]
+        matrix = v3_math.factor_matrix(base_rows)
         # 工具面逐标的的失败原因照样带出去（矩阵里那一行就是空的，原因不能丢）
         matrix["failures"] = value.get("failures") if isinstance(value.get("failures"), dict) else {}
+        extras, missing, sources = _factor_extras(v3_run, home, names, base_rows, wanted,
+                                                  pit_date, code,
+                                                  include_sentiment=include_sentiment)
+        # 只并入**真有读数**的因子的列：一个标的都没取到的因子不进矩阵（它照样出现在
+        # 顶层 ``factors`` 覆盖率与 ``factorsMissing`` 里 —— 缺席，不是 0，也不是均值）。
+        extras = {key: values for key, values in extras.items() if values}
+        if extras:
+            _merge_factor_extras(matrix, base_rows, extras)
+            matrix["factors"] = sorted({str(key) for key in matrix.get("factors", [])}
+                                       | {str(key) for key in extras})
+            matrix["matrix"] = _project_matrix(base_rows, matrix["factors"])
+        matrix["raw"] = [{"ticker": row.get("ticker"),
+                          "factors": dict(row.get("factors") or {})}
+                         for row in base_rows]
+        registry = factor_registry_data(matrix)
         return {"ok": True, "market": code, "universe_source": universe_source,
                 "market_filter": ("显式 tickers 优先，market 仅作标注" if explicit_universe
                                   else "标的取该市场宇宙"),
+                "asOf": pit_date, "classes": sorted(wanted),
                 "matrix": matrix,
-                "ic": _factor_ic(v3_run, names, factor, forward_days)}
+                "factors": registry["coverage"]["factors"],
+                "factorsMissing": missing,
+                "sources": {**{"kline": _kline_source(value.get("sources"))}, **sources},                "ic": _factor_ic(v3_run, names, factor, forward_days)}
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
+
+
+#: 允许的因子类别（``classes=`` 参数取值）。``price`` 不是可选项——价量列恒定存在。
+FACTOR_CLASS_KEYS = ("quality", "growth", "sentiment", "alternative")
+
+
+def _factor_classes(raw):
+    """``classes`` 参数 → 类别集合。``all``/空 → 除 ``alternative`` 外的全部（见 docstring）。"""
+    if raw in (None, "", []):
+        return {"quality", "growth", "sentiment"}
+    items = raw if isinstance(raw, (list, tuple)) else str(raw).split(",")
+    text = [str(item).strip().lower() for item in items if str(item).strip()]
+    if not text or "all" in text:
+        return set(FACTOR_CLASS_KEYS)
+    if "none" in text or "price" in text and len(text) == 1:
+        return set()
+    return {item for item in text if item in FACTOR_CLASS_KEYS}
+
+
+def _pit_date(as_of):
+    """PIT 上界（``YYYY-MM-DD``）：显式 ``as_of`` → 归一；缺省 = 今天（UTC）。"""
+    if as_of not in (None, ""):
+        text = str(as_of).strip()[:10]
+        try:
+            datetime.strptime(text, "%Y-%m-%d")
+            return text
+        except ValueError:
+            pass
+    return datetime.now(timezone.utc).date().isoformat()
+
+
+def _factor_extras(v3_run, home, names, base_rows, wanted, pit_date, market, *,
+                   include_sentiment=True):
+    """新四类因子的原始值 → ``(extras, missing, sources)``。
+
+    ``extras`` 形状 ``{factor_key: {ticker: raw_value}}``；取不到的标的**不出现在**该字典里
+    （不是 0，也不是均值）；每个因子的缺失原因汇总进 ``missing``。
+    """
+    extras = {key: {} for key in ("gross_margin", "net_margin", "revenue_yoy",
+                                  "net_profit_yoy", "sentiment", "capital_flow",
+                                  "short_interest")}
+    missing = []
+    sources = {"quality": None, "growth": None, "sentiment": None, "alternative": None}
+
+    if wanted & {"quality", "growth"} or (include_sentiment and "sentiment" in wanted):
+        local, local_missing, local_sources = local_factor_extras(
+            home, names, pit_date,
+            want_quality=bool(wanted & {"quality", "growth"}),
+            want_sentiment=bool(include_sentiment and "sentiment" in wanted))
+        for key, values in local.items():
+            extras[key].update(values)
+        missing.extend(local_missing)
+        for key, value in local_sources.items():
+            if value:
+                sources[key] = value
+
+    if "alternative" in wanted:
+        reasons = {"capital_flow": [], "short_interest": []}
+        for ticker in names:
+            values, meta = alternative_factor_values(v3_run, ticker)
+            for key, value in values.items():
+                extras[key][ticker] = value
+            for key, reason in (meta.get("reasons") or {}).items():
+                reasons.setdefault(key, []).append(f"{ticker}：{reason}")
+        sources["alternative"] = ("futu/capital_flow_history + futu/short_interest（实时，"
+                                  "受全局限流器约束）")
+        for key in ("capital_flow", "short_interest"):
+            if not extras[key]:
+                missing.append({"key": key,
+                                "reason": "；".join((reasons.get(key) or [])[:3])
+                                          or "上游未返回可解析字段（no-data）"})
+    return extras, missing, sources
+
+
+def local_factor_extras(home, names, pit_date, *, want_quality=True, want_sentiment=True):
+    """**本地**（不联网）新因子原始值：质量 / 成长 / 情绪。
+
+    ``strategy_run`` 的 PAAT 阶段与 ``factors_matrix_data`` 共用这一份实现（不做第二事实源），
+    一次打开交易库、逐标的读数；交易库缺失时全部返回空 + 原因（绝不用均值/0 顶替）。
+    返回 ``(extras, missing, sources)``，形状与 :func:`_factor_extras` 一致。
+    """
+    extras = {key: {} for key in ("gross_margin", "net_margin", "revenue_yoy",
+                                  "net_profit_yoy", "sentiment")}
+    missing = []
+    sources = {"quality": None, "growth": None, "sentiment": None}
+    conn = _open_trading_store(home) if want_quality else None
+    if want_quality:
+        if conn is None:
+            reason = f"交易库 {_trading_store_path(home)} 不存在或不可只读打开"
+            for key in ("gross_margin", "net_margin", "revenue_yoy", "net_profit_yoy"):
+                missing.append({"key": key, "reason": reason})
+            sources["quality"] = f"trading-data/fundamentals 不可读（{reason}）"
+            sources["growth"] = sources["quality"]
+        else:
+            reasons = {}
+            records = 0
+            for ticker in names:
+                rows = _read_pit_fundamentals(conn, ticker, pit_date)
+                if rows:
+                    records += 1
+                values, meta = quality_growth_factors(rows, ticker, pit_date)
+                for key, value in values.items():
+                    extras[key][ticker] = value
+                for key, reason in (meta.get("reasons") or {}).items():
+                    reasons.setdefault(key, []).append(f"{ticker}：{reason}")
+            conn.close()
+            sources["quality"] = (f"trading-data/fundamentals（PIT announced_at ≤ {pit_date}；"
+                                  f"{records}/{len(names)} 只有可用财报）")
+            sources["growth"] = sources["quality"]
+            for key in ("gross_margin", "net_margin", "revenue_yoy", "net_profit_yoy"):
+                if not extras[key]:
+                    entry = next(item for item in FACTOR_REGISTRY if item["key"] == key)
+                    detail = reasons.get(key) or [str(entry["pit"])]
+                    missing.append({"key": key, "reason": "；".join(detail[:3])})
+    if want_sentiment:
+        reasons = []
+        covered = 0
+        for ticker in names:
+            score, meta = sentiment_factor_values(home, ticker, pit_date)
+            if score is None:
+                reasons.append(f"{ticker}：{meta.get('reason') or 'score=null'}")
+            else:
+                extras["sentiment"][ticker] = score
+                covered += 1
+        sources["sentiment"] = (f"store.sentiment_snapshots（PIT ≤ {pit_date}）+ "
+                                f"v3_nlp 离线复算；{covered}/{len(names)} 只有可用情绪分")
+        if covered == 0:
+            missing.append({"key": "sentiment",
+                            "reason": "；".join(reasons[:3]) or "窗口内没有可用情绪文档"})
+    return extras, missing, sources
+
+
+def _cross_sectional_z_map(values):
+    """``{ticker: value}`` → ``{ticker: z}``（样本标准差 n−1，截断 ±3；有效值 <2 → 全 null）。"""
+    tickers = sorted(values)
+    raw = [values[ticker] for ticker in tickers]
+    zs = v3_math.cross_sectional_z(raw)
+    return {ticker: z for ticker, z in zip(tickers, zs)}
+
+
+def _merge_factor_extras(matrix, base_rows, extras):
+    """把新因子的横截面 z 写进每行 ``z``（**只增不改**：价量/估值 z 一位不动）。"""
+    by_ticker = {row.get("ticker"): row for row in base_rows}
+    for key, values in extras.items():
+        zs = _cross_sectional_z_map(values)
+        for ticker, z in zs.items():
+            row = by_ticker.get(ticker)
+            if row is None:
+                continue
+            zmap = row.get("z")
+            if not isinstance(zmap, dict):
+                zmap = {}
+                row["z"] = zmap
+            zmap[key] = z
+        for ticker, value in values.items():
+            row = by_ticker.get(ticker)
+            if row is None:
+                continue
+            factors = row.get("factors")
+            if not isinstance(factors, dict):
+                factors = {}
+                row["factors"] = factors
+            factors[key] = value
+
+
+def _project_matrix(base_rows, keys):
+    """按 ``keys`` 的列顺序重建二维矩阵（缺格 ``null``，不填 0）。"""
+    out = []
+    for row in base_rows:
+        zmap = row.get("z") if isinstance(row.get("z"), dict) else {}
+        line = []
+        for key in keys:
+            value = v3_math.to_float(zmap.get(key))
+            line.append(None if value is None else v3_math.round_half_up(value, 4))
+        out.append(line)
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -726,9 +1147,19 @@ def strategy_last(home, market=None):
         return _error("v3/internal", error)
 
 
-def _strategy_analysis(v3_run, universe_list, klines, window):
+def _strategy_analysis(v3_run, universe_list, klines, window, home=None):
     """PAAT：优先 workbench ``factors`` 的 z（综合分 = mom_20/mom_60/trend 的 z 均值），
-    不可用时**如实标注**并退化为本地 K 线动量的横截面 z（保证候选池不为空）。"""
+    不可用时**如实标注**并退化为本地 K 线动量的横截面 z（保证候选池不为空）。
+
+    **FR-STRAT-001 补全（2026-09-20）**：``home`` 给定时，PAAT 再把 **质量/成长/情绪**
+    三类新因子（``local_factor_extras``：本地交易库 + 情绪快照，不联网）按横截面 z **同权**
+    并进 ``extendedZ``，并如实回报每类因子的覆盖数与缺失原因：
+
+      * ``compositeZ`` 保持历史口径（纯价量动量 z）——既有排序不因本改动而变化；
+      * ``extendedZ`` = 有数据的各项 z（价量动量 + 质量 + 成长 + 情绪）同权平均，
+        取不到的维度**不参与**（不填 0）；选股/评分改用 ``extendedZ``（见 PET 的 ``basis``），
+        缺失维度全部记进 ``stage.factorCoverage``。
+    """
     factor_rows = []
     factors_error = None
     if len(universe_list) >= 2:
@@ -738,6 +1169,15 @@ def _strategy_analysis(v3_run, universe_list, klines, window):
             factor_rows = rows if isinstance(rows, list) else []
         else:
             factors_error = _tool_error(envelope)
+
+    extras, extras_missing, extras_sources = ({}, [], {})
+    if home:
+        try:
+            extras, extras_missing, extras_sources = local_factor_extras(
+                home, list(universe_list)[:FACTOR_LIMIT], _pit_date(None))
+        except Exception as error:  # noqa: BLE001 —— 新因子失败不拖垮 PAAT
+            extras_missing = [{"key": "quality/growth/sentiment",
+                               "reason": f"{type(error).__name__}: {error}"}]
 
     analysis = []
     for ticker in universe_list:
@@ -753,9 +1193,13 @@ def _strategy_analysis(v3_run, universe_list, klines, window):
             if close is not None:
                 closes.append(close)
         local_momentum = (closes[-1] / closes[-1 - window] - 1) if len(closes) > window else None
+        extras_of_ticker = {key: values.get(ticker) for key, values in extras.items()
+                            if values.get(ticker) is not None}
         analysis.append({
             "ticker": ticker,
             "compositeZ": None if composite is None else v3_math.round_half_up(composite, 4),
+            "extras": {key: v3_math.round_half_up(value, 4)
+                       for key, value in extras_of_ticker.items()},
             "factors": {key: (row.get("factors") or {}).get(key)
                         for key in ("mom_20", "mom_60", "rsi_14", "mdd_60")} if row else None,
             "localMomentum": (None if local_momentum is None
@@ -776,13 +1220,63 @@ def _strategy_analysis(v3_run, universe_list, klines, window):
                 item["fallback"] = True
             score_source = "local/series 动量横截面 z（workbench factors 不可用时的兜底）"
 
+    extended = _extended_scores(analysis, extras)
+    for item in analysis:
+        item["extendedZ"] = extended.get(item["ticker"])
+
+    coverage = {
+        "classes": {
+            "price": {"covered": sum(1 for item in analysis if item["compositeZ"] is not None),
+                      "total": len(analysis), "source": score_source},
+            "quality": {"covered": sum(1 for item in analysis if item["extras"].get("gross_margin") is not None
+                                       or item["extras"].get("net_margin") is not None),
+                        "total": len(analysis), "source": extras_sources.get("quality")},
+            "growth": {"covered": sum(1 for item in analysis if item["extras"].get("revenue_yoy") is not None
+                                      or item["extras"].get("net_profit_yoy") is not None),
+                       "total": len(analysis), "source": extras_sources.get("growth")},
+            "sentiment": {"covered": sum(1 for item in analysis
+                                         if item["extras"].get("sentiment") is not None),
+                          "total": len(analysis), "source": extras_sources.get("sentiment")},
+        },
+        "missing": extras_missing,
+        "note": ("extendedZ = 有数据的横截面 z 同权平均（价量动量 + 质量 + 成长 + 情绪）；"
+                 "取不到的因子维度不参与、也不填 0；compositeZ 保持历史纯价量口径"),
+    }
     stage = {
         "analyzed": len(analysis),
         "withFactors": sum(1 for item in analysis if item["compositeZ"] is not None),
         "scoreSource": score_source,
         "factorsError": factors_error,
+        "factorCoverage": coverage,
     }
     return analysis, stage
+
+
+def _extended_scores(analysis, extras):
+    """扩展综合分：``{ticker: z}`` —— 价量动量 z 与质量/成长/情绪 z 同权平均。
+
+    没有 ``home``（``extras`` 为空）时逐字段退化为历史行为（= ``compositeZ``），
+    因此既有调用方与单测零改动。
+    """
+    if not extras:
+        return {item["ticker"]: item["compositeZ"] for item in analysis}
+    z_by_key = {}
+    for key, values in extras.items():
+        if not values:
+            continue
+        z_by_key[key] = _cross_sectional_z_map({ticker: value for ticker, value in values.items()})
+    out = {}
+    for item in analysis:
+        parts = []
+        if item["compositeZ"] is not None:
+            parts.append(item["compositeZ"])
+        for key, zmap in z_by_key.items():
+            z = zmap.get(item["ticker"])
+            if z is not None:
+                parts.append(z)
+        out[item["ticker"]] = (v3_math.round_half_up(sum(parts) / len(parts), 4)
+                               if parts else None)
+    return out
 
 
 def strategy_run(v3_run, home, payload=None):
@@ -860,18 +1354,27 @@ def strategy_run(v3_run, home, payload=None):
         stages["PDAT"] = {"universe": universe_list, "bars": bar_count,
                           "errors": series_errors}
 
-        # PAAT：因子分析（workbench factors → 本地动量兜底）
-        analysis, paat = _strategy_analysis(v3_run, universe_list, klines, window)
+        # PAAT：因子分析（workbench factors → 本地动量兜底）+ 质量/成长/情绪扩维
+        analysis, paat = _strategy_analysis(v3_run, universe_list, klines, window, home=home)
         stages["PAAT"] = paat
 
-        # PCPT：候选池（按综合 z 降序；排序稳定，同分保持 universe 顺序）
-        ranked = sorted([item for item in analysis if item["compositeZ"] is not None],
-                        key=lambda item: item["compositeZ"], reverse=True)
+        # PCPT：候选池。排序优先用 **extendedZ**（价量动量 + 质量 + 成长 + 情绪同权），
+        # 没有扩维因子时 extendedZ 恒等于 compositeZ（既有行为逐字段不变）。
+        def _rank_key(item):
+            score = item.get("extendedZ")
+            return score if score is not None else item["compositeZ"]
+
+        ranked = sorted([item for item in analysis if _rank_key(item) is not None],
+                        key=_rank_key, reverse=True)
         longs = ranked[:top_n]
         reduce_count = min(top_n, max(0, len(ranked) - top_n))
         reduces = list(reversed(ranked[len(ranked) - reduce_count:])) if reduce_count else []
         stages["PCPT"] = {"longs": [item["ticker"] for item in longs],
-                          "reduces": [item["ticker"] for item in reduces]}
+                          "reduces": [item["ticker"] for item in reduces],
+                          "rankBy": ("extendedZ（价量动量+质量+成长+情绪同权）"
+                                     if any(item.get("extendedZ") is not None
+                                            and item.get("extras") for item in analysis)
+                                     else "compositeZ（纯价量动量 z；扩维因子无数据）")}
 
         # PRT：等权目标权重（受单笔上限约束）
         weight_pct = min(SINGLE_NAME_LIMIT_PCT, 100.0 / max(1, len(longs)))
@@ -882,14 +1385,21 @@ def strategy_run(v3_run, home, payload=None):
         # PET：调仓建议提案（不下单）
         proposals = []
         for item in longs:
+            score = _rank_key(item)
             composite = item["compositeZ"]
             mom_20 = (item.get("factors") or {}).get("mom_20")
+            extras_text = "、".join(f"{key}={_plain(value)}"
+                                    for key, value in sorted((item.get("extras") or {}).items()))
             proposals.append({
                 "ticker": item["ticker"],
                 "action": "增持",
                 "targetWeightPct": v3_math.round_half_up(weight_pct, 4),
-                "basis": f"综合动量 z={_plain(composite)}（mom_20={_plain(mom_20)}）",
-                "riskLevel": "低" if (composite or 0) > 0.5 else "中",
+                "basis": (f"扩展综合 z={_plain(score)}（动量 z={_plain(composite)}，"
+                          f"mom_20={_plain(mom_20)}"
+                          + (f"；扩维因子 {extras_text}" if extras_text else
+                             "；扩维因子无数据，仅用价量动量")
+                          + "）"),
+                "riskLevel": "低" if (score or 0) > 0.5 else "中",
                 "action_hint": "经审批后由工作台受约束入口执行",
             })
         for item in reduces:
@@ -897,7 +1407,7 @@ def strategy_run(v3_run, home, payload=None):
                 "ticker": item["ticker"],
                 "action": "减持",
                 "targetWeightPct": 0,
-                "basis": f"综合动量 z={_plain(item['compositeZ'])}（排名末位）",
+                "basis": f"扩展综合 z={_plain(_rank_key(item))}（排名末位）",
                 "riskLevel": "中",
                 "action_hint": "经审批后由工作台受约束入口执行",
             })
@@ -960,8 +1470,7 @@ def ml_sweep(v3_run, ticker="SH.600519", windows_raw="10,20,30,60",
         if not windows or not rebalance:
             return _error("bad-request", "windows/rebalance 需为逗号分隔的正整数（如 10,20,30,60）")
 
-        envelope = _call(v3_run, "series",
-                         {"ticker": ticker, "period": "1d", "limit": limit})
+        envelope = _pit_series_envelope(v3_run, ticker, limit)
         if not envelope.get("ok"):
             return {"ok": False, "error": _tool_error(envelope), "market": code}
         result = v3_math.param_sweep(_bars_of(envelope), windows, rebalance)
@@ -1001,8 +1510,7 @@ def ml_backtest(v3_run, payload=None):
         window = _clamp_int(payload.get("window"), 20, 1, 500)
         rebalance_days = _clamp_int(payload.get("rebalanceDays"), 5, 1, 500)
 
-        envelope = _call(v3_run, "series",
-                         {"ticker": ticker, "period": "1d", "limit": limit})
+        envelope = _pit_series_envelope(v3_run, ticker, limit)
         if not envelope.get("ok"):
             return {"ok": False, "error": _tool_error(envelope), "market": code}
         result = v3_math.backtest_momentum(_bars_of(envelope), window, rebalance_days)
@@ -1082,8 +1590,7 @@ def ml_models(v3_run, home, *, market="SH", ticker=None, window=ML_WINDOW,
         failures = {}
         sources = {}
         for name in names:
-            envelope = _call(v3_run, "series",
-                             {"ticker": name, "period": "1d", "limit": limit})
+            envelope = _pit_series_envelope(v3_run, name, limit)
             if not envelope.get("ok"):
                 failures[name] = _tool_error(envelope)
                 continue
@@ -1116,6 +1623,980 @@ def ml_models(v3_run, home, *, market="SH", ticker=None, window=ML_WINDOW,
         return _error("v3/internal", error)
 
 
+# ===========================================================================
+# FR-EXEC-003 补全：杠杆率 / 流动性风险 / 绩效归因 / 资金检查
+# ===========================================================================
+#
+# 四条纪律（与模块头部的数据诚实性一致，逐条可查）:
+#
+#   1. **只读**：只调只读工具（``positions`` / ``equity`` / ``plan`` / ``account_funds``）
+#      与只读的本地库/HTTP；本段**没有任何**下单/改单/撤单/切模式入口。
+#   2. **不改既有闸门语义**：行业红线 / 单笔上限 / 回撤红线在 ``v3_stdlib``（``v3_ops``）
+#      里一分不动；这里只做「读数 + 分级建议」，并把资金检查作为**新增的、可缺省**
+#      一维交给调用方（缺省不参与 → 既有判定逐字段不变）。
+#   3. **缺数据一律 ``null`` + 原因**：绝不用 0 / 行业均值 / 估算值顶替（``no-data``）。
+#   4. **口径写在响应里**：每个子项都带 ``source`` / ``as_of`` / ``note``，页面原样展示。
+
+#: 富途模拟账户 ``market_id`` → 市场链（与 ``trading_core.market_ids.SIM_MARKET_IDS``
+#: 同源实测口径：港股 1 / A 股 3 / 美股 100）。表外的 market_id（期权 9、期货 10-13、
+#: 日股 16…）**不猜**，一律排除并计数。
+SIM_MARKET_TO_CHAIN = {1: "HK", 3: "SH", 100: "US"}
+#: 用于把持仓行拼成 ``MARKET.CODE`` 的账户市场 → 前缀（A 股模拟账户同时承载 SH/SZ/BJ，
+#: 只有 6 位代码无法区分交易所，故统一用 ``SH`` 前缀——与 ``v3_universe.resolve_universe``
+#: 对真实持仓的归一同一口径；行业解析用的是同一份前缀语义）。
+SIM_MARKET_TO_PREFIX = {1: "HK", 3: "SH", 100: "US"}
+
+#: ADV 口径：近 20 个交易日的**日均成交额**（既有 K 线链路 ``series``，period=1d）。
+ADV_WINDOW = 20
+#: 参与率分级阈值（%）：订单金额 / ADV。≥ block → 建议阻断（人工改单）；≥ warn → 建议人工确认。
+LIQUIDITY_WARN_PCT = 5.0
+LIQUIDITY_BLOCK_PCT = 10.0
+
+#: 组合归因口径标识（写在响应里，不用前端二次换算）。
+ATTRIBUTION_TICKER_METHOD = "逐标的贡献 = 该标的未实现盈亏 / 账户总资产（券商持仓口径，非时间加权）"
+ATTRIBUTION_INDUSTRY_METHOD = "行业贡献 = 该行业全部持仓未实现盈亏合计 / 账户总资产"
+ATTRIBUTION_FACTOR_REASON = (
+    "因子归因缺 PIT 建仓因子敞口：券商持仓不返回建仓时点的因子值，"
+    "工作台台账也没有逐笔因子快照（factor_snapshots 只有日度横截面快照）——"
+    "本实现不臆造因子贡献，返回 null")
+#: 归因可用的行业映射来源（与 ``/api/v3/risk/industry`` 同一份富途板块链路）。
+ATTRIBUTION_INDUSTRY_SOURCE = "server.v3_industry.IndustryResolver（futu/info_owner_plate）"
+
+
+def _trading_store_path(home):
+    """交易库路径（``<home>/trading-data/trading.sqlite``）——实现已收敛到 PIT 入口。
+
+    FR-DATA-003：路径口径只有一份（``server.data.cache.store_path``）；本模块保留这个薄名
+    是为了不打断既有调用点与错误文案。
+    """
+    return pit_cache.store_path(home)
+
+
+def _open_trading_store(home):
+    """**只读**打开交易库（``mode=ro``）；库不存在/打不开 → ``None``（调用方如实报 no-data）。
+
+    FR-DATA-003：连接方式与 PIT 口径都收敛到 ``server.data.cache``（``open_store``）——
+    只读打开后只发 ``SELECT``，不 import ``trading_core.store`` 的建表/``migrate()`` 路径
+    （读数口不该在取数路径上写库）。PIT 条件由 ``pit_cache.read_fundamentals`` 施加，
+    与 ``trading_core.store.read_fundamentals`` 的 ``announced_at IS NOT NULL AND
+    announced_at<=as_of`` 逐字同口径。
+    """
+    return pit_cache.open_store(home)
+
+
+def _read_pit_fundamentals(conn, ticker, as_of):
+    """PIT 基本面行（``announced_at`` 非空且 ≤ ``as_of``）→ ``[row, ...]``。
+
+    FR-DATA-003 迁移：过滤逻辑本身搬进 ``server.data.cache.read_fundamentals``（PIT 唯一
+    入口），本函数退化成薄适配（把信封里的行取出来、把缺连接的情形保持为 ``[]``）。
+    ``conn`` 为 ``None``（库缺失）→ 空列表。**没有公告日的行一律不可见**——它们无法证明
+    「当时已知」，拿报告期当可得日就是前视偏差（宁缺毋假）。
+    """
+    if conn is None:
+        return []
+    try:
+        envelope = pit_cache.read_fundamentals(str(as_of), pit_cache.AS_OF_INCLUSIVE,
+                                               symbol=str(ticker), conn=conn,
+                                               source="trading-data/fundamentals")
+    except pit_cache.PitSourceError:
+        return []
+    return list(envelope.get("rows") or [])
+
+
+def _latest_period_rows(rows, ticker, as_of):
+    """最新报告期的字段行 → ``(field → value, period_end, announced_at, source)``。
+
+    FR-DATA-003 迁移：``period_end <= as_of`` 这道闸门搬进
+    ``server.data.cache.latest_period_rows``（PIT 唯一入口）；数值转换仍留在本模块
+    （``v3_math.to_float``），返回形状与原实现逐字段一致。
+    """
+    fields, latest, announced, source, _stats = pit_cache.latest_period_rows(
+        rows, as_of, pit_cache.AS_OF_INCLUSIVE)
+    if latest is None:
+        return {}, None, None, None
+    return ({key: v3_math.to_float(value.get("value")) for key, value in fields.items()},
+            latest, announced, source)
+
+
+def _ratio_pct(numerator, denominator):
+    """比率（%）——分子/分母任一缺失或分母非正 → ``None``（不用 0 假冒）。"""
+    if numerator is None or denominator is None or denominator <= 0:
+        return None
+    return v3_math.round_half_up(numerator / denominator * 100.0, 4)
+
+
+def quality_growth_factors(rows, ticker, as_of):
+    """质量（``gross_margin``/``net_margin``）+ 成长（``revenue_yoy``/``net_profit_yoy``）。
+
+    ``rows`` 是 :func:`_read_pit_fundamentals` 的 PIT 行；**只用 ≤ ``as_of`` 的公告**。
+    返回 ``(values, meta)``：``values`` 里缺的键**不出现**（调用方按 no-data 记原因），
+    ``meta`` 写明用了哪个报告期/公告日/来源，以及每个缺失因子**为什么缺**。
+    """
+    values = {}
+    fields, period, announced, source = _latest_period_rows(rows, ticker, as_of)
+    reasons = {}
+    if not period:
+        reason = (f"无 PIT 财报：{ticker} 在 trading-data/fundamentals 里没有公告日 ≤ {as_of}"
+                  f" 的记录（该表只收录已合并公告日的行；无公告日 = 无法证明当时已知）")
+        for key in ("gross_margin", "net_margin", "revenue_yoy", "net_profit_yoy"):
+            reasons[key] = reason
+        return values, {"ticker": ticker, "period_end": None, "announced_at": None,
+                        "source": None, "reasons": reasons}
+
+    gross_margin = _ratio_pct(fields.get("gross_profit"), fields.get("revenue"))
+    net_margin = _ratio_pct(fields.get("net_profit"), fields.get("revenue"))
+    if gross_margin is None:
+        reasons["gross_margin"] = (f"报告期 {period} 缺毛利/营收科目"
+                                   f"（gross_profit={fields.get('gross_profit')}、"
+                                   f"revenue={fields.get('revenue')}）")
+    else:
+        values["gross_margin"] = gross_margin
+    if net_margin is None:
+        reasons["net_margin"] = (f"报告期 {period} 缺净利/营收科目"
+                                 f"（net_profit={fields.get('net_profit')}、"
+                                 f"revenue={fields.get('revenue')}）")
+    else:
+        values["net_margin"] = net_margin
+
+    # 成长：与**同报告期口径**的上一年比（``2026-06-30`` ↔ ``2025-06-30``）。
+    # 库里没有上一年同期的 PIT 行 → null + 原因，绝不拿相邻期或全年数硬算同比。
+    prior = None
+    if period:
+        target = f"{int(period[:4]) - 1}{period[4:]}"
+        for row in rows:
+            if str(row.get("period_end")) == target:
+                prior = row
+                break
+    if prior is None:
+        reason = (f"无上一年同期 PIT 记录（需要 {int(period[:4]) - 1}{period[4:]} 且已合并公告日），"
+                  f"跨期/跨年推算同比会前视，故 {('revenue_yoy')} 返回 null")
+        reasons["revenue_yoy"] = reason
+        reasons["net_profit_yoy"] = reason
+    else:
+        prior_rows = [row for row in rows if str(row.get("period_end")) == prior.get("period_end")]
+        prior_fields, _, _, _ = _latest_period_rows(prior_rows, ticker, as_of)
+        revenue_yoy = _growth_pct(fields.get("revenue"), prior_fields.get("revenue"))
+        profit_yoy = _growth_pct(fields.get("net_profit"), prior_fields.get("net_profit"))
+        if revenue_yoy is None:
+            reasons["revenue_yoy"] = (f"{period} 或 {prior.get('period_end')} 的营收缺失/基期非正"
+                                      "（同比用同口径报告期，不做跨期推算）")
+        else:
+            values["revenue_yoy"] = revenue_yoy
+        if profit_yoy is None:
+            reasons["net_profit_yoy"] = (f"{period} 或 {prior.get('period_end')} 的净利润缺失/基期非正"
+                                         "（同比用同口径报告期，不做跨期推算）")
+        else:
+            values["net_profit_yoy"] = profit_yoy
+    return values, {"ticker": ticker, "period_end": period, "announced_at": announced,
+                    "source": source, "reasons": reasons,
+                    "comparison_period": None if prior is None else prior.get("period_end")}
+
+
+def _growth_pct(current, prior):
+    """同比（%）——基期缺失/非正 → ``None``（基期 ≤0 的同比无意义，不给假数）。"""
+    if current is None or prior is None or prior <= 0:
+        return None
+    return v3_math.round_half_up((current / prior - 1.0) * 100.0, 4)
+
+
+def sentiment_factor_values(home, ticker, as_of, *, window_days=7, half_life_hours=48.0):
+    """情绪因子：用 ``v3_nlp`` 同一份自研打分器**离线复算**已落库的资讯快照。
+
+    **数据源**：``<home>/trading-data/trading.sqlite`` 的 ``sentiment_snapshots``
+    （``sentiment_snapshot`` 作业每日落库，含 ``fin_sentiment``/``fin_news`` 两源原文）。
+    **PIT（两道闸门，都要过）**：
+
+      1. ``date <= as_of``（快照按采集日落库，绝不看未来采集）；
+      2. **文档自身的发布时间**也要落在 ``[as_of - window_days, as_of]`` 内——快照里的
+         ``items`` 常常是**历史长尾**（实测 ``fin_news`` 里混着 2–4 个月前的新闻），
+         只按采集日过滤会让「窗口」名不副实；窗口外的文档被排除并**计数写进 meta**
+         （``outsideWindow``），不静默丢弃也不硬算进分数。
+
+    打分时间基准取 ``as_of`` 当日 00:00 UTC（半衰权重因此不含未来资讯），
+    默认窗口 7 天与 ``GET /api/v3/sentiment`` 的 ``days`` 缺省一致。
+    **不是 0**：没有文档 / 一篇都没命中词典 / 命中文档的权重和被半衰压到 0 →
+    ``score=None`` + 各自原因（与在线端点的诚实口径逐条一致）。
+    """
+    conn = _open_trading_store(home)
+    if conn is None:
+        return None, {"reason": "交易库 trading-data/trading.sqlite 不存在或不可读（只读模式打开失败）",
+                      "source": "store.sentiment_snapshots"}
+    try:
+        # FR-DATA-003：采集日闸门（``date <= as_of``）与「最近 60 条」都改由 PIT 唯一入口
+        # 施加（``server.data.cache.read_sentiment_snapshots``）；本函数只保留第二道
+        # **业务**闸门（文档自身发布时间落在窗口内）与打分口径。
+        envelope = pit_cache.read_sentiment_snapshots(
+            str(as_of), pit_cache.AS_OF_INCLUSIVE, symbol=str(ticker), conn=conn,
+            limit=60, source="store.sentiment_snapshots")
+        rows = envelope.get("rows") or []
+    except pit_cache.PitSourceError as error:
+        return None, {"reason": f"sentiment_snapshots 读取失败：{error}",
+                      "source": "store.sentiment_snapshots"}
+    finally:
+        conn.close()
+
+    try:
+        day = datetime.strptime(str(as_of)[:10], "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    except ValueError:
+        day = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+    # 「PIT 上界」= as_of **当日结束**（UTC）：as_of 日当天发布的资讯在收盘后是已知的，
+    # 用当日 00:00 作上界会把它们当成「未来」剔除（实测 2026-09-10 的资讯正是这样被误剔的）。
+    # 半衰权重的基准也用它：当日资讯的 age_hours ∈ [0, 24)，权重仍在同一量级。
+    cutoff = day + timedelta(days=1) - timedelta(microseconds=1)
+    floor = (cutoff - timedelta(days=max(1, int(window_days)))).date().isoformat()
+
+    documents = []
+    prepared = []
+    dates = set()
+    for row in rows:
+        day = str(row["date"])
+        if day < floor:
+            continue
+        dates.add(day)
+        try:
+            payload = json.loads(row["payload"])
+        except (TypeError, ValueError):
+            continue
+        if not isinstance(payload, dict):
+            continue
+        for key in ("items", "docs", "documents", "news"):
+            items = payload.get(key)
+            if isinstance(items, list):
+                for item in items:
+                    if isinstance(item, dict):
+                        prepared.append(_normalize_doc_time(item))
+                    elif isinstance(item, str) and item.strip():
+                        prepared.append({"title": item})
+    # 第二个 PIT 闸门：文档自身发布时间必须落在窗口内（无时间戳的按旧口径保留并计入 undated，
+    # 由打分器按 as_of 计权并自己计数——它不猜时间，我们也不替它丢）。
+    from server import v3_nlp
+    start = cutoff - timedelta(days=max(1, int(window_days)))
+    outside = 0
+    for item in prepared:
+        published = v3_nlp._doc_time(item)
+        if published is None:
+            documents.append(item)
+            continue
+        if published < start or published > cutoff:
+            outside += 1
+            continue
+        documents.append(item)
+    if not documents:
+        reason = (f"{ticker} 在 {floor}..{as_of} 没有窗口内的情绪快照文档"
+                  + (f"（快照里有 {outside} 篇原文发布时间在窗口外，已排除）" if outside else "")
+                  + "（store.sentiment_snapshots）")
+        return None, {"reason": reason, "source": "store.sentiment_snapshots",
+                      "window_from": floor, "window_to": str(as_of)[:10], "documents": 0,
+                      "outsideWindow": outside}
+    scored = v3_nlp.score_documents(documents, half_life_hours=half_life_hours, now=cutoff)
+    # ``score=None`` 有两种原因，分开写清（页面/矩阵才不会把 no-data 读成「中性 0 分」）：
+    #   ① 一篇都没命中词典（scored=0）；
+    #   ② 有命中文档、但时间半衰把权重和压到 0（快照原文远早于 as_of：例如 last30days 的长尾）——
+    #      半衰权重和 <= 0 时打分器按设计返回 null，这里如实转述，**不**另算一个数出来。
+    score = scored["score"]
+    reason = None
+    if score is None:
+        if scored.get("scored"):
+            reason = (f"{scored['documents']} 篇文档里 {scored['scored']} 篇命中词典，"
+                      f"但时间半衰（{half_life_hours}h）把权重和压到 0"
+                      f"（原文远早于 as_of）→ score=null（不是 0 分）")
+        else:
+            reason = f"{scored.get('documents', 0)} 篇文档无一命中词典（score=null，不是 0 分）"
+    return score, {
+        "source": "store.sentiment_snapshots + server.v3_nlp.score_documents(离线复算)",
+        "method": scored.get("method"), "window_from": floor, "window_to": str(as_of)[:10],
+        "dates": sorted(dates), "documents": scored.get("documents"),
+        "scored": scored.get("scored"), "coverage": scored.get("coverage"),
+        "half_life_hours": half_life_hours, "outsideWindow": outside,
+        "reason": reason,
+    }
+
+
+def _normalize_doc_time(doc):
+    """把快照文档里的 **epoch 毫秒时间戳字符串**归一成 ISO —— 只做单位换算，不改语义。
+
+    为什么需要（实测 2026-09-20）::
+
+        sentiment_snapshots.fin_news 的 items[].time = "1787829257000"（**字符串形式的毫秒**）
+
+    ``v3_nlp.parse_time`` 支持「epoch（秒/毫秒）」但只对**数值**成立：13 位字符串既不是
+    ISO 也不是任何 ``_TIME_PATTERNS``，会返回 ``None`` → 半衰权重按 `w=1.0` 计（`age_hours=0`），
+    在 as_of 回放里等于把「一个月前的资讯」当「今天」——**这是会算错分的**，不是显示问题。
+    两种单位在本数据里可由数量级区分（秒 ≈1.8e9、毫秒 ≈1.8e12），因此用 1e11 作阈值显式归一，
+    并在 10 位/13 位以外的数字上一律不动（无法判定就不猜单位，交给打分器按无时间处理）。
+    """
+    if not isinstance(doc, dict):
+        return doc
+    for key in ("time", "published_at", "published", "datetime", "date", "发布时间", "时间"):
+        value = doc.get(key)
+        if not isinstance(value, str):
+            continue
+        text = value.strip()
+        if not text.isdigit() or len(text) not in (10, 13):
+            continue
+        try:
+            number = int(text)
+        except ValueError:  # pragma: no cover —— isdigit 已保证可转
+            continue
+        seconds = number / 1000.0 if number > 100_000_000_000 else float(number)
+        try:
+            stamp = datetime.fromtimestamp(seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            continue
+        # 输出成 ``...+00:00`` 的 ISO：``v3_nlp.parse_time`` 的 fromisoformat 分支能直接解析
+        # （带 ``Z`` 会被它改写成 ``+00:00`` 同样走通；两种都行，这里用 ISO 省一步替换）。
+        return {**doc, key: stamp.isoformat()}
+    return doc
+
+
+def alternative_factor_values(v3_run, ticker, *, days=20):
+    """另类因子：``capital_flow``（主力净流入强度）+ ``short_interest``（空头占比）。
+
+    数据源都是既有工具（富途实时读取，受全局限流器约束）。取不到 → 值 ``None`` + **上游
+    错误原文**，绝不用 0 顶替；A 股无卖空数据是上游事实（``short_*`` 仅 HK/US 可卖空证券）。
+    """
+    values, meta = {}, {"ticker": ticker, "reasons": {}, "sources": {}}
+
+    envelope = _call(v3_run, "capital_flow_history", {"code": ticker, "days": days})
+    value = _value_of(envelope) or {}
+    flows = value.get("flow_list") if isinstance(value.get("flow_list"), list) else []
+    if not flows:
+        meta["reasons"]["capital_flow"] = (
+            f"capital_flow_history 未返回流水：{_error_message(envelope)}")
+    else:
+        main = 0.0
+        gross = 0.0
+        for row in flows:
+            if not isinstance(row, dict):
+                continue
+            net = v3_math.to_float(row.get("main_in_flow"))
+            if net is None:
+                net = v3_math.to_float(row.get("in_flow"))
+            if net is None:
+                continue
+            main += net
+            gross += abs(net)
+        if gross <= 0:
+            meta["reasons"]["capital_flow"] = (
+                f"{len(flows)} 日资金流水的净额全为 0/不可解析，无法算强度（不返回 0 分）")
+        else:
+            values["capital_flow"] = v3_math.round_half_up(main / gross, 4)
+            meta["sources"]["capital_flow"] = ("futu/capital_flow_history（近 "
+                                               f"{len(flows)} 个交易日主力净流入 / Σ|净额|）")
+
+    envelope = _call(v3_run, "short_interest", {"code": ticker})
+    value = _value_of(envelope) or {}
+    ratio = None
+    for key in ("short_interest_ratio", "short_ratio", "ratio", "short_percent"):
+        ratio = v3_math.to_float(value.get(key))
+        if ratio is not None:
+            break
+    rows = value.get("interest_list") or value.get("items") or value.get("list") or []
+    if ratio is None and isinstance(rows, list) and rows and isinstance(rows[0], dict):
+        for key in ("short_interest_ratio", "short_ratio", "ratio", "short_percent"):
+            ratio = v3_math.to_float(rows[0].get(key))
+            if ratio is not None:
+                break
+    if ratio is None:
+        meta["reasons"]["short_interest"] = (
+            f"short_interest 未给出空头占比：{_error_message(envelope)}")
+    else:
+        values["short_interest"] = ratio
+        meta["sources"]["short_interest"] = "futu/short_interest（空头占比，原始字段直取）"
+    return values, meta
+
+
+# ---------------------------------------------------------------------------
+# ① 杠杆率（真实账户字段推导；上游不给融资字段就如实 no-data）
+# ---------------------------------------------------------------------------
+def _parse_cash_fields(raw):
+    """富途资金行 → 认识字段的字典（``None`` 保留原样：不认识就不知道自己不知道）。"""
+    if not isinstance(raw, dict):
+        return {}
+    out = {}
+    for key in ("total_assets", "total_asset", "power", "max_power_long", "available_funds",
+                "cash", "balance", "hold", "mv", "long_mv", "short_mv",
+                "unrealized_profit", "realized_profit"):
+        if key in raw:
+            out[key] = v3_math.to_float(raw.get(key))
+    return out
+
+
+def _account_groups(envelope):
+    """账户类工具信封 → ``[group, ...]``；形状不认识 → 空列表（原因由调用方写）。"""
+    value = _value_of(envelope)
+    if isinstance(value, list):
+        return [row for row in value if isinstance(row, dict)]
+    if not isinstance(value, dict):
+        return []
+    groups = value.get("groups")
+    if not isinstance(groups, list):
+        return []
+    return [row for row in groups if isinstance(row, dict)]
+
+
+def _chain_of_group(group):
+    """账户分组 → 市场链（``market_id`` 实测表；表外 → ``None``，不猜）。"""
+    market = group.get("market")
+    if isinstance(market, bool):
+        return None
+    if isinstance(market, (int, float)) and float(market).is_integer():
+        return SIM_MARKET_TO_CHAIN.get(int(market))
+    for key in ("market_chain", "chain", "market_code"):
+        text = str(group.get(key) or "").strip().upper()
+        if text in ("SH", "SZ", "BJ", "HK", "US"):
+            return text if text in ("HK", "US") else "SH"
+    return None
+
+
+def _position_key(group, row):
+    """持仓行 → ``(market_chain, MARKET.CODE)``。"""
+    chain = _chain_of_group(group)
+    symbol = str(row.get("symbol") or row.get("code") or "").strip().upper()
+    if "." in symbol:
+        head, tail = symbol.split(".", 1)
+        if head in ("SH", "SZ", "BJ", "HK", "US", "CN"):
+            return ("SH" if head in ("SH", "SZ", "BJ", "CN") else head), symbol
+        if tail in ("SH", "SZ", "BJ", "HK", "US"):
+            return ("SH" if tail in ("SH", "SZ", "BJ") else tail), f"{tail}.{head}"
+    if not chain:
+        return None, symbol
+    prefix = SIM_MARKET_TO_PREFIX.get(group.get("market")) if isinstance(
+        group.get("market"), int) else None
+    prefix = prefix or ("HK" if chain == "HK" else "US" if chain == "US" else "SH")
+    return chain, f"{prefix}.{symbol}" if symbol else symbol
+
+
+def portfolio_leverage(v3_run, *, market=None, funds_envelope=None, positions_envelope=None):
+    """FR-EXEC-003 事中「杠杆率」：**从真实资金/持仓字段推导**，缺字段就 no-data。
+
+    读数（全部来自券商原始字段，见 ``note``）::
+
+        {source, as_of, mode, market, accounts[], readings:{...}, direction,
+         leverage_ratio_pct, long_mv_ratio_pct, buying_power_ratio_pct, cash_ratio_pct,
+         provider_note, note, error}
+
+    上游事实（本机 2026-09-20 实测，写进 ``provider_note``，不假装有融资余额）:
+
+      * 模拟盘 ``sim_trade_cash_info``：``balance`` / ``hold`` / ``max_power_long`` /
+        ``total_asset`` / ``mv`` / ``long_mv`` / ``short_mv``；``max_power_long`` 即券商口径
+        「最大可买」，**没有**独立的融资负债/保证金占用字段；
+      * 实盘 ``account_funds``：``total_assets`` / ``power`` / ``available_funds`` / ``cash``，
+        同样**没有**融资负债字段。
+
+    因此本实现只给「真实净敞口比」（持仓市值 / 总资产）与「购买力可用比」
+    （可用购买力 / 总资产）、「现金 / 总资产」，**不给**「融资负债 / 净资产」——
+    后者上游不提供，返回 ``null`` 并写明原因。
+    """
+    funds = funds_envelope if funds_envelope is not None else _call(v3_run, "account_funds", {})
+    positions = (positions_envelope if positions_envelope is not None
+                 else _call(v3_run, "positions", {}))
+    funds_value = _value_of(funds) or {}
+    mode = funds_value.get("mode") or ((_value_of(positions) or {}).get("mode"))
+    as_of = funds_value.get("as_of") or (_value_of(positions) or {}).get("as_of")
+
+    funds_rows, mv_rows = [], []
+    for group in _account_groups(funds):
+        chain = _chain_of_group(group)
+        if chain is None:
+            continue
+        if market and chain != market:
+            continue
+        cash = _parse_cash_fields(group.get("cash"))
+        equity = cash.get("total_assets")
+        if equity is None:
+            equity = cash.get("total_asset")
+        if equity is None:
+            equity = cash.get("mv")
+        power = cash.get("power")
+        if power is None:
+            power = cash.get("max_power_long")
+        if power is None:
+            power = cash.get("available_funds")
+        funds_rows.append({"market": chain, "acc_id": group.get("acc_id"),
+                           "equity": equity, "power": power,
+                           "cash": cash.get("cash") if cash.get("cash") is not None
+                           else cash.get("balance"),
+                           "long_mv": cash.get("long_mv")})
+    for group in _account_groups(positions):
+        key, symbol = _position_key(group, {})
+        if key is None:
+            continue
+        if market and key != market:
+            continue
+        total = 0.0
+        found = False
+        for row in group.get("positions") or []:
+            if not isinstance(row, dict):
+                continue
+            value = v3_math.to_float(row.get("mv"))
+            if value is None:
+                value = v3_math.to_float(row.get("market_value"))
+            if value is None:
+                continue
+            total += value
+            found = True
+        if found:
+            mv_rows.append({"market": key, "acc_id": group.get("acc_id"), "long_mv": total})
+
+    equity = sum(row["equity"] for row in funds_rows if row.get("equity") is not None) \
+        if any(row.get("equity") is not None for row in funds_rows) else None
+    # 持仓市值：优先逐持仓行求和（可核对）；持仓接口取不到时退回**资金响应自带的**
+    # ``long_mv``（同一份券商数据，实测一致：376020 / 376020），并如实标注用哪一路。
+    long_mv = sum(row["long_mv"] for row in mv_rows) if mv_rows else None
+    if long_mv is None:
+        cash_mv = [row["long_mv"] for row in funds_rows if row.get("long_mv") is not None]
+        mv_source = ("资金响应的 long_mv 字段（持仓接口未返回可用市值）" if cash_mv else None)
+        long_mv = sum(cash_mv) if cash_mv else None
+    else:
+        mv_source = "逐持仓行的 mv 字段"
+    power = sum(row["power"] for row in funds_rows if row.get("power") is not None) \
+        if any(row.get("power") is not None for row in funds_rows) else None
+    cash_sum = sum(row["cash"] for row in funds_rows if row.get("cash") is not None) \
+        if any(row.get("cash") is not None for row in funds_rows) else None
+
+    readings = {"totalAssets": equity, "longMarketValue": long_mv,
+                "buyingPower": power, "cash": cash_sum, "longMarketValueSource": mv_source,
+                "accounts": len(funds_rows), "positionAccounts": len(mv_rows)}
+    payload = {
+        "source": funds_value.get("source") or (_value_of(positions) or {}).get("source"),
+        "as_of": as_of, "mode": mode, "market": market,
+        "accounts": funds_rows, "readings": readings,
+        "leverage_ratio_pct": (_ratio_pct(long_mv, equity)),
+        "long_mv_ratio_pct": (_ratio_pct(long_mv, equity)),
+        "buying_power_ratio_pct": (_ratio_pct(power, equity)),
+        "cash_ratio_pct": (_ratio_pct(cash_sum, equity)),
+        "margin_debt_pct": None,
+        "direction": "真实净敞口 = 持仓市值 / 总资产；不折算跨币种、不跨市场合并",
+        "error": None,
+    }
+    if equity is None:
+        payload["error"] = {
+            "code": "leverage/no-equity",
+            "message": (f"资金读数里没有可用的总资产字段（上游只给 "
+                        f"{sorted(set(key for row in funds_rows for key in row)) or '空'}），"
+                        f"杠杆率 = null"),
+        }
+    payload["provider_note"] = (
+        "上游字段事实（2026-09-20 实测）：模拟盘 sim_trade_cash_info 给 balance/hold/"
+        "max_power_long/total_asset/mv/long_mv/short_mv，实盘 account_funds 给 "
+        "total_assets/power/available_funds/cash；**两者都没有独立的融资负债/保证金占用字段**，"
+        "故 margin_debt_pct 恒为 null（no-data，不估算），杠杆读数只有"
+        "「持仓市值 / 总资产」与「可用购买力 / 总资产」。")
+    payload["note"] = (
+        f"读数口径：{'多账户合计（同市场链）' if funds_rows else '无可用账户分组'}"
+        f"；总资产来自 {funds_value.get('source') or '—'}，持仓市值来自 "
+        f"{(_value_of(positions) or {}).get('source') or '—'}")
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# ② 流动性风险（订单金额 / 近 20 日 ADV）
+# ---------------------------------------------------------------------------
+def liquidity_risk(order_value, bars, *, window=ADV_WINDOW, market=None, ticker=None,
+                   warn_pct=LIQUIDITY_WARN_PCT, block_pct=LIQUIDITY_BLOCK_PCT,
+                   order_note=None):
+    """参与率 = 订单金额 / ADV；ADV = 近 ``window`` 个交易日**日均成交额**。
+
+    ``bars``：既有 K 线链路的日 K（``series`` 工具 ``period=1d``，字段 ``c``/``v``/``t``）。
+    成交额按 ``close × volume`` 逐日算（上游不单列成交额），口径写进 ``adv_basis``。
+    订单金额缺失 / K 线不足 / ADV 为 0 → ``participation_pct = None`` + 原因。
+    """
+    value = v3_math.to_float(order_value)
+    rows = [bar for bar in (bars or []) if isinstance(bar, dict)]
+    window = max(1, int(window))
+    turnover = []
+    for bar in rows[-window:]:
+        close = v3_math.to_float(bar.get("c"))
+        volume = v3_math.to_float(bar.get("v"))
+        if close is None or volume is None:
+            continue
+        turnover.append(close * volume)
+    payload = {
+        "ticker": ticker, "market": market,
+        "order_value": value,
+        "adv_window_days": window,
+        "adv_observations": len(turnover),
+        "adv_source": (f"GET /api/v3/factors/matrix 同源的 K 线链路（series period=1d，"
+                       f"近 {len(turnover)} 根日 K）" if turnover else None),
+        "adv_basis": "ADV = mean(close × volume)，取最近 window 根日 K（上游不单列成交额）",
+        "adv_window_from": (str(rows[-window].get("t")) if len(rows) >= window
+                            else (str(rows[0].get("t")) if rows else None)),
+        "adv_window_to": (str(rows[-1].get("t")) if rows else None),
+        "adv_amount": (v3_math.round_half_up(sum(turnover) / len(turnover), 2)
+                       if turnover else None),
+        "participation_pct": None,
+        "grade": "no-data",
+        "grade_note": None,
+        "thresholds": {"warnPct": warn_pct, "blockPct": block_pct},
+        "reason": None,
+    }
+    if order_note:
+        payload["order_note"] = order_note
+    if value is None:
+        payload["reason"] = "订单金额缺失（order_value=null）→ 参与率无法计算"
+        return payload
+    if not turnover:
+        payload["reason"] = (f"K 线不足 {window} 根可用的 close/volume，无法算 ADV"
+                             f"（拿到 {len(rows)} 根）")
+        return payload
+    if len(turnover) < window:
+        # 只用半截窗口算出来的「ADV」不是 20 日均额，会系统性低估/高估参与率 → 如实 no-data
+        payload["reason"] = (f"可用成交额样本仅 {len(turnover)} 个 < ADV 窗口 {window} 日，"
+                            f"不拿不满窗口的均值冒充 ADV（参与率 = null）")
+        return payload
+    adv = sum(turnover) / len(turnover)
+    if adv <= 0:
+        payload["reason"] = f"ADV 非正（{adv}）→ 参与率无意义，返回 null"
+        return payload
+    participation = value / adv * 100.0
+    payload["participation_pct"] = v3_math.round_half_up(participation, 4)
+    if participation >= block_pct:
+        payload["grade"] = "blocked"
+        payload["grade_note"] = (f"参与率 {participation:.2f}% ≥ {block_pct:.0f}%（ADV 窗口 "
+                                 f"{len(turnover)} 日）→ 建议拆分/改单后人工确认，禁止一次打满")
+    elif participation >= warn_pct:
+        payload["grade"] = "manual"
+        payload["grade_note"] = (f"参与率 {participation:.2f}% ≥ {warn_pct:.0f}% → 建议人工确认"
+                                 f"（冲击成本可能显著）")
+    else:
+        payload["grade"] = "auto"
+        payload["grade_note"] = f"参与率 {participation:.2f}% < {warn_pct:.0f}%，流动性充裕"
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# ③ 绩效归因（逐标的 + 行业；因子维度如实缺失）
+# ---------------------------------------------------------------------------
+def portfolio_attribution(positions_envelope, *, market=None, industry_map=None,
+                          industry_missing=None, weights=None, total_return_pct=None):
+    """事后绩效归因：按标的、按行业分组；因子分组**如实缺失**（原因写进响应）。
+
+    * ``byTicker``：逐标的 ``pl_val``（券商持仓的未实现盈亏）与 ``mv``；
+    * ``contributionPct`` = ``pl_val / equity``（``equity`` = 分组 ``total_asset`` 或
+      各持仓 ``mv`` 合计），**不是**时间加权收益——口径原文写进 ``methods``；
+    * ``byIndustry``：用 ``industry_map``（``{MARKET.CODE: 行业名}``，来自富途板块链路）；
+      取不到行业的标的进 ``industryMissing`` 并单独汇总，**不并入某个行业**；
+    * ``byFactor``：恒为 ``null`` + ``factor_reason``（缺 PIT 建仓因子敞口）。
+    """
+    value = _value_of(positions_envelope) or {}
+    by_ticker, by_industry = [], {}
+    equity = 0.0
+    equity_found = False
+    missing = list(industry_missing or [])
+    for group in _account_groups(positions_envelope):
+        chain = _chain_of_group(group)
+        if chain is None or (market and chain != market):
+            continue
+        declared = v3_math.to_float(group.get("total_asset"))
+        if declared is not None:
+            equity += declared
+            equity_found = True
+        for row in group.get("positions") or []:
+            if not isinstance(row, dict):
+                continue
+            chain_of_row, key = _position_key(group, row)
+            if chain_of_row is None or (market and chain_of_row != market):
+                continue
+            mv = v3_math.to_float(row.get("mv"))
+            if mv is None:
+                mv = v3_math.to_float(row.get("market_value"))
+            pl = v3_math.to_float(row.get("pl_val"))
+            if pl is None:
+                pl = v3_math.to_float(row.get("unrealized_profit"))
+            ratio = v3_math.to_float(row.get("pl_ratio"))
+            if ratio is None:
+                ratio = v3_math.to_float(row.get("profit_ratio"))
+            entry = {"ticker": key, "market": chain_of_row,
+                     "name": row.get("stock_name") or row.get("name"),
+                     "marketValue": None if mv is None else v3_math.round_half_up(mv, 2),
+                     "plValue": None if pl is None else v3_math.round_half_up(pl, 2),
+                     "plRatioPct": None if ratio is None else v3_math.round_half_up(ratio, 4)}
+            industry = (industry_map or {}).get(key)
+            entry["industry"] = industry
+            if industry is None:
+                missing.append({"ticker": key, "reason": "行业映射缺失（full report）"})
+            else:
+                bucket = by_industry.setdefault(industry, {
+                    "industry": industry, "plValue": 0.0, "marketValue": 0.0, "tickers": []})
+                bucket["plValue"] += pl or 0.0
+                bucket["marketValue"] += mv or 0.0
+                bucket["tickers"].append(key)
+            by_ticker.append(entry)
+
+    if not equity_found:
+        for entry in by_ticker:
+            equity += entry["marketValue"] or 0.0
+    total_pl = sum(entry["plValue"] or 0.0 for entry in by_ticker)
+    for entry in by_ticker:
+        entry["contributionPct"] = _ratio_pct(entry["plValue"], equity)
+    industries = []
+    for bucket in by_industry.values():
+        industry_total_pl = sum(entry["plValue"] or 0.0
+                                for entry in by_ticker
+                                if entry.get("industry") == bucket["industry"])
+        industries.append({
+            "industry": bucket["industry"],
+            "plValue": v3_math.round_half_up(industry_total_pl, 2),
+            "marketValue": v3_math.round_half_up(bucket["marketValue"], 2),
+            "tickers": sorted(bucket["tickers"]),
+            "contributionPct": _ratio_pct(industry_total_pl, equity),
+        })
+    industries.sort(key=lambda item: (item["contributionPct"] is None,
+                                      -(item["contributionPct"] or 0.0)))
+    by_ticker.sort(key=lambda item: (item["contributionPct"] is None,
+                                     -(item["contributionPct"] or 0.0)))
+
+    payload = {
+        "basis": "券商持仓未实现盈亏（``pl_val``）",
+        "as_of": value.get("as_of"),
+        "source": value.get("source"),
+        "mode": value.get("mode"),
+        "market": market,
+        "equity": None if not equity else v3_math.round_half_up(equity, 2),
+        "totalPlValue": v3_math.round_half_up(total_pl, 2),
+        "totalContributionPct": _ratio_pct(total_pl, equity),
+        "positions": len(by_ticker),
+        "byTicker": by_ticker,
+        "byIndustry": industries,
+        "industryMissing": missing,
+        "byFactor": None,
+        "byPortfolio": None if total_return_pct is None else total_return_pct,
+        "methods": {
+            "ticker": ATTRIBUTION_TICKER_METHOD,
+            "industry": ATTRIBUTION_INDUSTRY_METHOD,
+            "industrySource": ATTRIBUTION_INDUSTRY_SOURCE if industry_map else None,
+            "factor": ATTRIBUTION_FACTOR_REASON,
+        },
+        "coverage": {
+            "positions": len(by_ticker),
+            "withIndustry": sum(1 for entry in by_ticker if entry.get("industry")),
+            "industryMissing": len([row for row in missing if row.get("ticker")]),
+            "note": ("覆盖 = 本市场分组里有持仓行且能取到行业映射的部分；"
+                     "取不到行业的持仓仍给出逐标的贡献，但不并入任何行业"),
+        },
+        "note": ("归因只用券商持仓的未实现盈亏与市值字段（不折算跨币种、不跨市场合并）；"
+                 "因子归因因缺 PIT 建仓敞口缺失（见 methods.factor）"),
+    }
+    if not by_ticker:
+        payload["error"] = {"code": "attribution/no-positions",
+                            "message": "本市场分组里没有持仓行 → 归因无数据"}
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# ④ 资金检查（事前风控：订单金额 vs 真实可用资金/购买力）
+# ---------------------------------------------------------------------------
+def funding_check_data(v3_run, *, order_value=None, symbol=None, side=None, qty=None,
+                       price=None, market=None, funds_envelope=None):
+    """下单金额 vs **真实**可用资金/购买力（``account_funds``；模拟盘为 max_power_long）。
+
+    返回 ``{ok, action, reason, orderValue, readings:{...}, funding_basis, ...}``：
+
+      * ``action="blocked"``：订单金额 > 该市场可用购买力（**读数与字段名一并给出**）；
+      * ``action="noted"``：资金充足（读数仍完整返回，供页面留痕）；
+      * ``action="unknown"``：资金/购买力取不到或订单金额算不出 → **不改既有闸门语义**，
+        只如实上报（调用方按 ``reason`` 决定是否退回人工确认）。
+
+    **只读**：只调 ``account_funds``；不触任何写/交易端点，不做任何用户确认。
+    """
+    value = v3_math.to_float(order_value)
+    if value is None:
+        qty_number = v3_math.to_float(qty)
+        price_number = v3_math.to_float(price)
+        if qty_number is not None and price_number is not None:
+            value = qty_number * price_number
+    if value is None and (qty is not None or price is not None):
+        reason = "下单金额算不出：qty/price 需同时为数值（或用 order_value 直接给金额）"
+        return {"ok": False, "orderValue": None, "action": "unknown", "reason": reason,
+                "error": {"code": "funds/bad-order", "message": reason}}
+
+    envelope = funds_envelope if funds_envelope is not None else _call(v3_run, "account_funds", {})
+    funds_value = _value_of(envelope) or {}
+    rows = []
+    for group in _account_groups(envelope):
+        chain = _chain_of_group(group)
+        if chain is None:
+            continue
+        cash = _parse_cash_fields(group.get("cash"))
+        reading = {
+            "market": chain, "acc_id": group.get("acc_id"),
+            "totalAssets": cash.get("total_assets", cash.get("total_asset")),
+            "buyingPower": cash.get("power", cash.get("max_power_long")),
+            "availableFunds": cash.get("available_funds"),
+            "cash": cash.get("cash", cash.get("balance")),
+            "buyingPowerField": ("power" if cash.get("power") is not None
+                                 else ("max_power_long" if cash.get("max_power_long") is not None
+                                       else None)),
+        }
+        rows.append(reading)
+    scoped = [row for row in rows if not market or row["market"] == market]
+    if market and not scoped:
+        available = sorted({row["market"] for row in rows})
+        reason = (f"market={market} 没有对应的券商资金分组"
+                  f"（账户列表里的市场：{'/'.join(available) or '空'}）")
+        return {"ok": False, "orderValue": value, "action": "unknown", "reason": reason,
+                "market": market, "accounts": rows,
+                "error": {"code": "funds/no-account", "message": reason}}
+
+    basis_values = [row["buyingPower"] for row in scoped if row["buyingPower"] is not None]
+    cash_values = [row["cash"] for row in scoped if row["cash"] is not None]
+    basis_total = sum(basis_values) if basis_values else None
+    cash_total = sum(cash_values) if cash_values else None
+    payload = {
+        "ok": True,
+        "market": market,
+        "mode": funds_value.get("mode"),
+        "source": funds_value.get("source"),
+        "as_of": funds_value.get("as_of"),
+        "orderValue": None if value is None else v3_math.round_half_up(value, 2),
+        "symbol": symbol, "side": side,
+        "readings": {"totalAssets": sum(row["totalAssets"] for row in scoped
+                                        if row["totalAssets"] is not None) or None,
+                     "buyingPower": basis_total, "cash": cash_total},
+        "accounts": scoped,
+        "funding_basis": "券商资金字段 max_power_long（sim）/ power（live），按市场分组求和",
+        "funding_basis_field": sorted({row["buyingPowerField"] for row in scoped
+                                       if row["buyingPowerField"]}),
+        "basisNote": ("购买力只按**同市场链**的账户求和（不跨市场/币种折算）；"
+                      "权益（total_asset/total_assets）不作可用资金"),
+        "action": "unknown", "reason": None,
+    }
+    if value is None:
+        payload["reason"] = "未提供订单金额（order_value 或 qty×price 至少给一个）"
+        return payload
+    if basis_total is None:
+        payload["reason"] = (f"上游资金读数里没有购买力字段（max_power_long/power/available_funds），"
+                             f"只有 {sorted({key for row in scoped for key in row})} → 资金检查 no-data，"
+                             f"不改既有闸门语义")
+        return payload
+    payload["shortfall"] = (v3_math.round_half_up(value - basis_total, 2)
+                            if value > basis_total else 0.0)
+    if value > basis_total:
+        payload["action"] = "blocked"
+        payload["reason"] = (f"订单金额 {value:.2f} > 该市场可用购买力 {basis_total:.2f}"
+                             f"（字段 {payload['funding_basis_field']}，来源 "
+                             f"{funds_value.get('source') or '—'}，as_of "
+                             f"{funds_value.get('as_of') or '—'}）→ 资金不足，建议退回人工/阻断")
+    else:
+        payload["action"] = "noted"
+        payload["reason"] = (f"订单金额 {value:.2f} ≤ 可用购买力 {basis_total:.2f}"
+                             f"（字段 {payload['funding_basis_field']}）→ 资金充足（仅留痕，不改既有判定）")
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# FR-STRAT-001 补全：因子注册表（六类因子 + 真实数据源 + PIT 口径 + 覆盖率）
+# ---------------------------------------------------------------------------
+#: 因子注册表：每个因子一条「真实数据源 + PIT 口径 + 方向」。**这是唯一事实来源**——
+#: ``/api/v3/factors/registry`` 与矩阵的 ``coverage`` 都从这里生成，不在别处再抄一份。
+#: ``class`` 取规格 FR-STRAT-001 的六类：value/momentum/quality/growth/sentiment/alternative。
+FACTOR_REGISTRY = tuple([
+    {"key": "mom_20", "class": "momentum", "direction": 1,
+     "source": "workbench/factors（日 K 动量，series→factors 工具链）",
+     "pit": "只用 ≤t 的日 K（因子在 t 收盘后可得）"},
+    {"key": "mom_60", "class": "momentum", "direction": 1,
+     "source": "workbench/factors（日 K 动量）", "pit": "只用 ≤t 的日 K"},
+    {"key": "vol_20", "class": "momentum", "direction": -1,
+     "source": "workbench/factors（20 日年化波动）", "pit": "只用 ≤t 的日 K"},
+    {"key": "trend", "class": "momentum", "direction": 1,
+     "source": "workbench/factors（close/MA20−1）", "pit": "只用 ≤t 的日 K"},
+    {"key": "rsi_14", "class": "momentum", "direction": -1,
+     "source": "workbench/factors（RSI14）", "pit": "只用 ≤t 的日 K"},
+    {"key": "liq_ratio", "class": "alternative", "direction": 1,
+     "source": "workbench/factors（20 日均量 / 60 日均量）", "pit": "只用 ≤t 的日 K 量"},
+    {"key": "mdd_60", "class": "momentum", "direction": 1,
+     "source": "workbench/factors（60 日最大回撤）", "pit": "只用 ≤t 的日 K"},
+    {"key": "pe_ttm", "class": "value", "direction": -1,
+     "source": "trading_core.factors（富途估值快照，失败退同花顺）",
+     "pit": "估值快照按取得时点；历史分位序列见 pe_ttm_pct"},
+    {"key": "pb", "class": "value", "direction": -1,
+     "source": "trading_core.factors（富途估值快照）", "pit": "同上"},
+    {"key": "ps", "class": "value", "direction": -1,
+     "source": "trading_core.factors（富途估值快照）", "pit": "同上"},
+    {"key": "peg", "class": "value", "direction": -1,
+     "source": "trading_core.factors（富途估值快照）", "pit": "同上"},
+    {"key": "pe_ttm_pct", "class": "value", "direction": -1,
+     "source": "trading_core.factors（富途历史分位）", "pit": "分位只用 ≤t 的历史"},
+    {"key": "pb_pct", "class": "value", "direction": -1,
+     "source": "trading_core.factors（富途历史分位）", "pit": "同上"},
+    {"key": "ps_pct", "class": "value", "direction": -1,
+     "source": "trading_core.factors（富途历史分位）", "pit": "同上"},
+    # ── 质量（FR-STRAT-001 缺失类 ①；实现口径与 plugins/workbench/python/quality.py 同源）──
+    {"key": "gross_margin", "class": "quality", "direction": 1,
+     "source": "trading-data/fundamentals（futu/statements 毛利/营收，公告日由 akshare/yjbb 合并）",
+     "pit": "只认 announced_at 非空且 ≤t 的行（报告期不可当可得日）"},
+    {"key": "net_margin", "class": "quality", "direction": 1,
+     "source": "trading-data/fundamentals（futu/statements 净利/营收）",
+     "pit": "同上"},
+    {"key": "roe", "class": "quality", "direction": 1,
+     "source": "plugins/workbench/python/quality.py → trading_datasource.fundamentals.load_returns"
+               "（Yahoo/AKShare 资产负债表，富途无此接口）",
+     "pit": "备用源返回最近报告期，须按 announced_at 截断；本矩阵当前**不联网取**，列为 null",
+     "live_source": "GET /api/v3/sentiment 同级的在线取数（本版未接线到矩阵）"},
+    {"key": "roa", "class": "quality", "direction": 1,
+     "source": "同上（总资产口径）", "pit": "同上",
+     "live_source": "同上"},
+    # ── 成长（缺失类 ②）──
+    {"key": "revenue_yoy", "class": "growth", "direction": 1,
+     "source": "trading-data/fundamentals（同报告期同比，2026-06-30 ↔ 2025-06-30）",
+     "pit": "两个报告期都须有 announced_at ≤t 的行；缺同期基期 → null（不跨期推算）"},
+    {"key": "net_profit_yoy", "class": "growth", "direction": 1,
+     "source": "trading-data/fundamentals（同报告期净利润同比）", "pit": "同上"},
+    # ── 情绪（缺失类 ③）──
+    {"key": "sentiment", "class": "sentiment", "direction": 1,
+     "source": "store.sentiment_snapshots（sentiment_snapshot 作业落库的 fin_sentiment/fin_news "
+               "原文）+ server.v3_nlp.score_documents 离线复算；在线口径见 GET /api/v3/sentiment",
+     "pit": "只取 date ≤t 的快照，且按 t 当日 00:00 UTC 做时间半衰（不含 t 之后资讯）"},
+    # ── 另类（缺失类 ④）──
+    {"key": "capital_flow", "class": "alternative", "direction": 1,
+     "source": "futu/capital_flow_history（近 20 个交易日主力净流入 / Σ|净额|）",
+     "pit": "上游按日聚合的资金流水；只用请求时刻已发布的交易日"},
+    {"key": "short_interest", "class": "alternative", "direction": -1,
+     "source": "futu/short_interest（空头占比；仅 HK/US 可卖空证券，A 股上游无数据）",
+     "pit": "上游返回的最新一期（PIT 由上游披露节奏决定，响应里带 as_of）"},
+])
+
+#: 因子类别 → 中文标签（页面与响应共用，避免两边各写一份）。
+FACTOR_CLASS_LABELS = {"value": "价值", "momentum": "动量", "quality": "质量",
+                       "growth": "成长", "sentiment": "情绪", "alternative": "另类"}
+
+
+def factor_registry_data(matrix=None):
+    """因子注册表 + **真实覆盖率**（每类因子有几个标的真的有值）。
+
+    ``matrix`` 给定时（:func:`factors_matrix_data` 的 ``matrix``）用它统计覆盖；
+    不给则只返回注册表本身（``coverage.available=false`` + 原因）。
+    """
+    coverage = []
+    raw_rows = (matrix or {}).get("raw") if isinstance(matrix, dict) else None
+    if not isinstance(raw_rows, list):
+        return {"registry": [dict(entry) for entry in FACTOR_REGISTRY],
+                "classes": dict(FACTOR_CLASS_LABELS),
+                "coverage": {"available": False,
+                             "reason": "未提供因子矩阵（先请求 /api/v3/factors/matrix）",
+                             "factors": []}}
+    by_ticker = {row.get("ticker"): (row.get("factors") or {})
+                 for row in raw_rows if isinstance(row, dict)}
+    for entry in FACTOR_REGISTRY:
+        key = entry["key"]
+        present = [ticker for ticker, values in by_ticker.items()
+                   if values.get(key) is not None]
+        coverage.append({
+            "key": key, "class": entry["class"], "classLabel": FACTOR_CLASS_LABELS[entry["class"]],
+            "covered": len(present), "total": len(by_ticker),
+            "coveragePct": (v3_math.round_half_up(len(present) / len(by_ticker) * 100.0, 2)
+                            if by_ticker else None),
+            "tickers": sorted(present),
+            "missingTickers": sorted(ticker for ticker in by_ticker if ticker not in present),
+            "source": entry["source"], "pit": entry["pit"],
+            "direction": entry["direction"],
+        })
+    return {"registry": [dict(entry) for entry in FACTOR_REGISTRY],
+            "classes": dict(FACTOR_CLASS_LABELS),
+            "coverage": {"available": True, "tickers": sorted(by_ticker), "factors": coverage}}
+
+
 # ---------------------------------------------------------------------------
 # 路由注册
 # ---------------------------------------------------------------------------
@@ -1134,35 +2615,93 @@ def register(app, v3_run, home):
     @app.get("/api/v3/risk/analytics")
     async def v3_risk_analytics(limit: int = 250, confidence: float = 0.95,
                                 benchmark: Optional[str] = None,
-                                weights: Optional[str] = None, market: str = "SH"):
+                                weights: Optional[str] = None, market: str = "SH",
+                                details: bool = True):
         """组合风险量：history-simulation VaR/CVaR + Beta/Alpha/IR + Kupiec POF + 净值曲线。
 
         ``market`` 缺省 ``SH``（保持既有 A 股口径）；组合＝该市场宇宙等权（或该市场
         frozen 计划目标）；该市场无宇宙 → ``market/no-universe``。``benchmark`` 缺省
         按市场实测选取（SH.000300 / HK.800000 / US.SPY，逐级降级；全不可用 → null 且
         beta/alpha/ir 为 null）；显式给出时原样使用。
+
+        ``details``（缺省 ``true``）：附带 FR-EXEC-003 补全块 ``risk_detail``（杠杆率 /
+        流动性风险 / 绩效归因 / 资金检查；全部只读）。``details=false`` 时响应与历史逐字段
+        一致，便于只要风险量的调用方省掉额外的账户读数。
         """
         def work():
             return risk_analytics(v3_run, home, limit=limit, confidence=confidence,
-                                  benchmark=benchmark, weights_raw=weights, market=market)
+                                  benchmark=benchmark, weights_raw=weights, market=market,
+                                  details=bool(details))
 
         return _ok(await asyncio.to_thread(work))
 
     @app.get("/api/v3/factors/matrix")
     async def v3_factors_matrix(tickers: Optional[str] = None, factor: str = "mom_20",
                                 forward_days: Optional[int] = None,
-                                forward: Optional[int] = None, market: str = "SH"):
-        """横截面因子 z 矩阵 + 因子 IC 序列（``forward`` 与 ``forward_days`` 都接受，缺省 5）。
+                                forward: Optional[int] = None, market: str = "SH",
+                                classes: str = "", as_of: str = ""):
+        """横截面因子 z 矩阵 + 因子 IC 序列 + 六类因子的真实覆盖率（``factors`` 字段）。
 
         ``market`` 缺省 ``SH``：未给 ``tickers`` 时标的取该市场宇宙（与 watchlist 同一份
-        解析）；显式 ``tickers`` 优先（此时 ``market`` 仅作标注）。
+        解析）；显式 ``tickers`` 优先（此时 ``market`` 仅作标注）。``classes`` 选择要并入的
+        新因子类别（``quality,growth,sentiment`` 缺省；``all`` 含 ``alternative`` 实时取数；
+        ``none`` 只要价量/估值列）。``as_of``（``YYYY-MM-DD``）是 PIT 上界，缺省今天（UTC）。
         """
         chosen_forward = forward if forward is not None else forward_days
 
         def work():
             return factors_matrix_data(v3_run, home, tickers_raw=tickers, factor=factor,
                                        forward_days=chosen_forward if chosen_forward is not None else 5,
-                                       market=market)
+                                       market=market, classes=classes or None,
+                                       as_of=as_of or None)
+
+        return _ok(await asyncio.to_thread(work))
+
+    @app.get("/api/v3/factors/registry")
+    async def v3_factors_registry(tickers: Optional[str] = None, market: str = "SH",
+                                 as_of: str = "", classes: str = ""):
+        """因子注册表（**六类因子 + 真实数据源 + PIT 口径**）+ 逐因子覆盖率。
+
+        覆盖率与 ``/api/v3/factors/matrix`` **同一份计算**（不为页面另造一套统计）；
+        默认只算本地三类（quality/growth/sentiment），``classes=all`` 才把实时另类因子
+        （``capital_flow``/``short_interest``）一起取。
+        """
+        def work():
+            matrix = factors_matrix_data(v3_run, home, tickers_raw=tickers, factor="mom_20",
+                                         forward_days=5, market=market,
+                                         classes=classes or None, as_of=as_of or None)
+            if not matrix.get("ok"):
+                return matrix
+            registry = factor_registry_data(matrix.get("matrix"))
+            return {"ok": True, "market": matrix.get("market"), "asOf": matrix.get("asOf"),
+                    "classes": matrix.get("classes"),
+                    "registry": registry["registry"], "classLabels": registry["classes"],
+                    "coverage": registry["coverage"],
+                    "factorsMissing": matrix.get("factorsMissing"),
+                    "sources": matrix.get("sources")}
+
+        return _ok(await asyncio.to_thread(work))
+
+    @app.get("/api/v3/risk/funding-check")
+    async def v3_risk_funding_check(order_value: Optional[float] = None,
+                                    symbol: str = "", side: str = "",
+                                    qty: Optional[float] = None, price: Optional[float] = None,
+                                    market: str = ""):
+        """**事前风控·资金检查（只读）**：订单金额 vs 真实可用购买力（``account_funds``）。
+
+        金额 = ``order_value``，或 ``qty × price``。``market`` 给定时只按该市场链的账户分组
+        求和（不跨币种折算）。资金不足 → ``action="blocked"`` + 读数与来源；不够读数 →
+        ``action="unknown"`` + 原因（**不改既有下单前闸门语义**，只作读数与分级建议）。
+        """
+        def work():
+            code = None
+            if str(market or "").strip():
+                code = v3_universe.normalize_market(market)
+                if code is None:
+                    return _error("market/bad-market", "market 需为 SH / HK / US",
+                                  market=str(market))
+            return funding_check_data(v3_run, order_value=order_value, symbol=symbol or None,
+                                      side=side or None, qty=qty, price=price, market=code)
 
         return _ok(await asyncio.to_thread(work))
 

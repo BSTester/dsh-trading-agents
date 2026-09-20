@@ -190,6 +190,12 @@ discovery 模式**多花的那一次往返**：`list_tools` 默认一页 20 张�
 * **未知工具不静默**：`call_tool(name='不存在')` → `mcp/unknown-tool`（isError=false 的
   业务失败信封）+ 「请先用 list_tools 检索」提示；实参名/必填不对 → `mcp/bad-arguments`。
 
+> ⚠️ **边界澄清（2026-09-21 起）**：本节说的「代理不能绕过约束」指**平台服务侧的既有闸门**
+> （凭据封死、`/api/v3/*` 无交易写端点）；它**不**等于「代理面上的写工具不可达」——
+> 全局 `/mcp` 的 `call_tool` 在缺省 `discovery` 面下仍可转发工作台写工具
+> （`trade_place` / `research_tasks_claim` / …），这正是 1.5.5 只读面要解决的漏洞
+> （真机后果见 `docs/e2e-and-data-gaps.md` §22.6）。决策 profile 的硬边界在 `/mcp/ro`。
+
 #### 1.5.4 怎么切换（一行）
 
 ```bash
@@ -201,11 +207,45 @@ QUANT_MCP_SURFACE=direct scripts/platform_service.sh restart
 # 非法取值直接报错（不静默退回某个模式）
 ```
 
-profile 侧（`platform/install/quant-headless/cordis.patch.yml` 的 `quant-platform-mcp` 行）
-不需要改：两种模式都是同一个 `/mcp`。详见 `platform/install/quant-headless/README.md`
-的「一之补：工具面模式」。
+profile 侧（`platform/install/*/cordis.patch.yml` 的 `quant-platform-mcp` 行）**已指向
+`/mcp/ro`**（见 1.5.5），不受此开关影响。`QUANT_MCP_SURFACE` 只改**全局 `/mcp`** 的模式。
+详见 `platform/install/quant-headless/README.md` 的「一之补：工具面模式」。
 
-#### 1.5.5 `v3_*` 工具表
+#### 1.5.5 只读面 `/mcp/ro`：两个 MCP 端点对照（2026-09-21 漏洞修复）
+
+**问题**：缺省 `discovery` 面下，全局 `/mcp` 的 `tools/list` 只有 6 件，写/交易工具的唯一
+到达路径是转发器 `call_tool`；而 Harness 侧白名单钩子按**工具名**匹配
+（`mcp__quantwb__trade_place` 等 42 项），对 `mcp__quantwb__call_tool` 既不在名单里、也
+**看不到被转发的内层名字**。2026-09-21T00:01Z 的一次线上 quant-headless 决策唤醒经它
+**误领了 2 条值班队列任务**（`docs/e2e-and-data-gaps.md` §22.6 有 stderr 与 DB 行证据）。
+不能全局禁掉 `call_tool`：官方 `headless` profile 的值班链
+（`research_duty.sh` → `research_tasks_claim/report`）走的就是全局 `/mcp`。
+
+**修法**：`app.py` 挂第二个 MCP 端点 **`/mcp/ro`**（同一实现、同一目录，表面恒为
+discovery 形态），唯一差异是 `call_tool` 在转发**之前**按**注册表 annotations** 判定
+（`readOnlyHint=true` 的内层工具 + 4 件直连保留件；不维护第二份名单）。两个决策 profile
+（quant-headless / quant-sdk）的 `quant-platform-mcp` 已指向 `/mcp/ro`。
+
+| | 全局 `/mcp`（值班链/人用） | 只读面 `/mcp/ro`（决策 profile 用） |
+|---|---|---|
+| `tools/list` | `QUANT_MCP_SURFACE` 决定（缺省 discovery = 6 件） | 恒 6 件（discovery 形态），目录与 `/mcp` **同一份** |
+| `call_tool` 转发写类内层工具 | ✅ 可达（服务侧闸门只剩业务确认链） | ❌ `mcp/denied-by-policy`（handler 零调用，先于实参校验） |
+| `call_tool` 转发只读 `v3_*` | ✅ | ✅ 响应与 `/mcp` 直连**逐字段一致**（同一函数对象） |
+| 直连 4 件（snapshot/admin_status/v3_gateway/v3_tools） | ✅ | ✅（同一函数对象、同一份标注） |
+| 非放行工具的检索卡片 | 无特殊标注 | `roCallable=false` + 「只读面不可调用」（防反复尝试） |
+| 凭据 save/clear | 桥内封死（`v3/credentials-web-only`） | **双层**：先被 annotations 闸门拒，桥内封死仍在 |
+| 鉴权 | token 中间件（`/mcp`） | 同一中间件按 `/mcp/` 前缀覆盖（无旁路） |
+
+**放行判据的口径（为什么有些只读工具也调不了）**：判据现读注册表 annotations
+（`mcp_discovery.registry_annotations`）。桥接 `v3_*` 写类（`v3_oms_sync` / `v3_strategy_run` /
+`v3_sdk_prompt` / `v3_credentials`）标了 `readOnlyHint=false` → 拒；基础面工具**本来就不发布
+annotations** → 一律拒（**fail-closed**：包括 `series` 这类事实上只读的工作台工具）。决策取数
+走带只读标注的 `v3_*` 桥接件（`v3_market`/`v3_news`/`v3_events`/`v3_sentiment`/…），
+`/mcp/ro` 的 `list_tools` 卡片 `roCallable` 字段是「能不能调」的权威判据。测试：
+`platform/tests/test_mcp_discovery.py::ReadonlySurfaceTests`（写类拒绝 + spy 零调用 +
+双面等价 + 卡片标注 + token 鉴权）。
+
+#### 1.5.6 `v3_*` 工具表
 
 | 工具 | 路由 | 只读 | 入参 | 本模式是否直连（`discovery`） |
 |---|---|---|---|---|

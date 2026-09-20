@@ -394,6 +394,52 @@ class DiscoverySurfaceTests(unittest.TestCase):
 
 
 # ---------------------------------------------------------------------------
+# 1c. 只读面 /mcp/ro（2026-09-21）：第二个传输端点，不影响路由⇄工具双射
+# ---------------------------------------------------------------------------
+class ReadonlySurfaceParityTests(unittest.TestCase):
+    """``/mcp/ro`` 的存在不给既有推导式添乱。
+
+    它是一条额外的**传输路由**（SDK Route 精确匹配 ``/mcp/ro``），不在 ``/api/v3/*`` 里，
+    因此「``/api/v3/*`` 路由路径 ⇄ 桥接工具 endpoint」的双射推导式一字不改仍然成立；
+    两个 MCP 端点的注册面互不相干，能力目录是同一份。
+    """
+
+    def test_readonly_endpoint_does_not_disturb_route_tool_bijection(self):
+        home = Path(tempfile.mkdtemp(prefix="v3-mcp-ro-parity-"))
+        try:
+            app, _calls = build_offline_app(home, surface=mcp_discovery.DISCOVERY)
+            bridge = app.state.v3_mcp_bridge
+            # /mcp/ro 恰好一条传输路由，且不是 /api/v3/* 路由
+            ro_routes = [route for route in app.routes
+                         if getattr(route, "path", "") == "/mcp/ro"]
+            self.assertEqual(len(ro_routes), 1)
+            route_paths = sorted({route.path for route in app.routes
+                                  if getattr(route, "path", "").startswith("/api/v3/")})
+            # 同一个推导式照常成立（本模块第 1 层的那套断言，一字未改）
+            report = assert_parity(route_paths, [d.endpoint for d in bridge.definitions])
+            self.assertEqual(report, {"missing_tools": [], "orphan_tools": []})
+            self.assertNotIn("/mcp/ro", route_paths)
+            self.assertEqual(len(bridge.definitions), len(route_paths))
+            # 两个端点的注册面互不相干：/mcp（discovery）6 件；/mcp/ro 也 6 件
+            expected = list(mcp_discovery.DIRECT_KEEP) + list(mcp_discovery.PROXY_NAMES)
+            self.assertEqual(registered_names(app.state.mcp), expected)
+            self.assertEqual(registered_names(app.state.mcp_ro), expected)
+            # 只读面的目录与 /mcp 面目录是同一份（同一实现、同一目录）
+            self.assertEqual(set(app.state.mcp_ro_discovery.catalog),
+                             set(app.state.mcp_discovery.catalog))
+            # 只读面不随 QUANT_MCP_SURFACE 变：direct 模式下它照样是 6 件 discovery 形态
+            direct, _ = build_offline_app(home, surface=mcp_discovery.DIRECT)
+            self.assertEqual(registered_names(direct.state.mcp_ro), expected)
+            self.assertIsNone(direct.state.mcp_discovery)
+            self.assertEqual(direct.state.mcp_ro_discovery.catalog,
+                             direct.state.mcp_ro_discovery.catalog)
+        finally:
+            import shutil
+            shutil.rmtree(home, ignore_errors=True)
+            _silence_loggers()
+
+
+# ---------------------------------------------------------------------------
 # 2. 真实协议调用（tools/list + tools/call）——两种模式各跑一遍
 # ---------------------------------------------------------------------------
 class ProtocolCallTests(unittest.TestCase):

@@ -88,6 +88,18 @@ CACHE_TTL_MS = {
     "watchlist_groups": 5 * 60_000,
     "f10_detail": 30 * 60_000,
     "derivative_detail": 30 * 60_000,
+    # FR-DATA-003：PIT 读数端点（**唯一入口** ``server.data.cache``，2026-09-20）。
+    # 这三条是 ``data.cache`` 的 TTL 来源——PIT 层**不自造第二张 TTL 表**，键的原料
+    # （含 as_of / mode / 标的 / 数据源身份）由 ``data.cache._payload`` 构造。
+    # 档位按**数据变化速度**取，与同类面板端点同量级：
+    #   * pit-bars 10m：本地日线按交易日收盘写一次；
+    #   * pit-fundamentals 30m：财报按公告日合并，与 ``factors`` 同档；
+    #   * pit-sentiment 5m：快照按日采集，与 ``sentiment-history`` 同档。
+    # 注意：**上游工具取的 K 线（fetch 路径）不走这三条 TTL**——``series`` 端点已有
+    # 10 分钟 TTL，再叠一层就是第二套过期机制（理由见 ``data.cache`` 模块 docstring 三）。
+    "pit-bars": 10 * 60_000,
+    "pit-fundamentals": 30 * 60_000,
+    "pit-sentiment": 5 * 60_000,
 }
 
 # endpoints.js:46-65 的端点最小字段（plan-execute 是动作端点，不进缓存形状表）

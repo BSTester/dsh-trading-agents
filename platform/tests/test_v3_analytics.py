@@ -17,6 +17,7 @@
 """
 
 import asyncio
+import copy
 import datetime as dt
 import json
 import math
@@ -31,6 +32,8 @@ TRADING_DAYS = 252
 ROUTES = {
     ("GET", "/api/v3/risk/analytics"),
     ("GET", "/api/v3/factors/matrix"),
+    ("GET", "/api/v3/factors/registry"),
+    ("GET", "/api/v3/risk/funding-check"),
     ("GET", "/api/v3/strategy"),
     ("POST", "/api/v3/strategy/run"),
     ("GET", "/api/v3/ml/sweep"),
@@ -849,7 +852,8 @@ class TestStrategyRoute(RouteCase):
         self.assertEqual(long_proposal["action"], "增持")
         self.assertEqual(long_proposal["targetWeightPct"], 2.0)
         self.assertEqual(long_proposal["riskLevel"], "低")
-        self.assertIn("综合动量 z=", long_proposal["basis"])
+        self.assertIn("扩展综合 z=", long_proposal["basis"])
+        self.assertIn("动量 z=", long_proposal["basis"])
         self.assertIn("mom_20=0.04", long_proposal["basis"])
         self.assertEqual(summary["proposals"][2]["action"], "减持")
         self.assertEqual(summary["proposals"][2]["targetWeightPct"], 0)
@@ -1156,9 +1160,16 @@ class TestRegisterRoutes(RouteCase):
         app = self._app(run)
         get_kwargs = {
             "/api/v3/risk/analytics": {"limit": 250, "confidence": 0.95,
-                                       "benchmark": "SH.000300", "weights": None},
+                                       "benchmark": "SH.000300", "weights": None,
+                                       "market": "SH", "details": True},
             "/api/v3/factors/matrix": {"tickers": None, "factor": "mom_20",
-                                       "forward_days": None, "forward": None},
+                                       "forward_days": None, "forward": None,
+                                       "market": "SH", "classes": "", "as_of": ""},
+            "/api/v3/factors/registry": {"tickers": None, "market": "SH",
+                                         "as_of": "", "classes": ""},
+            "/api/v3/risk/funding-check": {"order_value": 10000.0, "symbol": "",
+                                           "side": "", "qty": None, "price": None,
+                                           "market": ""},
             "/api/v3/strategy": {},
             "/api/v3/ml/sweep": {"ticker": "SH.600519", "windows": "5",
                                  "rebalance": "5", "limit": 500},
@@ -1526,6 +1537,498 @@ class MarketScopeTests(RouteCase):
             market="HK")))
         self.assertEqual(shown["market"], "HK")
         self.assertIsNone(shown["run"])
+
+
+# ---------------------------------------------------------------------------
+# FR-EXEC-003 补全：杠杆率 / 流动性风险 / 绩效归因 / 资金检查
+# ---------------------------------------------------------------------------
+class RiskSubItemUnitTests(unittest.TestCase):
+    """四个子项的**纯函数**口径（构造数据，不打网络、不读真实库）。"""
+
+    def test_leverage_uses_real_account_fields_and_declares_missing_margin_debt(self):
+        funds = {"ok": True, "value": {"mode": "sim", "source": "futu/sim_trade_cash_info",
+                                       "as_of": "2026-09-20T00:00:00Z",
+                                       "groups": [
+                                           {"acc_id": "1", "market": 3,
+                                            "cash": {"balance": "1000", "hold": "0",
+                                                     "max_power_long": "2000",
+                                                     "total_asset": "3000",
+                                                     "long_mv": "1500"}},
+                                           {"acc_id": "2", "market": 9,     # 表外 market_id
+                                            "cash": {"total_asset": "999", "mv": "999"}}]}}
+        positions = {"ok": True, "value": {"groups": [
+            {"acc_id": "1", "market": 3,
+             "positions": [{"symbol": "600000", "mv": "1500"}]}]}}
+        result = v3_analytics.portfolio_leverage(None, market="SH", funds_envelope=funds,
+                                                 positions_envelope=positions)
+        self.assertEqual(result["readings"]["totalAssets"], 3000.0)
+        self.assertEqual(result["readings"]["longMarketValue"], 1500.0)
+        self.assertEqual(result["readings"]["buyingPower"], 2000.0)
+        self.assertEqual(result["leverage_ratio_pct"], 50.0)
+        self.assertEqual(result["buying_power_ratio_pct"], 66.6667)
+        self.assertEqual(result["cash_ratio_pct"], 33.3333)
+        # 上游没有融资负债字段 → 这一项**是 null**（no-data），不是 0
+        self.assertIsNone(result["margin_debt_pct"])
+        self.assertIn("没有独立的融资负债", result["provider_note"])
+        self.assertEqual(len(result["accounts"]), 1, "表外 market_id 不猜市场")
+
+    def test_leverage_reports_no_data_without_equity(self):
+        funds = {"ok": True, "value": {"groups": [{"acc_id": "1", "market": 3,
+                                                   "cash": {"max_power_long": "2000"}}]}}
+        result = v3_analytics.portfolio_leverage(None, market="SH", funds_envelope=funds,
+                                                 positions_envelope={"ok": True, "value": {}})
+        self.assertIsNone(result["leverage_ratio_pct"])
+        self.assertEqual(result["error"]["code"], "leverage/no-equity")
+        self.assertIn("杠杆率 = null", result["error"]["message"])
+
+    def test_liquidity_participation_and_grades(self):
+        bars = [{"t": f"2026-06-{index:02d}", "c": 10.0, "v": 100000.0}
+                for index in range(1, 26)]
+        low = v3_analytics.liquidity_risk(30000.0, bars, ticker="SH.600000")
+        self.assertEqual(low["adv_observations"], 20)
+        self.assertEqual(low["adv_amount"], 1000000.0)
+        self.assertEqual(low["participation_pct"], 3.0)
+        self.assertEqual(low["grade"], "auto")
+        mid = v3_analytics.liquidity_risk(70000.0, bars)
+        self.assertEqual(mid["grade"], "manual")
+        high = v3_analytics.liquidity_risk(200000.0, bars)
+        self.assertEqual(high["grade"], "blocked")
+        self.assertIn("拆分", high["grade_note"])
+        # 缺 ADV → null + 原因（不是 0）；只有 5 根 K 线时**不拿半截窗口冒充 20 日 ADV**
+        none = v3_analytics.liquidity_risk(1000.0, bars[:5])
+        self.assertIsNone(none["participation_pct"])
+        self.assertEqual(none["grade"], "no-data")
+        self.assertIn("不满窗口", none["reason"])
+        self.assertEqual(none["adv_observations"], 5)
+        empty = v3_analytics.liquidity_risk(1000.0, [])
+        self.assertIn("K 线不足", empty["reason"])
+        # 缺订单金额 → null + 原因
+        no_value = v3_analytics.liquidity_risk(None, bars)
+        self.assertIsNone(no_value["participation_pct"])
+        self.assertIn("订单金额缺失", no_value["reason"])
+
+    def test_attribution_groups_by_ticker_and_industry_and_admits_factor_gap(self):
+        positions = {"ok": True, "value": {
+            "as_of": "2026-09-20", "source": "futu/sim_trade_position_list", "mode": "sim",
+            "groups": [{"acc_id": "1", "market": 3, "total_asset": "100000",
+                        "positions": [
+                            {"symbol": "600000", "stock_name": "浦发银行", "mv": "30000",
+                             "pl_val": "1500", "pl_ratio": "5.0"},
+                            {"symbol": "600009", "stock_name": "上海机场", "mv": "20000",
+                             "pl_val": "-500", "pl_ratio": "-2.0"},
+                            {"symbol": "600010", "stock_name": "包钢股份", "mv": "10000",
+                             "pl_val": "200", "pl_ratio": "2.0"}]}]}}
+        result = v3_analytics.portfolio_attribution(
+            positions, market="SH", industry_map={"SH.600000": "银行", "SH.600009": "机场"})
+        self.assertEqual(result["equity"], 100000.0)
+        self.assertEqual(result["totalPlValue"], 1200.0)
+        self.assertEqual(result["totalContributionPct"], 1.2)
+        by_ticker = {row["ticker"]: row for row in result["byTicker"]}
+        self.assertEqual(by_ticker["SH.600000"]["contributionPct"], 1.5)
+        self.assertEqual(by_ticker["SH.600010"]["industry"], None)
+        industries = {row["industry"]: row for row in result["byIndustry"]}
+        self.assertEqual(industries["银行"]["plValue"], 1500.0)
+        self.assertEqual(industries["机场"]["plValue"], -500.0)
+        self.assertEqual(result["coverage"]["withIndustry"], 2)
+        self.assertEqual(result["coverage"]["industryMissing"], 1)
+        # 因子归因：**如实缺失**（不是 0，也不是均值）
+        self.assertIsNone(result["byFactor"])
+        self.assertIn("PIT 建仓因子敞口", result["methods"]["factor"])
+
+    def test_attribution_without_positions_is_an_error_not_zeros(self):
+        result = v3_analytics.portfolio_attribution(
+            {"ok": True, "value": {"groups": [{"acc_id": "1", "market": 3,
+                                               "positions": []}]}}, market="SH")
+        self.assertEqual(result["byTicker"], [])
+        self.assertEqual(result["error"]["code"], "attribution/no-positions")
+        self.assertIsNone(result["totalContributionPct"])
+
+    def test_funding_check_blocks_over_buying_power_and_reads_source(self):
+        funds = {"ok": True, "value": {
+            "mode": "sim", "source": "futu/sim_trade_cash_info", "as_of": "2026-09-20T00:00:00Z",
+            "groups": [{"acc_id": "1", "market": 3,
+                        "cash": {"balance": "50000", "max_power_long": "60000",
+                                 "total_asset": "80000"}},
+                       {"acc_id": "2", "market": 1,
+                        "cash": {"balance": "1000", "max_power_long": "1000",
+                                 "total_asset": "2000"}}]}}
+        short = v3_analytics.funding_check_data(None, order_value=1000.0, market="SH",
+                                                funds_envelope=funds)
+        self.assertTrue(short["ok"])
+        self.assertEqual(short["action"], "noted")
+        self.assertEqual(short["readings"]["buyingPower"], 60000.0, "只算同市场链")
+        self.assertEqual(short["funding_basis_field"], ["max_power_long"])
+        over = v3_analytics.funding_check_data(None, order_value=90000.0, market="SH",
+                                               funds_envelope=funds)
+        self.assertEqual(over["action"], "blocked")
+        self.assertEqual(over["shortfall"], 30000.0)
+        self.assertIn("60000", over["reason"])
+        self.assertIn("futu/sim_trade_cash_info", over["reason"])
+
+    def test_funding_check_no_data_and_bad_order(self):
+        empty = v3_analytics.funding_check_data(None, order_value=1000.0, market="SH",
+                                                funds_envelope={"ok": True, "value": {}})
+        self.assertEqual(empty["action"], "unknown")
+        self.assertEqual(empty["error"]["code"], "funds/no-account")
+        no_power = v3_analytics.funding_check_data(
+            None, order_value=1000.0, market="SH",
+            funds_envelope={"ok": True, "value": {"groups": [
+                {"acc_id": "1", "market": 3, "cash": {"total_asset": "80000"}}]}})
+        self.assertEqual(no_power["action"], "unknown")
+        self.assertIn("no-data", no_power["reason"])
+        bad = v3_analytics.funding_check_data(None, qty=100.0, market="SH")
+        self.assertFalse(bad["ok"])
+        self.assertEqual(bad["error"]["code"], "funds/bad-order")
+        computed = v3_analytics.funding_check_data(
+            None, qty=100.0, price=10.0, market="SH",
+            funds_envelope={"ok": True, "value": {"groups": [
+                {"acc_id": "1", "market": 3, "cash": {"max_power_long": "500"}}]}})
+        self.assertEqual(computed["orderValue"], 1000.0)
+        self.assertEqual(computed["action"], "blocked")
+        self.assertEqual(computed["shortfall"], 500.0)
+
+
+class RiskDetailRouteTests(RouteCase):
+    """``risk/analytics`` 的 ``risk_detail`` 块：四个子项真的进了响应，缺数据是 null + 原因。"""
+
+    def _run(self, funds=None, positions=None, days=60):
+        closes = closes_from([0.01 if index % 2 == 0 else -0.008 for index in range(days - 1)])
+
+        def series(payload):
+            return series_envelope(make_bars(closes), ticker=payload["ticker"])
+
+        return FakeRun({
+            "series": series,
+            "plan": {"ok": True, "value": {"plans": []}},
+            "equity": {"ok": True, "value": {"current": 1000000.0}},
+            "positions": positions if positions is not None else {"ok": True, "value": {}},
+            "account_funds": funds if funds is not None else {"ok": True, "value": {}},
+        })
+
+    def test_detail_block_present_with_all_four_items(self):
+        result = v3_analytics.risk_analytics(self._run(), self.home,
+                                             weights_raw='{"T0": 1, "T1": 1}', market=None)
+        self.assertTrue(result["ok"], result)
+        detail = result["risk_detail"]
+        for key in ("leverage", "liquidity", "attribution", "fundsCheck", "errors", "sources"):
+            self.assertIn(key, detail, key)
+        self.assertEqual(detail["errors"], [])
+        # 名义单金额 = NAV × 2%（写在响应里，供页面原样展示）
+        self.assertIn("名义单金额", detail["nominalOrderNote"])
+        self.assertEqual(detail["liquidity"]["order_value"], 20000.0)
+        self.assertEqual(detail["liquidity"]["adv_window_days"], 20)
+
+    def test_detail_block_can_be_turned_off(self):
+        run = self._run()
+        result = v3_analytics.risk_analytics(run, self.home, weights_raw='{"T0": 1, "T1": 1}',
+                                             market=None, details=False)
+        self.assertNotIn("risk_detail", result)
+        self.assertEqual([name for name, _ in run.calls if name == "account_funds"], [])
+
+    def test_missing_data_stays_null_with_a_reason(self):
+        funds = {"ok": True, "value": {
+            "mode": "live", "source": "futu/account_funds",
+            "groups": [{"acc_id": "L", "market": 3, "cash": {"total_assets": "900000"}}]}}
+        positions = {"ok": True, "value": {
+            "as_of": "2026-09-20", "source": "futu/account_positions", "mode": "live",
+            "groups": [{"acc_id": "L", "market": 3, "total_asset": "900000",
+                        "positions": [{"symbol": "SH.600000", "mv": "120000",
+                                       "pl_val": "5000"}]}]}}
+        result = v3_analytics.risk_analytics(self._run(funds=funds, positions=positions),
+                                             self.home, weights_raw='{"T0": 1, "T1": 1}',
+                                             market=None)
+        detail = result["risk_detail"]
+        # 杠杆率有读数（总资产 + 持仓市值都是真字段）
+        self.assertEqual(detail["leverage"]["readings"]["totalAssets"], 900000.0)
+        self.assertEqual(detail["leverage"]["leverage_ratio_pct"], 13.3333)
+        self.assertIsNone(detail["leverage"]["margin_debt_pct"])
+        # 归因有逐标的读数；因子维度是 null + 原因
+        self.assertEqual(detail["attribution"]["positions"], 1)
+        self.assertIsNone(detail["attribution"]["byFactor"])
+        # 资金检查：上游没有购买力字段 → unknown（no-data），不改判定
+        self.assertEqual(detail["fundsCheck"]["action"], "unknown")
+        self.assertIn("no-data", detail["fundsCheck"]["reason"])
+
+
+# ---------------------------------------------------------------------------
+# FR-STRAT-001 补全：四类因子（质量/成长/情绪/另类）+ 覆盖率
+# ---------------------------------------------------------------------------
+def _make_trading_store(home, *, fundamentals=None, sentiments=None):
+    """建一个**最小**交易库（只含本测试用到的两张表），用于 PIT/覆盖率用例。"""
+    import sqlite3 as _sqlite3
+    path = Path(home) / "trading-data"
+    path.mkdir(parents=True, exist_ok=True)
+    conn = _sqlite3.connect(str(path / "trading.sqlite"))
+    conn.executescript(
+        "CREATE TABLE IF NOT EXISTS fundamentals(symbol TEXT NOT NULL, field TEXT NOT NULL,"
+        " period_end TEXT NOT NULL, announced_at TEXT, announced_source TEXT,"
+        " value REAL NOT NULL, source TEXT NOT NULL,"
+        " PRIMARY KEY(symbol, field, period_end));"
+        "CREATE TABLE IF NOT EXISTS sentiment_snapshots(date TEXT NOT NULL,"
+        " symbol TEXT NOT NULL, source TEXT NOT NULL, payload TEXT NOT NULL,"
+        " fetched_at TEXT NOT NULL, PRIMARY KEY(date, symbol, source));")
+    for row in fundamentals or []:
+        conn.execute("INSERT OR REPLACE INTO fundamentals(symbol,field,period_end,"
+                     "announced_at,announced_source,value,source) VALUES(?,?,?,?,?,?,?)",
+                     (row["symbol"], row["field"], row["period_end"], row.get("announced_at"),
+                      "akshare/yjbb", row["value"], "futu/statements"))
+    for row in sentiments or []:
+        conn.execute("INSERT OR REPLACE INTO sentiment_snapshots(date,symbol,source,payload,"
+                     "fetched_at) VALUES(?,?,?,?,?)",
+                     (row["date"], row["symbol"], row["source"],
+                      json.dumps(row["payload"], ensure_ascii=False), row["date"]))
+    conn.commit()
+    conn.close()
+    return path / "trading.sqlite"
+
+
+class NewFactorClassTests(RouteCase):
+    """四类新因子：真实数据源 + PIT + 覆盖率；取不到就是 null + 原因（不填 0）。"""
+
+    BASE_ROWS = [
+        {"ticker": "SH.600000", "as_of": "2026-09-18",
+         "factors": {"mom_20": 0.04}, "z": {"mom_20": 1.0}},
+        {"ticker": "SH.600009", "as_of": "2026-09-18",
+         "factors": {"mom_20": -0.02}, "z": {"mom_20": -1.0}},
+    ]
+
+    def _run(self, alternatives=None):
+        handlers = {"factors": {"ok": True, "value": {"rows": copy.deepcopy(self.BASE_ROWS)}},
+                    "ic": {"ok": True, "value": {"points": [{"t": "2026-09-08", "ic": 0.4}]}}}
+        handlers.update(alternatives or {})
+        return FakeRun(handlers)
+
+    def _fundamentals(self):
+        rows = []
+        for symbol, revenue, gross, profit in (("SH.600000", 1000.0, 300.0, 100.0),
+                                               ("SH.600009", 2000.0, 400.0, 250.0)):
+            for field, value in (("revenue", revenue), ("gross_profit", gross),
+                                 ("net_profit", profit)):
+                rows.append({"symbol": symbol, "field": field, "period_end": "2026-06-30",
+                             "announced_at": "2026-08-28", "value": value})
+        return rows
+
+    def test_quality_and_growth_factors_come_from_the_pit_store(self):
+        _make_trading_store(self.home, fundamentals=self._fundamentals())
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600000,SH.600009", classes="quality,growth",
+            as_of="2026-09-20")
+        self.assertTrue(result["ok"], result)
+        matrix = result["matrix"]
+        self.assertIn("gross_margin", matrix["factors"])
+        self.assertIn("net_margin", matrix["factors"])
+        # 同比这一列**不进矩阵**（两个标的都缺基期）——它出现在覆盖率里，是 null 不是 0
+        self.assertNotIn("revenue_yoy", matrix["factors"])
+        raw = {row["ticker"]: row["factors"] for row in matrix["raw"]}
+        self.assertEqual(raw["SH.600000"]["gross_margin"], 30.0)
+        self.assertEqual(raw["SH.600009"]["net_margin"], 12.5)
+        # 成长：库里没有上一年同期 PIT 行 → 缺席（矩阵里该格是 null）+ 原因（**不从相邻期硬算**）
+        self.assertNotIn("revenue_yoy", raw["SH.600000"])
+        missing = {row["key"]: row["reason"] for row in result["factorsMissing"]}
+        self.assertIn("revenue_yoy", missing)
+        self.assertIn("上一年同期", missing["revenue_yoy"])
+        # 覆盖率如实：2/2 有毛利率，0/2 有同比
+        coverage = {row["key"]: row for row in result["factors"]}
+        self.assertEqual(coverage["gross_margin"]["covered"], 2)
+        self.assertEqual(coverage["gross_margin"]["total"], 2)
+        self.assertEqual(coverage["revenue_yoy"]["covered"], 0)
+        self.assertEqual(coverage["revenue_yoy"]["missingTickers"],
+                         ["SH.600000", "SH.600009"])
+        self.assertIn("announced_at", coverage["gross_margin"]["pit"])
+
+    def test_growth_is_computed_when_the_same_period_exists_last_year(self):
+        rows = []
+        for period, revenue, profit in (("2025-06-30", 800.0, 80.0), ("2026-06-30", 1000.0, 100.0)):
+            for field, value in (("revenue", revenue), ("net_profit", profit)):
+                rows.append({"symbol": "SH.600000", "field": field, "period_end": period,
+                             "announced_at": f"{period[:4]}-08-28", "value": value})
+        rows.append({"symbol": "SH.600009", "field": "revenue", "period_end": "2026-06-30",
+                     "announced_at": "2026-08-28", "value": 100.0})
+        _make_trading_store(self.home, fundamentals=rows)
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600000,SH.600009", classes="growth",
+            as_of="2026-09-20")
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertEqual(raw["SH.600000"]["revenue_yoy"], 25.0)
+        self.assertEqual(raw["SH.600000"]["net_profit_yoy"], 25.0)
+        # SH.600009 只有本期营收、没有基期 → 该格在矩阵里是 null（未超限的缺席，不跨期推算）
+        self.assertNotIn("revenue_yoy", raw["SH.600009"])
+        matrix = result["matrix"]
+        column = matrix["factors"].index("revenue_yoy")
+        cells = {row["ticker"]: matrix["matrix"][index][column]
+                 for index, row in enumerate(matrix["raw"])}
+        self.assertEqual(cells["SH.600000"], cells["SH.600000"])
+        self.assertIsNone(cells["SH.600009"], "缺基期的标的在矩阵里是 null，不是 0")
+
+    def test_future_announcement_is_invisible_under_pit(self):
+        _make_trading_store(self.home, fundamentals=self._fundamentals())
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600000,SH.600009", classes="quality",
+            as_of="2026-08-01")
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertNotIn("gross_margin", raw["SH.600000"],
+                         "公告日 2026-08-28 在 as_of 之后 → 当时不可得")
+        missing = {row["key"]: row["reason"] for row in result["factorsMissing"]}
+        self.assertIn("gross_margin", missing)
+
+    def test_sentiment_factor_scores_stored_snapshots(self):
+        _make_trading_store(self.home, sentiments=[
+            {"date": "2026-09-18", "symbol": "SH.600000", "source": "fin_news",
+             "payload": {"ticker": "SH.600000", "items": [
+                 {"title": "公司业绩大幅增长，利好", "time": "2026-09-18"},
+                 {"title": "净利润创新高，超预期", "time": "2026-09-18"}]}},
+            {"date": "2026-09-18", "symbol": "SH.600009", "source": "fin_news",
+             "payload": {"ticker": "SH.600009", "items": [
+                 {"title": "公司净利润大幅下滑，利空", "time": "2026-09-18"}]}}])
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600000,SH.600009", classes="sentiment",
+            as_of="2026-09-20")
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertGreater(raw["SH.600000"]["sentiment"], 0)
+        self.assertLess(raw["SH.600009"]["sentiment"], 0)
+        coverage = {row["key"]: row for row in result["factors"]}
+        self.assertEqual(coverage["sentiment"]["covered"], 2)
+        self.assertIn("sentiment_snapshots", coverage["sentiment"]["source"])
+
+    def test_sentiment_missing_is_null_with_reason(self):
+        _make_trading_store(self.home, sentiments=[])
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600000,SH.600009", classes="sentiment",
+            as_of="2026-09-20")
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertNotIn("sentiment", raw["SH.600000"])
+        missing = {row["key"]: row["reason"] for row in result["factorsMissing"]}
+        self.assertIn("sentiment", missing)
+        coverage = {row["key"]: row for row in result["factors"]}
+        self.assertEqual(coverage["sentiment"]["covered"], 0)
+
+    def test_sentiment_window_excludes_stale_snapshot_items(self):
+        """快照里的原文常常是历史长尾：**窗口外的文档要被排除并计数**，不能当「今天」算。"""
+        self.home = str(self.home)
+        _make_trading_store(self.home, sentiments=[
+            {"date": "2026-09-18", "symbol": "SH.600000", "source": "fin_news",
+             "payload": {"items": [
+                 {"title": "公司业绩增长，利好", "time": "2026-09-17T00:00:00Z"},
+                 {"title": "三个月前的旧闻，利好", "time": "2026-06-17T00:00:00Z"}]}}])
+        score, meta = v3_analytics.sentiment_factor_values(self.home, "SH.600000", "2026-09-18")
+        self.assertIsNotNone(score)
+        self.assertEqual(meta["documents"], 1, "只有窗口内那篇参与打分")
+        self.assertEqual(meta["outsideWindow"], 1, "窗口外的文档被计数排除")
+
+    def test_sentiment_normalizes_epoch_millisecond_strings(self):
+        """``fin_news`` 的 ``items[].time`` 是**字符串形式的 epoch 毫秒**（实测 13 位）。"""
+        self.home = str(self.home)
+        # 1789035601000 ms = 2026-09-10T10:20:01Z；as_of=2026-09-10 时它在窗口内
+        _make_trading_store(self.home, sentiments=[
+            {"date": "2026-09-10", "symbol": "SH.600000", "source": "fin_news",
+             "payload": {"items": [{"title": "净利润大幅增长，超预期", "time": "1789035601000"}]}}])
+        score, meta = v3_analytics.sentiment_factor_values(self.home, "SH.600000", "2026-09-10")
+        self.assertIsNotNone(score, meta)
+        self.assertGreater(score, 0)
+        self.assertEqual(meta["documents"], 1, "epoch 毫秒被归一后落在窗口内（不再被当过时剔除）")
+        self.assertEqual(meta["outsideWindow"], 0)
+        # 反向：13 位数字串若被当成「秒」会落到 1789 年 → 那种解释下窗口必然全空
+        self.assertEqual(v3_analytics._normalize_doc_time({"time": "1789035601"})["time"],
+                         "2026-09-10T10:20:01+00:00")
+
+    def test_alternative_factors_use_existing_tools_and_admit_a_share_gap(self):
+        alternatives = {
+            "capital_flow_history": {"ok": True, "value": {"flow_list": [
+                {"capital_flow_item_time": 1787500800000, "main_in_flow": 600, "in_flow": 600},
+                {"capital_flow_item_time": 1789660800000, "main_in_flow": 400, "in_flow": 400}]}},
+            "short_interest": {"ok": False, "error": {"code": "trading/no-data",
+                                                       "message": "A 股无卖空数据"}}}
+        result = v3_analytics.factors_matrix_data(
+            self._run(alternatives), self.home, tickers_raw="SH.600000,SH.600009",
+            classes="alternative", as_of="2026-09-20")
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertAlmostEqual(raw["SH.600000"]["capital_flow"], 1.0, places=6)
+        self.assertNotIn("short_interest", raw["SH.600000"])
+        missing = {row["key"]: row["reason"] for row in result["factorsMissing"]}
+        self.assertIn("short_interest", missing)
+        self.assertIn("A 股无卖空数据", missing["short_interest"])
+        self.assertIn("capital_flow_history", result["sources"]["alternative"])
+
+    def test_alternative_is_opt_in_by_default(self):
+        run = self._run()
+        v3_analytics.factors_matrix_data(run, self.home,
+                                         tickers_raw="SH.600000,SH.600009", as_of="2026-09-20")
+        called = {name for name, _ in run.calls}
+        self.assertNotIn("capital_flow_history", called)
+        self.assertNotIn("short_interest", called)
+
+    def test_matrix_columns_never_gain_a_factor_without_data(self):
+        """一个标的都没取到的因子不进列（它出现在覆盖率里）——缺数据不是 0。"""
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600000,SH.600009", classes="all",
+            as_of="2026-09-20")
+        self.assertEqual(result["matrix"]["factors"], ["mom_20"])
+        covered = {row["key"] for row in result["factors"]
+                   if row["covered"] and row["class"] in ("quality", "growth", "sentiment",
+                                                          "alternative")}
+        self.assertEqual(covered, set(), "临时 home 里没有 fundamentals/sentiment 数据")
+
+    def test_registry_covers_the_six_required_classes(self):
+        classes = {entry["class"] for entry in v3_analytics.FACTOR_REGISTRY}
+        self.assertEqual(classes, {"value", "momentum", "quality", "growth", "sentiment",
+                                   "alternative"})
+        keys = {entry["key"] for entry in v3_analytics.FACTOR_REGISTRY}
+        for key in ("roe", "roa", "gross_margin", "revenue_yoy", "net_profit_yoy",
+                    "sentiment", "capital_flow", "short_interest"):
+            self.assertIn(key, keys)
+        for entry in v3_analytics.FACTOR_REGISTRY:
+            self.assertTrue(entry["source"], entry)
+            self.assertTrue(entry["pit"], entry)
+            self.assertIn(entry["direction"], (1, -1))
+        factor_registry = v3_analytics.factor_registry_data(None)
+        self.assertFalse(factor_registry["coverage"]["available"])
+        self.assertIn("reason", factor_registry["coverage"])
+
+
+class StrategyExtendedScoreTests(RouteCase):
+    """五阶段流水线真的用上新因子（``PAAT.factorCoverage`` + ``PCPT.rankBy``）。"""
+
+    def test_pipeline_reports_coverage_and_uses_extended_z(self):
+        _make_trading_store(self.home, fundamentals=[
+            {"symbol": "SH.600000", "field": "revenue", "period_end": "2026-06-30",
+             "announced_at": "2026-08-28", "value": 1000.0},
+            {"symbol": "SH.600000", "field": "gross_profit", "period_end": "2026-06-30",
+             "announced_at": "2026-08-28", "value": 400.0},
+            {"symbol": "SH.600009", "field": "revenue", "period_end": "2026-06-30",
+             "announced_at": "2026-08-28", "value": 1000.0},
+            {"symbol": "SH.600009", "field": "gross_profit", "period_end": "2026-06-30",
+             "announced_at": "2026-08-28", "value": 100.0}])
+        closes = closes_from([0.002] * 199)
+        rows = [
+            {"ticker": "SH.600000", "as_of": "2026-09-18", "factors": {"mom_20": 0.01},
+             "z": {"mom_20": -1.0, "mom_60": -1.0, "trend": -1.0}},
+            {"ticker": "SH.600009", "as_of": "2026-09-18", "factors": {"mom_20": 0.02},
+             "z": {"mom_20": 1.0, "mom_60": 1.0, "trend": 1.0}}]
+        run = FakeRun({"series": lambda payload: series_envelope(make_bars(closes),
+                                                                 ticker=payload["ticker"]),
+                       "factors": {"ok": True, "value": {"rows": rows}},
+                       "ic": {"ok": True, "value": {"points": []}},
+                       "plan": {"ok": True, "value": {"plans": []}},
+                       "equity": {"ok": True, "value": {"current": 100000.0}}})
+        result = v3_analytics.strategy_run(run, self.home,
+                                           {"universe": ["SH.600000", "SH.600009"],
+                                            "market": "SH", "topN": 2, "window": 20})
+        self.assertTrue(result["ok"], result)
+        paat = result["run"]["stages"]["PAAT"]
+        coverage = paat["factorCoverage"]["classes"]
+        self.assertEqual(coverage["quality"]["covered"], 2)
+        self.assertEqual(coverage["growth"]["covered"], 0)
+        self.assertEqual(coverage["sentiment"]["covered"], 0)
+        self.assertEqual(result["run"]["stages"]["PCPT"]["rankBy"],
+                         "extendedZ（价量动量+质量+成长+情绪同权）")
+        # 质量 z 与动量 z 同权：质量占优的 SH.600000（毛利率 40% vs 10%）把动量劣势收窄到
+        # 仅差 1 个名次（纯动量口径下它是 0 vs 1 的两极）——这就是「新因子真的进了评分」。
+        ranks = {ticker: index for index, ticker in
+                 enumerate(result["run"]["stages"]["PCPT"]["longs"])}
+        self.assertEqual(ranks, {"SH.600009": 0, "SH.600000": 1})
+        first = result["run"]["proposals"][0]
+        self.assertIn("gross_margin=", first["basis"])
+        self.assertIn("扩展综合 z=", first["basis"])
 
 
 if __name__ == "__main__":

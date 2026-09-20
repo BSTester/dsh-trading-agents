@@ -144,11 +144,18 @@
 
 # ── 与 platform/ 的衔接：量化数据工具面（**唯一**交互面）────────────────────
 #
-# 分析师能看到的量化数据都从平台的 MCP 工具面来：同一个 `/mcp` 端点、同一份服务端实现
-# （桥接不复制业务逻辑，见 server/v3_mcp.py 与 docs/v3-integration.md）。
+# 分析师能看到的量化数据都从平台的 MCP 工具面来：同一个**只读面** `/mcp/ro` 端点、同一份
+# 服务端实现（桥接不复制业务逻辑，见 server/v3_mcp.py 与 docs/v3-integration.md §1.5.5）。
+# 为什么是 `/mcp/ro` 而不是 `/mcp`：缺省 discovery 面下，写/交易工具的唯一到达路径是
+# `call_tool` 转发，而本 profile 的白名单钩子按工具名匹配、**看不到被转发的内层名字**
+# （2026-09-21 真机后果：一次决策唤醒经它误领了 2 条值班任务，见 README §6.6 与
+# docs/e2e-and-data-gaps.md §22.6）。`/mcp/ro` 在**服务侧**按注册表 annotations 把
+# 非只读内层工具一律拒为 `mcp/denied-by-policy`——这条边界不依赖任何 Harness 侧钩子。
+# 官方 `headless` profile（research_duty.sh 值班链）仍走全局 `/mcp`，不受影响。
 #
 # ⚠️ 工具面有**两种模式**（规格 FR-TOOLS-003 / §10 决策 3），由**平台服务进程**的环境变量
-# ``QUANT_MCP_SURFACE`` 决定——本 profile 不需要改任何一行：
+# ``QUANT_MCP_SURFACE`` 决定——本 profile 不需要改任何一行（且 `/mcp/ro` 恒为 discovery
+# 形态，与此开关无关）：
 #   * ``discovery``（缺省）—— 只直连 4 件高频工具（snapshot / admin_status / v3_gateway /
 #     v3_tools）+ ``list_tools``（按关键词/域/前缀检索，返回精简卡片）+ ``call_tool``
 #     （转发到同一实现）。实测 `tools/list` 从 ≈79.6k 字符（≈2 万 token）降到 3.2k 字符
@@ -157,8 +164,8 @@
 # 切换（一行，然后重启平台服务）：
 #   QUANT_MCP_SURFACE=direct scripts/platform_service.sh restart
 # 或写进 <DSH_HOME>/trading-platform.json 的 {"service": {"mcp_surface": "direct"}}。
-# 两种模式的能力集合**完全一致**（代理转发的是注册表里同一个函数对象）：省的是 schema
-# token，不是能力；凭据封死（v3/credentials-web-only）与「`/api/v3/*` 无交易写端点」
+# 两种模式下 `/mcp/ro` 的能力集合**一致**（代理转发的是注册表里同一个函数对象）：省的是
+# schema token，不是能力；凭据封死（v3/credentials-web-only）与「`/api/v3/*` 无交易写端点」
 # 在两种模式下都成立（platform/tests/test_mcp_discovery.py 两种路径都断言）。
 #
 # 双方交互只此一条：**不挂任何第三方 adapter/桥接包**。
@@ -173,7 +180,7 @@
       config:
         serverName: quantwb
         transport: streamable-http
-        url: http://127.0.0.1:8397/mcp
+        url: http://127.0.0.1:8397/mcp/ro
         # 平台服务没起时不要让整个 profile 起不来：让工具面缺席，由模型如实报告
         # 「数据源不可达」，而不是让会话直接崩在启动阶段。
         failOnStartupError: false

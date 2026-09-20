@@ -4,7 +4,9 @@
   * **只做算术**：不取数、不读盘、不碰 FastAPI/网络——取数一律由 ``v3_analytics.ml_models``
     经既有限流器 ``v3_run("series", …)`` 完成，本模块只吃 ``bars_by_ticker``；
   * **PIT 严格**：``t`` 日特征只用 ``≤ t`` 的收盘价，标签用 ``t+horizon`` 收益；任何特征都
-    不得触达 ``t`` 之后的数据（``tests/test_v3_ml.py::PITTests`` 用「打乱未来数据」钉住）；
+    不得触达 ``t`` 之后的数据（``tests/test_v3_ml.py::PITTests`` 用「打乱未来数据」钉住）。
+    这条 ``≤ t`` 边界本身由 ``server.data.cache.pit_prefix``（FR-DATA-003 唯一入口）给出，
+    ``tests/test_data_cache.py::MigrationWiringTests`` 断言本模块确实在用它；
   * **诚实标注实现**：本部署（``~/.dsh/trading-venv``，Python 3.13）**没有** ``sklearn``／
     ``lightgbm``，因此三个模型都走 numpy 自实现，``impl`` 如实写 ``numpy-lasso`` /
     ``numpy-gbdt-lite`` / ``numpy-mlp``。可选库只做「探测 + 存在时优先」，
@@ -29,6 +31,9 @@ from datetime import datetime, timezone
 import numpy as np
 
 from server import v3_math
+# FR-DATA-003：特征侧的 PIT 边界（``t`` 日特征只用 ``≤ t``）改由**唯一入口**
+# ``server.data.cache.pit_prefix`` 给出，本模块不再自己维护一份「closes[:i+1]」切片。
+from server.data import cache as pit_cache
 
 __all__ = [
     "FEATURE_NAMES",
@@ -220,6 +225,10 @@ def _feature_matrix(closes, window):
 
     历史不足以定义某列时该格为 ``NaN``（调用方按行丢弃），**绝不用 0 或估计值顶替**。
     返回矩阵的第 ``i`` 行在数学上只依赖 ``closes[0..i]``——这是 PIT 无未来函数的全部依据。
+
+    FR-DATA-003 迁移（2026-09-20）：这个「``closes[0..i]``」边界不再由本函数自己切片，
+    而是向**唯一入口** ``server.data.cache.pit_prefix``（``lag=LAG_SAME_DAY``）索取
+    ``visible``；``win_close``/``win_ret`` 都从 ``visible`` 取。数值逐元素不变。
     """
     n = int(closes.size)
     out = np.full((n, len(FEATURE_NAMES)), np.nan, dtype=float)
@@ -228,9 +237,10 @@ def _feature_matrix(closes, window):
     rets = np.zeros(n, dtype=float)
     rets[1:] = closes[1:] / closes[:-1] - 1.0
     for index in range(1, n):
-        lo = max(0, index - window + 1)
+        visible = pit_cache.pit_prefix(closes, index, lag=pit_cache.LAG_SAME_DAY)
+        lo = max(0, len(visible) - window)   # 原 ``max(0, index - window + 1)``，等价
         win_ret = rets[lo:index + 1]
-        win_close = closes[lo:index + 1]
+        win_close = visible[lo:]             # 原 ``closes[lo:index + 1]``，等价
         row = out[index]
         row[0] = rets[index]
         if index >= 5:

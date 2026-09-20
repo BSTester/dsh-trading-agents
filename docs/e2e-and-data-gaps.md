@@ -2290,6 +2290,7 @@ token 预算 kill + 估算口径标注 · 并发 3 与排队（peak=3、queue=2�
    （`platform/install/quant-headless/`），装进线上是运维动作（README「方式 B」）。因此线上服务
    现在若真触发 headless，会得到 `outcome=profile-missing`（**明确拒绝，不静默回退到没有白名单的
    `headless` profile**）。真机验证是在独立 DSH_HOME `~/.dsh/headless-probe` 里做的。
+   → **2026-09-21 已改变**：线上 profile 已安装、线上唤醒已跑通，见 **§22**（「线上尚未安装」不再成立）。
 2. **运行中的 8397 还是改动前的进程**：`/api/v3/headless/*` 两个只读端点要等主 agent 统一重启才可见；
    在此之前真实服务仍返回旧形状（`headless.last=[]`、无这两个路由）。**本次没重启服务。**
 3. ~~**`v3_ops` 只改了 `headless.last` 一处**：同一响应里 `headless.today`（恒为零计数）、
@@ -2303,6 +2304,11 @@ token 预算 kill + 估算口径标注 · 并发 3 与排队（peak=3、queue=2�
 4. **白名单只覆盖「工具名」这一层**：它拦不住模型经 MCP 工具面之外的通道（本 profile 已关掉
    bash/web/委派，但这不是安全边界）。真正的交易边界仍在服务侧（人工确认 + `confirm-decide`
    不进工具面 + live 口令）。
+   → **2026-09-21 真机补充（比原文更严重）**：缺省 `QUANT_MCP_SURFACE=discovery` 时，MCP 写工具
+   **根本不以自己的名字出现**（`/mcp` 的 `tools/list` 只有 6 件，含转发器 `call_tool`），
+   而 `hooks.json` 的 matcher 只列工具名——于是**这一层连「工具名」都看不到**：实测
+   `call_tool(name="trade_place")` 一路到达平台实现，且线上唤醒**真的领走了** 2 条
+   `research_tasks` 队列任务。见 **§22.6**。
 5. **事件触发的阈值是工程默认值而非业务标定**（资讯条数 5 / 持仓异动 5% / 探测缓存 6h /
    因子快照 48h）：都在 `<home>/v3-headless.json` 的 `thresholds` 里，端点可查。
    哪个值真正适合业务，需要业务方标定；本次只保证「口径可解释、取不到就 no-data」。
@@ -2436,3 +2442,422 @@ token 预算 kill + 估算口径标注 · 并发 3 与排队（peak=3、queue=2�
 8. **`gateway.jsx` 的两处 Headless 失效文案未修**：见 §20.2 末尾（该文件本轮禁改）。
 9. **运行中的 8397 仍是改动前的进程**：以上读数都是**进程外**用同一份代码路径（`compute.run_script`
    + 真实工作台脚本）跑出来的；`/api/v3/*` 的新字段要等主 agent 统一重启才可见。**本次没重启服务。**
+
+## 21. FR-DATA-003：PIT 唯一读取入口（`platform/server/data/cache.py`）
+
+规格 `docs/v3-spec.md:288` 点名「平台侧的 `data/cache.py` 作为唯一数据读取接口」。
+本节登记落点、口径、迁移、证据与未解决项（**本节所有读数都是只读请求，没有重启 8397**）。
+
+### 21.1 落点与 API
+
+* `platform/server/data/__init__.py`、`platform/server/data/cache.py`（新增；相对规格点名路径
+  满足 `data/cache.py` 命名。放在 `server/data/` 而非仓库根 `platform/data/`：本平台服务端只有
+  `server` 一个包，接线循环只 import `server.<模块>`，旁路包需要额外 `sys.path` 手术）。
+* 读取函数（都返回同一个可核验信封）：
+
+| 函数 | 覆盖的原 PIT 点 | 可见性时间戳 |
+|---|---|---|
+| `read_bars(as_of, mode, symbol=…, conn=/home=/fetch=…)` | `trading._local_close`、`v3_analytics` 的 K 线取数 | `bars.ts` |
+| `read_bars_frame(as_of, mode, symbols=[…])` | 横截面（新增能力） | `bars.ts` |
+| `read_fundamentals(as_of, mode, symbol=…)` | `v3_analytics._read_pit_fundamentals` | `announced_at`（+ `period_end` 第二道闸门） |
+| `read_sentiment_snapshots(as_of, mode, symbol=…)` | `v3_analytics.sentiment_factor_values` | `sentiment_snapshots.date` |
+| `latest_period_rows(rows, as_of, mode)` | `v3_analytics._latest_period_rows` | `period_end` |
+| `pit_prefix(values, index, lag=…)` | `v3_ml._feature_matrix`（`LAG_SAME_DAY`）、`v3_math.backtest_momentum`（`LAG_PREV_DAY`） | 序列下标 |
+
+* 信封字段（**可核验**）：`ok / kind / as_of / mode / semantics / symbol / source / window /
+  rows_used / bars|closes|derived|rows / rejected{future,undated(,period_ceiling)} / missing /
+  cached / cache_policy`。缺失时 `bars`/`rows` 一律 `null` + `missing.reason`，**绝不填 0/估算**。
+
+### 21.2 `as_of` 语义（显式二选一，不允许含糊）
+
+| 模式 | 上界 | 含义 |
+|---|---|---|
+| `AS_OF_INCLUSIVE` | `ts <= as_of` | **含当日**：as_of 当日已收盘的日 K／已披露的公告视为已知（收盘后视角） |
+| `AS_OF_EXCLUSIVE` | `ts < as_of` | **不含当日**：当日记录一律不可见（开盘前/盘中视角，只用 ≤ t−1） |
+
+* `as_of` **必填**：缺失/非 `YYYY-MM-DD` 抛 `PitError`（与 `trading_core.store._require_as_of`
+  同一条纪律）——「缺省今天」正是回测忘传 as_of 时前视偏差的入口。
+* 比较一律是**字符串比较**（与既有 SQL 的 TEXT 比较逐字一致）。由此保留一个既有事实：
+  `announced_at` 带时间成分时（`2026-09-20T05:00:00Z`）在 `INCLUSIVE` + `as_of=2026-09-20` 下
+  也不可见。这是迁移前就有的行为，**如实保留、未顺手修正**（改它属口径变更，需单独评审）。
+
+### 21.3 缓存键设计（`caches.CACHE_TTL_MS` 是唯一 TTL 表）
+
+键 = `f"{endpoint}|{caches.stable_key(payload)}"`，payload 至少含
+`store`（数据源身份 = sqlite 文件路径）、`symbol`、`period`、`limit`、**`as_of`**、**`mode`**：
+
+1. **`as_of` 进键**：`as_of=09-20` 与 `09-21` 是两个历史视图，共用条目 = 前视偏差；
+2. **`mode` 进键**：`<=` 与 `<` 差一整天（当日那根 K）；
+3. **`store` 进键**：同一标的 + 同一 `as_of` 在不同交易库（不同 `home`／测试临时库）是完全
+   不同的数据；内存库无稳定身份 → **不缓存**（除非调用方显式 `store=`）。
+
+TTL 三条（`pit-bars` 10m／`pit-fundamentals` 30m／`pit-sentiment` 5m）按数据变化速度分档，
+与同类面板端点同量级；**PIT 语义不依赖 TTL**：TTL 过期只是重取，闸门每次都重新施加。
+
+### 21.4 5 处迁移（file:line 与行为差异）
+
+| # | 原位置 | 迁移后 | 行为差异 |
+|---|---|---|---|
+| 1 | `v3_analytics.py::_read_pit_fundamentals`（原 SQL `announced_at IS NOT NULL AND announced_at<=?`） | 转调 `data.cache.read_fundamentals(..., AS_OF_INCLUSIVE)` | 行集/列/排序逐字相同；新增「报告期 ≤ as_of」这道**独立**闸门（对现有调用方等价，见 21.5） |
+| 2 | `v3_analytics.py::_latest_period_rows`（`period_end > as_of` 跳过） | `data.cache.latest_period_rows` | 完全等价；数值转换（`v3_math.to_float`）仍留在本模块 |
+| 3 | `v3_analytics.py::sentiment_factor_values` 的 `SELECT … date<=? ORDER BY date DESC LIMIT 60` | `data.cache.read_sentiment_snapshots(..., limit=60)` | 行集与 **DESC 顺序**相同（打分是浮点加权和，顺序也一并保持）；文档自身发布时间的第二道**业务**闸门仍在原位 |
+| 4 | `v3_ml.py::_feature_matrix` 的 `closes[:index+1]` | `data.cache.pit_prefix(..., lag=LAG_SAME_DAY)` | 逐元素相同（`lo = max(0, len(visible)-window)` 与原 `max(0, index-window+1)` 等价） |
+| 5 | `v3_math.py::backtest_momentum` 的 `closes[index]/closes[index-window]` | `data.cache.pit_prefix(..., lag=LAG_PREV_DAY)` | 逐位相同（`len(visible) > window` 与原 `index-window >= 0` 等价） |
+| 6 | `trading.py::_local_close` 的 `core_store.read_bars(..., today, limit=1)` | `data.cache.read_bars(today, AS_OF_INCLUSIVE, ..., cache=False)` | 语义相同；**显式 `cache=False`**（下单前风控的价格基准要最新读数，不许 TTL 陈旧值），PIT 闸门照旧生效 |
+| 7 | `v3_analytics` 的 `series` 取数（`_load_series` / 基准 / `ml_sweep` / `ml_backtest` / `ml_models`） | 同一处经 `pit_cache.pit_rows`（`_pit_series_envelope` / `read_bars(fetch=…)`） | 上游错误信封**原样保留**（错误码不丢）；新增效果：任何晚于「今天 UTC」的脏 bar 会被挡掉并计数，对干净数据零影响 |
+
+**有意不走 TTL 的路径**（理由写进 `server/data/cache.py` 模块 docstring 第三节）：
+
+* `fetch=`（上游 `series` 工具）路径**不叠第二层 TTL**——`series` 端点已由
+  `caches.cached("series", …)` 提供 10 分钟 TTL，再包一层就是第二套过期机制；本层只做 PIT 过滤；
+* `trading._local_close` 显式 `cache=False`（写路径的风险基准价）。
+
+### 21.5 验证证据（真实输出）
+
+* 只读自检（脚本 / 测试同一份实现）：
+
+      cd platform && ~/.dsh/trading-venv/bin/python -B -m server.data.cache
+      [PASS] 幂等：同一 as_of 连读两次逐字段相同
+      [PASS] 缓存命中：同一 as_of 第二次读数走 TTL 缓存
+      [PASS] PIT 严格：as_of=t 的窗口内没有 > t 的记录
+      [PASS] PIT 证据：两根未来 K 线被闸门计数挡掉（rejected.future=2）
+      [PASS] 模式显式：inclusive 含当日、exclusive 不含当日（3 vs 2 根）
+      [PASS] 键隔离：不同 as_of 不串味（09-12 → 3 根；09-11 → 2 根）
+      [PASS] 键隔离：不同标的不是同一条缓存
+      [PASS] 缺失即 null + 原因（不填 0）
+      [PASS] 基本面 PIT：未来公告不可见（future=1）、未来报告期被独立闸门挡掉（period_ceiling=1）
+      [PASS] 边界原语：≤t / ≤t-1 的可见前缀
+
+* 单测：`platform/tests/test_data_cache.py`（**50 例，全绿**，离线）覆盖 PIT 严格性、边界、
+  幂等、键隔离（as_of/mode/标的/交易库）、缺失→null、TTL 命中与过期后重取（含「过期后新落库的
+  未来 bar 仍被挡掉」）、fetch 路径不缓存、迁移接线（spy 断言 5 个点确实走本模块）。
+* **鉴别力（mutation，真实验证）**：对 `server/data/cache.py` 注入缺陷后跑同一份测试：
+
+| 注入的缺陷 | 结果 |
+|---|---|
+| `visible_at` 恒 `True`（放宽 as_of 闸门） | `FAILED (failures=24)`，含 `test_no_future_record_can_enter_the_window`、`test_rejected_future_rows_are_counted_as_evidence`、`test_different_as_of_do_not_share_a_cache_entry`、自检 4 例 |
+| 缓存键删掉 `as_of` | `FAILED (failures=4)`：`test_different_as_of_do_not_share_a_cache_entry`、`test_dropping_as_of_from_the_cache_key_makes_two_views_collide` 等 |
+| `pit_prefix` 忽略 `lag`（`≤ t-1` 退化成 `≤ t`） | `FAILED (failures=3)`：`test_pit_prefix_encodes_the_two_lags`、`test_ignoring_the_pit_lag_makes_the_backtest_look_ahead`、自检 |
+
+  文件内的 `DiscriminationTests` 另用 `unittest.mock.patch` 把三种缺陷各跑一遍，**断言断言会红**
+  （例如「放宽闸门后窗口里必须出现 999.0 的未来收盘价」），保证绿灯不是恒真断言。
+
+* 全量回归：`cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests`
+  → `Ran 944 tests in 220.543s` / **`OK (skipped=2)`**（= 改动前 894 例 + 本模块 50 例）。
+  过程如实记录：改动**前**的基线是 `Ran 894 … FAILED (failures=10, skipped=2)`，10 条全部落在
+  `tests/test_v3_risk_gate.py`（`LedgerGateTests` 8 + `MetricsGateTests` 2）——那是并行 agent
+  正在做的风控行业闸门改动（在本轮进行中由其提交修好，非本模块所致）；本轮中间一次运行另见
+  `test_v3_sdk.HttpEndpointsTest` 的一例事件竞态（同一文件单独重跑 3 次均 `OK`，属竞态而非
+  本改动引入），最终运行 944 例全绿。
+
+### 21.6 迁移回归（真实只读请求，改前 vs 改后）
+
+改前 = 运行中的 8397（改动前的进程，**未重启**）；改后 = 同一份 home/数据层、新代码在进程内用
+`create_handler` + 只挂 `v3_analytics` 路由的 FastAPI `TestClient`（不监听端口、不启调度器、
+不启推送、不跑 `v3_db.init_db`）：
+
+| 请求 | 改前 | 改后 | 结论 |
+|---|---|---|---|
+| `GET /api/v3/factors/matrix?tickers=SH.600519,SH.601318&market=SH` | 10423 B | 10423 B | **逐字段相同**（矩阵 14 列、`sources`、`factorsMissing` 全等） |
+| 同上 + `&as_of=2026-06-30&classes=quality,growth` | 10048 B | 10048 B | **逐字段相同** |
+| `GET /api/v3/factors/registry`（+ `&as_of=2026-06-30`） | 14192／13461 B | 14192／13461 B | **逐字段相同** |
+| `POST /api/v3/ml/backtest`（SH.600519/limit 300/window 20/rb 5） | 10789 B | 10789 B | `metrics` 逐项相同：sharpe −0.473、annReturnPct −6.38、maxDrawdownPct −16.34、signalFlips 11、heldDays 120、flatDays 179、days 299、winRatePct 41.7；299 点 `equity` 全等 |
+| `GET /api/v3/ml/models?ticker=SH.600519&limit=300` | 5167 B | 5167 B | 三模型与基线 `metrics` 全等；`n_samples=279`、`as_of=2026-09-17`；**唯一差异是 `generated_at` 时间戳** |
+| `GET /api/v3/ml/sweep?ticker=SH.600519&windows=10,20,30&rebalance=5,10&limit=300` | 811 B | 811 B | `best` 与 6 格 `grid` 全等（best: window 10/rb 5/sharpe −0.124） |
+| `GET /api/v3/risk/analytics?market=SH&details=false`（覆盖 `_load_series` 与基准取数两条迁移路径） | 9412 B | 9412 B | **逐字段相同**（`analytics`／`benchmark*`／`sources`／`nav` 全等） |
+
+（比较方式：两边的 JSON 解析后逐键递归比对，仅忽略易变字段 `generated_at`；字节数相同是因为
+两次响应的**语义结构**完全一致，改后那份由脚本用同一份响应体重新缩进写出。）
+
+### 21.7 未解决项（如实登记）
+
+1. **价量因子列的 `as_of` 仍未生效**：`/api/v3/factors/matrix?as_of=2026-06-30` 的
+   `matrix.as_of` 仍是 `2026-09-18`——价量/估值列来自工具面 `factors`（`bars.py` 走的富途
+   链路），该工具**不接受 as_of**，其 PIT 由工具内部决定。本轮把工具面**已返回**的 K 线
+   全部过了 `data.cache` 的闸门，但「让 `factors` 工具按调用方 as_of 取数」需要改
+   `v3_mcp.py`／`mcp_tools.py`／`bars.py`（本轮禁改文件），属**下一轮**的收敛点。
+   本轮的诚实标注：`asOf`（本地因子 PIT 上界）与 `matrix.as_of`（价量列实际日期）**并列展示**，
+   不互相冒充。
+2. **`announced_at` 带时间成分的既有行为未改**（见 21.2 末）：保留是为了「迁移不改口径」，
+   若要改成「按日期截断再比较」需要单独评审 + 单独回归。
+3. **`docs/v3-capability-alignment.md` 的 FR-DATA-003／G10 行仍是「🟡 部分」**（该文件不在
+   本轮可改范围）：本轮已把 `data/cache.py` 建起来并把 5 处 PIT 收敛进去，需由该文件负责人
+   更新判定与证据链接。
+4. **运行中的 8397 仍是改动前的进程**：21.6 的「改后」是进程外同一份代码路径跑出来的，
+   `/api/v3/*` 的新行为要等主 agent 统一重启才在 8397 生效。**本次没有重启服务。**
+
+---
+
+# 二十二、线上 profile 已安装 + 真机唤醒 / 握手成功（2026-09-21 实测）
+
+**这一节回答的就是 §19.7.1 那句「线上 `~/.dsh/profiles/quant-headless` 尚未安装」**：
+2026-09-21 00:00–00:16 CST（= `2026-09-20T16:00–16:16Z`，机器的 `date -u` 就在这一天）
+把 `quant-headless` 与 `quant-sdk` 两个 profile **加法式**装进线上 `~/.dsh/profiles/`，
+并在**没有重启 8397**（`pid 305473`，`python -m server.run`，`DSH_HOME=/home/penn/.dsh`）的
+前提下真机跑通了两条通道。安装清单与逐条原始输出在两份 README 的验证小节：
+`platform/install/quant-headless/README.md` §六、`platform/install/quant-sdk/README.md` §八。
+本节只登记**结论、关键读数与未解决项**。
+
+## 22.1 安装（加法式）+ 既有 profile 未变（硬证据）
+
+| 目录 | 文件数（前 → 后） | 逐文件清单 sha1（含 size/mtime 纳秒） | 目录 mtime |
+|---|---|---|---|
+| `profiles/headless` | 5 → 5 | `c3f47dec7d82960a13a84933cf4740ea89fe3101` **未变** | `1789733566` 未变 |
+| `profiles/sdk` | 4 → 4 | `107169d648ddf635cf70de6bd13e23f408f6d484` **未变** | `1789811944` 未变 |
+| `profiles/web` | 45 → 45 | `8b631f182c36fc2f59fe8244b05e473da77321ca` **未变** | `1789718918` 未变 |
+| `profiles/node_modules`（共享） | 608 → 608 | `37f136a0a8ef332b4e3a89c39d2cdf22d06c467e` **未变** | `1789813003` 未变 |
+| headless/sdk/web 子目录 mtime 清单 | — | `77914c108d5499bba226092852768f7b3bdfaaf4` **未变** | — |
+
+新增的只有两个**新目录**：`profiles/quant-headless/`（6 个文件，sha1 与仓库素材逐文件相同）、
+`profiles/quant-sdk/`（4 个文件 + `node_modules/quant-tool-whitelist`，`index.js` sha1
+`dc2e04faf3adfbb866d77d7056a02fec8103a530` 与素材相同）。共享包目录条目数仍是 279。
+`dsh plugin --profile quant-sdk add file:…` 走 pnpm **离线**成功（`downloaded 0`，7.6 s，exit 0），
+只写进新 profile 自己的 `node_modules/` 与 `pnpm-lock.yaml`。
+
+## 22.2 headless：`outcome` 不再是 `profile-missing`
+
+安装前线上 `/api/v3/headless/log` 的 6 条**全是** `profile-missing`（`duration_ms=0`）；
+安装后同一端点（`GET /api/v3/headless/log?limit=14`，**线上台账 `~/.dsh/v3.db`**）：
+
+| started_at (UTC) | trigger | outcome | exit_code | duration_ms | stdout_chars |
+|---|---|---|---|---|---|
+| `2026-09-20T16:02:36.279034` | manual（探针，线上 home + 线上台账） | **`completed`** | **0** | 43712.415 | 3（`OK\n`） |
+| `2026-09-20T16:00:44.939559` | **risk_breach（线上服务自己的 tick 投递）** | **`completed`** | **0** | 182071.042 | 8047 |
+| `2026-09-20T16:00:45.248332` | pre_rebalance_confirm（同上） | `timeout` | −9 | 300150.778 | 0 |
+| `2026-09-20T16:00:44.626702` | position_move（同上） | `timeout` | −9 | 300185.309 | 0 |
+| 14:41:50 / 15:00:17–18 共 6 条 | 上述三条 | `profile-missing` | — | 0 | — |
+
+* 探针三路原文：`outcome='completed'`、`exit_code=0`、`stderr=''`、`stdout='OK\n'`、
+  `duration_ms=43712.415`、`tokens_estimate=14`、`tool_deny_count=42`（口径：dsh headless 不回
+  报 usage，14 是估算，**不是计费口径**）。
+* `GET /api/v3/headless/schedule` 的 `profileWhitelist`：安装前 `verified=false / detail=null`，
+  安装后 `verified=true`，`detail.missingDisabledRows=[]`、`detail.uncoveredTools=[]`、
+  `detail.hooksPath=…/quant-headless/hooks.json`。
+* 两条 `timeout` 是**外部熔断真的生效**（`error.code=headless/timeout`、`signal=9`、`killed=1`、
+  300 s 预算），stderr 里是 `/dsh: reasoning:/` 轨迹——通道已通、预算要标定，与 `profile-missing`
+  是两类不同事实。
+
+## 22.3 SDK：线上握手与一次真实提示
+
+`POST /api/v3/sdk/prompt`（口令`确认下发`）在线上 home 起 `dsh --profile quant-sdk`：
+
+* `spawn`：`pid=315177`、`argv=["dsh","--profile","quant-sdk"]`；`initialize` **27.1 s**，
+  `observed="deepseek-harness-sdk-runtime"` == `expected` → **`protocol_match: true`**（version 0.0.1）。
+* 一次最小提示（`只回复 OK，不要调用任何工具`）回执：`queue_id=q_1`、
+  `message_id=eaa2646b-9caf-45d6-a401-fcad3fdd9878`、`chars=15`、
+  `sha256=ad2a676a242003913d98e329cc0273bfa9888ff5855b66e38692c9b0c044ead1`。
+* 事件流 18 条（`turn/start` → `assistant/message("OK")` → `turn/end {"kind":"completed"}`），
+  会话 `running → idle`；**真实 token 账**：
+  `{"inputTokens": 8367, "outputTokens": 2, "totalTokens": 8497, "cacheReadTokens": 128, "reasoningTokens": 0}`。
+* 帧完整性：`framer.frames=23`、`malformed_lines=0`、`frame_overflows=0`；审计落
+  `~/.dsh/v3-sdk-audit.jsonl`（start + 2 条 prompt，均 `accepted=true / passphrase_ok=true`）。
+* 该会话**看不到写/交易工具**：模型自述 MCP 工具面 = `admin_status`、`call_tool`、`list_tools`、
+  `snapshot`、`v3_gateway`、`v3_tools` 共 **6 件**；插件诊断
+  `[quant-tool-whitelist] agent quant-live-1: 工具面无需收窄（0 命中）`。
+
+## 22.4 一条命令看清「装好了没」
+
+```console
+$ curl -s http://127.0.0.1:8397/api/v3/headless/schedule \
+  | python3 -c "import json,sys;print(json.load(sys.stdin)['profileWhitelist']['verified'])"
+True
+$ curl -s http://127.0.0.1:8397/api/v3/sdk/status \
+  | python3 -c "import json,sys;d=json.load(sys.stdin);print(d['state'], d['protocol_match'])"
+running True
+```
+
+## 22.5 本轮**没有**做的事（边界声明）
+
+* **没有下单**、没有点任何确认卡片，**没有**触发 `trade_*` / `sim_trade_*` / `plan-execute` /
+  `confirm-decide` / `switch-mode`。唯一一次「尝试写工具」是 `call_tool(name="trade_place",
+  arguments={})`——空载荷，连必填校验都过不了（见 22.6），服务侧**没有**任何订单或待确认卡片产生。
+* **没有重启 8397**（`pid 305473` 自 23:49:04 CST 起未变）。
+* **没有修改** `~/.dsh/profiles/{headless,sdk,web}` 任何文件（22.1 的三次快照对比）。
+* **没有**代替 headless 唤醒回报它领走的队列任务（见 22.6 第 2 条，回报会改队列状态）。
+
+## 22.6 未解决项（如实登记，两条都请优先看）
+
+1. **⚠️ `discovery` 工具面下，逐名拒绝白名单被 `call_tool` 代理绕过（真机实测，非理论）**
+   * 缺省 `QUANT_MCP_SURFACE=discovery` 时线上 `/mcp` 的 `tools/list` **只有 6 件**
+     （`snapshot` / `admin_status` / `v3_gateway` / `v3_tools` / `list_tools` / `call_tool`），
+     写工具只能经 `mcp__quantwb__call_tool` 转发（`mcp_discovery.py` 转发的是注册表里同一函数对象，
+     服务侧**不按名拒绝**）。
+   * `hooks.json` 的 matcher 只列**工具名**，里面**没有** `call_tool`；`dsh-tools` 的
+     `tools/pre-execute` 只在工具名已注册且实参合法时才跑（`dsh-tools/lib/index.js:3106`），
+     所以这一层**看不到**被转发的内层名字。
+   * 真机证据 ①（不拦截）：`call_tool(name="trade_place", arguments={})` →
+     `{"ok":false,"error":{"code":"mcp/bad-arguments","message":"…缺必填参数 ['qty','side','symbol']…"}}`
+     ——**到达了平台实现**，全程没有 `hook`/`白名单`/`denied` 字样。
+   * 真机证据 ②（机制本身是活的）：诊断 overlay 把 matcher 改成 `mcp__quantwb__call_tool` 后，
+     同一代理调用被 `exit 2` 挡下，模型收到的原文是
+     `Error: headless 白名单：写/交易工具已从工具面移除（额度：只读研究）。该动作只能由人在工作台 Web 确认后执行。`
+   * 真机证据 ③（**有真实后果**）：16:00:44Z 的线上 `risk_review` 唤醒 stderr 写着
+     「I've claimed a research task for HK factor patrol…」，`~/.dsh/trading-data/trading.sqlite`
+     的 `research_tasks` 里对应出现
+     `RT-20260918-HK-factor_patrol-EAFE8E status=running started_at=2026-09-21 00:01:29`、
+     `RT-20260918-SH-mining_round-AF100F status=running started_at=2026-09-21 00:01:36 attempts=2`。
+     （`research-duty.timer` 上次触发 2026-09-18 20:02、下次 2026-09-21 19:20，**不是它**。）
+     装 profile **之前**这些唤醒全死在 `profile-missing`、不领任务——**这次安装把一个
+     「白名单外写操作可达」的路径真正激活了**。
+   * 建议修法（**本轮未实施**）：把拒绝判据下沉到**服务侧**，在 `mcp_discovery.call_tool` 转发前
+     用同一份事实源（`v3_ops.WRITE_TOOLS` + `tools/e2e_probe.WRITE_ENDPOINTS` +
+     `mcp_tools.MCP_EXCLUDED_ENDPOINTS`）按**内层 name** 判一次，命中回 `mcp/denied-by-policy`；
+     两种表面模式据此一致，profile 侧不用改。**不要**把「已有白名单」当成兜住了写工具。
+   * → **2026-09-21 已修复（按更稳的形态）**：新增只读面 **`/mcp/ro`**（第二个 MCP 端点，
+     全局 `/mcp` 保持现状、值班链不受影响），两个决策 profile 的 `quant-platform-mcp` 已指向它；
+     判据用**注册表 annotations**（`readOnlyHint=true` + 直连保留件，不维护第二份名单——
+     新增写端点若漏登记任何名单，在只读面上缺省被拒，fail-closed）。被拒返回
+     `mcp/denied-by-policy`、handler 零调用。两面对照表与测试证据见 **§23**。
+2. **被唤醒领走的 2 条队列任务停在 `running`**：30 min 后由 `reclaim` 记一次 `timeouts`（连续 3 次
+   转 `failed`）。本轮只做通道验证，**没有**代替它们 `research_tasks_report`（回报会改队列状态，
+   且那不是本次授权的动作）。需要的话请人工决定是回报还是让超时回收。
+3. **`timeoutSeconds=300` 未标定**：两条 `timeout` 是工程默认值下的真实结果（3 并发 + 大提示词）。
+   建议按提示词体量标定 `timeoutSeconds` / `maxConcurrency`。
+4. **`quant-sdk/cordis.patch.yml` 的 `skill-filesystem` 路径笔误**：
+   `/home/penn/workspace/dsh-trading-agents/futu-skills/` 应为 `.../skills/futu-skills/`
+   （仓库根没有 `futu-skills`）。不致命（`--dump-config` 与真机握手都不报错），但该目录下的技能
+   在线上 SDK 会话里加载不到。**本轮未改**。
+   → **2026-09-21 已改**：`customSkillDirs` 已改为 `.../skills/futu-skills/`；线上 profile 目录
+   是拷贝，下次部署时同步重新拷入（见 `platform/install/quant-sdk/README.md` §8.6）。
+5. **线上 SDK runtime 仍在运行**（`pid 315177`，`state=running`）：`/api/v3/sdk/*` 没有 stop 端点，
+   本轮没重启服务；空闲 runtime 不发请求、不产生费用。
+
+---
+
+## 23. 漏洞修复：只读面 `/mcp/ro`（discovery 写类经 `call_tool` 可达 → 服务侧硬边界）
+
+一条「发现 → 根因 → 修复 → 证据」的完整记录（2026-09-21）。本节所有验证都是只读的：
+写类用例只断言**被挡在闸门**（spy 证明实现零调用），从未真正执行写动作；**没有重启 8397**。
+
+### 23.1 发现（动机证据，§22.6 已登记）
+
+* 线上 quant-headless 决策唤醒（16:00:44Z）的 stderr 原文：
+  「I've claimed a research task for HK factor patrol…」；`~/.dsh/trading-data/trading.sqlite`
+  的 `research_tasks` 表对应出现 `RT-20260918-HK-factor_patrol-EAFE8E status=running
+  started_at=2026-09-21 00:01:29`、`RT-20260918-SH-mining_round-AF100F status=running
+  started_at=2026-09-21 00:01:36 attempts=2`（两条任务已由主 agent 如实回报退回/终态）。
+  该 profile 的 42 项白名单（`tool-whitelist.json` 的 `denyTools`）**明确禁止**
+  `research_tasks_claim`——它还是被领走了。
+* 探针证据：`call_tool(name="trade_place", arguments={})` 一路到达平台实现，只被业务参数
+  校验挡下（`mcp/bad-arguments`），全程无任何钩子字样（§22.6 真机证据 ①）。
+
+### 23.2 根因
+
+1. 缺省 `QUANT_MCP_SURFACE=discovery` 时，`/mcp` 的 `tools/list` 只有 6 件，写/交易工具
+   **不以自己的名字出现**，唯一到达路径 = 转发器 `call_tool`（`platform/server/mcp_discovery.py`
+   转发的是注册表里**同一个函数对象**）。
+2. Harness 侧白名单钩子按**工具名**匹配（`mcp__quantwb__trade_place` 等 42 项）：
+   `mcp__quantwb__call_tool` 不在名单里，且 `tools/pre-execute` 拿不到**被转发的内层名字**——
+   这一层对内层调用是**盲**的。
+3. 不能全局禁 `call_tool`：官方 `headless` profile（`research_duty.sh` 值班链）经同一个全局
+   `/mcp` 用 `research_tasks_claim/report`。
+
+### 23.3 修复（file:line）
+
+* **`platform/server/mcp_discovery.py`**：`READONLY_SURFACE_PATH` / `DENIED_BY_POLICY_CODE` /
+  `DENIED_BY_POLICY_MESSAGE` 常量（~110-120）；`DiscoveryProxy.ro_allowed` + `readonly_denial`
+  （闸门，先于实参校验与 handler）；`search(..., ro=True)` 给非放行卡片加 `roCallable=false` +
+  「只读面不可调用」标注；`registry_annotations`（注册表 annotations 现读，**唯一事实源**，
+  不维护第二份名单）+ `readonly_allow_set`（`readOnlyHint=true` ∪ `DIRECT_KEEP`）+
+  `register_readonly`（只读面注册：4 件直连保留复用**同一函数对象与同一份标注** + 两个代理入口）。
+* **`platform/server/app.py`**：注册面 annotations **快照先于 discovery 移出**取
+  （`~1069` `ro_annotations = mcp_discovery.registry_annotations(app.state.mcp)`）；第二个
+  `MCPServer` + `streamable_http_app(streamable_http_path="/mcp/ro")`（`~1083-1092`）；
+  lifespan 同启两个 session manager（`~762-766`）；`app.router.routes.extend(mcp_ro_app.routes)`
+  （`~1124`，与 `/mcp` 同一「原样插路由、不用 Mount」手法）。
+* **判据口径（有意为之，如实说明）**：基础面工具在 MCP 上**本来就不发布 annotations**，
+  所以 `series` 这类事实上只读的工作台工具在 `/mcp/ro` 上也**不可调**（fail-closed：分不清
+  就拒绝）；决策取数走带只读标注的 `v3_*` 桥接件。4 件直连保留件是既有 `DIRECT_KEEP`
+  常量（模块 docstring：「四件都是只读、无副作用」），本就已整体暴露在该面上，纳入放行
+  避免假边界（「直连能调、转发被拒」）。
+* **profile 侧**：`platform/install/quant-headless/cordis.patch.yml` 与
+  `platform/install/quant-sdk/cordis.patch.yml` 的 `quant-platform-mcp` url → `…/mcp/ro`
+  （各自注明「为什么」）；顺手修复 quant-sdk 的 `skill-filesystem` 路径笔误（§22.6 第 4 条）。
+* **对照表**：`docs/v3-integration.md` §1.5.5（两个 MCP 端点逐行对照）。
+
+### 23.4 测试证据（真实输出）
+
+`cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest
+tests.test_mcp_discovery.ReadonlySurfaceTests` → **13 例全绿**，覆盖：
+`/mcp/ro` 与 `/mcp` 同为 6 件（逐名同序）；写类（`trade_place` / `research_tasks_claim` /
+`v3_oms_sync` / `v3_strategy_run` / `admin_prune_runs` / `switch_mode`）→ `mcp/denied-by-policy`
+且 **handler 零调用**（spy 断言，见 23.5）；只读（`v3_tools` / `v3_risk` / `snapshot`）
+经 `/mcp/ro` 转发与 `/mcp` 直连**逐字段一致**；凭据 save/clear 在 `/mcp/ro` 被 annotations
+闸门拒、在 `/mcp` 被桥内封死（两层、两个错误码、都零 handler）；卡片 `roCallable` 标注；
+放行集 = 注册表 annotations 推导（与 `NON_READONLY_PATHS` 交叉核对）；token 鉴权 `/mcp/`
+前缀覆盖 `/mcp/ro`（401/200）。全量回归见 23.6。
+
+### 23.5 鉴别力（mutation，真实输出）
+
+临时把 `readonly_denial` 改成放行一切（`if True: return None`，跑完即还原），
+`ReadonlySurfaceTests` 立刻变红——贴**真实输出**（摘录）：
+
+```text
+FAIL: …test_write_class_tools_are_denied_with_zero_handler_calls (tool='research_tasks_claim')
+AssertionError: 'trading/unknown-endpoint' != 'mcp/denied-by-policy'
+FAIL: …test_write_class_tools_are_denied_with_zero_handler_calls
+AssertionError: 1 != 0 : research_tasks_claim 的 handler 必须零调用（拒绝先于实现）
+FAIL: …test_write_class_tools_are_denied_with_zero_handler_calls (tool='v3_strategy_run')
+AssertionError: 'strategy/no-universe' != 'mcp/denied-by-policy'
+FAIL: …test_credentials_blocked_on_both_surfaces_by_two_distinct_layers
+AssertionError: 'v3/credentials-web-only' != 'mcp/denied-by-policy'
+```
+
+`research_tasks_claim` 的 spy 从 0 变 1——正是 §23.1 那次误领的调用路径：这些断言钉的
+就是它，不是恒真断言。还原后同一套用例全绿。
+
+### 23.6 全量回归与未解决项
+
+* `cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests`：
+  **958 例全绿（2 skipped，均为既有跳过项）**——改前同一工作树为 944 例，本节新增
+  `ReadonlySurfaceTests` 13 例 + `test_mcp_parity.py::ReadonlySurfaceParityTests` 1 例
+  （944 + 14 = 958，无一例变红）。真实输出：
+  `Ran 958 tests in 144.778s / OK (skipped=2)`。
+* **真机证据（8398 临时实例，真实 TCP + MCP 协议，temp home，跑完即停、不碰线上）**：
+  双面 `tools/list` 逐名一致（各 6 件，仅 `call_tool` 的标注按面语义不同：`/mcp` 上
+  `readOnlyHint=false`、`/mcp/ro` 上 `true`）；`/mcp/ro` 对 `trade_place` /
+  `research_tasks_claim` / `v3_oms_sync` / `v3_strategy_run` / `admin_prune_runs` 全部回
+  `mcp/denied-by-policy`（原文见下）；只读 `v3_tools` 转发两面**逐字段一致**。对照：
+  同一个 `call_tool(research_tasks_claim)` 在全局 `/mcp` 上**真实执行了领取 handler**
+  （temp home 队列为空 → `{"ok":true,"value":{"task":null,...}}`）——这正是 §23.1 那次
+  误领发生的路径，也是只读面存在的意义。`/mcp/ro` 拒绝原文（5 个写类同形，摘一条）：
+
+  ```json
+  {"ok":false,"error":{"code":"mcp/denied-by-policy","details":{},
+    "message":"该工具不是只读，只读面 /mcp/ro 不放行；需要写操作请由人在工作台完成（call_tool 名 'research_tasks_claim' 的注册表 annotations 没有 readOnlyHint=true；只读面用 list_tools 卡片的 roCallable 字段区分可转发/不可转发）"}}
+  ```
+* **运行中的 8397 还是改动前的进程**（只读探测确认：`/mcp` 仍 6 件旧面；`/mcp/ro` 404/兜底
+  不存在）：`/mcp/ro` 是新端点，要**主 agent 统一重启**后才在线上可见；两个 profile 的线上
+  拷贝（`~/.dsh/profiles/quant-*`）也要在部署时同步重新拷入（仓库素材已改，线上未动——
+  那是部署动作，不在本仓库改动范围内）。
+* 全局 `/mcp` 的行为**一字未改**（`call_tool` 在该面仍可转发写类——值班链依赖它）；只读面
+  只约束连到 `/mcp/ro` 的会话。
+
+## 二十四、已知问题：仓库级 HandleDispatchTests 顺序相关失败（最高优先级跟进）
+
+**现象**（2026-09-21，全量 `unittest discover -s tests`，2450 例）：`tests/test_wp6_service.py`
+的 `HandleDispatchTests` 在**全量/整文件顺序**下轮换出现 1-2 例失败，本轮观测到的三例：
+`test_core_endpoints_error_code`（`schedule` 期望 `trading/core-unavailable`，实际 `ok=true`）、
+`test_analytics_success_then_cache_hit`、`test_plan_merges_current_mode`（`plan` 的 value
+混入了 `snapshot-reconcile` 的 `diffs/tca`）。
+
+**已排除的假设（每条都有实验）**：
+1. 不是产品回归——直接复现（与用例同一个 `make_app`、同样注入坏 core）：
+   `handle("schedule", {})` **如实返回** `ok=false, error.code=trading/core-unavailable`；
+2. 不是模块级响应缓存——`HandleDispatchTests.setUp` 增加 `caches.clear()` 后类内仍红；
+3. 不是 `compute.py` 回归——`git diff 8b75fcc -- platform/server/compute.py` 为空；
+4. 不是单一污染源——二分显示前半（用例 1-6）与后半（7-13）作为前缀都能独立触发。
+
+**定性**：该遗留测试类存在**用例间共享状态污染**（候选：`Base`/模块级可变默认、
+`os.environ`/cwd 残留、或某 fake 把 dispatcher 的 core 表换成了共享可变对象），
+触发条件随本轮新增用例改变而显形。
+
+**复现**：
+```
+cd tests && python -B -m unittest test_wp6_service.HandleDispatchTests            # 类内红
+python -B -m unittest test_wp6_service.HandleDispatchTests.test_core_endpoints_error_code  # 单跑绿
+```
+
+**建议修法**：给 `Base`（或该类）做真正的隔离——`setUp` 深拷贝所有注入表、
+`addCleanup` 还原模块级可变状态；或用 `unittest` 的 `-b`+fixture 隔离工具定位具体污染字段。
+在定位前，判断平台行为请以**单用例结果**为准（产品路径已被证明正确）。

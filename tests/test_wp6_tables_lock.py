@@ -242,15 +242,30 @@ class CacheTtlLockTests(unittest.TestCase):
                           and name not in WP8_MARKET_ENDPOINTS
                           and name not in WP10_ENDPOINTS
                           and name not in WP11_ENDPOINTS
-                          and name not in WP12_ENDPOINTS}, self.LEGACY_TTL_MS)
+                          and name not in WP12_ENDPOINTS
+                          and name not in self.PIT_TTL_MS}, self.LEGACY_TTL_MS)
         self.assertEqual(self.LEGACY_TTL_MS["instrument"], 10 * 60_000)
+
+    #: FR-DATA-003（2026-09-21）：PIT 唯一入口（server/data/cache.py）新增三类 TTL——
+    #  键含 as_of/mode/数据源身份，TTL 只管"同一 as_of 视图内"的复用，PIT 语义在闸门层。
+    PIT_TTL_MS = {
+        "pit-bars": 10 * 60_000,
+        "pit-fundamentals": 30 * 60_000,
+        "pit-sentiment": 5 * 60_000,
+    }
+
+    def test_pit_ttl_delta_is_pinned(self):
+        """FR-DATA-003 增量钉死：PIT 读取入口三类 TTL（bars 10m / fundamentals 30m / sentiment 5m）。"""
+        self.assertEqual({name: caches.CACHE_TTL_MS[name]
+                          for name in self.PIT_TTL_MS}, self.PIT_TTL_MS)
 
     def test_wp7_ttl_delta_is_pinned(self):
         """WP7 增量钉死：factors-history 5 分钟（面板退役前的服务自有值）。"""
         self.assertEqual(caches.CACHE_TTL_MS.get("factors-history"), 5 * 60_000)
         self.assertEqual(len(caches.CACHE_TTL_MS),
                          len(self.LEGACY_TTL_MS) + 1 + len(WP8_MARKET_TTL_MS)
-                         + len(WP10_TTL) + len(WP11_TTL) + len(WP12_TTL))
+                         + len(WP10_TTL) + len(WP11_TTL) + len(WP12_TTL)
+                         + len(self.PIT_TTL_MS))
 
     def test_wp11_ttl_delta_is_pinned(self):
         """WP11 增量：情绪快照历史/摘要 5 分钟（按日采集，与 factors-history 同量级）。"""

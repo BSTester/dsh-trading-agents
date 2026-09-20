@@ -38,8 +38,14 @@
 # ── ② 平台 MCP 客户端行：与平台之间的**唯一**交互面 ──────────────────────────
 #
 # 分析师能看到的量化数据都从平台的 MCP 工具面来：既有工作台工具 + `/api/v3/*` 路由桥接出的
-# `v3_*` 工具，同一个 `/mcp` 端点、同一份服务端实现（桥接不复制业务逻辑，见
-# `server/v3_mcp.py` 与 `docs/v3-integration.md`）。**不挂任何第三方 adapter/桥接包**。
+# `v3_*` 工具，同一个**只读面** `/mcp/ro` 端点、同一份服务端实现（桥接不复制业务逻辑，见
+# `server/v3_mcp.py` 与 `docs/v3-integration.md` §1.5.5）。**不挂任何第三方 adapter/桥接包**。
+# 为什么是 `/mcp/ro` 而不是 `/mcp`：缺省 discovery 面下，写/交易工具的唯一到达路径是
+# `call_tool` 转发，而工具白名单钩子按工具名匹配、**看不到被转发的内层名字**（2026-09-21
+# 真机后果：quant-headless 的一次决策唤醒经它误领了 2 条值班任务）。`/mcp/ro` 在**服务侧**
+# 按注册表 annotations 把非只读内层工具一律拒为 `mcp/denied-by-policy`——这条边界不依赖
+# 任何 Harness 侧钩子，与下面的 ④ quant-tool-whitelist 互为纵深。
+# 官方 `headless` profile（research_duty.sh 值班链）仍走全局 `/mcp`，不受影响。
 # `@deepseek-ai/dsh-mcp-client` 已装在共享目录 `~/.dsh/profiles/node_modules/`（本 profile
 # 能向上解析到），**无需额外装包**。
 #
@@ -51,7 +57,7 @@
       config:
         serverName: quantwb
         transport: streamable-http
-        url: http://127.0.0.1:8397/mcp
+        url: http://127.0.0.1:8397/mcp/ro
         failOnStartupError: false
         # 对齐平台侧 TTL：live 业务确认 120s + 取数余量（见 v3_ops confirmation TTL）。
         toolCallTimeoutMs: 180000
@@ -114,11 +120,12 @@
 # 注入它的行卡在 waiting（"N row(s) did not activate"）。
 
 # 技能目录：指到仓库内的 skills/（与 quant-headless 同一处理；换机器要改绝对路径）。
+# （2026-09-21 修正笔误：`futu-skills/` 在仓库根不存在，正确路径是 `skills/futu-skills/`。）
 - id: skill-filesystem
   config:
     customSkillDirs:
       - /home/penn/workspace/dsh-trading-agents/skills/
-      - /home/penn/workspace/dsh-trading-agents/futu-skills/
+      - /home/penn/workspace/dsh-trading-agents/skills/futu-skills/
 
 # ── ④ 工具白名单：真边界插件（**MCP** 工具）──────────────────────────────────
 #

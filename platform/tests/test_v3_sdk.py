@@ -878,7 +878,10 @@ class WhitelistTest(unittest.TestCase):
         self.assertIn("sdk-jsonrpc-server", patch)
         self.assertIn("maxTokensAsSuccess: false", patch)
         self.assertIn("quant-platform-mcp", patch)
-        self.assertIn("http://127.0.0.1:8397/mcp", patch)
+        # 只读面（2026-09-21）：决策 profile 的 MCP 入口必须是 /mcp/ro（服务侧按注册表
+        # annotations 拒绝写类内层转发），且不得再出现指向裸 /mcp 的 url 行。
+        self.assertIn("url: http://127.0.0.1:8397/mcp/ro", patch)
+        self.assertNotIn("url: http://127.0.0.1:8397/mcp\n", patch)
         self.assertIn("quant-tool-whitelist", patch)
         # 白名单做法（照抄 quant-headless）：本地写面按行关停
         for row in ("tool-bash", "tool-pwsh", "tool-subagent", "tool-workflow", "tool-ralph",

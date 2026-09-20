@@ -747,8 +747,9 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         ``streamable_http_app()`` 返回的 Starlette app 自带
         ``lifespan=lambda app: session_manager.run()``；不进入它，MCP 会话管理器从未启动，
         ``/mcp`` 的每个请求都会因 ``self._task_group is None`` 失败。SDK 的
-        ``StreamableHTTPSessionManager.run()`` 每个实例只能进一次，因此进程内只建一个
-        MCPServer（``app.state.mcp``），由 uvicorn 的 lifespan 驱动。
+        ``StreamableHTTPSessionManager.run()`` 每个实例只能进一次，因此进程内每个端点一个
+        MCPServer（``app.state.mcp`` 与只读面 ``app.state.mcp_ro``），由 uvicorn 的 lifespan
+        驱动（两个独立的 session manager 实例，各自进一次）。
 
         WP7 任务 1：同处启停服务内调度器——start 在 MCP lifespan 之前，stop 放
         finally（MCP 启动失败也要停线程）；stop 自带 join，优雅退出不悬挂。
@@ -760,7 +761,9 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         _app.state.scheduler.start()
         try:
             await _app.state.push.start()
-            async with mcp_app.router.lifespan_context(mcp_app):
+            # 两个 MCP 端点各自的 session manager 都要在 lifespan 里启动（/mcp 与 /mcp/ro）。
+            async with mcp_app.router.lifespan_context(mcp_app), \
+                    mcp_ro_app.router.lifespan_context(mcp_ro_app):
                 yield
         finally:
             await _app.state.push.stop()
@@ -1071,10 +1074,29 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     app.state.v3_mcp_tools = v3_tool_names
     app.state.mcp_surface = surface
     app.state.mcp_discovery = None
+    # 只读面 /mcp/ro 的判据快照：注册表 annotations（现读 ToolManager）。**必须在 discovery
+    # 的 register() 之前取**——那一步会把内层工具移出 /mcp 注册面，标注就再也读不到了。
+    ro_annotations = mcp_discovery.registry_annotations(app.state.mcp)
     if surface == mcp_discovery.DISCOVERY:
         # 在同一个 MCPServer 上**注册**两个代理入口 + 4 件直连保留；既有注册表（`TOOLS` /
         # `V3Bridge.definitions`）一件不删——它们是代理的目录来源与转发目标。
         app.state.mcp_discovery = mcp_discovery.register(app.state.mcp, bound_tools, v3_bridge)
+
+    # /mcp/ro：只读面（2026-09-21 漏洞修复，见 mcp_discovery 模块 docstring「只读面」）。
+    # 缺省 discovery 面下写/交易工具的唯一到达路径是 call_tool 转发，而 Harness 白名单钩子
+    # 按工具名匹配、看不到被转发的内层名字（真机后果：误领值班任务）。这里挂第二个 MCP
+    # 端点：**同一实现、同一目录**（直连保留件复用同一个函数对象与同一份标注），仅两点不同：
+    #   * 表面强制 discovery 形态（6 件），与 /mcp 的模式开关无关；
+    #   * call_tool 转发前过注册表 annotations 闸门（readOnlyHint=true + 直连保留件才放行），
+    #     写类一律 mcp/denied-by-policy，先于实参校验与 handler。
+    mcp_ro_server = MCPServer(name=f"{mcp_tools.SERVER_NAME}-ro",
+                              version=mcp_tools.SERVER_VERSION)
+    mcp_ro_app = mcp_ro_server.streamable_http_app(streamable_http_path=mcp_discovery.READONLY_SURFACE_PATH,
+                                                   json_response=True)
+    app.state.mcp_ro = mcp_ro_server
+    app.state.mcp_ro_app = mcp_ro_app
+    app.state.mcp_ro_discovery = mcp_discovery.register_readonly(
+        mcp_ro_server, bound_tools, v3_bridge, ro_annotations)
 
     # /mcp：MCP streamable-http 端点（规格 §3.6，SDK 挂载）。
     # 有意差异 10：不用 ``app.mount("/mcp", mcp_app)``——Starlette 的 Mount 只匹配
@@ -1082,8 +1104,11 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # dsh-mcp-client）对 307 的跟随策略不由我们掌握，且每次会话都多一跳。这里把 SDK 的
     # 路由**原样插进主 app 的 router**（路径仍是 ``/mcp``），位置固定在静态兜底之前，
     # 语义与挂载等价且没有跳转。token 中间件的判定路径 ``/mcp`` 与 ``/mcp/`` 前缀因此仍然
-    # 精确命中（见 guard 的「等值或前缀」说明）。
+    # 精确命中（见 guard 的「等值或前缀」说明）。/mcp/ro 同一手法：SDK 侧 Route 精确匹配
+    # ``/mcp/ro``（不是 Mount），token 中间件的 ``/mcp/`` 前缀判定覆盖它；它是第二个传输
+    # 端点，不是 ``/api/v3/*`` 路由，路由⇄工具双射的推导式不受影响。
     app.router.routes.extend(mcp_app.routes)
+    app.router.routes.extend(mcp_ro_app.routes)
 
     @app.get("/{path:path}")
     async def static_files(path: str):

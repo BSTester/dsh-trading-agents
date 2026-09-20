@@ -378,6 +378,12 @@ class HandleDispatchTests(Base):
 
     def setUp(self):
         super().setUp()
+        # 2026-09-21 修：``caches`` 是**模块级**共享缓存，键只含 endpoint+payload——
+        # 前一个用例（哪怕是别的 app 实例、别的 fake core）留下的 ``plan|{}`` 等成功条目，
+        # 会让后面「core 故意弄坏、期望 trading/core-unavailable」的用例直接命中缓存
+        # （实测顺序相关：类内单跑红、两用例同跑绿）。每个用例从干净缓存开始，
+        # 缓存语义仍由各用例**内部**的两次调用自行验证，不放宽任何断言。
+        caches.clear()
         self.recorder = RecordingProvider()
         self.app = self.make_app(analytics=fake_analytics(self.recorder),
                                  series=lambda ticker, period, limit: {"ticker": ticker,
@@ -1144,7 +1150,9 @@ class ComputeBridgeTests(Base):
         # WP10 任务 1：+pipeline 30s（流程页阶段状态，与 schedule 同量级）
         # WP11 任务 3：+sentiment-history 5m（按日采集，与 factors-history 同量级）
         # WP12 任务 4：+数据面 15 项（6h/30m/5m/1h 四档；写类 modify_user_security 不进表）
-        self.assertEqual(len(caches.CACHE_TTL_MS), 40)
+        # FR-DATA-003（2026-09-21）：+PIT 唯一入口 3 项（pit-bars 10m / pit-fundamentals 30m /
+        # pit-sentiment 5m；键含 as_of/mode/数据源身份，见 server/data/cache.py）
+        self.assertEqual(len(caches.CACHE_TTL_MS), 43)
         self.assertEqual(caches.CACHE_TTL_MS["pipeline"], 30_000)
         self.assertEqual(caches.CACHE_TTL_MS["quality"], 60 * 60_000)
 

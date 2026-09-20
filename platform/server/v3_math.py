@@ -18,6 +18,10 @@
 import decimal
 import math
 
+# FR-DATA-003：PIT 边界的**唯一实现**在 ``server.data.cache``。本模块只消费
+# ``pit_prefix``（``t`` 日可见前缀），不再自带一份「≤ t-1」的切片逻辑。
+from server.data import cache as pit_cache
+
 __all__ = [
     "TRADING_DAYS",
     "align_series",
@@ -365,6 +369,10 @@ def backtest_momentum(bars, window=20, rebalance_days=5):
     两者逐位相同。
     有意差异 2：``window``/``rebalanceDays`` 非正时直接报错（参考实现会退化成一个
     每天重算、动量恒为 0 的空壳，指标看似有效实则无信息）。
+
+    FR-DATA-003 迁移（2026-09-20）：信号可见窗口改由 ``server.data.cache.pit_prefix``
+    给出（``lag=LAG_PREV_DAY``）——「``t`` 日只可用 ``≤ t-1``」这条边界不再由本函数自己
+    维护切片，而是走**唯一入口**。数值逐位不变（同一个切片、同一个除法）。
     """
     pairs = []
     for bar in bars or []:
@@ -396,9 +404,13 @@ def backtest_momentum(bars, window=20, rebalance_days=5):
     last_signal_pos = None
     days_since_rebalance = rebalance_days  # 第一个可调仓日为第 1 天
     for t in range(1, len(closes)):
-        index = t - 1  # 今日对应的 closes 下标
-        if days_since_rebalance >= rebalance_days and index - window >= 0:
-            momentum = closes[index] / closes[index - window] - 1
+        # PIT：t 日的决策只许看 ≤ t-1（``pit_prefix`` 是这条边界的唯一实现）。
+        # ``len(visible) > window`` 与原来的 ``index - window >= 0`` 等价（整数），
+        # ``visible[-1] / visible[-1 - window]`` 与 ``closes[index] / closes[index-window]``
+        # 逐位相同 —— 迁移不改数值，只改这条约束的**归属**。
+        visible = pit_cache.pit_prefix(closes, t, lag=pit_cache.LAG_PREV_DAY)
+        if days_since_rebalance >= rebalance_days and len(visible) > window:
+            momentum = visible[-1] / visible[-1 - window] - 1
             new_position = 1 if momentum > 0 else 0
             if last_signal_pos is not None and new_position != last_signal_pos:
                 signal_flips += 1

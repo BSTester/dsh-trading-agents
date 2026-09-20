@@ -590,6 +590,8 @@ READ_ONLY_TOOLS = {"series", "positions"}
 ROUTES = {
     ("GET", "/api/v3/risk/analytics"),
     ("GET", "/api/v3/factors/matrix"),
+    ("GET", "/api/v3/factors/registry"),
+    ("GET", "/api/v3/risk/funding-check"),
     ("GET", "/api/v3/strategy"),
     ("POST", "/api/v3/strategy/run"),
     ("GET", "/api/v3/ml/sweep"),

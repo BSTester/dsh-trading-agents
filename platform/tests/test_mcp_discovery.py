@@ -10,13 +10,19 @@
 3. **约束不绕过**：``v3_credentials`` 的 ``save``/``clear`` 经代理路径依然封死
    （``v3/credentials-web-only``、handler 零调用、磁盘零写入）；交易类工具不在目录里，
    代理因此不可能凭空造出交易能力。
-4. **鉴别力（mutation）**：**真实**删掉一条 ``/api/v3/*`` 路由 → 目录与代理面必须
+4. **只读面 /mcp/ro**（2026-09-21 漏洞修复）：与 ``/mcp`` 同为 6 件；``call_tool`` 对写类
+   （``trade_place`` / ``research_tasks_claim`` / ``v3_oms_sync`` / ``v3_strategy_run`` /
+   ``admin_prune_runs`` 等）回 ``mcp/denied-by-policy`` 且 **handler 零调用**（spy 断言）；
+   只读工具正常转发且与 ``/mcp`` 直连逐字段一致；凭据两条路径都仍然封死；卡片对写类标注
+   「只读面不可调用」；放行集由注册表 annotations 推导（不维护第二份名单）。
+5. **鉴别力（mutation）**：**真实**删掉一条 ``/api/v3/*`` 路由 → 目录与代理面必须
    同时变小、探针必须报出缺的那件；同一套探针在完整装配下必须通过。这条证明第 1/2 层
    不是恒真断言。
 
 只读验证：所有真实调用只打只读工具（``v3_gateway`` / ``v3_tools`` / ``v3_risk`` /
 ``v3_credentials?action=status``），不触发 ``trade_*``/``sim_trade_*``/``plan-execute``/
-``confirm-decide``/``switch-mode``。
+``confirm-decide``/``switch-mode``。写类工具的「拒绝」用例**只断言被挡在闸门**（spy 证明
+实现零调用），从不真正执行写动作。
 
 运行：``cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_mcp_discovery -v``
 """
@@ -202,8 +208,11 @@ class McpClient:
         return body
 
 
-def inproc(surface, work, home=None, raw=None):
-    """在真 lifespan 下跑一段异步工作（MCP session manager 必须有 lifespan）。"""
+def inproc(surface, work, home=None, raw=None, base="/mcp"):
+    """在真 lifespan 下跑一段异步工作（MCP session manager 必须有 lifespan）。
+
+    ``base``：MCP 端点路径（``/mcp`` 缺省；只读面传 ``/mcp/ro``）。
+    """
     app = build_offline_app(surface, home=home, raw=raw)
     try:
         async def runner():
@@ -211,7 +220,7 @@ def inproc(surface, work, home=None, raw=None):
                 transport = httpx.ASGITransport(app=app)
                 async with httpx.AsyncClient(transport=transport,
                                              base_url="http://127.0.0.1:8397") as http:
-                    client = McpClient(http)
+                    client = McpClient(http, base=base)
                     await client.initialize()
                     return await work(client, app)
 
@@ -603,6 +612,356 @@ class ConstraintBoundaryTests(unittest.TestCase):
         self.assertFalse(is_error)
         self.assertEqual(body["error"]["code"], "mcp/unknown-tool")
         self.assertIn("list_tools", body["error"]["message"])
+
+
+# ---------------------------------------------------------------------------
+# 3b. 只读面 /mcp/ro（2026-09-21 漏洞修复：call_tool 的服务侧硬边界）
+# ---------------------------------------------------------------------------
+class _CallSpy:
+    """包住原函数对象的调用计数器（async 函数：原样返回协程，由调用方 await）。"""
+
+    def __init__(self, fn):
+        self.fn = fn
+        self.calls = 0
+
+    def __call__(self, *args, **kwargs):
+        self.calls += 1
+        return self.fn(*args, **kwargs)
+
+
+class _SpyTargets:
+    """把 call_tool 会转发的目标函数对象换成计数器（进 with 装上、出 with 原样还原）。
+
+    桥接面换 ``bridge.bound[name]``（同一 dict 槽位，代理每次现读）；基础面换
+    ``BoundTool.fn``（``patch.object`` 实例属性）。读数 ``calls(name)`` 即该实现的
+    真实被调次数——拒绝路径必须是 0。
+    """
+
+    def __init__(self, testcase, names):
+        self.testcase = testcase
+        self.names = tuple(names)
+        self.spies = {}
+        self._restores = []
+
+    def __enter__(self):
+        for name in self.names:
+            if name in self.testcase.bridge.bound:
+                original = self.testcase.bridge.bound[name]
+                spy = _CallSpy(original)
+                self.testcase.bridge.bound[name] = spy
+                self._restores.append(
+                    lambda n=name, o=original: self.testcase.bridge.bound.__setitem__(n, o))
+            else:
+                bound = self.testcase.base_by_name[name]
+                spy = _CallSpy(bound.fn)
+                patcher = unittest.mock.patch.object(bound, "fn", spy)
+                patcher.start()
+                self._restores.append(patcher.stop)
+            self.spies[name] = spy
+        return self
+
+    def __exit__(self, *exc):
+        for restore in self._restores:
+            restore()
+        return False
+
+    def calls(self, name):
+        return self.spies[name].calls
+
+
+class ReadonlySurfaceTests(unittest.TestCase):
+    """/mcp/ro：同一实现、同一目录，call_tool 只放行注册表标注只读的内层工具。
+
+    背景（platform/server/mcp_discovery.py 模块 docstring「只读面」）：缺省 discovery 面下
+    写/交易工具的唯一到达路径是 ``call_tool`` 转发，而 Harness 白名单钩子按工具名匹配、
+    看不到被转发的内层名字——2026-09-21T00:01Z 一次线上决策唤醒经它误领了 2 条值班任务。
+    本面把这条边界下沉到**服务侧**：判据现读注册表 annotations（``readOnlyHint=True`` ∪
+    ``DIRECT_KEEP``），不维护第二份名单。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = build_offline_app(mcp_discovery.DISCOVERY)
+        cls.proxy = cls.app.state.mcp_ro_discovery
+        cls.bridge = cls.app.state.v3_mcp_bridge
+        cls.base_by_name = {tool.name: tool for tool in cls.app.state.mcp_tools}
+        _silence_loggers()
+
+    # -- spy 装置见 _SpyTargets（模块级，本类与 mutation 用例共用语义）--------------
+
+    def test_ro_surface_is_exactly_the_same_six_tools(self):
+        """/mcp/ro 的 tools/list 与 /mcp 同为 6 件，逐名相同、顺序相同。"""
+        main_names = registry_names(self.app.state.mcp)
+        ro_names = registry_names(self.app.state.mcp_ro)
+        self.assertEqual(ro_names, list(mcp_discovery.DIRECT_KEEP)
+                         + list(mcp_discovery.PROXY_NAMES))
+        self.assertEqual(ro_names, main_names)
+        self.assertEqual(len(ro_names), DISCOVERY_SURFACE)
+
+    def test_ro_surface_annotations_mirror_the_registry(self):
+        """直连保留件复用同一份标注；两个代理入口的标注按本面语义如实给出。"""
+        tools = {tool.name: tool for tool in asyncio.run(self.app.state.mcp_ro.list_tools())}
+        self.assertIs(tools["list_tools"].annotations.read_only_hint, True)
+        # 只读面的 call_tool **只会**转发只读工具（闸门在绑定里）→ 如实标 readOnlyHint=True
+        self.assertIs(tools["call_tool"].annotations.read_only_hint, True)
+        bridge = self.bridge
+        for name in ("v3_gateway", "v3_tools"):
+            self.assertIs(tools[name].annotations.read_only_hint, True, name)
+        for name in ("snapshot", "admin_status"):
+            self.assertIsNone(tools[name].annotations, name)
+        # 直连保留件是**同一个函数对象**（不是同源代码的复制品）
+        for name in ("v3_gateway", "v3_tools"):
+            self.assertIs(self.proxy.target(name), bridge.bound[name], name)
+        for name in ("snapshot", "admin_status"):
+            self.assertIs(self.proxy.target(name), self.base_by_name[name].fn, name)
+
+    def test_allow_set_is_derived_from_registry_annotations(self):
+        """放行集 = 注册表 annotations 快照的 readOnlyHint=True ∪ DIRECT_KEEP（无第二份名单）。
+
+        对照物必须是**快照本身**（``proxy.ro_annotations``，discovery 移出注册面之前取）——
+        装配后 /mcp 注册面只剩 6 件，从现读注册表反推会得到假差集（这正是要快照的原因）。
+        桥接件再与 ``NON_READONLY_PATHS`` 交叉核对（两份同源声明的方向必须一致）。
+        """
+        self.assertTrue(self.proxy.ro_annotations, "快照不得为空")
+        self.assertEqual(self.proxy.ro_allowed,
+                         mcp_discovery.readonly_allow_set(self.proxy.ro_annotations))
+        # 抽查方向：只读桥接件放行；桥接写类与基础写类一律不放行
+        for name in ("v3_sentiment", "v3_risk", "v3_metrics"):
+            self.assertIn(name, self.proxy.ro_allowed, name)
+        for name in ("v3_oms_sync", "v3_strategy_run", "v3_sdk_prompt", "v3_credentials",
+                     "trade_place", "research_tasks_claim", "admin_prune_runs",
+                     "switch_mode", "plan_execute"):
+            self.assertNotIn(name, self.proxy.ro_allowed, name)
+        # 判据确实来自 annotations，而不是目录里的 readOnly 卡片字段：
+        # 基础面只读工具（series）无标注 → 也不放行（fail-closed，README 有说明）
+        self.assertIsNone(self.proxy.ro_annotations.get("series"))
+        self.assertNotIn("series", self.proxy.ro_allowed)
+        # 桥接面交叉核对：放行 ⟺ endpoint 不在 NON_READONLY_PATHS（同源声明的两个落点）
+        path_of = {d.name: d.endpoint for d in self.bridge.definitions}
+        for name, endpoint in path_of.items():
+            self.assertEqual(name in self.proxy.ro_allowed,
+                             endpoint not in v3_mcp.NON_READONLY_PATHS, name)
+
+    def test_write_class_tools_are_denied_with_zero_handler_calls(self):
+        """写类内层工具 → ``mcp/denied-by-policy``，且 **handler 零调用**（spy 断言）。"""
+        write_class = ("trade_place", "research_tasks_claim", "v3_oms_sync",
+                       "v3_strategy_run", "admin_prune_runs", "switch_mode")
+        async def runner():
+            out = {}
+            with _SpyTargets(self, write_class) as spy:
+                for name in write_class:
+                    result = await self.app.state.mcp_ro.call_tool(
+                        "call_tool", {"name": name, "arguments": {}})
+                    out[name] = result
+                out["calls"] = {name: spy.calls(name) for name in write_class}
+            return out
+
+        out = asyncio.run(runner())
+        for name in write_class:
+            with self.subTest(tool=name):
+                result = out[name]
+                self.assertFalse(result.is_error, "策略拒绝是业务失败信封，不是协议错误")
+                body = envelope(result)
+                self.assertFalse(body["ok"])
+                self.assertEqual(body["error"]["code"], mcp_discovery.DENIED_BY_POLICY_CODE)
+                self.assertIn(mcp_discovery.DENIED_BY_POLICY_MESSAGE, body["error"]["message"])
+                self.assertIn("工作台", body["error"]["message"])
+        for name, calls in out["calls"].items():
+            self.assertEqual(calls, 0, f"{name} 的 handler 必须零调用（拒绝先于实现）")
+
+    def test_denial_precedes_argument_validation(self):
+        """空载荷的写调用也是策略拒绝（不是 mcp/bad-arguments）——闸门在最外层。"""
+        async def runner():
+            return await self.app.state.mcp_ro.call_tool("call_tool",
+                                                         {"name": "trade_place",
+                                                          "arguments": {}})
+
+        result = asyncio.run(runner())
+        body = envelope(result)
+        self.assertEqual(body["error"]["code"], mcp_discovery.DENIED_BY_POLICY_CODE)
+
+    def test_unknown_tool_stays_unknown_on_ro(self):
+        async def runner():
+            return await self.app.state.mcp_ro.call_tool("call_tool",
+                                                         {"name": "no_such_tool_zzz", "arguments": {}})
+
+        result = asyncio.run(runner())
+        body = envelope(result)
+        self.assertEqual(body["error"]["code"], "mcp/unknown-tool")
+        self.assertNotIn(mcp_discovery.DENIED_BY_POLICY_CODE, json.dumps(body, ensure_ascii=False))
+
+    def test_readonly_tools_forward_identically_on_both_surfaces(self):
+        """只读工具经 /mcp/ro 转发与经 /mcp 转发（以及同一函数对象直调）**逐字段一致**。
+
+        用例取**确定性**只读工具（``v3_tools`` / ``v3_risk`` / ``snapshot``——假 handle 下
+        输出恒定）。``v3_metrics``（调用计数器）与 ``v3_gateway``（``generated_at`` 微秒）
+        两次调用之间必然不同，属被测工具自身的时变输出，不进逐字段对照。
+        """
+        readonly_cases = (("v3_tools", {}), ("v3_risk", {}), ("snapshot", {}),
+                          ("snapshot", {"refresh": True}))
+        async def runner():
+            out = {"ro": {}, "main": {}, "direct": {}}
+            for name, arguments in readonly_cases:
+                out["ro"][name] = await self.app.state.mcp_ro.call_tool(
+                    "call_tool", {"name": name, "arguments": arguments})
+                out["main"][name] = await self.app.state.mcp.call_tool(
+                    "call_tool", {"name": name, "arguments": arguments})
+                target = self.proxy.target(name)
+                filled = {field: mcp_tools.UNSET for field in self.proxy.catalog[name].optional}
+                filled.update(arguments)
+                direct = target(**filled)
+                if hasattr(direct, "__await__"):
+                    direct = await direct
+                out["direct"][name] = direct
+            return out
+
+        out = asyncio.run(runner())
+        for name, _arguments in readonly_cases:
+            with self.subTest(tool=name):
+                ro_body = envelope(out["ro"][name])
+                self.assertTrue(ro_body["ok"], ro_body)
+                self.assertEqual(ro_body, envelope(out["main"][name]), name)
+                self.assertEqual(ro_body, envelope(out["direct"][name]), name)
+
+    def test_ro_over_the_wire_denies_write_and_forwards_readonly(self):
+        """真协议（/mcp/ro 端点）：写类被拒、只读放行、列表卡片带 roCallable 标注。"""
+        async def work(client, app):
+            out = {}
+            # McpClient.call_tool(name, …) 的 name 就是**内层**名（助手自己套 call_tool 外壳）
+            out["denied"] = await client.call_tool("research_tasks_claim", {})
+            out["forwarded"] = await client.call_tool("v3_tools", {})
+            _is_error, page = await client.tool_result("list_tools", {"keyword": "v3_oms_sync"})
+            out["cards"] = page["cards"]
+            _is_error, ro_page = await client.tool_result("list_tools",
+                                                          {"keyword": "v3_oms_orders"})
+            out["read_only_cards"] = ro_page["cards"]
+            out["surface"] = page.get("surface")
+            return out
+
+        out = inproc(mcp_discovery.DISCOVERY, work, base="/mcp/ro")
+        is_error, body = out["denied"]
+        self.assertFalse(is_error)
+        self.assertEqual(body["error"]["code"], mcp_discovery.DENIED_BY_POLICY_CODE)
+        self.assertIn(mcp_discovery.DENIED_BY_POLICY_MESSAGE, body["error"]["message"])
+        is_error, forwarded = out["forwarded"]
+        self.assertFalse(is_error)
+        self.assertTrue(forwarded["ok"], forwarded)
+        self.assertEqual(out["surface"], {"path": mcp_discovery.READONLY_SURFACE_PATH,
+                                          "readOnlyOnly": True})
+        self.assertEqual([card["name"] for card in out["cards"]], ["v3_oms_sync"])
+        for card in out["cards"]:
+            self.assertIs(card["roCallable"], False, card)
+            self.assertIn(mcp_discovery.RO_NOT_CALLABLE, card["roNote"])
+        # 对照：只读兄弟件（v3_oms_orders）的卡片放行且无标注
+        self.assertEqual([card["name"] for card in out["read_only_cards"]], ["v3_oms_orders"])
+        for card in out["read_only_cards"]:
+            self.assertIs(card["roCallable"], True, card)
+            self.assertNotIn("roNote", card)
+
+    def test_ro_cards_mark_write_class_not_callable(self):
+        """只读面检索页：写类卡片标注「只读面不可调用」；/mcp 面的卡片**没有**这些字段。"""
+        write_names = ("trade_place", "research_tasks_claim", "v3_oms_sync",
+                       "v3_strategy_run", "admin_prune_runs")
+        for name in write_names:
+            page = self.proxy.search(keyword=name, ro=True)
+            self.assertEqual(page["total"], 1, name)
+            card = page["cards"][0]
+            self.assertIs(card["roCallable"], False, name)
+            self.assertIn(mcp_discovery.RO_NOT_CALLABLE, card["roNote"])
+            self.assertIn("工作台", card["roNote"])
+        # 只读桥接件：可调用、无标注
+        page = self.proxy.search(keyword="v3_sentiment", ro=True)
+        card = page["cards"][0]
+        self.assertIs(card["roCallable"], True)
+        self.assertNotIn("roNote", card)
+        # 对照：/mcp 面的检索页不加 roCallable/roNote（表面行为一字不变）
+        plain = self.app.state.mcp_discovery.search(keyword="trade_place")
+        self.assertNotIn("roCallable", plain["cards"][0])
+        self.assertNotIn("roNote", plain["cards"][0])
+        self.assertNotIn("surface", plain)
+        # 「看到」不等于「能调」：只读面检索页仍覆盖全目录
+        self.assertEqual(self.proxy.search(ro=True)["total"],
+                         self.app.state.mcp_discovery.search()["total"])
+
+    def test_credentials_blocked_on_both_surfaces_by_two_distinct_layers(self):
+        """凭据 save/clear：/mcp/ro 被 annotations 闸门拒绝；/mcp 被桥内封死——都零 handler。"""
+        from server import v3_credentials
+
+        async def runner():
+            out = {}
+            with unittest.mock.patch.object(v3_credentials, "save") as save_spy, \
+                    unittest.mock.patch.object(v3_credentials, "clear") as clear_spy:
+                for surface_key, server in (("ro", self.app.state.mcp_ro),
+                                            ("main", self.app.state.mcp)):
+                    for action in ("save", "clear"):
+                        result = await server.call_tool(
+                            "call_tool",
+                            {"name": "v3_credentials",
+                             "arguments": {"action": action, "key": "tushare_token",
+                                           "value": "should-never-be-written"}})
+                        out[f"{surface_key}/{action}"] = envelope(result)
+                out["save_calls"] = save_spy.call_count
+                out["clear_calls"] = clear_spy.call_count
+            return out
+
+        out = asyncio.run(runner())
+        for action in ("save", "clear"):
+            # 只读面：annotations 闸门在最外层（readOnlyHint=False → 拒绝）
+            body = out[f"ro/{action}"]
+            self.assertEqual(body["error"]["code"], mcp_discovery.DENIED_BY_POLICY_CODE)
+            self.assertIn(mcp_discovery.DENIED_BY_POLICY_MESSAGE, body["error"]["message"])
+            # /mcp 面：桥内封死分支不变（v3/credentials-web-only）
+            body = out[f"main/{action}"]
+            self.assertEqual(body["error"]["code"], v3_mcp.CREDENTIALS_WEB_ONLY_CODE)
+            self.assertIn("Web", body["error"]["message"])
+        self.assertEqual(out["save_calls"], 0, "两条路径都必须零 handler 调用")
+        self.assertEqual(out["clear_calls"], 0)
+
+    def test_research_tasks_list_is_absent_by_design(self):
+        """``research_tasks_list`` 有意不在工具面（队列清单给人看）→ 只读放行不适用于它。"""
+        self.assertNotIn("research_tasks_list", self.proxy.catalog)
+
+    def test_main_surface_keeps_forwarding_write_class(self):
+        """对照（边界只在 /mcp/ro）：/mcp 的 call_tool 对写类**没有**策略拒绝（现状不变）。"""
+        async def runner():
+            return await self.app.state.mcp.call_tool("call_tool",
+                                                      {"name": "research_tasks_claim",
+                                                       "arguments": {}})
+
+        result = asyncio.run(runner())
+        body = envelope(result)
+        self.assertNotEqual(body["error"]["code"], mcp_discovery.DENIED_BY_POLICY_CODE)
+
+    def test_ro_surface_requires_auth_when_token_is_set(self):
+        """token 鉴权的 ``/mcp/`` 前缀判定覆盖 /mcp/ro：无 Bearer → 401（不出现未鉴权旁路）。
+
+        ``build_offline_app`` 传的 ``config={}`` 与中间件闭包里读的是**同一个 dict**，
+        这里就地填上 token 再走一遍中间件。
+        """
+        app = build_offline_app(mcp_discovery.DISCOVERY)
+        app.state.config["token"] = "secret"
+
+        async def runner():
+            async with app.router.lifespan_context(app):
+                transport = httpx.ASGITransport(app=app)
+                async with httpx.AsyncClient(transport=transport,
+                                             base_url="http://127.0.0.1:8397") as http:
+                    unauth = await http.post(
+                        "/mcp/ro", json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                         "params": {"protocolVersion": PROTOCOL_VERSION,
+                                                    "capabilities": {}}},
+                        headers={"Accept": "application/json, text/event-stream"})
+                    authed = await http.post(
+                        "/mcp/ro", json={"jsonrpc": "2.0", "id": 1, "method": "initialize",
+                                         "params": {"protocolVersion": PROTOCOL_VERSION,
+                                                    "capabilities": {}}},
+                        headers={"Accept": "application/json, text/event-stream",
+                                 "Authorization": "Bearer secret"})
+                    return unauth.status_code, authed.status_code
+
+        unauth_status, authed_status = asyncio.run(runner())
+        self.assertEqual(unauth_status, 401)
+        self.assertEqual(authed_status, 200)
 
 
 # ---------------------------------------------------------------------------
