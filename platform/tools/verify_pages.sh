@@ -14,7 +14,7 @@ TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
 
 # 路由 key → 设计稿页文件名（同一套功能）
-ROUTES="overview:index brain:brain market:market strategy:strategy risk:risk execution:execution gateway:gateway tools:tools settings:settings"
+ROUTES="overview:index brain:brain market:market strategy:strategy research:research risk:risk execution:execution gateway:gateway tools:tools settings:settings"
 for pair in $ROUTES; do
   key="${pair%%:*}"
   timeout 240 chromium --headless=new --no-sandbox --disable-gpu --hide-scrollbars \
@@ -27,8 +27,8 @@ import pathlib, re, sys
 
 tmp = pathlib.Path(sys.argv[1])
 PAIRS = [('overview','index'),('brain','brain'),('market','market'),('strategy','strategy'),
-         ('risk','risk'),('execution','execution'),('gateway','gateway'),('tools','tools'),
-         ('settings','settings')]
+         ('research','research'),('risk','risk'),('execution','execution'),('gateway','gateway'),
+         ('tools','tools'),('settings','settings')]
 # 与**真实数据**碰撞、已逐条人工取证的设计稿数字（登记后不再作为硬哨兵）：
 #   0.8%/99.2% 真实成功率与失败率；0.25 真实信号阈值与 z 值；0.58/1.00/1.24/1.38/0.42 真实网格夏普或
 #   真实风控数值；0.71 真实手续费 190.71 子串；25.4%/2.4% 页面真实文案；0.92 market 真实因子 z 值
@@ -58,6 +58,7 @@ REQUIRED = {
   'strategy': ['流水线', '提案', '因子', '扫描', '回测'],
   'risk': ['VaR', 'CVaR', 'Beta', 'Alpha', 'IR', '事前', '事中', '事后', '阻断'],
   'execution': ['生命周期', '审批', '订单', '持仓', '决策链路', '冻结计划', '待确认'],
+  'research': ['研报', '研究 run', '量化预览', '活动流', '值勤队列'],
   'gateway': ['MCP', 'SDK', 'Headless', '调度', '熔断'],
   'tools': ['工具', '域', '发现代理', '注册'],
   'settings': ['交易模式', '富途', '授权', '环境变量', '自动流水线'],

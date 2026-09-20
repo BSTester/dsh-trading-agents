@@ -43,6 +43,7 @@
 import asyncio
 import contextlib
 import importlib
+import inspect
 import json
 from datetime import datetime, timezone
 import os
@@ -886,15 +887,28 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         except Exception as error:  # noqa: BLE001 —— 与工具面口径一致：失败进 error 信封
             return {"ok": False, "error": {"code": "v3/tool-failed", "message": str(error)[:300]}}
 
-    # V3 子模块自动接线（分析 / 运维 / 外部数据源）：各自提供 register(app, v3_run, home)。
-    # 用 import 守卫：模块尚未创建时安静跳过，不阻断服务启动。
-    for _v3_module in ("v3_market", "v3_risk", "v3_credentials", "v3_analytics", "v3_ops", "v3_sources"):
+    # V3 子模块自动接线（分析 / 运维 / 外部数据源 / 密钥 / 行情 / 研报）：
+    # 各自提供 register(app, v3_run, home[, wb_http])；wb_http 为既有 HTTP 端点面的处理器
+    # （仅供 HTTP-only 读端点使用，例如研究值勤队列 research-tasks-list）。
+    def _wb_http(endpoint, payload=None):
+        return handle(endpoint, payload or {})
+
+    for _v3_module in ("v3_market", "v3_risk", "v3_credentials", "v3_research",
+                       "v3_analytics", "v3_ops", "v3_sources"):
         try:
             _module = importlib.import_module(f"server.{_v3_module}")
         except ModuleNotFoundError:
             continue
         _register = getattr(_module, "register", None)
-        if callable(_register):
+        if not callable(_register):
+            continue
+        # 按**参数名**注入：v3_sources.register 的第 4 参是 deps（测试注入用），
+        # 位置传参会破坏它的语义，因此只认显式声明 wb_http 的模块。
+        import inspect
+
+        if "wb_http" in inspect.signature(_register).parameters:
+            _register(app, v3_run, home, wb_http=_wb_http)
+        else:
             _register(app, v3_run, home)
 
     @app.get("/api/v3/overview")

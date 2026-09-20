@@ -9,6 +9,7 @@ import OverviewPage from "./pages/overview.jsx";
 import BrainPage from "./pages/brain.jsx";
 import MarketPage from "./pages/market.jsx";
 import StrategyPage from "./pages/strategy.jsx";
+import ResearchPage from "./pages/research.jsx";
 import RiskPage from "./pages/risk.jsx";
 import ExecutionPage from "./pages/execution.jsx";
 import GatewayPage from "./pages/gateway.jsx";
@@ -24,6 +25,7 @@ const GROUPS = [
   { cat: "研究", items: [
     { key: "market", name: "行情与信号", element: <MarketPage /> },
     { key: "strategy", name: "策略与因子", element: <StrategyPage /> },
+    { key: "research", name: "研究报告", element: <ResearchPage /> },
   ] },
   { cat: "交易", items: [
     { key: "risk", name: "风险监控", element: <RiskPage /> },

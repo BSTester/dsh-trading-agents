@@ -13,13 +13,13 @@ const read = (rel) => readFileSync(join(SRC, rel), "utf8");
 // 设计稿版的 9 页 + 分组（监控/研究/交易/系统）——两版必须一致
 const GROUPS = [
   ["监控", ["overview", "brain"]],
-  ["研究", ["market", "strategy"]],
+  ["研究", ["market", "strategy", "research"]],
   ["交易", ["risk", "execution"]],
   ["系统", ["gateway", "tools", "settings"]],
 ];
 const PAGES = GROUPS.flatMap(([, keys]) => keys);
 
-test("菜单分组与页面集合（4 组 9 页，与设计稿导航一致）", () => {
+test("菜单分组与页面集合（4 组 10 页）", () => {
   const app = read("app.jsx");
   for (const [cat] of GROUPS) {
     assert.ok(app.includes(`cat: "${cat}"`), `app.jsx 缺分组 ${cat}`);
@@ -27,10 +27,10 @@ test("菜单分组与页面集合（4 组 9 页，与设计稿导航一致）", 
   for (const key of PAGES) {
     assert.ok(app.includes(`key: "${key}"`), `app.jsx 缺页面 ${key}`);
   }
-  assert.equal((app.match(/key: "/g) ?? []).length, PAGES.length, "PAGES 数量不符（应为 9 页）");
+  assert.equal((app.match(/key: "/g) ?? []).length, PAGES.length, `PAGES 数量不符（应为 ${PAGES.length} 页）`);
 });
 
-test("9 个页面文件都存在且各自导出一个组件", () => {
+test("每个菜单项都有对应页面文件且导出组件", () => {
   const files = readdirSync(join(SRC, "pages")).filter((name) => name.endsWith(".jsx"));
   assert.deepEqual(files.sort(), PAGES.map((key) => `${key}.jsx`).sort());
   for (const key of PAGES) {
