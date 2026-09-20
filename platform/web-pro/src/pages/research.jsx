@@ -9,7 +9,7 @@
 // 数据：GET /api/v3/research（工作台快照：runs/reports/previews/activity）
 //      GET /api/v3/research/tasks（值勤队列，HTTP-only 读端点）
 import React from "react";
-import { Alert, Badge, Button, Col, Descriptions, Empty, Row, Space, Table, Tag, Tooltip, Typography } from "antd";
+import { Alert, Badge, Button, Col, DatePicker, Descriptions, Empty, Input, Row, Select, Space, Table, Tag, Tooltip, Typography } from "antd";
 import { ProCard } from "@ant-design/pro-components";
 import { fmt, noSourceText, useV3 } from "../services/api.js";
 import { Markdown } from "../lib/markdown.jsx";
@@ -46,13 +46,74 @@ export default function ResearchPage() {
   const research = useV3("research", {});
   const tasks = useV3("research/tasks", {});
   const [selectedId, setSelectedId] = React.useState(null);
+  // 筛选：标的 / 评级 / 时间范围 / 关键词（只作用于列表与导出目标，不改动后端数据）
+  const [filters, setFilters] = React.useState({ ticker: null, rating: null, range: null, keyword: "" });
+  const [exporting, setExporting] = React.useState(null);
 
   const reports = Array.isArray(research.value?.reports) ? research.value.reports : [];
   const runs = Array.isArray(research.value?.runs) ? research.value.runs : [];
   const previews = Array.isArray(research.value?.previews) ? research.value.previews : [];
   const activity = Array.isArray(research.value?.activity) ? research.value.activity : [];
   const queue = Array.isArray(tasks.value?.tasks) ? tasks.value.tasks : [];
-  const selected = reports.find((item) => item.id === selectedId) ?? reports[0] ?? null;
+  const allTickers = [...new Set(reports.map((item) => item.ticker).filter(Boolean))];
+  const allRatings = [...new Set(reports.map((item) => item.rating_label ?? item.rating).filter(Boolean))];
+  const filtered = reports.filter((item) => {
+    if (filters.ticker && item.ticker !== filters.ticker) return false;
+    if (filters.rating && (item.rating_label ?? item.rating) !== filters.rating) return false;
+    if (filters.keyword) {
+      const haystack = `${item.ticker ?? ""} ${item.report ?? ""}`.toLowerCase();
+      if (!haystack.includes(filters.keyword.toLowerCase())) return false;
+    }
+    if (filters.range && filters.range[0] && filters.range[1]) {
+      const at = Date.parse(item.published_at ?? "");
+      const from = filters.range[0].startOf("day").valueOf();
+      const to = filters.range[1].endOf("day").valueOf();
+      if (!Number.isFinite(at) || at < from || at > to) return false;
+    }
+    return true;
+  });
+  const selected = filtered.find((item) => item.id === selectedId) ?? filtered[0] ?? null;
+
+  /** 导出 PDF：服务端渲染（A4 暗色专业研报主题 + 封面页独占一页），直接下载/预览。 */
+  const exportPdf = () => {
+    if (!selected) return;
+    setExporting("pdf");
+    const url = `/api/v3/research/report.pdf?id=${encodeURIComponent(selected.id)}`;
+    window.open(url, "_blank", "noopener");
+    setTimeout(() => setExporting(null), 1200);
+  };
+
+  /** 导出 Markdown：正文与来源原样导出（与页面/ PDF 同源数据）。 */
+  const exportMarkdown = () => {
+    if (!selected) return;
+    setExporting("md");
+    const lines = [
+      `# ${selected.ticker} 研究报告`,
+      "",
+      `- 评级：${selected.rating_label ?? selected.rating ?? "—"}（${selected.rating ?? "—"}）`,
+      `- 账户模式：${selected.mode ?? "—"}`,
+      `- 发布时间：${fmt.stamp(selected.published_at)}`,
+      `- 研究 run：${selected.id}`,
+      `- 会话：${selected.session_id ?? "—"}`,
+      "",
+      String(selected.report ?? ""),
+      "",
+      "## 来源与数据时间",
+      "",
+      "| 来源 | 数据时间 | 引用 |",
+      "| --- | --- | --- |",
+      ...(selected.sources ?? []).map((item) => `| ${item.name ?? "—"} | ${item.as_of ?? "—"} | ${item.reference ?? "—"} |`),
+      "",
+      `> 导出时间 ${new Date().toISOString()} · 量化决策平台 V3（研究记录原样导出，未改写正文）`,
+    ];
+    const blob = new Blob([lines.join("\n")], { type: "text/markdown;charset=utf-8" });
+    const link = document.createElement("a");
+    link.href = URL.createObjectURL(blob);
+    link.download = `research-${String(selected.ticker ?? "report").replace(".", "_")}.md`;
+    link.click();
+    URL.revokeObjectURL(link.href);
+    setExporting(null);
+  };
   const running = runs.filter((run) => runStatus(run).raw === "running").length;
 
   return (
@@ -96,10 +157,35 @@ export default function ResearchPage() {
 
       <Row gutter={[12, 12]}>
         <Col xs={24} lg={9}>
-          <ProCard title="研报列表" bordered extra={<Text type="secondary" style={{ fontSize: 11 }}>按发布时间倒序</Text>}>
+          <ProCard title="研报列表" bordered
+            extra={<Text type="secondary" style={{ fontSize: 11 }}>{`按发布时间倒序 · 命中 ${filtered.length}/${reports.length}`}</Text>}>
+            <Space direction="vertical" size={8} style={{ width: "100%", marginBottom: 10 }}>
+              <Space size={8} wrap>
+                <Select size="small" allowClear placeholder="标的" style={{ width: 120 }}
+                  value={filters.ticker} onChange={(value) => setFilters((prev) => ({ ...prev, ticker: value ?? null }))}
+                  options={allTickers.map((ticker) => ({ value: ticker, label: ticker }))} />
+                <Select size="small" allowClear placeholder="评级" style={{ width: 110 }}
+                  value={filters.rating} onChange={(value) => setFilters((prev) => ({ ...prev, rating: value ?? null }))}
+                  options={allRatings.map((rating) => ({ value: rating, label: rating }))} />
+                <DatePicker.RangePicker size="small" style={{ width: 220 }}
+                  value={filters.range} onChange={(range) => setFilters((prev) => ({ ...prev, range }))} />
+              </Space>
+              <Input size="small" allowClear placeholder="关键词（标的或正文）"
+                value={filters.keyword} onChange={(event) => setFilters((prev) => ({ ...prev, keyword: event.target.value }))} />
+              <Space size={8} wrap>
+                <Button size="small" type="primary" ghost disabled={!selected} loading={exporting === "pdf"} onClick={exportPdf}
+                  title="服务端渲染 A4 PDF：暗色专业研报主题 + 封面页独占一页（正文文字可选中）">
+                  导出 PDF
+                </Button>
+                <Button size="small" disabled={!selected} loading={exporting === "md"} onClick={exportMarkdown}>
+                  导出 Markdown
+                </Button>
+                <Text type="secondary" style={{ fontSize: 11 }}>导出对象 = 当前选中研报</Text>
+              </Space>
+            </Space>
             <Table
               size="small" rowKey={(row) => row.id} loading={research.loading}
-              dataSource={reports} pagination={false}
+              dataSource={filtered} pagination={false}
               locale={{ emptyText: <Empty imageStyle={{ display: "none" }} description="尚无已发布研报（在对话里让 trading-agents 出一份）" /> }}
               onRow={(row) => ({ onClick: () => setSelectedId(row.id), style: { cursor: "pointer" } })}
               columns={[
@@ -124,9 +210,13 @@ export default function ResearchPage() {
                     { key: "published", label: "发布时间", children: fmt.stamp(selected.published_at) },
                     { key: "sources", label: "来源数", children: (selected.sources ?? []).length },
                   ]} />
-                <div style={{ background: "#12161d", border: "1px solid #232b37", borderRadius: 8, padding: "10px 14px" }}>
+                <div className="report-doc"
+                  style={{ border: "1px solid #232b37", borderRadius: 8, padding: "14px 18px" }}>
                   <Markdown text={String(selected.report ?? "")} />
                 </div>
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  正文渲染主题与导出 PDF 同源（.report-doc ↔ server/v3_report.py 的 REPORT_CSS，同一组设计 token）
+                </Text>
                 <Table size="small" rowKey={(row) => `${row.name}-${row.reference}`} pagination={false}
                   dataSource={selected.sources ?? []} locale={{ emptyText: "该研报未附来源（发布时要求至少一项）" }}
                   columns={[

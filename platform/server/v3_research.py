@@ -54,6 +54,8 @@ def register(app, v3_run, home, wb_http=None):
             "source": "workbench/snapshot",
         }
 
+    register_pdf(app, v3_run, wb_http)
+
     @app.get("/api/v3/research/tasks")
     async def v3_research_tasks():
         """值勤研究队列（daily_brief / factor_patrol / mining_round）——HTTP-only 端点直读。"""
@@ -65,3 +67,69 @@ def register(app, v3_run, home, wb_http=None):
         value = envelope.get("value") or {}
         return {"ok": True, "tasks": value.get("tasks") or [],
                 "source": "workbench/research-tasks-list"}
+
+
+def register_pdf(app, v3_run, wb_http=None):
+    """（由 register 内部调用）研报 PDF 导出：GET /api/v3/research/report.pdf?id=&ticker="""
+    from fastapi import Request, Response
+
+    from server import v3_report
+
+    def pick_report(query):
+        value = None
+        envelope = v3_run("snapshot", {})
+        if isinstance(envelope, dict) and envelope.get("ok"):
+            value = envelope.get("value")
+        if not isinstance(value, dict) and wb_http is not None:
+            try:
+                fallback = wb_http("snapshot", {}) or {}
+                value = fallback.get("value") if fallback.get("ok") else None
+            except Exception:  # noqa: BLE001
+                value = None
+        if not isinstance(value, dict):
+            return None, None, {"code": "research/snapshot-unavailable",
+                                "message": "工作台快照不可读"}
+        reports = value.get("reports") or []
+        wanted = (query.get("id") or "").strip()
+        ticker = (query.get("ticker") or "").strip().upper()
+        if wanted:
+            hit = next((item for item in reports if str(item.get("id")) == wanted), None)
+        elif ticker:
+            hit = next((item for item in reports if str(item.get("ticker", "")).upper() == ticker), None)
+        else:
+            hit = reports[0] if reports else None
+        if hit is None:
+            return None, value, {"code": "research/report-not-found",
+                                 "message": "没有匹配的已发布研报（可先用 ticker 或 id 筛选）"}
+        return hit, value, None
+
+    @app.get("/api/v3/research/report.pdf")
+    async def v3_research_pdf(request: Request):
+        """研报 → PDF（A4，暗色专业研报主题，封面页独占一页）。
+
+        ``?id=<run id>`` 或 ``?ticker=SH.600000`` 选一篇；都不给则取最新一篇。
+        渲染失败（无浏览器/超时）返回 JSON 错误信封而不是空文件。
+        """
+        query = dict(request.query_params)
+        report, snapshot, error = await asyncio.to_thread(pick_report, query)
+        if error:
+            return {"ok": False, "error": error}
+        html_text = v3_report.report_html(
+            report,
+            mode=(snapshot or {}).get("mode"),
+            generated_at=(snapshot or {}).get("generated_at"),
+            notice=(snapshot or {}).get("notice"),
+        )
+        data, meta = await asyncio.to_thread(v3_report.render_pdf, html_text)
+        if data is None:
+            return {"ok": False, "error": meta}
+        filename = f"research-{str(report.get('ticker') or 'report').replace('.', '_')}.pdf"
+        return Response(
+            content=data,
+            media_type="application/pdf",
+            headers={
+                "content-disposition": f'inline; filename="{filename}"',
+                "x-pdf-bytes": str(meta.get("bytes", len(data))),
+                "x-pdf-engine": str(meta.get("engine", "")),
+            },
+        )

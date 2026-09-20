@@ -4,6 +4,48 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>量化决策平台 V3 · 工作台</title>
+    <!-- 研报正文主题：与 server/v3_report.py 的 REPORT_CSS 同源（同一组设计 token），
+         保证「页面看到的」与「导出 PDF 的」排版一致；tests/test_v3_report.py 断言两边 token 相同。 -->
+    <style>
+      :root { --r-bg:#0b0e13; --r-panel:#12161d; --r-panel2:#171c26; --r-border:#232b37;
+              --r-text:#e6edf3; --r-muted:#8b97a5; --r-faint:#626d7c; --r-accent:#4c8dff;
+              --r-pos:#3fb950; --r-neg:#f8514d;
+              --r-mono: ui-monospace, Menlo, Consolas, monospace; }
+      .report-doc { background: var(--r-bg); color: var(--r-text);
+        font: 12.5px/1.8 -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; }
+      .report-doc h1 { font-size: 20px; margin: 0 0 12px; padding-bottom: 8px; border-bottom: 1px solid var(--r-border); }
+      .report-doc h2 { font-size: 15px; margin: 20px 0 8px; padding-left: 8px; border-left: 3px solid var(--r-accent); }
+      .report-doc h3 { font-size: 13.5px; margin: 16px 0 6px; }
+      .report-doc h4 { font-size: 12.5px; margin: 14px 0 6px; color: var(--r-muted); }
+      .report-doc p { margin: 0 0 9px; }
+      .report-doc strong { color: #fff; }
+      .report-doc .pos { color: var(--r-pos, #3fb950); }
+      .report-doc .neg { color: var(--r-neg, #f8514d); }
+      .report-doc .rating-up { color: var(--r-pos, #3fb950); }
+      .report-doc .rating-down { color: var(--r-neg, #f8514d); }
+      .report-doc a { color: var(--r-accent); text-decoration: none; word-break: break-all; }
+      .report-doc ul, .report-doc ol { margin: 0 0 9px; padding-left: 20px; }
+      .report-doc blockquote { margin: 0 0 10px; padding: 8px 12px; background: var(--r-panel2);
+        border-left: 3px solid #d9a112; color: var(--r-muted); }
+      .report-doc code { font-family: var(--r-mono); font-size: 11.5px; background: var(--r-panel2);
+        border: 1px solid var(--r-border); border-radius: 3px; padding: 0 4px; }
+      .report-doc pre { background: var(--r-panel2); border: 1px solid var(--r-border); border-radius: 4px;
+        padding: 10px 12px; overflow-x: auto; }
+      .report-doc pre code { border: 0; background: transparent; padding: 0; }
+      .report-doc table { width: 100%; border-collapse: collapse; margin: 0 0 12px; font-size: 12px; }
+      .report-doc th, .report-doc td { border: 1px solid var(--r-border); padding: 6px 8px; text-align: left; vertical-align: top; }
+      .report-doc th { background: var(--r-panel2); color: var(--r-muted); font-weight: 500; }
+      .report-doc td { font-variant-numeric: tabular-nums; }
+      .report-doc hr { border: 0; border-top: 1px solid var(--r-border); margin: 16px 0; }
+      /* 打印（浏览器另存为 PDF）时保持暗色，并让封面/正文分页 */
+      @media print {
+        html, body { background: var(--r-bg) !important; }
+        * { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+        @page { size: A4; margin: 16mm; }
+        .report-doc h2, .report-doc h3 { page-break-after: avoid; }
+        .report-doc table, .report-doc pre { page-break-inside: avoid; }
+      }
+    </style>
   </head>
   <body>
     <div id="root"></div>
