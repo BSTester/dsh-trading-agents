@@ -87,6 +87,103 @@ async function postCredentials(payload) {
   return body;
 }
 
+/**
+ * 只读 GET /api/v3/*（本页新增的「数据源与降级链」用）。
+ * 为什么不直接用共享层 useV3：需要区分「端点未上线 / 返回非 JSON」与「接口正常但没数据」——
+ * 未注册的 /api/v3/* 会落到 SPA 兜底返回 HTML（HTTP 200），共享层把这种响应折成 value=null，
+ * 页面就无法如实写出原因。鉴权与查询串沿用共享层同一约定（localStorage.trading_token → Bearer），
+ * 一律同源相对路径：控制台只与本服务通信（不接受外部基地址覆盖，避免同页混用事实源）。
+ * 只读：只发 GET，加载与刷新都不发任何写请求。
+ */
+function useReadV3(path, params = {}) {
+  const [state, setState] = React.useState({ loading: true, value: null, error: null });
+  const seqRef = React.useRef(0);
+  const key = JSON.stringify(params ?? {});
+  const read = React.useCallback(
+    async (refresh = false) => {
+      seqRef.current += 1;
+      const seq = seqRef.current;
+      setState((prev) => ({ ...prev, loading: true, error: null }));
+      const query = new URLSearchParams();
+      for (const [name, value] of Object.entries(params ?? {})) {
+        if (value === undefined || value === null || value === "") continue;
+        query.set(name, String(value));
+      }
+      if (refresh) query.set("_", String(Date.now()));
+      const suffix = query.toString();
+      // 一律同源相对路径：控制台只与本服务通信，不接受任何外部基地址覆盖
+      const url = `/api/v3/${path}${suffix ? `?${suffix}` : ""}`;
+      const headers = {};
+      try {
+        const token = window.localStorage.getItem("trading_token");
+        if (token) headers.Authorization = `Bearer ${token}`;
+      } catch {
+        /* localStorage 不可用时按未鉴权处理 */
+      }
+      let response = null;
+      try {
+        response = await window.fetch(url, { headers });
+      } catch (error) {
+        if (seqRef.current === seq) {
+          setState({ loading: false, value: null, error: `网络不可达（${url}）：${String(error?.message || error)}` });
+        }
+        return;
+      }
+      const contentType = String(response.headers.get("content-type") || "");
+      let body = null;
+      try {
+        body = await response.json();
+      } catch {
+        body = null;
+      }
+      if (seqRef.current !== seq) return;
+      if (response.status === 401) {
+        setState({ loading: false, value: null, error: "需要访问令牌：右上角「令牌」填入服务配置的 token" });
+        return;
+      }
+      if (body === null || typeof body !== "object") {
+        setState({
+          loading: false,
+          value: null,
+          error: `HTTP ${response.status} 返回的不是 JSON（content-type=${contentType || "未标注"}）：该端点可能尚未上线`,
+        });
+        return;
+      }
+      if (!response.ok) {
+        setState({ loading: false, value: body, error: body?.error?.message ? String(body.error.message) : `HTTP ${response.status}` });
+        return;
+      }
+      setState({ loading: false, value: body, error: null });
+    },
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [path, key],
+  );
+  React.useEffect(() => {
+    read(false);
+    return () => {
+      seqRef.current += 1;
+    };
+  }, [read]);
+  return { ...state, refresh: () => read(true) };
+}
+
+/** 错误原文：字符串原样展示；结构化错误保留 code 与 message（两段都不丢），其余回退到 JSON 原文。 */
+function rawErrorText(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "string") return value;
+  if (typeof value === "object") {
+    if (value.code && value.message) return `${String(value.code)}：${String(value.message)}`;
+    if (value.message) return String(value.message);
+    if (value.code) return String(value.code);
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  return String(value);
+}
+
 /** 自动流水线有效配置 → 本地草稿（缺省补全，非法配置保留 error 供如实展示）。 */
 function autoDraft(config) {
   const src = config && typeof config === "object" ? config : {};
@@ -137,6 +234,8 @@ export default function SettingsPage() {
   const orders = useV3("oms/orders");
   const audit = useV3("audit", { window: 120 });
   const credentials = useV3("credentials");
+  // 数据源降级链状态（只读 GET）
+  const sourcesStatus = useReadV3("sources/status");
 
   const s = settings.value ?? {};
   const mode = String(s.trading_mode ?? overview.value?.mode ?? "");
@@ -519,6 +618,19 @@ export default function SettingsPage() {
     link.remove();
     URL.revokeObjectURL(url);
   }
+
+  /* ── 「数据源与降级链」派生值（GET /api/v3/sources/status，只读） ──────────── */
+  const chainPayload = sourcesStatus.value && sourcesStatus.value.ok === true ? sourcesStatus.value : null;
+  const chainRows = Array.isArray(chainPayload?.chains) ? chainPayload.chains : [];
+  const chainAvailable = chainRows.filter((row) => row?.available === true).length;
+  const chainWithFallback = chainRows.filter(
+    (row) => typeof row?.fallback === "string" && row.fallback.trim() !== "",
+  ).length;
+  const chainReason = sourcesStatus.error
+    ? sourcesStatus.error
+    : sourcesStatus.value && sourcesStatus.value.ok === false
+      ? `${sourcesStatus.value.error?.code ?? "error"}：${sourcesStatus.value.error?.message ?? "服务端未给出原因"}`
+      : "GET /api/v3/sources/status 未返回 chains 清单";
 
   const unconfigured = credKeys.filter((item) => !item.present).length;
   const injectedMissing = envRows.filter((item) => !item.injected).length;
@@ -952,6 +1064,125 @@ export default function SettingsPage() {
         </Paragraph>
       </ProCard>
 
+      {/* 4.5 数据源与降级链（只读 GET /api/v3/sources/status）
+          有意不加 loading：该端点要对 8 条链各做一次真实只读探测（实测 20–60s），
+          卡片结构（统计位 / 表头 / 口径说明）必须立刻可见，探测中显式写明「探测中」。 */}
+      <ProCard
+        title="数据源与降级链"
+        bordered
+        extra={
+          <Space size={8}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {chainPayload ? `真实链状态 · ${chainRows.length} 条 · as_of ${fmt.stamp(chainPayload.as_of)}` : "GET /api/v3/sources/status · 只读"}
+            </Text>
+            <Button size="small" loading={sourcesStatus.loading} onClick={() => sourcesStatus.refresh()}>刷新</Button>
+          </Space>
+        }
+      >
+        {chainRows.length > 0 ? (
+          <Space size={32} wrap style={{ marginBottom: 12 }}>
+            <Statistic title="可用链 / 总链数" value={`${chainAvailable} / ${chainRows.length}`} valueStyle={{ fontSize: 18 }} />
+            <Statistic title="其中有降级源的链" value={chainWithFallback} suffix={`/ ${chainRows.length}`} valueStyle={{ fontSize: 18 }} />
+            <Statistic title="最近检查时间" value={fmt.stamp(chainPayload.checked_at ?? chainPayload.as_of)} valueStyle={{ fontSize: 18 }} />
+          </Space>
+        ) : sourcesStatus.loading ? (
+          <div style={{ marginBottom: 12 }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              正在探测各链（每链按主源 → 降级源各做一次真实只读 GET，实测约 20–60 秒；本卡不发任何写请求）…
+            </Text>
+          </div>
+        ) : (
+          <div style={{ marginBottom: 12 }}>
+            <NoSource what="数据源降级链" why={chainReason} />
+          </div>
+        )}
+        <Table
+          size="small"
+          rowKey={(row, index) => String(row?.key ?? index)}
+          dataSource={chainRows}
+          pagination={false}
+          locale={emptyTable(
+            "数据源降级链",
+            sourcesStatus.loading ? "探测中（每链一次真实只读 GET，实测约 20–60 秒）" : chainReason,
+          )}
+          scroll={{ x: 1400 }}
+          columns={[
+            {
+              title: "数据源",
+              width: 220,
+              render: (_, row) => (
+                <Space size={6}>
+                  <Text style={{ fontSize: 12 }}>{fmt.dash(row.label || row.key)}</Text>
+                  <Text code style={{ fontSize: 11 }}>{fmt.dash(row.key)}</Text>
+                </Space>
+              ),
+            },
+            {
+              title: "主源",
+              width: 250,
+              render: (_, row) => <Text code style={{ fontSize: 11 }}>{fmt.dash(row.primary)}</Text>,
+            },
+            {
+              title: "降级源",
+              width: 250,
+              render: (_, row) =>
+                typeof row.fallback === "string" && row.fallback.trim() !== "" ? (
+                  <Text code style={{ fontSize: 11 }}>{row.fallback}</Text>
+                ) : (
+                  <Text type="secondary" style={{ fontSize: 11 }}>无降级源（该链无开源替代）</Text>
+                ),
+            },
+            {
+              title: "当前可用",
+              width: 110,
+              render: (_, row) => (
+                <Tag color={row.available === true ? "success" : row.available === false ? "error" : "default"}>
+                  {row.available === true ? "可用" : row.available === false ? "不可用" : "未返回"}
+                </Tag>
+              ),
+            },
+            {
+              title: "最近来源（last_source · 最近实际命中）",
+              width: 280,
+              render: (_, row) => (
+                <Space size={6}>
+                  {row.last_source ? (
+                    <Text code style={{ fontSize: 11 }}>{String(row.last_source)}</Text>
+                  ) : (
+                    <Text type="secondary">—</Text>
+                  )}
+                  <Tag color={row.last_ok === true ? "success" : row.last_ok === false ? "error" : "default"}>
+                    {row.last_ok === true ? "成功" : row.last_ok === false ? "失败" : "未返回"}
+                  </Tag>
+                </Space>
+              ),
+            },
+            {
+              title: "检查时间",
+              width: 170,
+              render: (_, row) => <span className="num">{row.checked_at ? fmt.stamp(row.checked_at) : "—"}</span>,
+            },
+            {
+              title: "错误",
+              render: (_, row) => {
+                const text = rawErrorText(row.error);
+                return text ? (
+                  <Text style={{ color: "#f8514d", fontSize: 11.5, wordBreak: "break-all" }}>{text}</Text>
+                ) : (
+                  <Text type="secondary">—</Text>
+                );
+              },
+            },
+          ]}
+        />
+        <Paragraph type="secondary" style={{ fontSize: 11.5, marginTop: 8, marginBottom: 0 }}>
+          {`降级口径：优先富途（主源）；富途不可用时按该链的 fallback 降级到开源源（AKShare 等），每条数据都带 source 标注，可在行情 / 研究页核对。
+            两个源都失败时如实返回错误原文，不返回占位数据。成交质量类没有开源替代，降级源列为空时即为「无降级源」。
+            本卡只读展示，页面不提供任何降级开关；来源 GET /api/v3/sources/status。`}
+          {chainPayload && chainPayload.note ? ` 服务端说明：${String(chainPayload.note)}` : ""}
+        </Paragraph>
+      </ProCard>
+
       {/* 5. 环境变量与密钥来源 */}
       <ProCard
         title="环境变量与密钥来源"
@@ -1158,7 +1389,7 @@ export default function SettingsPage() {
 
       <ProCard bordered>
         <Text type="secondary" style={{ fontSize: 11.5 }}>
-          {`数据来源：/api/v3/settings · /api/v3/credentials · /api/v3/metrics · /api/v3/audit；工具 ${fmt.dash(metrics.value?.toolTotal)} 个 · 数据截至 ${fmt.stamp(metrics.value?.generated_at)}；凭据未配置 ${unconfigured} 项（密钥值不在任何位置展示）`}
+          {`数据来源：/api/v3/settings · /api/v3/credentials · /api/v3/metrics · /api/v3/audit · /api/v3/sources/status；工具 ${fmt.dash(metrics.value?.toolTotal)} 个 · 数据截至 ${fmt.stamp(metrics.value?.generated_at)}；凭据未配置 ${unconfigured} 项（密钥值不在任何位置展示）`}
         </Text>
       </ProCard>
 

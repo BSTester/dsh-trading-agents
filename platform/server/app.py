@@ -894,7 +894,9 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         return handle(endpoint, payload or {})
 
     for _v3_module in ("v3_market", "v3_risk", "v3_credentials", "v3_research",
-                       "v3_analytics", "v3_ops", "v3_sources"):
+                       "v3_analytics", "v3_ops", "v3_sources",
+                       # 2026-09-20：三市场时段、通用降级链与数据源状态、成交质量、行业暴露
+                       "v3_market_calendar", "v3_fallback", "v3_quality", "v3_industry"):
         try:
             _module = importlib.import_module(f"server.{_v3_module}")
         except ModuleNotFoundError:

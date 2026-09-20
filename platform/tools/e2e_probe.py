@@ -8,6 +8,7 @@
    * 记录：HTTP 状态、耗时、ok、错误码与消息、返回体量、以及是否拿到了真实数据。
 
 用法：python3 platform/tools/e2e_probe.py [--base http://127.0.0.1:8397] [--json out.json] [--md out.md]
+      python3 platform/tools/e2e_probe.py --markets SH,HK,US     # 三市场只读模式（见 MARKET_STEPS）
 """
 import argparse
 import json
@@ -15,6 +16,8 @@ import re
 import time
 import urllib.error
 import urllib.request
+from datetime import date as _date
+from datetime import timedelta as _timedelta
 
 #: 绝不主动触发的写/交易端点（本探针只读；这些能力已由页面在人工确认下验证）
 WRITE_ENDPOINTS = {
@@ -188,12 +191,207 @@ def probe_wb(base, endpoint):
     return last
 
 
+# ── 三市场模式（--markets SH,HK,US）─────────────────────────────────────────────
+# 对每个市场跑同一组**只读**步骤，输出按市场分组的成功/失败表：
+#   ① series（日 K，富途历史行情）          ② market_snapshot（实时快照，A 股权限 -9 是已知缺口）
+#   ③ quote_history_kline_v2（历史 K 线 v2）④ /api/v3/financials（A股/港股走 f10、美股走 SEC）
+#   ⑤ /api/v3/markets/calendar            ⑥ /api/v3/risk/industry（行业映射与暴露）
+#   ⑦ /api/v3/execution/quality（成交质量，券商委托/成交）
+# 全部 GET/POST 只读端点；写/交易端点在本模式下**一次都不碰**。
+MARKET_PLAN = {
+    "SH": {"quote": "SH.600000", "financials": "SH.600000", "financials_source": "futu/f10_detail/statements"},
+    "HK": {"quote": "HK.00700", "financials": "HK.00700", "financials_source": "futu/f10_detail/statements"},
+    "US": {"quote": "US.NVDA", "financials": "AAPL", "financials_source": "sec/companyconcept(us-gaap XBRL)"},
+}
+#: 三市场模式里的每一步 → (kind, name)：kind 为 wb 时走 /api/wb/<name>，v3 时走 /api/v3/<name>
+MARKET_STEPS = (
+    ("wb", "series", "日 K（富途历史行情）"),
+    ("wb", "market_snapshot", "实时快照（A 股已知无实时权限 -9）"),
+    ("wb", "quote_history_kline_v2", "历史 K 线 v2（K_DAY 3 根）"),
+    ("v3", "financials", "三表（A股/港股 f10、美股 SEC）"),
+    ("v3", "markets/calendar", "三市场交易时段/节假日"),
+    ("v3", "risk/industry", "行业映射与暴露"),
+    ("v3", "execution/quality", "成交质量（委托/成交回报）"),
+)
+
+
+def market_wb_payload(market, step, plan):
+    """每个市场、每个 /api/wb 步骤的真实载荷（参数与工具面契约逐项对齐）。"""
+    quote = plan["quote"]
+    today = _date.today()
+    if step == "series":
+        return {"ticker": quote, "period": "1d", "limit": 20}, 45
+    if step == "market_snapshot":
+        return {"codes": [quote]}, 45
+    if step == "quote_history_kline_v2":
+        # ktype 是**整数**枚举（7=K_DAY）、end 必填；窗口取最近 10 天，num 3 根（轻量探测）
+        return {"code": quote, "ktype": 7,
+                "start": (today - _timedelta(days=10)).isoformat(),
+                "end": today.isoformat(), "num": 3}, 60
+    return None, 30
+
+
+def market_v3_query(market, step, plan):
+    """每个市场、每个 /api/v3 步骤的查询串（返回 (path_with_query, timeout)）。"""
+    from urllib.parse import urlencode
+
+    financials_ticker = plan["financials"]
+    if step == "financials":
+        query = urlencode({"ticker": financials_ticker, "statement": "income", "periods": 3})
+        return f"financials?{query}", 90
+    if step == "markets/calendar":
+        return f"markets/calendar?{urlencode({'markets': 'SH,HK,US'})}", 30
+    if step == "risk/industry":
+        return f"risk/industry?{urlencode({'limit_pct': 20})}", 120
+    if step == "execution/quality":
+        return f"execution/quality?{urlencode({'market': market, 'mode': 'sim'})}", 90
+    return step, 45
+
+
+def _market_result(base, market, kind, step, plan):
+    """跑一步并把「真实证据」摘出来（成功看 source/条数，失败看错误码与原文）。"""
+    if kind == "wb":
+        payload, timeout = market_wb_payload(market, step, plan)
+        result = call(f"{base}/api/wb/{step}", payload, timeout=timeout)
+    else:
+        path, timeout = market_v3_query(market, step, plan)
+        result = call(f"{base}/api/v3/{path}", timeout=timeout)
+    result["step"] = step
+    result["kind"] = kind
+    value = None
+    if isinstance(result.get("raw"), str) and result["raw"].startswith("{"):
+        try:
+            parsed = json.loads(result["raw"])
+        except ValueError:
+            parsed = None
+        if isinstance(parsed, dict):
+            value = parsed.get("value") if "value" in parsed else parsed
+            if result.get("error") is None:
+                result["error"] = parsed.get("error")
+    elif result.get("ok") is False and result.get("error") is None:
+        # SPA 兜底会把「路由不存在」渲染成 200 + HTML：这不是数据缺口，是**服务未加载**该模块
+        result["error"] = {
+            "code": "probe/not-json",
+            "message": "响应不是 JSON（静态兜底返回了页面）→ 该 V3 路由尚未被进程加载，需重启服务",
+        }
+    result["value"] = value
+    result["evidence"] = _evidence(step, value)
+    return result
+
+
+def _evidence(step, value):
+    """一句话说明「这一步真拿到了什么」——空壳一律说空壳，不美化。"""
+    if not isinstance(value, (dict, list)):
+        return "—"
+    if step == "series":
+        bars = value.get("bars") if isinstance(value, dict) else None
+        return f"bars={len(bars or [])} source={value.get('source')}" if isinstance(value, dict) else "—"
+    if step == "market_snapshot":
+        return f"keys={sorted(value)[:6]}" if isinstance(value, dict) else "—"
+    if step == "quote_history_kline_v2":
+        rows = value.get("kline_list") if isinstance(value, dict) else None
+        return f"kline_list={len(rows or [])}"
+    if step == "financials":
+        if not isinstance(value, dict):
+            return "—"
+        return (f"source={value.get('source')} lines={len(value.get('lines') or [])} "
+                f"market={value.get('market')}")
+    if step == "markets/calendar":
+        markets = value.get("markets") if isinstance(value, dict) else None
+        if not isinstance(markets, dict):
+            return "—"
+        return " · ".join(f"{key}:{item.get('session')}" for key, item in markets.items())
+    if step == "risk/industry":
+        if not isinstance(value, dict):
+            return "—"
+        top = value.get("top") or {}
+        return (f"mapped={len(value.get('mapping') or {})} top={top.get('industry')}"
+                f"({top.get('weightPct')}%) breach={value.get('breach')}")
+    if step == "execution/quality":
+        if not isinstance(value, dict):
+            return "—"
+        metrics = value.get("metrics") or {}
+        return (f"orders={metrics.get('orders')} filled={metrics.get('filled')} "
+                f"cancelled={metrics.get('cancelled')} src={value.get('sources', {}).get('orders')}")
+    return "—"
+
+
+def run_market_mode(base, markets):
+    """三市场模式主流程：返回 ``{"markets": {market: [rows]}}``。"""
+    out = {}
+    for market in markets:
+        plan = MARKET_PLAN.get(market)
+        if plan is None:
+            out[market] = [{"step": "-", "kind": "-", "http": None, "ok": False, "ms": 0,
+                            "error": {"code": "probe/unknown-market",
+                                      "message": f"未知市场 {market}（支持 {sorted(MARKET_PLAN)}）"},
+                            "evidence": "—"}]
+            continue
+        rows = []
+        for kind, step, label in MARKET_STEPS:
+            result = _market_result(base, market, kind, step, plan)
+            result["label"] = label
+            if step == "financials":
+                # A股/港股必须是富途 f10；美股必须是 SEC——不是预期来源就标成失败（如实核对路由）
+                actual = (result.get("value") or {}).get("source") if isinstance(result.get("value"), dict) else None
+                expected = plan["financials_source"]
+                result["expected_source"] = expected
+                result["source_ok"] = (actual == expected)
+                if result.get("ok") and not result["source_ok"]:
+                    result["ok"] = False
+                    result["error"] = {"code": "probe/unexpected-source",
+                                       "message": f"期望 {expected}，实际 {actual}"}
+            rows.append(result)
+        out[market] = rows
+    return out
+
+
+def market_report(results):
+    """按市场分组渲染文本表 + Markdown。"""
+    lines = ["# V3 三市场只读探针（SH / HK / US）", ""]
+    totals = {"ok": 0, "fail": 0}
+    for market, rows in results.items():
+        passed = sum(1 for row in rows if row.get("ok") is True)
+        failed = sum(1 for row in rows if row.get("ok") is False)
+        totals["ok"] += passed
+        totals["fail"] += failed
+        lines.append(f"## {market} · 成功 {passed} / 失败 {failed}")
+        lines.append("")
+        lines.append("| 步骤 | 端点 | ok | 耗时 | 来源/证据 | 错误 |")
+        lines.append("|---|---|---|---|---|---|")
+        for row in rows:
+            error = row.get("error") or {}
+            error_text = f"{error.get('code')}：{str(error.get('message') or '')[:120]}" if error else "—"
+            endpoint = f"/api/{'wb' if row['kind'] == 'wb' else 'v3'}/{row['step']}"
+            lines.append(
+                f"| {row.get('label', '-')} | `{endpoint}` | "
+                f"{'✅' if row.get('ok') is True else '❌'} | {row.get('ms')}ms | "
+                f"{row.get('evidence') or '—'} | {error_text} |")
+        lines.append("")
+    lines.insert(2, f"- 总成功 {totals['ok']} · 总失败 {totals['fail']}（表内 ✅/❌ 均为真实响应判定）")
+    return "\n".join(lines)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--base", default="http://127.0.0.1:8397")
     parser.add_argument("--json", default="/tmp/e2e-probe.json")
     parser.add_argument("--md", default="/tmp/e2e-probe.md")
+    parser.add_argument("--markets", default="",
+                        help="三市场模式：逗号分隔的市场（如 SH,HK,US）。给了就只跑该模式。")
     args = parser.parse_args()
+
+    if args.markets.strip():
+        markets = [item.strip().upper() for item in args.markets.split(",") if item.strip()]
+        results = run_market_mode(args.base, markets)
+        report = market_report(results)
+        with open(args.json, "w", encoding="utf-8") as handle:
+            json.dump({"markets": results}, handle, ensure_ascii=False, indent=1)
+        with open(args.md, "w", encoding="utf-8") as handle:
+            handle.write(report + "\n")
+        print(report)
+        print(f"\n[已写出] {args.json} / {args.md}")
+        return
 
     snapshot = call(f"{args.base}/api/wb/snapshot", {})
     endpoints = []

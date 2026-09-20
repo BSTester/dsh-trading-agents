@@ -4,11 +4,11 @@
 //   ① 指标卡 5 张：VaR / CVaR / Beta / Alpha / IR（真实值 + 金额/占比/样本/方法说明）
 //   ② 三栏 Row/Col：事前（risk.config 5 项阈值）/ 事中（台账回撤 + 组合年化波动 + 事件流 events+audit）/
 //      事后（Kupiec 通过与否 + 破位/期望 + 组合年化 + 最大回撤 + 区间）
-//   ③ 暴露与集中度（analytics.tickers 权重 BarList）+ 单票上限说明
+//   ③ 暴露与集中度（行业暴露 BarList + 映射明细 ← risk/industry；单票集中度 ← analytics.tickers）
 //   ④ 净值/回撤曲线（LineChart ← analytics.equityCurve）
-//   ⑤ 风控规则表（阈值 + 来源 + 状态）
+//   ⑤ 风控规则表（阈值 + 来源 + 状态，含单一行业暴露上限 ← risk/industry）
 //   ⑥ 阻断记录（OMS 未自动放行订单，无则空态）
-//   ⑦ 无数据源项：行业暴露、行业/因子/个股归因、逐标的 ATR、杠杆率、流动性评分、逐日 VaR 序列
+//   ⑦ 无数据源项：行业/因子/个股归因、逐标的 ATR、杠杆率、流动性评分、逐日 VaR 序列
 //
 // 本页**没有任何写动作**：全部是 GET /api/v3/*（useV3 读），不提供规则编辑入口。
 import React from "react";
@@ -52,11 +52,13 @@ const OK = (env) => Boolean(env && env.ok);
 const fin = (value) => Number.isFinite(Number(value));
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
+/** 取数失败原因：HTTP 非 2xx（error）与 HTTP 200 的 ok:false 信封都取服务端 code/message 原文。 */
 function envError(env, fallback) {
   const error = (env && env.error) || {};
   const code = error.code ? String(error.code) : "";
   const message = error.message ? String(error.message) : "";
   if (code || message) return code ? `${code}：${message || fallback || "请求失败"}` : message;
+  if (env && env.ok === false) return fallback || "接口返回 ok:false 但未给出 error.code/message";
   return fallback || "接口未返回 error.code/message";
 }
 
@@ -67,6 +69,159 @@ const pct = (value, digits = 2) => (fin(value) ? `${Number(value) < 0 ? "−" : 
 const spct = (value, digits = 2) => (fin(value) ? `${Number(value) >= 0 ? "+" : "−"}${Math.abs(Number(value)).toFixed(digits)}%` : "—");
 const day = (value) => String(value || "").slice(0, 10);
 const toneOf = (value) => (!fin(value) || Number(value) === 0 ? undefined : Number(value) > 0 ? "#3fb950" : "#f8514d");
+/** 数字等宽：阈值/权重/占比等可比较数字统一走它（与设计 token 一致）。 */
+const NUM_FONT = { fontFamily: "ui-monospace, Menlo, monospace", fontVariantNumeric: "tabular-nums" };
+
+/* ── 行业暴露：GET /api/v3/risk/industry（真实板块映射 + 组合权重） ─────────────
+ *  口径：mapping 来自富途板块接口，权重来自平台组合；未取得行业的标的进 missing，原样列出。
+ *  取不到一律写「无数据源 · 原因」，缺项显示「—」，不估算、不占位。
+ */
+const industryExposureRows = (env) => {
+  const list = OK(env) ? env.exposures : null;
+  return asArray(list)
+    .map((row) => ({
+      industry: String((row && row.industry) || "—"),
+      weightPct: row && fin(row.weightPct) ? Number(row.weightPct) : null,
+      value: row && fin(row.value) ? Number(row.value) : null,
+      tickers: asArray(row && row.tickers).map((ticker) => String(ticker)),
+    }))
+    .filter((row) => row.weightPct !== null)
+    .sort((a, b) => b.weightPct - a.weightPct);
+};
+
+const industryMappingRows = (env) => {
+  const mapping = OK(env) && env.mapping && typeof env.mapping === "object" ? env.mapping : null;
+  if (!mapping) return [];
+  return Object.entries(mapping).map(([ticker, item]) => ({
+    key: ticker,
+    ticker,
+    industry: (item && item.industry) || "—",
+    plates: asArray(item && item.plates).map((plate) => String(plate)),
+  }));
+};
+
+/** 行业暴露与集中度（BarList + Top + 上限/breach + 映射明细 + missing）。 */
+function IndustryExposureCard({ env }) {
+  const ready = OK(env);
+  const rows = industryExposureRows(env);
+  const mappingRows = industryMappingRows(env);
+  const items = rows.map((row) => [row.industry, `${row.weightPct.toFixed(2)}%`]);
+  const top = ready && env.top && fin(env.top.weightPct)
+    ? { industry: String(env.top.industry || "—"), weightPct: Number(env.top.weightPct) }
+    : (rows[0] ? { industry: rows[0].industry, weightPct: rows[0].weightPct } : null);
+  const limitPct = ready && fin(env.limitPct) ? Number(env.limitPct) : null;
+  const breach = ready ? Boolean(env.breach) : false;
+  const missing = ready ? asArray(env.missing).filter((item) => item && typeof item === "object") : [];
+  const sources = ready && env.sources && typeof env.sources === "object" ? env.sources : null;
+  const maxWeight = rows.reduce((max, row) => Math.max(max, row.weightPct), 0);
+
+  const mappingColumns = [
+    { title: "标的", dataIndex: "ticker", width: 130, render: (value) => <Text code style={{ fontSize: 11 }}>{String(value)}</Text> },
+    { title: "行业", dataIndex: "industry", width: 120, render: (value) => <Text style={{ fontSize: 12 }}>{String(value)}</Text> },
+    {
+      title: "板块代码", dataIndex: "plates", render: (value) => (
+        <Space size={4} wrap>
+          {asArray(value).length === 0
+            ? <Text type="secondary" style={{ fontSize: 11 }}>—</Text>
+            : asArray(value).map((plate) => <Tag key={String(plate)} style={{ fontSize: 10 }}>{String(plate)}</Tag>)}
+        </Space>
+      ),
+    },
+  ];
+
+  return (
+    <Space direction="vertical" size={10} style={{ width: "100%" }}>
+      {!ready ? (
+        <NoSource what="行业暴露" why={envError(env, "GET /api/v3/risk/industry 取不到（板块映射或组合权重缺失）")} />
+      ) : (
+        <>
+          <Space size={8} wrap>
+            <Tag color={breach ? "red" : "green"}>{breach ? "超限" : "未超限"}</Tag>
+            <Text style={{ fontSize: 12 }}>
+              {top
+                ? `Top 行业 ${top.industry} · 占比 ${fmt.pct(top.weightPct, 2)}`
+                : "Top 行业 —（服务端未返回 exposures/top）"}
+            </Text>
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              {`单一行业暴露上限 ${limitPct === null ? "—" : fmt.pct(limitPct, 0)}（接口 limit_pct）· 来源 /api/v3/risk/industry · as_of ${fmt.stamp(env.as_of)}`}
+            </Text>
+          </Space>
+          <Row gutter={[16, 16]}>
+            <Col xs={24} lg={14}>
+              <Text strong style={{ fontSize: 12 }}>行业暴露（占组合净值）</Text>
+              <div style={{ marginTop: 8 }}>
+                {rows.length === 0 ? (
+                  <NoSource what="行业暴露" why="服务端未返回 exposures（板块映射或组合权重为空）" />
+                ) : (
+                  <BarList items={items} max={Math.max(maxWeight, limitPct || 0) || 1}
+                    color={breach ? "#f8514d" : "#4c8dff"} />
+                )}
+              </div>
+            </Col>
+            <Col xs={24} lg={10}>
+              <Text strong style={{ fontSize: 12 }}>Top 行业</Text>
+              <div style={{ marginTop: 8, border: "1px solid #232b37", borderRadius: 6, padding: "8px 10px" }}>
+                {!top ? (
+                  <NoSource what="Top 行业" why="服务端未返回 top.weightPct" />
+                ) : (
+                  <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                    <Space size={8} wrap>
+                      <Text strong>{top.industry}</Text>
+                      <Text style={{ ...NUM_FONT, fontSize: 14 }}>{fmt.pct(top.weightPct, 2)}</Text>
+                      <Tag color={breach ? "red" : "green"}>{breach ? "超限" : "未超限"}</Tag>
+                    </Space>
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      {`上限 ${limitPct === null ? "—" : fmt.pct(limitPct, 0)} · ${top.weightPct > (limitPct ?? Infinity) ? `超出 ${fmt.pct(top.weightPct - limitPct, 2)}` : `距上限 ${limitPct === null ? "—" : fmt.pct(limitPct - top.weightPct, 2)}`}`}
+                    </Text>
+                    <Text type="secondary" style={{ fontSize: 11 }}>
+                      {`行业数 ${rows.length} · 已映射标的 ${mappingRows.length} · 最大行业权重 ${rows.length ? fmt.pct(maxWeight, 2) : "—"}`}
+                    </Text>
+                  </Space>
+                )}
+              </div>
+            </Col>
+          </Row>
+          <div>
+            <Text strong style={{ fontSize: 12 }}>{`映射明细（标的 → 行业 → 板块代码，${mappingRows.length} 条）`}</Text>
+            <div style={{ marginTop: 8 }}>
+              {mappingRows.length === 0 ? (
+                <NoSource what="行业映射明细" why="服务端未返回 mapping" />
+              ) : (
+                <Table size="small" rowKey="key" pagination={false} columns={mappingColumns}
+                  dataSource={mappingRows} scroll={{ x: 520 }} />
+              )}
+            </div>
+          </div>
+          <div>
+            <Text strong style={{ fontSize: 12 }}>{`未取得行业的标的（${missing.length} 条）`}</Text>
+            <div style={{ marginTop: 6 }}>
+              {missing.length === 0 ? (
+                <Text type="secondary" style={{ fontSize: 12 }}>服务端未返回 missing（全部标的均已取得行业）</Text>
+              ) : (
+                <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                  {missing.map((item, index) => (
+                    <Text key={`${item.ticker}-${index}`} style={{ fontSize: 12 }}>
+                      <Text code style={{ fontSize: 11 }}>{String(item.ticker || "—")}</Text>
+                      <Text type="secondary">{`：${String(item.reason || "服务端未给出原因")}`}</Text>
+                    </Text>
+                  ))}
+                </Space>
+              )}
+            </div>
+          </div>
+          <Descriptions size="small" column={{ xs: 1, sm: 2 }} bordered
+            items={[
+              { key: "plate", label: "板块来源", children: <Text code style={{ fontSize: 11 }}>{sources && sources.plate ? String(sources.plate) : "—"}</Text> },
+              { key: "weights", label: "权重来源", children: <Text code style={{ fontSize: 11 }}>{sources && sources.weights ? String(sources.weights) : "—"}</Text> },
+              { key: "asof", label: "口径时点 as_of", children: fmt.stamp(env.as_of) },
+              { key: "breach", label: "超限判定 breach", children: breach ? <Tag color="red">true（已超限）</Tag> : <Tag color="green">false（未超限）</Tag> },
+            ]}
+          />
+        </>
+      )}
+    </Space>
+  );
+}
 
 /** 净值曲线统计：峰值/谷底/最大回撤/修复天数（全部由 analytics.equityCurve 实数推导）。 */
 function curveStats(curve) {
@@ -216,7 +371,7 @@ function MetricCards({ env }) {
 }
 
 /* ── ② 三栏：事前 / 事中 / 事后 ─────────────────────────────────────────── */
-function PreTradeCard({ riskEnv, orders, nav, analytics, positions }) {
+function PreTradeCard({ riskEnv, orders, nav, analytics, positions, industryEnv }) {
   const config = OK(riskEnv) && riskEnv.data ? (riskEnv.data.config || {}) : null;
   if (!config) {
     return (
@@ -225,6 +380,14 @@ function PreTradeCard({ riskEnv, orders, nav, analytics, positions }) {
       </ProCard>
     );
   }
+  // 行业红线（单一行业暴露上限）的当前值改由 /api/v3/risk/industry.top.weightPct 提供。
+  const industryReady = OK(industryEnv);
+  const industryRows = industryExposureRows(industryEnv);
+  const industryTop = industryReady && industryEnv.top && fin(industryEnv.top.weightPct)
+    ? { industry: String(industryEnv.top.industry || "—"), weightPct: Number(industryEnv.top.weightPct) }
+    : (industryRows[0] || null);
+  const industryLimit = industryReady && fin(industryEnv.limitPct) ? Number(industryEnv.limitPct) : null;
+  const industryBreach = industryReady ? Boolean(industryEnv.breach) : false;
   const source = riskEnv.data.source || "未返回来源";
   const reasonText = orders.map((order) => asArray(order.risk && order.risk.reasons).join("；")).join("；");
   const limitMatch = reasonText.match(/[>＞]\s*([0-9.]+)\s*%/);
@@ -273,6 +436,21 @@ function PreTradeCard({ riskEnv, orders, nav, analytics, positions }) {
       threshold: fin(config.daily_loss_limit_pct) ? `单日 ≤ ${pct(Number(config.daily_loss_limit_pct) * 100, 0)}（config.daily_loss_limit_pct）` : "无数据源（config.daily_loss_limit_pct 未返回）",
       note: analytics && fin(analytics.maxDrawdownPct) ? `组合区间累计最大回撤 ${pct(analytics.maxDrawdownPct)}（analytics，非单日口径）` : "无数据源：组合净值曲线不足",
       tone: ["gold", "关注"],
+    },
+    {
+      key: "industry",
+      label: "单一行业暴露上限",
+      threshold: industryReady
+        ? (industryLimit === null
+          ? "上限：服务端未返回 limit_pct"
+          : `≤ 组合净值 ${pct(industryLimit, 0)}（/api/v3/risk/industry.limitPct）`)
+        : `上限：无数据源 · ${envError(industryEnv, "GET /api/v3/risk/industry 取不到")}`,
+      note: industryTop
+        ? `当前 Top 行业 ${industryTop.industry} ${pct(industryTop.weightPct, 2)}（权重来源 ${(industryEnv.sources && industryEnv.sources.weights) || "—"}）· as_of ${fmt.stamp(industryEnv.as_of)}`
+        : (industryReady ? "服务端未返回 exposures/top（板块映射或组合权重为空）" : "行业暴露取不到，红线需人工核对"),
+      tone: !industryTop || industryLimit === null
+        ? ["default", "无数据"]
+        : (industryBreach || industryTop.weightPct > industryLimit ? ["red", "超限"] : ["green", "正常"]),
     },
   ];
   return (
@@ -453,7 +631,7 @@ function PostTradeCard({ env }) {
 }
 
 /* ── ③ 暴露与集中度 ─────────────────────────────────────────────────────── */
-function ExposureCard({ env, riskEnv, ordersEnv }) {
+function ExposureCard({ env, riskEnv, ordersEnv, industryEnv }) {
   const analytics = OK(env) ? env.analytics : null;
   const config = OK(riskEnv) && riskEnv.data ? (riskEnv.data.config || {}) : null;
   const cap = config && fin(config.max_position_pct) ? Number(config.max_position_pct) * 100 : null;
@@ -462,6 +640,10 @@ function ExposureCard({ env, riskEnv, ordersEnv }) {
     : [];
   const top5 = entries.slice(0, 5).reduce((sum, row) => sum + row[1], 0);
   const industrySource = OK(ordersEnv) ? ordersEnv.industry_source : null;
+  const industryReady = OK(industryEnv);
+  const industryTop = industryReady && industryEnv.top && fin(industryEnv.top.weightPct) ? Number(industryEnv.top.weightPct) : null;
+  const industryLimit = industryReady && fin(industryEnv.limitPct) ? Number(industryEnv.limitPct) : null;
+  const industryBreach = industryReady ? Boolean(industryEnv.breach) : false;
   return (
     <ProCard
       title="暴露与集中度"
@@ -476,7 +658,7 @@ function ExposureCard({ env, riskEnv, ordersEnv }) {
         <Col xs={24} lg={12}>
           <Text strong style={{ fontSize: 12 }}>行业暴露（占组合净值）</Text>
           <div style={{ marginTop: 8 }}>
-            <NoSource what="行业暴露" why={`工作台工具面无行业分类数据源（OMS industry_source=${String(industrySource || "no-data").slice(0, 8)}…）：行业上限按 0% 不参与自动阻断，红线需人工核对`} />
+            <IndustryExposureCard env={industryEnv} />
           </div>
         </Col>
         <Col xs={24} lg={12}>
@@ -495,13 +677,17 @@ function ExposureCard({ env, riskEnv, ordersEnv }) {
       </Row>
       <Alert
         style={{ marginTop: 12 }}
-        type="warning"
+        type={industryBreach ? "error" : industryReady ? "info" : "warning"}
         showIcon
-        message={`单票上限：${cap === null ? "无数据源（config.max_position_pct 未返回）" : `≤ 组合权益 ${pct(cap, 0)}（config.max_position_pct）`}`}
+        message={industryReady
+          ? `行业集中度红线：≤ ${industryLimit === null ? "—" : pct(industryLimit, 0)}（接口 limit_pct）· 当前 Top 行业 ${industryEnv.top && industryEnv.top.industry ? industryEnv.top.industry : "—"} ${industryTop === null ? "—" : pct(industryTop, 2)} · ${industryBreach ? "已超限（需人工处置）" : "未超限"}`
+          : `行业集中度红线：无数据源 · ${envError(industryEnv, "GET /api/v3/risk/industry 取不到")}`}
         description={
           <Text type="secondary" style={{ fontSize: 12 }}>
-            权重口径＝组合内权重（{(analytics && analytics.portfolioSource) || "组合口径未知"}，共 {entries.length} 个标的）；
-            行业分类与因子暴露工作台未提供，行业红线不参与自动阻断（OMS industry_source=no-data）。
+            单票上限：{cap === null ? "无数据源（config.max_position_pct 未返回）" : `≤ 组合权益 ${pct(cap, 0)}（config.max_position_pct）`}；
+            单票权重口径＝组合内权重（{(analytics && analytics.portfolioSource) || "组合口径未知"}，共 {entries.length} 个标的）。
+            行业暴露与映射明细来自 /api/v3/risk/industry（板块 {industryReady && industryEnv.sources && industryEnv.sources.plate ? industryEnv.sources.plate : "—"}）；
+            行业红线只做展示与人工核对，OMS 台账的 industry_source={String(industrySource || "no-data").slice(0, 12)}，超限不自动阻断订单。
             杠杆率 / 流动性评分：{noSourceText("杠杆率与流动性评分", "positions 不返回融资余额与盘口深度")}。
           </Text>
         }
@@ -550,7 +736,7 @@ function CurveCard({ env }) {
 }
 
 /* ── ⑤ 风控规则表 ───────────────────────────────────────────────────────── */
-function RulesCard({ riskEnv, orders, nav, env }) {
+function RulesCard({ riskEnv, orders, nav, env, industryEnv }) {
   const config = OK(riskEnv) && riskEnv.data ? (riskEnv.data.config || {}) : null;
   const analytics = OK(env) ? env.analytics : null;
   if (!config) {
@@ -565,6 +751,14 @@ function RulesCard({ riskEnv, orders, nav, env }) {
   const heaviest = weights.slice().sort((a, b) => b[1] - a[1])[0] || null;
   const maxOrder = orders.reduce((acc, order) => (fin(order.value) && (!acc || Number(order.value) > Number(acc.value)) ? order : acc), null);
   const singleRatio = maxOrder && fin(nav) && Number(nav) ? (Number(maxOrder.value) / Number(nav)) * 100 : null;
+  // 单一行业暴露上限：当前值取 /api/v3/risk/industry.top.weightPct（此前显示「无数据源」）；breach 时标红。
+  const industryReady = OK(industryEnv);
+  const industryRows = industryExposureRows(industryEnv);
+  const industryTop = industryReady && industryEnv.top && fin(industryEnv.top.weightPct)
+    ? { industry: String(industryEnv.top.industry || "—"), weightPct: Number(industryEnv.top.weightPct) }
+    : (industryRows[0] || null);
+  const industryLimit = industryReady && fin(industryEnv.limitPct) ? Number(industryEnv.limitPct) : null;
+  const industryBreach = industryReady ? Boolean(industryEnv.breach) : false;
   const rows = [
     {
       key: "cap",
@@ -574,6 +768,19 @@ function RulesCard({ riskEnv, orders, nav, env }) {
       tone: !heaviest || config.max_position_pct == null ? { color: undefined, text: "无数据" } : (heaviest[1] <= Number(config.max_position_pct) * 100 ? { color: "green", text: "正常" } : { color: "red", text: "超限" }),
       source: `组合权重 /api/v3/risk/analytics${heaviest ? `（${heaviest[0]}）` : ""}`,
       updated: "无数据源",
+    },
+    {
+      key: "industry",
+      name: "单一行业暴露上限",
+      threshold: `≤ 组合净值 ${pct(industryLimit, 0)}（/api/v3/risk/industry.limitPct）`,
+      current: industryTop ? `${industryTop.industry} ${pct(industryTop.weightPct, 2)}` : "无数据源",
+      tone: !industryTop || industryLimit === null
+        ? { color: undefined, text: "无数据" }
+        : (industryBreach || industryTop.weightPct > industryLimit ? { color: "red", text: "超限" } : { color: "green", text: "正常" }),
+      source: industryTop
+        ? `行业映射 /api/v3/risk/industry（板块 ${(industryEnv.sources && industryEnv.sources.plate) || "—"}）· as_of ${fmt.stamp(industryEnv.as_of)}`
+        : `行业映射 /api/v3/risk/industry 取不到`,
+      updated: industryTop ? fmt.stamp(industryEnv.as_of) : "无数据源",
     },
     {
       key: "order",
@@ -695,7 +902,6 @@ function BlocksCard({ orders }) {
 /* ── ⑦ 无数据源清单 ─────────────────────────────────────────────────────── */
 function NoSourceCard() {
   const items = [
-    { what: "行业暴露 / 行业分类", why: "工具面无行业分类数据源（OMS industry_source=no-data），行业上限按 0% 不参与自动阻断" },
     { what: "行业归因 / 因子归因 / 个股归因", why: "工作台工具面无归因数据源，本页不估算" },
     { what: "逐标的 ATR 与单笔风险折算", why: "工具面未提供逐标的 ATR 与止损价，风险预算无法按止损距离折算" },
     { what: "杠杆率", why: "positions 不返回融资余额/保证金占用" },
@@ -724,6 +930,8 @@ export default function 风险监控Page() {
   const execution = useV3("execution", {});
   const audit = useV3("audit", { window: 120 });
   const strategy = useV3("strategy", {});
+  // 行业暴露与集中度：只读 GET；limit_pct=20 为单一行业暴露红线（与风控页红线口径一致）。
+  const industry = useV3("risk/industry", { limit_pct: 20 });
 
   const orders = OK(ordersEnv.value) && Array.isArray(ordersEnv.value.orders) ? ordersEnv.value.orders : [];
   const nav = OK(analytics.value) && fin(analytics.value.nav)
@@ -756,7 +964,7 @@ export default function 风险监控Page() {
       <Row gutter={[12, 12]}>
         <Col xs={24} xl={8}>
           <Block title="事前风控">
-            <PreTradeCard riskEnv={risk.value} orders={orders} nav={nav} analytics={OK(analytics.value) ? analytics.value.analytics : null} positions={positions} />
+            <PreTradeCard riskEnv={risk.value} orders={orders} nav={nav} analytics={OK(analytics.value) ? analytics.value.analytics : null} positions={positions} industryEnv={industry.value} />
           </Block>
         </Col>
         <Col xs={24} xl={8}>
@@ -771,13 +979,13 @@ export default function 风险监控Page() {
         </Col>
       </Row>
       <Block title="暴露与集中度">
-        <ExposureCard env={analytics.value} riskEnv={risk.value} ordersEnv={ordersEnv.value} />
+        <ExposureCard env={analytics.value} riskEnv={risk.value} ordersEnv={ordersEnv.value} industryEnv={industry.value} />
       </Block>
       <Block title="净值曲线">
         <CurveCard env={analytics.value} />
       </Block>
       <Block title="风控规则">
-        <RulesCard riskEnv={risk.value} orders={orders} nav={nav} env={analytics.value} />
+        <RulesCard riskEnv={risk.value} orders={orders} nav={nav} env={analytics.value} industryEnv={industry.value} />
       </Block>
       <Block title="阻断记录">
         <BlocksCard orders={orders} />
@@ -786,7 +994,7 @@ export default function 风险监控Page() {
         <NoSourceCard />
       </Block>
       <Text type="secondary" style={{ fontSize: 12 }}>
-        数据来源：/api/v3/risk/analytics（VaR/CVaR/Beta/Alpha/IR + Kupiec + 净值曲线）· /api/v3/risk（事前阈值配置）· /api/v3/oms/orders（台账订单与风控分级）·
+        数据来源：/api/v3/risk/analytics（VaR/CVaR/Beta/Alpha/IR + Kupiec + 净值曲线）· /api/v3/risk（事前阈值配置）· /api/v3/risk/industry（行业暴露与板块映射）· /api/v3/oms/orders（台账订单与风控分级）·
         /api/v3/execution（持仓口径）· /api/v3/audit（事中事件流）· /api/v3/events?ticker={eventsTicker}（公开披露事件）。页面不含占位数字。
         {" "}<Link href="/v3/risk.html">对照设计稿原样版</Link>
       </Text>

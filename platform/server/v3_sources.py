@@ -1,4 +1,4 @@
-"""外部数据源 V3 接口（``/api/v3/*`` 的数据源半边）：AKShare / SEC EDGAR / Tushare / OpenBB。
+"""外部数据源 V3 接口（``/api/v3/*`` 的数据源半边）：富途 f10 / AKShare / SEC EDGAR / Tushare / OpenBB。
 
 设计约束（与规格 FR-DATA-002 及仓库「数据诚实」纪律一致）：
 
@@ -10,6 +10,14 @@
   * **持久化/惰性**。``register()`` 只挂路由，**不 import** akshare / openbb / pandas：
     那些库导入以十秒计，服务启动与测试套件都不能被它们拖住。一切三方 import 都在
     请求处理路径内按需发生，且可被注入的假模块/假 fetch 替换（见 ``deps``）。
+
+``/api/v3/financials`` 的**按市场路由 + 降级链**（见 ``financials_with_chain``）::
+
+    AAPL / US.*        → SEC EDGAR（us-gaap XBRL，字段与既有响应完全兼容）
+    SH.600000 / HK.00700 → 富途 f10_detail/statements（**主源**，逐期逐科目）
+                           → AKShare（免密钥；A 股 stock_financial_abstract、港股按版本）
+                           → Tushare（income/balancesheet/cashflow；token 未注入则跳过并记进 chain）
+                           → 全失败如实报错，错误里带 ``chain`` 写明每一级为什么没成
 
 参数注入（``register(app, v3_run, home, deps=None)``，前三个是约定签名；``deps`` 仅供测试）::
 
@@ -32,7 +40,8 @@ import json
 import os
 import socket
 import threading
-from datetime import date, datetime, timezone
+import time
+from datetime import date, datetime, timedelta, timezone
 from types import ModuleType
 
 
@@ -108,6 +117,64 @@ TUSHARE_APIS = {
         "params": (),
         "default_limit": 20,
     },
+    # A 股/港股财务降级链的第 3 级（前两级是富途 f10_detail 与 AKShare）。期次口径与
+    # ``income`` 一致：``period`` 是报告期（YYYYMMDD），不传则取最近若干期。
+    "balancesheet": {
+        "fields": "ts_code,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int",
+        "params": ("ts_code", "period"),
+        "default_limit": 8,
+    },
+    "cashflow": {
+        "fields": "ts_code,end_date,n_cashflow_act,n_cashflow_inv_act,n_cash_flows_fnc_act",
+        "params": ("ts_code", "period"),
+        "default_limit": 8,
+    },
+}
+
+#: ``/api/v3/financials`` 的三表 → 富途 ``f10_detail`` 的 ``statements.statement_type``
+#: （官方 1~4：1=利润表 2=资产负债表 3=现金流量表 4=主要指标）。只有前三者是「三表」口径。
+#:
+#: 为什么是 ``statements``：先列出富途 ``f10_detail`` 支持的 **26 个 section**（白名单单一
+#: 事实源 = ``trading_datasource.futu_openapi.groups.f10.OpenApiF10.SECTIONS``）——
+#:   财务：earnings_price_move / earnings_price_history / **statements** / revenue_breakdown
+#:   研究：analyst_consensus / rating_summary / morningstar
+#:   估值：valuation_detail / valuation_plate_stocks / valuation_index_stocks /
+#:         valuation_index_stock_plates
+#:   公司行为：dividends / buybacks / splits
+#:   股东：shareholders_overview / holding_changes / holder_detail / institutional /
+#:         insider_holders / insider_trades
+#:   公司信息：company_profile / company_executives / company_executive_background /
+#:             company_operational_efficiency
+#:   经纪商：top_brokers / top_brokers_history
+#: 其中只有 ``statements`` 给出**逐期逐科目的三表数据**（``report_list[].item_list``）；
+#: ``earnings_price_move`` 是财报日涨跌、``revenue_breakdown`` 是营收构成、
+#: ``valuation_detail`` 是估值倍数——都不是三表口径，因此不拿它们顶替（宁可报缺口）。
+FUTU_STATEMENT_TYPES = {"income": 1, "balance": 2, "cashflow": 3}
+
+#: 三表 → Tushare Pro 的 api 名（降级链第 3 级）。
+TUSHARE_STATEMENT_APIS = {"income": "income", "balance": "balancesheet", "cashflow": "cashflow"}
+
+#: 三表 → 富途报表结构名（仅用于响应里的可读标注，不参与取数）。
+FUTU_STATEMENT_LABELS = {"income": "利润表", "balance": "资产负债表", "cashflow": "现金流量表"}
+
+#: 裸 6 位 A 股代码的首位 → 交易所（公开编码规则，不做业务猜测）：
+#: 6xx/9xx=上交所（含 B 股），0xx/2xx/3xx=深交所，4xx/8xx=北交所。
+A_SHARE_HEAD_MARKET = {
+    "6": "SH", "9": "SH", "5": "SH", "1": "SH",
+    "0": "SZ", "2": "SZ", "3": "SZ",
+    "4": "BJ", "8": "BJ",
+}
+
+#: ``/api/v3/financials`` 的降级链预算（秒）：三级源都没回应就当全失败。
+FINANCIALS_CHAIN_TIMEOUT = 90.0
+
+#: 市场 → 时区（把富途的毫秒时间戳折算成正确的**本地**报表期末）。
+MARKET_TZ = {
+    "SH": "Asia/Shanghai",
+    "SZ": "Asia/Shanghai",
+    "BJ": "Asia/Shanghai",
+    "HK": "Asia/Hong_Kong",
+    "US": "America/New_York",
 }
 
 
@@ -506,6 +573,400 @@ def fetch_spot(deps, limit):
     return {"ok": True, "as_of": now_iso(), "source": "akshare/stock_zh_a_spot_em", "rows": rows}
 
 
+def fetch_kline_akshare(deps, symbol, limit=3):
+    """``ak.stock_zh_a_hist`` → A 股日 K（K 线链的**降级源**，免密钥）。
+
+    只取 ``limit`` 根（探测用 3 根即可）。历史行情需要具体起止日期——按 ``limit`` 个自然日
+    反推一个足够宽的窗口（节假日会少几根，但**不会**因为窗口太窄而空手）。
+    """
+    code = normalize_a_share_symbol(symbol)
+    if not code:
+        return envelope_error("akshare/bad-args", "kline 需要非空 symbol（如 600519 或 SH.600519）")
+    try:
+        ak = akshare_module(deps)
+    except Exception as error:  # noqa: BLE001
+        return envelope_error("akshare/missing", f"akshare 不可用：{_error_text(error)}")
+    func = getattr(ak, "stock_zh_a_hist", None)
+    if not callable(func):
+        return envelope_error("akshare/missing-func", "akshare.stock_zh_a_hist 不存在（版本不兼容？）")
+    want = to_int(limit, 3, 1, 500)
+    end = date.today()
+    start = end - timedelta(days=max(14, want * 3))
+    try:
+        with _SocketTimeoutGuard(deps.timeout):
+            frame = func(symbol=code, period="daily",
+                         start_date=start.strftime("%Y%m%d"), end_date=end.strftime("%Y%m%d"),
+                         adjust="qfq")
+    except Exception as error:  # noqa: BLE001 —— 上游断连/限流都在这里如实暴露
+        return envelope_error("akshare/stock_zh_a_hist", _error_text(error))
+    rows = []
+    for row in _rows_from_frame(frame)[-want:]:
+        rows.append(
+            {
+                "t": as_text(row.get("日期")),
+                "o": as_number(row.get("开盘")),
+                "h": as_number(row.get("最高")),
+                "l": as_number(row.get("最低")),
+                "c": as_number(row.get("收盘")),
+                "v": as_number(row.get("成交量")),
+            }
+        )
+    if not rows:
+        return envelope_error("akshare/no-rows", f"akshare.stock_zh_a_hist 未返回 {code} 的任何日 K")
+    return {"ok": True, "as_of": now_iso(), "source": "akshare/stock_zh_a_hist",
+            "symbol": code, "bars": rows}
+
+
+#: AKShare 财务接口 → 三表的中文报表名（``stock_financial_report_sina`` 的 ``symbol``）。
+AKSHARE_SINA_STATEMENTS = {"income": "利润表", "balance": "资产负债表", "cashflow": "现金流量表"}
+#: AKShare 港股财务接口 ``stock_financial_hk_report_em`` 的 ``symbol`` 取值。
+AKSHARE_HK_STATEMENTS = {"income": "利润表", "balance": "资产负债表", "cashflow": "现金流量表"}
+
+
+def _lines_from_akshare_frame(frame, periods):
+    """AKShare 财务表 → 契约形状 ``lines:[{tag,label,unit,points:[{end,val}]}]``。
+
+    两种常见朝向都支持（**不改写数值**，只做重排）:
+      * 「指标为行、报告期为列」（``stock_financial_abstract``：首列是指标名，其余列是期数）；
+      * 「报告期为行」（首列是报告期，其余列是指标名）。
+    无法识别的形状返回 ``[]``（调用方转 ``akshare/unexpected-shape``，不当成功）。
+    """
+    rows = _rows_from_frame(frame)
+    if not rows:
+        return []
+    headers = list(rows[0].keys())
+    if not headers:
+        return []
+    label_key = None
+    for candidate in ("指标", "选项", "报告期", "日期"):
+        if candidate in headers:
+            label_key = candidate
+            break
+    if label_key is None:
+        label_key = headers[0]
+    # 「指标为行」：除标签列外，其余列都是期数（形如 20240930 / 2024-09-30）
+    period_columns = [key for key in headers
+                      if key != label_key and _looks_like_period(key)]
+    if period_columns:
+        periods = sorted(period_columns)[-max(1, int(periods)):]
+        lines = []
+        for row in rows:
+            label = as_text(row.get(label_key))
+            if not label:
+                continue
+            points = []
+            for column in periods:
+                value = as_number(row.get(column))
+                if value is None:
+                    continue
+                points.append({"end": _period_to_date(column), "val": value, "period": str(column)})
+            if points:
+                lines.append({"tag": label, "label": label, "unit": None, "points": points,
+                              "latestEnd": points[-1]["end"],
+                              "ageDays": age_days_since(points[-1]["end"]),
+                              "stale": _is_stale(points[-1]["end"])})
+        return lines
+    # 「报告期为行」：标签列是期数，其余列是指标名
+    line_map = {}
+    for row in rows:
+        end = _period_to_date(as_text(row.get(label_key)))
+        if not end:
+            continue
+        for key in headers:
+            if key == label_key:
+                continue
+            value = as_number(row.get(key))
+            if value is None:
+                continue
+            entry = line_map.setdefault(str(key), {"tag": str(key), "label": str(key), "unit": None,
+                                                   "points": []})
+            entry["points"].append({"end": end, "val": value, "period": as_text(row.get(label_key))})
+    lines = []
+    for entry in line_map.values():
+        entry["points"].sort(key=lambda point: point["end"])
+        entry["points"] = entry["points"][-max(1, int(periods)):]
+        entry["latestEnd"] = entry["points"][-1]["end"]
+        entry["ageDays"] = age_days_since(entry["latestEnd"])
+        entry["stale"] = _is_stale(entry["latestEnd"])
+        lines.append(entry)
+    return lines
+
+
+def _looks_like_period(value):
+    text = str(value or "").strip()
+    digits = text.replace("-", "").replace("/", "")
+    return len(digits) >= 6 and digits[:6].isdigit()
+
+
+def _period_to_date(value):
+    """``20240930`` / ``2024-09-30`` → ``2024-09-30``；无法识别返回 ``""``。"""
+    text = str(value or "").strip()
+    digits = text.replace("-", "").replace("/", "")
+    if len(digits) >= 8 and digits[:8].isdigit():
+        return f"{digits[:4]}-{digits[4:6]}-{digits[6:8]}"
+    if len(digits) >= 6 and digits[:6].isdigit():
+        return text
+    return ""
+
+
+def _is_stale(end):
+    age = age_days_since(end)
+    return age is not None and age > SEC_STALE_DAYS
+
+
+def fetch_financials_akshare(deps, ticker, statement, periods):
+    """AKShare 财务（降级链第 2 级，免密钥；**A 股覆盖，港股依版本**）。
+
+    A 股：``stock_financial_abstract(symbol=600519)``；港股：``stock_financial_hk_report_em``
+    （若该版本没有这个函数，如实报 ``akshare/missing-func``，不编造）。
+    """
+    if statement not in AKSHARE_SINA_STATEMENTS:
+        return envelope_error("akshare/bad-statement",
+                              f"statement 需为 {sorted(AKSHARE_SINA_STATEMENTS)}，收到 {statement!r}")
+    market = detect_market(ticker)
+    code = normalize_a_share_symbol(ticker) if market in ("SH", "SZ", "BJ") else _bare_code(ticker)
+    if not code:
+        return envelope_error("akshare/bad-args", f"financials 需要可识别的标的代码，收到 {ticker!r}")
+    try:
+        ak = akshare_module(deps)
+    except Exception as error:  # noqa: BLE001
+        return envelope_error("akshare/missing", f"akshare 不可用：{_error_text(error)}")
+    want = to_int(periods, 4, 1, 12)
+    if market == "HK":
+        func = getattr(ak, "stock_financial_hk_report_em", None)
+        if not callable(func):
+            return envelope_error(
+                "akshare/missing-func",
+                "akshare.stock_financial_hk_report_em 不存在（该版本不支持港股财务；"
+                "港股财务降级无可用开源源）")
+        try:
+            with _SocketTimeoutGuard(deps.timeout):
+                frame = func(stock=code, symbol=AKSHARE_HK_STATEMENTS[statement], indicator="年度")
+        except Exception as error:  # noqa: BLE001
+            return envelope_error("akshare/stock_financial_hk_report_em", _error_text(error))
+        source = "akshare/stock_financial_hk_report_em"
+    else:
+        func = getattr(ak, "stock_financial_abstract", None)
+        if not callable(func):
+            return envelope_error("akshare/missing-func", "akshare.stock_financial_abstract 不存在（版本不兼容？）")
+        try:
+            with _SocketTimeoutGuard(deps.timeout):
+                frame = func(symbol=code)
+        except Exception as error:  # noqa: BLE001
+            return envelope_error("akshare/stock_financial_abstract", _error_text(error))
+        source = "akshare/stock_financial_abstract"
+    lines = _lines_from_akshare_frame(frame, want)
+    if not lines:
+        return envelope_error("akshare/unexpected-shape",
+                              f"{source} 返回的表结构无法识别为财务期数（未做猜测性解析）")
+    return {
+        "ok": True,
+        "ticker": str(ticker).strip().upper(),
+        "market": market,
+        "statement": statement,
+        "as_of": now_iso(),
+        "source": source,
+        "lines": lines,
+        "missing": [],
+    }
+
+
+# ── 富途 f10_detail（三表主源）────────────────────────────────────────────────
+
+
+def _bare_code(ticker):
+    """``SH.600519`` / ``600519.SH`` → ``600519``；``AAPL`` → ``AAPL``。"""
+    text = as_text(ticker).upper()
+    if "." in text:
+        head, tail = text.split(".", 1)
+        if head in ("SH", "SZ", "BJ", "HK", "US"):
+            return tail
+        if tail in ("SH", "SZ", "BJ", "HK", "US"):
+            return head
+    return text
+
+
+def detect_market(ticker):
+    """标的 → ``SH/SZ/BJ/HK/US``（识别不出返回 ``""``）。
+
+    规则全部来自**公开编码形态**，不做业务猜测:
+      * 带前缀/后缀（``SH.600000`` / ``600000.SH`` / ``00700.HK`` / ``US.AAPL``）→ 直接取；
+      * 纯 6 位数字 → 按首位映射交易所（6/9/5/1→SH，0/2/3→SZ，4/8→BJ）；
+      * 纯 5 位数字 → 港股；
+      * 纯字母（1~6 位）→ 美股。
+    """
+    text = as_text(ticker).upper()
+    if not text:
+        return ""
+    if "." in text:
+        head, tail = text.split(".", 1)
+        if head in ("SH", "SZ", "BJ", "HK", "US"):
+            return head
+        if tail in ("SH", "SZ", "BJ", "HK", "US"):
+            return tail
+        return ""
+    if text.isdigit():
+        if len(text) == 6:
+            return A_SHARE_HEAD_MARKET.get(text[0], "")
+        if len(text) == 5:
+            return "HK"
+        return ""
+    if text.isalpha() and len(text) <= 6:
+        return "US"
+    return ""
+
+
+def normalize_futu_code(ticker):
+    """标的 → 富途代码形态（``SH.600000`` / ``HK.00700`` / ``US.AAPL``）。
+
+    港股补零到 5 位（富途用 ``HK.00700``）；A 股补零到 6 位。识别不出的市场原样返回，
+    由上游如实报错（错误消息里能看到是不是代码形态的问题）。
+    """
+    market = detect_market(ticker)
+    suffix_map = {"SH": "SH", "SZ": "SZ", "BJ": "BJ", "HK": "HK", "US": "US"}
+    suffix_map.update({"SS": "SH"})
+    if not market:
+        text = as_text(ticker).upper()
+        if "." in text:
+            head, tail = text.split(".", 1)
+            if tail in suffix_map:
+                return f"{suffix_map[tail]}.{head}"
+            if head in suffix_map:
+                return f"{suffix_map[head]}.{tail}"
+        return text
+    code = _bare_code(ticker)
+    if market in ("SH", "SZ", "BJ") and code.isdigit() and len(code) < 6:
+        code = code.zfill(6)
+    if market == "HK" and code.isdigit() and len(code) < 5:
+        code = code.zfill(5)
+    return f"{market}.{code}"
+
+
+def _futu_report_date(report, market=""):
+    """富途报表期 → ``YYYY-MM-DD``。
+
+    ``date_time`` 是**毫秒**时间戳，表示该市场**本地**零点的报表期末（实测 SH.600000 的
+    2026/Q2 是 ``1782748800000`` = 2026-06-30 00:00+08:00）。若按 UTC 取日期会整体差一天，
+    所以必须按市场时区折算。
+    """
+    raw = report.get("date_time")
+    number = as_number(raw)
+    if number is None or number <= 0:
+        return ""
+    zone = MARKET_TZ.get(market or "")
+    try:
+        if zone is None:
+            moment = datetime.fromtimestamp(number / 1000.0, tz=timezone.utc)
+        else:
+            from zoneinfo import ZoneInfo  # 惰性：只有 A 股/港股这条链才需要
+
+            moment = datetime.fromtimestamp(number / 1000.0, tz=timezone.utc).astimezone(ZoneInfo(zone))
+    except (OverflowError, OSError, ValueError):
+        return ""
+    return moment.date().isoformat()
+
+
+def fetch_futu_financials(v3_run, ticker, statement, periods):
+    """富途 ``f10_detail`` 的 ``statements`` section（**A 股/港股三表主源**）。
+
+    ``statement_type``: 1=利润表 2=资产负债表 3=现金流量表（官方 1~4；第 4 项是主要指标，
+    不是三表口径，故不接受）。返回契约形状 ``lines:[{tag,label,points:[{end,val}]}]``：
+      * ``tag`` 用富途的 ``field_id``（跨期稳定）；
+      * ``label`` 用 ``display_name``；
+      * ``points`` 按期升序，``end`` 是报表期末（按市场时区折算），另带 ``period``（如 2026/Q2）；
+      * ``yoy``/``qoq`` 是上游原值，一并保留（前端可选展示）。
+    上游报「无报表期数据」时**返回失败信封**（``futu/no-reports``），好让降级链接手。
+    """
+    statement = as_text(statement).lower()
+    if statement not in FUTU_STATEMENT_TYPES:
+        return envelope_error("futu/bad-statement",
+                              f"statement 需为 {sorted(FUTU_STATEMENT_TYPES)}，收到 {statement!r}")
+    code = normalize_futu_code(ticker)
+    if not code or "." not in code:
+        return envelope_error("futu/bad-args", f"无法把 {ticker!r} 归一成富途代码（如 SH.600000 / HK.00700）")
+    want = to_int(periods, 4, 1, 12)
+    envelope = v3_run("f10_detail", {
+        "code": code,
+        "section": "statements",
+        "params": {"statement_type": FUTU_STATEMENT_TYPES[statement], "limit": want},
+    })
+    if not isinstance(envelope, dict):
+        return envelope_error("futu/bad-envelope", f"f10_detail 返回非信封对象：{type(envelope).__name__}")
+    if not envelope.get("ok"):
+        error = envelope.get("error") if isinstance(envelope.get("error"), dict) else {}
+        return envelope_error(error.get("code") or "futu/f10_detail",
+                              error.get("message") or "f10_detail 返回 ok=false")
+    value = envelope.get("value") if isinstance(envelope.get("value"), dict) else {}
+    reports = [item for item in (value.get("report_list") or []) if isinstance(item, dict)]
+    if not reports:
+        return envelope_error("futu/no-reports",
+                              f"富途 f10_detail/statements 未返回 {code} 的报表期数据"
+                              f"（section 存在但该标的无此报表，或已按 -10 无数据处理）")
+    ordered = list(reversed(reports))[:want]  # 上游按新→旧返回；取最近 want 期后转成旧→新
+    lines = {}
+    line_order = []
+    for report in ordered:
+        end = _futu_report_date(report, detect_market(ticker))
+        period = as_text(report.get("period_text"))
+        currency = as_text(report.get("currency_code"))
+        for item in report.get("item_list") or []:
+            if not isinstance(item, dict):
+                continue
+            display = as_text(item.get("display_name"))
+            field_id = item.get("field_id")
+            tag = str(field_id) if field_id is not None else f"name:{display}"
+            if tag not in lines:
+                lines[tag] = {
+                    "tag": tag,
+                    "label": display or tag,
+                    "unit": as_text(item.get("value_type")) or None,
+                    "currency": currency or None,
+                    "points": [],
+                }
+                line_order.append(tag)
+            value_raw = item.get("data")
+            number = as_number(value_raw)
+            if number is None:
+                continue  # 空值**不进 points**（不填 0 冒充）
+            point = {"end": end, "val": number, "period": period}
+            if item.get("yoy") is not None:
+                point["yoy"] = as_number(item.get("yoy"))
+            if item.get("qoq") is not None:
+                point["qoq"] = as_number(item.get("qoq"))
+            lines[tag]["points"].append(point)
+    out_lines = []
+    missing = []
+    for tag in line_order:
+        entry = lines[tag]
+        entry["points"] = [point for point in entry["points"] if point.get("end")]
+        if not entry["points"]:
+            missing.append({"tag": tag, "error": "futu/no-points",
+                            "message": f"{entry['label']} 各期均为空值（不填 0）"})
+            continue
+        entry["points"].sort(key=lambda point: point["end"])
+        entry["latestEnd"] = entry["points"][-1]["end"]
+        entry["ageDays"] = age_days_since(entry["latestEnd"])
+        entry["stale"] = _is_stale(entry["latestEnd"])
+        out_lines.append(entry)
+    if not out_lines:
+        return envelope_error("futu/no-points",
+                              f"富途返回了 {len(reports)} 个报表期，但所有科目都是空值（不编造）")
+    return {
+        "ok": True,
+        "ticker": as_text(ticker).upper(),
+        "futuCode": code,
+        "market": detect_market(ticker),
+        "statement": statement,
+        "statementType": FUTU_STATEMENT_TYPES[statement],
+        "statementLabel": FUTU_STATEMENT_LABELS[statement],
+        "as_of": now_iso(),
+        "source": "futu/f10_detail/statements",
+        "periods": [as_text(report.get("period_text")) for report in ordered],
+        "lines": out_lines,
+        "missing": missing,
+    }
+
+
 # ── SEC EDGAR ──────────────────────────────────────────────────────────────────
 
 
@@ -873,6 +1334,108 @@ def fetch_openbb(deps, symbol):
     }
 
 
+# ── /api/v3/financials 的按市场路由 + 降级链 ───────────────────────────────────
+
+
+def financials_with_chain(sec, deps, v3_run, ticker, statement, periods):
+    """按市场选主源并组装降级链（纯函数，路由只是它的异步外壳；便于离线单测）。
+
+    返回**契约形状**（美股保持既有字段；A 股/港股给 ``lines`` + ``chain``）:
+
+        {"ok":true,"ticker":"SH.600000","market":"SH","statement":"income",
+         "source":"futu/f10_detail/statements","lines":[{tag,label,points:[{end,val}]}],
+         "missing":[...],"chain":[{"source":...,"ok":...,"ms":...,"error"?}]}
+
+    全链失败 → ``{ok:false,error:{code,message,chain}}``：``code/message`` 取**最后一级的
+    真实错误**（保留上游错误码原文），``chain`` 写明每一级为什么没成。
+    """
+    from server import v3_fallback  # 局部导入：v3_fallback 反向依赖本模块的取数函数
+
+    symbol = as_text(ticker)
+    if not symbol:
+        return envelope_error("financials/bad-args", "financials 需要非空 ticker（如 AAPL / SH.600000 / HK.00700）")
+    market = detect_market(symbol)
+    # ── 美股：SEC EDGAR（既有行为逐字不变，只追加 chain）────────────────────────
+    if market == "US":
+        started = time.monotonic()
+        payload = sec.financials(symbol, statement, periods)
+        elapsed = int((time.monotonic() - started) * 1000)
+        attempt = {"source": "sec/companyconcept(us-gaap XBRL)", "ok": bool(payload.get("ok")),
+                   "ms": elapsed}
+        if not payload.get("ok"):
+            error = payload.get("error") if isinstance(payload.get("error"), dict) else {}
+            attempt["error"] = {"code": error.get("code", "sec/error"),
+                                "message": error.get("message", "SEC 取数失败")}
+            payload["chain"] = [attempt]
+            payload["market"] = "US"
+            return payload
+        payload["market"] = "US"
+        payload["chain"] = [attempt]
+        return payload
+
+    # ── A 股/港股：富途 f10_detail → AKShare → Tushare ─────────────────────────
+    if statement not in FUTU_STATEMENT_TYPES:
+        return envelope_error("financials/bad-statement",
+                              f"statement 需为 {sorted(FUTU_STATEMENT_TYPES)}，收到 {statement!r}")
+
+    def futu_link():
+        return fetch_futu_financials(v3_run, symbol, statement, periods)
+
+    def akshare_link():
+        if market == "HK":
+            # AKShare 的 A 股财务接口不覆盖港股（港股接口依版本可能不存在）——真试一次，
+            # 让真实的 missing-func/上游错误进 chain，而不是写死一句「不支持」。
+            return fetch_financials_akshare(deps, symbol, statement, periods)
+        if market not in ("SH", "SZ", "BJ"):
+            return envelope_error(
+                "akshare/unsupported-market",
+                f"AKShare 财务降级仅覆盖 A 股（market={market or '未知'}）；港股美股请以富途/SEC 为准")
+        return fetch_financials_akshare(deps, symbol, statement, periods)
+
+    def tushare_link():
+        ts_code = normalize_tushare_code(symbol)
+        api = TUSHARE_STATEMENT_APIS[statement]
+        return fetch_tushare(deps, api, {"ts_code": ts_code}, to_int(periods, 4, 1, 12))
+
+    chain = [
+        ("futu/f10_detail/statements", futu_link),
+        (f"akshare/{'stock_financial_hk_report_em' if market == 'HK' else 'stock_financial_abstract'}",
+         akshare_link),
+        (f"tushare/{TUSHARE_STATEMENT_APIS[statement]}", tushare_link),
+    ]
+    value, used_source, attempts = v3_fallback.run_chain(chain, timeout=FINANCIALS_CHAIN_TIMEOUT)
+    attempts = v3_fallback.attempts_chain(attempts)
+    if value is None:
+        error = v3_fallback.last_error(attempts)
+        payload = envelope_error(
+            error.get("code") or "financials/all-sources-failed",
+            f"{symbol} 的 {statement} 三级源全部失败。降级链：{v3_fallback.describe_attempts(attempts)}",
+        )
+        payload["ticker"] = symbol.upper()
+        payload["market"] = market
+        payload["statement"] = statement
+        payload["chain"] = attempts
+        return payload
+    payload = dict(value)
+    payload["chain"] = attempts
+    payload["sources_chain"] = [item["source"] for item in attempts]
+    payload["used_source"] = used_source
+    return payload
+
+
+def normalize_tushare_code(ticker):
+    """标的 → Tushare ``ts_code``（``600519.SH`` / ``00700.HK`` / ``AAPL``）。"""
+    market = detect_market(ticker)
+    code = _bare_code(ticker)
+    if market in ("SH", "SZ", "BJ"):
+        return f"{code.zfill(6)}.{market}"
+    if market == "HK":
+        return f"{code.zfill(5)}.HK"
+    if market == "US":
+        return code.upper()
+    return as_text(ticker).upper()
+
+
 # ── 路由注册 ───────────────────────────────────────────────────────────────────
 
 
@@ -908,13 +1471,24 @@ def register(app, v3_run, home, deps=None):
 
     @app.get("/api/v3/financials")
     async def v3_financials(ticker: str = "", statement: str = "income", periods: int = 4):
-        """SEC EDGAR 三表（us-gaap XBRL）。未申报的标签进 missing，不编造。"""
+        """三表：美股走 SEC EDGAR；A 股/港股走富途 ``f10_detail`` 并按**降级链**兜底。
+
+        路由规则（按 ticker 的市场识别，见 ``detect_market``）:
+          * ``AAPL`` 之类美股 → SEC EDGAR（**既有字段保持不变**，仅追加 ``chain``）；
+          * ``SH.600000`` / ``600519.SH`` / ``HK.00700`` → 富途 ``f10_detail`` 的
+            ``statements`` section（``statement_type`` 1/2/3）→ AKShare（免密钥，A 股）
+            → Tushare（token 未注入则跳过并在 ``chain`` 里说明）→ 全失败如实报错。
+
+        任何一条链的尝试结果都在 ``chain:[{source,ok,ms,error?}]`` 里，前端可逐级核对。
+        """
+        want_statement = as_text(statement).lower() or "income"
+        want_periods = to_int(periods, 4, 1, 12)
         try:
             payload = await asyncio.to_thread(
-                sec.financials, ticker, as_text(statement).lower() or "income", to_int(periods, 4, 1, 12)
+                financials_with_chain, sec, deps, v3_run, ticker, want_statement, want_periods
             )
         except Exception as error:  # noqa: BLE001
-            payload = envelope_error("sec/internal", _error_text(error))
+            payload = envelope_error("financials/internal", _error_text(error))
         return payload
 
     @app.get("/api/v3/tushare")

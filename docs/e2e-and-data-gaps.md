@@ -102,3 +102,59 @@
 3. **A 股财务去依赖**：把 `f10_detail` 作为 `/api/v3/financials` 的 A 股通道（免 token）。
 4. **实时行情**：如确需盘口，走富途权限开通（代码零改动）；否则以「最近收盘 + as_of」呈现。
 5. 探针常驻：把 `e2e_probe.py` 纳入回归（写动作仍跳过），每次改动后跑一次确认 79+ 项仍成功。
+
+---
+
+# 第二轮：三处接线 + 开源降级链 + 三市场 + 真实交易时段（2026-09-20 晚）
+
+## 一、本轮新增能力（全部只读）
+
+| 端点 | 内容 | 实测 |
+|---|---|---|
+| `GET /api/v3/execution/quality?market=SH\|HK\|US` | 成交率 / 撤单率 / 名义金额加权滑点（正=不利）+ 逐日 points | SH `37 单/0 成交/37 撤单`（成交率 0%、撤单率 100%）；**HK `11 单/3 成交/8 撤单`，成交率 27.27%、滑点 −21.78bps、名义 184,900**；US `1 单全撤` |
+| `GET /api/v3/risk/industry` | 富途板块行业映射 + 组合权重 + `breach` | 8/8 映射成功，Top=**股份制银行Ⅱ 37.5% > 20% → breach=true**；HK.00700→数码解决方案服务、US.NVDA→半导体 |
+| `GET /api/v3/financials?ticker=` | A股/港股走**富途 f10_detail/statements**（免 token）、美股走 SEC | SH.600000 35 行、HK.00700 23 行、AAPL SEC 6 行；三者均带 `chain` 与 `used_source` |
+| `GET /api/v3/markets/calendar` | 三市场时段/节假日（zoneinfo，含美股夏令时） | 今日（周六）SH/HK/US 均 `closed` + 「休市（周末）」+ SH `nextOpen 2026-09-21 09:30`；`holidays_loaded=false` |
+| `GET /api/v3/sources/status` | 8 条**主源→开源降级链**真实轻量探测 | 可用 6/8；`news` 链实测**真实降级**（futu `info_search` 载荷不完整 → AKShare 命中浦发银行中报新闻）；`snapshot`/`spot` 双源失败（-9 + AKShare 断连）如实入表 |
+
+- **降级链实现**：`v3_fallback.run_chain()` 逐级尝试并记录 `attempts[{source,ok,ms,error}]`，响应永远带实际 `source`/`as_of`；两源都失败→如实报错，**不返回占位数据**；成交质量类**无开源替代**，错误信息里明说。
+- **交易时段**：SH 09:30–11:30/13:00–15:00（Asia/Shanghai）、HK 09:30–12:00/13:00–16:00（Asia/Hong_Kong）、US 09:30–16:00（America/New_York，夏令时自动）；节假日来自 `QUANT_MARKET_HOLIDAYS` 或 `<home>/market-holidays.json`，缺失时只按周末判断并标 `holidays_loaded:false`；休市**不隐藏数据**——价格用最近收盘并标 `as_of`。
+
+## 二、三市场验收（`platform/tools/e2e_markets.sh`）
+
+```
+[SH] 行情 K 线 SH.600000   ✓ bars=60 最新=9.07    源 futu/quote_history_kline as_of 2026-09-18
+[HK] 行情 K 线 HK.00700    ✓ bars=60 最新=419.0   源 futu/quote_history_kline as_of 2026-09-18
+[US] 行情 K 线 US.NVDA     ✓ bars=60 最新=222.27  源 futu/quote_history_kline as_of 2026-09-18
+[US] 财务（SEC）           ✓ sec/companyconcept lines=6      [SH] 财务（f10）✓ 35 行   [HK] 财务（f10）✓ 23 行
+交易日历                    ✓ SH/HK/US closed · holidays_loaded=False
+行业暴露                    ✓ SH 5 行业 top 37.5% breach=True · HK/US 单标的映射成功
+成交质量                    ✓ SH 37 单 · HK 11 单(3 成交,−21.78bps) · US 1 单
+降级链状态                  ✓ 8 链 / 可用 6
+页面 market/execution/risk  ✓ 示例=0 无缺模块 无崩溃白屏
+```
+配套 `platform/tools/e2e_probe.py --markets SH,HK,US`：**HK 7/7、US 7/7、SH 6/7**（唯一失败＝A 股实时快照权限 -9，已知缺口）。
+
+## 三、本轮新发现的真实问题（重要）
+
+1. **富途 OpenAPI 频控 `-12006`（HTTP 403）**：全量探针连续调用时，`deals_history`/`deals_today`/`f10_detail`/`economic_calendar_hot` 会被限流拒绝。**这不是缺数据源**，是调用节奏问题。
+   - 影响：密集探测（探针、`/api/v3/sources/status` 的 8 链探测）会临时失败；
+   - 缓解：服务端已有 TTL 缓存；建议对富途类调用再加**退避 + 单飞（single-flight）+ 全局限速**，并把 `-12006` 明确映射为「限流，请稍后重试」而不是泛化错误。
+2. **`info_search` 返回载荷不完整**（既有）：news 链靠 AKShare 兜住（降级已实测生效）。
+3. **A 股实时行情权限 -9**：`market_snapshot`/`rt_*`/`cur_kline` 无权限；**港股/美股快照与五档实测可用**（页面已按市场分别呈现，不再一律标「无数据源」）。
+4. **自选池与因子矩阵仍是 A 股口径**（后端未按 `market` 过滤）：页面已按「参数随市场切换 + 原样展示 + 显式标注接口未按市场过滤」处理；后端补 `market` 支持后页面无需改动。
+
+## 四、验收命令汇总
+
+```bash
+# 1) 三市场端到端（接口 + 页面）
+bash platform/tools/e2e_markets.sh http://127.0.0.1:8397
+# 2) 全量只读探针（113 项）/ 三市场分步表
+~/.dsh/trading-venv/bin/python platform/tools/e2e_probe.py --json /tmp/e2e.json --md /tmp/e2e.md
+~/.dsh/trading-venv/bin/python platform/tools/e2e_probe.py --markets SH,HK,US
+# 3) 工作台 10 路由
+bash platform/tools/verify_pages.sh http://127.0.0.1:8397
+# 4) 测试
+cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest discover -s tests   # 246 OK
+cd .. && node --test tests/*.test.mjs && cd platform/web-pro && npm test        # 73 / 188
+```

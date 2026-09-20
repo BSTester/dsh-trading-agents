@@ -18,11 +18,12 @@
 // 平台不含逐单下单/改单/撤单入口：台账里 stage=manual 只是平台侧台账的审批阶段，不是券商待确认。
 import React from "react";
 import {
-  Alert, Badge, Button, Col, Descriptions, Empty, Form, Input, Modal, Progress, Row, Space, Table,
-  Tag, Timeline, Typography,
+  Alert, Badge, Button, Col, Descriptions, Empty, Form, Input, Modal, Progress, Row, Segmented, Space,
+  Table, Tag, Timeline, Typography,
 } from "antd";
 import { ProCard } from "@ant-design/pro-components";
-import { useV3, useWbAction, postWb, fmt, noSourceText } from "../services/api.js";
+import { useV3, useWbAction, postWb, getV3, fmt, noSourceText } from "../services/api.js";
+import { BarList } from "../components/charts.jsx";
 
 const { Text, Link } = Typography;
 
@@ -62,11 +63,13 @@ const OK = (env) => Boolean(env && env.ok);
 const fin = (value) => Number.isFinite(Number(value));
 const asArray = (value) => (Array.isArray(value) ? value : []);
 
+/** 取数失败原因：HTTP 非 2xx（error）与 HTTP 200 的 ok:false 信封都取服务端 code/message 原文。 */
 function envError(env, fallback) {
   const error = (env && env.error) || {};
   const code = error.code ? String(error.code) : "";
   const message = error.message ? String(error.message) : "";
   if (code || message) return code ? `${code}：${message || fallback || "请求失败"}` : message;
+  if (env && env.ok === false) return fallback || "接口返回 ok:false 但未给出 error.code/message";
   return fallback || "接口未返回 error.code/message";
 }
 
@@ -357,7 +360,7 @@ function LifecycleBoard({ execEnv, orders, audit, stages }) {
 }
 
 /* ── ③ 分级审批三档 ─────────────────────────────────────────────────────── */
-function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan }) {
+function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan, industryEnv }) {
   const auto = orders.filter((order) => String(order.stage) === "risk_passed");
   const manual = orders.filter((order) => String(order.stage) === "manual");
   const blocked = orders.filter((order) => ["blocked", "rejected"].includes(String(order.stage)));
@@ -428,13 +431,17 @@ function ApprovalGrades({ orders, riskCfg, nav, onOpenPlan }) {
         <Col xs={24} lg={8}>
           <ProCard size="small" bordered title={<Space size={6}><Text style={{ fontSize: 12 }}>强制阻断</Text><Tag color={blocked.length ? "red" : "blue"}>台账 {blocked.length} 单</Tag></Space>}
             subTitle={<Text type="secondary" style={{ fontSize: 11 }}>强制阻断无操作入口 · 全程留痕可追溯（/api/v3/oms/orders）</Text>}>
-            <Tag color="blue">行业分类：无数据源（不参与自动阻断）</Tag>
+            <Tag color={industryEnv && OK(industryEnv) ? (industryEnv.breach ? "red" : "blue") : undefined}>
+              {industryEnv && OK(industryEnv)
+                ? `行业暴露 ${fmt.pct(industryEnv.top && industryEnv.top.weightPct, 2)} · 上限 ${fmt.pct(industryEnv.limitPct, 0)} · ${industryEnv.breach ? "超限（人工核对）" : "未超限"}（/api/v3/risk/industry）`
+                : noSourceText("行业分类", envError(industryEnv, "GET /api/v3/risk/industry 取不到"))}
+            </Tag>
             <div style={{ marginTop: 6 }}>
               {blocked.length > 0
                 ? <Space direction="vertical" size={4} style={{ width: "100%" }}>{blocked.slice(0, 3).map(orderCard)}</Space>
                 : (
                   <Text type="secondary" style={{ fontSize: 11 }}>
-                    {noSourceText("强制阻断订单", "OMS 台账 0 条 blocked/rejected 订单；硬阻断只能来自单笔占比与回撤红线，行业分类工具面无数据源（industry_source=no-data），行业上限不参与自动阻断")}
+                    {noSourceText("强制阻断订单", "OMS 台账 0 条 blocked/rejected 订单；硬阻断只能来自单笔占比与回撤红线，行业上限只做展示与人工核对，未接入自动阻断")}
                   </Text>
                 )}
             </div>
@@ -513,37 +520,191 @@ function HoldingsCard({ execEnv }) {
   );
 }
 
-function QualityCard({ execEnv, orders }) {
-  const exec = OK(execEnv) ? execEnv : null;
-  const openRows = flatRows(exec && exec.orders_open, ["rows", "orders"]);
-  const dealRows = flatRows(exec && exec.deals_today, ["rows", "deals"]);
-  const partial = openRows.filter((row) => Number(row.dealt_qty || row.cum_qty || 0) > 0);
-  const items = [
-    { label: "成交率", value: null },
-    { label: "平均滑点", value: null },
-    { label: "撤单率", value: null },
-    { label: "部分成交", value: `${partial.length + orders.filter((order) => order.stage === "partial").length} 笔` },
+/* ── 成交质量：GET /api/v3/execution/quality（真实券商委托/成交回报） ──────────
+ *  口径：委托/成交笔数与名义金额来自券商历史委托与成交流水（sources.orders / sources.deals），
+ *  滑点为**近似口径**，服务端在 missing 里给出原文说明，本卡原样展示，不换算、不估算。
+ *  失败或空态一律写「无数据源 · 原因」，缺项显示「—」，不填占位数字。
+ */
+const MARKETS = ["SH", "HK", "US"];
+
+/** 按市场取成交质量（只用 GET；市场切换或人工刷新才发请求）。 */
+function useQuality(market) {
+  const [state, setState] = React.useState({ loading: true, value: undefined, error: undefined });
+  const seqRef = React.useRef(0);
+  const run = React.useCallback(async (refresh = false) => {
+    seqRef.current += 1;
+    const seq = seqRef.current;
+    setState((prev) => ({ ...prev, loading: true, error: undefined }));
+    try {
+      const value = await getV3("execution/quality", { market, mode: "sim" }, { refresh });
+      if (seqRef.current !== seq) return;
+      // 失败信封（HTTP 200 + ok:false）不是「空数据」：把服务端原因留在 error，交给卡片如实展示。
+      if (value && value.ok === false) {
+        setState({ loading: false, value: undefined, error: envError(value, "GET /api/v3/execution/quality 返回 ok:false") });
+        return;
+      }
+      setState({ loading: false, value, error: undefined });
+    } catch (error) {
+      if (seqRef.current === seq) setState({ loading: false, value: undefined, error: String((error && error.message) || error) });
+    }
+  }, [market]);
+  React.useEffect(() => {
+    run(false);
+    return () => { seqRef.current += 1; };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [market]);
+  return { ...state, refresh: () => run(true) };
+}
+
+const NUM_FONT = { fontFamily: "ui-monospace, Menlo, monospace", fontVariantNumeric: "tabular-nums" };
+
+function qualityMetricCards(metrics, points, asOf, definitions) {
+  const define = (key, fallback) => (definitions && definitions[key]) || fallback;
+  const slip = metrics && fin(metrics.avgSlippageBps) ? Number(metrics.avgSlippageBps) : null;
+  const tiles = [
+    { key: "filled", label: "已成交", value: metrics && fin(metrics.filled) ? `${fmt.num(metrics.filled, 0)} 笔` : "—", hint: "券商成交流水（deals）" },
+    { key: "partial", label: "部分成交", value: metrics && fin(metrics.partial) ? `${fmt.num(metrics.partial, 0)} 笔` : "—", hint: "券商委托状态（orders）" },
+    { key: "cancelled", label: "已撤单", value: metrics && fin(metrics.cancelled) ? `${fmt.num(metrics.cancelled, 0)} 笔` : "—", hint: "券商委托状态（orders）" },
+    { key: "fillRate", label: "成交率", value: metrics && fin(metrics.fillRatePct) ? fmt.pct(metrics.fillRatePct, 2) : "—", hint: define("fillRatePct", "服务端口径：已成交（含部分）/ 总委托") },
+    { key: "cancelRate", label: "撤单率", value: metrics && fin(metrics.cancelRatePct) ? fmt.pct(metrics.cancelRatePct, 2) : "—", hint: define("cancelRatePct", "服务端口径：已撤 / 总委托") },
+    {
+      key: "slip",
+      label: "平均滑点(bps)",
+      value: slip === null ? "—" : (slip === 0 ? fmt.num(0, 2) + " bps" : fmt.signed(slip, 2, " bps")),
+      hint: define("avgSlippageBps", "正 = 不利（服务端口径），见下方 missing 原文"),
+      color: slip === null || slip === 0 ? undefined : slip > 0 ? "#f8514d" : "#3fb950",
+    },
+    { key: "notional", label: "成交名义金额", value: metrics && fin(metrics.notional) ? fmt.money(metrics.notional) : "—", hint: "券商成交名义金额合计" },
   ];
+  return (
+    <Row gutter={[8, 8]}>
+      <Col xs={24} md={12} xl={8}>
+        <div style={{ border: "1px solid #232b37", borderRadius: 6, padding: "6px 8px", height: "100%" }}>
+          <Text type="secondary" style={{ fontSize: 12 }}>委托 / 已成交 / 部分 / 撤单</Text>
+          <div style={{ fontSize: 15, ...NUM_FONT }}>
+            {metrics
+              ? `${fmt.num(metrics.orders, 0)} / ${fmt.num(metrics.filled, 0)} / ${fmt.num(metrics.partial, 0)} / ${fmt.num(metrics.cancelled, 0)}`
+              : "— / — / — / —"}
+          </div>
+          <Text type="secondary" style={{ fontSize: 11 }}>{`as_of ${fmt.stamp(asOf)} · 共 ${asArray(points).length} 个滑点取样点`}</Text>
+        </div>
+      </Col>
+      {tiles.map((tile) => (
+        <Col xs={12} md={6} xl={4} key={tile.key}>
+          <div style={{ border: "1px solid #232b37", borderRadius: 6, padding: "6px 8px", height: "100%" }}>
+            <Text type="secondary" style={{ fontSize: 12 }}>{tile.label}</Text>
+            <div style={{ fontSize: 15, color: tile.color, ...NUM_FONT }}>{tile.value}</div>
+            <Text type="secondary" style={{ fontSize: 11 }}>{tile.hint}</Text>
+          </div>
+        </Col>
+      ))}
+    </Row>
+  );
+}
+
+function QualityCard({ market, onMarket, qualityEnv }) {
+  const env = qualityEnv.value;
+  const data = OK(env) ? env : null;
+  const metrics = data && data.metrics && typeof data.metrics === "object" ? data.metrics : null;
+  const points = data ? asArray(data.points).filter((point) => point && typeof point === "object") : [];
+  const sources = data && data.sources && typeof data.sources === "object" ? data.sources : null;
+  const missing = data ? asArray(data.missing).map((line) => String(line)).filter(Boolean) : [];
+  const reasonText = missing.join("；") || "服务端未返回 missing 口径说明";
+
+  const bars = points
+    .map((point) => {
+      const value = Number(point.slippageBps);
+      if (!Number.isFinite(value)) return null;
+      const stamp = String(point.t || "");
+      const label = `${stamp.length >= 10 ? stamp.slice(5, 10) : (stamp || "—")} 滑点 ${value.toFixed(2)}bp`;
+      // BarList 的宽度是 `value/max*100%`，负值会写成无效 CSS 宽度（条形不可见）：
+      // 因此宽度传绝对值，符号保留在标签文字与整体配色（负＝有利，绿）里。
+      return { label, value: Math.abs(value), signed: value, notional: Number(point.notional) };
+    })
+    .filter(Boolean)
+    .slice(-12);
+  const maxBar = bars.reduce((max, bar) => Math.max(max, Math.abs(bar.value)), 0);
+
+  const reason = qualityEnv.error
+    ? `请求失败 · ${qualityEnv.error}`
+    : (data ? reasonText : `GET /api/v3/execution/quality 未返回数据（market=${market}）`);
+
   return (
     <ProCard
       title="成交质量"
       bordered
-      extra={<Text type="secondary" style={{ fontSize: 12 }}>今日成交 {dealRows.length} 行（deals_today）· 滑点/成交率/撤单率无数据源</Text>}
       style={{ height: "100%" }}
+      extra={
+        <Space size={8} wrap>
+          <Segmented
+            size="small"
+            value={market}
+            options={MARKETS}
+            onChange={onMarket}
+            aria-label="成交质量市场切换"
+          />
+          <Button size="small" loading={qualityEnv.loading} onClick={qualityEnv.refresh}
+            title="重新读取 GET /api/v3/execution/quality（只读 GET，不写任何状态）">
+            刷新
+          </Button>
+        </Space>
+      }
     >
-      <Row gutter={[8, 8]}>
-        {items.map((item) => (
-          <Col span={12} key={item.label}>
-            <Text type="secondary" style={{ fontSize: 12 }}>{item.label}</Text>
-            <div style={{ fontSize: 15 }}>{item.value === null ? <Text type="secondary" style={{ fontSize: 12 }}>无数据源</Text> : item.value}</div>
-          </Col>
-        ))}
-      </Row>
-      <div style={{ marginTop: 8 }}>
-        <Text type="secondary" style={{ fontSize: 11 }}>
-          {noSourceText("成交率 / 平均滑点 / 撤单率 / 滑点分布", "券商成交流水未接入：deals_today 由模拟订单派生，无独立成交回报（滑点/成交率/撤单率无分母）")}
-        </Text>
-      </div>
+      {qualityEnv.loading && !env ? (
+        <Empty imageStyle={{ display: "none" }} style={{ margin: 0 }} description={<Text type="secondary">正在读取成交质量…</Text>} />
+      ) : !data || !metrics ? (
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what={`成交质量 · ${market}`} why={reason} />
+          {!data && !qualityEnv.error ? (
+            <Text type="secondary" style={{ fontSize: 11 }}>
+              成交类数据没有开源替代：当日无委托或券商未返回委托/成交流水时，本卡按原因如实展示，不用估算值顶替。
+            </Text>
+          ) : null}
+        </Space>
+      ) : (
+        <Space direction="vertical" size={10} style={{ width: "100%" }}>
+          {qualityMetricCards(metrics, points, data.as_of, data.definitions)}
+          <div>
+            <Space size={8} wrap style={{ marginBottom: 6 }}>
+              <Text strong style={{ fontSize: 12 }}>{`滑点走势（成交回报，最近 ${bars.length} 个取样点）`}</Text>
+              <Text type="secondary" style={{ fontSize: 11 }}>横条＝滑点 bps；正值（红）＝成交劣于基准价，负值（绿）＝成交优于基准价</Text>
+            </Space>
+            {bars.length === 0 ? (
+              <NoSource what="滑点走势" why={`/api/v3/execution/quality.points 为空（market=${market}）`} />
+            ) : (
+              <BarList
+                items={bars.map((bar) => [bar.label, bar.value])}
+                max={maxBar || 1}
+                color={Number(metrics.avgSlippageBps) < 0 ? "#3fb950" : "#f8514d"}
+              />
+            )}
+          </div>
+          <Descriptions size="small" column={{ xs: 1, sm: 2 }} bordered
+            items={[
+              { key: "orders", label: "委托来源", children: <Text code style={{ fontSize: 11 }}>{sources && sources.orders ? String(sources.orders) : "—"}</Text> },
+              { key: "deals", label: "成交来源", children: <Text code style={{ fontSize: 11 }}>{sources && sources.deals ? String(sources.deals) : "—"}</Text> },
+              { key: "market", label: "市场 / 模式", children: `${data.market || market} · ${String(data.mode || "sim").toUpperCase()}` },
+              { key: "asof", label: "口径时点 as_of", children: fmt.stamp(data.as_of) },
+            ]}
+          />
+          <Alert
+            type={missing.length ? "warning" : "info"}
+            showIcon
+            message={`口径说明（服务端 missing 原文，${missing.length} 条）`}
+            description={
+              <Space direction="vertical" size={2} style={{ width: "100%" }}>
+                {missing.length === 0 ? (
+                  <Text type="secondary" style={{ fontSize: 12 }}>服务端未返回 missing 说明（口径以 sources 为准）</Text>
+                ) : (
+                  missing.map((line, index) => (
+                    <Text key={`missing-${index}`} type="secondary" style={{ fontSize: 12 }}>{`· ${line}`}</Text>
+                  ))
+                )}
+              </Space>
+            }
+          />
+        </Space>
+      )}
     </ProCard>
   );
 }
@@ -938,6 +1099,11 @@ export default function 执行审批Page() {
 
   const [modalOpen, setModalOpen] = React.useState(false);
   const [selectedId, setSelectedId] = React.useState(null);
+  // 成交质量：市场切换即按市场取真实成交回报（只读 GET）；默认 SH，与页面其它模块的市场口径一致。
+  const [qualityMarket, setQualityMarket] = React.useState("SH");
+  const quality = useQuality(qualityMarket);
+  // 行业暴露与集中度：与风控页同一只读端点，用于取消「行业分类无数据源」的表述（只读 GET）。
+  const industry = useV3("risk/industry", { limit_pct: 20 });
 
   const ordersEnvelope = OK(oms.value) ? oms.value : (OK(exec.value) && exec.value.oms ? exec.value.oms : null);
   const orders = ordersEnvelope && Array.isArray(ordersEnvelope.orders) ? ordersEnvelope.orders : [];
@@ -976,7 +1142,7 @@ export default function 执行审批Page() {
         <LifecycleBoard execEnv={exec.value} orders={orders} audit={auditEntries} stages={stages} />
       </Block>
       <Block title="分级审批">
-        <ApprovalGrades orders={orders} riskCfg={riskCfg} nav={nav} onOpenPlan={() => setModalOpen(true)} />
+        <ApprovalGrades orders={orders} riskCfg={riskCfg} nav={nav} onOpenPlan={() => setModalOpen(true)} industryEnv={industry.value} />
       </Block>
       <Block title="订单明细">
         <ProCard title="订单明细" bordered
@@ -1014,7 +1180,7 @@ export default function 执行审批Page() {
         </Col>
         <Col xs={24} xl={12}>
           <Block title="成交质量">
-            <QualityCard execEnv={exec.value} orders={orders} />
+            <QualityCard market={qualityMarket} onMarket={setQualityMarket} qualityEnv={quality} />
           </Block>
         </Col>
       </Row>
@@ -1029,7 +1195,6 @@ export default function 执行审批Page() {
         <ProCard title="无数据源项（逐项写明原因，不填占位数字）" bordered>
           <Space direction="vertical" size={4} style={{ width: "100%" }}>
             {[
-              { what: "券商成交流水（成交均价 / 滑点 / 成交率 / 撤单率）", why: "券商成交流水未接入：deals_today 由模拟订单派生，无独立成交回报" },
               { what: "模块化执行参数（TWAP 片数 / 执行算法）", why: "工具面无执行算法参数与切片计划数据源" },
               { what: "PIT 因子快照与情绪评分", why: "工作台订单未携带 PIT 因子快照，工具面无情绪评分" },
               { what: "盘中市场状态", why: "工具面无盘中市场状态快照" },
