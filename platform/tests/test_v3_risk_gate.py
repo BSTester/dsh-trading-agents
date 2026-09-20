@@ -38,7 +38,17 @@ from fastapi.testclient import TestClient  # noqa: E402
 from server import observability, v3_ops, v3_risk_gate  # noqa: E402
 
 DAY = "2026-09-20"
-NOW = 1789898332.0536346  # 与真实缓存同一量级的 epoch（测试里显式传入，不读系统钟）
+#: 2026-09-20 修：原先写死 epoch（1789898332.05），而闸门按「相对**现在**的新鲜度」判定，
+#: 于是这套用例在真实时钟走过 6h 后整片变红（**时间炸弹**，不是产品回归）。
+#: 现在取"进程启动那一刻"，并保证 ``generated_at`` 与 ``generated_at_iso`` 同源。
+NOW = time.time()
+
+
+def iso_of(ts):
+    """epoch → ISO8601（与 ``observability`` 落盘格式一致）。"""
+    from datetime import datetime, timezone
+
+    return datetime.fromtimestamp(float(ts), timezone.utc).isoformat()
 
 
 class FakeV3Run:
@@ -103,7 +113,7 @@ def probe(markets, *, generated_at=NOW, limit_pct=20.0):
     top = max(usable, key=lambda row: row["top_weight_pct"]) if usable else None
     return {
         "version": 1, "generated_at": generated_at,
-        "generated_at_iso": "2026-09-20T09:58:52.053639+00:00", "limit_pct": limit_pct,
+        "generated_at_iso": iso_of(generated_at), "limit_pct": limit_pct,
         "markets": sorted(rows), "market": None if top is None else top["market"],
         "top_industry": None if top is None else top["top_industry"],
         "top_weight_pct": None if top is None else top["top_weight_pct"],
@@ -305,7 +315,7 @@ class LedgerGateTests(GateTestCase):
         self.assertIn("单一行业暴露 37.5% > 20%", reason)
         self.assertIn("top=股份制银行Ⅱ", reason)
         self.assertIn("来源 cache/futu/info_owner_plate", reason)
-        self.assertIn("as_of 2026-09-20T09:58:52.053639+00:00", reason)
+        self.assertIn(f"as_of {iso_of(NOW)}", reason)
         self.assertIn("市场 SH", reason)
         self.assertIn("强制阻断", reason)
 

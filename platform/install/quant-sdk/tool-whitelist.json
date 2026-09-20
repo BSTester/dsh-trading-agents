@@ -1,0 +1,94 @@
+{
+  "note": "quant-sdk 会话的工具白名单（唯一事实源）。platform/server/v3_sdk.py 的 is_write_tool() 从**平台自己的常量**推导出同一份名单（v3_ops.WRITE_TOOLS + mcp_tools.MCP_EXCLUDED_ENDPOINTS − readOnlyExcluded + tools/e2e_probe.WRITE_ENDPOINTS），platform/tests/test_v3_sdk.py 断言 本文件 ⇄ v3_sdk.py ⇄ tool-whitelist/index.js 三方一致；任何一边漂移都会让测试变红。改这里必须同时改另外两处。",
+  "profile": "quant-sdk",
+  "disabledRows": [
+    "tool-bash",
+    "tool-pwsh",
+    "tool-jobs",
+    "tool-subagent",
+    "tool-subagent-fork",
+    "tool-subagent-control",
+    "tool-subagent-list-agents",
+    "tool-workflow",
+    "tool-ralph",
+    "tool-goal",
+    "tool-web",
+    "web-search-deepseek",
+    "web-fetch-http",
+    "web"
+  ],
+  "denyRowId": "quant-sdk-tool-whitelist",
+  "denyMechanism": {
+    "plugin": "quant-tool-whitelist",
+    "source": "platform/install/quant-sdk/tool-whitelist/index.js",
+    "callTimeDeny": "ctx.tools.guard()（单调：拒绝后任何监听器都无法改回允许）",
+    "visibility": "ctx.tools.restrict({deny})（agent/created 时按 agent 作用域摘除）",
+    "nameMatch": "归一化后匹配：剥掉 mcp__<server>__ 前缀，-/. 折成 _，转小写"
+  },
+  "mcpServerName": "quantwb",
+  "denyNames": [
+    "auto_pipeline",
+    "confirm_decide",
+    "modify_user_security",
+    "openapi_config",
+    "openapi_oauth",
+    "openapi_test",
+    "plan_execute",
+    "push_subscribe",
+    "push_unsubscribe",
+    "record_observation",
+    "research_tasks_claim",
+    "research_tasks_report",
+    "rules_decide",
+    "sentiment_snapshot",
+    "switch_mode"
+  ],
+  "denyPrefixes": [
+    "trade_",
+    "sim_trade_",
+    "openapi_",
+    "v3_credentials",
+    "v3_oms_sync",
+    "v3_strategy_run",
+    "v3_sdk",
+    "admin_cancel",
+    "admin_prune"
+  ],
+  "denySubstrings": [
+    "credentials",
+    "confirm_decide"
+  ],
+  "denyTools": [
+    "auto_pipeline",
+    "confirm_decide",
+    "modify_user_security",
+    "openapi_config",
+    "openapi_oauth",
+    "openapi_test",
+    "plan_execute",
+    "push_subscribe",
+    "push_unsubscribe",
+    "record_observation",
+    "research_tasks_claim",
+    "research_tasks_report",
+    "rules_decide",
+    "sentiment_snapshot",
+    "sim_trade_cancel",
+    "sim_trade_modify",
+    "sim_trade_place",
+    "switch_mode",
+    "trade_cancel",
+    "trade_modify",
+    "trade_place"
+  ],
+  "derivation": [
+    "v3_ops.WRITE_TOOLS",
+    "mcp_tools.MCP_EXCLUDED_ENDPOINTS - readOnlyExcluded",
+    "platform/tools/e2e_probe.WRITE_ENDPOINTS"
+  ],
+  "readOnlyExcluded": [
+    "info_rehab",
+    "research-tasks-list",
+    "warrant_screen"
+  ]
+}

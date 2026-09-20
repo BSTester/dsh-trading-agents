@@ -1,17 +1,23 @@
 # 监控落地（规格 §8.3）：Prometheus 抓取 + 告警规则
 
 本目录只放**可直接用的配置文件与说明**，不安装任何系统服务、不改 `systemd`。
-平台侧的唯一改动是新增了一个 Prometheus 文本出口（`platform/server/observability.py` 的
-`GET /metrics`）与两个探测结果落盘（`/api/v3/sources/status` 写 `v3-datasource-probe.json`；
-`POST /api/v3/metrics/probe/refresh` 写 `v3-risk-probe.json`），**只加不删**。
+平台侧的改动是一个 Prometheus 文本出口（`platform/server/observability.py` 的
+`GET /metrics`）、两个探测结果落盘（`/api/v3/sources/status` 写 `v3-datasource-probe.json`；
+`POST /api/v3/metrics/probe/refresh` 写 `v3-risk-probe.json`），以及**平台内规则求值器**
+（`platform/server/v3_alerts.py`，`GET /api/v3/ops/alerts`），**只加不删**。
 
 | 文件 | 作用 |
 |---|---|
 | `prometheus.yml` | 抓取配置：目标 `127.0.0.1:8397`、路径 `/metrics`、间隔 15s |
-| `alerts.yml` | 23 条告警规则（7 组），每条阈值都写明依据 |
+| `alerts.yml` | 33 条告警规则（8 组），每条阈值都写明依据。**两个求值方读同一份**：Prometheus（`rule_files`）与平台内求值器 `platform/server/v3_alerts.py` |
 | `dump_metrics.py` | 离线导出 `/metrics` 文本，供 `promtool check metrics` 自检（服务没起也能校验） |
 | `verify_industry_gate.py` | **真机只读**验证行业红线闸门：读真实 `~/.dsh/v3-risk-probe.json`、用构造订单过 `check_order`/`_upsert`，打印真实 reasons/history 与 fail-open 样例（不下单、不写盘） |
 | `README.md` | 本文件 |
+
+> **不装 Grafana/Prometheus 也能用**：见 §九「无 Grafana 的替代方案」——
+> `/metrics`（标准文本，谁都能抓）+ `platform/server/v3_alerts.py`（进程内规则求值，
+> `GET /api/v3/ops/alerts` 三态）+ 工作台「网关与调度」页的「运维告警」卡片。
+> 将来接 Prometheus/Grafana/Alertmanager 时**不需要改平台代码**（同一份 `alerts.yml`）。
 
 ---
 
@@ -286,6 +292,57 @@ alerting:
 
 ---
 
+## 五之二、规格 §8.3 补齐项 + §4.1 分位数（2026-09-20 第二轮新增）
+
+这一组指标的存在理由只有一条：**规格点名的 9 类监控里，原先有 5 类没有指标可判、2 类口径不符**。
+数据源全部是平台**已经落库/落盘的事实**，没有为监控新增任何取数路径、没有新增外部调用。
+
+| 指标 | 类型 | 含义 / 口径 |
+|---|---|---|
+| `quantwb_headless_window_seconds` | gauge | Headless 统计窗口（秒），由 `QUANT_HEADLESS_WINDOW_SECONDS` 配置（默认 86400） |
+| `quantwb_headless_log_rows` | gauge | 从 `headless_log` 表（或 `<DSH_HOME>/v3-headless-log.jsonl` 冷备）读到的记录条数。**为 0 时下面的成功率/耗时一律不导出** |
+| `quantwb_headless_calls` | gauge | 窗口内调用记录数 |
+| `quantwb_headless_successes` | gauge | 窗口内成功记录数 |
+| `quantwb_headless_success_rate` | gauge | 窗口内 `successes / calls`（0～1）。§8.3 阈值 0.95 |
+| `quantwb_headless_call_duration_seconds` | gauge | 窗口内**平均**耗时（秒）。§8.3 阈值 60s |
+| `quantwb_sdk_session_window_seconds` | gauge | SDK 活跃会话判定窗口（秒），由 `QUANT_SDK_SESSION_WINDOW_SECONDS` 配置（默认 300） |
+| `quantwb_sdk_active_sessions{source="…"}` | gauge | SDK 活跃会话数。来源见标签：`v3_sdk.metrics_view()` 或 `sdk_turns`（窗口内出现 turn 的不同 `session_id`） |
+| `quantwb_sdk_active_sessions_source_missing{reason="…"}` | gauge | **只在两条来源都拿不到时出现**（值恒 1 + 原因标签）；此时不导出 `quantwb_sdk_active_sessions` |
+| `quantwb_risk_blocked_total` | counter | 进程内累计**首次观测到**进入阻断阶段（`blocked` / `blocked_industry`）的台账订单数；§8.3「风控阻断次数突增」的 `increase()` 输入 |
+| `quantwb_order_execution_latency_max_seconds` | gauge | 窗口内**最大**的「首次登记（`first_seen_at`）→ 进入 `submitted`/`filled`」间隔（秒）。§8.3 阈值 1s |
+| `quantwb_datasource_data_age_seconds{chain="…"}` | gauge | 该链最近一次探测命中来源返回的 `as_of` 距今秒数（= 数据延迟）。只对**有 `as_of`** 的链导出 |
+| `quantwb_call_duration_window_seconds` | gauge | 分位数滑动窗口长度（秒），`QUANT_LATENCY_WINDOW_SECONDS`（默认 900） |
+| `quantwb_call_duration_min_samples` | gauge | 导出分位数所需最小样本数，`QUANT_LATENCY_MIN_SAMPLES`（默认 20）；不足则不导出 |
+| `quantwb_call_duration_window_samples{scope="…"}` | gauge | 该 scope 在窗口内的真实观测样本数 |
+| `quantwb_call_duration_p50_seconds{scope="…"}` | gauge | 延迟 P50（秒），见下方「分位数口径」 |
+| `quantwb_call_duration_p95_seconds{scope="…"}` | gauge | 延迟 P95（秒）。§8.3 MCP 阈值 5s；§4.1 目标：MCP 2s / 订单 0.5s / Headless 30s |
+| `quantwb_call_duration_p99_seconds{scope="…"}` | gauge | 延迟 P99（秒） |
+
+### 分位数口径（**不谎称精确**）
+
+* **算法**：滑动窗口内的**原始样本** + **最近秩（nearest-rank，`ceil(q·n)` 名次，不插值）**。
+  报告的是窗口里**真实观测到**的那个值——不像 PromQL 的 `histogram_quantile` 那样在桶内插值，
+  也不做 `rate()`/`increase()` 那样的区间外推。
+* **窗口**：默认 900s（`QUANT_LATENCY_WINDOW_SECONDS`），每个 scope 最多保留 4096 个样本。
+* **最小样本**：默认 20（`QUANT_LATENCY_MIN_SAMPLES`）。**不足 20 个样本就不导出该 scope 的分位数**——
+  「样本不足」是 no-data，规则随之显示 no-data，绝不拿一个不可信的分位数冒充读数。
+* **scope（样本来源，逐一如实标注）**：
+
+  | scope | 样本是什么 | 覆盖范围与已知偏差 |
+  |---|---|---|
+  | `mcp-tool-http` | `/mcp`、`/api/wb/*`、`/api/v3/*` 里**一次请求恰好一次工具调用**（用 `v3_ops` 计数器差值 `Δcalls == 1` 判定）的 HTTP 请求耗时 | 等于**真实单次工具调用**耗时 + 回环 HTTP 开销。实测命中：`/mcp` 的 JSON-RPC `tools/call`、`/api/v3/audit`、`/api/v3/gateway`、`/api/v3/metrics`。**多调用请求不计入**（如 `/api/v3/overview` 一次算 8 个工具）——宁缺毋滥；不含探测线程里直接调 `v3_run` 的调用，也不含 `Δcalls == 0` 的请求（如 `/api/wb/schedule` 走 store HTTP 桥、不经计数调用器）。因此它对「工具面整体延迟」是**有偏子集**，均值口径仍看 `quantwb_mcp_call_duration_seconds` |
+  | `headless-log` | `headless_log` 记录的 `duration_ms / 1000` | 与 `quantwb_headless_calls` 同源；没有 `duration_ms` 字段的记录不喂样本 |
+  | `oms-ledger` | 台账订单「`first_seen_at` → `history[].at` 进入 `submitted`/`filled`」的间隔 | **口径差异**：规格 §4.1 写的是「信号生成到订单提交」，台账能拿到的真实两端是**登记时刻**与**阶段迁移时刻** |
+  | `datasource-probe` | 降级链探测里每一级上游调用的 `attempts[].ms` | 采样频率 = 探测频率（`/api/v3/sources/status` 被调用时才产生样本），**不是**持续采样；同一份缓存只喂一次 |
+
+* **进度可见性**：`quantwb_call_duration_window_samples{scope=…}` 让人一眼看出「现在到底有几个样本」；
+  `evaluator.history_stats`（`/api/v3/ops/alerts` 响应里）给出规则求值器自己的窗口年龄。
+* **平台内求值器的窗口历史**是另一件事（规则里的 `rate()/increase()/delta()/changes()` 需要它）：
+  默认 2h（`QUANT_ALERTS_HISTORY_SECONDS`），**进程重启后清零**，覆盖率不足 90% 时相关规则
+  如实报 `no-data`——不学 PromQL 的区间外推。
+
+---
+
 ## 六、当前指标缺口 → 需要平台补哪些 metric
 
 这一节是**如实说明**，不是待办清单的美化版。
@@ -350,12 +407,160 @@ alerting:
 - ❌ 没有安装 Prometheus/Grafana/Alertmanager，没有改任何 systemd 单元（**只产出素材**：
   `platform/install/quant-v3-probe.{service,timer}` + `platform/install/README.md`，需运维自行
   `systemctl --user enable --now`）；
-- ❌ 没有建 Grafana 面板（任务书只要求 prometheus + alerts + README；Grafana 面板属可选，
-  且本机没有 Grafana 可校验——**未产出未校验的东西**）；
-- ❌ 没有接真实通知通道（飞书/邮件），告警止于 Prometheus `/alerts` 与日志；
+- ❌ 没有建 Grafana 面板（本机没有 Grafana 可校验——**未产出未校验的东西**）。
+  **替代面**见 §九：平台内规则求值器（`GET /api/v3/ops/alerts`）+ 工作台「运维告警」卡片；
+- ⚠️ 通知投递**仍然没有**：firing 只在 `/api/v3/ops/alerts` 与工作台卡片上可见，
+  没人打开页面就不会被通知（要通知就接 Alertmanager，见 §9.3）；
+- ❌ 没有接真实通知通道（飞书/邮件），告警止于 Prometheus `/alerts`、`/api/v3/ops/alerts` 与日志；
 - ✅ 已覆盖行业集中度红线（`quantwb_risk_industry_pct` + 探测写入器），且**已接闸门**：
   `check_order` 读同一份落盘缓存，超限 → `stage="blocked_industry"`；缺读数 → fail-open
   + 强制留痕（`/api/v3/metrics` 的 `industryGate.failOpen` 可告警）；
 - ⚠️ 降级链/行业探测的**自动触发**只到「素材」为止：定时器单元已写好，**没有安装、没有
   enable**。不装会怎样见 `platform/install/README.md`——`DataSourceProbeStale` /
   `RiskIndustryProbeStale` 会响（这是有意的：让静默本身可见）。
+
+---
+
+## 九、无 Grafana 的替代方案（`/metrics` 标准文本 + 平台内求值 + 工作台卡片）
+
+**前提**：本机没有（也不为本任务新装）Grafana / Prometheus / Alertmanager。
+「不装」不等于「没有监控」——规格 §8.3 要的是**这 9 类事实可被观测、可被判定、可被人看见**。
+本方案用三层把这件事落地，**不新增任何事实源**：
+
+```
+ ①  指标出口（已有）       platform/server/observability.py → GET /metrics
+                          Prometheus 文本格式（0.0.4），谁都能抓；25+ → 40+ family
+                                     │
+ ②  规则求值（本轮新增）   platform/server/v3_alerts.py
+                          解析 platform/deploy/monitoring/alerts.yml（**同一份规则文件**）
+                          在进程内对 ① 的文本求值 → firing / pending / ok / no-data / unsupported
+                          → GET /api/v3/ops/alerts（只读）· GET /api/v3/ops/alerts/rules
+                                     │
+ ③  展示面（本轮新增）     工作台「网关与调度」页 → 「运维告警」卡片
+                          读 ② 的 JSON；firing=红 / pending=橙 / no-data=中性灰 / unsupported=紫
+                          卡内明写「数据来自平台内求值，非 Grafana」
+```
+
+三层各自的**边界**（不夸大）：
+
+| 层 | 能做 | 不能做（如实） |
+|---|---|---|
+| ① `/metrics` | 标准文本，Prometheus/Grafana/任何抓取器都能读；已有 40+ family | 只是**数据出口**，不做判定、不存历史 |
+| ② `v3_alerts` | 进程内三态判定、`for` 时钟、`rate/increase/delta/changes` 窗口、UI 的 JSON | 只实现 alerts.yml 实际用到的 **PromQL 子集**；窗口历史在进程内（重启清零）；不做通知投递、不存时序、不画图 |
+| ③ 工作台卡片 | 人打开页面就能看到 firing/no-data 与证据 | **不是**时序面板：没有历史曲线、没有告警静默/抑制（silence/inhibition）、没有值班轮转 |
+
+**因此**：本替代方案解决的是「**有没有人在看**」与「**三态是否诚实**」，
+不解决「长期趋势图」「通知渠道」「静默抑制」——那三件事要么接 Prometheus/Grafana/Alertmanager，
+要么另行实现（本轮不产出未校验的东西）。
+
+### 9.1 三态语义（`no-data` 必须与 `ok` 分开）
+
+| state | 含义 | 卡片配色 | 什么时候出现 |
+|---|---|---|---|
+| `firing` | 表达式为真，且已持续满 `for` | 红 | 真的越线 |
+| `pending` | 表达式为真但 `for` 未满 | 橙 | 刚越线，观察中（**既不冒充 firing，也不冒充 ok**） |
+| `ok` | 表达式为假（判定过，且不满足） | 绿 | 有读数、不越线 |
+| `no-data` | **判不了**：表达式引用的指标在 `/metrics` 里没有任何样本；或 `rate/increase/delta/changes` 的窗口历史不足（覆盖率 < 90%） | **中性灰** | 没有读数、探测缓存缺失/过期、进程刚重启历史未积累 |
+| `unsupported` | 表达式超出求值器的 PromQL 子集（聚合 / `absent()` / `or` / 正则匹配 / `bool` …） | 紫 | 规则文件里出现了不支持的构造——**显式报出，绝不静默当 ok** |
+
+三条纪律：
+
+1. **`no-data` 不是 `ok`**：指标缺席时绝不显示「正常」。这也是 `/metrics` 本身的纪律
+   （没有读数就不导出该 family，而不是导出 0）。
+2. **不插值、不外推**：分位数用窗口内真实样本的**最近秩**；`rate/increase/delta/changes`
+   要求窗口历史覆盖率 ≥ 90%，否则 `no-data`——不学 PromQL 的区间外推。
+3. **规则文件唯一**：求值器不复制、不派生 `alerts.yml`；改规则只需改这一份文件，
+   Prometheus 与平台内求值器同时生效。
+
+### 9.2 与 Prometheus 的关系（口径差异，逐条写清）
+
+| 项 | Prometheus | 平台内求值器 `v3_alerts` |
+|---|---|---|
+| 规则来源 | `prometheus.yml` 的 `rule_files: alerts.yml` | **同一份** `alerts.yml`（环境变量 `QUANT_ALERTS_RULES` 可改路径） |
+| 表达式 | 完整 PromQL | 子集：选择器 + 标签精确匹配 + 比较 + `and`（含 `on()/ignoring()`）+ 算术 + `rate/increase/delta/changes` + `time()` + `offset`；其余 → `unsupported` |
+| `for` | 抓取周期的整数倍 | 采样线程每 `QUANT_ALERTS_SAMPLE_SECONDS`（默认 15s）推进一次 |
+| 窗口历史 | TSDB，任意长度 | **进程内内存**，默认 2h（`QUANT_ALERTS_HISTORY_SECONDS`），**重启清零** |
+| `rate()`/`increase()` | 区间外推 | 观测跨度内的实际增量（覆盖率 < 90% → `no-data`） |
+| 分位数 | `histogram_quantile()` + 直方图桶 | 平台自己算（滑动窗口 + 最近秩），以 gauge 暴露，见 §五之二 |
+| 进程自身存活（`up`） | 抓取器生成 `up{job="quantwb-v3"}` | **无法判定**：进程看不到自己死亡 → `QuantWorkbenchDown` 报 `no-data`，证据里写「由外部抓取器判定」 |
+| 分位数/`up` 之外的告警语义 | `pending`/`firing` | 同 + 显式的 `no-data` / `unsupported` |
+
+> **平台内求值器发现的既有规则缺陷（本轮修正）**：`RiskIndustryConcentrationBreached` /
+> `RiskIndustryConcentrationApproaching` / `RiskIndustryProbeFailed` 原先写作
+> ``expr > 阈值 and (time() - <无标签指标>) < N``。PromQL 的 `and` **默认要求两侧标签集完全
+> 相同**，而左侧带 `scope`/`error` 标签、右侧守卫是无标签指标 ⇒ 交集为空 ⇒
+> **这两条规则永远不会命中**（`promtool check rules` 只查语法，查不出这个）。
+> 现改为 `and on() (...)`（空标签列表 = 任意序列都视为匹配），语义与「缓存新鲜才参与判定」一致。
+
+### 9.3 将来接 Prometheus / Grafana / Alertmanager —— **不改平台代码**
+
+平台侧已经就绪，接的时候只动外部组件：
+
+1. **Prometheus**（拉 `/metrics` + 用同一份规则）：
+   ```bash
+   docker run --rm --network host \
+     -v "$PWD/platform/deploy/monitoring:/etc/prometheus:ro" \
+     prom/prometheus --config.file=/etc/prometheus/prometheus.yml
+   ```
+   `prometheus.yml` 已指向 `127.0.0.1:8397/metrics`（15s）并把 `alerts.yml` 挂在 `rule_files`。
+   **规则不用改**：同一份文件，同一批指标。
+2. **Grafana**（可选，纯展示）：数据源指向上面的 Prometheus（`http://127.0.0.1:9090`），
+   面板直接查 `quantwb_*` / `futu_*`。届时工作台卡片仍可用（它读平台内求值），
+   两者**同源不同判**：面板看趋势，卡片看三态。
+3. **Alertmanager**（可选，通知投递）：在 `prometheus.yml` 里取消 `alerting:` 段注释并指向
+   `127.0.0.1:9093`，再配 receiver（邮件/飞书 webhook）。平台侧**不参与**通知投递，
+   因此**不需要改任何代码**。
+4. 反过来也要说清：若将来接上了 Prometheus，**平台内求值器不必下线**——它是
+   「没有 Prometheus 时也能判定」的兜底，且它的 `no-data` 语义（指标缺席即无法判定）
+   是外部告警栈不提供的额外诚实性。
+
+### 9.4 规格 §8.3 逐条对照（9 类）
+
+| # | 规格 §8.3 指标 | 告警阈值 | 现状 | 规则名 | 输入指标（口径） |
+|---|---|---|---|---|---|
+| 1 | Headless 调用成功率 | < 95% | ✅ **本轮补齐** | `HarnessHeadlessSuccessRateLow` | `quantwb_headless_success_rate`（窗口内 successes/calls，窗口默认 24h） |
+| 2 | Headless 调用平均耗时 | > 60s | ✅ **本轮补齐** | `HarnessHeadlessDurationHigh` | `quantwb_headless_call_duration_seconds`（窗口内平均；单次口径另有 §4.1 的 P95 规则） |
+| 3 | SDK 会话活跃数 | > 10 | ✅ **本轮补齐** | `HarnessSdkActiveSessionsHigh` | `quantwb_sdk_active_sessions`（来源：`v3_sdk.metrics_view()` 或 `sdk_turns`；**两条来源都没有时不导出 → no-data**） |
+| 4 | MCP 工具调用延迟 | > 5s | ✅ **本轮补齐** | `ToolMcpCallLatencyP95High` | `quantwb_call_duration_p95_seconds{scope="mcp-tool-http"}`（一请求一调用的真实单次耗时；样本 < 20 不导出） |
+| 5 | MCP 工具调用失败率 | > 5% | ✅ 第一轮**已对齐**（规则阈值 10%，见下注） | `QuantMcpToolCallFailureRateHigh` | `rate(quantwb_mcp_errors_total[10m]) / rate(quantwb_mcp_calls_total[10m])` |
+| 6 | 数据源连接状态 | 断连 | ✅ 第一轮**已对齐** | `DataSourceChainUnavailable` | `quantwb_datasource_available{chain} == 0`（+ 24h 探测新鲜度守卫） |
+| 7 | 数据延迟 | > 5min | ⚠️→✅ **本轮修正口径** | `DataSourceDataDelayHigh` | `quantwb_datasource_data_age_seconds{chain}` = `now - as_of`（**新指标**）。原先只有 `DataSourceProbeStale`（「探测缓存 > 24h 过期」），那是**监控自身的可见性缺口**，不是数据延迟 |
+| 8 | 订单执行延迟 | > 1s | ✅ **本轮补齐** | `TradeOrderExecutionLatencyHigh`（另加 §4.1 的 P95 规则） | `quantwb_order_execution_latency_max_seconds`（台账「`first_seen_at` → `submitted`/`filled`」窗口内最大值；**当前 sim 无已提交订单 → no-data**） |
+| 9 | 风控阻断次数 | 突增 | ⚠️→✅ **本轮修正口径** | `RiskBlockedSpike` | `quantwb_risk_blocked_total`（**新计数器**）+ `increase(...[1h])` 与前一小时基线比较。原先只有 `RiskBlockedOrderAppeared`（「任何一次新增阻断」，事件级，不构成突增判定） |
+
+> 注（第 5 条，**口径差异，如实标注**）：规格写「失败率 > 5%」，第一轮规则写的是 **10%**
+> （`QuantMcpToolCallFailureRateHigh`，注释理由是「工作台工具面是只读数据面，偶发单次失败属正常」）。
+> 这是一处**有意放宽**的阈值差异，不是遗漏；若要让规则与规格**逐字一致**，
+> 把该规则的 `> 0.1` 改成 `> 0.05` 即可（改一处，两个求值方同时生效）——本轮**没有**擅自改，
+> 因为那会改变既有告警的行为基线；这里只把差异摆明。
+>
+> 注（第 9 条）：规格只说「突增」，没给数字。规则里的「≥3 单/小时且 ≥3× 前一小时」是**运维约定**
+> 并在规则注释里写明来源，不是平台常数（平台常数是 `LIMITS` 的 2%/20%/15%）。
+
+### 9.5 规格 §4.1 的分位数口径（本轮补齐）
+
+| §4.1 指标 | 目标 | 规则 | 指标 |
+|---|---|---|---|
+| MCP 工具调用延迟 | < 2s（单次） | `NfrMcpToolCallLatencyP95AboveTarget` | `quantwb_call_duration_p95_seconds{scope="mcp-tool-http"} > 2` |
+| 订单执行延迟 | < 500ms | `NfrOrderExecutionLatencyP95AboveTarget` | `quantwb_call_duration_p95_seconds{scope="oms-ledger"} > 0.5` |
+| Headless 调用延迟 | < 30s（单次） | `NfrHeadlessLatencyP95AboveTarget` | `quantwb_call_duration_p95_seconds{scope="headless-log"} > 30` |
+| 行情数据延迟 | < 100ms（富途 L2） | **仍缺** | 平台没有「L2 行情端到端延迟」的真实读数；`scope="datasource-probe"` 是**上游探测调用的 RTT**，口径不同，**不拿它顶替**（见 §9.6） |
+| SDK 会话首次握手 | < 30s | **仍缺** | 需要 `v3_sdk` 提供握手计时；当前无 SDK 会话事实 |
+| 系统可用性 | 99.9% | **仍缺（本替代方案不提供）** | 需要长期时序与跨度统计 → 属 Prometheus/Grafana 的职责；工作台卡片只有「当前三态」 |
+
+分位数的算法、窗口、最小样本与四个 `scope` 的样本来源见 **§五之二**（含已知偏差）。
+
+### 9.6 本方案的**已知缺口**（不装 Grafana 就必须承认的）
+
+- ⚠️ **没有通知投递**：firing 只在 `/api/v3/ops/alerts` 与工作台账面上可见，
+  没人打开页面就不会被通知（要通知就接 Alertmanager，见 §9.3）；
+- ⚠️ **没有长期历史与趋势图**：进程重启后窗口历史清零，`rate/increase/delta/changes`
+  类规则会先报 `no-data`，再随采样重新积累（最长 2h 恢复满窗口）；
+- ⚠️ **没有静默/抑制**：同一根因可能同时点亮多条规则（如缓存过期会连带
+  `DataSourceProbeStale` + `DataSourceDataDelayHigh` 静默），需要人按 §七 的表逐条处置；
+- ⚠️ **`quantwb_risk_blocked_total` 是「首见计数」**：进程内首次观测到某单进入阻断阶段才 +1，
+  重启归零、台账删单后重新出现会再计一次（口径写在 HELP 里，不谎称是事件流回放）；
+- ⚠️ **`mcp-tool-http` 分位数只覆盖「一请求一调用」**：批量/多调用请求不计入（宁缺毋滥），
+  因此它对「工具面整体延迟」是**有偏样本**，不是全量分布；
+- ⚠️ **订单延迟口径与规格有差异**：规格 §4.1 是「信号生成 → 订单提交」，
+  平台能拿到的真实两端是「台账登记 → 阶段迁移」（见 §五之二表格）。

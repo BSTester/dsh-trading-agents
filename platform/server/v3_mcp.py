@@ -56,6 +56,7 @@ CREDENTIALS_WEB_ONLY_MESSAGE = (
 NON_READONLY_PATHS = frozenset({
     "/api/v3/strategy/run",   # 落盘一轮研究流水线记录（不出订单）
     "/api/v3/oms/sync",       # 重写本地 OMS 台账（不出订单）
+    "/api/v3/sdk/prompt",     # 起 Harness 子进程 / 下发提示词 + 追加审计（要口令，写类）
     CREDENTIALS_PATH,         # POST 面写/清凭据（桥内封死，见上）
 })
 
@@ -93,14 +94,27 @@ TOOL_DOCS = {
     "/api/v3/execution/quality": "成交质量（只读）：委托/成交全部来自券商历史，无开源替代；"
                                  "取不到就如实报错，不给估算的滑点。market=SH|HK|US，mode=sim|live。"
                                  + _READ_NOTE,
-    "/api/v3/factors/matrix": "横截面因子 z 矩阵 + 因子 IC 序列（未给 tickers 时取该市场宇宙；"
+    "/api/v3/factors/matrix": "横截面因子 z 矩阵 + 因子 IC 序列 + 六类因子的真实覆盖率（未给 tickers 时取该市场宇宙；"
+                              "classes 选择并入的因子类别，as_of 是 PIT 上界；"
                               "forward 与 forward_days 同义，缺省 5）。"
                               + _READ_NOTE,
+    "/api/v3/factors/registry": "因子注册表（六类因子 + 真实数据源 + PIT 口径）+ 逐因子覆盖率；"
+                                "覆盖率与 /api/v3/factors/matrix **同一份计算**（不为页面另造一套统计）；"
+                                "classes=all 才把实时另类因子一起取。"
+                                + _READ_NOTE,
     "/api/v3/financials": "三表（利润/资产/现金流）：美股走 SEC EDGAR，A 股/港股走富途 f10 并逐级降级；"
                           "chain 里逐条列出每次尝试的来源/耗时/错误。"
                           + _READ_NOTE,
     "/api/v3/gateway": "网关与调度只读视图：通道状态（mcp/sdk/headless）、调度心跳、作业历史与 kill/halt。"
                        + _READ_NOTE,
+    "/api/v3/headless/log": "Headless 调用日志（FR-MON-003）：真实 headless_log 表 + 分页/筛选"
+                            "（success/task_type/trigger/outcome/since/until，按 started_at 比较）；"
+                            "stdout/stderr 分列存储（items[].stdout / .stderr 即原始两路）。"
+                            + _READ_NOTE,
+    "/api/v3/headless/schedule": "Headless 触发策略只读视图：各触发条件开关与最近判定、下一次触发时间、"
+                                 "最近触发记录，以及外部熔断三参数（并发上限/单次超时/token 预算，"
+                                 "超限即 kill 并记录）与 profile 白名单审计。"
+                                 + _READ_NOTE,
     "/api/v3/market": "K 线序列（周期 1m..1d/1w/1M），经工作台 series 工具取数，字段按 V3 契约适配。"
                       + _READ_NOTE,
     "/api/v3/market/watchlist": "该市场池子的快照（逐票最近日 K + 动量）：池子来自配置自选池或真实持仓，"
@@ -135,6 +149,14 @@ TOOL_DOCS = {
                         "只改本地台账，不产生任何订单；行业暴露按订单所属市场分别取数。",
     "/api/v3/openbb": "OpenBB 基本面（可选依赖）：未安装时返回 openbb/unavailable 且**不发网络请求**。"
                       + _READ_NOTE,
+    "/api/v3/ops/alerts": "平台内告警三态（firing / pending / ok / no-data / unsupported）："
+                          "对 Prometheus 文本求值，与 Grafana 读同一份规则。state 只过滤其中一个"
+                          "状态，取值非法时**不过滤也不报错**（只读端点不因参数失败）。"
+                          + _READ_NOTE,
+    "/api/v3/ops/alerts/rules": "告警规则清单（名字/表达式/for/severity/域/是否在支持子集内/"
+                                "依赖的指标与来源文件）——与 Prometheus 共用一份 alerts.yml，"
+                                "规则里用到的函数也逐条列出。"
+                                + _READ_NOTE,
     "/api/v3/orderbook": "盘口五档快照；富途账号未开通实时行情权限时原样透传上游错误（如 errcode=-9），"
                          "由调用方显示「无数据源 + 原因」，不填占位。"
                          + _READ_NOTE,
@@ -166,6 +188,22 @@ TOOL_DOCS = {
     "/api/v3/risk/industry": "行业映射与暴露：板块归属来自富途，权重来自平台组合；limit_pct 是行业红线"
                              "（缺省 20）。上游缺数据时如实标注 missing，不估算。"
                              + _READ_NOTE,
+    "/api/v3/risk/funding-check": "**事前风控·资金检查（只读）**：订单金额（order_value，或 qty×price）"
+                                  "对真实可用购买力（account_funds）。资金不足 → action=blocked + 读数与来源；"
+                                  "不够读数 → action=unknown + 原因。**不改既有下单前闸门语义**，只作读数与"
+                                  "分级建议。"
+                                  + _READ_NOTE,
+    "/api/v3/sdk/status": "Harness SDK 通道**只读**状态：本进程内真实 dsh 子进程与握手结果"
+                          "（含协议标识比对）、白名单审计与最近审计条目。有意**不**在这里起进程——"
+                          "启动/握手是显式动作（POST /api/v3/sdk/prompt 且要口令）。"
+                          + _READ_NOTE,
+    "/api/v3/sdk/sessions": "Harness SDK 会话**只读**回放：会话状态 + 事件环（since 之后、最多 limit 条）。"
+                            "事件是进程内真实记录，非回填。"
+                            + _READ_NOTE,
+    "/api/v3/sdk/prompt": "**写端点**：向 Harness SDK 会话下发提示词（或 action=start 只做「起进程 + "
+                          "initialize 握手」）。需人工口令「确认下发」，服务端 fail-closed：口令缺失/不符"
+                          "一律拒绝、未知 action 拒绝，**拒绝也落审计**（拒绝不是静默）。会改本进程状态"
+                          "（起子进程、追加审计文件），故**不标只读**。",
     "/api/v3/settings": "接入与授权只读状态：当前模式、富途渠道与 token 状态、环境变量是否注入（**只报是否"
                         "与来源，绝不出值**）、各数据源可用性。"
                         + _READ_NOTE,
@@ -225,6 +263,18 @@ PARAM_DOCS = {
     "periods": "返回的报告期数（1..12）",
     "api": "Tushare 接口名（需在服务端受支持清单内）",
     "ts_code": "Tushare 标的代码，如 600519.SH",
+    "classes": "因子类别选择（quality,growth,sentiment 缺省；all 含实时另类；none 只要价量/估值列）",
+    "as_of": "PIT 上界（YYYY-MM-DD），缺省今天（UTC）",
+    "session": "会话 id（缺省聚合全部会话）",
+    "offset": "分页起点（缺省 0）",
+    "success": "只看成功/失败（true|false；非法值不过滤）",
+    "task_type": "按任务类型过滤（如 daily_brief / factor_patrol / mining_round）",
+    "trigger": "按触发来源过滤（如 schedule / event / manual）",
+    "outcome": "按结束状态过滤（如 done / failed / timeout）",
+    "since": "起始时间（ISO 字符串，按 started_at 前缀比较）",
+    "until": "结束时间（ISO 字符串，按 started_at 前缀比较）",
+    "qty": "数量（与 price 一起算订单金额）",
+    "side": "交易方向（BUY / SELL；仅作读数标注）",
 }
 #: 同名不同义的少数端点在此写清（键为 (路径, 参数名)）。
 PARAM_DOCS_OVERRIDES = {
@@ -232,6 +282,19 @@ PARAM_DOCS_OVERRIDES = {
     ("/api/v3/financials", "ticker"): "标的代码：美股如 AAPL，A 股如 SH.600000/600519.SH，港股如 HK.00700",
     ("/api/v3/tushare", "period"): "报告期，如 20260630",
     ("/api/v3/market/watchlist", "market"): "市场：SH / HK / US（缺省 SH）",
+    ("/api/v3/ops/alerts", "state"): "只看某一态（firing / pending / ok / no-data / unsupported）；"
+                                     "留空看全部，取值非法时不过滤（只读端点不因参数失败）",
+    ("/api/v3/risk/funding-check", "order_value"): "订单金额（不给则由 qty × price 计算）",
+    ("/api/v3/risk/funding-check", "qty"): "下单数量（与 price 一起算订单金额）",
+    ("/api/v3/risk/funding-check", "price"): "下单价格（与 qty 一起算订单金额）",
+    ("/api/v3/risk/funding-check", "side"): "交易方向：BUY / SELL（只作读数标注，不改变闸门语义）",
+    ("/api/v3/risk/analytics", "details"): "true 时附带逐日明细（净值/回撤序列），false 只给汇总量",
+    ("/api/v3/sdk/sessions", "session"): "只看某个会话 id（缺省聚合全部会话）",
+    ("/api/v3/sdk/sessions", "since"): "从第几条事件开始回放（事件环下标，缺省 0）",
+    ("/api/v3/headless/log", "offset"): "分页起点（缺省 0）",
+    ("/api/v3/headless/log", "since"): "起始时间（ISO 字符串，按 started_at 前缀比较）",
+    ("/api/v3/headless/log", "until"): "结束时间（ISO 字符串，按 started_at 前缀比较）",
+    ("/api/v3/headless/log", "success"): "只看成功/失败（true|false；非法值不过滤）",
 }
 
 # ---------------------------------------------------------------------------
@@ -568,6 +631,9 @@ class V3Bridge:
         self.names = tuple(definition.name for definition in self.definitions)
         self.readonly = {definition.endpoint: definition.endpoint not in NON_READONLY_PATHS
                          for definition in self.definitions}
+        #: 名字 → **同一个**已注册函数对象（direct 模式注册时填充；discovery 模式复用同一批，
+        #: 保证「直连工具」与「发现代理转发的工具」是同一份实现，不是两份同源代码）。
+        self.bound = {}
 
     def method_for(self, path, payload):
         """该路径该动作该走哪个 HTTP 方法（**只**按声明表；没声明就退回 GET=读，绝不猜写）。"""
@@ -632,14 +698,20 @@ def register(server, app, bridge=None):
 
     ``server`` 是 ``create_app`` 里那个唯一的 ``MCPServer``（与既有 77 工具同一实例、同一
     ``/mcp`` 端点）；``app`` 是刚装配完 V3 路由的 FastAPI 应用。
+
+    注册的函数对象**每个定义只造一次**并记进 ``bridge.bound``：discovery 模式下
+    ``mcp_discovery.register`` 直接复用这一批，不另造一件——因此「直连的 v3_x」与
+    「call_tool 转发的 v3_x」在进程里是同一个函数对象。
     """
     from mcp.types import ToolAnnotations
 
     bridge = bridge or V3Bridge(app)
     with mcp_tools.schema_warning_filter():
         for definition in bridge.definitions:
+            bound = _bind(definition, bridge)
+            bridge.bound[definition.name] = bound
             server.add_tool(
-                _bind(definition, bridge),
+                bound,
                 name=definition.name,
                 description=definition.description,
                 annotations=ToolAnnotations(

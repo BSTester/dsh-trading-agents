@@ -70,8 +70,8 @@ function channelTag(status) {
 }
 
 const REASON = {
-  sdk: "本服务未挂载 SDK JSON-RPC 通道（无 dsh SDK 会话）",
-  headless: "本服务未挂载 Headless CLI 子通道（无 dsh --profile headless 子进程调度）",
+  sdk: "SDK JSON-RPC 会话通道已实现（platform/server/v3_sdk.py）；后端未上报 channels.sdk.reason，故此处为兜底说明，真实状态见 GET /api/v3/sdk/status",
+  headless: "Headless 通道已实现（platform/server/v3_headless.py：真实 spawn + 工具白名单 + 熔断 + headless_log 落库）；后端未上报 channels.headless.reason，故此处为兜底说明，真实状态见 GET /api/v3/headless/schedule",
 };
 
 /** 通道卡里的「指标 + 值」小块（对应设计稿 .ch-metrics .m / .v / .l）。 */
@@ -196,10 +196,196 @@ function UnavailableChannelCard({ title, channel, reason, extraRows = [], footer
   );
 }
 
+/**
+ * 告警三态（+ 两个必须分清的中间态）的配色与文案。
+ *
+ * 取自 ``GET /api/v3/ops/alerts`` 的 ``state`` 字段，**不在这里重新判定**：
+ *   * firing      表达式为真且已满 ``for`` → 红（error）
+ *   * pending     条件为真但 ``for`` 未满 → 橙（warning）
+ *   * no-data     指标不存在 / 窗口历史不足 → **中性灰**（default）：看不到 ≠ 正常
+ *   * unsupported 表达式超出平台内求值器的 PromQL 子集 → 紫（purple）
+ *   * ok          判定过且不满足 → 绿（success）
+ */
+const ALERT_STATE_META = {
+  firing: { color: "error", label: "触发" },
+  pending: { color: "warning", label: "待满 for" },
+  "no-data": { color: "default", label: "无法判定" },
+  unsupported: { color: "purple", label: "表达式不支持" },
+  ok: { color: "success", label: "正常" },
+};
+
+const alertStateMeta = (state) => ALERT_STATE_META[state] ?? { color: "default", label: fmt.dash(state) };
+
+/** 告警的「当前值 / 阈值」：没有读数就是「—」，绝不显示 0（0 只表示接口确实返回 0）。 */
+function AlertValue({ item, field }) {
+  const value = item?.[field];
+  if (value === null || value === undefined || value === "") {
+    return <Text type="secondary">—</Text>;
+  }
+  if (typeof value === "object") {
+    return <Text type="secondary">{JSON.stringify(value)}</Text>;
+  }
+  return <Text>{typeof value === "number" ? Number(value.toPrecision(6)) : String(value)}</Text>;
+}
+
+/**
+ * 运维告警卡：**平台内求值，不是 Grafana**。
+ *
+ * 数据来自 ``GET /api/v3/ops/alerts``（``server/v3_alerts.py``）：它解析
+ * ``deploy/monitoring/alerts.yml``（与 Prometheus 同一份规则文件）后在进程内对 ``/metrics``
+ * 求值。本机未部署 Grafana/Prometheus，所以这里没有 Grafana 面板可嵌——本卡片就是替代面。
+ */
+function AlertsCard({ env }) {
+  const data = env?.value ?? {};
+  const items = Array.isArray(data.alerts) ? data.alerts : [];
+  const [stateFilter, setStateFilter] = React.useState("ALL");
+  const summary = data.summary ?? {};
+  const states = Array.from(new Set(items.map((item) => String(item.state ?? "")))).filter(Boolean);
+  const visible = stateFilter === "ALL" ? items : items.filter((item) => item.state === stateFilter);
+  // 默认只看需要人处理的三态（firing / pending / no-data / unsupported），ok 收在筛选里
+  const attention = items.filter((item) => item.state !== "ok").length;
+  const options = [
+    { value: "ALL", label: `全部（${items.length} 条）` },
+    ...states.map((state) => ({
+      value: state,
+      label: `${alertStateMeta(state).label}（${items.filter((row) => row.state === state).length} 条）`,
+    })),
+  ];
+  return (
+    <ProCard
+      title="运维告警"
+      bordered
+      extra={
+        <Space size={8} wrap>
+          <Tag color={summary.firing ? "error" : "default"}>{`firing ${fmt.dash(summary.firing)}`}</Tag>
+          <Tag color={summary.pending ? "warning" : "default"}>{`pending ${fmt.dash(summary.pending)}`}</Tag>
+          <Tag>{`no-data ${fmt.dash(summary["no-data"])}`}</Tag>
+          {summary.unsupported ? <Tag color="purple">{`unsupported ${fmt.dash(summary.unsupported)}`}</Tag> : null}
+          <Tag color="success">{`ok ${fmt.dash(summary.ok)}`}</Tag>
+          <ScopeTag market={undefined} label={undefined} global />
+        </Space>
+      }
+    >
+      <Alert
+        type="info"
+        showIcon
+        style={{ marginBottom: 10 }}
+        message="数据来自平台内规则求值器（GET /api/v3/ops/alerts），不是 Grafana"
+        description={
+          <Text type="secondary" style={{ fontSize: 11.5 }}>
+            求值器（<Text code>server/v3_alerts.py</Text>）解析 <Text code>platform/deploy/monitoring/alerts.yml</Text>
+            （与 Prometheus 同一份规则文件）后，在本服务进程内对 <Text code>/metrics</Text> 求值；
+            本机未部署 Grafana/Prometheus，因此没有 Grafana 面板可嵌，本卡片就是轻量替代面。
+            三态语义：<Text code>firing</Text> 红 / <Text code>pending</Text> 橙（条件为真但 for 未满）/
+            <Text code>no-data</Text> 中性灰（指标缺失或窗口历史不足——<Text strong>看不到不等于正常</Text>）/
+            <Text code>unsupported</Text> 紫（表达式超出求值器支持的 PromQL 子集，显式报出，不当 ok）。
+            规则文件：<Text code>{fmt.dash(data.rules_file)}</Text> · 求值时刻 {fmt.stamp(data.as_of)}
+          </Text>
+        }
+      />
+      {env?.loading && !env?.value ? <Text type="secondary">读取中…（未取到前不显示任何计数）</Text> : null}
+      {env?.error ? (
+        <NoSource what="运维告警" why={`/api/v3/ops/alerts 取数失败：${env.error}`} type="error" />
+      ) : null}
+      {!env?.loading && !env?.error && env?.value && data.ok !== true ? (
+        <NoSource
+          what="运维告警"
+          why={data.ok === false
+            ? `求值器返回失败信封：${data.error?.code ?? "unknown"} · ${data.error?.message ?? "无原因"}`
+            : "接口没有返回有效信封（端点可能尚未注册——运行中的服务进程需要重启一次才会有 /api/v3/ops/alerts）"}
+          type={data.ok === false ? "error" : "warning"}
+        />
+      ) : null}
+      {!env?.loading && !env?.error && env?.value && data.ok === true && items.length === 0 ? (
+        <Empty image={EMPTY_FRAME} description={noSourceText("运维告警", "alerts 为空数组（规则文件里没有规则？）")} />
+      ) : null}
+      {items.length > 0 ? (
+        <Space direction="vertical" size={10} style={{ width: "100%" }}>
+          <Space size={8} wrap style={{ justifyContent: "space-between", width: "100%" }}>
+            <Text type="secondary" style={{ fontSize: 11.5 }}>
+              {`需要人看的有 ${attention} 条（firing / pending / no-data / unsupported）；表内按状态与严重度排序，来源为平台内求值`}
+            </Text>
+            <Select size="small" style={{ minWidth: 190 }} value={stateFilter} onChange={setStateFilter} options={options} />
+          </Space>
+          <Table
+            size="small"
+            rowKey={(record) => String(record.rule ?? record.name)}
+            dataSource={visible.slice(0, 20)}
+            pagination={false}
+            locale={emptyTable("运维告警", `没有状态为 ${stateFilter} 的规则`)}
+            expandable={{
+              expandedRowRender: (record) => (
+                <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                  <Text code style={{ fontSize: 11.5 }}>{fmt.dash(record.expr)}</Text>
+                  <Text type="secondary" style={{ fontSize: 11.5 }}>
+                    {`证据：${fmt.dash(record.evidence?.reason)}`}
+                  </Text>
+                  {record.thresholds?.length > 1 ? (
+                    <Text type="secondary" style={{ fontSize: 11.5 }}>
+                      {`表达式里全部阈值：${record.thresholds
+                        .map((row) => `${row.metric ?? "（无指标前缀）"} ${row.operator} ${row.threshold}`)
+                        .join(" · ")}`}
+                    </Text>
+                  ) : null}
+                </Space>
+              ),
+            }}
+            columns={[
+              {
+                title: "规则",
+                render: (_, record) => (
+                  <Space direction="vertical" size={0}>
+                    <Text strong style={{ fontSize: 12 }}>{fmt.dash(record.rule)}</Text>
+                    <Text type="secondary" style={{ fontSize: 11 }}>{fmt.dash(record.summary)}</Text>
+                  </Space>
+                ),
+              },
+              {
+                title: "严重度",
+                width: 90,
+                render: (_, record) => (
+                  <Tag color={record.severity === "critical" ? "error" : record.severity === "warning" ? "warning" : "default"}>
+                    {fmt.dash(record.severity)}
+                  </Tag>
+                ),
+              },
+              {
+                title: "状态",
+                width: 108,
+                render: (_, record) => <Tag color={alertStateMeta(record.state).color}>{alertStateMeta(record.state).label}</Tag>,
+              },
+              { title: "当前值", width: 110, render: (_, record) => <AlertValue item={record} field="value" /> },
+              { title: "阈值", width: 100, render: (_, record) => <AlertValue item={record} field="threshold" /> },
+              {
+                // 只显示比较运算符；完整表达式在展开行（列宽放不下，且表达式本身是证据不是结论）
+                title: "运算符",
+                width: 82,
+                render: (_, record) => <Text type="secondary" style={{ fontSize: 11 }}>{fmt.dash(record.operator)}</Text>,
+              },
+              { title: "since", width: 170, render: (_, record) => fmt.stamp(record.since) },
+              {
+                title: "影响范围",
+                width: 96,
+                render: (_, record) => (
+                  <Text type="secondary" style={{ fontSize: 11 }}>
+                    {record.state === "no-data" ? "无法判定" : record.series?.length ? `${record.series.length} 条序列` : "—"}
+                  </Text>
+                ),
+              },
+            ]}
+          />
+        </Space>
+      ) : null}
+    </ProCard>
+  );
+}
+
 export default function GatewayPage() {
   const { market, label } = useMarket();
   const gateway = useV3("gateway");
   const metrics = useV3("metrics");
+  // 运维告警（平台内求值：GET /api/v3/ops/alerts；不是 Grafana 面板）
+  const opsAlerts = useV3("ops/alerts");
   // 调度作业历史的市场筛选（job 前缀；默认「全部市场」，纯前端过滤，不新增请求）
   const [jobMarket, setJobMarket] = React.useState("ALL");
   const g = gateway.value ?? {};
@@ -292,12 +478,14 @@ export default function GatewayPage() {
             children: (
               <Text type="secondary">
                 {`唤醒 ${fmt.dash(today.total)} · 成功 ${fmt.dash(today.success)} · 失败 ${fmt.dash(today.failed)} · 平均 ${fmt.dash(today.avgMs)}ms`}
-                （本服务不拉起 headless 子进程，计数恒为 0）
+                {`（来源：headless_log 当日真实记录，GET /api/v3/headless/log；全 0 表示当日无唤醒，不是"不拉起子进程"）`}
               </Text>
             ),
           }]}
         />
       </div>
+
+      <AlertsCard env={opsAlerts} />
 
       <ProCard
         title="Headless 调用日志"

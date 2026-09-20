@@ -297,9 +297,16 @@ export default function OverviewPage() {
   const mcpCalls = Number(mt && mt.mcp ? mt.mcp.calls : 0) || 0;
   const mcpErrors = Number(mt && mt.mcp ? mt.mcp.errors : 0) || 0;
   const mcpOk = Boolean(mt);
-  const sdkReason = (br && br.sdk && br.sdk.reason) || "本服务未挂载 SDK JSON-RPC 客户端";
-  const headlessReason =
-    (br && br.headless && br.headless.reason) || "本服务未挂载 Headless CLI 运行器";
+  const sdkReason = (br && br.sdk && br.sdk.reason)
+    || "SDK JSON-RPC 通道由 server/v3_sdk.py 提供；本视图未取得 /api/v3/brain 的 sdk 读数";
+  /* Headless：通道**已实现**（server/v3_headless.py，真实 spawn dsh --profile headless）；
+   * 这里显示的 reason/status 全部来自服务端真实读数（registered / schedulerAlive / today / last），
+   * 前端**不写**「未挂载 / 未实现」这类会随实现变化的断言。 */
+  const headlessStatus = (br && br.headless && br.headless.status) || "unknown";
+  const headlessReason = (br && br.headless && br.headless.reason)
+    || "未取得 /api/v3/brain 的 headless 读数（服务端未接线或接口失败）";
+  const headlessRegistered = Boolean(br && br.headless && br.headless.registered);
+  const headlessAlive = br && br.headless ? br.headless.schedulerAlive : null;
 
   const mcpStats = (
     <Descriptions
@@ -689,7 +696,8 @@ export default function OverviewPage() {
           name="SDK JSON-RPC"
           subtitle="人工会话通道"
           loading={brain.loading}
-          chip={<Chip ok={false} />}
+          chip={<Chip ok={Boolean(br && br.sdk && br.sdk.status && br.sdk.status !== "unavailable")}
+            okText="已接线" badText="无会话读数" />}
           stats={
             brain.error ? (
               <BlockError name="SDK JSON-RPC（/api/v3/brain）" error={brain.error} />
@@ -716,7 +724,7 @@ export default function OverviewPage() {
                       children: (
                         <Text type="secondary">
                           {br && br.sdk && Array.isArray(br.sdk.turns)
-                            ? `${br.sdk.turns.length} 条（未挂载会话即 0）`
+                            ? `${br.sdk.turns.length} 条（本视图不含会话回合；活跃会话见 /api/v3/sdk/status）`
                             : "无数据源"}
                         </Text>
                       ),
@@ -726,13 +734,13 @@ export default function OverviewPage() {
               </Space>
             )
           }
-          foot="SDK 通道未挂载：会话与握手耗时无数据源"
+          foot={`SDK 通道由 server/v3_sdk.py 提供（/api/v3/sdk/status 是会话读数口）：${sdkReason}`}
         />
         <ChannelCard
           name="Headless CLI"
           subtitle="自动唤醒通道"
           loading={brain.loading}
-          chip={<Chip ok={false} />}
+          chip={<Chip ok={headlessRegistered} okText={headlessAlive ? "调度中" : "已接线（空闲）"} badText="已实现 · 未接线" />}
           stats={
             brain.error ? (
               <BlockError name="Headless CLI（/api/v3/brain）" error={brain.error} />
@@ -777,14 +785,14 @@ export default function OverviewPage() {
                     key: "last",
                     label: "最近任务",
                     children: (
-                      <Text type="secondary">{headlessLast.length ? `${headlessLast.length} 条` : "无数据源"}</Text>
+                      <Text type="secondary">{headlessLast.length ? `${headlessLast.length} 条` : "无记录"}</Text>
                     ),
                   },
                 ]}
               />
             )
           }
-          foot={`Headless 通道未挂载：${headlessReason} · 定时器 + 调度心跳由服务侧提供（见网关与调度页）`}
+          foot={`Headless 状态 ${headlessStatus}（registered=${headlessRegistered}，schedulerAlive=${headlessAlive === null ? "—" : String(headlessAlive)}）：${headlessReason} · 定时器 + 调度心跳由服务侧提供（见网关与调度页）`}
         />
       </div>
 

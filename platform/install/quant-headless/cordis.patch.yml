@@ -144,9 +144,23 @@
 
 # ── 与 platform/ 的衔接：量化数据工具面（**唯一**交互面）────────────────────
 #
-# 分析师能看到的量化数据都从平台的 MCP 工具面来：既有 77 个工作台工具 + `/api/v3/*`
-# 路由桥接出的 `v3_*` 工具（随路由表，当前 39 个，合计 116 个），同一个 `/mcp` 端点、
-# 同一份服务端实现（桥接不复制业务逻辑，见 server/v3_mcp.py 与 docs/v3-integration.md）。
+# 分析师能看到的量化数据都从平台的 MCP 工具面来：同一个 `/mcp` 端点、同一份服务端实现
+# （桥接不复制业务逻辑，见 server/v3_mcp.py 与 docs/v3-integration.md）。
+#
+# ⚠️ 工具面有**两种模式**（规格 FR-TOOLS-003 / §10 决策 3），由**平台服务进程**的环境变量
+# ``QUANT_MCP_SURFACE`` 决定——本 profile 不需要改任何一行：
+#   * ``discovery``（缺省）—— 只直连 4 件高频工具（snapshot / admin_status / v3_gateway /
+#     v3_tools）+ ``list_tools``（按关键词/域/前缀检索，返回精简卡片）+ ``call_tool``
+#     （转发到同一实现）。实测 `tools/list` 从 ≈79.6k 字符（≈2 万 token）降到 3.2k 字符
+#     （≈0.8k token）；代价是多 1~2 次「先发现再调用」的往返。
+#   * ``direct`` —— 全量直暴露（工作台工具 + 全部 `v3_*` 桥接件），向后兼容。
+# 切换（一行，然后重启平台服务）：
+#   QUANT_MCP_SURFACE=direct scripts/platform_service.sh restart
+# 或写进 <DSH_HOME>/trading-platform.json 的 {"service": {"mcp_surface": "direct"}}。
+# 两种模式的能力集合**完全一致**（代理转发的是注册表里同一个函数对象）：省的是 schema
+# token，不是能力；凭据封死（v3/credentials-web-only）与「`/api/v3/*` 无交易写端点」
+# 在两种模式下都成立（platform/tests/test_mcp_discovery.py 两种路径都断言）。
+#
 # 双方交互只此一条：**不挂任何第三方 adapter/桥接包**。
 # @deepseek-ai/dsh-mcp-client 已装在共享目录 ~/.dsh/profiles/node_modules/
 # （本 profile 能向上解析到），**无需额外装包**。
@@ -175,13 +189,39 @@
       - /home/penn/workspace/dsh-trading-agents/skills/
       - /home/penn/workspace/dsh-trading-agents/skills/futu-skills/
 
+# ── ④ 写/交易工具的逐名拒绝（FR-GATEWAY-004「绝不触发交易」的硬一层）────────────
+#
+# 上面「按行关停」关得掉**本地工具**（bash/web/委派），但关不掉 MCP 工具面里的
+# trade_place / trade_modify / trade_cancel / plan_execute / switch_mode 等写工具——
+# 它们是同一个 `dsh-mcp-client` 行发现的工具，没有 per-tool 开关。
+# 运行时的唯一细粒度扩展点是 `tools/pre-execute`（waterfall，allow/deny/ask 三态），
+# 官方 `@deepseek-ai/dsh-hooks-claude-code` 把它桥接成 Claude Code 的 PreToolUse 命令钩子：
+# **退出码 2 = 阻断**（stderr 作为给模型的理由，见 dsh-hook-protocol 的 parseHookOutput）。
+# 因此这里挂官方钩子行 + 一份 matcher 名单（字面精确名，含 mcp__quantwb__ 前缀），
+# 名单由平台自己的常量推导（v3_ops.WRITE_TOOLS + e2e_probe.WRITE_ENDPOINTS +
+# mcp_tools.MCP_EXCLUDED_ENDPOINTS 的写类），与 tool-whitelist.json 一一对应。
+#
+# fail-closed：`platform/server/v3_headless.py` 起进程**之前**校验 profile 里
+# ①每个危险 tool-* 行 disabled、②本行存在、③hooks.json 的 matcher 覆盖全部写工具名；
+# 任一不成立就不起进程（outcome=whitelist-unverified），宁可没有分析也不越权。
+#
+# ⚠️ 绝对路径：与 skill-filesystem 同一约定，换机器/换 DSH_HOME 要改成仓库实际路径。
+- insert:
+    - id: quant-headless-tool-deny
+      name: '@deepseek-ai/dsh-hooks-claude-code'
+      config:
+        configPath: /home/penn/workspace/dsh-trading-agents/platform/install/quant-headless/hooks.json
+        # 钩子命令只是 echo + exit 2：默认 10 分钟超时太长，收紧到 15s。
+        defaultTimeoutMs: 15000
+
 # ═══════════════════════════════════════════════════════════════════════════
 # 真实边界在哪：**提示词与工具白名单都不是交易边界**
 # ═══════════════════════════════════════════════════════════════════════════
-# 关掉 shell、关掉委派，能减少「分析师乱动手」的面，但真正拦住下单的是服务侧：
+# 关掉 shell、关掉委派、再逐名拒绝写/交易工具，能大幅收窄「分析师乱动手」的面，
+# 但真正拦住下单的仍是服务侧：
 #   * 本 profile 只挂 MCP 客户端行，写端点仍然要求人工在 Web 确认
 #     （store_access.request_confirmation，TTL 120s 超时=拒绝，fail-closed）；
 #   * `confirm-decide` 与设置页两端点**有意不进 MCP 工具面**，所以模型无法自批实盘单、
 #     无法自改凭据（见 docs/architecture.md 与 platform/server/mcp_tools.py）；
-#   * sim→live 切换必须由人在 Web 输入口令，qut-headless 侧没有任何等价通道。
+#   * sim→live 切换必须由人在 Web 输入口令，quant-headless 侧没有任何等价通道。
 # 因此：白名单是**纵深**的一层，不是唯一一层。任何一条都不该被当成「所以可以放心」。

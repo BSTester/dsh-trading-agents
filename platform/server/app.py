@@ -55,8 +55,8 @@ from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
 from mcp.server.mcpserver import MCPServer
 
-from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_tools,
-                    oauth_flow, settings_api, store_access, trading, v3_db, v3_mcp,
+from server import (audit_chain, caches, compute, futu_data, futu_push, mcp_discovery,
+                    mcp_tools, oauth_flow, settings_api, store_access, trading, v3_db, v3_mcp,
                     v3_ratelimit)
 from server.config import load_config
 from server.store_access import WorkbenchError
@@ -671,8 +671,20 @@ def create_handler(home, analytics=None, series=None, core=None, command_home=No
     return handle
 
 
+def _config_surface(config):
+    """``service.mcp_surface``（部署级缺省）→ 表面模式；缺键/非字符串返回 ``None``。
+
+    与 ``read_service_cfg``（host/port）同一套「读配置但容错」口径：坏值不让平台起不来，
+    但**拼错的值**不在这里吞掉——它交给 ``mcp_discovery.resolve_surface`` 判定，非法取值
+    直接抛错（静默退回某个模式会让「切了没生效」变成查不出的运维事故）。
+    """
+    service = config.get("service") if isinstance(config, dict) else None
+    value = service.get("mcp_surface") if isinstance(service, dict) else None
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def create_app(home=None, dist=None, config=None, analytics=None, series=None, core=None,
-               scheduler=None, futu=None, push=None):
+               scheduler=None, futu=None, push=None, mcp_surface=None):
     """组装 FastAPI 应用（沿用 Node 原实现已退役的组装顺序：一份 handle 共享）。
 
     ``scheduler``（WP7 任务 1）：传入即用（测试注入替身/禁用）；None 才建真调度器
@@ -683,6 +695,13 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     可用时才真正建连接，否则 lifespan 零副作用、``/healthz`` 如实报 ``enabled:false``。
     ``futu`` 注入口用于把同一个行情快照缓存接进直通层（``rt_quote`` 可命中推送数据）；
     缺省按 home 建 ``FutuData`` 并挂上 ``push.quote_cache``。
+
+    ``mcp_surface``（规格 FR-TOOLS-003 / §10 决策 3）：MCP 工具面模式
+    ``discovery``（缺省；少量直连 + ``list_tools``/``call_tool`` 两个发现入口）或
+    ``direct``（116 件全量直暴露，向后兼容）。**切换只改一个环境变量**
+    ``QUANT_MCP_SURFACE``（配置项 ``service.mcp_surface`` 可作部署级缺省）；
+    显式入参优先，供测试在同一进程里分别装配两种模式。解析结果记在
+    ``app.state.mcp_surface``，非法取值由 ``mcp_discovery.resolve_surface`` 抛错。
     """
     if home is None:
         home = os.environ.get("DSH_HOME") or str(Path.home() / ".dsh")
@@ -693,6 +712,8 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     db_state = v3_db.init_db(home)
     root = Path(dist if dist is not None else DEFAULT_DIST)
     config = load_config(home) if config is None else config
+    surface = mcp_discovery.resolve_surface(
+        mcp_surface if mcp_surface is not None else _config_surface(config))
     push = push if push is not None else futu_push.PushRuntime(home=home)
     if futu is None:
         futu = futu_data.FutuData(home=home, push=push.quote_cache)
@@ -709,8 +730,13 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # 共用同一个 handle 实例（规格 §5.2 R6 的结构保证），维护工具走 store_access 的
     # home 绑定门面。
     # 52 个 HTTP 端点里 ``confirm-decide`` **有意不进工具面**（人工决定通道，见 mcp_tools）。
+    #
+    # discovery 模式（规格 FR-TOOLS-003）下这 77 件仍会注册（引用同一批绑定对象），随后由
+    # ``mcp_discovery.register`` 从注册面**移出**——省的是 ``tools/list`` 的 schema 成本，
+    # 能力一件不少（``call_tool`` 转发的还是同一批 ``BoundTool.fn``）。
+    mcp_store_api = mcp_tools.StoreApi(home)
     mcp_server = MCPServer(name=mcp_tools.SERVER_NAME, version=mcp_tools.SERVER_VERSION)
-    bound_tools = mcp_tools.register(mcp_server, handle, mcp_tools.StoreApi(home))
+    bound_tools = mcp_tools.register(mcp_server, handle, mcp_store_api)
     # json_response=True 对齐 Node 版 enableJsonResponse：无 SSE 依赖，普通 JSON 响应。
     mcp_app = mcp_server.streamable_http_app(json_response=True)
 
@@ -921,6 +947,11 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
                        "v3_analytics", "v3_ops", "v3_sources", "v3_nlp",
                        # 2026-09-20：三市场时段、通用降级链与数据源状态、成交质量、行业暴露
                        "v3_market_calendar", "v3_fallback", "v3_quality", "v3_industry",
+                       # 2026-09-20：规格 FR-GATEWAY-002（SDK JSON-RPC 会话通道）与
+                       # FR-GATEWAY-003/004（Headless Runner + 调度触发 + 外部熔断）。
+                       # 两者都只暴露**只读**端点 + 一个需人工口令的会话下发端点，
+                       # 且各自带写/交易工具白名单；注册顺序在静态兜底之前。
+                       "v3_sdk", "v3_headless",
                        # 2026-09-20：规格 §8.3 监控落地——Prometheus 文本出口 ``/metrics``。
                        # 必须排在下面的 ``/{path:path}`` 静态兜底之前注册，否则会被 SPA
                        # 兜底当成静态路径吃掉（返回 index.html，而不是指标文本）。
@@ -1029,9 +1060,21 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
     # 函数（同一个函数对象 → 同一份限流/缓存/信封，不存在第二份业务逻辑）。
     # 注册在 ``streamable_http_app()`` 之后也成立：SDK 的 tools/list 与 tools/call 都从
     # 同一个 ToolManager 现读，工具集在进程存活期内只增不减。
+    #
+    # 表面模式（规格 FR-TOOLS-003 / §10 决策 3）：
+    #   * ``direct``    —— 上面这些注册原样保留：77 + 39 = 116 件全量直暴露（老行为）；
+    #   * ``discovery`` —— 注册面只留 4 件高频直连 + ``list_tools`` / ``call_tool`` 两个发现入口；
+    #     被省下的是 **schema 成本**，不是能力（代理转发的还是注册表里这些对象，
+    #     见 platform/server/mcp_discovery.py 与 platform/tests/test_mcp_discovery.py）。
     v3_bridge, v3_tool_names = v3_mcp.register(app.state.mcp, app)
     app.state.v3_mcp_bridge = v3_bridge
     app.state.v3_mcp_tools = v3_tool_names
+    app.state.mcp_surface = surface
+    app.state.mcp_discovery = None
+    if surface == mcp_discovery.DISCOVERY:
+        # 在同一个 MCPServer 上**注册**两个代理入口 + 4 件直连保留；既有注册表（`TOOLS` /
+        # `V3Bridge.definitions`）一件不删——它们是代理的目录来源与转发目标。
+        app.state.mcp_discovery = mcp_discovery.register(app.state.mcp, bound_tools, v3_bridge)
 
     # /mcp：MCP streamable-http 端点（规格 §3.6，SDK 挂载）。
     # 有意差异 10：不用 ``app.mount("/mcp", mcp_app)``——Starlette 的 Mount 只匹配

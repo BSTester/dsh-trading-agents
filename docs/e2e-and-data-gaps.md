@@ -2097,3 +2097,342 @@ $ cd platform/web-pro && flock /tmp/probuild.lock npm run build
 * 行业读数目前只覆盖平台自选池口径（`cache/futu/info_owner_plate` + 平台组合权重），
   不是全账户持仓的行业暴露；这一缺口见 §三「缺失数据源清单」。
 
+
+---
+
+# 十九、Headless 通道落地：Runner + 调度器 + 外部熔断 + 调用日志（FR-GATEWAY-003/004、FR-MON-003，2026-09-20）
+
+改前的实测事实（三处「全无」都在这条链上）：
+
+| 现象（改前） | 位置 | 改后 |
+|---|---|---|
+| 平台服务内 **0** headless 代码，自述「本服务未挂载 Headless CLI 子通道」 | `v3_ops.py` 的 `HEADLESS_REASON` / `HEADLESS_COMMAND`（常量保留，另见 §19.7 未解决项） | 新增 `platform/server/v3_headless.py`（唯一实现）：起进程 / 熔断 / 调度 / 落库 / 只读端点 |
+| `headless_log` 表与迁移从 WP 起就在，**没有任何写入方** | `v3_db.py` 的 `TABLE_SPECS["headless_log"]` | 每次调用（含被熔断拦下、根本没起进程的那次）都写这张表 |
+| `v3_ops` 的 `headless.last` **硬编码 `[]`**（两处） | `v3_ops.py:1956` / `v3_ops.py:2113` | `_headless_last()` 读**真实表**（`v3_ops.py:420`） |
+| 08:30 / 12:00 / 16:00 触发全无；事件/流水线节点触发 0；并发上限 3、预算 200K 均未实现 | `daemon.py` 的 16:00 只是 `sync_bars` 数据同步 | 九条触发条件全部落地 + 三参数熔断真的生效（§19.3/§19.4） |
+
+## 19.1 交付物（文件与入口）
+
+| 文件 | 作用 | 关键入口（行号） |
+|---|---|---|
+| `platform/server/v3_headless.py`（新） | Headless Runner + 调度器 + 触发条件 + 外部熔断 + 调用日志读写 + 两个只读端点 | `DefaultSpawner`(327)、`HeadlessRunner.execute`(1043)、`submit`(1155)、`preflight`(996)、`verify_whitelist`(690)、`deny_tool_names`(602)、`HeadlessScheduler`(1680)、`scheduler_tick`(1925)、`query_log`(1954)、`register`(2022) |
+| `platform/server/scheduler.py` | 平台调度线程每轮 keep-alive 触发循环（**新增一段，失败只留痕、绝不拖垮交易作业链**） | `scheduler.py:137-142` |
+| `platform/server/v3_ops.py` | `headless.last` 改为读真实表（**本次在该文件里唯一改动的一处**） | `_headless_last`(420)、两处调用点(1956/2113) |
+| `platform/install/quant-headless/cordis.patch.yml` | 白名单第 4 段：`PreToolUse` 逐名拒绝写/交易工具（`quant-headless-tool-deny` 行） | 文件尾 `- insert:` 块 |
+| `platform/install/quant-headless/tool-whitelist.json`（新） | 白名单唯一事实源（关停行 / 拒绝工具名 / matcher / 推导来源） | `disabledRows` / `denyTools` / `matcher` |
+| `platform/install/quant-headless/hooks.json`（新） | 真正的 `PreToolUse` 命令钩子（**exit 2 = 阻断**，stderr 作为给模型的理由） | `hooks.PreToolUse[0]` |
+| `platform/tests/test_v3_headless.py`（新） | 52 例离线契约测试（真机例默认 skip） | 见 §19.6 |
+| `platform/tools/v3_headless_probe.py`（新） | 真机探针（独立 DSH_HOME；产出 stdout/stderr/exit/duration/DB 行原文） | `main()` |
+
+装配方式与其它 V3 子模块一致：`register(app, v3_run, home)` 由 `app.py` 自动接线（**本次没动 app.py**），
+模块只提供两个**只读**端点：
+
+* `GET /api/v3/headless/log?limit=&offset=&success=&task_type=&trigger=&outcome=&since=&until=`
+  —— FR-MON-003 的调用日志（真实 `headless_log` 表 + 分页/筛选，`stdout`/`stderr` 分列返回原文）；
+* `GET /api/v3/headless/schedule` —— 触发策略只读视图：每条触发条件的开关 / **真实数据来源** /
+  最近一次判定（含 `idle`/`no-data` 的原因）、**下一次触发时间**、最近触发记录、熔断三参数的
+  生效值、白名单校验结果。
+
+**没有新增任何写端点**：开关只在文件/环境变量（`<home>/v3-headless.json`、`QUANT_HEADLESS_*`）。
+理由是平台纪律「模型不得自拨开关」，headless 触发策略也不例外。
+
+## 19.2 触发策略表（每条都有真实数据来源；取不到就是 `no-data`）
+
+| 触发条件 | 类别 | 时点/判据 | 真实数据来源 | `task_type` |
+|---|---|---|---|---|
+| `slot:pre_market_scan` | 定时 | 交易日 08:30（市场本地时区） | `v3_market_calendar.load_holidays` + `is_trading_day`（**非交易日不触发**） | `pre_market_scan` |
+| `slot:midday_review` | 定时 | 交易日 12:00 | 同上 | `risk_review`（窗口=午间） |
+| `slot:post_close` | 定时 | 交易日 16:00 | 同上 | `risk_review`（窗口=收盘后） |
+| `breaking_news` | 事件 | 窗口（默认 60min）内资讯观测条数 ≥ 5 | 平台库 `store.sentiment_snapshots`（每日 `sentiment_snapshot` 作业写入的渠道原文） | `breaking_news` |
+| `position_move` | 事件 | 单标的异动 ≥ 5% | 工具面 `positions`（富途持仓）行内 `pl_ratio`，缺则 `price/cost_price`（每行都记 `source`） | `risk_review` |
+| `risk_breach` | 事件 | 行业暴露 ≥ 20% 或回撤 ≥ 15% | `<home>/v3-risk-probe.json`（行业探测缓存，**超过 6h 视为没有读数**）+ `v3_db.oms_sync` 最近一次的 `drawdown_pct/nav`；阈值取 `v3_ops.LIMITS` | `risk_review` |
+| `factor_reversal` | 事件 | 最近两日横截面均值符号翻转 | 平台库 `store.factor_snapshots`（每日 `factors-snapshot` 作业写入），因子默认 `mom_20` | `risk_review` |
+| `pre_rebalance_confirm` | 流水线 | 存在「已冻结且未提交」的计划 | 平台库 `store.plans`(status=frozen) + `store.orders`（该计划的未提交订单） | `pre_market_scan` |
+| `strategy_param_change` | 流水线 | 规则候选池非空 | 平台库 `store.rules`(status=candidate，人审通道) | `risk_review` |
+
+口径说明（避免被误读）：
+
+* **突发新闻是「采集量爆发」口径，不是情绪打分**：条数来自 `sentiment_snapshots` 的窗口内观测数，
+  `detail.caliber` 里写明「渠道原文条数，不做情绪打分」。平台不打分，所以这里也不打分。
+* **每一个触发条件都注册在 `TRIGGER_SOURCES`（`v3_headless.py:219`）里**，端点、日志与本文档
+  引的是同一张表；取不到数据一律 `status="no-data"` + 原因（例如「窗口内无资讯观测（源未采集/未运行）」），
+  **绝不拿 0 或估算值冒充读数**。
+* 每条触发条件有**冷却**（默认 60min，`cooldownMinutes`），定时触发按「当天一次」去重（`<home>/v3-headless.state.json`）。
+* 单条触发条件抛异常 → 该轮记 `status="error"` 并继续，**不拖垮其它触发条件与调度线程**。
+
+## 19.3 外部熔断三参数（默认值与生效证据）
+
+| 参数 | 默认值 | 配置 | 生效证据（离线单测，全部真子进程/替身） |
+|---|---|---|---|
+| 并发上限 | **3** | `maxConcurrency` / `QUANT_HEADLESS_CONCURRENCY` | `ConcurrencyTests.test_three_parallel_and_the_rest_queue`：5 个请求同时投递 → 实测只有 3 个进入子进程、`peak=3`、队列里还有 2 个（**排队不是丢弃**） |
+| 单次超时 | **300s** | `timeoutSeconds` / `QUANT_HEADLESS_TIMEOUT` | `BreakerKillTests.test_timeout_kills_and_records_kill`：子进程睡 30s、超时 0.6s → 进程被 `killpg(SIGKILL)`，`outcome=timeout`、`killed=1`、`success=0`、`exit_code<0` |
+| token 预算 | **200K** | `tokenBudget` / `QUANT_HEADLESS_TOKEN_BUDGET` | `BreakerKillTests.test_token_budget_kills_and_is_labelled_estimate`：预算 200、子进程连续输 120K 字符 → 边读边估超限即 kill，`outcome=token-budget`、`success=0`、`tokens_estimate>200` |
+
+被杀 = 失败，写进记录里：`killed=true` + `kill_reason` + `success=0` + `error.code=headless/timeout|headless/token-budget`。
+**绝不把被 kill 的调用写成成功**（`exit_code` 记的是真实 returncode，被 SIGKILL 时是负的信号号）。
+
+### token 估算口径（**是估算，不是计量**）
+
+```
+tokens_estimate = ceil(ASCII 字符数 / 4) + 非 ASCII 字符数      # prompt + stdout + stderr 三段
+```
+
+* 每一条记录的 `token_estimate_note` 与 `/api/v3/headless/log` 的 `estimation` 都带着这句话：
+  「dsh headless 不回报 usage，故这是**估算**，不是计量口径，不能用于对账/计费」。
+* 依据：dsh headless 的 stdout 只有最终文本、stderr 只有诊断/推理文本，**没有 usage 行**
+  （真机实测：见 §19.5 的落库行，`token_estimate_detail` = `{asciiChars: 281, wideChars: 0}`）。
+* 为什么是「4 字符/token」：英文经验值；非 ASCII 按 1 字符/token（中文一字≈一 token，**偏保守**，宁高不低）。
+
+## 19.4 绝不触发交易：三层，且都有可验证的落点
+
+1. **profile 层（照抄 `platform/install/quant-headless` 的「按行关停」做法 + 一层逐名拒绝）**
+   * 危险本地工具行全部 `disabled: true`：`tool-bash`/`tool-pwsh`/`tool-jobs`/`tool-subagent*`/
+     `tool-workflow`/`tool-ralph`/`tool-goal`/`tool-web`/`web-*`（14 行，`REQUIRED_DISABLED_ROWS`）；
+   * MCP 工具面里的写/交易工具**没有 per-tool 开关**，所以走运行时唯一的细粒度扩展点
+     `tools/pre-execute`：挂官方 `@deepseek-ai/dsh-hooks-claude-code`，`hooks.json` 的
+     `PreToolUse` matcher 用**字面精确名**（含 `mcp__quantwb__` 前缀）覆盖 **42 个**写/交易工具名，
+     钩子命令 `printf … >&2; exit 2`（`dsh-hook-protocol` 的 `BLOCKING_EXIT_CODE=2` → `deny`）。
+   * 名单**不是手抄的**：`deny_tool_names()` 从平台自己的常量推导——
+     `v3_ops.WRITE_TOOLS` ∪ `platform/tools/e2e_probe.WRITE_ENDPOINTS` ∪
+     `mcp_tools.MCP_EXCLUDED_ENDPOINTS`（减去三个只读的），归一化连字符/下划线两种写法。
+2. **平台层（起进程之前，fail-closed）**：`verify_whitelist()` 校验装到机器上的 profile——
+   ①每个危险行 `disabled`；②`quant-headless-tool-deny` 行存在且指向 `hooks.json`；
+   ③`hooks.json` 的 matcher 覆盖**全部** 42 个写工具名（逐个精确命中）。任一不成立 →
+   `outcome=whitelist-unverified`，**不起进程**（`platform/tools/v3_headless_probe.py` 打印校验结果）。
+3. **提示词层**：每次调用的提示词尾部都带只读边界（`READONLY_BOUNDARY`：不得下单/改单/撤单/
+   切模式/执行计划/批准规则/拨流水线开关；写工具已从工具面移除；发现绕过路径要停下报告）。
+
+**真机反证（不是推理）**：真机让模型去调 `mcp__quantwb__trade_place`，模型按提示词层拒绝执行；
+同时它按仓库纪律调了 `research_tasks_claim`（同样在拒绝名单里），**钩子真的拦下了**，模型拿到的原文是：
+
+```text
+Error: headless 白名单：写/交易工具已从工具面移除（额度：只读研究）。该动作只能由人在工作台 Web 确认后执行。
+```
+
+这正是 `hooks.json` 里那条钩子的 stderr，说明 `PreToolUse` → `exit 2` → `deny` 这条链在真机上是通的。
+
+> 已知代价（如实登记）：本名单取自平台自己的「写/副作用端点」清单，所以它**也**会拦下
+> `research_tasks_claim`/`research_tasks_report`（值班队列的领取/回报，它们是**写队列状态**、不是交易）。
+> 决策/分析 profile 本来就不做值班队列消费——L3 值班走的是官方 `headless` profile
+> （`scripts/research_duty.sh` 的 `DSH_DUTY_PROFILE`，默认 `headless`），不受影响。
+> 若要让本 profile 也能消费队列，从 `tool-whitelist.json`/`hooks.json` 的名单里去掉这两个名字即可
+> （但那样就不是「排除全部写端点」了）。
+
+## 19.5 真机输出（独立 DSH_HOME `~/.dsh/headless-probe`，2026-09-20）
+
+前置（一次性）：独立 home = 共享包软链 + 仓库里的 6 个 profile 文件 + 线上 `.credentials.yaml`/`settings.yaml` 副本。
+
+```console
+$ cd platform
+$ ~/.dsh/trading-venv/bin/python tools/v3_headless_probe.py --dsh-home ~/.dsh/headless-probe
+[probe] platform home = /tmp/v3-headless-probe-d3kmmug3      # 台账/库都在临时目录，不碰线上 ~/.dsh/v3.db
+[probe] DSH_HOME      = /home/penn/.dsh/headless-probe
+[probe] dsh           = /home/penn/.npm/_npx/1e7f6d9597241db0/node_modules/.bin/dsh (PATH)
+[probe] profile dir   = /home/penn/.dsh/headless-probe/profiles/quant-headless
+[probe] whitelist     = True
+[probe] outcome = 'completed'
+[probe] success = 1
+[probe] exit_code = 0
+[probe] kill_reason = None
+[probe] killed = 0
+[probe] signal = None
+[probe] duration_ms = 33121.408
+[probe] tokens_estimate = 83
+[probe] stdout = 'OK\n'
+[probe] stderr = "dsh: reasoning:\nThe user explicitly says: reply only OK, don't call any tools. …"
+[probe] streams_separated = 1
+```
+
+落库行原文（`headless_log`，`v3_db.list_events` 读回，节选关键字段）：
+
+```json
+{
+  "started_at": "2026-09-20T14:08:50.509571+00:00",
+  "finished_at": "2026-09-20T14:09:23.674196+00:00",
+  "task_type": "manual", "trigger": "manual", "profile": "quant-headless",
+  "prompt": "只回复 OK，不要调用任何工具",
+  "stdout": "OK\n", "stdout_chars": 3,
+  "stderr": "dsh: reasoning:\nThe user explicitly says: reply only OK, don't call any tools. …", "stderr_chars": 278,
+  "streams_separated": 1,
+  "exit_code": 0, "outcome": "completed", "success": 1, "killed": 0, "kill_reason": null,
+  "duration_ms": 33121.408, "tokens_estimate": 83,
+  "token_estimate_detail": {"asciiChars": 281, "wideChars": 0, "charsPerTokenAscii": 4},
+  "timeout_s": 300.0, "token_budget": 200000, "max_concurrency": 3,
+  "dsh_home": "/home/penn/.dsh/headless-probe", "tool_deny_count": 42,
+  "contract_note": "exit 0 只证明 Agent 轮次在其运行时契约下完成（最终原因为 completed），不证明所请求的文件、部署、测试或外部效果存在，需要独立验证。"
+}
+```
+
+**这一次真机数据同时证明了「stdout/stderr 分离」这件事不是纸面条款**：stdout 只有 `OK\n`，
+而 dsh 的推理过程在 stderr —— 旧口径 `scripts/research_duty.sh:82` 的 `2>&1 | tee` 会把推理
+混进 stdout，让「答案」不再是答案。本 Runner 走两条独立管道（`DefaultSpawner`），
+落库也分列两列。
+
+真机反证（写工具调用被拦）见 §19.4；两次真机调用的 `headless_log` 都在临时库里，未写入线上 `~/.dsh/v3.db`。
+
+## 19.6 测试（真实输出）
+
+```console
+$ cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_headless
+Ran 52 tests in 5.4s
+OK (skipped=1)          # skip = 真机用例（要 QUANT_HEADLESS_PROBE=1 + 独立 DSH_HOME）
+```
+
+覆盖逐条：退出码映射（0/1/130/None/负信号）· 真子进程的 stdout/stderr 分离 · 超时 kill 且不写成成功 ·
+token 预算 kill + 估算口径标注 · 并发 3 与排队（peak=3、queue=2）· 提示词三模板逐字 · 缺上下文报错 ·
+持仓/阈值/市场摘要打包 + 无数据源如实写入 · 交易日触发一次/非交易日与节假日不触发 ·
+九条触发条件各自的 `no-data`→`fire` · 开关 · 下一次触发时间 · 日志字段齐全分页筛选 ·
+`v3_ops.headless.last` 读真实表 · 白名单材料一致性 + **MCP 工具面里没有漏网的写工具** + 校验不过不起进程。
+
+## 19.7 未解决项（如实登记）
+
+1. **线上 `~/.dsh/profiles/quant-headless` 尚未安装**：本仓库只产出**素材**
+   （`platform/install/quant-headless/`），装进线上是运维动作（README「方式 B」）。因此线上服务
+   现在若真触发 headless，会得到 `outcome=profile-missing`（**明确拒绝，不静默回退到没有白名单的
+   `headless` profile**）。真机验证是在独立 DSH_HOME `~/.dsh/headless-probe` 里做的。
+2. **运行中的 8397 还是改动前的进程**：`/api/v3/headless/*` 两个只读端点要等主 agent 统一重启才可见；
+   在此之前真实服务仍返回旧形状（`headless.last=[]`、无这两个路由）。**本次没重启服务。**
+3. ~~**`v3_ops` 只改了 `headless.last` 一处**：同一响应里 `headless.today`（恒为零计数）、
+   `headless.status="unavailable"`、`HEADLESS_REASON`（「本服务未挂载 Headless CLI 子通道」）
+   仍是旧口径~~ → **2026-09-20 第三轮已修完**（见 §20.2）：`headless.today` 读真实表当日记录、
+   `breaker` 读 `v3_headless.load_config/params` 的熔断参数、`status` 报**接线状态**
+   （`registered-idle` / `implemented-not-registered`）、`reason` 写「已实现 + 是否接线」，
+   四处失效断言（常量 + `channels.headless` + `headless` 块 + `brain.sources.headless`）全部换掉，
+   `HEADLESS_REASON` 常量里不再出现「未挂载/不可用/未实现」。`SDK_REASON` 同样改为指向
+   `/api/v3/sdk/status`（原「本服务未挂载 SDK JSON-RPC 通道」也是失效断言）。
+4. **白名单只覆盖「工具名」这一层**：它拦不住模型经 MCP 工具面之外的通道（本 profile 已关掉
+   bash/web/委派，但这不是安全边界）。真正的交易边界仍在服务侧（人工确认 + `confirm-decide`
+   不进工具面 + live 口令）。
+5. **事件触发的阈值是工程默认值而非业务标定**（资讯条数 5 / 持仓异动 5% / 探测缓存 6h /
+   因子快照 48h）：都在 `<home>/v3-headless.json` 的 `thresholds` 里，端点可查。
+   哪个值真正适合业务，需要业务方标定；本次只保证「口径可解释、取不到就 no-data」。
+6. **`sentiment_snapshots` 的「突发」判据是采集量**：平台对渠道原文**不打分**（PIT 一致性优先），
+   所以本触发条件也不打分。若要「负面新闻触发」，需要先有平台侧的情绪打分口径（另一件事）。
+   *2026-09-20 第三轮补充*：因子侧已有打分口径——`/api/v3/factors/matrix` 的 `sentiment` 因子用
+   `server.v3_nlp.score_documents` **离线复算**已落库快照（时间基准 = `as_of` 当日 00:00 UTC，
+   只取 `date ≤ as_of` 的观测），见 §20.3。触发条件仍不打分（它要的是「有没有新资讯」）。
+7. **`store.sentiment_snapshots` / `factor_snapshots` 的时效**取决于每日作业是否真的跑过；
+   作业没跑时触发条件会一直 `no-data`（这是设计如此：**没有读数就不唤醒 LLM**）。
+
+# 二十、V3.0 规格补全第三轮：FR-EXEC-003 四子项 + FR-STRAT-001 四类因子 + Headless 表述（2026-09-20）
+
+本轮把上一轮「有实现、没接线」的缺口补齐：FR-EXEC-003 的四个子项（杠杆率 / 流动性风险 /
+绩效归因 / 资金检查）真的进了 `/api/v3/risk/analytics` 与页面，FR-STRAT-001 的六类因子
+（价值/动量 + **质量/成长/情绪/另类**）真的进了因子矩阵、注册表、覆盖率与五阶段流水线打分，
+并把 `v3_ops` 里 4 处**与事实相反**的 headless 表述换成真实读数。
+
+## 20.1 FR-EXEC-003 四个子项（实现位置 + 真实读数）
+
+| 子项 | 实现位置 | 数据源（真实字段） | 本机实测读数（2026-09-20，market=HK/sim） |
+|---|---|---|---|
+| 杠杆率 | `v3_analytics.portfolio_leverage` | `sim_trade_cash_info` 的 `total_asset`/`max_power_long`/`balance` + 持仓行 `mv`（持仓接口缺失时退回资金响应的 `long_mv`） | 总资产 669267.749 / 持仓市值 376020 / 可用购买力 293247.749 → **持仓市值/总资产 = 56.18%**、购买力/总资产 = 43.82% |
+| 流动性风险 | `v3_analytics.liquidity_risk` | 既有 K 线链路（`series` period=1d）逐日 `close × volume` 求 **近 20 个交易日均额（ADV）** | HK.00700 ADV = 8,019,042,111.09（2026-08-24 → 2026-09-18，20 根）：订单 801.9 万 → 0.1% auto；4.009 亿 → 5.0% manual；12.03 亿 → 15.0% blocked |
+| 绩效归因 | `v3_analytics.portfolio_attribution` | 券商持仓 `pl_val`/`mv`（未实现盈亏口径，非时间加权）+ 行业映射（`v3_industry.IndustryResolver` 注入；缺映射的标的单列不并入行业） | HK 组合未实现盈亏 −55435 / 总资产 669267.75 → 贡献 −8.28%；逐标的：HK.03986 +11.40%、HK.09988 −2.51%、HK.09961 −4.21%… |
+| 资金检查 | `v3_analytics.funding_check_data` + `v3_ops.check_order(funds=…)` | `account_funds` 的 `max_power_long`（sim）/`power`（live），按市场链分组求和 | 购买力 293247.749：订单 100000 → `noted`；订单 400000 → **`blocked`**（缺口 106752.25，原因是原文）；上游无购买力字段 → `unknown`（**不改既有判定**，只留痕） |
+
+三条边界（逐条可查）：
+
+1. **只读**：只调 `positions`/`equity`/`plan`/`account_funds` 与本地只读库；本段没有任何
+   下单/改单/撤单/切模式入口；
+2. **不改既有闸门语义**：行业红线 / 单笔上限 / 回撤红线一字不动；资金检查是**可选新增维度**
+   （`check_order(funds=None)` 与历史逐字段一致，`/api/v3/oms/sync` 仅在 `?funds=1` 时接）；
+3. **缺数据是 `null` + 原因**：上游无融资负债字段 → `margin_debt_pct` 恒 `null`（`provider_note`
+   写清两个通道的实测字段清单）；NAV 取不到 → 名义单金额 `null`、流动性与资金检查各自给原因；
+   ADV 样本不满 20 根 → **不拿半截窗口冒充 ADV**。
+
+新增只读端点：`GET /api/v3/risk/funding-check?order_value=|qty=&price=&market=`（订单金额 vs
+真实购买力，返回 `action`/`readings`/`funding_basis_field`/`source`/`as_of`）。
+
+## 20.2 Headless 的 4 处失效表述（改前 → 改后）
+
+| # | 位置 | 改前（已不成立） | 改后（真实读数） |
+|---|---|---|---|
+| 1 | `v3_ops.HEADLESS_REASON` | 「本服务未挂载 Headless CLI 子通道（无 dsh --profile headless 子进程调度）」 | 「Headless CLI 子进程通道**已实现**（server/v3_headless.py：真实 spawn + 白名单 + 熔断 + 日志落 `v3_db.headless_log`）；该模块未注册进本进程（装配未接线）→ 调度状态不可读」 |
+| 2 | `/api/v3/gateway` 的 `channels.headless` | `status="unavailable"` + 上面那句 reason | `status` = 真实接线状态（`registered-idle` / `implemented-not-registered`）+ `registered` + `schedulerAlive` + 准确 reason |
+| 3 | `/api/v3/gateway` / `/api/v3/brain` 的 `headless` 块 | `today` 恒零计数、`breaker=null`、`status="unavailable"` | `today` 读 `headless_log` 当日（UTC）记录（本机实测 total=3 / failed=3）；`breaker` 读 `v3_headless.load_config` 的 `maxConcurrency`/`timeoutSeconds`/`tokenBudget`/`enabled`/`profile`；`status`/`registered`/`schedulerAlive`/`nextFireTimes` 全部真值；`last` 仍读最近 10 条真实记录 |
+| 4 | `/api/v3/brain` 的 `sources.headless` | `HEADLESS_REASON`（失效断言原文） | 与 `/api/v3/gateway` **同一份** `_headless_status()` 的 `reason`（不做第二事实源） |
+
+顺带修掉同一类失效断言：`SDK_REASON` 由「本服务未挂载 SDK JSON-RPC 通道」改为
+「SDK JSON-RPC 通道由 `server/v3_sdk.py` 提供（`/api/v3/sdk/status` 是它的读数口）；本模块
+**刻意不直连** SDK 运行时（`get_runtime()` 会创建运行时对象）」。前端 `risk.jsx` / `overview.jsx`
+不再出现「本服务未挂载 SDK / Headless 通道」，Headless 卡片的状态 chip 与 foot 全部取自服务端
+真实字段。
+
+`GET /api/v3/headless/log|schedule`（上一轮的只读端点）仍是更细的读数口。
+
+**仍未修（本轮不在可改范围）**：`platform/web-pro/src/pages/gateway.jsx` 里还有两处同类失效断言——
+第 74 行 `REASON.headless` 的兜底串「本服务未挂载 Headless CLI 子通道（无 dsh --profile headless
+子进程调度）」，以及第 481 行卡片里的「（本服务不拉起 headless 子进程，计数恒为 0）」。
+后端现在会返回准确 reason（该行只在 reason 缺失时兜底），但第 481 行是**无条件渲染**的写死文案，
+与 `headless.today` 的真实读数并列出现，读起来自相矛盾。该文件本轮被列为禁改（另一路改动正在写它），
+留给主 agent 一并修。
+
+## 20.3 FR-STRAT-001 六类因子：真实数据源 + PIT 口径 + 覆盖率
+
+因子注册表（`v3_analytics.FACTOR_REGISTRY`，`GET /api/v3/factors/registry`）是**唯一事实来源**，
+矩阵的覆盖率与页面的「类别/覆盖」列都从它生成：
+
+| 类别 | 因子 | 数据源 | PIT 口径 | 本机实测覆盖（SH 宇宙 5 只） |
+|---|---|---|---|---|
+| 价值 | `pe_ttm`/`pb`/`ps`/`peg`/`*_pct` | `trading_core.factors`（富途估值快照 + 历史分位） | 快照按取得时点 | 5/5（`peg` 0/5：上游未返回） |
+| 动量 | `mom_20`/`mom_60`/`vol_20`/`trend`/`rsi_14`/`mdd_60` | workbench `factors`（日 K） | 只用 ≤t 的日 K | 5/5 |
+| **质量** | `gross_margin`/`net_margin`（+`roe`/`roa`） | `trading-data/fundamentals`（`futu/statements` 毛利/营收/净利；公告日由 `akshare/yjbb` 合并）；ROE/ROA 走 `quality.py → trading_datasource.fundamentals`（Yahoo/AKShare，富途无资产负债表接口） | **只认 `announced_at` 非空且 ≤ `as_of` 的行**（与 `store.read_fundamentals` 同一 WHERE 条件，只读打开、不跑 migrate） | `gross_margin` 5/5、`net_margin` 5/5；`roe`/`roa` 0/5（见 §20.5 未解决 2） |
+| **成长** | `revenue_yoy`/`net_profit_yoy` | 同上（同报告期同比：2026-06-30 ↔ 2025-06-30） | 两个报告期都须有 `announced_at ≤ t` 的行 | 0/5：库里没有上一年同期 PIT 行 → **null + 原因**（不跨期/跨年推算，避免前视） |
+| **情绪** | `sentiment` | `store.sentiment_snapshots` 落库原文 + `server.v3_nlp.score_documents` 离线复算（在线口径见 `GET /api/v3/sentiment`） | 三道闸门：①只取 `date ≤ as_of` 的快照；②文档**自身发布时间**须落在 `[as_of-7d, as_of 当日末]`（快照里常混历史长尾，实测 `fin_news` 的 `items[].time` 是**字符串形式的 epoch 毫秒**，已显式归一）；③打分基准 = `as_of` 当日末 UTC | 0/5：本机 11 条快照全在 2026-09-18 采集，其 `fin_news` 最新原文是 2026-09-10（采集时已 8 天旧）→ 7 天窗内**没有文档**，各项一律 `null` + 原因（把窗放宽到 10 天会看到 1 篇窗口内文档，但未命中词典 → 仍 `null`；打分链路本身由单测用真实快照文本钉住） |
+| **质量/成长的覆盖只限 A 股** | （同上） | — | — | HK/US 的 `fundamentals` 行数为 0（本机实测 `HK.00700`/`US.NVDA` 各 0 行）→ 这两个市场的质量/成长因子一律 `null` + 「无 PIT 财报」原因；`sentiment_snapshots` 同样只有 SH 标的 |
+| **另类** | `capital_flow`/`short_interest`（+`liq_ratio`） | `futu/capital_flow_history`（近 20 日主力净流入 / Σ\|净额\|）、`futu/short_interest`（空头占比） | 上游按日聚合；只用请求时刻已发布的交易日 | **缺省不并入**（实时取数受全局限流约束）；`classes=alternative` 或 `all` 才取。A 股无卖空数据 → null + 上游原因 |
+
+打通三处：
+
+* `GET /api/v3/factors/matrix`（默认并入质量/成长/情绪；`?classes=` 选类、`?as_of=` 是 PIT 上界）：
+  新因子以**横截面 z**（±3 截断）并入 `matrix.matrix`，顶层 `factors` 给逐因子覆盖率
+  （`covered`/`total`/`coveragePct`/`missingTickers`/`source`/`pit`），`factorsMissing` 给缺席原因。
+  **一个标的都没取到的因子不进矩阵列**（缺席，不是 0，也不是均值）。
+* `GET /api/v3/factors/registry`：六类注册表 + 覆盖率（与矩阵同一份计算）。
+* `POST /api/v3/strategy/run`：PAAT 增加 `factorCoverage`（四类各自覆盖数 + 来源 + 缺席原因），
+  PCPT 的 `rankBy` 改为 `extendedZ`（价量动量 + 质量 + 成长 + 情绪**同权**，取不到的维度不参与），
+  PET 的 `basis` 带上扩维因子读数；`compositeZ` 保持历史纯价量口径（既有排序不因本轮漂移）。
+
+## 20.4 `v3_sdk.metrics_view()`（模块级只读视图）
+
+`server/v3_sdk.metrics_view(home=None)`：只读进程内 `_REGISTRY` 里**已存在**的 runtime，
+返回 `{activeSessions, runtimes, runningProcesses, sessions, asOf, note}`。
+
+* **刻意不调 `get_runtime()`**：那会创建 `SdkRuntime` 对象并 arm atexit——抓取路径不造对象；
+* **不起进程 / 无副作用**：不 `start()`、不握手、不写盘、不发网络请求（单测断言 `fake.argv is None`）；
+* **没有运行时就是 0**（不是 `None`），`runtimes=0` 一并给出，便于区分「0 个会话」与「0 个运行时」；
+* `observability.sdk_active_sessions` 现在优先采信它（来源标签 `v3_sdk.metrics_view()`）。
+
+## 20.5 未解决项（如实登记）
+
+1. **`roe`/`roa` 仍不在矩阵里**：富途无资产负债表接口，唯一通道是
+   `trading_datasource.fundamentals.load_returns`（Yahoo/AKShare），本机实测单标的约 **16 秒**
+   （yfinance 抓两张报表）——放进 `/api/v3/factors/matrix` 的取数路径会拖垮首屏且放大限流风险。
+   注册表里如实列为 `covered=0` + 数据源与原因，**没有**用价量因子冒充。要进矩阵需要一条
+   离线落库通道（把 ROE/ROA 写进 `fundamentals` 表再由矩阵读取）。
+2. **`revenue_yoy`/`net_profit_yoy` 当前覆盖 0**：本地库里只有 `2026-06-30` 的 PIT 行
+   （`announced_at=2026-08-28`），没有 `2025-06-30` 的行；`sync_fundamentals` 的
+   `announced_at` 只对**当期**合并（`merge_announcements` 逐期跑），所以基期行没有公告日、
+   PIT 视图看不到它们。补齐办法：对历史报告期也跑一次 `merge_announcements`
+   （`core/cli.py` 的 `merge-announcements --period 20250630`），行有公告日之后同比自动出现。
+   **本实现不做跨期/跨年推算**（那会引入前视偏差）。
+3. **情绪因子当前线上必然 no-data**：`sentiment_snapshot` 作业把渠道原文落库，但**采集到的
+   资讯比采集日旧**（实测 2026-09-18 采集的快照里最新原文是 2026-09-10），7 天窗口因此没有文档。
+   这不是本实现的问题、也不是「0 分」：因子如实给 `null` + 原因（含窗口外的文档条数）。
+   要让它有读数，需要一条**每日新鲜资讯**的采集口径（作业频次/源新鲜度问题，属数据侧）。
+   另：`score_documents` 的时间半衰以「当日末」为基准，所以历史长尾文档的权重不会被误当成今天。
+4. **另类因子默认不取**：`capital_flow_history`/`short_interest` 是实时富途调用，全局限流器
+   下逐标的各一次，8 标的矩阵会明显变慢。因此 `classes` 缺省只含本地三类；要另类因子必须
+   显式 `?classes=all`（页面/探针按需调用）。A 股 `short_interest` 上游本身无数据（仅 HK/US
+   可卖空证券），如实进 `factorsMissing`。
+5. **归因的行业分组需要工具面注入**：`portfolio_attribution(industry_map=...)` 的行业映射由
+   调用方（`v3_industry.IndustryResolver`，走 `info_owner_plate`）提供；离线探针里没有工具面时
+   逐个标的进 `industryMissing`（逐标的与合计贡献仍然真实）。线上服务里该链路是通的。
+6. **`/api/v3/factors/registry` 与 `/api/v3/risk/funding-check` 未在 `v3_mcp.TOOL_DOCS` 登记**：
+   `platform/tests/test_mcp_parity.py::test_no_description_gaps` 会对新路由记欠账（该文件本轮
+   不在可改范围）。需要主 agent 在 `platform/server/v3_mcp.py` 补两条 `TOOL_DOCS` 与
+   `order_value`/`qty`/`price`/`side`/`classes`/`as_of`/`details` 的 `PARAM_DOCS`
+   （同时修掉上一轮遗留的 `headless/log|schedule`、`sdk/*` 五条欠账）。
+8. **`gateway.jsx` 的两处 Headless 失效文案未修**：见 §20.2 末尾（该文件本轮禁改）。
+9. **运行中的 8397 仍是改动前的进程**：以上读数都是**进程外**用同一份代码路径（`compute.run_script`
+   + 真实工作台脚本）跑出来的；`/api/v3/*` 的新字段要等主 agent 统一重启才可见。**本次没重启服务。**

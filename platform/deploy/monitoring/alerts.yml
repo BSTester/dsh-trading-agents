@@ -18,6 +18,13 @@
 # quantwb_risk_industry_* 来自**缓存探测**，缓存过期时保留旧值（行业取值类指标更严：
 # 超过 QUANT_RISK_PROBE_MAX_AGE 默认 6h 时 /metrics 直接不导出）。因此相关规则一律附带
 # ``time() - <probe>_timestamp_seconds < N`` 守卫，避免拿昨天的快照当今天的结论。
+#
+# 这份文件**只有一份**，两个求值方读它：
+#   1. Prometheus（`prometheus.yml` 的 rule_files；本机未部署，装上即可用）；
+#   2. 平台内求值器 ``platform/server/v3_alerts.py``（`GET /api/v3/ops/alerts`）——
+#      「不装 Grafana/Prometheus」时的轻量替代：直接解析本文件，在进程内对 /metrics 求值。
+#      它只实现本文件实际用到的 PromQL 子集；超出子集的表达式会显式报 ``unsupported``
+#      （绝不静默当成 ok）。两个求值方的口径差异见 monitoring/README.md。
 
 groups:
   # ═══════════════════════════════════════════════════════════════════════
@@ -315,9 +322,14 @@ groups:
         # 阈值 20% = 平台自己的行业集中度红线常数（v3_ops.LIMITS["industryPct"] = 20.0），
         # 不是外部拍的；check_order 在该值上直接判 blocked。
         # 守卫 6h = QUANT_RISK_PROBE_MAX_AGE 默认值（缓存更旧时该指标压根不导出）。
+        # 【2026-09-20 第二轮修正】原来的写法 ``... and (time() - ts) < 21600`` 在 PromQL 里
+        # **永远不会命中**：``and`` 默认要求两侧标签集完全相同，而左侧带 ``scope="max"``、
+        # 右侧的守卫是无标签指标（标签集 ``{}``）——交集为空。实测 ``promtool check rules``
+        # 只查语法不查这个，两轮都没发现。现在显式写 ``and on()``（空标签列表 = 任意序列都
+        # 视为匹配），语义与「只要缓存新鲜就参与判定」一致。
         expr: >-
           quantwb_risk_industry_pct{scope="max"} > 20
-          and (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
+          and on() (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
         for: 5m
         labels:
           severity: critical
@@ -337,9 +349,10 @@ groups:
       - alert: RiskIndustryConcentrationApproaching
         # 阈值 15% = 20% 红线的 75%，留出调整仓位的处置时间（等权 8 只自选池里
         # 两个同行业标的就会到 25%，集中度是**跳变**的，不是缓慢漂移）。
+        # 同 RiskIndustryConcentrationBreached：``and on()`` 是必须的（否则标签集不匹配）。
         expr: >-
           quantwb_risk_industry_pct{scope="max"} > 15
-          and (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
+          and on() (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
         for: 15m
         labels:
           severity: warning
@@ -356,9 +369,11 @@ groups:
         # 原因在 error 标签）。「该市场本来就没有标的」（industry/no-universe）**不算失败**，
         # 如实记进缓存的 per_market，不会触发本告警。
         # 守卫 6h：缓存过期后该 info 指标仍在（时间戳也还在），没有守卫会永远响。
+        # 同 RiskIndustryConcentrationBreached：``quantwb_risk_industry_probe_failed`` 带
+        # ``error`` 标签，与无标签的时间戳指标标签集不同，必须写 ``and on()``。
         expr: >-
           quantwb_risk_industry_probe_failed == 1
-          and (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
+          and on() (time() - quantwb_risk_industry_probe_timestamp_seconds) < 21600
         for: 15m
         labels:
           severity: warning
@@ -453,3 +468,224 @@ groups:
         annotations:
           summary: "富途 WS 通道频繁重连：{{ $labels.channel }}"
           description: "近 15 分钟重连 {{ $value | humanize }} 次，连接质量不稳定。"
+
+  # ═══════════════════════════════════════════════════════════════════════
+  # 7. 规格 §8.3 补齐 + §4.1 分位数口径（2026-09-20 第二轮）
+  #
+  # 为什么单列一组：规格 §8.3 点名 9 类指标，第一轮落地时
+  #   * 2 条对齐（MCP 失败率、数据源断连），
+  #   * 2 条口径不符（「数据延迟」当时只有 24h 缓存过期；「风控阻断」只有「任何阻断」），
+  #   * 5 条缺失（Headless 成功率/耗时、SDK 活跃会话、MCP 调用延迟、订单执行延迟）。
+  # 本组把**缺的 5 条**补上、把**口径不符的 2 条**按规格原文改准，并补 §4.1 的分位数口径
+  # （同一批延迟指标，阈值换成 §4.1 的目标值——「平均值」掩盖长尾，分位数才看得见）。
+  #
+  # 分位数来自 observability 的滑动窗口（scope 标明来源，口径见 README）：
+  #   * scope="mcp-tool-http"    工具面一请求一调用（/mcp、/api/wb/*）的真实单次耗时
+  #   * scope="headless-log"     headless_log 记录的 duration_ms
+  #   * scope="oms-ledger"       台账订单「登记 → submitted/filled」间隔
+  # 窗口默认 900s、最小样本 20：**样本不足时不导出该指标** → 规则如实 no-data
+  # （不是 ok，也不是拿一个不可信的 P95 下结论）。
+  # ═══════════════════════════════════════════════════════════════════════
+  - name: quantwb-spec83-completion
+    rules:
+      - alert: HarnessHeadlessSuccessRateLow
+        # 阈值 0.95 = 规格 §8.3 原文「Headless 调用成功率 < 95%」，不是自选数字。
+        # 窗口 = QUANT_HEADLESS_WINDOW_SECONDS（默认 24h，日频分析任务的自然周期）。
+        # for 15m：成功率是 24h 窗口的比值，单次失败最多把比值拉低 1/N，
+        # 15 分钟（3 个 5 分钟抓取周期）足以排除「一次抖动就报警」。
+        # 窗口内没有记录时该指标**不导出** → 本规则 no-data：没有调用 ≠ 成功率 0%。
+        expr: quantwb_headless_success_rate < 0.95
+        for: 15m
+        labels:
+          severity: warning
+          domain: harness
+        annotations:
+          summary: "Headless 调用成功率 {{ $value | humanizePercentage }} < 95%（窗口内）"
+          description: >-
+            headless_log 里窗口内的成功率低于规格 §8.3 的 95% 红线。
+            口径：成功率 = 窗口内 success 记录数 / 记录数，窗口由
+            QUANT_HEADLESS_WINDOW_SECONDS 控制（默认 86400s）。
+            排查：`curl -s localhost:8397/metrics | grep quantwb_headless_` 看
+            quantwb_headless_calls / _successes；逐条记录看 headless_log 表
+            （或 <DSH_HOME>/v3-headless-log.jsonl 冷备）的 exit_code 与 duration_ms。
+            注意：窗口内没有记录时该指标缺席，本规则会显示 no-data——那是「无法判定」，
+            不是「正常」。
+
+      - alert: HarnessHeadlessDurationHigh
+        # 阈值 60s = 规格 §8.3 原文「Headless 调用平均耗时 > 60s」。
+        # 注意这是**平均**口径（规格原文如此）；§4.1 的单次目标 30s 由下面的
+        # NfrHeadlessLatencyP95AboveTarget 用 P95 接——两个口径不互相替代。
+        # for 15m：平均耗时是慢变量，短于窗口的波动没有统计意义。
+        expr: quantwb_headless_call_duration_seconds > 60
+        for: 15m
+        labels:
+          severity: warning
+          domain: harness
+        annotations:
+          summary: "Headless 平均耗时 {{ $value | humanize }}s > 60s（窗口内）"
+          description: >-
+            窗口内 headless 调用平均耗时超过规格 §8.3 的 60s。
+            该指标只在窗口内**至少有一条带 duration_ms 的记录**时才导出；
+            没有读数时规则为 no-data。分位数口径见
+            quantwb_call_duration_p95_seconds{scope="headless-log"}。
+
+      - alert: HarnessSdkActiveSessionsHigh
+        # 阈值 10 = 规格 §8.3 原文「SDK 会话活跃数 > 10」。
+        # 活跃判定窗口 = QUANT_SDK_SESSION_WINDOW_SECONDS（默认 300s）：
+        # 会话在 5 分钟内出现过 turn 才算活跃（SDK 通道由 v3_sdk 提供，
+        # 没有 sdk_turns 记录且 v3_sdk 未提供 metrics_view() 时**不导出**该指标 → no-data）。
+        # for 5m：会话数是短周期变量，5 分钟持续超限已经需要人看一眼。
+        expr: quantwb_sdk_active_sessions > 10
+        for: 5m
+        labels:
+          severity: warning
+          domain: harness
+        annotations:
+          summary: "SDK 活跃会话 {{ $value }} > 10"
+          description: >-
+            活跃会话数超过规格 §8.3 的 10。
+            事实来源见该指标的 source 标签：v3_sdk.metrics_view()（进程内真实会话态）
+            或 sdk_turns（窗口内出现 turn 的不同 session_id）。
+            两条来源都没有时 /metrics 只导出
+            quantwb_sdk_active_sessions_source_missing（值 1 + reason 标签），
+            本规则随之 no-data——「没有来源」不是「0 个会话」。
+
+      - alert: ToolMcpCallLatencyP95High
+        # 阈值 5s = 规格 §8.3 原文「MCP 工具调用延迟 > 5s」。
+        # 用 P95 而不是均值：均值会把少数慢调用抹平（第一轮实测均值 2.384s 已超 §4.1 的 2s，
+        # 而当时出口里只有均值，看不出长尾）。P95 的口径见注释块与 README：
+        # /mcp、/api/wb/*、/api/v3/* 里「一请求恰好一次工具调用」的请求耗时，滑动窗口 900s。
+        # for 5m：P95 本身已是稳健统计量，5 分钟持续超限即认为不是单点抖动。
+        expr: quantwb_call_duration_p95_seconds{scope="mcp-tool-http"} > 5
+        for: 5m
+        labels:
+          severity: warning
+          domain: tool
+        annotations:
+          summary: "MCP 工具调用 P95 {{ $value | humanize }}s > 5s（近 15 分钟窗口）"
+          description: >-
+            工具面单次调用耗时的 P95 超过规格 §8.3 的 5s。
+            窗口样本数见 quantwb_call_duration_window_samples{scope="mcp-tool-http"}；
+            样本不足 20 个时该分位数**不导出**，本规则如实显示 no-data。
+            排查：先看 quantwb_tool_calls_total 的逐工具调用量，再对照
+            futu_rate_limited_total / futu_cooldown_remaining_ms（限流是最常见的慢因）。
+
+      - alert: TradeOrderExecutionLatencyHigh
+        # 阈值 1s = 规格 §8.3 原文「订单执行延迟 > 1s」。
+        # 用**窗口内最大**而不是均值：订单提交是低频事件，一笔超 1s 就该被看见。
+        # 口径差异（如实写明）：规格 §4.1 写的是「信号生成到订单提交」；台账里能拿到的
+        # 真实两端是 first_seen_at（登记冻结计划的时刻）与 history[].at（进入
+        # submitted/filled 的时刻），本规则算的是「登记 → 提交/成交」。
+        # 当前 sim 模式下没有 submitted/filled 订单 → 该指标缺席 → 本规则 no-data
+        # （不导出 0：没有已提交订单 ≠ 延迟为 0）。
+        expr: quantwb_order_execution_latency_max_seconds > 1
+        for: 5m
+        labels:
+          severity: warning
+          domain: trade
+        annotations:
+          summary: "订单执行延迟（窗口内最大）{{ $value | humanize }}s > 1s"
+          description: >-
+            台账里「首次登记 → 进入 submitted/filled」的最大间隔超过规格 §8.3 的 1s。
+            排查：/api/v3/oms/orders 看该订单的 history 原文（每步 at/stage），
+            并核对 /api/v3/execution 的确认链路。口径边界见本规则注释与 README。
+
+      - alert: DataSourceDataDelayHigh
+        # 【口径修正】规格 §8.3 要的是「数据延迟 > 5min」。第一轮只有
+        # DataSourceProbeStale（「探测缓存 > 24h 过期」）——那是**监控自身的可见性缺口**，
+        # 不是数据延迟。本规则读的是探测命中来源返回的 as_of：
+        # quantwb_datasource_data_age_seconds = now - as_of（数据有多旧）。
+        # 阈值 300s = 规格 §8.3 的 5min。
+        # 守卫 86400s：as_of 只有在**最近 24h 内真的探测过**时才有意义
+        # （探测缓存过期后该 as_of 也是旧的，拿它下结论等于自欺）。
+        expr: >-
+          quantwb_datasource_data_age_seconds > 300
+          and (time() - quantwb_datasource_probe_timestamp_seconds) < 86400
+        for: 5m
+        labels:
+          severity: warning
+          domain: data
+        annotations:
+          summary: "数据延迟 {{ $value | humanizeDuration }} > 5min：{{ $labels.chain }}"
+          description: >-
+            该降级链最近一次真实探测命中来源返回的数据时点（as_of）距今超过 5 分钟。
+            这是「平台现在能供出的数据有多旧」，与「探测缓存是否过期」是两件事
+            （后者由 DataSourceProbeStale 负责）。
+            缺 as_of 的链不导出该指标 → 本规则 no-data（无法判定，不是数据新鲜）。
+            处置：`curl -s 'localhost:8397/api/v3/sources/status?keys={{ $labels.chain }}'`
+            看真实 as_of 与逐级 attempts。
+
+      - alert: RiskBlockedSpike
+        # 【口径修正】规格 §8.3 要的是「风控阻断次数**突增**」。第一轮只有
+        # RiskBlockedOrderAppeared（「任何一次新增阻断」）——事件级，不构成突增判定。
+        # 本规则用平台自己的阻断计数器 quantwb_risk_blocked_total（进程内累计首次观测到
+        # 进入 blocked/blocked_industry 的订单数）做增速比较：
+        #   * 绝对下限 3 单/小时：规格**没有给数字**，这是运维约定——1 单可能是人工确认
+        #     流程的正常产物，3 单/小时才值得占用值班注意力；
+        #   * 相对条件 3 倍于前一小时：同样是运维约定，用来排除「原本就在持续阻断」的基线
+        #     （基线高时绝对条件会天天响）。
+        # 两条同时成立才算突增；任一窗口历史不足（求值器重启后 2h 内）→ no-data。
+        # 说明：``>=`` 与 ``<`` 都按规则字面语义求值（== 不会因为「接近」而当成命中）。
+        expr: >-
+          increase(quantwb_risk_blocked_total[1h]) >= 3
+          and increase(quantwb_risk_blocked_total[1h] offset 1h) * 3 < increase(quantwb_risk_blocked_total[1h])
+        for: 5m
+        labels:
+          severity: critical
+          domain: risk
+        annotations:
+          summary: "风控阻断突增：近 1 小时新增 {{ $value | humanize }} 单（≥3 单且 ≥3× 前一小时）"
+          description: >-
+            近 1 小时内首次被观测到进入阻断阶段的订单数 ≥ 3，且达到前一小时的 3 倍以上。
+            排查：/api/v3/oms/orders 的 stages.blocked / blocked_industry 与每单
+            risk.rule / risk.reasons 原文；回撤红线看 quantwb_risk_drawdown_pct，
+            行业红线看 quantwb_risk_industry_pct{scope="max"}。
+            **不要**改 LIMITS 常量消警。
+
+      # ── §4.1 性能需求的分位数口径（与 §8.3 同一批指标，换成 §4.1 的目标值）──
+      - alert: NfrMcpToolCallLatencyP95AboveTarget
+        # 阈值 2s = 规格 §4.1「MCP 工具调用延迟 < 2s（单次工具执行）」。
+        # 用 P95 而不是均值：均值会把长尾抹平（实测均值 2.384s 超规格，而 P95 才是
+        # 真正决定体验的口径）。10m 观察窗口：§4.1 是目标值不是红线，不追求秒级告警。
+        expr: quantwb_call_duration_p95_seconds{scope="mcp-tool-http"} > 2
+        for: 10m
+        labels:
+          severity: warning
+          domain: nfr
+        annotations:
+          summary: "§4.1 MCP 工具调用 P95 {{ $value | humanize }}s 超 2s 目标"
+          description: >-
+            这是**目标值**告警（§4.1），比 §8.3 的 5s 红线更早暴露退化趋势。
+            分位数口径：滑动窗口（默认 900s）内真实观测样本的最近秩，不做插值/外推；
+            样本不足 20 个时不导出该指标（no-data），绝不拿不可信的分位数下结论。
+
+      - alert: NfrOrderExecutionLatencyP95AboveTarget
+        # 阈值 0.5s = 规格 §4.1「订单执行延迟 < 500ms（信号生成到订单提交）」。
+        # 口径同 TradeOrderExecutionLatencyHigh（台账「登记 → submitted/filled」），
+        # 这里用 P95：目标值关注的是整体分布，不是单笔极端值。
+        expr: quantwb_call_duration_p95_seconds{scope="oms-ledger"} > 0.5
+        for: 10m
+        labels:
+          severity: warning
+          domain: nfr
+        annotations:
+          summary: "§4.1 订单执行 P95 {{ $value | humanize }}s 超 500ms 目标"
+          description: >-
+            近 15 分钟窗口内，台账「登记 → submitted/filled」间隔的 P95 超过 §4.1 的 500ms。
+            没有已提交订单时该分位数不导出 → no-data（不是 0）。
+            单笔极端值由 TradeOrderExecutionLatencyHigh（> 1s）负责。
+
+      - alert: NfrHeadlessLatencyP95AboveTarget
+        # 阈值 30s = 规格 §4.1「Headless 调用延迟 < 30s（单次分析任务，超时可配）」。
+        # 与 §8.3 的「平均 > 60s」并存：一个管单次体验（P95），一个管整体趋势（均值）。
+        expr: quantwb_call_duration_p95_seconds{scope="headless-log"} > 30
+        for: 10m
+        labels:
+          severity: warning
+          domain: nfr
+        annotations:
+          summary: "§4.1 Headless 调用 P95 {{ $value | humanize }}s 超 30s 目标"
+          description: >-
+            headless_log 记录的 duration_ms 在窗口内的 P95 超过 §4.1 的 30s。
+            没有带 duration_ms 的记录时不导出 → no-data。
+            §8.3 的平均口径告警是 HarnessHeadlessDurationHigh（> 60s）。

@@ -30,6 +30,7 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -201,8 +202,8 @@ class MetricsTests(V3OpsTestCase):
         self.assertEqual(body["mcp"]["tools"], {"schedule": 1})
         self.assertEqual(body["wb"]["byTool"], {"schedule": 1})
         self.assertEqual(body["http"], {"requests": 1, "errors": 0})
-        self.assertEqual(body["sdk"], {"status": "unavailable",
-                                       "reason": "本服务未挂载 SDK JSON-RPC 通道"})
+        self.assertEqual(body["sdk"]["status"], "unavailable")
+        self.assertIn("/api/v3/sdk/status", body["sdk"]["reason"])
         self.assertIsInstance(body["oms"], dict)
 
         again = self.get("/api/v3/metrics")
@@ -246,9 +247,14 @@ class GatewayTests(V3OpsTestCase):
         self.assertIn("mcp_tools.TOOLS", channels["mcp"]["tools_source"])
         self.assertIn("MCP", channels["mcp"]["protocol"])
         self.assertEqual(channels["sdk"]["status"], "unavailable")
-        self.assertEqual(channels["sdk"]["reason"], "本服务未挂载 SDK JSON-RPC 通道")
-        self.assertEqual(channels["headless"]["status"], "unavailable")
-        self.assertIn("Headless", channels["headless"]["reason"])
+        self.assertIn("/api/v3/sdk/status", channels["sdk"]["reason"])
+        self.assertIn("v3_sdk", channels["sdk"]["reason"])
+        # Headless 通道**已实现**（server/v3_headless.py）：status 说的是「本进程有没有
+        # 装配它」，reason 不得再出现「未挂载/不可用/未实现」这类失效断言。
+        self.assertEqual(channels["headless"]["status"], "implemented-not-registered")
+        self.assertIs(channels["headless"]["registered"], False)
+        self.assertIn("已实现", channels["headless"]["reason"])
+        self.assertNotIn("未挂载", channels["headless"]["reason"])
         self.assertIn("headless", channels["headless"]["command"])
 
         scheduler = body["scheduler"]
@@ -262,11 +268,28 @@ class GatewayTests(V3OpsTestCase):
         self.assertFalse(scheduler["kill"])
         self.assertFalse(scheduler["halt"])
 
-        # Headless 通道无数据源：零计数、breaker=null、last=[]，绝不编造
-        self.assertEqual(body["headless"]["today"],
-                         {"total": 0, "success": 0, "failed": 0, "avgMs": 0, "killed": 0})
-        self.assertIsNone(body["headless"]["breaker"])
+        # Headless 通道读数**全部来自真实表/真实配置**：today 是当日口径统计（临时 home 的
+        # 库里没有记录 → 0，但字段面与真值同形），breaker 取 v3_headless 的熔断参数。
+        today = body["headless"]["today"]
+        self.assertEqual(today["total"], 0)
+        self.assertEqual(today["success"], 0)
+        self.assertEqual(today["failed"], 0)
+        self.assertEqual(today["killed"], 0)
+        self.assertEqual(today["avgMs"], 0)
+        self.assertEqual(today["tokensEstimate"], 0)
+        self.assertTrue(str(today["date"]).startswith("20"))
+        self.assertIn("headless_log", body["headless"]["logNote"])
+        self.assertIn("UTC", today["basis"])
+        breaker = body["headless"]["breaker"]
+        self.assertIsNotNone(breaker, "熔断参数来自 v3_headless 真实配置，不是 null")
+        for key in ("maxConcurrency", "timeoutSeconds", "tokenBudget", "enabled", "profile"):
+            self.assertIn(key, breaker)
         self.assertEqual(body["headless"]["last"], [])
+        self.assertEqual(body["headless"]["status"], "implemented-not-registered")
+        self.assertIsNone(body["headless"]["schedulerAlive"])
+        self.assertIsNone(body["headless"]["nextFireTimes"])
+        # 「已实现」的断言：源码里必须真有 spawn 点（不是文案）
+        self.assertIn("headless", body["headless"]["source"])
         self.assertIn("generated_at", body)
 
     def test_mcp_tool_total_tracks_live_registry(self):
@@ -967,16 +990,17 @@ class ReportingTests(V3OpsTestCase):
         body = self.get("/api/v3/brain")
         self.assertTrue(body["ok"])
         self.assertIsNone(body["decision"])
-        self.assertEqual(body["headless"]["today"],
-                         {"total": 0, "success": 0, "failed": 0, "avgMs": 0, "killed": 0})
-        self.assertIsNone(body["headless"]["breaker"])
+        self.assertEqual(body["headless"]["today"]["total"], 0)
+        self.assertIn("date", body["headless"]["today"])
+        self.assertIsNotNone(body["headless"]["breaker"])
         self.assertEqual(body["headless"]["last"], [])
-        self.assertEqual(body["sdk"], {"status": "unavailable",
-                                       "reason": "本服务未挂载 SDK JSON-RPC 通道",
-                                       "serverInfo": None, "route": None, "lastTurn": None,
-                                       "turns": [], "events": []})
+        self.assertEqual(body["headless"]["status"], "implemented-not-registered")
+        self.assertIn("/api/v3/sdk/status", body["sdk"]["reason"])
+        self.assertEqual(body["sdk"]["turns"], [])
+        self.assertEqual(body["sdk"]["events"], [])
         self.assertIn("无数据源", body["sources"]["decision"])
         self.assertIn("v3-strategy-runs.jsonl", body["sources"]["decision"])
+        self.assertIn("已实现", body["sources"]["headless"])
         self.assertTrue(body["sources"]["workbench"]["ok"])
 
     def test_brain_reads_last_strategy_run_line(self):
@@ -1000,6 +1024,169 @@ class ReportingTests(V3OpsTestCase):
 # ---------------------------------------------------------------------------
 # SQLite 持久化层接线（v3_db）：只加断言，不改既有用例
 # ---------------------------------------------------------------------------
+class HeadlessRealReadTests(V3OpsTestCase):
+    """FR-MON-003 / FR-GATEWAY-004：``headless`` 块必须读**真实表与真实配置**。
+
+    这组用例钉的是「4 处失效表述已修」这件事本身：``today`` 不再恒 0、``breaker`` 不再恒
+    null、``status`` 不再恒 ``unavailable``、``reason`` 不再出现「未挂载 Headless CLI 子通道」。
+    """
+
+    def setUp(self):
+        super().setUp()
+        # 进程内注册表是全局的：别的用例注册过的 home 会残留，必须清干净（不 stop，没有进程）。
+        from server import v3_headless
+        self.headless = v3_headless
+        v3_headless.reset_registry()
+        self.addCleanup(v3_headless.reset_registry)
+
+    def _seed_log(self, rows):
+        """往真实表里写调用日志（``v3_headless`` 的写入路径同源：``v3_db.append_event``）。"""
+        for row in rows:
+            v3_db.append_event(self.home, "headless_log", row)
+
+    def test_today_counts_real_rows_from_the_table(self):
+        today = datetime.now(timezone.utc).date().isoformat()
+        self._seed_log([
+            {"started_at": f"{today}T01:00:00+00:00", "success": True, "exit_code": 0,
+             "duration_ms": 1200.0, "tokens_estimate": 900, "task_type": "risk_review",
+             "trigger": "risk_breach", "outcome": "completed", "killed": False},
+            {"started_at": f"{today}T02:00:00+00:00", "success": False, "exit_code": 1,
+             "duration_ms": 800.0, "tokens_estimate": 100, "task_type": "pre_market_scan",
+             "trigger": "slot:pre_market_scan", "outcome": "incomplete", "killed": False},
+            {"started_at": "2020-01-01T00:00:00+00:00", "success": True, "exit_code": 0,
+             "duration_ms": 10.0, "tokens_estimate": 1, "task_type": "old", "trigger": "old",
+             "outcome": "completed", "killed": False},
+        ])
+        body = self.get("/api/v3/gateway")
+        headless = body["headless"]
+        self.assertEqual(headless["today"]["total"], 2, "只数当日（UTC）")
+        self.assertEqual(headless["today"]["success"], 1)
+        self.assertEqual(headless["today"]["failed"], 1)
+        self.assertEqual(headless["today"]["tokensEstimate"], 1000)
+        self.assertEqual(headless["today"]["avgMs"], 1000.0)
+        self.assertEqual(len(headless["last"]), 3)
+        self.assertEqual(body["channels"]["headless"]["status"], "implemented-not-registered")
+        self.assertNotIn("未挂载", body["channels"]["headless"]["reason"])
+
+    def test_breaker_comes_from_v3_headless_config(self):
+        runner = self.headless.HeadlessRunner(self.home)
+        expected = runner.params()
+        body = self.get("/api/v3/gateway")["headless"]
+        self.assertEqual(body["breaker"]["maxConcurrency"], expected["maxConcurrency"])
+        self.assertEqual(body["breaker"]["timeoutSeconds"], expected["timeoutSeconds"])
+        self.assertEqual(body["breaker"]["tokenBudget"], expected["tokenBudget"])
+        self.assertEqual(body["breaker"]["profile"], expected["profile"])
+
+    def test_registered_module_reports_live_scheduler_state(self):
+        """真装配一次（register 起对象、**不起线程**）→ status/registered/schedulerAlive 变真值。"""
+        app = FastAPI()
+        runner, scheduler = self.headless.register(app, self.fake, str(self.home))
+        self.addCleanup(runner.stop)
+        try:
+            body = self.get("/api/v3/gateway")["headless"]
+            self.assertTrue(body["registered"])
+            self.assertEqual(body["status"], "registered-idle")
+            self.assertIs(body["schedulerAlive"], False)
+            self.assertTrue(body["nextFireTimes"], "真实调度器的下次触发时间应可读")
+            self.assertEqual(body["breaker"]["maxConcurrency"],
+                             runner.params()["maxConcurrency"])
+            self.assertIn("已注册", body["reason"])
+            # 本模块**不起进程**：注册只建对象，Runner 没有子进程句柄（真起进程只在 submit 里）
+            self.assertFalse(hasattr(runner, "pid"))
+        finally:
+            self.headless.reset_registry()
+
+    def test_gateway_and_brain_share_one_reading(self):
+        paths = {"headless", "channels"}
+        gateway = self.get("/api/v3/gateway")
+        brain = self.get("/api/v3/brain")
+        self.assertEqual(brain["headless"]["today"], gateway["headless"]["today"])
+        self.assertEqual(brain["headless"]["status"], gateway["headless"]["status"])
+        self.assertEqual(brain["headless"]["breaker"], gateway["headless"]["breaker"])
+        self.assertEqual(brain["sources"]["headless"], gateway["headless"]["reason"])
+        self.assertEqual(paths, {"headless", "channels"})  # 只是防止两个键被改名时静默跳过
+
+
+class FundsCheckTests(V3OpsTestCase):
+    """FR-EXEC-003 资金检查（事前风控）：**只读**、缺省不接、缺读数不改判定。"""
+
+    FUNDS = {"ok": True, "value": {
+        "mode": "sim", "source": "futu/sim_trade_cash_info", "as_of": DAY,
+        "groups": [{"acc_id": "SIM-1", "market": "SH",
+                    "cash": {"balance": "50000", "max_power_long": "60000",
+                             "total_asset": "80000", "mv": "30000"}},
+                   {"acc_id": "SIM-2", "market": "HK",
+                    "cash": {"balance": "1000", "max_power_long": "1000",
+                             "total_asset": "2000"}}]}}
+
+    def test_sync_defaults_to_no_funds_dimension(self):
+        """缺省 ``funds`` 不给 → 逐字段与历史一致（不调 account_funds、不加 funds_check）。"""
+        self.fake.values["plan"] = {"ok": True, "value": {"plans": [
+            plan([order("CID-1", qty=100, price=10.0)])]}}
+        result = self.sync()
+        self.assertTrue(result["ok"], result)
+        self.assertIsNone(result["funds_check"])
+        self.assertEqual([name for name, _ in self.fake.calls if name == "account_funds"], [])
+        body = self.get("/api/v3/oms/orders")
+        self.assertNotIn("funds_check", body["orders"][0])
+
+    def test_sync_with_funds_blocks_orders_over_buying_power(self):
+        self.fake.values["account_funds"] = self.FUNDS
+        self.fake.values["plan"] = {"ok": True, "value": {"plans": [
+            plan([order("SMALL", qty=100, price=10.0),        # 1000 ≤ 60000 → noted
+                  order("BIG", qty=100, price=1000.0)])]}}    # 100000 > 60000 → blocked
+        response = self.client.post("/api/v3/oms/sync", json={"funds": True})
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertTrue(body["ok"], body)
+        self.assertIsNotNone(body["funds_check"])
+        orders = {row["id"]: row for row in self.get("/api/v3/oms/orders")["orders"]}
+        self.assertEqual(orders["SMALL"]["stage"], "risk_passed")
+        self.assertEqual(orders["SMALL"]["funds_check"]["action"], "noted")
+        self.assertEqual(orders["BIG"]["stage"], "blocked")
+        self.assertEqual(orders["BIG"]["funds_check"]["action"], "blocked")
+        self.assertEqual(orders["BIG"]["funds_check"]["readings"]["buyingPower"], 61000.0)
+        self.assertTrue(any("资金检查" in reason for reason in orders["BIG"]["risk"]["reasons"]))
+
+    def test_sync_with_funds_is_fail_open_when_no_buying_power_field(self):
+        """上游没有购买力字段 → ``unknown``，**不改判定**，但必须留痕。"""
+        self.fake.values["account_funds"] = {"ok": True, "value": {
+            "mode": "live", "source": "futu/account_funds", "as_of": DAY,
+            "groups": [{"acc_id": "LIVE-1", "market": "SH",
+                        "cash": {"total_assets": "80000"}}]}}
+        self.fake.values["plan"] = {"ok": True, "value": {"plans": [
+            plan([order("CID-1", qty=100, price=10.0)])]}}
+        body = self.client.post("/api/v3/oms/sync?funds=1").json()
+        self.assertIsNotNone(body["funds_check"]["error"])
+        record = self.get("/api/v3/oms/orders")["orders"][0]
+        self.assertEqual(record["stage"], "risk_passed")
+        self.assertEqual(record["funds_check"]["action"], "unknown")
+        self.assertTrue(any("资金检查无读数" in reason
+                            for reason in record["risk"]["reasons"]))
+
+    def test_gateway_never_calls_account_funds(self):
+        """网关/大脑是只读展示位：**不许**在抓取路径上多打一次账户查询。"""
+        self.get("/api/v3/gateway")
+        self.get("/api/v3/brain")
+        self.assertEqual([name for name, _ in self.fake.calls if name == "account_funds"], [])
+
+    def test_unit_check_order_with_funds(self):
+        blocked, reasons = v3_ops.check_order(
+            150000.0, 1000000.0, funds={"action": "blocked", "readings": {"buyingPower": 60000.0},
+                                        "funding_basis_field": ["max_power_long"],
+                                        "source": "futu/sim_trade_cash_info", "as_of": DAY})
+        self.assertEqual(blocked, "blocked")
+        self.assertTrue(any("强制阻断" in reason for reason in reasons))
+        unknown, reasons = v3_ops.check_order(
+            1000.0, 1000000.0, funds={"action": "unknown", "reason": "没有购买力字段",
+                                      "readings": {}})
+        self.assertEqual(unknown, "auto", "读不到资金不改判定（fail-open + 留痕）")
+        self.assertTrue(any("资金检查无读数" in reason for reason in reasons))
+        # 缺省（funds=None）→ 与历史逐字段一致
+        legacy, legacy_reasons = v3_ops.check_order(1000.0, 1000000.0)
+        self.assertEqual((legacy, legacy_reasons), ("auto", []))
+
+
 class SqlitePersistenceTests(V3OpsTestCase):
     """OMS 台账/对账留痕/研究决策走库，JSONL/JSON 保留为冷备；库不可用时回退文件。"""
 

@@ -14,8 +14,9 @@
 
 第二半：``snapshot`` 载荷必须带 ``watchlist``（前端全局轮询它取关注池候选，不新增端点：
 端点数 82 与工作台基础工具面 77（``mcp_tools.TOOL_COUNT``）是锁定不变式，见
-``tests/test_wp6_store_access.py`` 与 ``tests/test_wp6_mcp.py``；MCP 面另有 V3 桥接 39 件，
-合计 116——桥接面由 ``/api/v3/*`` 路由装配，不改动这份 77 件的基础面）。
+``tests/test_wp6_store_access.py`` 与 ``tests/test_wp6_mcp.py``；MCP 面另有 V3 桥接件
+（条数 = ``/api/v3/*`` 路由数，由路由表装配，不改动这份 77 件的基础面），
+表面模式 direct/discovery 的期望值同样由路由表推导）。
 """
 import json
 import re

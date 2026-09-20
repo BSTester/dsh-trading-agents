@@ -1,0 +1,16 @@
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "auto-pipeline|auto_pipeline|confirm-decide|confirm_decide|mcp__quantwb__auto-pipeline|mcp__quantwb__auto_pipeline|mcp__quantwb__confirm-decide|mcp__quantwb__confirm_decide|mcp__quantwb__modify-user-security|mcp__quantwb__modify_user_security|mcp__quantwb__openapi-config|mcp__quantwb__openapi-oauth|mcp__quantwb__openapi-test|mcp__quantwb__openapi_config|mcp__quantwb__openapi_oauth|mcp__quantwb__openapi_test|mcp__quantwb__plan-execute|mcp__quantwb__plan_execute|mcp__quantwb__push-subscribe|mcp__quantwb__push-unsubscribe|mcp__quantwb__push_subscribe|mcp__quantwb__push_unsubscribe|mcp__quantwb__record-observation|mcp__quantwb__record_observation|mcp__quantwb__research-tasks-claim|mcp__quantwb__research-tasks-report|mcp__quantwb__research_tasks_claim|mcp__quantwb__research_tasks_report|mcp__quantwb__rules-decide|mcp__quantwb__rules_decide|mcp__quantwb__sentiment-snapshot|mcp__quantwb__sentiment_snapshot|mcp__quantwb__sim-trade-cancel|mcp__quantwb__sim-trade-modify|mcp__quantwb__sim-trade-place|mcp__quantwb__sim_trade_cancel|mcp__quantwb__sim_trade_modify|mcp__quantwb__sim_trade_place|mcp__quantwb__switch-mode|mcp__quantwb__switch_mode|mcp__quantwb__trade-cancel|mcp__quantwb__trade-modify|mcp__quantwb__trade-place|mcp__quantwb__trade_cancel|mcp__quantwb__trade_modify|mcp__quantwb__trade_place|modify-user-security|modify_user_security|openapi-config|openapi-oauth|openapi-test|openapi_config|openapi_oauth|openapi_test|plan-execute|plan_execute|push-subscribe|push-unsubscribe|push_subscribe|push_unsubscribe|record-observation|record_observation|research-tasks-claim|research-tasks-report|research_tasks_claim|research_tasks_report|rules-decide|rules_decide|sentiment-snapshot|sentiment_snapshot|sim-trade-cancel|sim-trade-modify|sim-trade-place|sim_trade_cancel|sim_trade_modify|sim_trade_place|switch-mode|switch_mode|trade-cancel|trade-modify|trade-place|trade_cancel|trade_modify|trade_place",
+        "hooks": [
+          {
+            "type": "command",
+            "timeout": 10,
+            "command": "printf '%s\\n' 'headless 白名单：写/交易工具已从工具面移除（额度：只读研究）。该动作只能由人在工作台 Web 确认后执行。' >&2; exit 2"
+          }
+        ]
+      }
+    ]
+  }
+}

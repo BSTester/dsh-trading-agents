@@ -37,13 +37,23 @@ from server import observability  # noqa: E402
 from server.app import create_app  # noqa: E402
 
 #: 仅为让降级链 family 出现在清单里；值是**标注出来的假数据**，不是探测结果。
+#: 2026-09-20 第二轮补 ``as_of`` 与 ``attempts[].ms``：它们是
+#: ``quantwb_datasource_data_age_seconds``（§8.3 数据延迟）与
+#: ``quantwb_call_duration_p*_seconds{scope="datasource-probe"}``（§4.1 分位数）的唯一来源，
+#: 少了这两个字段，离线导出就看不到这些新 family（抓取路径仍然只读落盘缓存）。
 SAMPLE_CHAINS = [
     {"key": "kline", "label": "K 线/历史行情", "primary": "futu/quote_history_kline",
      "fallback": "akshare/stock_zh_a_hist", "available": True,
-     "last_source": "akshare/stock_zh_a_hist", "chain_size": 2, "error": None},
+     "last_source": "akshare/stock_zh_a_hist", "chain_size": 2, "error": None,
+     "as_of": "2026-09-20T00:00:00+00:00",
+     "attempts": [{"source": "futu/quote_history_kline", "ok": False, "ms": 812},
+                  {"source": "akshare/stock_zh_a_hist", "ok": True, "ms": 431}]},
     {"key": "news", "label": "个股资讯", "primary": "futu/info_search",
      "fallback": "akshare/stock_news_em", "available": False,
-     "last_source": "akshare/stock_news_em", "chain_size": 2, "error": "HTTP 500"},
+     "last_source": "akshare/stock_news_em", "chain_size": 2, "error": "HTTP 500",
+     "as_of": None,
+     "attempts": [{"source": "futu/info_search", "ok": False, "ms": 1200},
+                  {"source": "akshare/stock_news_em", "ok": False, "ms": 2100}]},
 ]
 
 #: 仅为让行业红线 family 出现在清单里；值是**标注出来的假数据**，不是探测结果。

@@ -36,9 +36,10 @@ Type=oneshot
 # （systemd 的 oneshot 在某个 ExecStart 失败后会跳过后续 ExecStart，所以这里用 sh -c
 #  串起来，而不是两条 ExecStart：两条缓存必须各自独立地拿到刷新机会。）
 ExecStart=/bin/sh -c 'rc=0; \
-  curl -fsS -m 60 http://127.0.0.1:8397/api/v3/sources/status >/dev/null || rc=1; \
+  curl -fsS -m 150 http://127.0.0.1:8397/api/v3/sources/status >/dev/null || rc=1; \
   curl -fsS -m 120 -X POST http://127.0.0.1:8397/api/v3/metrics/probe/refresh >/dev/null || rc=1; \
   exit $rc'
-# 端点最坏耗时：sources/status ≈45s（v3_fallback.PROBE_CHAIN_TIMEOUT 逐级探测），
-# 行业探测按标的分市场打富途（SH 自选池 28 只 ⇒ 十秒级，受限流器 pacing）。
-TimeoutStartSec=300
+# 端点真实耗时（2026-09-20 实测，非估计）：sources/status **58.9s**（降级链逐级探测）、
+# probe/refresh 13.0s。原先 curl 超时写 60s，正好卡在 sources/status 的实测耗时上——
+# 偶尔超时就让整个单元 failed（"定时器没在跑"的假象）。故放宽到 150s。
+TimeoutStartSec=420

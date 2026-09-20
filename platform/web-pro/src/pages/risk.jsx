@@ -8,7 +8,8 @@
 //   ④ 净值/回撤曲线（LineChart ← analytics.equityCurve）
 //   ⑤ 风控规则表（阈值 + 来源 + 状态，含单一行业暴露上限 ← risk/industry）
 //   ⑥ 阻断记录（OMS 未自动放行订单：manual / blocked_industry / blocked / rejected）
-//   ⑦ 无数据源项：行业/因子/个股归因、逐标的 ATR、杠杆率、流动性评分、逐日 VaR 序列
+//   ⑦ 风控机制读数（FR-EXEC-003：杠杆率 / 流动性参与率 / 绩效归因 / 资金检查 ← analytics.risk_detail）
+//   ⑧ 无数据源项：因子归因（缺 PIT 建仓敞口）、逐标的 ATR、融资负债倍数、盘口深度、逐日 VaR 序列
 //
 // 行业红线（2026-09-20 后端接闸门后）：单一行业暴露 > 上限 → `stage=blocked_industry` +
 // `risk.rule=industry-red-line` **下单前强制阻断**；读数取 `/api/v3/metrics.industryGate`
@@ -102,6 +103,164 @@ const industryMappingRows = (env) => {
     plates: asArray(item && item.plates).map((plate) => String(plate)),
   }));
 };
+
+/* ── FR-EXEC-003 补全块：杠杆率 / 流动性风险 / 绩效归因 / 资金检查 ────────────────
+ *  口径：全部来自 GET /api/v3/risk/analytics.risk_detail（服务端只读读数 + 分级建议）。
+ *  缺数据一律显示「无数据源 · 原因」，绝不填 0；四项各自的 source/as_of 原样展示。
+ */
+const GRADE_TONE = { auto: "green", noted: "green", manual: "gold", blocked: "red",
+                     unknown: "default", "no-data": "default" };
+
+function RiskMechanicsCard({ env }) {
+  const { market } = useMarket();
+  const analytics = OK(env) ? env.analytics : null;
+  const detail = OK(env) ? env.risk_detail : null;
+  if (!analytics || !detail) {
+    return (
+      <ProCard title="风控机制读数（FR-EXEC-003）" bordered>
+        <Space direction="vertical" size={6} style={{ width: "100%" }}>
+          <NoSource what="杠杆率 / 流动性风险 / 绩效归因 / 资金检查"
+            why={envError(env, `GET /api/v3/risk/analytics?market=${market} 未返回 risk_detail（该字段随 details=true 返回；取不到组合时整体为 market/no-universe）`)} />
+          <MarketNote source={`GET /api/v3/risk/analytics?market=${market}&details=true`} />
+        </Space>
+      </ProCard>
+    );
+  }
+  const leverage = detail.leverage || null;
+  const liquidity = detail.liquidity || null;
+  const attribution = detail.attribution || null;
+  const funds = detail.fundsCheck || null;
+  const errors = asArray(detail.errors);
+
+  const leverageItems = leverage ? [
+    { key: "ratio", label: "持仓市值 / 总资产", value: leverage.leverage_ratio_pct },
+    { key: "power", label: "可用购买力 / 总资产", value: leverage.buying_power_ratio_pct },
+    { key: "cash", label: "现金 / 总资产", value: leverage.cash_ratio_pct },
+  ] : [];
+
+  const attributionColumns = [
+    { title: "标的", dataIndex: "ticker", width: 110, render: (value) => <Text code style={{ fontSize: 11 }}>{String(value || "—")}</Text> },
+    { title: "行业", dataIndex: "industry", width: 100, render: (value) => (value ? <Tag>{String(value)}</Tag> : <Text type="secondary" style={{ fontSize: 11 }} title={noSourceText("行业映射", "该标的未取到行业分类（不并入任何行业）")}>无数据源</Text>) },
+    { title: "持仓市值", dataIndex: "marketValue", width: 110, align: "right", render: (value) => (fin(value) ? fmt.money(value) : "—") },
+    { title: "未实现盈亏", dataIndex: "plValue", width: 110, align: "right", render: (value) => <Text style={{ color: toneOf(value) }}>{fin(value) ? fmt.money(value) : "—"}</Text> },
+    { title: "贡献（/总资产）", dataIndex: "contributionPct", width: 130, align: "right", render: (value) => (fin(value) ? spct(value, 2) : "无数据源") },
+  ];
+
+  return (
+    <ProCard
+      title="风控机制读数（FR-EXEC-003 补全：杠杆率 / 流动性 / 归因 / 资金检查）"
+      bordered
+      extra={<Text type="secondary" style={{ fontSize: 12 }}>{detail.note}</Text>}
+    >
+      {errors.length ? (
+        <Alert type="warning" showIcon style={{ marginBottom: 10 }}
+          message={`风险补全块有 ${errors.length} 项内部错误（该子项显示为 null，主区块不受影响）`}
+          description={<Text style={{ fontSize: 12 }}>{errors.map((item) => `${item.item}: ${item.error}`).join("；")}</Text>} />
+      ) : null}
+      <Row gutter={[12, 12]}>
+        <Col xs={24} lg={12}>
+          <ProCard size="small" title="杠杆率（事中）" bordered
+            extra={<Text type="secondary" style={{ fontSize: 11 }}>{leverage && leverage.source ? `来源 ${leverage.source} · as_of ${leverage.as_of || "—"}` : "无数据源"}</Text>}>
+            {leverage && leverage.error ? (
+              <NoSource what="杠杆率" why={leverage.error.message || leverage.error.code} />
+            ) : leverage ? (
+              <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                <Space size={16} wrap>
+                  {leverageItems.map((item) => (
+                    <Statistic key={item.key} title={item.label} value={fin(item.value) ? Number(item.value) : undefined}
+                      precision={2} suffix={fin(item.value) ? "%" : ""}
+                      formatter={fin(item.value) ? undefined : () => "无数据源"} />
+                  ))}
+                </Space>
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  读数：总资产 {fin(leverage.readings && leverage.readings.totalAssets) ? fmt.money(leverage.readings.totalAssets) : "—"} ·
+                  持仓市值 {fin(leverage.readings && leverage.readings.longMarketValue) ? fmt.money(leverage.readings.longMarketValue) : "—"} ·
+                  可用购买力 {fin(leverage.readings && leverage.readings.buyingPower) ? fmt.money(leverage.readings.buyingPower) : "—"} ·
+                  账户 {fmt.num(leverage.readings && leverage.readings.accounts, 0)} 个（{leverage.mode || "—"}）
+                </Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  融资负债率：{noSourceText("融资负债 / 净资产", leverage.provider_note || "上游不提供融资负债字段")}
+                </Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>{leverage.direction}</Text>
+              </Space>
+            ) : <NoSource what="杠杆率" why="risk_detail.leverage 缺失" />}
+          </ProCard>
+        </Col>
+        <Col xs={24} lg={12}>
+          <ProCard size="small" title="流动性风险（事中：参与率 = 订单金额 / ADV）" bordered
+            extra={<Text type="secondary" style={{ fontSize: 11 }}>{fin(liquidity && liquidity.participation_pct) ? `${liquidity.adv_window_days} 日 ADV 窗口` : "无数据源"}</Text>}>
+            {liquidity ? (
+              <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                <Space size={12} wrap>
+                  <Statistic title={`参与率 · ${liquidity.ticker || "—"}`}
+                    value={fin(liquidity.participation_pct) ? Number(liquidity.participation_pct) : undefined}
+                    precision={3} suffix={fin(liquidity.participation_pct) ? "%" : ""}
+                    formatter={fin(liquidity.participation_pct) ? undefined : () => "无数据源"} />
+                  <Tag color={GRADE_TONE[liquidity.grade] || "default"}>{liquidity.grade}</Tag>
+                </Space>
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  ADV {fin(liquidity.adv_amount) ? fmt.money(liquidity.adv_amount) : "—"}
+                  （样本 {fmt.num(liquidity.adv_observations, 0)} 根 · {day(liquidity.adv_window_from)} → {day(liquidity.adv_window_to)}）·
+                  阈值 {fmt.num(liquidity.thresholds && liquidity.thresholds.warnPct, 0)}% / {fmt.num(liquidity.thresholds && liquidity.thresholds.blockPct, 0)}%
+                </Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>{liquidity.grade_note || liquidity.reason || "—"}</Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>ADV 口径：{liquidity.adv_basis || "—"}；来源 {liquidity.adv_source || "无数据源"}</Text>
+              </Space>
+            ) : <NoSource what="流动性风险" why="risk_detail.liquidity 缺失" />}
+          </ProCard>
+        </Col>
+        <Col xs={24} lg={14}>
+          <ProCard size="small" title="绩效归因（事后：逐标的 + 行业）" bordered
+            extra={<Text type="secondary" style={{ fontSize: 11 }}>{attribution && attribution.positions ? `${attribution.positions} 个持仓 · 行业覆盖 ${fmt.num(attribution.coverage && attribution.coverage.withIndustry, 0)}/${fmt.num(attribution.positions, 0)}` : "无数据源"}</Text>}>
+            {attribution && attribution.error && !asArray(attribution.byTicker).length ? (
+              <NoSource what="绩效归因" why={attribution.error.message || attribution.error.code} />
+            ) : attribution ? (
+              <Space direction="vertical" size={6} style={{ width: "100%" }}>
+                {asArray(attribution.byTicker).length === 0
+                  ? <NoSource what="逐标的归因" why="本市场分组里没有持仓行（不是 0 贡献）" />
+                  : <Table size="small" rowKey="ticker" pagination={false} columns={attributionColumns}
+                      dataSource={asArray(attribution.byTicker)} scroll={{ x: 620 }} />}
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  口径：{attribution.methods && attribution.methods.ticker}；行业：{attribution.methods && attribution.methods.industry}
+                  （来源 {attribution.methods && attribution.methods.industrySource ? attribution.methods.industrySource : "无数据源"}）·
+                  合计未实现盈亏 {fin(attribution.totalPlValue) ? fmt.money(attribution.totalPlValue) : "—"}（
+                  {fin(attribution.totalContributionPct) ? spct(attribution.totalContributionPct, 2) : "—"}）
+                </Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  因子归因：{noSourceText("因子归因", attribution.methods && attribution.methods.factor)}
+                </Text>
+              </Space>
+            ) : <NoSource what="绩效归因" why="risk_detail.attribution 缺失" />}
+          </ProCard>
+        </Col>
+        <Col xs={24} lg={10}>
+          <ProCard size="small" title="资金检查（事前：订单金额 vs 真实购买力）" bordered
+            extra={<Tag color={GRADE_TONE[(funds && funds.action) || "unknown"] || "default"}>{(funds && funds.action) || "no-data"}</Tag>}>
+            {funds ? (
+              <Space direction="vertical" size={4} style={{ width: "100%" }}>
+                <Statistic title="名义单金额（NAV × 单笔上限）"
+                  value={fin(funds.orderValue) ? Number(funds.orderValue) : undefined}
+                  precision={2} formatter={fin(funds.orderValue) ? undefined : () => "无数据源"} />
+                <Text type="secondary" style={{ fontSize: 11 }}>
+                  可用购买力 {fin(funds.readings && funds.readings.buyingPower) ? fmt.money(funds.readings.buyingPower) : "—"} ·
+                  字段 {asArray(funds.funding_basis_field).join("/") || "—"} · 来源 {funds.source || "无数据源"} · as_of {funds.as_of || "—"}
+                </Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>{funds.reason || "—"}</Text>
+                <Text type="secondary" style={{ fontSize: 11 }}>{funds.basisNote || ""}</Text>
+                {funds.orderValueSource ? <Text type="secondary" style={{ fontSize: 11 }}>{funds.orderValueSource}</Text> : null}
+              </Space>
+            ) : <NoSource what="资金检查" why="risk_detail.fundsCheck 缺失" />}
+          </ProCard>
+        </Col>
+      </Row>
+      <MarketNote
+        source={`GET /api/v3/risk/analytics?market=${market}&details=true（risk_detail）· 资金检查另有只读端点 GET /api/v3/risk/funding-check`}
+        extra={detail.nominalOrderNote || ""}
+        style={{ display: "block", marginTop: 8 }}
+      />
+    </ProCard>
+  );
+}
 
 /** 行业暴露与集中度（BarList + Top + 上限/breach + 映射明细 + missing）。 */
 function IndustryExposureCard({ env }) {
@@ -748,7 +907,7 @@ function ExposureCard({ env, riskEnv, ordersEnv, industryEnv }) {
             行业暴露与映射明细来自 /api/v3/risk/industry（板块 {industryReady && industryEnv.sources && industryEnv.sources.plate ? industryEnv.sources.plate : "—"}）；
             <Text strong>行业红线已接入下单前闸门</Text>：单一行业暴露 &gt; 上限 → <Text code>stage=blocked_industry</Text>（<Text code>risk.rule=industry-red-line</Text>）强制阻断；
             OMS 台账当前 industry_source={String(industrySource || "no-data").slice(0, 12)}——为 <Text code>no-data</Text> 时闸门按 <Text strong>fail-open</Text> 处理（不阻断，但订单 reasons 写明「未参与阻断」）。
-            杠杆率 / 流动性评分：{noSourceText("杠杆率与流动性评分", "positions 不返回融资余额与盘口深度")}。
+            杠杆率 / 流动性 / 资金检查：见下方「风控机制读数」（GET /api/v3/risk/analytics.risk_detail 的真实读数：持仓市值/总资产、订单金额/近 20 日 ADV、account_funds 购买力）。
           </Text>
         }
       />
@@ -996,7 +1155,7 @@ function BlocksCard({ orders, gateView }) {
       ) : null}
       {rows.length === 0 ? (
         <Space direction="vertical" size={6} style={{ width: "100%" }}>
-          <NoSource what={`${marketLabel(market)} 阻断/退回记录`} why={`当前市场（market=${market}）的 OMS 台账无 blocked/rejected 阶段订单（本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders?market=${market} 台账为准）`} />
+          <NoSource what={`${marketLabel(market)} 阻断/退回记录`} why={`当前市场（market=${market}）的 OMS 台账无 blocked/rejected 阶段订单（记录以 /api/v3/oms/orders?market=${market} 台账为准）`} />
           <MarketNote source={`GET /api/v3/oms/orders?market=${market}`} extra="跨市场不合并：其他市场的阻断记录不在此列出" />
         </Space>
       ) : (
@@ -1006,7 +1165,7 @@ function BlocksCard({ orders, gateView }) {
             {`口径：stage 为 manual / blocked / blocked_industry / rejected 的订单（当前台账 ${rows.length} 单）。
             manual＝单笔占比超上限退回人工确认；blocked_industry＝单一行业暴露超上限被下单前闸门强制阻断；
             blocked＝回撤触及红线强制阻断；rejected＝券商/通道拒绝。触发规则列优先取后端 risk.rule 原文。
-            本服务未挂载 SDK JSON-RPC / Headless 通道，记录以 /api/v3/oms/orders 台账为准。`}
+            资金不足（FR-EXEC-003 资金检查：订单金额 > 真实可用购买力）同样落 blocked，原因写在 risk.reasons 原文里。`}
           </Text>
           <MarketNote source={`GET /api/v3/oms/orders?market=${market}`} extra={`该市场台账 ${rows.length} 条（跨市场不合并）`} />
         </Space>
@@ -1018,10 +1177,10 @@ function BlocksCard({ orders, gateView }) {
 /* ── ⑦ 无数据源清单 ─────────────────────────────────────────────────────── */
 function NoSourceCard() {
   const items = [
-    { what: "行业归因 / 因子归因 / 个股归因", why: "工作台工具面无归因数据源，本页不估算" },
+    { what: "因子归因（逐因子的收益拆解）", why: "缺 PIT 建仓因子敞口：券商持仓不返回建仓时点因子值，台账也没有逐笔因子快照（因子矩阵/覆盖率见策略页，逐标的与行业归因见上方「风控机制读数」）" },
     { what: "逐标的 ATR 与单笔风险折算", why: "工具面未提供逐标的 ATR 与止损价，风险预算无法按止损距离折算" },
-    { what: "杠杆率", why: "positions 不返回融资余额/保证金占用" },
-    { what: "流动性评分", why: "工具面无盘口深度与流动性评分数据源" },
+    { what: "融资负债 / 净资产（真实杠杆倍数）", why: "上游不提供融资负债字段（模拟盘只有 max_power_long、实盘只有 power/available_funds/cash）——本页只给「持仓市值 / 总资产」的真实净敞口比，不估算倍数" },
+    { what: "盘口深度与冲击成本模型", why: "工具面无盘口深度序列；流动性只给「订单金额 / 近 20 日 ADV」的真实参与率（见上方风控机制读数），不含价差/深度冲击模型" },
     { what: "逐日 VaR 序列", why: "risk/analytics 只返回区间 VaR/CVaR 点值，未返回逐日序列（故指标卡不绘制迷你走势线）" },
   ];
   return (
@@ -1142,6 +1301,9 @@ export default function 风险监控Page() {
           </Block>
         </Col>
       </Row>
+      <Block title="风控机制读数（FR-EXEC-003）">
+        <RiskMechanicsCard env={analytics.value} />
+      </Block>
       <Block title="暴露与集中度">
         <ExposureCard env={analytics.value} riskEnv={risk.value} ordersEnv={ordersEnv.value} industryEnv={industry.value} />
       </Block>

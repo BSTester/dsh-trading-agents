@@ -102,12 +102,16 @@ const STAGE_TEXT = {
 };
 const STAGE_ORDER = ["PDAT", "PAAT", "PCPT", "PRT", "PET"];
 
-/* ── 因子类别：按真实因子名前缀归类（与 binder 的 CATEGORY 同规则） ─────── */
+/* ── 因子类别：按真实因子名前缀归类（与 binder 的 CATEGORY 同规则） ───────
+ *  六类与规格 FR-STRAT-001 一一对应：价值 / 成长 / 动量 / 质量 / 情绪 / 另类。
+ *  规则**顺序有意义**（先匹配先生效）：`rsi_14` 属情绪（不是动量），`liq_ratio` 属另类。 */
 const CATEGORY = [
   { match: /^mom_/, label: "动量", color: "blue" },
   { match: /^(pe_|pb|ps|peg)/, label: "价值", color: "purple" },
-  { match: /^(rsi_|trend)/, label: "情绪", color: "gold" },
-  { match: /^(liq_|vol_|mdd_)/, label: "另类", color: "green" },
+  { match: /^(revenue_yoy|net_profit_yoy)/, label: "成长", color: "cyan" },
+  { match: /^(roe|roa|gross_margin|net_margin|operating_margin)/, label: "质量", color: "geekblue" },
+  { match: /^(sentiment|rsi_|trend)/, label: "情绪", color: "gold" },
+  { match: /^(capital_flow|short_interest|liq_|vol_|mdd_)/, label: "另类", color: "green" },
 ];
 function categoryOf(name) {
   for (const item of CATEGORY) if (item.match.test(String(name))) return item;
@@ -213,6 +217,18 @@ function PipelineCard({ env, refresh, ticker, market }) {
               { key: "scoreSource", label: "评分来源", children: ((run.stages || {}).PAAT || {}).scoreSource || "—" },
               { key: "factorsError", label: "因子回退", children: ((run.stages || {}).PAAT || {}).factorsError || "无（因子接口正常）" },
               { key: "bars", label: "日 K 合计", children: ((run.stages || {}).PDAT || {}).bars === undefined ? "—" : String(((run.stages || {}).PDAT || {}).bars) },
+              {
+                key: "rankBy",
+                label: "排序口径（PCPT）",
+                children: ((run.stages || {}).PCPT || {}).rankBy || "接口未返回（该轮早于扩维打分上线）",
+              },
+              {
+                key: "coverage",
+                label: "扩维因子覆盖（PAAT）",
+                children: Object.entries((((run.stages || {}).PAAT || {}).factorCoverage || {}).classes || {})
+                  .map(([name, item]) => `${name} ${fmt.num(item && item.covered, 0)}/${fmt.num(item && item.total, 0)}`)
+                  .join(" · ") || "接口未返回（该轮早于扩维因子上线）",
+              },
             ]}
           />
           <Text type="secondary" style={{ fontSize: 12 }}>
@@ -282,6 +298,12 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
   const tickers = asArray(matrix && matrix.tickers);
   const factors = asArray(matrix && matrix.factors);
   const rows = asArray(matrix && matrix.matrix);
+  /* 逐因子覆盖率（六类因子的真实数据源 + PIT 口径 + 有数据的标的数）：服务端
+   * /api/v3/factors/matrix 的 `factors` 数组（与 /api/v3/factors/registry 同一份计算）。 */
+  const coverageOf = (name) => {
+    const list = asArray(baseEnv && baseEnv.factors);
+    return list.find((item) => item && item.key === name) || null;
+  };
   const zOf = (rowIndex, factorName) => {
     const col = factors.indexOf(factorName);
     if (col < 0 || !rows[rowIndex]) return null;
@@ -303,6 +325,17 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
       render: (value) => (Array.isArray(value) && value.length
         ? <Text type="secondary" style={{ fontSize: 11 }}>{value.map((item) => `${item.ticker}=${item.z === null ? "—" : Number(item.z).toFixed(3)}`).join(" · ")}</Text>
         : <Text type="secondary" style={{ fontSize: 11 }}>—</Text>),
+    },
+    {
+      title: "覆盖（有数据的标的）", dataIndex: "coverage", width: 160, align: "right",
+      render: (value) => (value && Number.isFinite(Number(value.total)) && Number(value.total) > 0
+        ? (
+          <Text type={Number(value.covered) > 0 ? undefined : "secondary"}
+            title={`来源 ${value.source || "—"}；PIT 口径 ${value.pit || "—"}${Array.isArray(value.missingTickers) && value.missingTickers.length ? `；缺数据标的 ${value.missingTickers.join(" / ")}` : ""}`}>
+            {`${fmt.num(value.covered, 0)} / ${fmt.num(value.total, 0)}`}
+          </Text>
+        )
+        : <Text type="secondary" title={noSourceText("覆盖率", "factors/matrix 未返回该因子的覆盖率（接口降级或该因子不在注册表中）")}>无数据源</Text>),
     },
     {
       title: "IC 均值（近 60 日 RankIC）", dataIndex: "meanIc", width: 170, align: "right",
@@ -336,6 +369,7 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
       key: name,
       name,
       category: categoryOf(name),
+      coverage: coverageOf(name),
       z: rows.length ? zOf(0, name) : null,
       zs: tickers.map((ticker, index) => ({ ticker, z: rows.length > index ? zOf(index, name) : null })),
       hasIc,
@@ -382,14 +416,24 @@ function FactorLibraryCard({ baseEnv, onLoadMore, loadingMore, loadedFactors }) 
         </Space>
       ) : (
         <Space direction="vertical" size={8} style={{ width: "100%" }}>
-          <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={data} scroll={{ x: 1200 }} />
+          <Table size="small" rowKey="key" pagination={false} columns={columns} dataSource={data} scroll={{ x: 1380 }} />
           <Text type="secondary" style={{ fontSize: 12 }}>
             注：IC 为横截面 RankIC（forward {baseIc ? fmt.num(baseIc.forwardDays, 0) : "—"} 日，来源 {(baseIc && baseIc.source) || "workbench/ic"}）；
             默认基线因子为 mom_20（{(baseIc && baseIc.tickers ? baseIc.tickers.length : 0)} 只标的、{baseIc ? fmt.num(baseIc.observations, 0) : "—"} 期样本）。
+            「覆盖」列 = 该因子在本市场宇宙里**真有读数**的标的数（服务端 /api/v3/factors/matrix 的 factors 覆盖率，与 /api/v3/factors/registry 同一份计算）；
+            缺数据的标的不进矩阵（或该格为 null），绝不填均值/0。
             分层年化多空、换手率、相关性本服务未返回，标注「无数据源」而不填占位数字。
           </Text>
+          {asArray(baseEnv && baseEnv.factorsMissing).length ? (
+            <Text type="secondary" style={{ fontSize: 12 }}>
+              缺席因子原因：{asArray(baseEnv.factorsMissing).map((item) => `${item.key}（${item.reason}）`).join("；")}
+            </Text>
+          ) : null}
+          <Text type="secondary" style={{ fontSize: 12 }}>
+            六类因子口径：{asArray(baseEnv && baseEnv.factors).filter((item) => item && item.pit).slice(0, 2).map((item) => `${item.key} ← ${item.source}`).join("；")}…（完整注册表见 GET /api/v3/factors/registry）
+          </Text>
           <MarketNote
-            source={`GET /api/v3/factors/matrix?market=${market}（逐因子 IC 为 ?factor=X&market=${market}）`}
+            source={`GET /api/v3/factors/matrix?market=${market}（逐因子 IC 为 ?factor=X&market=${market}；六类注册表 /api/v3/factors/registry）`}
             asOf={matrix && matrix.as_of}
             extra={`${tickers.length} 只 × ${factors.length} 因子`}
           />

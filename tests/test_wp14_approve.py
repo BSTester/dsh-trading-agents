@@ -730,8 +730,9 @@ class RulesListFilterTest(ApproveBase):
 
 class RulesSurfaceTest(ApproveBase):
     def test_tool_and_endpoint_counts(self):
-        # mcp_tools 是**工作台基础注册表**（77 件）；V3 桥接 39 件在 v3_mcp，MCP 面 116
-        # 由 tests/test_wp6_mcp.py 锁定。
+        # mcp_tools 是**工作台基础注册表**（77 件）；V3 桥接件在 v3_mcp（条数 = /api/v3/*
+        # 路由数），MCP 表面（direct/discovery 两种模式）由 tests/test_wp6_mcp.py 按路由表
+        # 推导锁定（不写死条数）。
         self.assertEqual(mcp_tools.TOOL_COUNT, 77)
         self.assertEqual(len(mcp_tools.TOOLS), 77)
         self.assertEqual(len(store_access.endpoints()), 82)

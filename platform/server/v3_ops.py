@@ -23,10 +23,17 @@ oms/orders,oms/sync,events,audit,brain}``）。
   不是「某个 Python 包能否 import」（SEC EDGAR 走 HTTPS、Tushare 走 HTTP，都不需要包）。
   探测的真值放在 ``source``/``as_of``/``detail`` 三个字段里；失败如实写原因，绝不写死
   「不可用」。
-* **通道**：本服务**没有** SDK JSON-RPC 通道、也**没有** Headless CLI 子进程通道。
-  相关字段一律 ``status="unavailable"`` + ``reason``，绝不用编造的会话/成功率填充
-  （``headless.today`` 恒为零计数、``breaker=null``、``last=[]``、``turns=[]``）。
-* **执行入口**：本模块**没有任何下单/改单/撤单方法**。执行入口只有一个——工作台 Web 的
+* **通道（2026-09-20 修）**：两条通道**都已实现**——SDK JSON-RPC 在 ``server/v3_sdk.py``、
+  Headless CLI 子进程（``dsh --profile headless``）在 ``server/v3_headless.py``（真机跑通，
+  调用日志落 ``v3_db.headless_log``）。本模块报的是**本进程的接线状态**，不再写「不可用/
+  未实现」这类失效断言：
+  * ``headless``：``today`` 读 ``headless_log`` 真实当日记录、``last`` 读最近 10 条、
+    ``breaker`` 读 ``v3_headless`` 的熔断参数、``schedulerAlive``/``nextFireTimes`` 读
+    进程内调度器；模块未注册 → ``status="implemented-not-registered"`` + 原因（见
+    :func:`_headless_status`）。**不创建运行时、不起进程、不 spawn**。
+  * ``sdk``：本模块**不直连** SDK 运行时（那会创建会话对象）——``server.v3_sdk`` 自己的
+    ``/api/v3/sdk/*`` 是它的读数口；``turns``/``events`` 在 ``/api/v3/brain`` 保持空数组
+    并给出原因，绝不用编造的会话/成功率填充。* **执行入口**：本模块**没有任何下单/改单/撤单方法**。执行入口只有一个——工作台 Web 的
   ``plan_execute`` + 人工确认（live 需口令）。V3 只登记、风控分级、对账与展示。
 * **NAV 口径安全优先**：``equity.current``（本地模拟台账，单币种）→ 仅当 ``positions``
   只有**单一账户且单一币种**时用其持仓市值合计 → 多账户/多币种**不折算**（NAV=0，
@@ -127,8 +134,25 @@ FUTU_TOKEN_FILENAME = "futu-token"
 FUTU_TOKEN_EXPIRY_FILENAME = "futu-token-expiry"
 FUTU_CHANNELS = ("openapi", "mcp")
 
-SDK_REASON = "本服务未挂载 SDK JSON-RPC 通道"
-HEADLESS_REASON = "本服务未挂载 Headless CLI 子通道（无 dsh --profile headless 子进程调度）"
+#: SDK 通道的**准确**措辞（2026-09-20 修）。旧文案「本服务未挂载 SDK JSON-RPC 通道」同样是
+#: 失效断言：``server/v3_sdk.py``（FR-GATEWAY-002 的 stdio 换行分帧 JSON-RPC 客户端）**已实现并
+#: 装配**，它自己的 ``/api/v3/sdk/*`` 才是它的读数口。本模块**刻意不直连** SDK 运行时
+#: （``get_runtime()`` 会创建 ``SdkRuntime`` 对象并 arm atexit —— 只读视图不该在抓取路径上
+#: 造对象），因此这里报的是「本视图没有 SDK 会话事实来源」，而不是「没有这条通道」。
+SDK_REASON = ("SDK JSON-RPC 通道由 server/v3_sdk.py 提供（/api/v3/sdk/status 是它的读数口）；"
+              "本模块刻意不直连 SDK 运行时（get_runtime() 会创建运行时对象），"
+              "故此处不报会话/回合读数。")
+#: Headless 通道的**准确**措辞（2026-09-20 修）。旧文案是「本服务未挂载 Headless CLI
+#: 子通道（无 dsh --profile headless 子进程调度）」——**已失效**：``server/v3_headless.py``
+#: 已实现完整的 Headless Runner（真实 spawn ``dsh --profile headless``、白名单/熔断/调用日志
+#: 落 ``v3_db.headless_log``）并在本机真机跑通。因此这里改成对**接线状态**的诚实描述：
+#: 通道已实现、是否被平台调度线程保活由 ``headless.schedulerAlive`` 如实反映（见
+#: :func:`_headless_status`）。取数路径只读 ``v3_headless`` 的公开只读函数 + 进程内注册表，
+#: 不 import 任何写路径、不起进程。
+HEADLESS_REASON = ("Headless CLI 子进程通道已实现（server/v3_headless.py：真实 spawn "
+                   "dsh --profile headless + 白名单 + 熔断 + 调用日志落 v3_db.headless_log）；"
+                   "该模块未注册进本进程（装配未接线）→ 调度状态/下次触发时间不可读。"
+                   "headless.today/last 仍直接读 v3_db.headless_log 的真实记录。")
 HEADLESS_COMMAND = 'dsh --profile headless "<task>"'
 MCP_PROTOCOL = ("MCP streamable-http（/mcp，SDK 2.2.0 的 streamable_http_app）；"
                 "stdio 由 dsh 侧按需拉起")
@@ -417,6 +441,162 @@ def _now():
     return datetime.now(timezone.utc).isoformat()
 
 
+def _headless_last(home_path, limit=10):
+    """``headless.last`` 的**真实读数**：``v3_db`` 的 ``headless_log`` 表最近 N 条。
+
+    这是本模块里唯一改动的一处（原先硬编码 ``[]``）：FR-MON-003 的调用日志由
+    ``server/v3_headless.py`` 写表，网关/大脑视图在这里读同一张表，读的就是**真事实**。
+    投影只取网关视图需要的小字段（不含 prompt/stdout/stderr 全文，避免响应膨胀）；
+    库未初始化/损坏时返回 ``[]``（与 ``v3_db`` 的「不因数据库异常 500」同口径），
+    **不伪造一条记录**。
+    """
+    try:
+        rows = v3_db.list_events(home_path, "headless_log", limit=limit)
+    except Exception:  # noqa: BLE001 —— 台账读不到就是空，绝不编
+        return []
+    if not isinstance(rows, list):
+        return []
+    return [{"startedAt": row.get("started_at"), "taskType": row.get("task_type"),
+             "trigger": row.get("trigger"), "success": bool(row.get("success")),
+             "exitCode": row.get("exit_code"), "durationMs": row.get("duration_ms"),
+             "tokensEstimate": row.get("tokens_estimate"), "outcome": row.get("outcome"),
+             "killed": bool(row.get("killed"))}
+            for row in rows if isinstance(row, dict)]
+
+
+def _headless_module():
+    """惰性取 ``server.v3_headless``（缺模块/导入失败 → ``None``，绝不让网关 500）。"""
+    try:
+        from server import v3_headless  # noqa: PLC0415 —— 惰性：网关是只读视图，不参与装配
+        return v3_headless
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _headless_log_rows(home_path):
+    """``headless_log`` 原始行（未投影）——``today`` 统计与 ``last`` 共用一次读取。"""
+    try:
+        rows = v3_db.list_events(home_path, "headless_log", limit=None)
+    except Exception:  # noqa: BLE001
+        return None
+    return rows if isinstance(rows, list) else None
+
+
+def _headless_status(home_path):
+    """``/api/v3/gateway`` 与 ``/api/v3/brain`` 的 ``headless`` 块（**真实读数**）。
+
+    2026-09-20 修（原实现恒 ``today=0`` / ``status="unavailable"`` / ``breaker=null``，
+    并挂一句已失效的「未挂载 Headless CLI 子通道」）:
+
+      * ``today``：``v3_db.headless_log`` 里 ``started_at`` 属于**今天（UTC）**的记录，
+        用 ``v3_headless.summarize`` 的同一口径统计（模块在不在都读，读的就是真表）；
+      * ``breaker``：``v3_headless`` 的真实熔断参数（并发上限 / 单次超时 / token 预算），
+        经进程内注册表 ``get_entry(home)`` 取 ``runner.params()``——**不创建运行时、不起进程**；
+        ``maxConcurrency`` / ``timeoutSeconds`` / ``tokenBudget`` 都在，另外带上 ``enabled``；
+      * ``schedulerAlive`` / ``nextFireTimes``：模块已注册进本进程时给调度器真实状态；
+        未注册 → ``null`` + ``status="implemented-not-registered"``（**不说「不可用/未实现」**）；
+      * ``registered``：``v3_headless.get_entry(home) is not None``（装配真实性的唯一判据）；
+      * ``logNote`` / ``breakerNote``：写清每项来自哪张表 / 哪个对象，读不到的原因照实写。
+    """
+    rows = _headless_log_rows(home_path)
+    if rows is None:
+        log_note = "headless_log 表不可读（v3_db.list_events 失败）→ today/last 为空，不伪造记录"
+        rows = []
+    else:
+        log_note = f"v3_db.headless_log（server/v3_headless.py 写入；共 {len(rows)} 条历史记录）"
+    day = datetime.now(timezone.utc).date().isoformat()
+    todays = [row for row in rows
+              if isinstance(row, dict) and str(row.get("started_at") or "").startswith(day)]
+    durations = []
+    for row in todays:
+        number = _number(row.get("duration_ms"))
+        if number is not None:
+            durations.append(number)
+    today = {
+        "total": len(todays),
+        "success": sum(1 for row in todays if row.get("success")),
+        "failed": sum(1 for row in todays if not row.get("success")),
+        "killed": sum(1 for row in todays if row.get("killed")),
+        "avgMs": (round(sum(durations) / len(durations), 3) if durations else 0),
+        "tokensEstimate": sum(int(_number(row.get("tokens_estimate")) or 0) for row in todays),
+        "date": day,
+        "basis": "UTC 当日（started_at 前缀），口径与 v3_headless.today_summary 一致",
+    }
+
+    module = _headless_module()
+    registered = False
+    breaker = None
+    scheduler_alive = None
+    next_fire = None
+    status_note = HEADLESS_REASON
+    if module is not None:
+        # 熔断参数是**配置真值**（不依赖是否注册）：直接读 v3_headless.load_config(home)。
+        try:
+            config, config_sources = module.load_config(home_path)
+            breaker = {"maxConcurrency": config.get("maxConcurrency"),
+                       "timeoutSeconds": config.get("timeoutSeconds"),
+                       "tokenBudget": config.get("tokenBudget"),
+                       "enabled": config.get("enabled"),
+                       "profile": config.get("profile"),
+                       "configSources": config_sources}
+        except Exception as error:  # noqa: BLE001
+            breaker = {"error": f"{type(error).__name__}: {error}"}
+        try:
+            entry = module.get_entry(home_path)
+        except Exception:  # noqa: BLE001
+            entry = None
+        registered = entry is not None
+        if registered:
+            runner = entry.get("runner")
+            scheduler = entry.get("scheduler")
+            try:
+                params = runner.params()
+                breaker = {"maxConcurrency": params.get("maxConcurrency"),
+                           "timeoutSeconds": params.get("timeoutSeconds"),
+                           "tokenBudget": params.get("tokenBudget"),
+                           "enabled": params.get("enabled"),
+                           "profile": params.get("profile"),
+                           "configSources": breaker.get("configSources")
+                           if isinstance(breaker, dict) else None}
+            except Exception as error:  # noqa: BLE001
+                breaker = {"error": f"{type(error).__name__}: {error}"}
+            try:
+                scheduler_alive = bool(getattr(scheduler, "alive", False))
+                next_fire = scheduler.next_fire_times()[:3]
+            except Exception as error:  # noqa: BLE001
+                scheduler_alive = None
+                next_fire = None
+                status_note = (f"调度器视图读取失败（{type(error).__name__}: {error}）；"
+                               f"registry 已注册但状态不可读")
+            status = "running" if scheduler_alive else "registered-idle"
+            status_note = (
+                f"headless 模块已注册进本进程（{HEADLESS_COMMAND}）；调度线程 "
+                f"{'已保活' if scheduler_alive else '未运行（触发循环由 server/scheduler.py '
+                                                 '的 scheduler_tick 保活）'}；"
+                f"熔断参数取自 runner.params() 真实配置")
+        else:
+            status = "implemented-not-registered"
+    else:
+        status = "implemented-not-registered"
+        status_note = ("server.v3_headless 导入失败（模块不可用）→ 只读 headless_log 表；"
+                       + HEADLESS_REASON)
+    return {
+        "today": today,
+        "breaker": breaker,
+        "breakerNote": ("外部熔断（FR-GATEWAY-004）三参数：并发上限 / 单次超时 / token 预算"
+                        "（估算口径见 v3_headless.TOKEN_ESTIMATE_NOTE）；注册未接线时为 null"),
+        "last": _headless_last(home_path),
+        "status": status,
+        "reason": status_note,
+        "registered": registered,
+        "schedulerAlive": scheduler_alive,
+        "nextFireTimes": next_fire,
+        "command": HEADLESS_COMMAND,
+        "logNote": log_note,
+        "source": "v3_db.headless_log + server.v3_headless（get_entry/params/next_fire_times）",
+    }
+
+
 def _failure(code, message):
     return {"ok": False, "error": {"code": code, "message": message}}
 
@@ -494,7 +674,7 @@ def _read_mode(home):
 def check_order(value, nav, industry_pct=0.0, drawdown_pct=0.0, limits=None,
                 industry_source=None, industry_top=None, industry_as_of=None,
                 industry_probe_age_ms=None, industry_missing=None, industry_universe=None,
-                industry_market=None, industry_reason=None):
+                industry_market=None, industry_reason=None, funds=None):
     """下单前风控分级（纯函数）。返回 ``(action, reasons)``。
 
     action ∈ ``auto`` / ``manual`` / ``blocked``（回撤红线）/ ``blocked_industry``（行业红线）。
@@ -506,7 +686,8 @@ def check_order(value, nav, industry_pct=0.0, drawdown_pct=0.0, limits=None,
     3. **行业集中度** > ``LIMITS["industryPct"]``(20%) → ``blocked_industry``；
        无读数（``industry_pct=None``）→ **fail-open**（不阻断），但必须留痕
        「行业暴露数据不可用，未参与阻断（原因：…）」；
-    4. 回撤 ≥ ``LIMITS["drawdownPct"]``(15%) → ``blocked``。
+    4. 回撤 ≥ ``LIMITS["drawdownPct"]``(15%) → ``blocked``；**最后**叠加
+       ``funds``（FR-EXEC-003 资金检查，可选）——资金不足 → ``blocked``。
 
     行业参数（``industry_*``）来自 :func:`server.v3_risk_gate.industry_context`，只用于
     **措辞与留痕**（读数、来源、as_of、缺失数），阈值判定仍只看 ``industry_pct``：
@@ -516,6 +697,12 @@ def check_order(value, nav, industry_pct=0.0, drawdown_pct=0.0, limits=None,
     * ``industry_missing`` > 0：上游有标的没取到行业分类 → 读数只是**下界**，必须标注；
     * **历史调用口径不变**：完全不传任何 ``industry_*``（``industry_pct`` 取默认 ``0.0``）
       时不做行业判定、不产生行业原因——与闸门接入前逐字段一致。
+
+    ``funds``（FR-EXEC-003 资金检查，**缺省 ``None`` → 本函数行为逐字段不变**）：形状同
+    ``v3_analytics.funding_check_data`` 的信封（``action``/``readings``/``source``/``reason``）。
+    ``action="blocked"``（订单金额 > 真实可用购买力）→ 判定升级为 ``blocked`` 并把读数写进
+    原因；``action="unknown"``（上游没有购买力字段）→ **不改判定**，只把原因作为留痕追加
+    （fail-open，与行业无读数同口径：绝不因为「读不到」就假装资金充足，也绝不凭空阻断）。
     """
     limits = limits or LIMITS
     reasons = []
@@ -567,6 +754,24 @@ def check_order(value, nav, industry_pct=0.0, drawdown_pct=0.0, limits=None,
     if drawdown_pct >= limits["drawdownPct"]:
         action = "blocked"
         reasons.append(f"回撤 {drawdown_pct:.1f}% 触及 {limits['drawdownPct']:.0f}% 红线，强制阻断")
+
+    # ── FR-EXEC-003 资金检查（可选维度；缺省不参与，历史调用零改动）────────────────
+    if isinstance(funds, dict) and funds.get("action") in ("blocked", "noted", "unknown"):
+        readings = funds.get("readings") if isinstance(funds.get("readings"), dict) else {}
+        fields = funds.get("funding_basis_field")
+        basis = readings.get("buyingPower")
+        if funds.get("action") == "blocked":
+            action = "blocked"
+            reasons.append(
+                f"资金检查：订单金额 {value:.2f} > 可用购买力 {basis}"
+                f"（字段 {fields or '—'}，来源 {funds.get('source') or '—'}，"
+                f"as_of {funds.get('as_of') or '—'}）→ 强制阻断")
+        elif funds.get("action") == "unknown":
+            reasons.append(f"资金检查无读数，未参与阻断（原因：{funds.get('reason') or 'unknown'}）")
+        else:
+            reasons.append(
+                f"资金检查：订单金额 {value:.2f} ≤ 可用购买力 {basis}"
+                f"（字段 {fields or '—'}）→ 通过（仅留痕）")
     return action, reasons
 
 
@@ -679,6 +884,41 @@ def _row_market_value(row):
         if number is not None:
             return number
     return 0.0
+
+
+#: 模拟账户 ``market_id`` → 市场链（与 ``v3_analytics.SIM_MARKET_TO_CHAIN`` 同源实测口径）。
+_SIM_MARKET_CHAIN = {1: "HK", 3: "SH", 100: "US"}
+
+
+def _sim_market_chain(value):
+    """账户分组的 ``market`` → 市场链（表外/非法 → ``None``，不猜）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)) and float(value).is_integer():
+        return _SIM_MARKET_CHAIN.get(int(value))
+    text = str(value).strip().upper()
+    if text in ("SH", "SZ", "BJ", "HK", "US"):
+        return "SH" if text in ("SH", "SZ", "BJ") else text
+    if text.isdigit():
+        return _SIM_MARKET_CHAIN.get(int(text))
+    return None
+
+
+def _first_field(mapping, keys):
+    """按优先级取第一个**可解析数值**的字段名 → 命中字段名 / ``None``。"""
+    for key in keys:
+        if _number((mapping or {}).get(key)) is not None:
+            return key
+    return None
+
+
+def _first_of(mapping, keys):
+    """按优先级取第一个可解析数值 → 值 / ``None``（口径与 ``_first_field`` 一致）。"""
+    for key in keys:
+        number = _number((mapping or {}).get(key))
+        if number is not None:
+            return number
+    return None
 
 
 def positions_nav(envelope):
@@ -1101,7 +1341,7 @@ class OmsLedger:
             "confirmation_envelope": confirmation,
         }
 
-    def _upsert(self, orders, order, context, plan_record, industry=None):
+    def _upsert(self, orders, order, context, plan_record, industry=None, funds=None):
         plan_id = str(plan_record.get("plan_id") or "")
         symbol = str(order.get("symbol") or "")
         side = str(order.get("side") or "")
@@ -1110,6 +1350,13 @@ class OmsLedger:
         value = qty * price
         order_id = str(order.get("client_order_id")
                        or f"{plan_id}-{symbol}-{side}")
+        # FR-EXEC-003 资金检查（**可选维度**）：给了 ``funds`` 才参与判定；不给则与历史逐字段一致。
+        # ``funds`` 是 ``v3_analytics.funding_check_data`` 的**同活订单金额**读数（只读 account_funds）。
+        order_funds = None
+        if callable(funds):
+            order_funds = funds(value)
+        elif isinstance(funds, dict):
+            order_funds = {**funds, "orderValue": value}
         action, reasons = check_order(
             value, context["nav"], context["industry_pct"], context["drawdown_pct"],
             industry_source=context.get("industry_source"),
@@ -1119,7 +1366,8 @@ class OmsLedger:
             industry_missing=context.get("industry_missing"),
             industry_universe=context.get("industry_universe"),
             industry_market=context.get("industry_market"),
-            industry_reason=context.get("industry_reason"))
+            industry_reason=context.get("industry_reason"),
+            funds=order_funds)
         if action == "manual" and context["nav"] <= 0:
             reasons.append(f"NAV 不可用（{context['nav_source']}）：不折算，保守退回人工确认")
         # 行业红线阻断**单独成态**（blocked_industry）：单一行业 20% 与最大回撤 15% 都是硬阻断，
@@ -1183,14 +1431,32 @@ class OmsLedger:
             "updated_at": stamp,
             "history": history[-20:],
         }
+        if isinstance(order_funds, dict):
+            # 只增字段：既有读取方按名取值，不受影响；资金检查没接线时这一项不出现。
+            record["funds_check"] = {
+                "action": order_funds.get("action"),
+                "reason": order_funds.get("reason"),
+                "orderValue": order_funds.get("orderValue", value),
+                "readings": order_funds.get("readings"),
+                "fundingBasisField": order_funds.get("funding_basis_field"),
+                "source": order_funds.get("source"),
+                "as_of": order_funds.get("as_of"),
+                "market": order_funds.get("market"),
+                "basisNote": order_funds.get("basisNote"),
+            }
         orders[order_id] = record
         return record
 
-    def sync(self):
+    def sync(self, funds=None):
         """重新对账：``plan`` → 登记/分级 → 与 ``orders_open`` 命中 → 落盘。
 
         行业暴露按**订单所属市场**取（``_industry_contexts``），跨市场不合并；每个市场
         至多现取一次（缓存新鲜则一次上游都不打）。
+
+        ``funds``（FR-EXEC-003 资金检查，**缺省 ``None`` → 行为与历史逐字段一致**）：
+        给定时只读调一次 ``account_funds``（同一市场链分组求和），并对每张订单按
+        **该单自己的金额**做资金检查（``action="blocked"`` 时该单升级为 ``blocked``，
+        原因写进 ``risk.reasons`` 与新增的 ``funds_check`` 字段）。**不触任何写/交易端点**。
         """
         plan = self._call("plan", {})
         if not isinstance(plan, dict) or not plan.get("ok"):
@@ -1199,6 +1465,7 @@ class OmsLedger:
         value = plan.get("value") if isinstance(plan.get("value"), dict) else {}
         plans = [row for row in (value.get("plans") or []) if isinstance(row, dict)]
         contexts, industry_error, industry_base = self._industry_contexts(plans=plans)
+        fund_checker, funds_error = self._funds_checker(funds)
         orders = self.read()
         seen = []
         for plan_record in plans:
@@ -1208,7 +1475,8 @@ class OmsLedger:
                 market = v3_risk_gate.market_of_order(order.get("symbol"))
                 industry = contexts.get(v3_risk_gate.industry_context_key(market))
                 record = self._upsert(orders, order, context=industry["context"],
-                                      plan_record=plan_record, industry=industry)
+                                      plan_record=plan_record, industry=industry,
+                                      funds=fund_checker)
                 seen.append(record["id"])
         self.write(orders)
         # 结果里的行业读数 = 本次实际读到的各市场里**最严**的那个（一个都没读到 → 如实 null）
@@ -1232,9 +1500,75 @@ class OmsLedger:
                   "industry_markets": {key: item.get("industry_source")
                                        for key, item in sorted(contexts.items())},
                   "industry_error": industry_error,
+                  "funds_check": (None if fund_checker is None
+                                  else {"source": "workbench/account_funds",
+                                        "error": funds_error,
+                                        "note": "逐单按订单金额比对可用购买力；"
+                                                "无购买力字段时 action=unknown（不改判定）"}),
                   "stages": self.stage_counts_of(orders)}
         self._append_sync(result)
         return {"ok": True, **result}
+
+    def _funds_checker(self, funds):
+        """构造逐单资金检查闭包 ``(order_value) -> 读数 | None``（只读 ``account_funds``）。
+
+        ``funds`` 为 ``None`` → 返回 ``(None, None)``（**不接资金维度**，与历史一致）；
+        为 ``False`` 同样不接（显式关闭）；否则现读一次 ``account_funds``（每轮一次，不按订单重复打上游）。
+        """
+        if funds is None or funds is False:
+            return None, None
+        envelope = self._call("account_funds", {})
+        value = _value_or_none(envelope) or {}
+        rows = []
+        for group in (value.get("groups") or []):
+            if not isinstance(group, dict):
+                continue
+            market = _sim_market_chain(group.get("market"))
+            cash = group.get("cash") if isinstance(group.get("cash"), dict) else {}
+            rows.append({
+                "market": market,
+                "acc_id": group.get("acc_id"),
+                "totalAssets": _number(cash.get("total_assets", cash.get("total_asset"))),
+                "buyingPower": _first_of(cash, ("power", "max_power_long", "available_funds")),
+                "cash": _number(cash.get("cash", cash.get("balance"))),
+                "buyingPowerField": _first_field(cash, ("power", "max_power_long",
+                                                        "available_funds")),
+            })
+        source = value.get("source")
+        as_of = value.get("as_of")
+        error = None
+        if not rows:
+            error = _error_text(envelope) if not envelope.get("ok") else "资金响应里没有账户分组"
+        elif not any(row["buyingPower"] is not None for row in rows):
+            error = ("资金读数里没有购买力字段（power / max_power_long / available_funds）→ "
+                     "资金检查 no-data（不改既有判定）")
+
+        def checker(order_value):
+            scoped = [row for row in rows if row["buyingPower"] is not None]
+            return {
+                "action": "unknown" if not scoped else (
+                    "blocked" if (_number(order_value) or 0.0) > sum(
+                        row["buyingPower"] for row in scoped) else "noted"),
+                "orderValue": order_value,
+                "readings": {"buyingPower": (sum(row["buyingPower"] for row in scoped)
+                                             if scoped else None),
+                             "cash": (sum(row["cash"] for row in rows
+                                          if row["cash"] is not None) or None)},
+                "funding_basis_field": sorted({row["buyingPowerField"] for row in scoped
+                                               if row["buyingPowerField"]}),
+                "accounts": rows,
+                "source": source, "as_of": as_of,
+                "market": None,
+                "basisNote": ("购买力按账户分组求和（不跨市场/币种折算）；"
+                              "权益不作可用资金"),
+                "reason": (f"订单金额 {order_value} 与可用购买力比对（字段 "
+                           f"{sorted({row['buyingPowerField'] for row in scoped if row['buyingPowerField']})}）"
+                           if scoped else
+                           f"资金读数里没有购买力字段（power/max_power_long/available_funds）："
+                           f"{error or 'unknown'}"),
+            }
+
+        return checker, error
 
     # ---- 行业读数：缓存快照（不打上游）与对账分级（可现取一次）----
     def industry_readings(self, market=None, *, max_age_ms=None, now=None):
@@ -1895,6 +2229,7 @@ def register(app, v3_run, home, deps=None):
                 note += f" schedule 工具取数失败：{_error_text(schedule)}"
             # MCP 工具面真值：每个请求现读注册表（重启后 v3_* 桥接工具一并计入）
             surface = mcp_tool_surface(app)
+            headless = _headless_status(home_path)
             return {
                 "ok": True,
                 "channels": {
@@ -1914,8 +2249,13 @@ def register(app, v3_run, home, deps=None):
                     },
                     "sdk": {"status": "unavailable", "reason": SDK_REASON,
                             "protocol": SDK_PROTOCOL},
-                    "headless": {"status": "unavailable", "reason": HEADLESS_REASON,
-                                 "command": HEADLESS_COMMAND},
+                    # Headless 通道：**已实现**（server/v3_headless.py），这里的 status 说的是
+                    # 「本进程有没有把它装配进来」，不再是「有没有这个能力」。字段值全部来自
+                    # 真实读数（见 _headless_status）。
+                    "headless": {"status": headless["status"], "reason": headless["reason"],
+                                 "command": HEADLESS_COMMAND,
+                                 "registered": headless["registered"],
+                                 "schedulerAlive": headless["schedulerAlive"]},
                 },
                 "scheduler": {
                     "rules": [],
@@ -1927,10 +2267,7 @@ def register(app, v3_run, home, deps=None):
                     "critical": bool(value.get("critical")),
                     "note": note,
                 },
-                "headless": {"today": {"total": 0, "success": 0, "failed": 0, "avgMs": 0,
-                                       "killed": 0},
-                             "breaker": None, "last": [],
-                             "status": "unavailable", "reason": HEADLESS_REASON},
+                "headless": headless,
                 "generated_at": _now(),
             }
         return await respond(build)
@@ -2026,8 +2363,25 @@ def register(app, v3_run, home, deps=None):
         return await respond(build)
 
     @app.post("/api/v3/oms/sync")
-    async def v3_oms_sync():
-        return await respond(ledger.sync)
+    async def v3_oms_sync(request: Request):
+        """重新对账（**本地台账动作，不出订单**）。
+
+        ``?funds=1``（或请求体 ``{"funds": true}``）时，额外做一次**只读**的
+        FR-EXEC-003 资金检查：逐单按订单金额比对 ``account_funds`` 的真实可用购买力，
+        资金不足的单升级为 ``blocked`` 并写进 ``risk.reasons`` / ``funds_check``。
+        **缺省不接**（``funds`` 未给 → 与历史逐字段一致）；无论开关如何，本端点都不触达
+        任何下单/改单/撤单/切模式通道。
+        """
+        want_funds = (request.query_params.get("funds") or "").strip().lower() in (
+            "1", "true", "yes", "on")
+        if not want_funds:
+            try:
+                body = await request.json()
+            except Exception:  # noqa: BLE001 —— 空体/坏体按「不给开关」处理
+                body = None
+            if isinstance(body, dict) and body.get("funds") in (True, 1, "1", "true"):
+                want_funds = True
+        return await respond(lambda: ledger.sync(funds=want_funds))
 
     # ── 7. 事件（直接透传 events 工具信封）───────────────────────────────────
     @app.get("/api/v3/events")
@@ -2081,12 +2435,11 @@ def register(app, v3_run, home, deps=None):
                     return _failure("market/bad-market", "market 需为 SH / HK / US")
             decision, decision_path, decision_note = last_strategy_run(home_path, code)
             sources = call("sources", {})
+            headless = _headless_status(home_path)
             payload = {
                 "ok": True,
-                "headless": {"today": {"total": 0, "success": 0, "failed": 0, "avgMs": 0,
-                                       "killed": 0},
-                             "breaker": None, "last": [],
-                             "status": "unavailable", "reason": HEADLESS_REASON},
+                # 与 /api/v3/gateway 同一份真实读数（同一函数，不做第二事实源）
+                "headless": headless,
                 "sdk": {"status": "unavailable", "reason": SDK_REASON, "serverInfo": None,
                         "route": None, "lastTurn": None, "turns": [], "events": []},
                 "decision": decision,
@@ -2096,7 +2449,7 @@ def register(app, v3_run, home, deps=None):
                     "decision": (f"{decision_path}（{decision_note}）" if decision is not None
                                  else f"无数据源（{decision_path}：{decision_note}）"),
                     "sdk": SDK_REASON,
-                    "headless": HEADLESS_REASON,
+                    "headless": headless["reason"],
                     "workbench": {"ok": bool(sources.get("ok")),
                                   "data": _value_or_none(sources),
                                   "error": sources.get("error")},

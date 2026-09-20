@@ -7,10 +7,18 @@
 | 文件 | 作用 |
 |---|---|
 | `package.json` | profile 元数据；`dsh.profile.bundles` 指向**真实存在**的包 |
-| `cordis.patch.yml` | 用户 patch 层：角色 + 风控规则 + 工具白名单 + MCP 工具面 |
+| `cordis.patch.yml` | 用户 patch 层：角色 + 风控规则 + 工具白名单 + MCP 工具面 + **写/交易工具逐名拒绝**（`quant-headless-tool-deny` 行） |
 | `cordis.yml` | profile 根（空 `[]`，与官方 profile 一致；**不要**编辑它） |
 | `pnpm-workspace.yaml` | 工作区设置（`nodeLinker: hoisted` + `autoInstallPeers: false`，与官方三个 profile 逐字一致） |
+| `hooks.json` | `PreToolUse` 命令钩子：**42 个**写/交易工具名（含 `mcp__quantwb__` 前缀）一律 `exit 2` 阻断 |
+| `tool-whitelist.json` | 白名单唯一事实源（关停行 / 拒绝工具名 / matcher / 推导来源）；由 `server/v3_headless.py` 的 `deny_tool_names()` 推导同一份名单 |
 | `README.md` | 本文件 |
+
+> **平台侧会校验这份白名单**：`platform/server/v3_headless.py` 的 `verify_whitelist()` 在起
+> `dsh` 子进程**之前**检查「危险行都 disabled + 钩子行在 + matcher 覆盖全部写工具名」，
+> 任一不成立就不起进程（`outcome=whitelist-unverified`，fail-closed）。所以拷贝 profile 时
+> **必须**把 `hooks.json` 与 `tool-whitelist.json` 一起拷进 `$DSH_HOME/profiles/quant-headless/`
+> （下面的「方式 A」命令已包含这两个文件）。真机验证见 `docs/e2e-and-data-gaps.md` §19.
 
 ---
 
@@ -24,8 +32,9 @@ TMP=$(mktemp -d /tmp/dsh-quant-XXXX)
 mkdir -p "$TMP/profiles/quant-headless" "$TMP/profiles/node_modules"
 for e in ~/.dsh/profiles/node_modules/*; do ln -s "$e" "$TMP/profiles/node_modules/$(basename "$e")"; done
 
-# 2) 拷入素材（只拷 profile 真正需要的 4 个文件；README.md 不用进 profile 目录）
-cp platform/install/quant-headless/{package.json,cordis.yml,cordis.patch.yml,pnpm-workspace.yaml} \
+# 2) 拷入素材（6 个文件；README.md 不用进 profile 目录）。
+#    hooks.json / tool-whitelist.json 是**必须**的：平台起进程前会校验它们（fail-closed）
+cp platform/install/quant-headless/{package.json,cordis.yml,cordis.patch.yml,pnpm-workspace.yaml,hooks.json,tool-whitelist.json} \
    "$TMP/profiles/quant-headless/"
 
 # 3) 凭据（模型要能鉴权；不拷就只能验证组合，不能真跑）
@@ -46,7 +55,7 @@ DSH_HOME="$TMP" dsh --profile quant-headless "复盘今日 A 股持仓的行业�
 
 ```bash
 mkdir -p ~/.dsh/profiles/quant-headless
-cp platform/install/quant-headless/{package.json,cordis.yml,cordis.patch.yml,pnpm-workspace.yaml} \
+cp platform/install/quant-headless/{package.json,cordis.yml,cordis.patch.yml,pnpm-workspace.yaml,hooks.json,tool-whitelist.json} \
    ~/.dsh/profiles/quant-headless/
 dsh --profile quant-headless "…"
 ```
@@ -55,11 +64,11 @@ dsh --profile quant-headless "…"
 
 * **取数通道（唯一交互面）**：`cordis.patch.yml` 末尾 insert 了官方
   `@deepseek-ai/dsh-mcp-client` 行，指向 `http://127.0.0.1:8397/mcp`。这就是本 profile
-  与平台之间的**全部**交互：既有 77 个 `mcp__quantwb__*` 工作台工具 + `/api/v3/*` 路由
-  桥接出的 `v3_*` 工具（随路由表，当前 39 个，合计 116 个），同一 `/mcp`、同一份服务端实现
-  （见 `docs/v3-integration.md`）。**不挂任何第三方 adapter/桥接包。**
-  平台服务没起时 `failOnStartupError: false` 让工具面缺席，由模型**如实报告数据源不可达**，
-  而不是让会话崩在启动阶段。
+  与平台之间的**全部**交互：既有工作台工具 + `/api/v3/*` 路由桥接出的 `v3_*` 工具，
+  同一 `/mcp`、同一份服务端实现（见 `docs/v3-integration.md`）。**不挂任何第三方
+  adapter/桥接包。** 平台服务没起时 `failOnStartupError: false` 让工具面缺席，
+  由模型**如实报告数据源不可达**，而不是让会话崩在启动阶段。
+* **工具面模式（规格 FR-TOOLS-003 / §10 决策 3）**：见下方「一之补：工具面模式」。
 * **技能目录**：`skill-filesystem` 覆盖为仓库内
   `skills/` 与 `skills/futu-skills/`（绝对路径，换机器要改）。
 * **交易边界**：本 profile 只挂 **MCP 客户端**行。写端点仍要求人工在 Web 确认
@@ -68,6 +77,50 @@ dsh --profile quant-headless "…"
   sim→live 必须由人在 Web 输口令。**白名单是纵深的一层，不是唯一一层，也不该被当成「所以可以放心」。**
 * **监控**：`platform/deploy/monitoring/` 的告警覆盖工作台与富途限流；
   本 profile 的 `quantwb` 工具面调用会计入 `/metrics` 的 `quantwb_mcp_calls_total`。
+
+### 一之补：工具面模式（`QUANT_MCP_SURFACE`，切换只改一个环境变量）
+
+MCP 面上工具越多数，**schema 成本越大**（名称 + 描述 + 完整 inputSchema 每一轮都在
+上下文里）。规格 FR-TOOLS-003 要求「暴露一个 `list_tools` 入口和一个 `call_tool` 入口，
+让 Harness Agent 通过间接调用发现具体能力，避免上百个工具 schema 撑爆上下文窗口」。
+平台因此支持两种模式（实现在 `platform/server/mcp_discovery.py`）：
+
+| 模式 | `/mcp` 的 `tools/list` | 实测成本（2026-09-20 worktree） |
+|---|---|---|
+| `discovery`（**默认**） | 4 件直连保留（`snapshot` / `admin_status` / `v3_gateway` / `v3_tools`）+ `list_tools` + `call_tool` = **6 件** | **3,248 字符** / ≈812 token（4 字符每 token） |
+| `direct`（向后兼容） | 全部工作台工具 + 全部 `v3_*` 桥接件（随 `/api/v3/*` 路由表涨，实测 118 → 125） | **79,624 → 86,930 字符** / ≈19.9k → 21.7k token |
+
+**怎么切（改一个环境变量，然后重启平台服务）**：
+
+```bash
+# 平台服务进程读的是这个变量（不是 dsh profile 的变量）；缺省 = discovery
+QUANT_MCP_SURFACE=direct scripts/platform_service.sh restart     # 切回全量直暴露
+QUANT_MCP_SURFACE=discovery scripts/platform_service.sh restart  # 切回发现代理（默认）
+
+# 或者写进配置文件 <DSH_HOME>/trading-platform.json（部署级缺省，跟随机器）：
+#   {"service": {"mcp_surface": "direct"}}
+# 优先级：create_app(mcp_surface=...) 显式入参 > service.mcp_surface > QUANT_MCP_SURFACE
+#         > 缺省 discovery。取值只能是 discovery|direct，写错直接报错（不静默退回）。
+```
+
+切换**不影响** profile 侧任何东西：`cordis.patch.yml` 的 `quant-platform-mcp` 行不用改，
+两种模式都是同一个 `/mcp`、同一份服务端实现（代理转发的是注册表里同一个函数对象）。
+
+**选择建议**：
+
+* **默认用 `discovery`**：省掉约 96% 的 `tools/list` 上下文（≈19k token → ≈0.8k），
+  代价是「要先 `list_tools` 检索、再 `call_tool` 调用」——多 1~2 次往返。检索页
+  （20 张卡片）约 1,694 token，所以**只要一轮里要用的工具少于几十件就是净收益**；
+  另外首轮少 19k token 对长会话的上下文压力是持续收益（不是只省一次）。
+* **切 `direct` 的场合**：① 模型小/弱、多步工具编排容易走错（直连少一层间接）；
+  ② 排查「代理是不是丢了某个能力」（`tools/list` 一次看全）；
+  ③ 某次任务确定要连续用几十件不同工具（此时检索页的往返更贵）。
+* **不要**把 `direct` 当默认：规格 §10 决策 3 明确要求工具粒度控制，且一百多件 schema
+  的约 2 万 token 是**每一轮**的固定开销（不是只花一次）。
+
+> 诚实提醒：`discovery` 省的是 **context**，多的是**往返**（模型要先发现再调用）。
+> 这不是「免费优化」；上表两个数字与取舍是本仓库实测+估算，token 是按 4 字符/token 估的
+> （真实分词器不在依赖里），字符数是硬数字。复现命令见 `docs/v3-integration.md` §1.5。
 
 ---
 
@@ -124,9 +177,13 @@ spill-policy / timeout-policy 等无关行）。
 * **Harness 本地工具（9）**：`read`、`write`、`edit`、`glob`、`grep`、`read_image`、`skill`、
   `todo_write`、`exit_plan_mode`
 * **quantwb MCP 工具**：全部 `mcp__quantwb__*`（账户/行情/因子/研究/风控/推送等）。
-  这次运行报出的是 **77** 个 —— 当时 `/api/v3/*` → MCP 的反向桥接（`server/v3_mcp.py`）
-  还没落地；桥接落地后同一 `/mcp` 端点会再给出 39 个 `v3_*` 工具（合计 116），
-  数量随 `/api/v3/*` 路由表**自动**变化（路由表是唯一事实来源，测试断言一一对应）。
+  这次运行报出的是 **77** 个 —— 那是**桥接落地前**、且表面模式尚未引入时的记录；
+  现在同一 `/mcp` 端点的条数取决于 `QUANT_MCP_SURFACE`：
+  * 缺省 `discovery` → 只有 6 个 `mcp__quantwb__*`（4 件直连保留 + `list_tools` +
+    `call_tool`），其余能力经 `call_tool` 间接可达（本 profile 的会话应当报出 6 个）；
+  * `direct` → 全部工作台工具 + 全部 `v3_*` 桥接件（数量随 `/api/v3/*` 路由表**自动**变化，
+    路由表是唯一事实来源，测试断言一一对应）。
+  profile 侧不用改任何一行——切换只发生在平台服务进程（见「一之补」）。
 
 **被成功关掉的**（组合树里 `disabled: true`，共 16 行；其中 2 行是 bundle 自己关的）：
 

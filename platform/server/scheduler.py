@@ -97,7 +97,17 @@ def build_tick(home, jobs=None, now=None, conn=None):
 
     注：``sqlite3.Connection`` 自身可调用（``conn()`` 是游标的旧别名），因此**先按
     isinstance 认连接对象、再判可调用**——否则注入真实连接会被误当工厂调用而崩。
+
+    第三段（V3 Headless 通道，FR-GATEWAY-004）：headless 触发循环的 keep-alive。
+    **与本文件其它两段不同，这一段失败只留痕、绝不向上抛**：headless 是分析通道，
+    它坏掉不该把交易作业链的 tick 判成失败（那会让 /healthz 报错并让运维按交易事故处理）。
+    ``v3_headless.scheduler_tick`` 自己吞掉触发条件异常，这里再兜一层 import/运行异常。
     """
+    try:
+        from server import v3_headless  # noqa: PLC0415 —— 惰性 import，避免装配期环
+    except Exception:  # noqa: BLE001 —— 通道模块缺失不该影响交易调度
+        v3_headless = None
+
     def tick():
         if conn is None:
             connection = store.connect(store.db_path(str(home)))
@@ -124,6 +134,13 @@ def build_tick(home, jobs=None, now=None, conn=None):
             except Exception as error:  # noqa: BLE001
                 failures.append(("poll", error))
                 _record_last_error(connection, now, error)
+            if v3_headless is not None:
+                # 第三段：headless 触发循环 keep-alive（一行挂载）。
+                # 只留痕、不进 failures —— 见 build_tick docstring 的第三段说明。
+                try:
+                    v3_headless.scheduler_tick(str(home))
+                except Exception as error:  # noqa: BLE001
+                    _record_last_error(connection, now, error)
         finally:
             if close_after:
                 connection.close()

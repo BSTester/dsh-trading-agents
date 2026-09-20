@@ -10,9 +10,12 @@
     （trading/live-switch-web-only），且该分支不触达 handle、不触达 store（记录型替身零调用）；
   * R4 —— 服务层 ``plan_execute``：live 无口令拒、带口令 → queued+nonce、指令文件含
     plan_hash/expected_mode 且无口令字段、action 四映射、白名单外 action 拒；
-  * R5 —— 工具面封闭：MCP 面 116 = **工作台基础 77**（tools/list 逐名 ≡ ``mcp_tools`` 清单，
-    ``mcp_tools.TOOL_COUNT`` 仍是这个基础注册表的 77）+ **V3 桥接 39**（``/api/v3/*`` 路由
-    经 ``v3_mcp`` 桥接，全部 ``v3_`` 前缀、只读标注 36 件、与路由表一一对应）；基础面端点
+  * R5 —— 工具面封闭（**两种表面模式各一套精确断言**，期望值全部推导、不写死桥接条数）：
+    **direct** ≡ 工作台基础 77（tools/list 逐名 ≡ ``mcp_tools`` 清单，``mcp_tools.TOOL_COUNT``
+    仍是这个基础注册表的 77）++ **全部 V3 桥接件**（``/api/v3/*`` 路由经 ``v3_mcp`` 桥接，
+    全部 ``v3_`` 前缀、与路由表一一对应、只读标注按路由声明的只读集合推导）；
+    **discovery**（默认）≡ 4 件直连保留 ++ ``list_tools``/``call_tool``，且代理可达集合 ≡
+    direct 面（发现代理没丢能力，规格 FR-TOOLS-003 / §10 决策 3）；基础面端点
     工具集 ≡ store_access.endpoints() − MCP_EXCLUDED_ENDPOINTS（60 − 5 = 55，排除
     confirm-decide、设置页三端点 openapi_config/openapi_test/openapi_oauth 与 auto_pipeline）、
     输入字段与规格 §3.2（含 20b confirmation）/§3.4 逐项一致、两层都无黑名单名、未知名不触达
@@ -42,22 +45,41 @@ from fastapi.testclient import TestClient  # noqa: E402
 from mcp.server.mcpserver import MCPServer  # noqa: E402
 
 from server import app as app_module  # noqa: E402
-from server import caches, mcp_tools, store_access, v3_mcp  # noqa: E402
+from server import caches, mcp_discovery, mcp_tools, store_access, v3_mcp  # noqa: E402
 
 # ---------------------------------------------------------------------------
 # 仓库级锁定契约：MCP 面 = 工作台基础工具面 + V3 桥接面（2026-09-20 起）
 # ---------------------------------------------------------------------------
-# 与 tests/test_wp6_mcp.py 各自独立写死同一组数字（两份分别钉，任一份漂了都会红）。
-# 注意 ``app.state.mcp_tools`` 只是**基础注册表**的绑定清单；桥接面在
-# ``app.state.v3_mcp_tools`` / ``app.state.v3_mcp_bridge``。
+# 与 tests/test_wp6_mcp.py 各自独立断言同一组不变式（两份分别钉，任一份漂了都会红），
+# 但**都不写死桥接条数**：桥接面 = ``/api/v3/*`` 路由表的一次遍历，路由正在演进
+# （v3_sdk / v3_headless / v3_alerts 并行落地）。期望值一律推导：
+#   * direct    —— ``tools/list`` ≡ 基础 77 件 ++ ``bridge.names``（顺序也锁定）；
+#   * discovery —— ``tools/list`` ≡ 直连保留子集 ++ ``list_tools``/``call_tool``；
+#   * 只读数按路由声明的只读集合（``v3_mcp.NON_READONLY_PATHS``）推导。
+# 注意 ``app.state.mcp_tools`` 只是**基础注册表**的绑定清单（两种模式都是 77 件）；
+# 桥接面在 ``app.state.v3_mcp_tools`` / ``app.state.v3_mcp_bridge``。
 BASE_TOOLS = 77           # 工作台基础工具面（mcp_tools.TOOLS；逐名 + 逐件 schema 锁定）
-V3_BRIDGE_TOOLS = 39      # V3 桥接面（/api/v3/* 每条路由一件；全部 v3_ 前缀）
-V3_READONLY_TOOLS = 36    # 桥接面里标 readOnlyHint 的件数（写类 3 件 = 39 - 36）
-MCP_SURFACE = 116         # tools/list 的总数 = BASE_TOOLS + V3_BRIDGE_TOOLS
-#: 桥接面里**不**标只读的三件（逐名钉死，防「悄悄把写类标成只读」）。
-V3_NON_READONLY = frozenset({"v3_strategy_run", "v3_oms_sync", "v3_credentials"})
+DISCOVERY_KEEP = list(mcp_discovery.DIRECT_KEEP)
+DISCOVERY_PROXY = list(mcp_discovery.PROXY_NAMES)
+DISCOVERY_SURFACE = len(DISCOVERY_KEEP) + len(DISCOVERY_PROXY)
+#: 桥接面里**不**标只读的写类工具（逐名钉死，防「悄悄把写类标成只读」；条数不写死——
+#: 路由在演进，断言的是「这个集合 ≡ NON_READONLY_PATHS 的映射」）。
+V3_NON_READONLY = frozenset({"v3_strategy_run", "v3_oms_sync", "v3_credentials",
+                             "v3_sdk_prompt"})
 V3_PREFIX = "v3_"
 V3_ROUTE_PREFIX = "/api/v3/"
+
+
+def v3_route_paths(app):
+    """``/api/v3/*`` 路由表（去重排序）——桥接面的唯一事实来源。"""
+    return sorted({route.path for route in app.routes
+                   if getattr(route, "path", "").startswith(V3_ROUTE_PREFIX)})
+
+
+def declared_readonly_bridge_names(app):
+    """按路由声明推导的桥接只读工具名集合（``NON_READONLY_PATHS`` 是唯一口径）。"""
+    return {v3_mcp.tool_name(path) for path in v3_route_paths(app)
+            if path not in v3_mcp.NON_READONLY_PATHS}
 
 # R4 的动作 → 指令类型（规格 §8.2 五种指令里服务面可达的四种）。
 ACTION_COMMANDS = {"execute": "execute_plan", "cancel": "cancel_plan",
@@ -422,7 +444,7 @@ class R2ConfirmationTests(Base):
 
     def test_confirmation_read_tool_is_present_and_confirm_decide_is_absent(self):
         # app.state.mcp_tools 是**基础注册表**的绑定清单（77 件）；MCP 面总数（含 V3 桥接
-        # 39 件 = 116）由 R5ToolSurfaceTests 锁定。
+        # + 全部桥接件）由 R5ToolSurfaceTests 锁定；两种表面模式各一套。
         names = [tool.name for tool in self.app.state.mcp_tools]
         self.assertEqual(len(names), BASE_TOOLS)
         self.assertIn("confirmation", names)
@@ -616,68 +638,91 @@ class R4PlanExecuteTests(Base):
 
 
 class R5ToolSurfaceTests(Base):
-    """R5：工具面封闭（MCP 面 116 = 工作台基础 77 + V3 桥接 39 / 端点对等 − 排除集 /
+    """R5：工具面封闭（两种表面模式各自的精确集合 / 端点对等 − 排除集 /
     输入字段 / 黑名单 / 未知名不触达 handle）。"""
+
+    #: 本类默认在 **discovery**（规格要求的方向）下跑：断言「省的是 schema，不是能力」。
+    surface = mcp_discovery.DISCOVERY
 
     def setUp(self):
         super().setUp()
-        self.app = self.make_app()
+        self.app = self.make_app(mcp_surface=self.surface)
 
     def registered(self):
         return asyncio.run(self.app.state.mcp.list_tools())
 
+    def registered_names(self):
+        return [tool.name for tool in self.registered()]
+
+    def catalog(self):
+        """工具目录（两种模式都可读）：discovery 用代理实例，direct 现算同一份定义。"""
+        proxy = self.app.state.mcp_discovery
+        if proxy is not None:
+            return proxy.catalog
+        return mcp_discovery.build_catalog(mcp_tools.TOOLS, self.app.state.v3_mcp_bridge)
+
     def v3_route_paths(self):
         """``/api/v3/*`` 路由表（去重排序）——桥接面的唯一事实来源。"""
-        return sorted({route.path for route in self.app.routes
-                       if getattr(route, "path", "").startswith(V3_ROUTE_PREFIX)})
+        return v3_route_paths(self.app)
 
-    def test_exactly_116_tools_with_the_declared_names(self):
-        """MCP 面 ≡ 基础 77 件（逐名，一字未变）++ V3 桥接 39 件（全部 ``v3_`` 前缀）。
+    def test_surface_is_exactly_the_declared_names_for_this_mode(self):
+        """各模式 ``tools/list`` 精确相等（不放宽成 >=），期望值全部推导。
 
-        锁定三件事：总数 116、两份清单都与装配结果逐项相等、桥接面与 ``/api/v3/*`` 路由表
-        一一对应（不重复实现平台侧双射，直接复用 ``app.state.v3_mcp_bridge``）。
+        * ``direct``    —— 基础 77 件 ++ ``bridge.names``（顺序也锁定），条数 =
+          77 + ``len(routes)``（**路由数从路由表推，不写死**）；
+        * ``discovery`` —— 4 件直连保留 ++ ``list_tools``/``call_tool``；
+        * 两种模式共同：名字唯一；代理可达集合（discovery）≡ direct 面。
         """
         tools = self.registered()
         names = [tool.name for tool in tools]
-        self.assertEqual(MCP_SURFACE, BASE_TOOLS + V3_BRIDGE_TOOLS)
-        self.assertEqual(len(tools), MCP_SURFACE)
-        self.assertEqual(len(set(names)), MCP_SURFACE, "工具名必须唯一（两层不得重名）")
+        self.assertEqual(len(set(names)), len(names), "工具名必须唯一（两层不得重名）")
 
         self.assertEqual(mcp_tools.TOOL_COUNT, BASE_TOOLS)
         base_names = [definition.name for definition in mcp_tools.TOOLS]
         self.assertEqual(len(base_names), BASE_TOOLS)
+
         bridge = self.app.state.v3_mcp_bridge
         bridge_names = list(bridge.names)
-        self.assertEqual(len(bridge_names), V3_BRIDGE_TOOLS)
-        self.assertTrue(all(name.startswith(V3_PREFIX) for name in bridge_names))
-        # 顺序同样锁定：tools/list ≡ 基础清单 ++ 桥接清单（不多不少、不混序）
-        self.assertEqual(names, base_names + bridge_names)
-
         routes = self.v3_route_paths()
+        self.assertTrue(all(name.startswith(V3_PREFIX) for name in bridge_names))
+        # 桥接面 ⇄ /api/v3/* 路由表一一对应（不重复实现平台侧双射）
         self.assertEqual(sorted(bridge.paths), routes)
         self.assertEqual(sorted(bridge_names),
                          sorted(v3_mcp.tool_name(path) for path in routes))
         self.assertEqual(len(bridge.definitions), len(bridge.paths))
 
-        # 只读标注：桥接面 36 只读 + 3 写类逐名（服务端模型属性名是 snake_case）
-        readonly = {tool.name for tool in tools
-                    if tool.name.startswith(V3_PREFIX)
-                    and getattr(tool.annotations, "read_only_hint", None) is True}
-        self.assertEqual(len(readonly), V3_READONLY_TOOLS)
-        self.assertEqual(set(bridge_names) - readonly, set(V3_NON_READONLY))
-        self.assertEqual(set(V3_NON_READONLY),
-                         {v3_mcp.tool_name(path) for path in v3_mcp.NON_READONLY_PATHS})
+        if self.surface == mcp_discovery.DIRECT:
+            self.assertEqual(len(tools), BASE_TOOLS + len(routes))
+            self.assertEqual(names, base_names + bridge_names)
+            # 只读标注：按路由声明的只读集合推导（不写死 36/38）
+            readonly = {tool.name for tool in tools
+                        if tool.name.startswith(V3_PREFIX)
+                        and getattr(tool.annotations, "read_only_hint", None) is True}
+            self.assertEqual(readonly, declared_readonly_bridge_names(self.app))
+            self.assertEqual(set(bridge_names) - readonly, set(V3_NON_READONLY))
+            self.assertEqual(set(V3_NON_READONLY),
+                             {v3_mcp.tool_name(path) for path in v3_mcp.NON_READONLY_PATHS})
+        else:
+            self.assertEqual(len(tools), DISCOVERY_SURFACE)
+            self.assertEqual(names, DISCOVERY_KEEP + DISCOVERY_PROXY)
+            self.assertEqual(self.app.state.mcp_surface, mcp_discovery.DISCOVERY)
+            # 发现代理没丢能力：代理可达集合 ≡ direct 面（推导式，不写死条数）
+            self.assertEqual(set(self.app.state.mcp_discovery.catalog),
+                             set(base_names) | set(bridge_names))
+            self.assertEqual(len(self.app.state.mcp_discovery.catalog),
+                             BASE_TOOLS + len(routes))
 
     def test_confirm_decide_is_not_a_tool_and_never_reaches_any_channel(self):
         """不变式 1（规格 §5.1 A7）：``confirm-decide`` 绝不进 MCP 工具面。
 
         唯一能批准实盘操作的通道必须只由独立 Web 的用户点击触发；做成工具就等于让模型
         自己发起、自己批准。这里同时断言工具名（连中划线/下划线两种写法都没有）与端点映射表。
+        discovery 模式下再加一条：**代理也无法凭空造出它**（``call_tool`` 报未知工具）。
         """
         names = [definition.name for definition in mcp_tools.TOOLS]
         self.assertNotIn("confirm_decide", names)
         self.assertNotIn("confirm-decide", names)
-        self.assertNotIn("confirm_decide", [tool.name for tool in self.registered()])
+        self.assertNotIn("confirm_decide", self.registered_names())
         self.assertNotIn("confirm-decide", set(mcp_tools.ENDPOINT_TOOL_ENDPOINTS.values()))
         # WP8 任务 7：设置页三端点（凭据读/写/授权）与 confirm-decide 同类——有意排除集；
         # WP10 任务 2 的 auto_pipeline（自动执行总开关）同理：模型不得自拨
@@ -688,11 +733,54 @@ class R5ToolSurfaceTests(Base):
                                     "modify_user_security", "info_rehab", "rules-decide",
                                 # WP15 任务 3：值班队列的只读列表有意 HTTP-only
                                 "research-tasks-list"}))
-        # 只读的 confirmation 工具**在**工具面里（读待确认不是批准）
+        # 只读的 confirmation 工具**在**工具面（direct）与代理目录（discovery）里——
+        # 读待确认不是批准。代理目录两种模式都有（它来自两个注册表，与表面模式无关）。
         self.assertIn("confirmation", names)
+        self.assertIn("confirmation", set(self.catalog()))
         with self.assertRaises(Exception) as caught:
             asyncio.run(self.app.state.mcp.call_tool("confirm_decide", {}))
         self.assertIn("confirm_decide", str(caught.exception))
+
+    def test_unknown_name_never_reaches_the_handle_in_either_mode(self):
+        """未知名**不触达 handle**：direct 由 SDK 报「未知工具」，discovery 由代理报
+        ``mcp/unknown-tool`` + 「可用 list_tools 检索」——绝不静默返回空。"""
+        proxy = self.app.state.mcp_discovery
+        if proxy is None:
+            with self.assertRaises(Exception) as caught:
+                asyncio.run(self.app.state.mcp.call_tool("not_a_tool", {}))
+            self.assertIn("not_a_tool", str(caught.exception))
+            return
+        result, card, target = asyncio.run(proxy.call("not_a_tool", {}))
+        self.assertIsNone(card)
+        self.assertIsNone(target)
+        body = mcp_tools.result_payload(result)
+        self.assertFalse(body["ok"])
+        self.assertEqual(body["error"]["code"], "mcp/unknown-tool")
+        self.assertIn("list_tools", body["error"]["message"])
+
+    def test_no_trade_write_endpoint_is_bridged_in_this_mode(self):
+        """两种模式下桥里都绝无交易写端点（下单/改单/撤单/切模式/执行计划）。"""
+        forbidden = ("trade", "switch-mode", "plan-execute", "confirm-decide", "sim_trade")
+        for path in self.app.state.v3_mcp_bridge.paths:
+            lowered = path.lower()
+            self.assertFalse(any(token in lowered for token in forbidden), path)
+        # 六域目录里：交易写工具的卡片绝不标只读（``store_access.order_operation`` 判定，
+        # 与交易闸门同源）——「代理能把写类当只读悄悄转发」这条不可能发生。
+        catalog = self.catalog()
+        for name in ("trade_place", "trade_modify", "trade_cancel"):
+            self.assertIn(name, catalog)
+            self.assertIsNot(catalog[name].readonly, True,
+                             f"{name} 是写类工具，卡片不得标只读")
+
+
+class R5DirectToolSurfaceTests(R5ToolSurfaceTests):
+    """同一套 R5 断言在 ``QUANT_MCP_SURFACE=direct``（全量直暴露，向后兼容口径）下再跑一遍。"""
+
+    surface = mcp_discovery.DIRECT
+
+
+class R5ToolSurfaceShapeTests(R5ToolSurfaceTests):
+    """R5 的**形状**断言（端点对等 / 输入字段 / 黑名单 / 封闭 schema）：与表面模式无关。"""
 
     def test_endpoint_tool_set_equals_store_endpoints_minus_excluded(self):
         """端点工具集 ≡ 端点清单（22 legacy + WP7 7 + WP8 直通 8 + WP8 行情 9
@@ -719,32 +807,42 @@ class R5ToolSurfaceTests(Base):
                              set(optional), name)
 
     def test_published_schemas_are_closed(self):
-        """两层都要封闭：基础 77 件对 ``mcp_tools.TOOLS``、桥接 39 件对 ``v3_mcp`` 的装配结果。
+        """面上每件工具都封闭：``additionalProperties:false`` + 字段集/必填集 ≡ 定义。
 
-        不放宽：每件工具都断言 ``additionalProperties:false`` + 字段集/必填集与
-        ``ToolDefinition`` 逐项相等（字段集漂一格就红）。
+        两种模式各按自己的面断言（发现代理的 schema 成本是**省下**了，不是没校验）：
+
+        * ``direct``    —— 基础 77 件对 ``mcp_tools.TOOLS``、全部桥接件对 ``bridge.definitions``；
+        * ``discovery`` —— 面上的 6 件逐件对「基础 ``TOOLS`` / 桥接 ``definitions`` /
+          代理自己的签名（``mcp_discovery.list_tools_signature|call_tool_signature``）」；
+        * 字段集漂一格就红（不放宽）。
         """
         tools = self.registered()
         bridge = self.app.state.v3_mcp_bridge
-        layers = (
-            ("base", [tool for tool in tools if not tool.name.startswith(V3_PREFIX)],
-             {definition.name: definition for definition in mcp_tools.TOOLS}),
-            ("v3", [tool for tool in tools if tool.name.startswith(V3_PREFIX)],
-             {definition.name: definition for definition in bridge.definitions}),
-        )
-        for label, surface, definitions in layers:
-            self.assertEqual(len(surface), len(definitions), label)
-            for tool in surface:
-                definition = definitions[tool.name]
-                schema = tool.input_schema
-                self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
-                self.assertIs(schema.get("additionalProperties"), False, tool.name)
-                self.assertEqual({param.name for param in definition.params if param.required},
-                                 set(schema.get("required", [])), tool.name)
-        # 动作字段是枚举：白名单外 action 在 schema 层就被拒（handler 白名单是第二道）
-        execute = next(tool for tool in tools if tool.name == "plan_execute")
-        self.assertEqual(execute.input_schema["properties"]["action"]["anyOf"][0]["enum"],
-                         ["execute", "cancel", "kill", "unkill"])
+        registry = {definition.name: definition for definition in mcp_tools.TOOLS}
+        registry.update((definition.name, definition) for definition in bridge.definitions)
+        registry.setdefault(mcp_discovery.LIST_TOOL, mcp_tools.ToolDefinition(
+            mcp_discovery.LIST_TOOL, "", None, tuple(mcp_discovery.list_tools_signature())))
+        registry.setdefault(mcp_discovery.CALL_TOOL, mcp_tools.ToolDefinition(
+            mcp_discovery.CALL_TOOL, "", None, tuple(mcp_discovery.call_tool_signature())))
+        for tool in tools:
+            definition = registry[tool.name]
+            schema = tool.input_schema
+            self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
+            self.assertIs(schema.get("additionalProperties"), False, tool.name)
+            self.assertEqual({param.name for param in definition.params if param.required},
+                             set(schema.get("required", [])), tool.name)
+        self.assertEqual(len(tools), DISCOVERY_SURFACE if self.surface == mcp_discovery.DISCOVERY
+                         else BASE_TOOLS + len(self.v3_route_paths()))
+        # 动作字段是枚举（在 direct 面直连发布；discovery 面经 ``call_tool`` 转发，
+        # 枚举校验在实现内部——这里断言的是定义里的取值域本身没有退化）
+        if self.surface == mcp_discovery.DIRECT:
+            execute = next(tool for tool in tools if tool.name == "plan_execute")
+            self.assertEqual(execute.input_schema["properties"]["action"]["anyOf"][0]["enum"],
+                             ["execute", "cancel", "kill", "unkill"])
+        else:
+            plan = registry["plan_execute"]
+            action = next(param for param in plan.params if param.name == "action")
+            self.assertEqual(action.kind, "action")  # Literal[...] 取值域由 _TYPES 决定
 
     def test_no_blacklisted_names(self):
         names = [definition.name for definition in mcp_tools.TOOLS]

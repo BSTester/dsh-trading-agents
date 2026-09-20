@@ -1,0 +1,17 @@
+# 本 profile 的 pnpm 工作区设置（与官方 sdk/headless/web 三个 profile 逐字一致）
+#
+# 三项设置的由来（都是实测结论，见 quant-headless 的同一文件与 docs/v3-integration.md）：
+#   * `dsh plugin --profile <name> add <pkg>` 实际是把参数转发给 pnpm 在 profile 目录里跑；
+#   * pnpm 默认 `autoInstallPeers: true` 会把被安装包的 peerDependency 也去 registry 装一遍，
+#     而 `@deepseek-ai/cordis` / `dsh-tools` 的 npm **latest** 标签停在 0.0.x-rc，声明
+#     `>=0.1.0` 的 peer 会以 ERR_PNPM_NO_MATCHING_VERSION 失败（满足 `>=0.1.0` 的是 next 标签
+#     0.1.5-rc.2）。关掉 autoInstallPeers 后 pnpm 沿用共享目录里已装好的那份；
+#   * `nodeLinker: hoisted` 与既有共享 node_modules 的扁平布局一致，profile 目录能向上解析。
+#
+# 本 profile 的工具面只依赖**两个已装好的官方包**（dsh-mcp-client 在共享目录、
+# quant-tool-whitelist 由本目录 file: 安装），没有第三方风险。
+packages:
+  - .
+
+nodeLinker: hoisted
+autoInstallPeers: false

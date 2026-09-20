@@ -42,7 +42,12 @@
 * **工具面 = 两段，同一个 `/mcp`**：
   * **既有工作台工具 77 个**（`snapshot`、`series`、`positions`、`trade_place`…）——
     名字与行为**一字未改**；
-  * **`/api/v3/*` 路由桥接出的 `v3_*` 工具**（当前 **39** 个，随路由表自动增减）。
+  * **`/api/v3/*` 路由桥接出的 `v3_*` 工具**（随路由表自动增减；本 worktree 41 个）；
+  * **两个发现代理入口**（只有 `discovery` 模式直连可见）：`list_tools`（检索，返回精简卡片）
+    与 `call_tool`（转发到同一实现）。见 §1.5.1–1.5.4。
+* **表面模式**（`QUANT_MCP_SURFACE=discovery|direct`，缺省 `discovery`）：决定上面这些工具
+  **哪些直接进 `tools/list`**。`direct` = 全部直连（老行为）；`discovery` = 6 件
+  （4 件直连保留 + 两个入口），其余经 `call_tool` 间接可达——**省的是 schema token，不是能力**。
 * **桥接实现**：`platform/server/v3_mcp.py`（装配点在
   `platform/server/app.py` 的 `v3_bridge, v3_tool_names = v3_mcp.register(app.state.mcp, app)`）。
   **唯一事实来源是 FastAPI 路由表**：遍历 `app.routes` 里所有 `/api/v3/*` 路由，
@@ -116,66 +121,155 @@ for d in app.state.v3_mcp_bridge.definitions:
           '只读' if d.endpoint not in v3_mcp.NON_READONLY_PATHS else '写入')"
 ```
 
-| 工具 | 路由 | 只读 | 入参 |
-|---|---|---|---|
-| `v3_audit` | `/api/v3/audit` | 只读 | window |
-| `v3_brain` | `/api/v3/brain` | 只读 | market |
-| `v3_credentials` | `/api/v3/credentials` | 写入（写动作封死） | action,key,value |
-| `v3_events` | `/api/v3/events` | 只读 | ticker,window,days |
-| `v3_execution` | `/api/v3/execution` | 只读 | market |
-| `v3_execution_quality` | `/api/v3/execution/quality` | 只读 | market,mode |
-| `v3_factors_matrix` | `/api/v3/factors/matrix` | 只读 | tickers,factor,forward_days,forward,market |
-| `v3_financials` | `/api/v3/financials` | 只读 | ticker,statement,periods |
-| `v3_gateway` | `/api/v3/gateway` | 只读 | - |
-| `v3_market` | `/api/v3/market` | 只读 | ticker,period,limit |
-| `v3_market_watchlist` | `/api/v3/market/watchlist` | 只读 | n,market |
-| `v3_markets_calendar` | `/api/v3/markets/calendar` | 只读 | markets,now |
-| `v3_markets_calendar_refresh` | `/api/v3/markets/calendar/refresh` | 只读（只写缓存） | markets,horizon_days |
-| `v3_metrics` | `/api/v3/metrics` | 只读 | - |
-| `v3_metrics_probe_refresh` | `/api/v3/metrics/probe/refresh` | 只读（只写缓存） | markets,limit_pct |
-| `v3_ml_backtest` | `/api/v3/ml/backtest` | 只读 | ticker,window,rebalanceDays,limit,market |
-| `v3_ml_models` | `/api/v3/ml/models` | 只读 | market,ticker,window,horizon,limit,cost_bps |
-| `v3_ml_sweep` | `/api/v3/ml/sweep` | 只读 | ticker,windows,rebalance,limit,market |
-| `v3_news` | `/api/v3/news` | 只读 | symbol,limit |
-| `v3_oms_orders` | `/api/v3/oms/orders` | 只读 | market |
-| `v3_oms_sync` | `/api/v3/oms/sync` | 写入（改本地台账） | - |
-| `v3_openbb` | `/api/v3/openbb` | 只读 | symbol |
-| `v3_orderbook` | `/api/v3/orderbook` | 只读 | ticker |
-| `v3_overview` | `/api/v3/overview` | 只读 | market |
-| `v3_plates` | `/api/v3/plates` | 只读 | market,plate_class |
-| `v3_research` | `/api/v3/research` | 只读 | market |
-| `v3_research_report_pdf` | `/api/v3/research/report.pdf` | 只读 | id,ticker |
-| `v3_research_tasks` | `/api/v3/research/tasks` | 只读 | market |
-| `v3_risk` | `/api/v3/risk` | 只读 | - |
-| `v3_risk_analytics` | `/api/v3/risk/analytics` | 只读 | limit,confidence,benchmark,weights,market |
-| `v3_risk_industry` | `/api/v3/risk/industry` | 只读 | tickers,market,limit_pct |
-| `v3_sentiment` | `/api/v3/sentiment` | 只读 | symbol,market,days,limit |
-| `v3_settings` | `/api/v3/settings` | 只读 | - |
-| `v3_sources_status` | `/api/v3/sources/status` | 只读 | keys |
-| `v3_spot` | `/api/v3/spot` | 只读 | limit |
-| `v3_strategy` | `/api/v3/strategy` | 只读 | market |
-| `v3_strategy_run` | `/api/v3/strategy/run` | 写入（落盘研究轮） | topN,window,market,universe |
-| `v3_tools` | `/api/v3/tools` | 只读 | domain |
-| `v3_tushare` | `/api/v3/tushare` | 只读 | api,ts_code,period,limit |
+下表在**两种表面模式**下都成立——表里列的是**能力**（`call_tool` 可达集合 ≡ 这个集合）。
+「本模式是否直连」一列说明它出现在 `/mcp` 的 `tools/list` 里的方式：
 
-**数量口径（四个不同的东西，别混；下方每个数字都附本轮实测命令）**
+| 直连口径 | 含义 |
+|---|---|
+| `direct` | `tools/list` 里就有这件工具（表面模式 `direct`） |
+| 代理 | `tools/list` 里只有 `list_tools`/`call_tool`；这件工具经 `call_tool` 转发（表面模式 `discovery`，**默认**） |
+
+#### 1.5.1 两种表面模式：成本对比（规格 FR-TOOLS-003 / §10 决策 3）
+
+```bash
+# 测量脚本（两种模式各装配一次真应用，走真 MCP 协议取 tools/list；只读，不碰线上 8397）
+cd platform && ~/.dsh/trading-venv/bin/python -B tools/mcp_surface_report.py
+# 机器可读：加 --json
+```
+
+本 worktree 实测（`tools/list` 的 `json.dumps(tools)` 字符数；token 按 4 字符/token
+**估算**——真实分词器不在依赖里，**字符数是硬数字**）。**`direct` 的条数会随并行开发演进**
+（`/api/v3/*` 路由新增：v3_sdk / v3_headless / v3_alerts…），因此下表给的是实测区间与
+比值；`discovery` 恒为 6（4 件直连保留 + 两个入口，与路由数无关）：
+
+| 模式 | `tools/list` 条数 | 字符数 | ≈token | 说明 |
+|---|---|---|---|---|
+| `direct` | 77 + 全部 `v3_*` 桥接件（实测 **118 → 125**，随路由表涨） | **79,624 → 86,930** | **≈19.9k → 21.7k** | 全量直暴露，向后兼容 |
+| `discovery`（**默认**） | **6** | **3,248** | **≈812** | 省 **≈96%**（保留 3.7%~4.1%） |
+
+discovery 模式**多花的那一次往返**：`list_tools` 默认一页 20 张卡片 = 5,081 字符
+≈1,270 token，命中总数与分页信息一起返回（`has_more` / `next_offset`）。
+因此单轮净收益 ≈18.3k~20.5k token；**要连续检索 15 页以上（300+ 件）才会把省下的吃回去**，
+而工具面总量只有一百多件。
+
+**取舍（诚实写清）**：省的是 **context**，多的是 **往返**。
+
+* 首轮少 ≈19k token，且这个开销在 `direct` 下是**每一轮**的固定成本（工具 schema 进
+  系统提示词）；长会话里这是持续收益。
+* 代价是要多做 1~2 次工具往返（先 `list_tools` 检索、再 `call_tool` 调用），且模型必须
+  先知道「有 `list_tools` 这个东西」——所以发现代理必须**直连保留**（见下）。
+* 一轮里要用的工具越多，`direct` 的相对劣势越小；但要连续用几十件不同工具的场景在
+  研究/取数工作流里是少数，且那种场景下 `direct` 的 2 万 token 仍然是每轮成本。
+* 结论：**默认 `discovery`**，需要弱模型/排障/极限少往返时切 `direct`（一行环境变量）。
+
+#### 1.5.2 discovery 模式直连保留哪 4 件、为什么
+
+| 直连保留 | 为什么留它 |
+|---|---|
+| `snapshot` | 工作台全量快照：一次调用看清账户模式/在途/缺口——「账户面探活」 |
+| `admin_status` | 本地运行台账与维护状态——「本地服务面探活」 |
+| `v3_gateway` | 通道状态（mcp/sdk/headless）、调度心跳、作业历史——「通道面探活」 |
+| `v3_tools` | 六域工具**目录**（data/alpha/ml/risk/execution/ecosystem）——「能力面速览」 |
+
+四件都是只读、无副作用的「开胃菜」，合起来覆盖「先探活再看详情」的四个方向；合计 schema
+约千级字符（6 件共 3,248 字符含两个代理入口）。反例：`series` / `positions` / `trade_place`
+这类高频**业务**工具不直连——数量多、schema 大，且调用前本就该先检索（一次 `list_tools`
+就能拿到必填参数名）。
+
+#### 1.5.3 发现代理能不能绕过约束？——不能（同一份实现 + 同一套闸门）
+
+* **同一份实现**：`call_tool` 转发的是**注册进 MCPServer 的同一个函数对象**
+  （基础面 `BoundTool.fn`、桥接面 `v3_mcp.V3Bridge.bound[name]`），不是同源代码——
+  `platform/tests/test_mcp_discovery.py` 用 `is` 同一性 + 同一实参响应的逐字段相等断言。
+* **凭据封死依然生效**：`v3_credentials` 的 `save`/`clear` 封死在
+  `V3Bridge.__call__`（`v3/credentials-web-only`），**先于 endpoint 判定**；经 `call_tool`
+  转发时同样零调用 handler、零磁盘写入（测试里两种路径各断言一次）。
+* **无交易写能力**：`/api/v3/*` 面本来就没有下单/改单/撤单/切模式/执行计划端点，代理按
+  目录转发，因此**不可能凭空造出**交易能力；`tools/list` 与代理目录都不含
+  `confirm_decide`（人工批准通道）。
+* **未知工具不静默**：`call_tool(name='不存在')` → `mcp/unknown-tool`（isError=false 的
+  业务失败信封）+ 「请先用 list_tools 检索」提示；实参名/必填不对 → `mcp/bad-arguments`。
+
+#### 1.5.4 怎么切换（一行）
+
+```bash
+# 平台服务进程读这个环境变量（缺省 discovery）
+QUANT_MCP_SURFACE=direct scripts/platform_service.sh restart
+# 部署级缺省也可写进 <DSH_HOME>/trading-platform.json：
+#   {"service": {"mcp_surface": "direct"}}
+# 优先级：create_app(mcp_surface=…) > service.mcp_surface > QUANT_MCP_SURFACE > 缺省 discovery
+# 非法取值直接报错（不静默退回某个模式）
+```
+
+profile 侧（`platform/install/quant-headless/cordis.patch.yml` 的 `quant-platform-mcp` 行）
+不需要改：两种模式都是同一个 `/mcp`。详见 `platform/install/quant-headless/README.md`
+的「一之补：工具面模式」。
+
+#### 1.5.5 `v3_*` 工具表
+
+| 工具 | 路由 | 只读 | 入参 | 本模式是否直连（`discovery`） |
+|---|---|---|---|---|
+| `v3_audit` | `/api/v3/audit` | 只读 | window | 代理 |
+| `v3_brain` | `/api/v3/brain` | 只读 | market | 代理 |
+| `v3_credentials` | `/api/v3/credentials` | 写入（写动作封死） | action,key,value | 代理 |
+| `v3_events` | `/api/v3/events` | 只读 | ticker,window,days | 代理 |
+| `v3_execution` | `/api/v3/execution` | 只读 | market | 代理 |
+| `v3_execution_quality` | `/api/v3/execution/quality` | 只读 | market,mode | 代理 |
+| `v3_factors_matrix` | `/api/v3/factors/matrix` | 只读 | tickers,factor,forward_days,forward,market | 代理 |
+| `v3_financials` | `/api/v3/financials` | 只读 | ticker,statement,periods | 代理 |
+| `v3_gateway` | `/api/v3/gateway` | 只读 | - | **直连保留** |
+| `v3_market` | `/api/v3/market` | 只读 | ticker,period,limit | 代理 |
+| `v3_market_watchlist` | `/api/v3/market/watchlist` | 只读 | n,market | 代理 |
+| `v3_markets_calendar` | `/api/v3/markets/calendar` | 只读 | markets,now | 代理 |
+| `v3_markets_calendar_refresh` | `/api/v3/markets/calendar/refresh` | 只读（只写缓存） | markets,horizon_days | 代理 |
+| `v3_metrics` | `/api/v3/metrics` | 只读 | - | 代理 |
+| `v3_metrics_probe_refresh` | `/api/v3/metrics/probe/refresh` | 只读（只写缓存） | markets,limit_pct | 代理 |
+| `v3_ml_backtest` | `/api/v3/ml/backtest` | 只读 | ticker,window,rebalanceDays,limit,market | 代理 |
+| `v3_ml_models` | `/api/v3/ml/models` | 只读 | market,ticker,window,horizon,limit,cost_bps | 代理 |
+| `v3_ml_sweep` | `/api/v3/ml/sweep` | 只读 | ticker,windows,rebalance,limit,market | 代理 |
+| `v3_news` | `/api/v3/news` | 只读 | symbol,limit | 代理 |
+| `v3_oms_orders` | `/api/v3/oms/orders` | 只读 | market | 代理 |
+| `v3_oms_sync` | `/api/v3/oms/sync` | 写入（改本地台账） | - | 代理 |
+| `v3_openbb` | `/api/v3/openbb` | 只读 | symbol | 代理 |
+| `v3_orderbook` | `/api/v3/orderbook` | 只读 | ticker | 代理 |
+| `v3_overview` | `/api/v3/overview` | 只读 | market | 代理 |
+| `v3_plates` | `/api/v3/plates` | 只读 | market,plate_class | 代理 |
+| `v3_research` | `/api/v3/research` | 只读 | market | 代理 |
+| `v3_research_report_pdf` | `/api/v3/research/report.pdf` | 只读 | id,ticker | 代理 |
+| `v3_research_tasks` | `/api/v3/research/tasks` | 只读 | market | 代理 |
+| `v3_risk` | `/api/v3/risk` | 只读 | - | 代理 |
+| `v3_risk_analytics` | `/api/v3/risk/analytics` | 只读 | limit,confidence,benchmark,weights,market | 代理 |
+| `v3_risk_industry` | `/api/v3/risk/industry` | 只读 | tickers,market,limit_pct | 代理 |
+| `v3_sentiment` | `/api/v3/sentiment` | 只读 | symbol,market,days,limit | 代理 |
+| `v3_settings` | `/api/v3/settings` | 只读 | - | 代理 |
+| `v3_sources_status` | `/api/v3/sources/status` | 只读 | keys | 代理 |
+| `v3_spot` | `/api/v3/spot` | 只读 | limit | 代理 |
+| `v3_strategy` | `/api/v3/strategy` | 只读 | market | 代理 |
+| `v3_strategy_run` | `/api/v3/strategy/run` | 写入（落盘研究轮） | topN,window,market,universe | 代理 |
+| `v3_tools` | `/api/v3/tools` | 只读 | domain | **直连保留** |
+| `v3_tushare` | `/api/v3/tushare` | 只读 | api,ts_code,period,limit | 代理 |
+
+**数量口径（五个不同的东西，别混；下方每个数字都附本轮实测命令）**
 
 | 口径 | 数量 | 是什么 | 本轮实测怎么数出来的（2026-09-20，服务 `http://127.0.0.1:8397`） |
 |---|---|---|---|
 | `/api/wb/*` HTTP 端点 | **82** | 既有工作台工具面的 HTTP 端点总数（`snapshot.endpoints` 声明的那一份） | `curl -s -X POST /api/wb/snapshot -d '{}'` → `value.endpoints` 长度 = 82 |
-| MCP `/mcp` 工具（**线上真值，重启后实测**） | **116** | 工作台 77 工具 + 39 个 `v3_*` 桥接工具；只读标注 36 件 | `initialize` → `tools/list`，`result.tools` 长度 = **116**（`v3_*` 前缀 39 件，`annotations.readOnlyHint=true` 36 件） |
-| `/api/v3/*` HTTP 路由（源码快照） | **39** | FastAPI 上登记的 V3 路由条数 = `v3_*` 桥接工具数 | `grep -rhoE '@app\.(get\|post)\("/api/v3[^"]*"' platform/server \| sort -u \| wc -l` = 39 |
-| 六域工具目录条目（`/api/v3/tools`、`/metrics.toolTotal`、`/api/v3/gateway.channels.mcp.tools_domain_catalog`） | **82** | 工作台 77 工具 + 5 个 V3 本地计算（`v3_ops.V3_LOCAL_TOOLS`）——**这是「工具目录」不是 HTTP 端点** | `curl -s /api/v3/tools \| jq .total` = 82；域分布 data 32 / alpha 7 / ml 2 / risk 4 / execution 18 / ecosystem 19 |
-| `/metrics` 分口径 | `scope="mcp"` **116** / `scope="domain"` **82** | 桥接后用 Prometheus 标签区分两个口径（HELP 已写明不可相加/替代） | `curl -s /metrics \| grep '^quantwb_tools'` |
+| MCP `/mcp` 工具（**取决于表面模式 `QUANT_MCP_SURFACE`**） | `direct` = **工作台 77 + 全部 `v3_*` 桥接件**（本 worktree 125，随路由表涨）；`discovery`（**默认**）= **6** | 表面模式决定 `tools/list` 条数；两种模式**能力集合相同**（discovery 经 `call_tool` 间接可达） | `cd platform && ~/.dsh/trading-venv/bin/python -B tools/mcp_surface_report.py`（两模式各走真 MCP 协议量一次） |
+| 同上，**schema 成本**（进系统提示词的那一份） | `direct` **86,930 字符**（≈21,732 token @4 字符/token）；`discovery` **3,248 字符**（≈812 token） | 工具名 + 描述 + 完整 inputSchema 的 JSON 文本长度 | 同上脚本；**字符数是硬数字**，token 是估算（真实分词器不在依赖里） |
+| `/api/v3/*` HTTP 路由（源码快照） | **41 → 48**（本 worktree；随并行开发演进） | FastAPI 上登记的 V3 路由**路径**条数 = `v3_*` 桥接工具数 | `grep -rhoE '@app\.(get\|post)\("/api/v3[^"]*"' platform/server \| sort -u \| wc -l`；**测试里不写死这个数**（期望值一律由路由表推导） |
+| 六域工具目录条目（`/api/v3/tools`、`/metrics.toolTotal`、`/api/v3/gateway.channels.mcp.tools_domain_catalog`） | **82** | 工作台 77 工具 + 5 个 V3 本地计算（`v3_ops.V3_LOCAL_TOOLS`）——**这是「工具目录」不是 HTTP 端点，也不随表面模式变** | `curl -s /api/v3/tools \| jq .total` = 82；域分布 data 32 / alpha 7 / ml 2 / risk 4 / execution 18 / ecosystem 19 |
+| `/metrics` 分口径 | `scope="mcp"` = **当前模式的实际条数**（direct 随路由涨 / discovery 6）/ `scope="domain"` **82** | 桥接后用 Prometheus 标签区分两个口径（HELP 已写明不可相加/替代）；`mcp` 真读注册表，随表面模式变 | `curl -s /metrics \| grep '^quantwb_tools'` |
 
 **为什么两个「82」不是同一个东西**：`/api/wb/*` 的 82 是**工作台 HTTP 端点表**的行数；
 六域工具目录的 82 是**目录条目**（77 个工作台工具 + 5 个 V3 本地计算工具，其中
 `run_backtest` / `param_sweep` / `strategy_run` / `calc_var` / `search_news` 没有对应的
 `/api/wb/*` 端点）。两者数值相同纯属巧合，**不可互相替代**。
 桥接工具是同能力的 MCP 出口，不重复计入六域目录。
-**注意 `channels.mcp.tools` 的语义已更正**：它现在等于 `tools_total`（MCP 真值 116），
+**注意 `channels.mcp.tools` 的语义已更正**：它现在等于 `tools_total`（MCP 注册表真值，
+随表面模式变：`direct` 随路由表 / `discovery` 6），
 六域目录口径请读 `tools_domain_catalog`（82）；`/api/v3/metrics` 同时给
-`toolTotal=82`（目录）与 `mcpToolTotal=116`（MCP 面）。
+`toolTotal=82`（目录）与 `mcpToolTotal`（MCP 面，当前模式的实际条数）。
+两者不可相加/替代；`mcpToolTotal` 随 `QUANT_MCP_SURFACE` 变，`toolTotal` 不变。
 历史文档曾出现「56 工具」的写法，本轮按上表实测值统一。
 覆盖性与数量由 `platform/tests/test_mcp_parity.py` 钉死（见 §六）。
 
@@ -226,7 +320,7 @@ Error: dsh: plugin tree failed to load: failed to apply loader entry include (co
 
 | 数据源 | 用途 | 当前状态 | 需要密钥 | 接口（Agent 侧一律走 MCP，下表的 HTTP 路径是平台前端/运维口径） |
 |---|---|---|---|---|
-| 工作台工具面（77 工具 + 39 个 `v3_*`） | 行情/持仓/计划/审计/事件/调度/研究/风控 | ✅ 可用 | 否 | `POST /api/wb/<tool>`、`GET /api/v3/*`、**MCP `/mcp`** |
+| 工作台工具面（77 工具 + 全部 `v3_*` 桥接件） | 行情/持仓/计划/审计/事件/调度/研究/风控 | ✅ 可用 | 否 | `POST /api/wb/<tool>`、`GET /api/v3/*`、**MCP `/mcp`**（两种表面模式，见 §1.5.1） |
 | 富途 OpenAPI / OpenD | 行情与交易通道 | ✅ 已配置（appkey 模式） | appkey（已配） | MCP `v3_settings`（等价 `GET /api/v3/settings`） |
 | 富途实时行情权限 | 盘口五档、板块涨跌幅 | ❌ 权限缺口（`errcode=-9 realtime quote permission required`） | 券商侧开通 | MCP `v3_orderbook` / `v3_plates`；页面标注「无数据源」，不填占位 |
 | AKShare | A 股新闻/另类数据 | ✅ 可用（免密钥） | 否 | MCP `v3_news`（等价 `GET /api/v3/news`） |

@@ -41,12 +41,31 @@
 且 ``futu_cooldown_remaining_ms`` 是规格 §8.3 点名要的规则输入。其余 lint 项已按
 Prometheus 约定改正（耗时用秒、不加 ``_count`` 后缀）。
 
+延迟分位数（规格 §4.1 的分位数口径）
+------------------------------------
+Prometheus 文本出口里原本只有**均值**（``quantwb_mcp_call_duration_seconds``），
+拿均值比 §4.1 的「MCP 工具调用 < 2s」会把长尾抹平。本模块因此自带一个**滑动窗口 +
+最近秩（nearest-rank）**的分位数估算器，并按来源（``scope`` 标签）分别暴露：
+
+  * ``scope="mcp-tool-http"``   工具面 HTTP 请求（``/mcp``、``/api/wb/*``、``/api/v3/*``）里
+    **恰好只发生一次工具调用**的请求耗时（中间件实测，含回环传输开销）；
+  * ``scope="headless-log"``    ``headless_log`` 表里每条记录的 ``duration_ms``；
+  * ``scope="oms-ledger"``      台账订单「首次登记 → 进入 submitted/filled」的间隔；
+  * ``scope="datasource-probe"`` 降级链探测里每一级上游调用的 ``attempts[].ms``。
+
+口径**如实**写在这里，不谎称精确：分位数是**窗口内真实观测样本**的最近秩，
+不做插值、不做 PromQL 的外推；窗口默认 900s（``QUANT_LATENCY_WINDOW_SECONDS``），
+样本数低于 ``QUANT_LATENCY_MIN_SAMPLES``（默认 20）时**不导出**该 scope 的分位数
+（「样本不足」就是 no-data，不用一个不可信的 P95 冒充读数）。
+
 测试：``cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_observability -v``
 """
 from __future__ import annotations
 
 import asyncio
+import importlib
 import json
+import math
 import os
 import threading
 import time
@@ -55,27 +74,50 @@ from pathlib import Path
 
 from fastapi import Response
 
-from server import v3_ops, v3_ratelimit
+from server import v3_db, v3_ops, v3_ratelimit
 
 __all__ = [
     "DATASOURCE_PROBE_FILENAME",
+    "DEFAULT_LATENCY_MIN_SAMPLES",
+    "DEFAULT_LATENCY_WINDOW",
+    "HEADLESS_WINDOW_ENV",
+    "LATENCY_MIN_SAMPLES_ENV",
+    "LATENCY_SCOPES",
+    "LATENCY_WINDOW_ENV",
     "PROBE_TTL_ENV",
     "RISK_PROBE_FILENAME",
     "RISK_PROBE_LIMIT_PCT",
     "RISK_PROBE_MARKETS",
     "RISK_PROBE_MAX_AGE_ENV",
+    "SDK_SESSION_WINDOW_ENV",
+    "LatencyWindow",
     "build_metrics_text",
     "build_risk_probe_payload",
+    "feed_headless_samples",
+    "feed_order_samples",
+    "feed_probe_samples",
+    "headless_window_seconds",
+    "latency_min_samples",
+    "latency_window",
+    "latency_window_seconds",
+    "order_latency_samples",
     "load_datasource_probe",
+    "load_headless_rows",
     "load_risk_probe",
+    "load_sdk_rows",
+    "percentile_nearest_rank",
     "probe_industry_exposure",
     "record_datasource_probe",
     "record_risk_probe",
     "register",
     "render_prometheus",
+    "reset_blocked_counter",
+    "reset_feed_cursors",
+    "reset_latency_window",
     "reset_probe_cache",
     "risk_probe_max_age",
     "risk_probe_path",
+    "sdk_session_window_seconds",
 ]
 
 #: 数据源降级链探测结果的落盘文件名（``/api/v3/sources/status`` 写、``/metrics`` 读）。
@@ -111,8 +153,55 @@ DEFAULT_VERSION = "3.0"
 PROBE_SCHEDULE_TOOL = "schedule"
 PROBE_EQUITY_TOOL = "equity"
 
+#: 延迟分位数的滑动窗口（秒）与最小样本数。窗口太小则长尾被截掉、太大则对告警迟钝；
+#: 900s = 一个抓取周期（15s）的 60 个样本，也是「近一刻钟」这个值班常用尺度。
+LATENCY_WINDOW_ENV = "QUANT_LATENCY_WINDOW_SECONDS"
+DEFAULT_LATENCY_WINDOW = 900.0
+LATENCY_MIN_SAMPLES_ENV = "QUANT_LATENCY_MIN_SAMPLES"
+DEFAULT_LATENCY_MIN_SAMPLES = 20
+#: 窗口内每个 scope 保留的原始样本上限（防止长跑进程内存无界增长）。
+LATENCY_CAPACITY = 4096
+
+#: 分位数按**来源**分 scope（同一个 family + scope 标签，避免造一堆近义家族）。
+LATENCY_SCOPES = ("mcp-tool-http", "headless-log", "oms-ledger", "datasource-probe")
+
+#: 工具面 HTTP 路径前缀：这些路径上的请求可能承载工具调用，中间件据此计时。
+#: 覆盖 MCP streamable HTTP 端点（``/mcp``）、工作台工具桥（``/api/wb/*``）与
+#: V3 运维面（``/api/v3/*``，其处理函数内部走 ``v3_ops`` 的计数调用器）。
+TOOL_HTTP_PREFIXES = ("/mcp", "/api/wb/", "/api/v3/")
+
+#: Headless 成功率/平均耗时的统计窗口（秒）。24h = 与「数据源探测缓存最大可信年龄」同量级，
+#: 也是「日频分析任务」的自然周期；窗口内没有记录就不导出（no-data，不是 0）。
+HEADLESS_WINDOW_ENV = "QUANT_HEADLESS_WINDOW_SECONDS"
+DEFAULT_HEADLESS_WINDOW = 86400.0
+
+#: SDK 活跃会话判定窗口（秒）：会话在窗口内有 turn 记录即算活跃。
+SDK_SESSION_WINDOW_ENV = "QUANT_SDK_SESSION_WINDOW_SECONDS"
+DEFAULT_SDK_SESSION_WINDOW = 300.0
+
+#: 从表/冷备里最多读回的记录条数（防止长跑进程把整张表读进内存）。
+LOG_READ_LIMIT = 5000
+
+#: 台账里算「订单执行延迟」的终态：进入这些阶段即视为「已提交/已成交」。
+SUBMITTED_STAGES = ("submitted", "filled")
+
+#: 风控阻断阶段（与 ``v3_ops.STAGES`` 同源，只取阻断语义的两个）。
+BLOCKED_STAGES = ("blocked", "blocked_industry")
+
 #: OMS 六态（与 ``v3_ops.STAGES`` 同源；额外导出 ``unknown`` 以承载表外阶段）
 _PROM_STAGES = tuple(v3_ops.STAGES) + ("unknown",)
+
+#: 风控阻断的首见计数状态（见 ``_render_oms`` 的说明）。
+_BLOCKED_LOCK = threading.Lock()
+_BLOCKED = {"seen": set(), "total": 0}
+
+
+def reset_blocked_counter():
+    """清空阻断首见计数（测试用；生产重启即归零，不需要显式调用）。"""
+    global _BLOCKED
+    with _BLOCKED_LOCK:
+        _BLOCKED = {"seen": set(), "total": 0}
+    return _BLOCKED
 
 
 # ---------------------------------------------------------------------------
@@ -303,6 +392,300 @@ def reset_probe_cache(loader=None, ttl=None):
 
 
 # ---------------------------------------------------------------------------
+# 数值/时间的小工具（分位数与新型指标共用）
+# ---------------------------------------------------------------------------
+def _env_float(name, default, *, minimum=None):
+    """环境变量 → 正浮点数；缺失/非法/非正一律回落默认值（配置写错不毁读数口径）。"""
+    raw = os.environ.get(name)
+    if raw is None or str(raw).strip() == "":
+        return default
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return default
+    if value <= 0 or value != value or value in (float("inf"), float("-inf")):
+        return default
+    if minimum is not None and value < minimum:
+        return default
+    return value
+
+
+def latency_window_seconds():
+    """分位数滑动窗口（秒）。"""
+    return _env_float(LATENCY_WINDOW_ENV, DEFAULT_LATENCY_WINDOW)
+
+
+def latency_min_samples():
+    """导出分位数所需的最小样本数（不足即不导出——「样本不足」是 no-data）。"""
+    raw = os.environ.get(LATENCY_MIN_SAMPLES_ENV)
+    if raw is None or str(raw).strip() == "":
+        return DEFAULT_LATENCY_MIN_SAMPLES
+    try:
+        value = int(float(raw))
+    except (TypeError, ValueError):
+        return DEFAULT_LATENCY_MIN_SAMPLES
+    return value if value > 0 else DEFAULT_LATENCY_MIN_SAMPLES
+
+
+def headless_window_seconds():
+    return _env_float(HEADLESS_WINDOW_ENV, DEFAULT_HEADLESS_WINDOW)
+
+
+def sdk_session_window_seconds():
+    return _env_float(SDK_SESSION_WINDOW_ENV, DEFAULT_SDK_SESSION_WINDOW)
+
+
+def _iso_to_epoch(value):
+    """ISO 时间串 → epoch 秒；缺失/非法返回 ``None``（不猜时刻，也不拿现在顶替）。"""
+    if isinstance(value, bool) or value is None:
+        return None
+    if isinstance(value, (int, float)):
+        stamp = float(value)
+        return stamp if stamp > 0 else None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        moment = datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.timestamp()
+
+
+def percentile_nearest_rank(values, quantile):
+    """最近秩分位数（**不插值**）：返回窗口里真实观测到的那个样本。
+
+    ``ceil(q * n)`` 名次（Prometheus 的 ``histogram_quantile`` 则是桶内线性插值，
+    两者口径不同——这里选「真实观测值」，因为它是可复现的、不会造出没测到过的数）。
+    """
+    if not values:
+        return None
+    ordered = sorted(values)
+    index = int(math.ceil(float(quantile) * len(ordered))) - 1
+    index = min(max(index, 0), len(ordered) - 1)
+    return ordered[index]
+
+
+class LatencyWindow:
+    """按 scope 保存**原始延迟样本**的滑动窗口，并给出最近秩分位数。
+
+    为什么不用 Prometheus histogram：本模块就是指标的**生产者**，没有 Prometheus 帮着
+    ``histogram_quantile``；而固定桶的分位数精度取决于桶边界。这里的做法是保留窗口内的
+    原始样本（每秒至多几十个事件，容量上限 4096），直接取真实分位——口径写在 HELP 文本里。
+    """
+
+    def __init__(self, window=None, min_samples=None, capacity=LATENCY_CAPACITY):
+        self._window = float(window if window is not None else DEFAULT_LATENCY_WINDOW)
+        self._min_samples = int(min_samples if min_samples is not None else DEFAULT_LATENCY_MIN_SAMPLES)
+        self._capacity = int(capacity)
+        self._samples = {scope: [] for scope in LATENCY_SCOPES}
+        self._lock = threading.Lock()
+
+    def configure(self, window=None, min_samples=None):
+        with self._lock:
+            if window is not None:
+                self._window = float(window)
+            if min_samples is not None:
+                self._min_samples = int(min_samples)
+
+    @property
+    def window(self):
+        return self._window
+
+    @property
+    def min_samples(self):
+        return self._min_samples
+
+    def record(self, scope, seconds, at=None):
+        """记录一个样本（秒）。非有限值/负数一律丢弃——宁可少一个样本也不污染分位数。"""
+        value = _weight_pct(seconds)
+        if value is None or value < 0:
+            return False
+        moment = float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else time.time()
+        with self._lock:
+            bucket = self._samples.setdefault(str(scope), [])
+            bucket.append((moment, value))
+            if len(bucket) > self._capacity:
+                del bucket[: len(bucket) - self._capacity]
+            # 按**样本时刻**裁剪（而不是墙上时钟）：喂历史样本时（如一次探测里的
+            # attempts[].ms）也按同一基准判断新鲜度，测试可用固定时钟复现。
+            self._prune_locked(moment)
+        return True
+
+    def _prune_locked(self, now):
+        horizon = now - self._window
+        for scope, bucket in self._samples.items():
+            if bucket and bucket[0][0] < horizon:
+                self._samples[scope] = [item for item in bucket if item[0] >= horizon]
+
+    def samples(self, scope, now=None):
+        """窗口内的原始样本（秒），按记录顺序。"""
+        moment = time.time() if now is None else float(now)
+        with self._lock:
+            self._prune_locked(moment)
+            return [value for _, value in self._samples.get(str(scope), [])]
+
+    def count(self, scope, now=None):
+        return len(self.samples(scope, now))
+
+    def percentiles(self, scope, now=None):
+        """``{"p50","p95","p99"}``；样本不足（< min_samples）返回 ``None``（不导出）。"""
+        values = self.samples(scope, now)
+        if len(values) < self._min_samples:
+            return None
+        return {
+            "p50": percentile_nearest_rank(values, 0.50),
+            "p95": percentile_nearest_rank(values, 0.95),
+            "p99": percentile_nearest_rank(values, 0.99),
+        }
+
+    def reset(self):
+        with self._lock:
+            self._samples = {scope: [] for scope in LATENCY_SCOPES}
+
+
+#: 进程内唯一的延迟窗口（``reset_latency_window`` 可替换，测试用）。
+_LATENCY = LatencyWindow()
+
+
+def reset_latency_window(window=None, min_samples=None):
+    global _LATENCY
+    _LATENCY = LatencyWindow(window=window, min_samples=min_samples)
+    return _LATENCY
+
+
+def latency_window():
+    """当前进程使用的延迟窗口（中间件与渲染器读同一份）。"""
+    return _LATENCY
+
+
+# ---------------------------------------------------------------------------
+# 台账/日志 → 延迟样本（供分位数窗口与新型指标使用）
+# ---------------------------------------------------------------------------
+#: 各来源的「已喂到哪」游标：避免同一批历史记录被反复喂进窗口（重复样本会扭曲分位数）。
+_FEED_LOCK = threading.Lock()
+_FEED_CURSOR = {"headless": None, "probe_at": None, "orders": {}}
+
+
+def _headless_rows_sorted(rows):
+    """按 ``started_at`` 升序（游标只进不退，重复读同一份表不会重复喂样本）。"""
+    decorated = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = _iso_to_epoch(row.get("started_at") or row.get("startedAt") or row.get("at"))
+        decorated.append((stamp, row))
+    decorated.sort(key=lambda item: (item[0] is None, item[0] if item[0] is not None else 0.0))
+    return decorated
+
+
+def feed_headless_samples(rows, *, now=None):
+    """把新出现的 headless 记录喂进 ``scope="headless-log"`` 窗口，返回本次新增样本数。"""
+    moment = time.time() if now is None else float(now)
+    added = 0
+    with _FEED_LOCK:
+        cursor = _FEED_CURSOR.get("headless")
+        newest = cursor
+        for stamp, row in _headless_rows_sorted(rows):
+            if stamp is None:
+                continue
+            if cursor is not None and stamp <= cursor:
+                continue
+            duration_ms = _weight_pct(row.get("duration_ms", row.get("durationMs")))
+            if duration_ms is None:
+                # 有记录但没有耗时字段 → 不能编一个 0 秒出来；只推进游标。
+                newest = stamp if newest is None or stamp > newest else newest
+                continue
+            if _LATENCY.record("headless-log", duration_ms / 1000.0, at=moment):
+                added += 1
+            newest = stamp if newest is None or stamp > newest else newest
+        if newest is not None:
+            _FEED_CURSOR["headless"] = newest
+    return added
+
+
+def order_latency_samples(orders, *, now=None):
+    """台账订单「首次登记 → 进入 submitted/filled」的间隔样本。
+
+    规格 §4.1 的口径是「信号生成到订单提交」。台账里能拿到的**真实**两端是
+    ``first_seen_at``（平台从冻结计划登记该单的时刻）与 ``history[].at``（阶段迁移时刻），
+    所以这里算的是「登记 → 提交/成交」，并在 HELP/README 里如实标注这一口径差异。
+    """
+    samples = []
+    for identifier, record in (orders or {}).items():
+        if not isinstance(record, dict):
+            continue
+        first = _iso_to_epoch(record.get("first_seen_at"))
+        if first is None:
+            continue
+        for entry in (record.get("history") or []):
+            if not isinstance(entry, dict):
+                continue
+            if str(entry.get("stage") or "") not in SUBMITTED_STAGES:
+                continue
+            at = _iso_to_epoch(entry.get("at"))
+            if at is None or at < first:
+                continue
+            samples.append((str(identifier), str(entry.get("at")), at - first))
+    samples.sort(key=lambda item: item[2])
+    return samples
+
+
+def feed_order_samples(orders, *, now=None):
+    """把**新出现**的提交迁移喂进 ``scope="oms-ledger"`` 窗口，返回本次新增样本数。"""
+    moment = time.time() if now is None else float(now)
+    added = 0
+    with _FEED_LOCK:
+        cursors = _FEED_CURSOR.setdefault("orders", {})
+        for identifier, at_text, seconds in order_latency_samples(orders):
+            previous = cursors.get(identifier)
+            if previous is not None and at_text <= previous:
+                continue
+            if _LATENCY.record("oms-ledger", seconds, at=moment):
+                added += 1
+            cursors[identifier] = at_text
+    return added
+
+
+def feed_probe_samples(cache, *, now=None):
+    """把一次降级链探测里每一级上游调用的耗时喂进 ``scope="datasource-probe"`` 窗口。
+
+    同一份缓存（``probed_at`` 相同）只喂一次——``/metrics`` 会被反复抓取，重复喂样本
+    会让分位数偏离真实分布。
+    """
+    if not isinstance(cache, dict):
+        return 0
+    probed_at = _weight_pct(cache.get("probed_at"))
+    if probed_at is None:
+        return 0
+    moment = time.time() if now is None else float(now)
+    added = 0
+    with _FEED_LOCK:
+        previous = _FEED_CURSOR.get("probe_at")
+        if previous is not None and probed_at <= previous:
+            return 0
+        for row in cache.get("chains") or []:
+            if not isinstance(row, dict):
+                continue
+            for value in row.get("attempts_ms") or []:
+                if _LATENCY.record("datasource-probe", float(value) / 1000.0, at=moment):
+                    added += 1
+        _FEED_CURSOR["probe_at"] = probed_at
+    return added
+
+
+def reset_feed_cursors():
+    """清空喂样游标（测试用；生产不需要）。"""
+    global _FEED_CURSOR
+    with _FEED_LOCK:
+        _FEED_CURSOR = {"headless": None, "probe_at": None, "orders": {}}
+
+
+# ---------------------------------------------------------------------------
 # 数据源降级链探测缓存（``/api/v3/sources/status`` 写、``/metrics`` 读）
 # ---------------------------------------------------------------------------
 def datasource_probe_path(home):
@@ -313,12 +696,22 @@ def record_datasource_probe(home, chains):
     """把一次**真实**探测结果落盘（best-effort，失败不阻断业务）。
 
     ``chains`` 是 ``/api/v3/sources/status`` 的 ``chains`` 列表（``v3_fallback.probe_chains``
-    产出）。只保留指标需要的字段，不落 ``attempts``/``rows`` 等大块内容。
+    产出）。只保留指标需要的字段，不落 ``attempts``/``rows`` 等大块内容——
+    **例外**是 ``attempts[].ms``（每级上游调用的真实耗时，只留毫秒数）与 ``as_of``
+    （该链命中来源返回的数据时点）：这两个是「§8.3 数据延迟 / §4.1 分位数」的
+    **唯一真实来源**，丢了就只能靠猜，所以只留数值、不留错误原文以外的内容。
     """
     rows = []
     for row in chains or []:
         if not isinstance(row, dict):
             continue
+        attempt_ms = []
+        for item in row.get("attempts") or []:
+            if not isinstance(item, dict):
+                continue
+            value = _weight_pct(item.get("ms"))
+            if value is not None:
+                attempt_ms.append(value)
         rows.append({
             "key": _sanitize_label_value(row.get("key")),
             "label": _sanitize_label_value(row.get("label")),
@@ -328,6 +721,8 @@ def record_datasource_probe(home, chains):
             "last_source": _sanitize_label_value(row.get("last_source")),
             "chain_size": row.get("chain_size"),
             "error": None if row.get("error") is None else str(row.get("error"))[:300],
+            "as_of": None if row.get("as_of") is None else str(row.get("as_of"))[:64],
+            "attempts_ms": attempt_ms,
         })
     payload = {"version": 1, "probed_at": time.time(),
                "probed_at_iso": datetime.now(timezone.utc).isoformat(), "chains": rows}
@@ -352,6 +747,145 @@ def load_datasource_probe(home):
     if not isinstance(raw, dict) or not isinstance(raw.get("chains"), list):
         return None
     return raw
+
+
+# ---------------------------------------------------------------------------
+# 事件表读取（``headless_log`` / ``sdk_turns``）：主存 SQLite，冷备 JSONL
+#
+# 规格 §8.3 的「Headless 成功率/平均耗时」与「SDK 会话活跃数」只能来自这两张表。
+# 读法与 ``v3_ops.OmsLedger`` 一致：**先库后文件**，两者都拿不到就返回空列表——
+# 空列表会被上层翻译成「不导出该指标」（no-data），绝不用 0 冒充。
+#
+# 说明：``v3_headless.py`` / ``v3_sdk.py`` 由另一条并行工作流产出，本模块**只读**它们的
+# 落库结果（表结构由 ``v3_db.TABLE_SPECS`` 定义，是唯一事实来源），不 import 它们。
+# ---------------------------------------------------------------------------
+def _read_jsonl(path, limit=LOG_READ_LIMIT):
+    rows = []
+    try:
+        with open(path, "r", encoding="utf-8") as stream:
+            for line in stream:
+                text = line.strip()
+                if not text:
+                    continue
+                try:
+                    row = json.loads(text)
+                except json.JSONDecodeError:
+                    continue
+                if isinstance(row, dict):
+                    rows.append(row)
+    except OSError:
+        return []
+    return rows[-limit:]
+
+
+def _load_events(home, table, filename):
+    """表（优先）→ JSONL 冷备（回退）→ 空列表。任何异常都收敛成「读到 0 条」。"""
+    rows = None
+    try:
+        rows = v3_db.list_events(home, table, limit=LOG_READ_LIMIT, order="asc")
+    except Exception:  # noqa: BLE001 —— 库异常按「库里没有」处理，再试冷备
+        rows = None
+    if rows:
+        return [row for row in rows if isinstance(row, dict)]
+    return _read_jsonl(Path(home) / filename)
+
+
+def load_headless_rows(home):
+    """``headless_log`` 记录（库优先，``v3-headless-log.jsonl`` 冷备回退）。"""
+    return _load_events(home, "headless_log", v3_db.HEADLESS_LOG_FILE)
+
+
+def load_sdk_rows(home):
+    """``sdk_turns`` 记录（库优先，``v3-sdk-turns.jsonl`` 冷备回退）。"""
+    return _load_events(home, "sdk_turns", v3_db.SDK_TURNS_FILE)
+
+
+def _optional_module(module_name):
+    """惰性 import ``server.<module_name>``；不存在/导入失败返回 ``None``。"""
+    try:
+        return importlib.import_module(f"server.{module_name}")
+    except Exception:  # noqa: BLE001 —— 模块不存在/导入失败都按「没有该来源」处理
+        return None
+
+
+def _optional_metrics_view(module_name):
+    """``server.<module_name>.metrics_view()``，模块/函数不存在或抛错一律返回 ``None``。
+
+    这是与 ``v3_sdk``（并行工作流产出）的**唯一**集成点：约定它若提供
+    ``metrics_view() -> {"activeSessions": n}``，本模块优先采信「进程内真实会话态」；
+    没有该函数就退回 ``sdk_turns`` 表的事实。契约写在 README，不靠 import 成功与否猜。
+    """
+    module = _optional_module(module_name)
+    if module is None:
+        return None
+    view = getattr(module, "metrics_view", None)
+    if not callable(view):
+        return None
+    try:
+        data = view()
+    except Exception:  # noqa: BLE001
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _rows_active_sessions(rows, window, moment):
+    """``(活跃会话数, 是否有可解析时间戳)``：窗口内出现过活动的不同 ``session_id`` 数。"""
+    stamps = 0
+    sessions = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        stamp = _iso_to_epoch(row.get("at", row.get("started_at")))
+        if stamp is None:
+            continue
+        stamps += 1
+        if moment - stamp <= window:
+            identifier = row.get("session_id", row.get("sessionId"))
+            if identifier not in (None, ""):
+                sessions.add(str(identifier))
+    return float(len(sessions)), stamps > 0
+
+
+def sdk_active_sessions(home, *, now=None):
+    """``(活跃会话数, 来源)``；**无法判定时返回 ``(None, 原因)``**（由上层翻译成 no-data）。
+
+    判定优先级（每一级的来源都如实写进 ``source`` 标签）：
+      1. ``server.v3_sdk.metrics_view()["activeSessions"]``——**约定的集成契约**：由
+         ``v3_sdk`` 自己给出「进程内真实会话态」（本模块不替它判定「什么算活跃」）；
+      2. ``v3_sdk`` 的审计日志（``v3-sdk-audit.jsonl``，经它自己的 ``read_audit`` 读）：
+         窗口内出现过活动（含被拒调用）的不同 ``session_id`` 数；
+      3. ``sdk_turns`` 表（或 ``v3-sdk-turns.jsonl`` 冷备）里窗口内的不同 ``session_id`` 数；
+      4. 三级都没有事实来源 → ``None``：**没有 SDK 事实来源时，「0 个活跃会话」是编造**。
+
+    刻意**不**调用 ``v3_sdk.get_runtime()``：那会在只读抓取路径上**创建**运行时对象，
+    而「什么算活跃会话」是 v3_sdk 自己的状态机语义，本模块不替它猜。
+    """
+    moment = time.time() if now is None else float(now)
+    window = sdk_session_window_seconds()
+    view = _optional_metrics_view("v3_sdk")
+    if view is not None:
+        value = _weight_pct(view.get("activeSessions"))
+        if value is not None:
+            return value, "v3_sdk.metrics_view()"
+    module = _optional_module("v3_sdk")
+    if module is not None:
+        reader = getattr(module, "read_audit", None)
+        if callable(reader):
+            try:
+                rows = reader(str(home), 2000)
+            except Exception:  # noqa: BLE001 —— 读不到就退到下一级来源
+                rows = []
+            if isinstance(rows, list) and rows:
+                active, usable = _rows_active_sessions(rows, window, moment)
+                if usable:
+                    return active, "v3_sdk 审计日志（v3-sdk-audit.jsonl）"
+    rows = load_sdk_rows(home)
+    if rows:
+        active, usable = _rows_active_sessions(rows, window, moment)
+        if usable:
+            return active, "sdk_turns（窗口内出现 turn 的不同 session_id）"
+    return None, ("没有 SDK 会话事实来源：server.v3_sdk 未提供 metrics_view()、"
+                  "无 v3-sdk-audit.jsonl 记录、sdk_turns 也为空")
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +1150,39 @@ def _render_oms(writer, ledger):
                      "台账中待人工确认（stage=manual）订单里最大的单笔占比（%）；"
                      "超过 2% 即为平台单笔红线（v3_ops.LIMITS.singlePct）",
                      max(percents))
+    # 风控阻断：台账里「当前处在阻断阶段」的订单数由 quantwb_oms_orders{stage="blocked*"}
+    # 承载；但 §8.3 要的是「阻断次数**突增**」——那需要一个**计数器**（次数），不是当前快照。
+    # 平台没有阻断计数器，所以这里用「进程内首次观测到某单进入阻断阶段」累计：
+    # 单调不减、重启归零，口径写在 HELP 里（首见计数，不是事件流回放）。
+    newly_blocked = 0
+    with _BLOCKED_LOCK:
+        for identifier, record in orders.items():
+            if not isinstance(record, dict):
+                continue
+            if str(record.get("stage") or "") not in BLOCKED_STAGES:
+                continue
+            if identifier in _BLOCKED["seen"]:
+                continue
+            _BLOCKED["seen"].add(identifier)
+            newly_blocked += 1
+        _BLOCKED["total"] += newly_blocked
+        blocked_total = _BLOCKED["total"]
+    writer.counter("quantwb_risk_blocked_total",
+                   "进程内累计**首次观测到**进入风控阻断阶段（blocked / blocked_industry）"
+                   "的台账订单数；用于 §8.3「风控阻断次数突增」（increase()）。"
+                   "它是首见计数，不是事件流回放：同一订单不会重复计数，进程重启归零",
+                   blocked_total)
+    # 订单执行延迟（§4.1/§8.3）：先把新出现的「登记 → submitted/filled」迁移喂进窗口，
+    # 再取窗口内**最大**的一笔——单笔超标就该被看见（低频事件用均值会漏）。
+    feed_order_samples(orders)
+    samples = _LATENCY.samples("oms-ledger")
+    if samples:
+        writer.gauge("quantwb_order_execution_latency_max_seconds",
+                     "台账订单「首次登记（first_seen_at）→ 进入 submitted/filled」"
+                     f"在最近 {latency_window_seconds():.0f}s 窗口内**最大**的间隔（秒）。"
+                     "口径差异：规格 §4.1 写的是「信号生成到订单提交」，台账能拿到的真实两端"
+                     "是登记时刻与阶段迁移时刻（见 README）",
+                     max(samples))
 
 
 def _render_risk_industry(writer, cache, *, now=None):
@@ -744,6 +1311,8 @@ def _render_datasources(writer, cache):
         return
     probed_at = cache.get("probed_at")
     available_total = sum(1 for row in rows if row.get("available"))
+    # 同一份探测缓存只喂一次样本（重复抓取不该把分位数喂歪）。
+    feed_probe_samples(cache)
     # 同上：按 family 分轮写，保证每个 family 的样本连续。
     writer.gauge("quantwb_datasource_chains",
                  "降级链探测缓存里登记的链数量", len(rows))
@@ -770,6 +1339,173 @@ def _render_datasources(writer, cache):
                      1, labels=(("chain", row.get("key")),
                                 ("source", row.get("last_source") or "unknown"),
                                 ("primary", row.get("primary") or "")))
+    # 数据延迟（§8.3「数据延迟 > 5min」）：探测命中来源返回的 as_of 距今多少秒。
+    # 这是「最近一次真实探测时该链给出的数据时点」的年龄——不是「当前上游延迟」；
+    # 因此只对**有 as_of 的链**导出，并且规则一律带探测新鲜度守卫（缓存过期就没有结论）。
+    moment = time.time()
+    for row in rows:
+        stamp = _iso_to_epoch(row.get("as_of"))
+        if stamp is None:
+            continue
+        writer.gauge("quantwb_datasource_data_age_seconds",
+                     "该降级链最近一次探测命中来源返回的数据 as_of 距今秒数（数据延迟）；"
+                     "= now - as_of，只对有 as_of 的链导出，缺读数即不导出（不是 0）",
+                     max(0.0, moment - stamp), labels=(("chain", row.get("key")),))
+
+
+def _render_headless(writer, home, *, now=None):
+    """Headless 调用成功率与平均耗时（§8.3 前两条）。
+
+    数据源：``headless_log`` 表（``v3_db`` 定义）/ ``v3-headless-log.jsonl`` 冷备。
+    **窗口内没有记录就不导出成功率**——「没有调用」与「成功率 0%」是两件事，
+    导出 0 会被告警规则读成「全部失败」，那是编造。
+    """
+    moment = time.time() if now is None else float(now)
+    window = headless_window_seconds()
+    writer.gauge("quantwb_headless_window_seconds",
+                 "Headless 成功率/平均耗时的统计窗口（秒）；"
+                 f"由 {HEADLESS_WINDOW_ENV} 配置，默认 {DEFAULT_HEADLESS_WINDOW:.0f}",
+                 window)
+    rows = load_headless_rows(home)
+    writer.gauge("quantwb_headless_log_rows",
+                 "headless_log 表（或 v3-headless-log.jsonl 冷备）里读到的记录条数；"
+                 "为 0 时下面的成功率/耗时**不导出**（no-data，不是 0）",
+                 len(rows))
+    feed_headless_samples(rows, now=moment)
+    if not rows:
+        return
+    window_rows = []
+    for stamp, row in _headless_rows_sorted(rows):
+        if stamp is not None and moment - stamp <= window:
+            window_rows.append(row)
+    calls = len(window_rows)
+    if calls:
+        successes = 0
+        durations = []
+        for row in window_rows:
+            flag = row.get("success")
+            if isinstance(flag, bool):
+                successes += 1 if flag else 0
+            elif _weight_pct(flag) not in (None, 0):
+                successes += 1
+            duration = _weight_pct(row.get("duration_ms", row.get("durationMs")))
+            if duration is not None:
+                durations.append(duration / 1000.0)
+        writer.gauge("quantwb_headless_calls", "窗口内 headless 调用记录条数", calls)
+        writer.gauge("quantwb_headless_success_rate",
+                     "窗口内 headless 调用成功率（successes / calls，0～1）；"
+                     "规则阈值 0.95 对应规格 §8.3「< 95%」",
+                     successes / calls)
+        if durations:
+            writer.gauge("quantwb_headless_call_duration_seconds",
+                         "窗口内 headless 调用**平均**耗时（秒；规格 §8.3「平均耗时 > 60s」）；"
+                         "分位数见 quantwb_call_duration_p95_seconds{scope=\"headless-log\"}",
+                         sum(durations) / len(durations))
+        writer.gauge("quantwb_headless_successes", "窗口内 headless 成功记录条数", successes)
+
+
+def _render_sdk(writer, home, *, now=None):
+    """SDK 活跃会话数（§8.3「SDK 会话活跃数 > 10」）。
+
+    读不到事实来源时**不导出**（no-data），绝不导出 0：``v3_sdk`` 由并行工作流产出，
+    本模块只读它的 ``metrics_view()``（若提供）或 ``sdk_turns`` 表，两条路都没有事实
+    就说明白「没有来源」，而不是把「没有 SDK」写成「0 个活跃会话」。
+    """
+    moment = time.time() if now is None else float(now)
+    writer.gauge("quantwb_sdk_session_window_seconds",
+                 "SDK 活跃会话的判定窗口（秒）：窗口内出现过 turn 的会话算活跃；"
+                 f"由 {SDK_SESSION_WINDOW_ENV} 配置，默认 {DEFAULT_SDK_SESSION_WINDOW:.0f}",
+                 sdk_session_window_seconds())
+    active, source = sdk_active_sessions(home, now=moment)
+    if active is None:
+        writer.gauge("quantwb_sdk_active_sessions_source_missing",
+                     "1 = 没有可用的 SDK 会话事实来源（此时不导出 "
+                     "quantwb_sdk_active_sessions——「无法判定」不是「0 个会话」）",
+                     1, labels=(("reason", source),))
+        return
+    writer.gauge("quantwb_sdk_active_sessions",
+                 "当前 SDK 活跃会话数（事实来源见 source 标签）",
+                 active, labels=(("source", source),))
+
+
+def _render_latency(writer, *, now=None):
+    """延迟分位数（P50/P95/P99）+ 窗口元信息（规格 §4.1 的分位数口径）。"""
+    window = latency_window_seconds()
+    minimum = latency_min_samples()
+    writer.gauge("quantwb_call_duration_window_seconds",
+                 "分位数滑动窗口长度（秒）；由 "
+                 f"{LATENCY_WINDOW_ENV} 配置，默认 {DEFAULT_LATENCY_WINDOW:.0f}", window)
+    writer.gauge("quantwb_call_duration_min_samples",
+                 "导出分位数所需的最小样本数（不足则不导出该 scope 的分位数："
+                 f"样本不足 = 无法判定）；由 {LATENCY_MIN_SAMPLES_ENV} 配置，"
+                 f"默认 {DEFAULT_LATENCY_MIN_SAMPLES}", minimum)
+    for scope in LATENCY_SCOPES:
+        writer.gauge("quantwb_call_duration_window_samples",
+                     "该 scope 在窗口内的**真实观测样本数**；分位数只在样本数 >= "
+                     "quantwb_call_duration_min_samples 时导出",
+                     _LATENCY.count(scope), labels=(("scope", scope),))
+    for scope in LATENCY_SCOPES:
+        stats = _LATENCY.percentiles(scope, now=now)
+        if stats is None:
+            continue
+        writer.gauge("quantwb_call_duration_p50_seconds",
+                     "延迟 P50（秒）：滑动窗口内真实观测样本的**最近秩**（不插值、不外推）；"
+                     "scope 标明来源，口径见 README「分位数口径」",
+                     stats["p50"], labels=(("scope", scope),))
+    for scope in LATENCY_SCOPES:
+        stats = _LATENCY.percentiles(scope, now=now)
+        if stats is None:
+            continue
+        writer.gauge("quantwb_call_duration_p95_seconds",
+                     "延迟 P95（秒）：滑动窗口内真实观测样本的**最近秩**（不插值、不外推）；"
+                     "scope 标明来源，口径见 README「分位数口径」",
+                     stats["p95"], labels=(("scope", scope),))
+    for scope in LATENCY_SCOPES:
+        stats = _LATENCY.percentiles(scope, now=now)
+        if stats is None:
+            continue
+        writer.gauge("quantwb_call_duration_p99_seconds",
+                     "延迟 P99（秒）：滑动窗口内真实观测样本的**最近秩**（不插值、不外推）；"
+                     "scope 标明来源，口径见 README「分位数口径」",
+                     stats["p99"], labels=(("scope", scope),))
+
+
+#: 工具面 HTTP 路径（含 MCP streamable HTTP 端点）的延迟中间件。
+def _tool_latency_middleware(recorder):
+    """给工具面请求（``/mcp``、``/api/wb/*``、``/api/v3/*``）计时，但**只在一次请求恰好
+    一次工具调用时**记样本。
+
+    为什么加这个中间件：``v3_ops`` 只暴露「累计调用数 + 累计耗时」（均值），没有分布；
+    而分位数必须来自**单次调用**的原始耗时。于是用计数器差值 ``Δcalls == 1`` 把
+    「恰好一次调用」的请求挑出来——``/mcp`` 的 JSON-RPC ``tools/call``、
+    ``/api/v3/audit``/``/api/v3/gateway``/``/api/v3/metrics`` 这类单调用读端点都命中，
+    样本就是真实单次调用耗时（含回环 HTTP 开销，方向偏保守）；
+    多调用请求（如 ``/api/v3/overview`` 一次算 8 个工具）**不计入**——宁缺毋滥。
+    抓取路径 ``/metrics`` 与前缀不匹配，不会自计。
+    """
+
+    async def middleware(request, call_next):
+        path = request.url.path
+        if not str(path).startswith(TOOL_HTTP_PREFIXES):
+            return await call_next(request)
+        try:
+            before = v3_ops.metrics_snapshot()["mcp"]["calls"]
+        except Exception:  # noqa: BLE001 —— 计数读不到就不计时，绝不因此让请求失败
+            return await call_next(request)
+        started = time.perf_counter()
+        try:
+            response = await call_next(request)
+        finally:
+            elapsed = time.perf_counter() - started
+        try:
+            after = v3_ops.metrics_snapshot()["mcp"]["calls"]
+        except Exception:  # noqa: BLE001
+            return response
+        if after - before == 1:
+            recorder.record("mcp-tool-http", elapsed)
+        return response
+
+    return middleware
 
 
 def build_metrics_text(home, *, probe_cache=None, started_at=None, app=None):
@@ -793,6 +1529,10 @@ def build_metrics_text(home, *, probe_cache=None, started_at=None, app=None):
         _render_push(writer, getattr(app.state, "push", None))
     _render_datasources(writer, load_datasource_probe(home))
     _render_risk_industry(writer, load_risk_probe(home))
+    # 规格 §8.3 补齐项与 §4.1 分位数口径（都是只读既有落库/落盘事实，不新增事实源）。
+    _render_headless(writer, home)
+    _render_sdk(writer, home)
+    _render_latency(writer)
     return writer.text()
 
 
@@ -818,7 +1558,8 @@ def register(app, v3_run, home, deps=None):
 
     ``deps`` 仅供测试注入：``probe``（替换工作台探测器）、``probe_ttl``（缓存秒数）、
     ``started_at``（替换进程启动时刻）、``industry_probe``（替换行业暴露探测器，
-    签名 ``(markets, limit_pct) -> {market: 信封}``）。
+    签名 ``(markets, limit_pct) -> {market: 信封}``）、``latency_window`` /
+    ``latency_min_samples``（替换分位数窗口参数）。
     """
     deps = deps or {}
     ttl = deps.get("probe_ttl")
@@ -827,6 +1568,13 @@ def register(app, v3_run, home, deps=None):
     started_at = deps.get("started_at") or _STARTED_AT
     industry_probe = deps.get("industry_probe") or (
         lambda markets, limit_pct: probe_industry_exposure(v3_run, home, markets, limit_pct))
+    # 延迟分位数窗口：``deps`` 可注入窗口/最小样本数（测试用），默认读环境变量。
+    latency = _LATENCY
+    if "latency_window" in deps or "latency_min_samples" in deps:
+        latency = reset_latency_window(window=deps.get("latency_window"),
+                                      min_samples=deps.get("latency_min_samples"))
+    # §4.1 分位数口径：工具面「一请求一调用」的真实单次耗时（见 _tool_latency_middleware）。
+    app.middleware("http")(_tool_latency_middleware(latency))
 
     @app.get("/metrics")
     async def metrics():
@@ -871,5 +1619,31 @@ def register(app, v3_run, home, deps=None):
             "probe": payload,
         }
 
-    app.state.observability = {"routes": ("/metrics", "/api/v3/metrics/probe/refresh")}
+    # 规格 §8.3 的**平台内规则求值器**（不装 Grafana/Prometheus 的轻量替代）：
+    # ``server.v3_alerts`` 解析同一份 ``deploy/monitoring/alerts.yml``，在进程内对上面这套
+    # 指标模型求值，并把结果挂成 ``GET /api/v3/ops/alerts``。它**不**是第二份规则清单。
+    #
+    # 为什么在这里接线（而不是像别的子模块那样加进 app.py 的循环）：``app.py`` 的模块清单
+    # 正被并行的 v3_headless/v3_sdk 工作流同时改动，而求值器读的正是本模块产出的指标模型，
+    # 注册点放在这里既省一次合并冲突，也保证「有 /metrics 就有 /alerts」。
+    # ``v3_alerts.register`` 是**幂等**的：将来把它加进 app.py 的清单也不会重复注册。
+    try:
+        from server import v3_alerts  # noqa: PLC0415 —— 惰性 import，避免模块级循环
+    except Exception:  # noqa: BLE001 —— 求值器挂了不该影响 /metrics 抓取
+        v3_alerts = None
+    alert_routes = ()
+    if v3_alerts is not None and callable(getattr(v3_alerts, "register", None)):
+        try:
+            alert_routes = tuple(v3_alerts.register(app, v3_run, home) or ())
+        except Exception:  # noqa: BLE001
+            alert_routes = ()
+
+    app.state.observability = {
+        # 本模块自己的路由：**只加不删**（既有契约由 tests/test_observability.py 钉住）。
+        "routes": ("/metrics", "/api/v3/metrics/probe/refresh"),
+        # 求值器路由单独记一份：它们是 v3_alerts 的端点，不混进本模块的路由契约。
+        "alert_routes": tuple(alert_routes),
+        "latency_window_seconds": latency.window,
+        "latency_min_samples": latency.min_samples,
+    }
     return cache

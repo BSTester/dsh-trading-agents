@@ -1,0 +1,160 @@
+# 量化交易决策平台 V3 · `quant-sdk` profile 的用户 patch 层（规格 FR-GATEWAY-002 / §5.2.2 / §6.3）
+#
+# 装机顺序（dsh profile boot）：package.json 的 `dsh.profile.bundles` 逐个 apply，
+# 然后是本文件，最后是任何 `--patch` overlay。**本文件最后写，所以本文件赢。**
+#   @deepseek-ai/dsh-base     → 共享内核
+#   @deepseek-ai/dsh-sdk-app  → SDK 应用层（**它自带 JSON-RPC 服务行**，见下）
+#
+# 这一层做四件事：
+#   ① SDK JSON-RPC 服务行配置        → §6.3 要求 maxTokensAsSuccess: false
+#   ② 平台 MCP 客户端行（唯一交互面）  → quantwb @ http://127.0.0.1:8397/mcp
+#   ③ 工具白名单：按行关停（本地工具）  → 照抄 platform/install/quant-headless 的做法
+#   ④ 工具白名单：真边界插件（MCP 工具）→ quant-tool-whitelist（guard + restrict）
+#
+# ⚠️ 为什么 ① 是「按 id 覆盖」而**不是** `insert` 一行 `@deepseek-ai/dsh-sdk-jsonrpc-server`
+# ---------------------------------------------------------------------------
+# §6.3 的原文示例是在 `cordis.patch.yml` 里 insert 一行 `sdk-jsonrpc-server`。但**实测**
+# （`dsh --profile sdk --dump-config | grep jsonrpc`，2026-09-20）：
+#
+#     # == @deepseek-ai/dsh-sdk-app
+#     - id: sdk-app-startup
+#       name: '@deepseek-ai/dsh-sdk-app'
+#     - id: sdk-jsonrpc-server
+#       name: '@deepseek-ai/dsh-sdk-jsonrpc-server'
+#
+# 也就是说 `@deepseek-ai/dsh-sdk-app` 这个 bundle **自己已经挂了** `sdk-jsonrpc-server`
+# （`dsh-sdk-app` 的 package.json 里 `dsh.bundle.patch` 指向它的 cordis.patch.yml，
+# 其中有 `inject: [sdkAppStartup, loader]` 的 `sdk-jsonrpc-server` 行）。同一个 id 再
+# insert 一遍就是**重复行**——轻则同 id 两行互相覆盖，重则 loader 直接报重复 id。
+# 所以本文件走「按 id 覆盖既有行的 config」这条路（与 `quant-headless` 覆盖 `system-prompt`
+# 同一手法）。**结果与 §6.3 等价且不重复挂载**：profile 起来后 jsonrpc 行存在且
+# `maxTokensAsSuccess: false` 生效——已用 `--dump-config` 核对（见 README「实测」一节）。
+
+- id: sdk-jsonrpc-server
+  config:
+    # §6.3 原文就是这一项：maxTokens 截断不算成功轮次（false = 如实报未完成）。
+    maxTokensAsSuccess: false
+
+# ── ② 平台 MCP 客户端行：与平台之间的**唯一**交互面 ──────────────────────────
+#
+# 分析师能看到的量化数据都从平台的 MCP 工具面来：既有工作台工具 + `/api/v3/*` 路由桥接出的
+# `v3_*` 工具，同一个 `/mcp` 端点、同一份服务端实现（桥接不复制业务逻辑，见
+# `server/v3_mcp.py` 与 `docs/v3-integration.md`）。**不挂任何第三方 adapter/桥接包**。
+# `@deepseek-ai/dsh-mcp-client` 已装在共享目录 `~/.dsh/profiles/node_modules/`（本 profile
+# 能向上解析到），**无需额外装包**。
+#
+# 与官方 headless 侧的同一处做法一致；`failOnStartupError: false` 让平台服务没起时
+# 工具面缺席（由模型如实报告「数据源不可达」），而不是让整个 SDK 进程崩在启动阶段。
+- insert:
+    - id: quant-platform-mcp
+      name: '@deepseek-ai/dsh-mcp-client'
+      config:
+        serverName: quantwb
+        transport: streamable-http
+        url: http://127.0.0.1:8397/mcp
+        failOnStartupError: false
+        # 对齐平台侧 TTL：live 业务确认 120s + 取数余量（见 v3_ops confirmation TTL）。
+        toolCallTimeoutMs: 180000
+
+# ── ③ 工具白名单：按行关停（**本地**工具）────────────────────────────────────
+#
+# 做法与理由逐字沿用 `platform/install/quant-headless/cordis.patch.yml`：
+# 部署里 `@deepseek-ai/dsh-tools` 没有 allow/deny 配置项，也不存在工具过滤插件，
+# profile 层唯一真实可用的收窄手段是「按 shipped 行的 `disabled: true` 关停」。
+#
+# ── 保留（白名单内）────────────────────────────────────────────────────────
+#   tool-fs / tool-fs-search   读/写/改文件、glob、grep（研究笔记与报告落盘）
+#   tool-skill + skill-filesystem 技能手册
+#   user-questions / tool-todo / tool-present
+#   quant-platform-mcp          ↓ 量化数据面（上面 insert）
+#
+# ── 关停（白名单外）──────────────────────────────────────────────────────────
+
+# 通用 shell：可绕过工具面直接打任意 HTTP（含交易端点）。分析师的取数通道是 MCP 工具面。
+- id: tool-bash
+  disabled: true
+- id: tool-pwsh
+  disabled: true
+
+# 后台作业：只对 subagent/workflow 的后台子任务有意义，两者关掉后是死面。
+- id: tool-jobs
+  disabled: true
+
+# 委派与编排：子代理/工作流会放大工具面（一个子代理就是一次不受本白名单约束的新会话面）。
+- id: tool-subagent
+  disabled: true
+- id: tool-subagent-fork
+  disabled: true
+- id: tool-subagent-control
+  disabled: true
+- id: tool-subagent-list-agents
+  disabled: true
+- id: tool-workflow
+  disabled: true
+- id: tool-ralph
+  disabled: true
+
+# 长跑目标：跨轮自治续跑，人工交互式会话里不需要。
+- id: tool-goal
+  disabled: true
+
+# 外网直连：新闻/公告一律走平台 MCP 工具面（带 source/as_of 标注），不走模型侧自由抓取。
+# 这三个行是一组：只关 tool-web 会留下悬空的上游 provider 行。
+- id: tool-web
+  disabled: true
+- id: web-search-deepseek
+  disabled: true
+- id: web-fetch-http
+  disabled: true
+- id: web
+  disabled: true
+
+# 注：刻意**没有**关 subagent / subagent-spawn-in-process / subagent-fork-in-process /
+# workflow-worker-thread 这些**服务**行——只关模型可见的 tool-* 行。关服务行会让其它
+# 注入它的行卡在 waiting（"N row(s) did not activate"）。
+
+# 技能目录：指到仓库内的 skills/（与 quant-headless 同一处理；换机器要改绝对路径）。
+- id: skill-filesystem
+  config:
+    customSkillDirs:
+      - /home/penn/workspace/dsh-trading-agents/skills/
+      - /home/penn/workspace/dsh-trading-agents/futu-skills/
+
+# ── ④ 工具白名单：真边界插件（**MCP** 工具）──────────────────────────────────
+#
+# ③ 的「按行关停」**只能关本地 tool-\* 行**。平台的 77 个工作台工具与桥接出的 `v3_*` 工具
+# 是经上面**一行** `quant-platform-mcp` 进来的（`dsh-mcp-client` 没有 allow/deny 配置项，
+# 已核对其 README 配置表），所以 `trade_place` / `trade_modify` / `trade_cancel` /
+# `plan_execute` / `switch_mode` / `v3_credentials` / `v3_oms_sync` 在那一步**关不掉**。
+#
+# 因此这里挂一个 40 行的 profile 插件 `quant-tool-whitelist`：
+#   * `ctx.tools.guard()` —— 单调执行闸门：命中即拒，且**任何后续监听器都无法把拒绝改回
+#     允许**（`dsh-tools` README：「a returned reason denies the call, and no later listener
+#     can turn that denial back into permission」）。
+#   * `ctx.tools.restrict({deny})`（在 `agent/created` 里按 agent 作用域）—— 把命中的工具
+#     从该会话**模型可见的工具面**上摘掉，而不只是拒绝调用。
+# 拒绝集与 `platform/server/v3_sdk.py` 的 `WRITE_TOOL_NAMES`/`WRITE_TOOL_PREFIXES`/
+# `WRITE_TOOL_SUBSTRINGS` **逐字同源**；`platform/tests/test_v3_sdk.py` 会读插件文件并断言
+# 两侧一致（漂移即测试变红）。
+#
+# 安装（一次性，装进 profile 自己的 node_modules）：
+#   dsh plugin --profile quant-sdk add file:<仓库>/platform/install/quant-sdk/tool-whitelist
+- insert:
+    - id: quant-sdk-tool-whitelist
+      name: quant-tool-whitelist
+      config:
+        # 只读例外：默认空。填进来的名字会从拒绝集里**减去**（用于将来确认过的只读工具）。
+        allowExtra: []
+        # 额外拒绝：逗号分隔（运维临场加严用，不影响上面的静态档）。
+        denyExtra: !!js "process.env.QUANT_SDK_TOOL_DENY || ''"
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 真实边界在哪：**提示词、行关停、插件闸门都不是交易边界**
+# ═══════════════════════════════════════════════════════════════════════════
+# 上面四层把 SDK 会话的写/交易面收窄到「不可达」，但真正拦住下单的始终是服务侧：
+#   * 写端点要求人工在 Web 确认（store_access.request_confirmation，TTL 120s 超时=拒绝，
+#     fail-closed）；
+#   * `confirm-decide` / `rules-decide` / 设置页三端点**有意不进 MCP 工具面**，桥接层还把
+#     `/api/v3/credentials` 的 save/clear 直接封死（`v3/credentials-web-only`）；
+#   * sim→live 切换必须由人在 Web 输入口令「确认实盘」。
+# 因此：白名单是**纵深**的一层，不是唯一一层。任何一条都不该被当成「所以可以放心」。
