@@ -1,16 +1,18 @@
 """``server/v3_credentials.py`` 契约测试（页面化密钥配置）。
 
-离线：临时 home + 注入 ``get_env`` / ``http`` 替身，不打网络、不读真实 ``~/.dsh``。
-钉死的纪律：
-  * 凭据文件 0600，原子写；
-  * **任何响应都不含明文密钥**（status / save / clear / test 四条路径逐条断言）；
-  * 环境变量优先于文件；
-  * 未配置时 test 不发请求（no-token）；
-  * 保存前校验（空/过短/含空白一律拒绝，且**文件零改动**）。
+离线：临时 home，不打网络、不读真实 ``~/.dsh``。
+
+**2026-09-21 数据源政策后的新契约**（原 tushare_token 用例随 Tushare Pro 一并移除——
+政策：除富途（授权使用）外数据渠道一律免密钥，需要 token 的引用一律删除）：
+  * ``KEYS`` 注册表为空 → status 返回 ``keys=[]`` 且 note 写明免密钥政策；
+  * save / clear / validate 对**任何** key 一律拒绝（unknown-key / invalid），
+    且**不落盘**（文件保持不存在）；
+  * resolve 未知 key → ``(None, None)``。
+
+通用机制（0600 原子写 / 掩码 / 环境变量优先）随政策休眠：为它保留旧形态测试只会
+测试一个没有注册键的空壳，因此不保留。
 """
-import json
 import os
-import stat
 import tempfile
 import unittest
 
@@ -23,10 +25,10 @@ if PLATFORM not in sys.path:
 
 from server import v3_credentials as creds  # noqa: E402
 
-SECRET = "0123456789abcdef0123456789abcdef"
 
+class CredentialsPolicyTest(unittest.TestCase):
+    """数据源政策后的凭据注册表契约：空注册表 + 拒绝一切数据类凭据。"""
 
-class CredentialsTest(unittest.TestCase):
     def setUp(self):
         self.home = tempfile.mkdtemp(prefix="v3cred-")
 
@@ -35,89 +37,41 @@ class CredentialsTest(unittest.TestCase):
             os.unlink(os.path.join(self.home, name))
         os.rmdir(self.home)
 
-    # ── 读取/状态 ───────────────────────────────────────────────────────────
-    def test_status_without_file_reports_absent_and_creates_nothing(self):
+    def test_registry_is_empty_by_policy(self):
+        """注册表必须为空：数据渠道一律免密钥（富途凭据不在本模块）。"""
+        self.assertEqual(creds.KEYS, {}, "数据源政策：不得再注册需要 token 的数据渠道")
+
+    def test_status_returns_empty_keys_with_policy_note(self):
         body = creds.status(self.home)
         self.assertTrue(body["ok"])
-        entry = body["keys"][0]
-        self.assertFalse(entry["present"])
-        self.assertIsNone(entry["value"] if "value" in entry else None)
-        self.assertFalse(os.path.exists(creds.credential_path(self.home)))
+        self.assertEqual(body["keys"], [])
+        self.assertIn("免密钥", body.get("note", ""))
+        self.assertFalse(os.path.exists(creds.credential_path(self.home)),
+                         "空注册表的 status 不该创建凭据文件")
 
-    # ── 保存 ────────────────────────────────────────────────────────────────
-    def test_save_writes_0600_and_never_echoes_value(self):
-        body = creds.save(self.home, "tushare_token", SECRET)
-        self.assertTrue(body["ok"])
-        entry = body["keys"][0]
-        self.assertTrue(entry["present"])
-        self.assertEqual(entry["source"], "页面配置（v3-credentials.json）")
-        self.assertEqual(entry["hint"], "…" + SECRET[-4:])
-        self.assertNotIn(SECRET, json.dumps(body, ensure_ascii=False))
-        mode = stat.S_IMODE(os.stat(creds.credential_path(self.home)).st_mode)
-        self.assertEqual(mode, 0o600)
-
-    def test_save_rejects_invalid_values_without_touching_file(self):
-        for bad in ["", "   ", "short", "has space 1234567890"]:
-            body = creds.save(self.home, "tushare_token", bad)
-            self.assertFalse(body["ok"], bad)
-            self.assertEqual(body["error"]["code"], "v3-credentials/invalid")
-            self.assertFalse(os.path.exists(creds.credential_path(self.home)))
-        body = creds.save(self.home, "unknown_key", SECRET)
-        self.assertFalse(body["ok"])
-        self.assertEqual(body["error"]["code"], "v3-credentials/invalid")
-
-    # ── 优先级与清除 ────────────────────────────────────────────────────────
-    def test_env_wins_over_file(self):
-        creds.save(self.home, "tushare_token", SECRET)
-        value, source = creds.resolve(self.home, "tushare_token",
-                                      lambda name: "env-token-1234567890" if name == "TUSHARE_TOKEN" else None)
-        self.assertEqual(value, "env-token-1234567890")
-        self.assertIn("环境变量", source)
-
-    def test_clear_removes_file_entry_but_env_still_wins(self):
-        creds.save(self.home, "tushare_token", SECRET)
-        body = creds.clear(self.home, "tushare_token")
-        self.assertTrue(body["ok"])
-        self.assertFalse(body["keys"][0]["present"])
-        self.assertNotIn(SECRET, json.dumps(body, ensure_ascii=False))
-        value, _ = creds.resolve(self.home, "tushare_token", lambda name: "env-1234567890abcd")
-        self.assertEqual(value, "env-1234567890abcd")
-
-    def test_corrupt_file_is_treated_as_absent(self):
+    def test_status_treats_corrupt_file_as_absent(self):
         with open(creds.credential_path(self.home), "w", encoding="utf-8") as handle:
             handle.write("{ not json")
         body = creds.status(self.home)
-        self.assertFalse(body["keys"][0]["present"])
-
-    # ── 连通性测试 ──────────────────────────────────────────────────────────
-    def test_test_without_token_sends_nothing(self):
-        calls = []
-        body = creds.test_tushare(self.home, http=lambda b, t: calls.append(b) or {"code": 0})
-        self.assertFalse(body["ok"])
-        self.assertEqual(body["error"]["code"], "tushare/no-token")
-        self.assertEqual(calls, [], "未配置时不应发出任何请求")
-
-    def test_test_reports_ok_latency_and_api_error(self):
-        creds.save(self.home, "tushare_token", SECRET)
-        body = creds.test_tushare(self.home, http=lambda b, t: {"code": 0, "data": {"items": [[1], [2]]}})
         self.assertTrue(body["ok"])
-        self.assertEqual(body["rows"], 2)
-        self.assertNotIn(SECRET, json.dumps(body, ensure_ascii=False))
+        self.assertEqual(body["keys"], [])
 
-        failed = creds.test_tushare(self.home, http=lambda b, t: {"code": 2002, "msg": "权限不足"})
-        self.assertFalse(failed["ok"])
-        self.assertEqual(failed["error"]["code"], "tushare/api")
-        self.assertIn("权限不足", failed["error"]["message"])
+    def test_resolve_unknown_key_is_none(self):
+        self.assertEqual(creds.resolve(self.home, "tushare_token"), (None, None))
+        self.assertEqual(creds.resolve(self.home, "anything", os.environ.get), (None, None))
 
-    def test_test_network_error_is_normalized(self):
-        creds.save(self.home, "tushare_token", SECRET)
+    def test_save_rejects_any_key_without_writing_file(self):
+        for key in ("tushare_token", "deepseek_api_key", "anything"):
+            body = creds.save(self.home, key, "0123456789abcdef0123456789abcdef")
+            self.assertFalse(body["ok"], key)
+            self.assertEqual(body["error"]["code"], "v3-credentials/invalid", key)
+        self.assertFalse(os.path.exists(creds.credential_path(self.home)),
+                         "拒绝的保存不得落盘")
 
-        def boom(_body, _timeout):
-            raise TimeoutError("timed out")
-
-        body = creds.test_tushare(self.home, http=boom)
+    def test_clear_rejects_unknown_key(self):
+        body = creds.clear(self.home, "tushare_token")
         self.assertFalse(body["ok"])
-        self.assertEqual(body["error"]["code"], "tushare/network")
+        self.assertEqual(body["error"]["code"], "v3-credentials/unknown-key")
 
 
 if __name__ == "__main__":

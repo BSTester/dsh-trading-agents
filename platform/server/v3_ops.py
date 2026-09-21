@@ -20,7 +20,7 @@ oms/orders,oms/sync,events,audit,brain}``）。
   另附 ``tools_domain_catalog`` / ``tools_bridge`` / ``tools_source``），``/metrics`` 用
   ``quantwb_tools{scope="mcp"|"domain"}`` 分口径暴露——**两边都不写死常量**。
 * **数据源可用性（2026-09-20 修正）**：判据是**能力探测 / 最近一次真实调用的 source**，
-  不是「某个 Python 包能否 import」（SEC EDGAR 走 HTTPS、Tushare 走 HTTP，都不需要包）。
+  不是「某个 Python 包能否 import」（SEC EDGAR 走 HTTPS，不需要包）。
   探测的真值放在 ``source``/``as_of``/``detail`` 三个字段里；失败如实写原因，绝不写死
   「不可用」。
 * **通道（2026-09-20 修）**：两条通道**都已实现**——SDK JSON-RPC 在 ``server/v3_sdk.py``、
@@ -122,9 +122,10 @@ _RULE_OF_ACTION = {"auto": "within-limits", "manual": "single-order",
                    "blocked": "drawdown-red-line", "blocked_industry": "industry-red-line"}
 
 #: 设置页环境变量清单（任务书 §4）：只报「是否注入 + 来源」，**绝不出值**
+#: （2026-09-21 数据源政策：TUSHARE_TOKEN 随 Tushare Pro 一并移除——需要 token 的
+#: 数据渠道不再引用，能力由免密源覆盖）。
 ENV_KEYS = ("DSH_HOME", "DEEPSEEK_API_KEY", "QUANT_MCP_NODE", "QUANT_MCP_SERVER",
-            "QUANT_MCP_CWD", "QUANT_MCP_LOG", "FUTU_OPEND_HOST", "FUTU_OPEND_PORT",
-            "TUSHARE_TOKEN")
+            "QUANT_MCP_CWD", "QUANT_MCP_LOG", "FUTU_OPEND_HOST", "FUTU_OPEND_PORT")
 
 OMS_FILENAME = "v3-oms-orders.json"
 OMS_SYNC_FILENAME = "v3-oms-sync.jsonl"
@@ -1838,8 +1839,6 @@ DEFAULT_SOURCE_PROBE_TIMEOUT = 6.0
 #: 落盘探测证据的新鲜窗口：超过它仍可用（是真实调用结果），只是会在 detail 里注明年龄。
 SOURCE_PROBE_EVIDENCE_MAX_AGE = 3600.0
 
-#: Tushare 真实取数端点（与 ``v3_credentials.TUSHARE_ENDPOINT`` 同一地址；这里只做可达性探测）。
-TUSHARE_PROBE_URL = "http://api.tushare.pro"
 #: SEC XBRL 探测参数：与 ``GET /api/v3/financials?ticker=AAPL`` 同一条路径（Apple CIK=0000320193）。
 SEC_PROBE_CIK = 320193
 SEC_PROBE_TAG = "Revenues"
@@ -2010,41 +2009,12 @@ def _sec_edgar_row(home, http_probe):
                        "GET /api/v3/sources/status 刷新落盘的真实调用证据")}
 
 
-def _tushare_row(home, http_probe):
-    """Tushare Pro 的可用性 = **凭据就绪 × 端点 HTTP 可达**；与 ``tushare`` 包无关。
-
-    实现走 ``POST http://api.tushare.pro``（``v3_sources.fetch_tushare``），因此
-    「tushare 包能否 import」从来不是判据（2026-09-20 修正）。未配置凭据时**不发任何请求**。
-    """
-    from server import v3_credentials  # noqa: PLC0415 —— 与 v3_sources 同一份凭据解析
-    name = "Tushare Pro"
-    token, token_source = v3_credentials.resolve_tushare_token(home, os.environ.get)
-    if not token:
-        return {"name": name, "available": False, "as_of": _now(),
-                "source": "credentials:未配置",
-                "detail": ("TUSHARE_TOKEN 未注入（环境变量与页面配置 v3-credentials.json 都没有）"
-                           "→ 按既有纪律不发任何请求，故**未探测**端点可达性；"
-                           "实现走 POST http://api.tushare.pro，与 tushare 包是否可导入无关")}
-    result = _probe_cached("tushare", lambda: http_probe(TUSHARE_PROBE_URL))
-    if result.get("ok"):
-        verdict = "HTTP 可达（2xx）"
-    elif result.get("reachable"):
-        verdict = f"HTTP 可达但返回 {result.get('status')}（不判为可用）"
-    else:
-        verdict = "HTTP 不可达"
-    return {"name": name, "available": bool(result.get("ok")), "as_of": result.get("as_of"),
-            "source": "http-probe:api.tushare.pro + credentials",
-            "detail": (f"凭据就绪（{token_source}）× 端点 {verdict}：{result.get('evidence')}；"
-                       "本次**未做真实取数验证**（不消耗上游积分）——真实可用性以 "
-                       "GET /api/v3/tushare 的 source 或 "
-                       "POST /api/v3/credentials(action=test) 的结果为准")}
-
-
 def _data_sources(call, home, http_probe=None):
-    """五个数据源的真实可用性：能探测就探测，测不到就说清**为什么**并带上 ``as_of``。
+    """四个数据源的真实可用性：能探测就探测，测不到就说清**为什么**并带上 ``as_of``。
 
     判据一律是**能力/真实调用结果**，不是包导入（AKShare 一条除外——它在**本进程内**被
-    import 调用，importlib 探测与实现语义一致，故保留）。
+    import 调用，importlib 探测与实现语义一致，故保留）。Tushare Pro 行已随
+    「数据源政策：需要 token 的渠道一律移除」（2026-09-21）删除。
     """
     probe = http_probe or _http_probe
     checked_at = _now()
@@ -2074,7 +2044,6 @@ def _data_sources(call, home, http_probe=None):
          "source": "importlib:akshare",
          "as_of": checked_at},
         _sec_edgar_row(home, probe),
-        _tushare_row(home, probe),
     ]
 
 

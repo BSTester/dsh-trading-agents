@@ -1280,7 +1280,7 @@ export default function MarketPage() {
           </>
         )}
       </ProCard>
-      {/* 数据域：把后端外部数据源端点（news/financials/tushare/openbb/spot）全部对到界面 */}
+      {/* 数据域：把后端外部数据源端点（news/financials/openbb/spot）全部对到界面 */}
       <DataDomainCard />
     </Space>
   );

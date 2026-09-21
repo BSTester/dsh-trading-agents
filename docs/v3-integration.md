@@ -147,8 +147,9 @@ cd platform && ~/.dsh/trading-venv/bin/python -B tools/mcp_surface_report.py
 | `direct` | 77 + 全部 `v3_*` 桥接件（实测 **118 → 125**，随路由表涨） | **79,624 → 86,930** | **≈19.9k → 21.7k** | 全量直暴露，向后兼容 |
 | `discovery`（**默认**） | **6** | **3,248** | **≈812** | 省 **≈96%**（保留 3.7%~4.1%） |
 
-discovery 模式**多花的那一次往返**：`list_tools` 默认一页 20 张卡片 = 5,081 字符
-≈1,270 token，命中总数与分页信息一起返回（`has_more` / `next_offset`）。
+discovery 模式**多花的那一次往返**：`list_tools` 默认一页 20 张卡片 = **5,750 字符**
+≈1,438 token（2026-09-21 给卡片加并发/渲染元数据**之前**是 5,081~5,085 字符 ≈1,271 token；
+那一次改动只加不减，逐项账见 §1.7.3），命中总数与分页信息一起返回（`has_more` / `next_offset`）。
 因此单轮净收益 ≈18.3k~20.5k token；**要连续检索 15 页以上（300+ 件）才会把省下的吃回去**，
 而工具面总量只有一百多件。
 
@@ -246,6 +247,15 @@ annotations** → 一律拒（**fail-closed**：包括 `series` 这类事实上�
 双面等价 + 卡片标注 + token 鉴权）。
 
 #### 1.5.6 `v3_*` 工具表
+
+> ⚠️ **本表是 2026-09-20 的快照（39 行）**，路由表此后继续增长：本 worktree 现为 **51 件**
+> （新增 `v3_factors_registry` / `v3_sentiment` / `v3_strategies_event_study` /
+> `v3_strategies_stat_arb` / `v3_ml_backtest` / `v3_ml_models` / `v3_ml_sweep` /
+> `v3_ops_alerts` / `v3_ops_alerts_rules` / `v3_sdk_status` / `v3_sdk_sessions` / `v3_sdk_prompt` /
+> `v3_headless_log` / `v3_headless_schedule` / `v3_macro` / `v3_northbound` /
+> `v3_risk_funding_check` / `v3_sources_status` …），且 `v3_tushare` 行已随 Tushare 移除而去掉
+> （见 `docs/v3-source-policy.md`）。**权威口径一律由注册表推导**（`v3_mcp.V3Bridge.definitions`），
+> 条数与逐件判定用 §1.7 的实测命令现取，不要照抄本表。
 
 | 工具 | 路由 | 只读 | 入参 | 本模式是否直连（`discovery`） |
 |---|---|---|---|---|
@@ -353,6 +363,186 @@ Error: dsh: plugin tree failed to load: failed to apply loader entry include (co
 `~/.dsh/profiles/node_modules/@deepseek-ai/dsh-mcp-client`，无需额外装包。
 需要用 adapter 的话，得等包作者发一版对齐 dsh 0.1.5-rc.2 的适配（至少：patch 行名带 scope、
 改用 `ToolCallId`、声明 dsh 版本区间）。
+
+### 1.7 工具面元数据：`isConcurrencySafe`、`renderable` 与 `format:"text"`
+
+FR-TOOLS-002 的三条子规范落在**注册面**（`platform/server/mcp_tools.py`，本轮不改）：并发安全
+判定表 `CONCURRENCY_UNSAFE_TOOLS`、渲染纯函数注册表 `TOOL_RENDERERS`、`format` 参数。
+本节记录的是它们**有没有到达调用方**——`tools/list` 的 `_meta` 与 `list_tools` 的卡片，
+以及 2026-09-21 补齐的那几处缺口（改动只在 `platform/server/mcp_discovery.py`）。
+
+复现命令（两种面各装配一次真应用，**只读**，不碰线上 8397）：
+
+```bash
+cd platform && ~/.dsh/trading-venv/bin/python -B -c "
+import asyncio, sys; sys.path.insert(0,'.')
+from tests.test_mcp_discovery import build_offline_app
+app = build_offline_app('discovery')
+for server, label in ((app.state.mcp, '/mcp'), (app.state.mcp_ro, '/mcp/ro')):
+    print(label)
+    for t in asyncio.run(server.list_tools()):
+        print('  ', t.name, t.meta)"
+```
+
+实测输出（本 worktree，2026-09-21）：
+
+```console
+/mcp
+   snapshot {'quantwb.isConcurrencySafe': True}
+   admin_status {'quantwb.isConcurrencySafe': False}
+   v3_gateway {'quantwb.isConcurrencySafe': True}
+   v3_tools {'quantwb.isConcurrencySafe': True}
+   list_tools {'quantwb.isConcurrencySafe': True}
+   call_tool {'quantwb.isConcurrencySafe': False}
+/mcp/ro
+   snapshot {'quantwb.isConcurrencySafe': True}
+   admin_status {'quantwb.isConcurrencySafe': False}
+   v3_gateway {'quantwb.isConcurrencySafe': True}
+   v3_tools {'quantwb.isConcurrencySafe': True}
+   list_tools {'quantwb.isConcurrencySafe': True}
+   call_tool {'quantwb.isConcurrencySafe': True}
+```
+
+> 两个面的差异**只有 `call_tool`**：`/mcp` 的它可以转发写类内层工具 → `false`；
+> `/mcp/ro` 的它被闸门限制在只读件内 → `true`（与它自己的 `readOnlyHint=true` 同一口径）。
+
+#### 1.7.1 `quantwb.isConcurrencySafe` 的判据与逐值数量
+
+判定**只有一份实现**，本模块不重推（`mcp_discovery.concurrency_meta`）：注册面带了
+`readOnlyHint` 就照它（桥接 `v3_*` 与两个代理入口），不带的（基础面 77 件）退回
+`mcp_tools.is_concurrency_safe`。
+
+| 面 | 判定来源 | `true` | `false` | 合计 |
+|---|---|---|---|---|
+| 基础面（工作台 77 件） | `mcp_tools.CONCURRENCY_UNSAFE_TOOLS`（写账户模式 / 交易 / 推送订阅 / 值班队列状态机 / admin 维护面，按家族保守取 false） | **61** | **16** | 77 |
+| 桥接面（`v3_*` 51 件） | `v3_mcp.NON_READONLY_PATHS`（写类：落盘研究轮 / 改 OMS 台账 / 改配置 / SDK prompt） | **47** | **4** | 51 |
+| **合计** | — | **108** | **20** | **128** |
+
+16 件 false（基础面）：`trade_place`、`trade_modify`、`trade_cancel`、`trade_max_qty`、
+`plan_execute`、`switch_mode`、`push_status`、`push_subscribe`、`push_unsubscribe`、
+`research_tasks_claim`、`research_tasks_report`、`admin_status`、`admin_runs`、
+`admin_cancel_run`、`admin_cancel_stale`、`admin_prune_runs`。
+4 件 false（桥接面）：`v3_credentials`、`v3_oms_sync`、`v3_sdk_prompt`、`v3_strategy_run`。
+
+**覆盖面的实测口径（三种面的差别，别混）**：
+
+| 面 | 条数 | 带 `_meta` | 说明 |
+|---|---|---|---|
+| `direct` 模式的 `/mcp` | 128 | **128** | 已闭环（2026-09-21，主 agent 收口）：`v3_mcp.register` 的 `server.add_tool(...)` 补 `meta=mcp_tools.concurrency_meta(endpoint not in NON_READONLY_PATHS)` → 51 件 `v3_*` 全覆盖，实测 **51/51 带 `_meta`，其中 47 true / 4 false**（写类：`v3_credentials`/`v3_oms_sync`/`v3_strategy_run`/`v3_sdk_prompt`） |
+| `discovery` 模式的 `/mcp` | 6 | **6** | 本轮补齐：`v3_gateway`/`v3_tools` 保留件就地补 `_meta`，两个代理入口注册时带上 |
+| `/mcp/ro` | 6 | **6** | 本轮补齐：此前**六件全无** `_meta`（`register_readonly` 重新注册时没带） |
+
+**四件 `false` 的判定依据**（写入判定表，非保守猜测）：`v3_credentials`（写/清凭据，桥内封死但语义是写）、
+`v3_oms_sync`（重写本地台账）、`v3_strategy_run`（落盘研究轮）、`v3_sdk_prompt`（起 Harness 子进程 + 落审计）。
+其余 47 件为只读端点，无共享可变状态被本调用修改，可并行。
+
+#### 1.7.2 `renderable` 与 `format:"text"`：同一工具，两种输出
+
+`format` 是**可选响应形态参数**（缺省 `"json"` = 规范 JSON 信封，机器读；`"text"` = 人类可读
+散文渲染）。它只出现在 renderable 工具的签名里——当前 **5 件**（`TOOL_RENDERERS`：
+`snapshot` / `series` / `factors` / `ic` / `risk`，全部是基础面工具；桥接面 `v3_*` 无渲染器）。
+非 renderable 工具**没有**这个字段，传了按未知参数拒绝（与 schema 封闭性同一后果）。
+
+同一实参的两种输出（离线装配 + fixture 数据，**渲染是生产代码**；`series` 经 discovery 面的
+`call_tool` 转发）：
+
+```console
+# format 缺省（json）——规范信封，机器读
+$ call_tool(name="series", arguments={"ticker":"US.NVDA","period":"1d"})
+{"ok":true,"value":{"ticker":"US.NVDA","period":"1d","count":3,
+ "source":"futu/quote_history_kline","as_of":"2026-09-19",
+ "bars":[{"t":"2026-09-17","o":176.1,"h":178.4,"l":175.2,"c":177.9,"v":210340000}, …]}}
+
+# format="text"——同一份数据的人类渲染（纯函数：同输入恒同输出，无时钟/无 I/O）
+$ call_tool(name="series", arguments={"ticker":"US.NVDA","period":"1d","format":"text"})
+US.NVDA 1d K 线：共 3 根（2026-09-17 → 2026-09-19；来源 futu/quote_history_kline）
+- 最新一根：t=2026-09-19 O=178.2000 H=181.0000 L=177.5000 C=180.4000 V=241900000
+- 窗口首根：t=2026-09-17 C=177.9000
+- 窗口累计涨跌：1.41%（首→尾收盘）
+```
+
+两条约定（都不靠「渲染器写得好不好」保证）：
+
+* **空数据渲染成「无数据源·原因」，不是空串**（`_no_data`）：渲染函数返回空串时回退规范 JSON，
+  绝不返回空内容；
+* **非 renderable 工具传 `format` 仍被拒**，措辞与直连 schema 层同一后果：
+
+  ```console
+  $ call_tool(name="positions", arguments={"format":"text"})
+  {"ok":false,"error":{"code":"mcp/bad-arguments",
+   "message":"call_tool('positions') 的实参不合法：不认识参数 ['format']。…"}}
+  ```
+
+**本轮修掉的一个真缺陷**：`format` 是 `mcp_tools._bind` 在**绑定期**追加进签名/schema 的，
+`definition.params` 里没有它；而代理的实参白名单来自卡片参数名——于是
+`call_tool(name="series", arguments={…,"format":"text"})` 一直被判野字段（直连面同一实参却是
+合法的）。修法是让卡片在 renderable 件上补列 `format`（与 schema 同一谓词），并加了两条测试钉死
+「卡片参数名集合 ≡ schema `properties` 集合（128 件逐件）」与「代理转发 `format:"text"` 真出散文」。
+
+#### 1.7.3 卡片上的三个字段（`list_tools` 的导航面）
+
+discovery 模式下 122/128 件**不在** `tools/list` 上、拿不到 `_meta`，所以卡片必须自己回答
+「能不能并发调 / 能不能 text 渲染」。本轮给 `ToolCard` 加了三个键（`mcp_discovery.ToolCard`，
+**判定全部读出注册面，没有第二份清单**）：
+
+| 卡片键 | 取值 | 来源 | 出现条件 |
+|---|---|---|---|
+| `concurrencySafe` | `true`/`false`（**恒在**） | 基础面 `mcp_tools.is_concurrency_safe`；桥接面与 `readOnly` 同一判据 | 每张卡片 |
+| `renderable` | `true` | `mcp_tools.is_renderable` | 仅 renderable 件（其余缺键 = 不支持） |
+| `formats` | `["json","text"]` | `mcp_tools.FORMAT_JSON` / `FORMAT_TEXT` | 仅 renderable 件 |
+| （`optional` 里多出的 `format`） | 字段名 | 同上（与 schema 同集合） | 仅 renderable 件 |
+
+`readOnly` 的口径不变（基础面不发布 `readOnlyHint` → 如实为 `null`，**不发明**）；
+`concurrencySafe` 不是发明——基础面本来就发布这个判定（`/mcp` 的 `_meta` 就是它）。
+
+**卡片变大的代价（如实测量）**：默认一页 20 张卡片的 `cards` 数组从 **4,609 → 5,114 字符**
+（+505，**+11.0%**；一页 payload 含 note 后为 5,750 字符），其中 `concurrencySafe` 约
++26 字符/张；`renderable`/`formats`/`format` 只在 renderable 件上出现（一页 20 张里通常 0~1 件），
+几乎不占。全目录 128 件逐卡合计 **30,762 → 34,227 字符**（+3,465）。取舍：**保留**
+`concurrencySafe`（122 件工具的唯一元数据通道），**不给**非 renderable 件写
+`renderable:false`/`formats:["json"]`（那是 120+ 行冗余）。
+
+测试：`platform/tests/test_mcp_discovery.py::MetadataExposureTests`（9 条，含鉴别力用例
+「临时登记一个渲染器 → 卡片必须跟着翻」，证明字段是推导而非誊抄）。
+
+### 1.8 `skills/quant-research`：五阶段研究工作流如何被加载
+
+**它是什么**：`skills/quant-research/SKILL.md`（2026-09-21 新建）把规格 FR-TOOLS-002 的
+「Skill 层」补上——模型在需要时**自行加载**这条工作流，而不是把流程写进系统提示词。
+内容 = PDAT→PAAT→PCPT→PRT→PET 五阶段（每阶段的输入 / 真实工具名 / 输出 / **验收**）
++ **禁写边界**（研究侧永不下单、永不启用策略；只读研究产物进研究页与规则候选池）。
+
+**怎么被加载**（机制，可复核）：
+
+1. DSH 的 `skill-filesystem` 插件按配置的根目录扫描，**根下的一层目录** +
+   `<目录>/SKILL.md` 即一个技能（根目录下的 `<name>.md` 也算一个）；
+2. 两个决策 profile 都配了同一个根（`platform/install/quant-headless/cordis.patch.yml`、
+   `platform/install/quant-sdk/cordis.patch.yml`）：
+
+   ```yaml
+   - id: skill-filesystem
+     config:
+       customSkillDirs:
+         - /home/penn/workspace/dsh-trading-agents/skills/
+         - /home/penn/workspace/dsh-trading-agents/skills/futu-skills/
+   ```
+
+3. `skills/quant-research/SKILL.md` 与本仓库既有的 `quant-trading` / `research-institute`
+   **同形同根**（都在 `skills/` 下一层），因此**不需要新增任何配置**就随 profile 挂载；
+   `skills/futu-skills/` 单独列出来是因为它的子技能（`sentiment/` 等）还要再下一层。
+4. front-matter 只有 `name` + `description` 两个必填字段（`name: quant-research` 与目录名一致）；
+   **改技能文件不需要重启平台服务**——技能在会话开场按目录现扫。
+
+**与其它技能的分工**（避免模型走错路）：`research-institute` 是「挖因子/提规则/巡检」的研究院
+生产线，本技能是它内部那条**五阶段流水线**；`quant-trading` 是秒级信号快路径；
+`trading-agents` 是 12 角色深度研报。
+
+**技能内容里的工具名都经过核对**：`v3_factors_matrix` / `v3_factors_registry` / `v3_sentiment` /
+`v3_financials` / `v3_market` / `v3_risk_analytics` / `v3_risk_industry` /
+`v3_risk_funding_check` / `v3_strategy` / `v3_brain` / `v3_research` … 全部取自
+`list_tools` 的**真实目录**（128 件，无手抄）。技能同时写明：只读面 `/mcp/ro` 调不了基础面
+工具（`factors`/`ic`/`series`/`rules`… 一律 `mcp/denied-by-policy`），研究取数一律走带只读标注的
+`v3_*` 桥接件——这条有实测拒绝信封为证（见 `skills/quant-research/SKILL.md` 的「第一件事」一节）。
 
 ---
 

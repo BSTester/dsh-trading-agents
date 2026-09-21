@@ -1,4 +1,8 @@
-"""外部数据源 V3 接口（``/api/v3/*`` 的数据源半边）：富途 f10 / AKShare / SEC EDGAR / Tushare / OpenBB。
+"""外部数据源 V3 接口（``/api/v3/*`` 的数据源半边）：富途 f10 / AKShare / SEC EDGAR / OpenBB。
+
+（2026-09-21 数据源政策：除富途（授权使用）外一律免密钥公开端点——Tushare Pro 需要
+token，已按政策**整体移除**；其能力由免密源覆盖：财务=富途 f10/东财·新浪（AKShare）、
+宏观与北向=AKShare（见 ``server/v3_sources_ext.py``）。）
 
 设计约束（与规格 FR-DATA-002 及仓库「数据诚实」纪律一致）：
 
@@ -16,14 +20,12 @@
     AAPL / US.*        → SEC EDGAR（us-gaap XBRL，字段与既有响应完全兼容）
     SH.600000 / HK.00700 → 富途 f10_detail/statements（**主源**，逐期逐科目）
                            → AKShare（免密钥；A 股 stock_financial_abstract、港股按版本）
-                           → Tushare（income/balancesheet/cashflow；token 未注入则跳过并记进 chain）
                            → 全失败如实报错，错误里带 ``chain`` 写明每一级为什么没成
 
 参数注入（``register(app, v3_run, home, deps=None)``，前三个是约定签名；``deps`` 仅供测试）::
 
     deps = {
       "fetch_json":  callable(url) -> {"ok":True,"value":obj} | {"ok":False,"error":{...}},
-      "fetch_post":  callable(url, body) -> 同上,
       "akshare":     module-like | callable() -> module-like,
       "openbb":      module-like | callable() -> module-like,
       "env":         mapping-like（默认 os.environ）,
@@ -86,7 +88,6 @@ DEFAULT_SEC_UA = "quant-platform-v3 (ops@example.com)"
 SEC_TICKERS_URL = "https://www.sec.gov/files/company_tickers.json"
 SEC_CONCEPT_URL = "https://data.sec.gov/api/xbrl/companyconcept/CIK{cik:010d}/us-gaap/{tag}.json"
 SEC_TICKERS_CACHE = "sec_company_tickers.json"
-TUSHARE_ENDPOINT = "http://api.tushare.pro"
 
 DEFAULT_TIMEOUT = 25.0
 # openbb 的 import 本身以十秒计（本机实测冷启动 ~44-57s），且它的 provider 取数另计，
@@ -94,42 +95,8 @@ DEFAULT_TIMEOUT = 25.0
 OPENBB_TIMEOUT = 180.0
 OPENBB_IMPORT_TIMEOUT = 150.0
 
-# tushare API → 请求 fields / 请求参数 / 默认条数。fields 与 V3 原型（已退役）实现
-# tushare.mjs 的选择一致（那里按用途写死，这里按 api 名分发）。
-TUSHARE_APIS = {
-    "income": {
-        "fields": "ts_code,end_date,revenue,operate_profit,total_profit,n_income",
-        "params": ("ts_code", "period"),
-        "default_limit": 8,
-    },
-    "daily": {
-        "fields": "trade_date,open,high,low,close,vol,amount",
-        "params": ("ts_code", "start_date", "end_date"),
-        "default_limit": 60,
-    },
-    "daily_basic": {
-        "fields": "trade_date,pe_ttm,pb,ps_ttm,turnover_rate,volume_ratio",
-        "params": ("ts_code", "trade_date"),
-        "default_limit": 60,
-    },
-    "stock_basic": {
-        "fields": "ts_code,name,industry,market,list_date",
-        "params": (),
-        "default_limit": 20,
-    },
-    # A 股/港股财务降级链的第 3 级（前两级是富途 f10_detail 与 AKShare）。期次口径与
-    # ``income`` 一致：``period`` 是报告期（YYYYMMDD），不传则取最近若干期。
-    "balancesheet": {
-        "fields": "ts_code,end_date,total_assets,total_liab,total_hldr_eqy_exc_min_int",
-        "params": ("ts_code", "period"),
-        "default_limit": 8,
-    },
-    "cashflow": {
-        "fields": "ts_code,end_date,n_cashflow_act,n_cashflow_inv_act,n_cash_flows_fnc_act",
-        "params": ("ts_code", "period"),
-        "default_limit": 8,
-    },
-}
+# tushare API 表已随 Tushare Pro 移除（2026-09-21 数据源政策：需要 token 的数据渠道一律
+# 不再引用；能力由富途 f10 / AKShare / SEC EDGAR 免密覆盖）。
 
 #: ``/api/v3/financials`` 的三表 → 富途 ``f10_detail`` 的 ``statements.statement_type``
 #: （官方 1~4：1=利润表 2=资产负债表 3=现金流量表 4=主要指标）。只有前三者是「三表」口径。
@@ -150,9 +117,6 @@ TUSHARE_APIS = {
 #: ``earnings_price_move`` 是财报日涨跌、``revenue_breakdown`` 是营收构成、
 #: ``valuation_detail`` 是估值倍数——都不是三表口径，因此不拿它们顶替（宁可报缺口）。
 FUTU_STATEMENT_TYPES = {"income": 1, "balance": 2, "cashflow": 3}
-
-#: 三表 → Tushare Pro 的 api 名（降级链第 3 级）。
-TUSHARE_STATEMENT_APIS = {"income": "income", "balance": "balancesheet", "cashflow": "cashflow"}
 
 #: 三表 → 富途报表结构名（仅用于响应里的可读标注，不参与取数）。
 FUTU_STATEMENT_LABELS = {"income": "利润表", "balance": "资产负债表", "cashflow": "现金流量表"}
@@ -268,38 +232,6 @@ def http_get_json(url, headers=None, timeout=None):
         return envelope_error("sec/network", f"{url} → {_error_text(error)}")
 
 
-def http_post_json(url, body, headers=None, timeout=None):
-    """POST JSON + JSON。返回 ``{ok,value}`` 或 ``{ok:false,error}``；**永不抛异常**。"""
-    headers = dict(headers or {})
-    headers.setdefault("content-type", "application/json")
-    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
-    timeout = float(timeout or DEFAULT_TIMEOUT)
-    try:
-        try:
-            import httpx
-        except ImportError:
-            return {"ok": True, "value": _urllib_post_json(url, payload, headers, timeout)}
-        with httpx.Client(timeout=httpx.Timeout(timeout)) as client:
-            response = client.post(url, content=payload, headers=headers)
-        if response.status_code != 200:
-            return envelope_error(f"tushare/http-{response.status_code}", f"{url} → HTTP {response.status_code}")
-        return {"ok": True, "value": response.json()}
-    except Exception as error:  # noqa: BLE001
-        code = "tushare/timeout" if "timeout" in type(error).__name__.lower() else "tushare/network"
-        return envelope_error(code, f"{url} → {_error_text(error)}")
-
-
-def _urllib_post_json(url, payload, headers, timeout):
-    import urllib.request
-
-    request = urllib.request.Request(url, data=payload, headers=headers, method="POST")
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310
-        raw = response.read()
-    if isinstance(raw, bytes):
-        raw = raw.decode("utf-8", "replace")
-    return json.loads(raw)
-
-
 class _SocketTimeoutGuard:
     """给不接受超时参数的三方调用兜一条硬超时（akshare 内部走 requests → 读默认 socket 超时）。
 
@@ -339,7 +271,6 @@ class Deps:
     def __init__(
         self,
         fetch_json=None,
-        fetch_post=None,
         akshare=None,
         openbb=None,
         env=None,
@@ -349,7 +280,6 @@ class Deps:
         akshare_retry=None,
     ):
         self._fetch_json = fetch_json
-        self._fetch_post = fetch_post
         self._akshare = akshare
         self._openbb = openbb
         self._env = env
@@ -382,16 +312,6 @@ class Deps:
             except Exception as error:  # noqa: BLE001 —— 注入的假 fetch 抛错也走信封
                 return envelope_error("sec/network", f"{url} → {_error_text(error)}")
         return http_get_json(url, headers=headers, timeout=timeout or self.timeout)
-
-    def json_post(self, url, body, headers=None, timeout=None):
-        if self._fetch_post is not None:
-            try:
-                # 命名参数调用：测试替身按 ``(url, body, headers, timeout)`` 这一显式契约签名，
-                # 位置调用会让 body/headers 错位而不报错。
-                return self._fetch_post(url, body=body, headers=headers, timeout=timeout or self.timeout)
-            except Exception as error:  # noqa: BLE001
-                return envelope_error("tushare/network", f"{url} → {_error_text(error)}")
-        return http_post_json(url, body, headers=headers, timeout=timeout or self.timeout)
 
     # 三方模块（惰性 import + 可注入）-----------------------------------------
     def module(self, name, injector=None, timeout=None):
@@ -1380,57 +1300,6 @@ def age_days_since(end):
     return round((date.today() - parsed).days)
 
 
-# ── Tushare Pro ────────────────────────────────────────────────────────────────
-
-
-def fetch_tushare(deps, api, params, limit):
-    """POST ``api.tushare.pro``。**未注入 token 时不发任何请求**。"""
-    meta = TUSHARE_APIS.get(api)
-    if meta is None:
-        wanted = " / ".join(sorted(TUSHARE_APIS))
-        return envelope_error("tushare/unknown-api", f"api 需为 {wanted}，收到 {api!r}")
-    # 凭据来源：环境变量优先，其次页面配置（server/v3_credentials.py，0600 落盘）
-    from server import v3_credentials
-
-    token, token_source = v3_credentials.resolve_tushare_token(getattr(deps, "home", None), deps.get_env)
-    if not token:
-        return envelope_error("tushare/no-token",
-                              "TUSHARE_TOKEN 未注入（可在「接入与授权」页配置，或用环境变量）")
-    request_params = {}
-    for name in meta["params"]:
-        value = params.get(name)
-        if value not in (None, ""):
-            request_params[name] = value
-    if "ts_code" in meta["params"]:
-        if not request_params.get("ts_code"):
-            return envelope_error("tushare/bad-args", f"{api} 需要 ts_code（如 600519.SH）")
-        request_params["ts_code"] = as_text(request_params["ts_code"]).upper()
-    if "limit" not in request_params and limit:
-        request_params["limit"] = limit
-    body = {"api_name": api, "token": token, "params": request_params, "fields": meta["fields"]}
-    result = deps.json_post(TUSHARE_ENDPOINT, body, timeout=deps.timeout)
-    if not result.get("ok"):
-        error = result.get("error") or {}
-        return envelope_error(error.get("code", "tushare/network"), error.get("message", "tushare 请求失败"))
-    payload = result.get("value")
-    if not isinstance(payload, dict):
-        return envelope_error("tushare/bad-payload", "tushare 返回值不是对象")
-    if payload.get("code") != 0:
-        # 上游错误码透传：``msg`` 是 tushare 的原话（积分不足/接口没权限等），不要改写
-        return envelope_error("tushare/api", as_text(payload.get("msg")) or f"tushare 返回 code={payload.get('code')}")
-    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
-    columns = list(data.get("fields") or [])
-    items = data.get("items") or []
-    rows = []
-    for item in items:
-        if isinstance(item, dict):
-            rows.append({key: item.get(key) for key in columns} if columns else item)
-            continue
-        if isinstance(item, (list, tuple)):
-            rows.append({columns[i] if i < len(columns) else f"col{i}": value for i, value in enumerate(item)})
-    return {"ok": True, "api": api, "as_of": now_iso(), "source": f"tushare/{api}", "rows": rows}
-
-
 # ── OpenBB ─────────────────────────────────────────────────────────────────────
 
 
@@ -1567,7 +1436,7 @@ def financials_with_chain(sec, deps, v3_run, ticker, statement, periods):
         payload["chain"] = [attempt]
         return payload
 
-    # ── A 股/港股：富途 f10_detail → AKShare → Tushare ─────────────────────────
+    # ── A 股/港股：富途 f10_detail → AKShare（Tushare 已按数据源政策移除）────────
     if statement not in FUTU_STATEMENT_TYPES:
         return envelope_error("financials/bad-statement",
                               f"statement 需为 {sorted(FUTU_STATEMENT_TYPES)}，收到 {statement!r}")
@@ -1586,16 +1455,10 @@ def financials_with_chain(sec, deps, v3_run, ticker, statement, periods):
                 f"AKShare 财务降级仅覆盖 A 股（market={market or '未知'}）；港股美股请以富途/SEC 为准")
         return fetch_financials_akshare(deps, symbol, statement, periods)
 
-    def tushare_link():
-        ts_code = normalize_tushare_code(symbol)
-        api = TUSHARE_STATEMENT_APIS[statement]
-        return fetch_tushare(deps, api, {"ts_code": ts_code}, to_int(periods, 4, 1, 12))
-
     chain = [
         ("futu/f10_detail/statements", futu_link),
         (f"akshare/{'stock_financial_hk_report_em' if market == 'HK' else 'stock_financial_abstract'}",
          akshare_link),
-        (f"tushare/{TUSHARE_STATEMENT_APIS[statement]}", tushare_link),
     ]
     value, used_source, attempts = v3_fallback.run_chain(chain, timeout=FINANCIALS_CHAIN_TIMEOUT)
     attempts = v3_fallback.attempts_chain(attempts)
@@ -1603,7 +1466,7 @@ def financials_with_chain(sec, deps, v3_run, ticker, statement, periods):
         error = v3_fallback.last_error(attempts)
         payload = envelope_error(
             error.get("code") or "financials/all-sources-failed",
-            f"{symbol} 的 {statement} 三级源全部失败。降级链：{v3_fallback.describe_attempts(attempts)}",
+            f"{symbol} 的 {statement} 各级源全部失败。降级链：{v3_fallback.describe_attempts(attempts)}",
         )
         payload["ticker"] = symbol.upper()
         payload["market"] = market
@@ -1615,19 +1478,6 @@ def financials_with_chain(sec, deps, v3_run, ticker, statement, periods):
     payload["sources_chain"] = [item["source"] for item in attempts]
     payload["used_source"] = used_source
     return payload
-
-
-def normalize_tushare_code(ticker):
-    """标的 → Tushare ``ts_code``（``600519.SH`` / ``00700.HK`` / ``AAPL``）。"""
-    market = detect_market(ticker)
-    code = _bare_code(ticker)
-    if market in ("SH", "SZ", "BJ"):
-        return f"{code.zfill(6)}.{market}"
-    if market == "HK":
-        return f"{code.zfill(5)}.HK"
-    if market == "US":
-        return code.upper()
-    return as_text(ticker).upper()
 
 
 # ── 路由注册 ───────────────────────────────────────────────────────────────────
@@ -1675,7 +1525,7 @@ def register(app, v3_run, home, deps=None):
           * ``AAPL`` 之类美股 → SEC EDGAR（**既有字段保持不变**，仅追加 ``chain``）；
           * ``SH.600000`` / ``600519.SH`` / ``HK.00700`` → 富途 ``f10_detail`` 的
             ``statements`` section（``statement_type`` 1/2/3）→ AKShare（免密钥，A 股）
-            → Tushare（token 未注入则跳过并在 ``chain`` 里说明）→ 全失败如实报错。
+            → 全失败如实报错。
 
         任何一条链的尝试结果都在 ``chain:[{source,ok,ms,error?}]`` 里，前端可逐级核对。
         """
@@ -1689,19 +1539,6 @@ def register(app, v3_run, home, deps=None):
             payload = envelope_error("financials/internal", _error_text(error))
         return payload
 
-    @app.get("/api/v3/tushare")
-    async def v3_tushare(api: str = "", ts_code: str = "", period: str = "", limit: int = 0):
-        """Tushare Pro。token 未注入时不发任何请求。"""
-        params = {"ts_code": ts_code, "period": period}
-        api_name = as_text(api).lower()
-        meta = TUSHARE_APIS.get(api_name)
-        effective_limit = to_int(limit, meta["default_limit"] if meta else 20, 1, 5000)
-        try:
-            payload = await asyncio.to_thread(fetch_tushare, deps, api_name, params, effective_limit)
-        except Exception as error:  # noqa: BLE001
-            payload = envelope_error("tushare/internal", _error_text(error))
-        return payload
-
     @app.get("/api/v3/openbb")
     async def v3_openbb(symbol: str = ""):
         """OpenBB 基本面（可选依赖；未安装直接如实报错，不发网络请求）。"""
@@ -1713,10 +1550,21 @@ def register(app, v3_run, home, deps=None):
             payload = envelope_error("openbb/internal", _error_text(error))
         return payload
 
+    routes = ("/api/v3/news", "/api/v3/spot", "/api/v3/financials", "/api/v3/openbb")
+    # 扩展数据源（北向 / 宏观 / A 股公开行情·盘口降级链）：app.py 的模块接线清单是封闭的，
+    # 扩展模块借本入口一并装配（共享同一份 ``deps`` 与 ``v3_run``）。模块缺失不阻断主装配
+    # （与 app.py 的 try/import 同口径）；装配后的完整路由清单回写 ``app.state.v3_sources``。
+    try:
+        from server import v3_sources_ext
+
+        v3_sources_ext.register(app, v3_run, home, deps=deps)
+        routes = routes + tuple(app.state.v3_sources_ext["routes"])
+    except ModuleNotFoundError:
+        pass
     app.state.v3_sources = {
         "deps": deps,
         "sec": sec,
         "v3_run": v3_run,
-        "routes": ("/api/v3/news", "/api/v3/spot", "/api/v3/financials", "/api/v3/tushare", "/api/v3/openbb"),
+        "routes": routes,
     }
     return deps

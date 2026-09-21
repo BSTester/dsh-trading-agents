@@ -61,13 +61,33 @@ schema 大，且调用前本就该先知道标的存在（``list_tools`` 一次�
   交易写入器，所以代理**不可能**凭空造出交易能力（测试断言代理面与直连面一一对应）；
 * 未知工具名**明确报错**（``mcp/unknown-tool``）并提示用 ``list_tools`` 检索，绝不静默返回空。
 
-卡片里的 ``readOnly`` 口径（**不发明新元数据**）
-------------------------------------------------
+卡片里的 ``readOnly`` / ``concurrencySafe`` / ``renderable`` 口径（**不发明新元数据**）
+----------------------------------------------------------------------------------------
 桥接工具的只读标记现读 ``v3_mcp.NON_READONLY_PATHS``（与 ``/mcp`` 上的 ``readOnlyHint``
 同源）；工作台工具的「这是下单/改单/撤单」由 ``store_access.order_operation`` 判定（与交易
 闸门同一份实现）。**基础面在 MCP 上本来就没有发布 readOnlyHint**（注册时不带 annotations），
 所以本模块也**不替它发明**：这类工具的 ``readOnly`` 如实为 ``null``（未知），不写
 ``true``/``false`` 冒充已知——卡片只做导航，真实语义始终由被转发的那份实现决定。
+
+另两个字段**不是发明**，是读出注册面已经发布的判定（每个工具都有值，故不留 ``null``）：
+
+* ``concurrencySafe``：基础面读 ``mcp_tools.is_concurrency_safe``（那正是 ``/mcp`` 的
+  ``_meta.quantwb.isConcurrencySafe`` 的值，不是第二份判定）；桥接面与 ``readOnly`` 同一判据
+  （``v3_mcp.register`` 的 ``readOnlyHint`` 也由它来）。discovery 模式下 122/128 件不在
+  ``tools/list`` 上、拿不到 ``_meta``，卡片是它们唯一的元数据通道。
+* ``renderable`` / ``formats``：现读 ``mcp_tools.is_renderable``（``TOOL_RENDERERS`` —— 与
+  ``mcp_tools._bind`` 给签名追加 ``format`` 字段用的是**同一个谓词**）。``renderable=true``
+  的卡片才带这两个键（``formats:["json","text"]``），并且 ``optional`` 里同时补上
+  ``format``——它是**绑定期**才进 schema 的字段，卡片不列它，代理的实参白名单就会比 schema
+  更窄（``call_tool(arguments={"format":"text"})`` 被判野字段，实测过的真缺陷）。
+  其余卡片不带 ``renderable``/``formats``——缺省形态就是 ``["json"]``，缺键即「不支持
+  ``format:"text"``」，不为 120+ 件非 renderable 工具重复两行冗余。
+
+``tools/list`` 的 ``_meta``（``concurrency_meta``）用的也是同一份判定：``/mcp`` 与 ``/mcp/ro``
+暴露的每件工具都带 ``quantwb.isConcurrencySafe``——基础面 77 件那份由 ``mcp_tools.register`` 发，
+两个代理入口与保留集里的 ``v3_gateway`` / ``v3_tools`` 由本模块发。``v3_mcp.register`` 注册时
+**不传** ``meta=``，所以 ``direct`` 模式下那 51 件桥接件目前没有这个键（唯一未覆盖面，
+一行修法与影响见 ``docs/v3-integration.md`` §1.7.1「未覆盖项」）。
 
 只读面 ``/mcp/ro``（服务侧硬边界；2026-09-21 漏洞修复）
 --------------------------------------------------------
@@ -183,27 +203,68 @@ def _prefix_of(name):
     return name.split("_", 1)[0] + "_" if "_" in name else ""
 
 
+def concurrency_meta(name, annotations=None):
+    """注册面一件工具 → ``tools/list`` 的 ``_meta`` 体（键与构造函数都取自 ``mcp_tools``）。
+
+    **不在这里重推判定**，只做二选一：
+
+    1. 注册面带了 ``readOnlyHint``（桥接 ``v3_*`` 由 ``v3_mcp.register`` 按是否写类给；
+       两个代理入口由本模块给）→ 照它：写类（落盘研究轮 / 改 OMS 台账 / 改配置）并发下不
+       幂等 → ``false``；只读类（取数经全局限流器串行）→ ``true``；
+    2. 不带标注（基础面 77 件，``mcp_tools.register`` 不传 annotations）→ 退回基础面唯一
+       谓词 ``mcp_tools.is_concurrency_safe``（那张 ``CONCURRENCY_UNSAFE_TOOLS`` 表只在
+       ``mcp_tools`` 里有一份）。
+    """
+    hint = getattr(annotations, "read_only_hint", None)
+    safe = bool(hint) if hint is not None else mcp_tools.is_concurrency_safe(name)
+    return mcp_tools.concurrency_meta(safe)
+
+
+def render_facts(name):
+    """``(renderable, formats)``：现读 ``mcp_tools.is_renderable``（``TOOL_RENDERERS`` 的唯一谓词）。
+
+    谓词本身是「注册表里有没有 ``render(args, value)`` 渲染纯函数」；直连面 ``mcp_tools._bind``
+    只在它为真时给签名追加 ``format`` 字段——所以卡片这一栏与 schema 那一栏由**同一个谓词**
+    决定（本模块不重推、也不额外探测 schema）。非 renderable 件只接受 ``"json"``（缺省值本身
+    就是它，传 ``text`` 会被 schema 层按未知取值拒绝）。
+    """
+    renderable = mcp_tools.is_renderable(name)
+    formats = ((mcp_tools.FORMAT_JSON, mcp_tools.FORMAT_TEXT) if renderable
+               else (mcp_tools.FORMAT_JSON,))
+    return renderable, formats
+
+
 class ToolCard:
     """目录里的一条：名字 + 一句话用途 + 必填/可选参数名 + 域/前缀（**不含完整 schema**）。"""
 
     __slots__ = ("name", "summary", "source", "domain", "prefix", "readonly",
+                 "concurrency_safe", "renderable", "formats",
                  "required", "optional", "endpoint")
 
-    def __init__(self, name, summary, source, domain, prefix, readonly, required,
-                 optional, endpoint):
+    def __init__(self, name, summary, source, domain, prefix, readonly, concurrency_safe,
+                 renderable, formats, required, optional, endpoint):
         self.name = name
         self.summary = summary
         self.source = source
         self.domain = domain
         self.prefix = prefix
         self.readonly = readonly
+        self.concurrency_safe = bool(concurrency_safe)
+        self.renderable = bool(renderable)
+        self.formats = tuple(formats)
         self.required = tuple(required)
         self.optional = tuple(optional)
         self.endpoint = endpoint
 
     def as_dict(self):
-        """线格式：键名尽量短（卡片要小），必填字段名齐全（能回答「必填什么」）。"""
-        return {
+        """线格式：键名尽量短（卡片要小），必填字段名齐全（能回答「必填什么」）。
+
+        ``concurrencySafe`` 恒在——基础面也发布这个判定（见 :func:`concurrency_meta`），而
+        discovery 模式下 122/128 件不在 ``tools/list`` 上、拿不到 ``_meta``，卡片是它们唯一的
+        元数据通道。``renderable`` / ``formats`` **只在 renderable 时出现**：缺省形态就是
+        ``["json"]``（payload 的 ``note`` 写明），不为 120+ 件非 renderable 工具重复两行冗余。
+        """
+        card = {
             "name": self.name,
             "purpose": self.summary,
             "required": list(self.required),
@@ -211,8 +272,13 @@ class ToolCard:
             "domain": self.domain,
             "prefix": self.prefix,
             "readOnly": self.readonly,
+            "concurrencySafe": self.concurrency_safe,
             "source": self.source,
         }
+        if self.renderable:
+            card["renderable"] = True
+            card["formats"] = list(self.formats)
+        return card
 
     def __repr__(self):  # pragma: no cover —— 调试用
         return f"ToolCard({self.name!r}, domain={self.domain!r}, source={self.source!r})"
@@ -226,12 +292,29 @@ def _v3_domain(definition):
     return v3_ops.domain_of(definition.name)
 
 
+def _card_params(definition, renderable):
+    """定义的 ``params`` → ``(required, optional)``；renderable 件**补上** ``format`` 字段。
+
+    ``format`` 是 ``mcp_tools._bind`` 在**绑定期**追加到签名/schema 末尾的（``definition.params``
+    里没有它），所以这里必须用同一个谓词补同一个字段——否则代理的实参白名单会**比 schema 更窄**：
+    卡片查不到 ``format``、``call_tool(arguments={"format":"text"})`` 被判成野字段
+    （``mcp/bad-arguments``），而直连面同一实参是合法的（实测差异，2026-09-21 修）。
+    """
+    required = tuple(param.name for param in definition.params if param.required)
+    optional = tuple(param.name for param in definition.params if not param.required)
+    if renderable and mcp_tools.FORMAT_FIELD not in optional:
+        optional += (mcp_tools.FORMAT_FIELD,)
+    return required, optional
+
+
 def build_catalog(base_definitions=None, bridge=None):
     """两个既有注册表 → ``{name: ToolCard}``（本模块**不**持有第二份清单）。"""
     base_definitions = mcp_tools.TOOLS if base_definitions is None else base_definitions
     catalog = {}
     for definition in base_definitions:
         name = definition.name
+        renderable, formats = render_facts(name)
+        required, optional = _card_params(definition, renderable)
         catalog[name] = ToolCard(
             name=name,
             summary=purpose_of(definition.description),
@@ -239,12 +322,17 @@ def build_catalog(base_definitions=None, bridge=None):
             domain=v3_ops.domain_of(name),
             prefix=_prefix_of(name),
             readonly=_base_readonly(definition),
-            required=tuple(param.name for param in definition.params if param.required),
-            optional=tuple(param.name for param in definition.params if not param.required),
+            concurrency_safe=mcp_tools.is_concurrency_safe(name),
+            renderable=renderable,
+            formats=formats,
+            required=required,
+            optional=optional,
             endpoint=definition.endpoint,
         )
     for definition in bridge.definitions:
         name = definition.name
+        renderable, formats = render_facts(name)
+        required, optional = _card_params(definition, renderable)
         catalog[name] = ToolCard(
             name=name,
             summary=purpose_of(definition.description),
@@ -252,8 +340,12 @@ def build_catalog(base_definitions=None, bridge=None):
             domain=_v3_domain(definition),
             prefix=_prefix_of(name),
             readonly=_bridge_readonly(definition),
-            required=tuple(param.name for param in definition.params if param.required),
-            optional=tuple(param.name for param in definition.params if not param.required),
+            # 桥接件的并发安全与只读同一判据（``v3_mcp.register`` 的 readOnlyHint 也由它来）
+            concurrency_safe=_bridge_readonly(definition),
+            renderable=renderable,
+            formats=formats,
+            required=required,
+            optional=optional,
             endpoint=definition.endpoint,
         )
     return catalog
@@ -369,7 +461,11 @@ class DiscoveryProxy:
             "domains": list(DOMAINS),
             "catalog_total": len(self.catalog),
             "cards": [card.as_dict() for card in cards],
-            "note": ("卡片是导航信息（名字 + 一句话用途 + 必填/可选参数名），**不含完整 schema**；"
+            "note": ("卡片是导航信息（名字 + 一句话用途 + 必填/可选参数名 + readOnly/"
+                     "concurrencySafe），**不含完整 schema**；"
+                     "concurrencySafe 是并发安全判定（false 的工具不要并发调用）；"
+                     "renderable/formats 只在支持人类渲染时出现，缺键即只接受 format:\"json\""
+                     "（renderable 件另接受 format:\"text\"，人类可读散文渲染）；"
                      "确认要调用哪个后用 call_tool(name, arguments) 转发，"
                      "返回与直连工具逐字段一致的信封"),
             "source": ("目录 = mcp_tools.TOOLS + v3_mcp.V3Bridge.definitions"
@@ -604,17 +700,34 @@ def register(server, base_tools, bridge):
         for name in DIRECT_KEEP:
             tool = base_by_name.get(name)
             if tool is not None:
-                continue  # 基础面保留件仍在注册面里（未被动过）
+                continue  # 基础面保留件仍在注册面里（未被动过；_meta 由 mcp_tools.register 发）
             if name in bridge_by_name:
                 continue  # v3_* 保留件由 v3_mcp.register 注册（标注逐字段同一口径），不重复注册
             raise AssertionError(f"DIRECT_KEEP 的 {name} 不在任何注册表里")  # pragma: no cover
+        # 保留集里的 v3_* 是 v3_mcp.register 注册的，那一面**不发 _meta**；这里就地补上
+        # （annotations 原样复用，不另发一份标注），否则 discovery 面会出现「4 件保留件里
+        # 只有基础面那 2 件带 quantwb.isConcurrencySafe」的半截元数据。
+        registered = {info.name: info for info in manager.list_tools()}
+        for name in DIRECT_KEEP:
+            info = registered.get(name)
+            if info is None or info.meta is not None:
+                continue
+            server.remove_tool(name)
+            server.add_tool(info.fn, name=name, description=info.description,
+                            annotations=info.annotations,
+                            meta=concurrency_meta(name, info.annotations),
+                            structured_output=False)
+        list_annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                           idempotentHint=True, openWorldHint=False)
         server.add_tool(list_fn, name=LIST_TOOL, description=list_fn.__doc__,
-                        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
-                                                    idempotentHint=True, openWorldHint=False),
+                        annotations=list_annotations,
+                        meta=concurrency_meta(LIST_TOOL, list_annotations),
                         structured_output=False)
+        call_annotations = ToolAnnotations(readOnlyHint=False, destructiveHint=True,
+                                           idempotentHint=False, openWorldHint=True)
         server.add_tool(call_fn, name=CALL_TOOL, description=call_fn.__doc__,
-                        annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True,
-                                                    idempotentHint=False, openWorldHint=True),
+                        annotations=call_annotations,
+                        meta=concurrency_meta(CALL_TOOL, call_annotations),
                         structured_output=False)
         mcp_tools.forbid_extra_fields(server, PROXY_NAMES + DIRECT_KEEP)
     proxy.dropped = tuple(dropped)
@@ -674,16 +787,23 @@ def register_readonly(server, base_tools, bridge, annotations):
             else:
                 raise AssertionError(f"DIRECT_KEEP 的 {name} 不在任何注册表里")  # pragma: no cover
             server.add_tool(bound, name=name, description=bound.__doc__,
-                            annotations=annotations.get(name), structured_output=False)
+                            annotations=annotations.get(name),
+                            meta=concurrency_meta(name, annotations.get(name)),
+                            structured_output=False)
+        list_annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                           idempotentHint=True, openWorldHint=False)
         server.add_tool(list_fn, name=LIST_TOOL, description=list_fn.__doc__,
-                        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
-                                                    idempotentHint=True, openWorldHint=False),
+                        annotations=list_annotations,
+                        meta=concurrency_meta(LIST_TOOL, list_annotations),
                         structured_output=False)
         # 只读面的 call_tool 本身**只会**转发只读工具（闸门在绑定里）——因此这里如实标
-        # readOnlyHint=True（与 /mcp 面的 call_tool=False 相反，语义各自诚实）。
+        # readOnlyHint=True（与 /mcp 面的 call_tool=False 相反，语义各自诚实），并发安全
+        # 同理：它到不了任何写类内层工具（判定用的就是这份标注本身，不另写一份）。
+        call_annotations = ToolAnnotations(readOnlyHint=True, destructiveHint=False,
+                                           idempotentHint=False, openWorldHint=True)
         server.add_tool(call_fn, name=CALL_TOOL, description=call_fn.__doc__,
-                        annotations=ToolAnnotations(readOnlyHint=True, destructiveHint=False,
-                                                    idempotentHint=False, openWorldHint=True),
+                        annotations=call_annotations,
+                        meta=concurrency_meta(CALL_TOOL, call_annotations),
                         structured_output=False)
         mcp_tools.forbid_extra_fields(server, PROXY_NAMES + DIRECT_KEEP)
     proxy.dropped = ()  # 只读面从一开始就只注册 6 件，没有「移出」动作
@@ -701,7 +821,8 @@ __all__ = [
     "DEFAULT_SURFACE", "DIRECT", "DIRECT_KEEP", "DISCOVERY", "DOMAINS", "DiscoveryProxy",
     "LIST_TOOL", "MAX_PAGE", "PROXY_NAMES", "READONLY_SURFACE_PATH", "RO_NOT_CALLABLE",
     "SURFACE_ENV", "SURFACES", "SurfaceError", "ToolCard", "WORKBENCH_DOMAIN", "build_catalog",
-    "call_tool_binding", "call_tool_signature", "list_tools_binding", "list_tools_signature",
-    "match_cards", "page_cards", "purpose_of", "readonly_allow_set", "register",
-    "register_readonly", "registry_annotations", "resolve_surface", "surface_names",
+    "call_tool_binding", "call_tool_signature", "concurrency_meta", "list_tools_binding",
+    "list_tools_signature", "match_cards", "page_cards", "purpose_of", "readonly_allow_set",
+    "register", "register_readonly", "registry_annotations", "render_facts", "resolve_surface",
+    "surface_names",
 ]

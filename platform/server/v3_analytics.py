@@ -83,12 +83,19 @@ from server import v3_db, v3_math, v3_ml, v3_universe
 from server.data import cache as pit_cache
 
 __all__ = [
+    "ALIGNMENT_INPUT_LENGTH",
+    "ALIGNMENT_NULL_PADDED",
+    "SENTIMENT_ORIGIN_LIVE",
+    "SENTIMENT_ORIGIN_SNAPSHOT",
     "STRATEGY_RUNS_FILE",
     "FACTOR_REGISTRY",
+    "default_news_fetch",
     "factor_registry_data",
     "factors_matrix_data",
     "funding_check_data",
     "liquidity_risk",
+    "live_sentiment_factor_value",
+    "live_sentiment_values",
     "load_pit_bars",
     "ml_backtest",
     "ml_models",
@@ -232,6 +239,46 @@ def _plain(value):
         return "—"
     text = repr(number)
     return text[:-2] if text.endswith(".0") else text
+
+
+# ---------------------------------------------------------------------------
+# 等长 null 对齐（FR-TOOLS-002 子规范③）
+# ---------------------------------------------------------------------------
+# 「输出与输入等长，头部窗口位置为 ``null``，模型按索引对齐」——本模块里**时间序列**型
+# 输出统一按这条口径收口，并把口径写进响应的 ``alignment`` 字段（模型据此自证对齐方式，
+# 不必从文案里猜）。两个取值：
+#
+# * ``input-length-null-padded``：输出长度 == 输入窗口长度，头部预热/不可知位是 ``null``
+#   （**不是 0、也不丢行**）。第一根 K 线没有前值 → 那天没有收益/净值，那一位只能是 null。
+# * ``input-length``：本来就是等长的横截面（一行一标的），无需补位，只作标注。
+ALIGNMENT_NULL_PADDED = "input-length-null-padded"
+ALIGNMENT_INPUT_LENGTH = "input-length"
+
+
+def _pad_series_head(points, head_stamps, value_key):
+    """序列**头部预热位**补 ``null``（等长对齐）：返回 ``[预热位…, 原点…]``。
+
+    两件事一起做到：输出长度 == 输入窗口长度，且预热位取 **``null``**（取值不可知）
+    而不是 0——0 会被前端/模型读成「当天收益恰为 0」，是另一种意义上的假数据。
+    ``head_stamps`` 是预热位的时间戳（通常只有第一个输入时点一个）；时间戳缺失时照样
+    占位（``t=null``），**不丢行**。
+    """
+    prefix = [{"t": stamp, value_key: None} for stamp in (head_stamps or [])]
+    return prefix + list(points or [])
+
+
+def _first_series_stamp(bars):
+    """输入 K 线里**第一根可用 bar** 的时间戳（与 ``v3_math`` 的可用性判定同口径）。
+
+    ``v3_math.backtest_momentum`` 会跳过收盘价非数值的 bar；预热位要对齐的是它实际用到的
+    第一根 bar，所以这里用同一条过滤（``to_float(c) is not None``），不另立第二套口径。
+    """
+    for bar in bars or []:
+        if not isinstance(bar, dict):
+            continue
+        if v3_math.to_float(bar.get("c")) is not None:
+            return bar.get("t")
+    return None
 
 
 async def _read_json_body(request):
@@ -680,6 +727,7 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
         )
         if analytics.get("error"):
             return _error("risk/insufficient", analytics["error"])
+        _align_equity_curve(analytics)
 
         if bench_ok and analytics.get("beta") is None:
             # 基准取到了但比值仍为空：基准与组合的交易日没对齐（跨市场基准常见，例如拿
@@ -722,6 +770,28 @@ def risk_analytics(v3_run, home, limit=250, confidence=0.95, benchmark=None,
         }
     except Exception as error:  # noqa: BLE001 —— 任何内部异常都进信封，绝不 500
         return _error("v3/internal", error)
+
+
+def _align_equity_curve(analytics):
+    """``analytics.equityCurve`` 的**等长 null 对齐**（就地改写，返回同一个 dict）。
+
+    输入 = 对齐后的交易日 D 天（``window.from..to``）；``v3_math.portfolio_risk`` 原来只给
+    ``observations = D-1`` 个点（``dates[1..]``）——**第一天的位置被丢掉了**，按索引对齐时
+    整体错位一天。这里把第一天作为**预热位**补回来：那天还没有收益（净值从它之后的第一个
+    收益日才累乘出来），因此 ``v=null``，不是 0。补位后 ``len(equityCurve) == observations+1``。
+    """
+    curve = analytics.get("equityCurve")
+    window = analytics.get("window") or {}
+    if isinstance(curve, list) and curve:
+        analytics["equityCurve"] = _pad_series_head(curve, [window.get("from")], "v")
+    analytics["alignment"] = ALIGNMENT_NULL_PADDED
+    analytics["alignmentNote"] = (
+        "equityCurve 等长对齐：一行 = 一个对齐交易日（长度 = observations + 1），"
+        "首日没有前值 → v=null（不是 0）；第 2 行起的 v 与对齐交易日 dates[1..] 逐位对应。"
+        "**消费方契约**：预热位是「无读数」，按 stat-core 三态口径应显示占位符，"
+        "不得用 Number(null)=0 强转成 0（那会把曲线起点画成 0）。"
+        "maxDrawdownPct/observations 等指标口径不变（仍按收益序列算）")
+    return analytics
 
 
 def _safe_risk_detail(v3_run, home, code, weights, series_map, series_sources, analytics, nav):
@@ -825,6 +895,27 @@ def _risk_detail_block(v3_run, home, code, weights, series_map, series_sources, 
 # ---------------------------------------------------------------------------
 # 2) GET /api/v3/factors/matrix
 # ---------------------------------------------------------------------------
+def _aligned_ic_points(raw_points):
+    """工具面 ``ic`` 的 ``points`` → **等长** points（一行输入一行输出，取不到的位 ``null``）。
+
+    ``v3_math.ic_stats`` 原来会「丢掉非数值行 + 只留最近 40 个点」，两者都让输出比输入短：
+    模型按索引对齐时会静默错位（第 0 个点不再是第一期）。这里按 FR-TOOLS-002 的等长 null
+    对齐重建：**一行一期、原序不动**，``ic`` 解析不出来（``null``/非数值）的位就是 ``null``
+    ——不是 0，也不丢行；非 dict 的畸形元素照样占位（``t=null``），长度因此恒等于输入长度。
+    统计量（``observations`` / ``meanIc`` / ``stdIc`` / ``ir`` / ``latestIc``）仍只按**有值**
+    的期数算，口径不变。
+    """
+    aligned = []
+    for point in raw_points if isinstance(raw_points, list) else []:
+        if not isinstance(point, dict):
+            aligned.append({"t": None, "ic": None})
+            continue
+        number = v3_math.to_float(point.get("ic"))
+        aligned.append({"t": point.get("t"),
+                        "ic": None if number is None else v3_math.round_half_up(number, 4)})
+    return aligned
+
+
 def _factor_ic(v3_run, names, factor, forward_days):
     """因子 IC：需要 3..8 个标的（横截面相关），工具面字段名是 ``forward``。"""
     tickers = list(names)[:FACTOR_LIMIT]
@@ -835,25 +926,34 @@ def _factor_ic(v3_run, names, factor, forward_days):
                      {"tickers": tickers, "factor": factor, "forward": forward_days})
     if not envelope.get("ok"):
         return {"ok": False, "factor": factor, "error": _tool_error(envelope)}
-    return v3_math.ic_stats(_value_of(envelope) or {}, factor, forward_days,
-                            fallback_tickers=tickers)
+    value = _value_of(envelope) or {}
+    stats = v3_math.ic_stats(value, factor, forward_days, fallback_tickers=tickers)
+    stats["points"] = _aligned_ic_points(value.get("points"))
+    stats["alignment"] = ALIGNMENT_NULL_PADDED
+    stats["alignmentNote"] = (
+        f"points 等长对齐：长度 = 工具面 ic 的期数（{len(stats['points'])} 期，原序），"
+        "ic 取不到的期是 null（不是 0）；不再截尾 40 期、不再丢弃非数值行。"
+        "observations/meanIc/stdIc/ir/latestIc 仍只按有值的期数算")
+    return stats
 
 
 def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward_days=5,
-                        market=None, classes=None, as_of=None, include_sentiment=True):
+                        market=None, classes=None, as_of=None, include_sentiment=True,
+                        live_sentiment=False, sentiment_fetch=None):
     """横截面因子矩阵 + 因子 IC 序列 + **新四类因子**（FR-STRAT-001 补全）。
 
     契约::
 
         {ok, market, universe_source, market_filter,
          matrix: {as_of, source, tickers[], factors[], matrix[][],
-                  raw: [{ticker, factors}], failures},
+                  raw: [{ticker, factors}], failures, alignment, alignmentNote},
          factors: [{key, class, classLabel, source, pit, direction, covered, total,
                     coveragePct, tickers, missingTickers}],
          factorsMissing: [{key, reason}],
+         sentimentSources: {ticker: {origin, score, source, reason}},
          sources: {kline, quality, growth, sentiment, alternative},
          ic: {ok, factor, forwardDays, tickers, observations, meanIc, stdIc, ir,
-              latestIc, points: [{t, ic}]}}
+              latestIc, points: [{t, ic}], alignment, alignmentNote}}
 
     标的 2..8：请求显式给（取前 8）→ 否则**该市场宇宙**前 6（``market`` 缺省 SH，
     与 ``/market/watchlist`` 同一份 ``resolve_universe``）→ 不足 2 只 →
@@ -869,11 +969,20 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
       * 质量（``gross_margin`` / ``net_margin``）与成长（``revenue_yoy`` / ``net_profit_yoy``）：
         读本地交易库 ``fundamentals``，**只认 ``announced_at ≤ as_of`` 的行**（PIT）；
         缺公告日、缺同期基期的因子在矩阵里就是 ``null``，原因进 ``factorsMissing``。
-      * 情绪（``sentiment``）：``store.sentiment_snapshots`` 的落库原文经 ``v3_nlp``
-        离线复算（时间基准 = ``as_of`` 当日 00:00 UTC）。在线口径见 ``GET /api/v3/sentiment``。
+      * 情绪（``sentiment``）：**快照 ∨ 实时**——``store.sentiment_snapshots`` 的落库原文经
+        ``v3_nlp`` 离线复算（PIT ≤ ``as_of``）；该标的快照取不到分时，``live_sentiment=True``
+        下再走 ``v3_nlp`` **实时**打分（既有 ``akshare/stock_news_em`` 通道取资讯 → 经
+        ``server.data.cache`` 的 PIT 闸门，显式 ``as_of`` + INCLUSIVE → 同一份
+        ``score_documents``；见 :func:`live_sentiment_factor_value`）。两条通道的读数**逐标的
+        标注来源**（``snapshot`` / ``live:nlp-v1`` / 取不到 = ``null`` + 原因，
+        见响应 ``sentimentSources``），绝不混为一谈、也绝不填 0。
       * 另类（``capital_flow`` / ``short_interest``）：既有富途工具**实时**取数（受全局限流
         约束，故**缺省不并入**——需要时显式 ``classes=alternative`` 或 ``classes=all``）。
         A 股无卖空数据是上游事实，进 ``factorsMissing`` 而不是填 0。
+
+    ``live_sentiment``（缺省 ``False``）：情绪因子的**实时兜底**开关。缺省关是为了让内部
+    流水线与单测保持零网络；``/api/v3/factors/matrix`` 与 ``/api/v3/factors/registry``
+    两条只读路由显式打开（并可用 ``sentiment_fetch`` 注入假资讯源做单测）。
 
     新因子一律作为**横截面 z**（截断 ±3）并入 ``matrix.matrix``，并按
     :data:`FACTOR_REGISTRY` 的 ``direction`` 参与 ``strategy_run`` 的扩展综合分；
@@ -962,9 +1071,10 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
             wanted.discard("alternative")
             drop_alternative_note = ("as_of 模式下实时另类因子（capital_flow/short_interest）"
                                      "没有 PIT 口径，未并入矩阵")
-        extras, missing, sources = _factor_extras(v3_run, home, names, base_rows, wanted,
-                                                  pit_date, code,
-                                                  include_sentiment=include_sentiment)
+        extras, missing, sources, sentiment_report = _factor_extras(
+            v3_run, home, names, base_rows, wanted, pit_date, code,
+            include_sentiment=include_sentiment, live_sentiment=live_sentiment,
+            sentiment_fetch=sentiment_fetch)
         if drop_alternative_note:
             missing.append({"key": "capital_flow/short_interest",
                             "reason": drop_alternative_note})
@@ -979,6 +1089,14 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
         matrix["raw"] = [{"ticker": row.get("ticker"),
                           "factors": dict(row.get("factors") or {})}
                          for row in base_rows]
+        # 等长对齐（FR-TOOLS-002）：矩阵是**横截面**——``matrix.raw`` / ``matrix.matrix``
+        # 一行一标的，与 ``matrix.tickers`` 等长；缺数据的格是 ``null``（不是 0）。这一路
+        # 本来就等长，只把口径写进响应（时间序列型的 ``ic.points`` 另有 null 补位口径）。
+        matrix["alignment"] = ALIGNMENT_INPUT_LENGTH
+        matrix["alignmentNote"] = (
+            f"横截面等长对齐：{len(matrix.get('raw') or [])} 行 = {len(names)} 只标的"
+            "（请求显式 tickers 或该市场宇宙前 8），一行一标的、顺序同 matrix.tickers；"
+            "取不到的格是 null（不是 0）")
         registry = factor_registry_data(matrix)
         if explicit_as_of:
             # 响应口径并列且诚实：``matrix.as_of`` = 价量列实际日期（逐标的最后一根可见
@@ -1011,6 +1129,9 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
                     "matrix": matrix,
                     "factors": registry["coverage"]["factors"],
                     "factorsMissing": missing,
+                    # 情绪因子的**逐标的来源**：snapshot（落库快照）/ live:nlp-v1（实时打分）/
+                    # null（取不到 + 原因）。快照与实时两条通道因此可逐标的核对，不混为一谈。
+                    "sentimentSources": sentiment_report,
                     "sources": {**{"kline": kline_source}, **sources},
                     "ic": ic_block}
         if explicit_as_of:
@@ -1114,23 +1235,32 @@ def _pit_date(as_of):
 
 
 def _factor_extras(v3_run, home, names, base_rows, wanted, pit_date, market, *,
-                   include_sentiment=True):
-    """新四类因子的原始值 → ``(extras, missing, sources)``。
+                   include_sentiment=True, live_sentiment=False, sentiment_fetch=None):
+    """新四类因子的原始值 → ``(extras, missing, sources, sentiment_report)``。
 
     ``extras`` 形状 ``{factor_key: {ticker: raw_value}}``；取不到的标的**不出现在**该字典里
-    （不是 0，也不是均值）；每个因子的缺失原因汇总进 ``missing``。
+    （不是 0，也不是均值）；每个因子的缺失原因汇总进 ``missing``；``sentiment_report`` 是
+    情绪因子的**逐标的来源**（``snapshot`` / ``live:nlp-v1`` / 取不到；见
+    :func:`local_factor_extras`），进响应的 ``sentimentSources``。
+
+    ``live_sentiment``（缺省 ``False``）：快照取不到时是否再走 ``v3_nlp`` **实时**打分。
+    缺省关是为了让内部流水线（``strategy_run``）与单测保持**零网络**；两个矩阵路由显式打开。
+    ``sentiment_fetch`` 是实时取数的注入点（``(home, ticker, limit) -> 零参取数函数|None``）。
     """
     extras = {key: {} for key in ("gross_margin", "net_margin", "roe", "roa", "revenue_yoy",
                                   "net_profit_yoy", "sentiment", "capital_flow",
                                   "short_interest")}
     missing = []
     sources = {"quality": None, "growth": None, "sentiment": None, "alternative": None}
+    sentiment_report = {}
 
     if wanted & {"quality", "growth"} or (include_sentiment and "sentiment" in wanted):
-        local, local_missing, local_sources = local_factor_extras(
+        local, local_missing, local_sources, sentiment_report = local_factor_extras(
             home, names, pit_date,
             want_quality=bool(wanted & {"quality", "growth"}),
-            want_sentiment=bool(include_sentiment and "sentiment" in wanted))
+            want_sentiment=bool(include_sentiment and "sentiment" in wanted),
+            live_sentiment=bool(live_sentiment),
+            sentiment_fetch=sentiment_fetch)
         classes_by_key = {entry["key"]: entry["class"] for entry in FACTOR_REGISTRY}
         for key, values in local.items():
             if classes_by_key[key] in wanted:
@@ -1155,20 +1285,35 @@ def _factor_extras(v3_run, home, names, base_rows, wanted, pit_date, market, *,
                 missing.append({"key": key,
                                 "reason": "；".join((reasons.get(key) or [])[:3])
                                           or "上游未返回可解析字段（no-data）"})
-    return extras, missing, sources
+    return extras, missing, sources, sentiment_report
 
 
-def local_factor_extras(home, names, pit_date, *, want_quality=True, want_sentiment=True):
-    """**本地**（不联网）新因子原始值：质量 / 成长 / 情绪。
+def local_factor_extras(home, names, pit_date, *, want_quality=True, want_sentiment=True,
+                        live_sentiment=False, sentiment_fetch=None):
+    """新因子原始值：质量 / 成长（**本地交易库**）+ 情绪（**快照 ∨ 实时**）。
 
     ``strategy_run`` 的 PAAT 阶段与 ``factors_matrix_data`` 共用这一份实现（不做第二事实源），
     一次打开交易库、逐标的读数；交易库缺失时全部返回空 + 原因（绝不用均值/0 顶替）。
-    返回 ``(extras, missing, sources)``，形状与 :func:`_factor_extras` 一致。
+    返回 ``(extras, missing, sources, sentiment_report)``，前三个与 :func:`_factor_extras`
+    同形；``sentiment_report`` 是``{ticker: {"origin", "score", "source", "reason"}}``——
+    逐标的标注这一格情绪分的**来源**（见下），取不到时 ``origin=None`` + 原因。
+
+    情绪（``want_sentiment``）有两条通道，**快照优先、实时兜底**：
+
+      1. ``snapshot``：``<home>/trading-data/trading.sqlite`` 的 ``sentiment_snapshots``
+         （按日采集；PIT 两道闸门见 :func:`sentiment_factor_values`）；
+      2. ``live:nlp-v1``（仅 ``live_sentiment=True``）：该标的的**实时资讯**经
+         ``server.data.cache`` 的 PIT 闸门（显式 ``as_of``，见
+         :func:`live_sentiment_factor_value`）后交同一份 ``server.v3_nlp`` 打分器。
+
+    实时候选是**并发**取的（akshare 每标的 1~3s，逐标的独立失败、互不牵连），并且只在
+    快照确实取不到该标的时才并入——两条通道的读数与来源在响应里逐标的可查，绝不混为一谈。
     """
     extras = {key: {} for key in ("gross_margin", "net_margin", "roe", "roa", "revenue_yoy",
                                   "net_profit_yoy", "sentiment")}
     missing = []
     sources = {"quality": None, "growth": None, "sentiment": None}
+    sentiment_report = {}
     conn = _open_trading_store(home) if want_quality else None
     if want_quality:
         if conn is None:
@@ -1201,21 +1346,63 @@ def local_factor_extras(home, names, pit_date, *, want_quality=True, want_sentim
                     detail = reasons.get(key) or [str(entry["pit"])]
                     missing.append({"key": key, "reason": "；".join(detail[:3])})
     if want_sentiment:
+        # 快照优先：逐标的先读落库快照；**只有快照确实取不到的标的**才进实时候选，
+        # 且实时候选是并发取好再打分（快照有分的标的既不多一次 akshare 往返，来源也不混）。
+        snapshot = {ticker: sentiment_factor_values(home, ticker, pit_date)
+                    for ticker in names}
+        pending = [ticker for ticker in names if snapshot[ticker][0] is None]
+        live_values = (live_sentiment_values(home, pending, pit_date, fetch_factory=sentiment_fetch)
+                       if live_sentiment and pending else {})
         reasons = []
         covered = 0
+        snapshot_covered = 0
+        live_covered = 0
         for ticker in names:
-            score, meta = sentiment_factor_values(home, ticker, pit_date)
+            score, meta = snapshot[ticker]
+            origin = SENTIMENT_ORIGIN_SNAPSHOT if score is not None else None
+            snapshot_reason = None if score is not None else (meta.get("reason") or "score=null")
+            live_meta = None
+            if score is None and live_values:
+                live_score, live_meta = live_values.get(ticker) or (None, None)
+                if live_score is not None:
+                    score, meta, origin = live_score, live_meta, SENTIMENT_ORIGIN_LIVE
+            reason = None
+            source = (meta or {}).get("source")
             if score is None:
-                reasons.append(f"{ticker}：{meta.get('reason') or 'score=null'}")
+                reason = f"快照：{snapshot_reason}"
+                if live_sentiment:
+                    live_reason = (live_meta or {}).get("reason") or "未取到（见 sentimentSources）"
+                    reason += f"；实时：{live_reason}"
+                    if live_meta is not None:
+                        # 两条通道**都**取不到时来源如实并列（不拿快照那半掩盖实时那半）
+                        source = f"{source} ∨ {live_meta.get('source') or '实时资讯（未取到）'}"
+                reasons.append(f"{ticker}：{reason}")
             else:
                 extras["sentiment"][ticker] = score
                 covered += 1
-        sources["sentiment"] = (f"store.sentiment_snapshots（PIT ≤ {pit_date}）+ "
-                                f"v3_nlp 离线复算；{covered}/{len(names)} 只有可用情绪分")
+                if origin == SENTIMENT_ORIGIN_SNAPSHOT:
+                    snapshot_covered += 1
+                else:
+                    live_covered += 1
+            sentiment_report[ticker] = {
+                "origin": origin,
+                "score": (None if score is None else v3_math.round_half_up(score, 6)),
+                "source": source,
+                "reason": reason or (meta or {}).get("reason"),
+            }
+        if live_sentiment:
+            sources["sentiment"] = (
+                f"store.sentiment_snapshots（PIT ≤ {pit_date}）∨ akshare/stock_news_em 实时"
+                f"（经 server.data.cache PIT 闸门，as_of={pit_date} INCLUSIVE）→ "
+                f"server.v3_nlp.score_documents；快照 {snapshot_covered}/{len(names)} · "
+                f"实时补 {live_covered}/{len(names)} · 合计 {covered}/{len(names)}")
+        else:
+            sources["sentiment"] = (f"store.sentiment_snapshots（PIT ≤ {pit_date}）+ "
+                                    f"v3_nlp 离线复算；{covered}/{len(names)} 只有可用情绪分")
         if covered == 0:
             missing.append({"key": "sentiment",
                             "reason": "；".join(reasons[:3]) or "窗口内没有可用情绪文档"})
-    return extras, missing, sources
+    return extras, missing, sources, sentiment_report
 
 
 def _cross_sectional_z_map(values):
@@ -1325,7 +1512,9 @@ def _strategy_analysis(v3_run, universe_list, klines, window, home=None):
     extras, extras_missing, extras_sources = ({}, [], {})
     if home:
         try:
-            extras, extras_missing, extras_sources = local_factor_extras(
+            # 研究流水线（PAAT）只走**本地快照**通道（``live_sentiment`` 缺省关）：一轮流水线
+            # 不该因为逐标的实时资讯取数而变慢/变不确定；实时兜底只在两条矩阵只读路由上开。
+            extras, extras_missing, extras_sources, _sentiment_report = local_factor_extras(
                 home, list(universe_list)[:FACTOR_LIMIT], _pit_date(None))
         except Exception as error:  # noqa: BLE001 —— 新因子失败不拖垮 PAAT
             extras_missing = [{"key": "quality/growth/sentiment",
@@ -1644,9 +1833,13 @@ def ml_backtest(v3_run, payload=None):
         {ok, ticker, market, marketNote,
          metrics: {sharpe, annReturnPct, maxDrawdownPct, signalFlips,
                    heldDays, flatDays, days, winRatePct},
-         equity: [{t, value}]}
+         equity: [{t, value}], alignment, alignmentNote}
 
     指标按**持仓日**基准（空仓日不计入胜率）；数据不足 → ``backtest/insufficient``。
+    ``equity`` 与输入**等长**（``len(equity) == metrics.days + 1``）：首行是预热位
+    （``value=null``——那天没有前值 ⇒ 没有收益，净值从它之后的第一个收益日才算起），
+    第 2 行起逐位对应后一根可用 bar（FR-TOOLS-002 等长 null 对齐，
+    ``alignment = "input-length-null-padded"``）。
     ``payload.market``（或查询参数）只作标注：显式给出即回显，否则取标的的市场前缀
     （单标的端点，不改取数口径）。
     """
@@ -1666,11 +1859,23 @@ def ml_backtest(v3_run, payload=None):
         envelope = _pit_series_envelope(v3_run, ticker, limit)
         if not envelope.get("ok"):
             return {"ok": False, "error": _tool_error(envelope), "market": code}
-        result = v3_math.backtest_momentum(_bars_of(envelope), window, rebalance_days)
+        bars = _bars_of(envelope)
+        result = v3_math.backtest_momentum(bars, window, rebalance_days)
         if result.get("error"):
             return _error("backtest/insufficient", result["error"], market=code)
+        # FR-TOOLS-002 等长 null 对齐：``equity`` 一行 = 一根输入 K 线（可用 bar），首根是
+        # **预热位**——它没有前值 ⇒ 当天没有收益，净值从它之后的第一个收益日才算起，故
+        # ``value=null``（不是 0，也不丢行）。``metrics`` 口径不变（仍按收益序列算）。
+        equity = _pad_series_head(result["equity"], [_first_series_stamp(bars)], "value")
         return {"ok": True, "ticker": ticker, "market": code, "marketNote": market_note,
-                "metrics": result["metrics"], "equity": result["equity"]}
+                "metrics": result["metrics"], "equity": equity,
+                "alignment": ALIGNMENT_NULL_PADDED,
+                "alignmentNote": (
+                    f"equity 等长对齐：长度 = 输入可用 K 线数 = metrics.days + 1"
+                    f"（{len(equity)} 行），首行是预热位 → value=null（不是 0）；"
+                    "第 2 行起的 value 与「第二根可用 bar」逐位对应。"
+                    "**消费方契约**：预热位是「无读数」，按 stat-core 三态口径显示占位符，"
+                    "不得用 Number(null)=0 强转（那会把曲线起点画成 0）")}
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
 
@@ -1771,6 +1976,12 @@ def ml_models(v3_run, home, *, market="SH", ticker=None, window=ML_WINDOW,
                 "source": _dominant_source(sources), "sources": sources,
                 "tickers": sorted(bars_by_ticker.keys()),
                 "failures": failures or None, "requested_tickers": list(names),
+                # 等长对齐（FR-TOOLS-002）：per_ticker 一行一标的，与 tickers 等长；
+                # 取数失败的标的进 failures（不是全 0 的一行）。
+                "alignment": ALIGNMENT_INPUT_LENGTH,
+                "alignmentNote": (f"横截面等长对齐：per_ticker 一行一标的"
+                                  f"（{len(bars_by_ticker)} 只有效 / 请求 {len(names)} 只），"
+                                  "顺序同 tickers；失败的标的在 failures，不填 0"),
                 **suite}
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
@@ -1959,6 +2170,219 @@ def _growth_pct(current, prior):
     return v3_math.round_half_up((current / prior - 1.0) * 100.0, 4)
 
 
+# ---------------------------------------------------------------------------
+# 情绪因子·实时通道：v3_nlp 同一份打分器 + data.cache 的 PIT 闸门
+# ---------------------------------------------------------------------------
+#: 情绪读数的逐标的来源标注（响应 ``sentimentSources[ticker].origin``）：
+#: 落库快照 / 实时 NLP（``v3_nlp`` 词典版本见 ``sentiment_factor_values`` 的 method）。
+SENTIMENT_ORIGIN_SNAPSHOT = "snapshot"
+SENTIMENT_ORIGIN_LIVE = "live:nlp-v1"
+#: 实时情绪的资讯条数上限（``stock_news_em`` 实测每页 10 条；limit 只影响请求条数）。
+SENTIMENT_LIVE_LIMIT = 20
+#: 实时情绪的文档窗口（天）——与 ``sentiment_factor_values`` 的缺省窗口同一口径。
+SENTIMENT_LIVE_WINDOW_DAYS = 7
+#: 实时取数并发度上限（akshare 每标的 1~3s；逐标的独立失败，不互相牵连）。
+SENTIMENT_LIVE_WORKERS = 4
+#: 实时打分的时间半衰（小时）——与快照通道、``/api/v3/sentiment`` 同值。
+SENTIMENT_LIVE_HALF_LIFE_HOURS = 48.0
+
+
+def _nlp_guard():
+    """``server.v3_nlp`` 的**可选**导入（别人的模块）：拿不到就降级为 ``(None, 原因)``。
+
+    情绪因子是**附加值**：``v3_nlp`` 缺失/导入失败时，其余的价量/质量/成长列照常返回，
+    情绪格如实写 ``null`` + 原因（绝不填 0，也不把整个矩阵打成错误）。
+    """
+    try:
+        from server import v3_nlp
+    except ImportError as error:  # pragma: no cover —— 部署里它总在；缺了也不该 500
+        return None, f"server.v3_nlp 不可用（ImportError: {error}）"
+    return v3_nlp, None
+
+
+def default_news_fetch(home, ticker, limit=SENTIMENT_LIVE_LIMIT):
+    """缺省的实时资讯取数：``v3_sources.fetch_news``（**惰性导入**，失败 → ``(None, 原因)``）。
+
+    返回 ``(fetch, note)``：``fetch`` 是**零参**可调用对象，形状与 ``v3_nlp.sentiment_report``
+    的 ``news_fetch`` 依赖同一份既有资讯通道（``akshare/stock_news_em`` + ``retry_akshare``
+    退避重试与 ``attempts`` 留痕），检索关键字走 ``v3_nlp.news_keyword``（与在线情绪端点
+    同一口径：A 股用 6 位代码、港美股用裸代码）。本模块**不自造第二数据源**，也不新建
+    HTTP 客户端——只把既有通道包一层，并在测试里可整条替换。
+    """
+    nlp, error = _nlp_guard()
+    if nlp is None:
+        return None, error
+    try:
+        from server import v3_sources
+    except ImportError as error:  # pragma: no cover —— 同上：缺失只降级不报错
+        return None, f"server.v3_sources 不可用（ImportError: {error}）"
+    keyword = nlp.news_keyword(ticker)
+    deps = v3_sources.Deps(home=None if home is None else str(home))
+    return (lambda: v3_sources.fetch_news(deps, keyword, limit)), f"v3_sources.fetch_news({keyword})"
+
+
+def live_sentiment_factor_value(home, ticker, as_of, *,
+                                window_days=SENTIMENT_LIVE_WINDOW_DAYS,
+                                limit=SENTIMENT_LIVE_LIMIT,
+                                half_life_hours=SENTIMENT_LIVE_HALF_LIFE_HOURS,
+                                fetch=None):
+    """单标的**实时**情绪分：资讯取数 → ``data.cache`` PIT 闸门（显式 ``as_of``）→ ``v3_nlp`` 打分。
+
+    返回 ``(score, meta)``；``meta["origin"]`` 取到分时恒为 ``"live:nlp-v1"``，否则 ``None``
+    + ``meta["reason"]``（**不是 0**：没有资讯 / 一篇都没命中词典 / 命中但半衰把权重压到 0
+    都各自写明原因）。
+
+    三道闸门（逐条可核验）::
+
+      ① 取数：``fetch``（缺省 = ``default_news_fetch``：既有 ``v3_sources.fetch_news``）；
+      ② **PIT**：文档发布时间经 ``server.data.cache`` 的 ``pit_rows``（唯一入口）按
+         **显式 ``as_of`` + AS_OF_INCLUSIVE** 过滤——晚于 ``as_of``（UTC 日期）的文档被挡掉
+         并计数（``rejected.future``，前视证据）；没有时间戳的文档**进不了读数**
+         （``rejected.undated``）——实时资讯与落库快照不同：快照行自带的采集日是「当时已知」
+         的凭证，而一篇无时间戳的实时文章无法证明当时已知，按 ``data.cache`` 的
+         「宁缺毋假」处理；
+      ③ 业务窗口：发布时间必须落在 ``[as_of 当日结束 − window_days, as_of 当日结束]``，
+         窗口外的文档计数排除（``outsideWindow``），与快照通道同一口径。
+
+    打分器是 ``v3_nlp.score_documents``（与快照通道、``/api/v3/sentiment`` 同一份实现，
+    时间基准 = ``as_of`` 当日结束 UTC，半衰权重因此不含未来资讯）。**只读**：本函数不写盘、
+    不下单、不切模式；资讯也不进 ``data.cache`` 的 TTL 层——与 ``data/cache.py`` 第三节
+    「上游 ``fetch=`` 路径有意不缓存」同一条边界（新鲜度由上游端点自己的 TTL 负责）。
+    """
+    meta = {"origin": None, "source": None, "reason": None,
+            "mode": pit_cache.AS_OF_INCLUSIVE, "window_days": int(window_days)}
+    try:
+        as_of = pit_cache.normalize_as_of(as_of)
+    except pit_cache.PitError as error:
+        meta["reason"] = f"as_of 不合法：{error}"
+        return None, meta
+    meta["as_of"] = as_of
+    meta["semantics"] = pit_cache.semantics_text(pit_cache.AS_OF_INCLUSIVE, as_of)
+
+    nlp, error = _nlp_guard()
+    if nlp is None:
+        meta["reason"] = error
+        return None, meta
+    if fetch is None:
+        fetch, note = default_news_fetch(home, ticker, limit)
+        if fetch is None:
+            meta["reason"] = note
+            return None, meta
+    try:
+        envelope = fetch()
+    except Exception as error:  # noqa: BLE001 —— 取数抛异常按「取不到」处理，不冒泡成 500
+        meta["reason"] = f"实时资讯取数异常：{type(error).__name__}: {error}"
+        return None, meta
+    if not isinstance(envelope, dict):
+        meta["reason"] = f"资讯源返回非信封对象：{type(envelope).__name__}"
+        return None, meta
+    meta["source"] = str(envelope.get("source") or "akshare/stock_news_em") + "（实时）"
+    if not envelope.get("ok"):
+        detail = envelope.get("error") or {}
+        code = str(detail.get("code") or "sentiment/news-failed")
+        message = str(detail.get("message") or "资讯源失败且未提供错误明细")
+        meta["reason"] = f"实时资讯取数失败（{code}）：{message}"
+        return None, meta
+
+    rows = [row for row in (envelope.get("rows") or []) if isinstance(row, dict)]
+    prepared = [_normalize_doc_time(row) for row in rows]
+
+    # ② PIT 闸门（唯一入口）：as_of 用 **UTC 日期**（与本模块其它 as_of 同口径）。
+    gate = []
+    for item in prepared:
+        published = nlp._doc_time(item)
+        stamp = None
+        if isinstance(published, datetime):
+            aware = published if published.tzinfo else published.replace(tzinfo=timezone.utc)
+            stamp = aware.astimezone(timezone.utc).date().isoformat()
+        gate.append({"t": stamp, "doc": item})
+    visible, pit_stats = pit_cache.pit_rows(gate, as_of, pit_cache.AS_OF_INCLUSIVE, key="t")
+    meta["rejected"] = {"future": pit_stats.get("future"), "undated": pit_stats.get("undated"),
+                        "kept": pit_stats.get("kept")}
+
+    # ③ 业务窗口：与快照通道同一口径（as_of 当日结束 UTC 为右端，左端 −window_days）。
+    span = max(1, int(window_days))
+    cutoff = datetime.strptime(as_of, "%Y-%m-%d").replace(tzinfo=timezone.utc) \
+        + timedelta(days=1) - timedelta(microseconds=1)
+    start = cutoff - timedelta(days=span)
+    meta["window"] = {"from": start.date().isoformat(), "to": as_of}
+    documents = []
+    outside = 0
+    for entry in visible:
+        item = entry["doc"]
+        published = nlp._doc_time(item)
+        if not isinstance(published, datetime):
+            outside += 1
+            continue
+        aware = published if published.tzinfo else published.replace(tzinfo=timezone.utc)
+        if aware < start or aware > cutoff:
+            outside += 1
+            continue
+        documents.append(item)
+    meta["outsideWindow"] = outside
+    if not documents:
+        extra = ""
+        if meta["rejected"]["future"] or meta["rejected"]["undated"]:
+            extra = (f"（PIT 闸门：挡掉晚于 as_of 的 {meta['rejected']['future']} 篇、"
+                     f"无时间戳 {meta['rejected']['undated']} 篇）")
+        meta["reason"] = (f"{ticker} 在 {meta['window']['from']}..{as_of} 没有窗口内的实时资讯"
+                          + (f"（{outside} 篇发布时间在窗口外，已排除）" if outside else "")
+                          + extra + f"（{meta['source']}）")
+        return None, meta
+
+    scored = nlp.score_documents(documents, half_life_hours=half_life_hours, now=cutoff)
+    meta.update({"documents": scored.get("documents"), "scored": scored.get("scored"),
+                 "coverage": scored.get("coverage"), "method": scored.get("method"),
+                 "half_life_hours": half_life_hours})
+    score = scored.get("score")
+    if score is None:
+        # 与快照通道逐条同口径：命中 0 篇 / 半衰把权重和压到 0 → null（**不是 0 分**）。
+        if scored.get("scored"):
+            meta["reason"] = (f"{scored['documents']} 篇实时资讯里 {scored['scored']} 篇命中词典，"
+                              f"但时间半衰（{half_life_hours}h）把权重和压到 0 → score=null（不是 0 分）")
+        else:
+            meta["reason"] = (f"{scored.get('documents', 0)} 篇实时资讯无一命中词典"
+                              "（score=null，不是 0 分）")
+        return None, meta
+    meta["origin"] = SENTIMENT_ORIGIN_LIVE
+    return score, meta
+
+
+def live_sentiment_values(home, names, as_of, *, window_days=SENTIMENT_LIVE_WINDOW_DAYS,
+                          limit=SENTIMENT_LIVE_LIMIT,
+                          half_life_hours=SENTIMENT_LIVE_HALF_LIFE_HOURS,
+                          fetch_factory=None):
+    """批量实时情绪：``{ticker: (score, meta)}``（并发取数；逐标的失败互不牵连）。
+
+    ``fetch_factory``（缺省 :func:`default_news_fetch`）是取数注入点，签名
+    ``(home, ticker, limit) -> (零参取数函数|None, note)``——单测据此注入假资讯源，
+    **整个测试面因此不触网**。
+    """
+    out = {}
+    tickers = [str(name).strip() for name in (names or []) if str(name or "").strip()]
+    if not tickers:
+        return out
+    factory = fetch_factory or default_news_fetch
+
+    def worker(name):
+        try:
+            fetch, note = factory(home, name, limit)
+        except Exception as error:  # noqa: BLE001 —— 取数装配失败也只影响这一个标的
+            return name, (None, {"origin": None, "reason":
+                                 f"实时取数初始化失败：{type(error).__name__}: {error}"})
+        if fetch is None:
+            return name, (None, {"origin": None, "reason": note})
+        return name, live_sentiment_factor_value(
+            home, name, as_of, window_days=window_days, limit=limit,
+            half_life_hours=half_life_hours, fetch=fetch)
+
+    workers = max(1, min(SENTIMENT_LIVE_WORKERS, len(tickers)))
+    with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v3-sentiment") as pool:
+        for name, pair in pool.map(worker, tickers):
+            out[name] = pair
+    return out
+
+
 def sentiment_factor_values(home, ticker, as_of, *, window_days=7, half_life_hours=48.0):
     """情绪因子：用 ``v3_nlp`` 同一份自研打分器**离线复算**已落库的资讯快照。
 
@@ -2029,11 +2453,15 @@ def sentiment_factor_values(home, ticker, as_of, *, window_days=7, half_life_hou
                         prepared.append({"title": item})
     # 第二个 PIT 闸门：文档自身发布时间必须落在窗口内（无时间戳的按旧口径保留并计入 undated，
     # 由打分器按 as_of 计权并自己计数——它不猜时间，我们也不替它丢）。
-    from server import v3_nlp
+    # 打分器的导入与实时通道走**同一个守卫**：``v3_nlp`` 缺失时情绪格是 null + 原因，
+    # 而不是把整个矩阵打成 v3/internal（其余因子类别与价量列照常返回）。
+    nlp, import_error = _nlp_guard()
+    if nlp is None:
+        return None, {"reason": import_error, "source": "store.sentiment_snapshots"}
     start = cutoff - timedelta(days=max(1, int(window_days)))
     outside = 0
     for item in prepared:
-        published = v3_nlp._doc_time(item)
+        published = nlp._doc_time(item)
         if published is None:
             documents.append(item)
             continue
@@ -2048,7 +2476,7 @@ def sentiment_factor_values(home, ticker, as_of, *, window_days=7, half_life_hou
         return None, {"reason": reason, "source": "store.sentiment_snapshots",
                       "window_from": floor, "window_to": str(as_of)[:10], "documents": 0,
                       "outsideWindow": outside}
-    scored = v3_nlp.score_documents(documents, half_life_hours=half_life_hours, now=cutoff)
+    scored = nlp.score_documents(documents, half_life_hours=half_life_hours, now=cutoff)
     # ``score=None`` 有两种原因，分开写清（页面/矩阵才不会把 no-data 读成「中性 0 分」）：
     #   ① 一篇都没命中词典（scored=0）；
     #   ② 有命中文档、但时间半衰把权重和压到 0（快照原文远早于 as_of：例如 last30days 的长尾）——
@@ -2704,8 +3132,11 @@ FACTOR_REGISTRY = tuple([
     # ── 情绪（缺失类 ③）──
     {"key": "sentiment", "class": "sentiment", "direction": 1,
      "source": "store.sentiment_snapshots（sentiment_snapshot 作业落库的 fin_sentiment/fin_news "
-               "原文）+ server.v3_nlp.score_documents 离线复算；在线口径见 GET /api/v3/sentiment",
-     "pit": "只取 date ≤t 的快照，且按 t 当日 00:00 UTC 做时间半衰（不含 t 之后资讯）"},
+               "原文）∨ akshare/stock_news_em 实时资讯（仅两条矩阵路由；经 server.data.cache "
+               "PIT 闸门）+ server.v3_nlp.score_documents 同一份打分器；逐标的来源见 "
+               "sentimentSources；在线口径见 GET /api/v3/sentiment",
+     "pit": "快照：date ≤t 且文档发布时间在 [t−7d, t] 内；实时：文档发布时间经 as_of（t）+ "
+            "INCLUSIVE 闸门，晚于 t 的资讯被挡掉并计数；两者都用 t 当日结束 UTC 做时间半衰"},
     # ── 另类（缺失类 ④）──
     {"key": "capital_flow", "class": "alternative", "direction": 1,
      "source": "futu/capital_flow_history（近 20 个交易日主力净流入 / Σ|净额|）",
@@ -2763,6 +3194,19 @@ def _ok(content):
     return JSONResponse(status_code=200, content=content)
 
 
+def _route_sentiment_fetch(app):
+    """路由层的实时资讯取数接缝：``app.state.v3_sentiment_live_fetch``（缺省 ``None``）。
+
+    与 ``v3_nlp.register`` 把 ``deps`` 挂进 ``app.state.v3_nlp`` 同一手法：生产不需要注入
+    （``None`` → :func:`default_news_fetch` 走既有 akshare 通道），单测注入假资讯源后
+    整条路由**不触网**。注入物签名与 :func:`default_news_fetch` 一致：
+    ``(home, ticker, limit) -> (零参取数函数|None, note)``。
+    """
+    state = getattr(app, "state", None)
+    fetch = getattr(state, "v3_sentiment_live_fetch", None)
+    return fetch if callable(fetch) else None
+
+
 def register(app, v3_run, home):
     """把 5 个分析类契约（6 条路由）挂到 FastAPI ``app`` 上。
 
@@ -2808,6 +3252,11 @@ def register(app, v3_run, home):
         解析）；显式 ``tickers`` 优先（此时 ``market`` 仅作标注）。``classes`` 选择要并入的
         新因子类别（``quality,growth,sentiment`` 缺省；``all`` 含 ``alternative`` 实时取数；
         ``none`` 只要价量/估值列）。``as_of``（``YYYY-MM-DD``）是 PIT 上界，缺省今天（UTC）。
+
+        情绪列在本路由**打开实时兜底**（``live_sentiment=True``）：快照取不到分的标的再走
+        ``v3_nlp`` 实时打分（经 ``server.data.cache`` 的 PIT 闸门，显式 ``as_of``），
+        逐标的来源见 ``sentimentSources``。测试用 ``app.state.v3_sentiment_live_fetch``
+        注入假资讯源（缺省 = 既有 ``v3_sources.fetch_news`` 通道）。
         """
         chosen_forward = forward if forward is not None else forward_days
 
@@ -2815,7 +3264,8 @@ def register(app, v3_run, home):
             return factors_matrix_data(v3_run, home, tickers_raw=tickers, factor=factor,
                                        forward_days=chosen_forward if chosen_forward is not None else 5,
                                        market=market, classes=classes or None,
-                                       as_of=as_of or None)
+                                       as_of=as_of or None, live_sentiment=True,
+                                       sentiment_fetch=_route_sentiment_fetch(app))
 
         return _ok(await asyncio.to_thread(work))
 
@@ -2826,12 +3276,15 @@ def register(app, v3_run, home):
 
         覆盖率与 ``/api/v3/factors/matrix`` **同一份计算**（不为页面另造一套统计）；
         默认只算本地三类（quality/growth/sentiment），``classes=all`` 才把实时另类因子
-        （``capital_flow``/``short_interest``）一起取。
+        （``capital_flow``/``short_interest``）一起取。情绪列的实时兜底与矩阵路由同一口径
+        （``live_sentiment=True``），逐标的来源见响应 ``sentimentSources``。
         """
         def work():
             matrix = factors_matrix_data(v3_run, home, tickers_raw=tickers, factor="mom_20",
                                          forward_days=5, market=market,
-                                         classes=classes or None, as_of=as_of or None)
+                                         classes=classes or None, as_of=as_of or None,
+                                         live_sentiment=True,
+                                         sentiment_fetch=_route_sentiment_fetch(app))
             if not matrix.get("ok"):
                 return matrix
             registry = factor_registry_data(matrix.get("matrix"))
@@ -2840,6 +3293,7 @@ def register(app, v3_run, home):
                     "registry": registry["registry"], "classLabels": registry["classes"],
                     "coverage": registry["coverage"],
                     "factorsMissing": matrix.get("factorsMissing"),
+                    "sentimentSources": matrix.get("sentimentSources"),
                     "sources": matrix.get("sources")}
 
         return _ok(await asyncio.to_thread(work))

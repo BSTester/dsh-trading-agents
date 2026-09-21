@@ -18,6 +18,12 @@
 5. **鉴别力（mutation）**：**真实**删掉一条 ``/api/v3/*`` 路由 → 目录与代理面必须
    同时变小、探针必须报出缺的那件；同一套探针在完整装配下必须通过。这条证明第 1/2 层
    不是恒真断言。
+6. **元数据暴露**（2026-09-21 收尾）：``tools/list`` 的 ``_meta.quantwb.isConcurrencySafe``
+   覆盖 ``/mcp`` 与 ``/mcp/ro`` 暴露的全部 6 件（此前只有基础面那 2 件有、``/mcp/ro`` 一件
+   都没有），卡片带 ``concurrencySafe``（128 件逐件）与 ``renderable``/``formats``（仅 5 件
+   渲染件）。期望值一律从注册表现推（``mcp_tools.is_concurrency_safe`` /
+   ``NON_READONLY_PATHS`` / ``TOOL_RENDERERS``），并用「临时登记一个渲染器 → 卡片必须跟着
+   翻」证明这些字段是推导而非誊抄。
 
 只读验证：所有真实调用只打只读工具（``v3_gateway`` / ``v3_tools`` / ``v3_risk`` /
 ``v3_credentials?action=status``），不触发 ``trade_*``/``sim_trade_*``/``plan-execute``/
@@ -194,6 +200,12 @@ class McpClient:
         result = await self._request("tools/call", {"name": name,
                                                     "arguments": arguments or {}})
         return result.get("isError"), json.loads(result["content"][0]["text"])
+
+    async def raw_tool_result(self, name, arguments=None):
+        """不 ``json.loads`` 的原始文本结果：``format:"text"`` 的渲染**不是** JSON。"""
+        result = await self._request("tools/call", {"name": name,
+                                                    "arguments": arguments or {}})
+        return result.get("isError"), result["content"][0]["text"]
 
     async def call_tool(self, name, arguments=None):
         """走代理入口 ``call_tool``，返回（协议层 isError, 代理返回的信封）。"""
@@ -1045,6 +1057,220 @@ class MutationGuardTests(unittest.TestCase):
         self.assertIsNone(card)
         self.assertIsNone(target)
         self.assertEqual(envelope(result)["error"]["code"], "mcp/unknown-tool")
+
+
+class MetadataExposureTests(unittest.TestCase):
+    """第 6 层：``_meta``（并发安全）与卡片字段（``concurrencySafe`` / ``renderable`` / ``formats``）。
+
+    核实的是「**暴露**」而不是「计算」：这些判定在 ``mcp_tools`` 里本来就有，缺的是它们有没有
+    经 ``tools/list`` 的 ``_meta`` 与 ``list_tools`` 卡片**到达调用方**。两处都断言在**线格式**
+    上（真 MCP 协议 / ``card.as_dict()``），并且期望值一律**从注册表现推**——不抄一份常量，
+    所以注册表一变，这里的断言会跟着变，不会变成恒真的第二条清单。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = build_offline_app(mcp_discovery.DISCOVERY)
+        cls.proxy = cls.app.state.mcp_discovery
+        cls.bridge = cls.app.state.v3_mcp_bridge
+        cls.bridge_paths = {d.name: d.endpoint for d in cls.bridge.definitions}
+        _silence_loggers()
+
+    def expected_safe(self, name):
+        """名字 → 期望的并发安全判定（与装配时的推导同一口径：桥接看写类，基础看判定表）。
+
+        ``call_tool`` 按**本面自己的标注**（``/mcp`` 能转发写类 → false；``/mcp/ro`` 的闸门
+        保证到不了写类 → true，见下面的用例单独覆盖），不去查基础面那张表。
+        """
+        if name in self.bridge_paths:
+            return self.bridge_paths[name] not in v3_mcp.NON_READONLY_PATHS
+        if name == mcp_discovery.LIST_TOOL:
+            return True
+        if name == mcp_discovery.CALL_TOOL:
+            return False
+        return mcp_tools.is_concurrency_safe(name)
+
+    def wire_meta(self, base):
+        """真协议取一次 ``tools/list`` → ``{name: _meta}``（只读，不调用任何业务工具）。"""
+        async def work(client, _app):
+            tools = await client.list_tools()
+            return {tool["name"]: tool.get("_meta") for tool in tools}
+
+        return inproc(mcp_discovery.DISCOVERY, work, base=base)
+
+    def test_main_surface_publishes_the_concurrency_meta_for_all_six(self):
+        """``/mcp`` 的 6 件每件都带 ``quantwb.isConcurrencySafe``（此前只有基础面那 2 件有）。
+
+        期望值从注册表现推：``v3_gateway`` / ``v3_tools`` 是桥接只读件 → true；
+        ``snapshot`` true（它在基础面判定表里）／``admin_status`` false（同一张表）；
+        ``list_tools`` true、``call_tool`` false（本面能转发写类内层工具）。
+        """
+        metas = self.wire_meta("/mcp")
+        self.assertEqual(sorted(metas), sorted(mcp_discovery.DIRECT_KEEP
+                                              + mcp_discovery.PROXY_NAMES))
+        for name, meta in metas.items():
+            self.assertIsNotNone(meta, f"{name} 缺 _meta（tools/list 的元数据是半截的）")
+            self.assertEqual(meta[mcp_tools.CONCURRENCY_META_KEY],
+                             self.expected_safe(name), name)
+        self.assertIs(metas["call_tool"][mcp_tools.CONCURRENCY_META_KEY], False)
+
+    def test_readonly_surface_publishes_the_concurrency_meta_for_all_six(self):
+        """``/mcp/ro`` 的 6 件同样每件都带；与 ``/mcp`` 的差异只有 ``call_tool``。
+
+        ``/mcp/ro`` 的 ``call_tool`` 只转发只读件（闸门在绑定里）→ 并发安全 true，与它自己的
+        ``readOnlyHint=true`` 同一口径；基础件（无 annotations）走判定表 → 与 ``/mcp`` 上
+        ``mcp_tools.register`` 发的那份**逐值相同**（同一条判据，两个落点不会各说各话）。
+        """
+        ro_metas = self.wire_meta("/mcp/ro")
+        main_metas = self.wire_meta("/mcp")
+        for name, meta in ro_metas.items():
+            self.assertIsNotNone(meta, name)
+            expected = self.expected_safe(name)
+            if name == mcp_discovery.CALL_TOOL:
+                expected = True  # 只读面的转发闸门保证到不了写类
+            self.assertEqual(meta[mcp_tools.CONCURRENCY_META_KEY], expected, name)
+        for name in mcp_discovery.DIRECT_KEEP:
+            self.assertEqual(ro_metas[name], main_metas[name], name)
+
+    def test_direct_mode_base_surface_keeps_its_meta(self):
+        """``direct`` 模式下基础面 77 件照旧每件都带（discovery 的改动没有动它）。"""
+        app = build_offline_app(mcp_discovery.DIRECT)
+        tools = asyncio.run(app.state.mcp.list_tools())
+        base = [tool for tool in tools if not tool.name.startswith("v3_")]
+        self.assertEqual(len(base), BASE_TOOLS)
+        for tool in base:
+            self.assertIsNotNone(tool.meta, tool.name)
+            self.assertEqual(tool.meta[mcp_tools.CONCURRENCY_META_KEY],
+                             mcp_tools.is_concurrency_safe(tool.name), tool.name)
+
+    def test_cards_carry_concurrency_safe_for_every_tool(self):
+        """128 件卡片每件都带 ``concurrencySafe``，且与注册面同源（不是第二份判定）。"""
+        for name, card in self.proxy.catalog.items():
+            wire = card.as_dict()
+            self.assertIsInstance(wire["concurrencySafe"], bool, name)
+            self.assertEqual(wire["concurrencySafe"], self.expected_safe(name), name)
+        # 方向抽查（三条不同来路）：桥接只读 true / 桥接写类 false / 基础写类 false
+        self.assertIs(self.proxy.catalog["v3_sentiment"].as_dict()["concurrencySafe"], True)
+        self.assertIs(self.proxy.catalog["v3_strategy_run"].as_dict()["concurrencySafe"], False)
+        self.assertIs(self.proxy.catalog["trade_place"].as_dict()["concurrencySafe"], False)
+
+    def test_cards_expose_renderable_and_formats_only_when_supported(self):
+        """``renderable``/``formats`` 与注册表 ``TOOL_RENDERERS`` 逐件同真同假（缺键 = 不支持）。"""
+        renderable_names = {name for name in self.proxy.catalog
+                            if mcp_tools.is_renderable(name)}
+        self.assertTrue(renderable_names, "渲染器注册表不该为空（否则这条用例恒真）")
+        for name, card in self.proxy.catalog.items():
+            wire = card.as_dict()
+            if name in renderable_names:
+                self.assertIs(wire.get("renderable"), True, name)
+                self.assertEqual(wire.get("formats"), [mcp_tools.FORMAT_JSON,
+                                                       mcp_tools.FORMAT_TEXT], name)
+            else:
+                self.assertNotIn("renderable", wire, name)
+                self.assertNotIn("formats", wire, name)
+        # 抽查：snapshot（基础面可渲染）在卡片上说得清；桥接面当前无渲染器 → 一件都不带
+        self.assertEqual(self.proxy.catalog["snapshot"].as_dict()["formats"], ["json", "text"])
+        self.assertEqual([name for name in renderable_names
+                          if name in self.bridge_paths], [])
+
+    def test_card_facts_are_derived_not_hardcoded(self):
+        """鉴别力：临时给一件桥接工具登记渲染器 → 卡片必须跟着翻（证明字段是**推导**的）。"""
+        victim = "v3_market"
+        self.assertNotIn("renderable", self.proxy.catalog[victim].as_dict())
+        self.assertFalse(mcp_tools.is_renderable(victim))
+        mcp_tools.TOOL_RENDERERS[victim] = lambda args, value: "临时渲染器"
+        try:
+            rebuilt = mcp_discovery.build_catalog(mcp_tools.TOOLS, self.bridge)
+            self.assertIs(rebuilt[victim].as_dict()["renderable"], True)
+            self.assertEqual(rebuilt[victim].as_dict()["formats"], ["json", "text"])
+            # 同一份推导也作用于并发安全：把某件基础名临时判成不安全 → 卡片必须变 false
+            self.assertIs(rebuilt["series"].as_dict()["concurrencySafe"], True)
+            with unittest.mock.patch.object(mcp_tools, "is_concurrency_safe",
+                                            lambda name: str(name) != "series"):
+                flipped = mcp_discovery.build_catalog(mcp_tools.TOOLS, self.bridge)
+            self.assertIs(flipped["series"].as_dict()["concurrencySafe"], False)
+        finally:
+            mcp_tools.TOOL_RENDERERS.pop(victim, None)
+
+    def test_renderable_card_travels_over_the_wire_with_a_yes_no_answer(self):
+        """线格式：``list_tools`` 的卡片直接回答「能不能 text 渲染」，且与真 schema 一致。
+
+        与 ``/mcp`` 直连工具的 ``inputSchema`` 交叉核对：卡片说 renderable 的件，签名里必须
+        真有 ``format`` 字段（同一个谓词的两个落点）。
+        """
+        def work(_client, app):
+            async def inner():
+                page = app.state.mcp_discovery.search(keyword="snapshot")
+                # 关键词同时匹配名字与用途（``market_snapshot`` 也命中）→ 按名字取那一张
+                card = [item for item in page["cards"] if item["name"] == "snapshot"][0]
+                tools = {tool.name: tool for tool in await app.state.mcp.list_tools()}
+                return card, sorted((tools["snapshot"].input_schema or {})
+                                    .get("properties", {}))
+
+            return inner()
+
+        card, snapshot_props = inproc(mcp_discovery.DISCOVERY, work)
+        self.assertIn(mcp_tools.FORMAT_FIELD, snapshot_props, "snapshot 签名里应有 format")
+        self.assertIs(card["renderable"], True)
+        self.assertEqual(card["formats"], [mcp_tools.FORMAT_JSON, mcp_tools.FORMAT_TEXT])
+        self.assertEqual(card["concurrencySafe"], True)
+
+
+    def test_renderable_card_lists_the_format_field_like_the_schema_does(self):
+        """卡片 ``required ∪ optional`` 与直连 schema 的 ``properties`` **同集合**（128 件逐件）。
+
+        这条会抓到一类真缺陷：``format`` 是 ``mcp_tools._bind`` 在**绑定期**追加到 schema 的，
+        而卡片参数名来自 ``definition.params``——不补这一项，代理的实参白名单就比 schema 更窄，
+        ``call_tool(arguments={"format":"text"})`` 会被判野字段（2026-09-21 实测并修复）。
+        """
+        direct = build_offline_app(mcp_discovery.DIRECT)
+        schema = {tool.name: set((tool.input_schema or {}).get("properties", {}))
+                  for tool in asyncio.run(direct.state.mcp.list_tools())}
+        checked = 0
+        for name, card in self.proxy.catalog.items():
+            if name not in schema:  # pragma: no cover —— 目录与直连面同源，走不到
+                continue
+            checked += 1
+            self.assertEqual(set(card.required) | set(card.optional), schema[name], name)
+        self.assertEqual(checked, len(self.proxy.catalog))
+        for name in mcp_tools.TOOL_RENDERERS:
+            self.assertIn(mcp_tools.FORMAT_FIELD, self.proxy.catalog[name].optional, name)
+
+    def test_format_text_works_through_the_proxy(self):
+        """``call_tool(arguments={"format":"text"})`` 真出人类渲染；非 renderable 件仍拒。
+
+        直连面一直支持 ``format``（签名里有这个字段），但**代理面此前被白名单拒**——同一次
+        调用的两种形态（JSON / 散文）都在这里钉死，且断言的是**线格式**。
+        """
+        raw = {"series": {"ok": True, "value": {
+            "ticker": "US.NVDA", "period": "1d", "count": 2,
+            "source": "futu/quote_history_kline", "as_of": "2026-09-19",
+            "bars": [{"t": "2026-09-18", "c": 178.2}, {"t": "2026-09-19", "c": 180.4}]}}}
+
+        async def work(client, _app):
+            is_error, text = await client.raw_tool_result(
+                "call_tool", {"name": "series",
+                              "arguments": {"ticker": "US.NVDA", "period": "1d",
+                                            "format": mcp_tools.FORMAT_TEXT}})
+            _, plain = await client.raw_tool_result(
+                "call_tool", {"name": "series",
+                              "arguments": {"ticker": "US.NVDA", "period": "1d"}})
+            _, refused = await client.raw_tool_result(
+                "call_tool", {"name": "positions",
+                              "arguments": {"format": mcp_tools.FORMAT_TEXT}})
+            return is_error, text, plain, refused
+
+        is_error, text, plain, refused = inproc(mcp_discovery.DISCOVERY, work, raw=raw)
+        self.assertFalse(is_error, "人类渲染是正常工具结果，不是 isError=true")
+        self.assertIn("US.NVDA 1d K 线：共 2 根", text)
+        self.assertIn("来源 futu/quote_history_kline", text)
+        # 同一实参不带 format → 仍是规范 JSON 信封（机器读的那一份没被动过）
+        self.assertTrue(json.loads(plain)["ok"])
+        self.assertIn("bars", json.loads(plain)["value"])
+        # 非 renderable 件没有这个字段 → 按未知参数拒绝（与直连 schema 同一后果）
+        refusal = json.loads(refused)
+        self.assertEqual(refusal["error"]["code"], "mcp/bad-arguments")
+        self.assertIn(mcp_tools.FORMAT_FIELD, refusal["error"]["message"])
 
 
 if __name__ == "__main__":  # pragma: no cover

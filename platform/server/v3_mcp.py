@@ -118,6 +118,11 @@ TOOL_DOCS = {
                                  "最近触发记录，以及外部熔断三参数（并发上限/单次超时/token 预算，"
                                  "超限即 kill 并记录）与 profile 白名单审计。"
                                  + _READ_NOTE,
+    "/api/v3/macro": "宏观经济序列（免密钥）：主源 AKShare（国家统计局/央行口径），OpenBB OECD 为第二源。"
+                     "indicator = cpi / ppi / pmi / shrzgm(社融) / m2；返回升序尾部序列 + 最新值 + 来源。"
+                     "compare=oecd 时并列 OECD 标准化口径块（仅 CPI 有中国同口径序列，其余如实 oecd/no-series）；"
+                     "AKShare 失败且为 CPI 时自动降到 OECD 腿（source/caliber 如实换标，不互相冒充）。"
+                     + _READ_NOTE,
     "/api/v3/market": "K 线序列（周期 1m..1d/1w/1M），经工作台 series 工具取数，字段按 V3 契约适配。"
                       + _READ_NOTE,
     "/api/v3/market/watchlist": "该市场池子的快照（逐票最近日 K + 动量）：池子来自配置自选池或真实持仓，"
@@ -148,6 +153,11 @@ TOOL_DOCS = {
                         + _READ_NOTE,
     "/api/v3/news": "A 股个股资讯（AKShare 免密钥）。symbol 允许 SH.600519 形式；无数据时给出真实原因。"
                     + _READ_NOTE,
+    "/api/v3/northbound": "北向资金（AKShare 免密钥）：当日四方板块（沪股通/深股通/港股通沪深）+ "
+                          "沪/深股通历史净买额序列。**披露事实**：北向当日净买入自 2024-08-19 起交易所"
+                          "不再披露（实测最后非空日期 2024-08-16），响应 net_buy_disclosure 写明，"
+                          "上游 0 占位绝不冒充真实净买额；部件失败在 errors 里逐条留真实错误。"
+                          + _READ_NOTE,
     "/api/v3/oms/orders": "OMS 台账只读视图（按市场过滤可选）：登记、风控分级与对账结果。"
                           + _READ_NOTE,
     "/api/v3/oms/sync": "重新对账：plan → 登记/分级 → 与在途委托命中 → **重写本地 OMS 台账**。"
@@ -242,9 +252,6 @@ TOOL_DOCS = {
     "/api/v3/tools": "六域工具目录（data/alpha/ml/risk/execution/ecosystem）：工作台工具面 + V3 本地计算；"
                      "?domain= 可只看一域。"
                      + _READ_NOTE,
-    "/api/v3/tushare": "Tushare Pro 只读取数（api 需在受支持清单内）；token 未注入时不发任何请求，"
-                       "如实返回 tushare/no-token。"
-                       + _READ_NOTE,
 }
 
 # ---------------------------------------------------------------------------
@@ -287,8 +294,9 @@ PARAM_DOCS = {
     "mode": "账户模式：sim / live（只影响读取哪个模式下的账户数据）",
     "statement": "报表类型：income / balance / cashflow",
     "periods": "返回的报告期数（1..12）",
-    "api": "Tushare 接口名（需在服务端受支持清单内）",
-    "ts_code": "Tushare 标的代码，如 600519.SH",
+    "indicator": "宏观指标：cpi / ppi / pmi / shrzgm(社融) / m2（或中文别名 社融 / 货币供应量）",
+    "compare": "宏观对照源：oecd = 并列 OpenBB OECD 标准化口径块（仅 CPI 有中国同口径序列）；"
+               "留空 = 只出 NBS 主源（不触发 openbb 冷启动 import）",
     "classes": "因子类别选择（quality,growth,sentiment 缺省；all 含实时另类；none 只要价量/估值列）",
     "as_of": "PIT 上界（严格完整 YYYY-MM-DD 日历日）。工作台 factors 未指定/空值保持最新口径；"
              "显式给出时仅用 t <= as_of 的价量日线，估值无 PIT 数据，未并入原始值、z-score 或合成权重。"
@@ -319,7 +327,8 @@ PARAM_DOCS_OVERRIDES = {
                                                "对齐后不足 80 天报 statarb/insufficient）",
     ("/api/v3/research/report.pdf", "ticker"): "按标的筛选一篇已发布研报（与 id 二选一）",
     ("/api/v3/financials", "ticker"): "标的代码：美股如 AAPL，A 股如 SH.600000/600519.SH，港股如 HK.00700",
-    ("/api/v3/tushare", "period"): "报告期，如 20260630",
+    ("/api/v3/macro", "limit"): "序列尾部返回条数（1..500，缺省 24）",
+    ("/api/v3/northbound", "limit"): "沪/深股通历史序列各返回的尾部条数（1..3000，缺省 60）",
     ("/api/v3/market/watchlist", "market"): "市场：SH / HK / US（缺省 SH）",
     ("/api/v3/ops/alerts", "state"): "只看某一态（firing / pending / ok / no-data / unsupported）；"
                                      "留空看全部，取值非法时不过滤（只读端点不因参数失败）",
@@ -366,7 +375,7 @@ REQUEST_PARAMS = {
     CREDENTIALS_PATH: (
         _p("action", "str", "status=读配置状态（缺省）；test=用已保存凭据做一次只读连通性测试。"
                             "save/clear 在 MCP 面封死（凭据写入只能由人在 Web 设置页完成）"),
-        _p("key", "str", "凭据键名（缺省 tushare_token）"),
+        _p("key", "str", "凭据键名（缺省读凭据注册表首键；Tushare 已随免密政策移除）"),
         _p("value", "str", "**MCP 面不接受**：凭据值只能由人在 Web 设置页输入"),
     ),
     "/api/v3/strategy/run": (
@@ -759,6 +768,12 @@ def register(server, app, bridge=None):
                     idempotentHint=definition.endpoint not in NON_READONLY_PATHS,
                     openWorldHint=True,
                 ),
+                # FR-TOOLS-002 子规范：``isConcurrencySafe`` 经 ``_meta`` 暴露（与
+                # ``mcp_tools``/``mcp_discovery`` 同一份键与判定）。原先只有 discovery 代理
+                # 面补齐，**direct 模式下这 51 件 v3_* 没有 meta**；此处补上后 direct 面
+                # 128 件全覆盖。判定只看"是否只读"（桥接件无共享可变状态）。
+                meta=mcp_tools.concurrency_meta(
+                    definition.endpoint not in NON_READONLY_PATHS),
                 structured_output=False,
             )
         # 与 77 工具同一套封闭性保证（additionalProperties:false），只作用于本模块注册的名字。

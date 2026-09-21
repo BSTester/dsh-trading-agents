@@ -43,7 +43,8 @@ const PURPOSES = {
   QUANT_MCP_LOG: "MCP Bridge 日志文件",
   FUTU_OPEND_HOST: "OpenD 连接地址",
   FUTU_OPEND_PORT: "OpenD 连接端口",
-  TUSHARE_TOKEN: "Tushare Pro 行情 / 财务数据",
+  // 2026-09-21 数据源政策：除富途授权外全部免密钥公开端点 → TUSHARE_TOKEN 已随 Tushare Pro
+  // 集成移除（路由/降级链/凭据解析全删），能力由免密源替代（财务=东财/新浪、宏观·北向=AKShare）。
 };
 const MODE_LABEL = { sim: "模拟盘 SIM", live: "实盘 LIVE" };
 
@@ -1272,7 +1273,8 @@ export default function SettingsPage() {
         )}
         <Paragraph type="secondary" style={{ fontSize: 11.5, marginTop: 8, marginBottom: 0 }}>
           「未注入」指该变量尚未进入 Harness 运行时环境；本表只显示注入状态与来源，不显示任何变量值。
-          其中 TUSHARE_TOKEN 的已配置状态见上方「统一授权中心」。本表为全局口径（不按市场拆分）。
+          数据渠道政策：除富途（授权使用）外全部为免密钥公开端点；需要 token 的渠道（如 Tushare Pro）已移除，
+           能力由免密源替代（财务=东财/新浪、宏观·北向=AKShare）。本表为全局口径（不按市场拆分）。
         </Paragraph>
       </ProCard>
 

@@ -1,36 +1,28 @@
 """V3 密钥与授权配置（**页面可操作**）。
 
-为什么单独一层：规格要求「所有需要密钥的配置在页面上就能完成」。本模块把 V3 侧所需的
-密钥（当前只有 Tushare Pro）做成可读状态 / 保存 / 测试 / 清除四个动作，供
+本模块把 V3 侧所需的密钥做成可读状态 / 保存 / 测试 / 清除四个动作，供
 ``/api/v3/credentials`` 路由使用。
+
+**当前注册表为空（2026-09-21 数据源政策）**：除富途（授权使用，凭据走独立的
+``futu-openapi.json`` / 设置页 OAuth 流程，不在本模块）外，数据渠道一律使用
+免密钥公开端点；唯一曾注册的 Tushare Pro token 因「需要 token」随 Tushare Pro
+能力一并移除（能力由富途 f10 / AKShare / SEC EDGAR 免密覆盖）。
+``KEYS`` 保留通用机制（校验 / 0600 落盘 / 状态掩码），供未来**确需凭据**的渠道
+注册时复用——恢复注册不等于政策放宽，仍需逐项审查。
 
 硬约束（与既有设置页同一纪律）：
   * 凭据落 ``<home>/v3-credentials.json``，**0600**，先校验后原子写；
   * 任何响应**都不回显凭据值**——status 只给 present/source/updated_at/掩码尾号；
-  * **环境变量优先**于文件：部署方用 env，临时/单机用页面写文件；
-  * 未配置时**不发出任何外部请求**（Tushare 取数直接返回 no-token）。
-
-OAuth 类授权（富途 OpenAPI）不在本模块：既有工作台设置页已完整支持
-（``/api/wb/openapi_oauth`` 的 start/status/cancel + ``openapi_config`` 保存 AppKey），
-V3 接入与授权页只做状态展示与入口跳转，避免出现第二套授权实现。
+  * **环境变量优先**于文件：部署方用 env，临时/单机用页面写文件。
 """
 import json
 import os
 import time
-import urllib.error
-import urllib.request
 
-#: 支持的密钥。env 为环境变量名（优先级高于文件），label 给人看。
-KEYS = {
-    "tushare_token": {
-        "label": "Tushare Pro Token",
-        "env": "TUSHARE_TOKEN",
-        "usage": "A 股财务/行情（/api/v3/tushare）",
-        "min_length": 16,
-    },
-}
+#: 支持的密钥注册表。env 为环境变量名（优先级高于文件），label 给人看。
+#: 当前为空（数据源政策：数据渠道一律免密钥；富途凭据不在本模块管理）。
+KEYS: dict = {}
 
-TUSHARE_ENDPOINT = "http://api.tushare.pro"
 CREDENTIALS_FILE = "v3-credentials.json"
 
 
@@ -91,13 +83,8 @@ def resolve(home, key, get_env=None):
     return None, None
 
 
-def resolve_tushare_token(home, get_env=None):
-    """Tushare 取数专用：返回 ``(token, source)``。"""
-    return resolve(home, "tushare_token", get_env)
-
-
 def status(home, get_env=None):
-    """密钥状态（**不含任何凭据值**）。"""
+    """密钥状态（**不含任何凭据值**）。注册表为空时 ``keys`` 就是空列表。"""
     stored = _read_file(home)
     keys = []
     for key, meta in KEYS.items():
@@ -114,14 +101,17 @@ def status(home, get_env=None):
             "hint": _hint(value) if value else None,
             "file": credential_path(home),
         })
-    return {"ok": True, "keys": keys}
+    return {"ok": True, "keys": keys,
+            "note": "数据源政策（2026-09-21）：数据渠道一律免密钥公开端点，当前无注册凭据；"
+                    "富途凭据走设置页 OAuth/AppKey 流程（不在本模块）"}
 
 
 def validate(key, value):
     """保存前校验：返回错误消息或 None。"""
     meta = KEYS.get(key)
     if meta is None:
-        return f"不支持的密钥 {key!r}（可选：{' / '.join(sorted(KEYS))}）"
+        return (f"不支持的密钥 {key!r}（可选：{' / '.join(sorted(KEYS))}；"
+                "数据源政策：数据渠道一律免密钥，不注册新的数据类凭据）")
     text = str(value or "").strip()
     if not text:
         return "密钥不能为空"
@@ -154,44 +144,6 @@ def clear(home, key):
     return status(home)
 
 
-def test_tushare(home, get_env=None, http=None, timeout=20):
-    """真实连通性测试：用当前生效的 token 调一次最小 Tushare 接口。
-
-    只回传 ok/延迟/上游消息，**不含 token**。未配置 → no-token（不发请求）。
-    """
-    token, source = resolve_tushare_token(home, get_env)
-    if not token:
-        return {"ok": False, "error": {"code": "tushare/no-token",
-                                       "message": "TUSHARE_TOKEN 未注入（环境变量或页面配置）"}}
-    body = json.dumps({
-        "api_name": "trade_cal",
-        "token": token,
-        "params": {"exchange": "SSE", "start_date": "20260101", "end_date": "20260110"},
-        "fields": "cal_date,is_open",
-    }).encode("utf-8")
-    started = time.time()
-    try:
-        if http is not None:  # 测试注入：签名 (body, timeout) -> dict
-            payload = http(body, timeout)
-        else:
-            payload = _post(TUSHARE_ENDPOINT, body, timeout)
-    except Exception as error:  # noqa: BLE001 —— 网络/超时/解析统一收敛
-        return {"ok": False, "source": source,
-                "error": {"code": "tushare/network", "message": str(error)[:200]}}
-    elapsed = int((time.time() - started) * 1000)
-    if payload.get("code") != 0:
-        return {"ok": False, "source": source, "latency_ms": elapsed,
-                "error": {"code": "tushare/api", "message": str(payload.get("msg"))[:200]}}
-    rows = (payload.get("data") or {}).get("items") or []
-    return {"ok": True, "source": source, "latency_ms": elapsed, "rows": len(rows)}
-
-
-def _post(url, body, timeout):
-    request = urllib.request.Request(url, data=body, headers={"content-type": "application/json"})
-    with urllib.request.urlopen(request, timeout=timeout) as response:  # noqa: S310 —— 固定 http 端点
-        return json.loads(response.read().decode("utf-8"))
-
-
 def register(app, v3_run, home):
     """注册 ``/api/v3/credentials``（GET 读状态；POST save/test/clear）。"""
     import asyncio
@@ -217,7 +169,7 @@ def register(app, v3_run, home):
             return respond({"ok": False, "error": {"code": "v3-credentials/bad-json",
                                                    "message": "请求体需为对象"}})
         action = str(payload.get("action") or "status")
-        key = str(payload.get("key") or "tushare_token")
+        key = str(payload.get("key") or "")
 
         def run():
             if action == "status":
@@ -227,10 +179,10 @@ def register(app, v3_run, home):
             if action == "clear":
                 return clear(home, key)
             if action == "test":
-                if key == "tushare_token":
-                    return test_tushare(home, os.environ.get)
+                # 当前注册表为空：test 动作如实说明（不再有 tushare 连通性测试）
                 return {"ok": False, "error": {"code": "v3-credentials/no-test",
-                                               "message": f"{key} 暂无连通性测试"}}
+                                               "message": f"{key or '(未指定)'} 无已注册的连通性测试"
+                                                          "（数据源政策：数据渠道一律免密钥）"}}
             return {"ok": False, "error": {"code": "v3-credentials/unknown-action",
                                            "message": f"action 需为 status / save / test / clear，收到 {action!r}"}}
 

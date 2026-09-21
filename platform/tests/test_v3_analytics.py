@@ -21,7 +21,9 @@ import copy
 import datetime as dt
 import json
 import math
+import sys
 import tempfile
+import types
 import unittest
 from pathlib import Path
 
@@ -93,10 +95,17 @@ class FakeRun:
 
 
 class FakeApp:
-    """记录路由的假 app（只需 ``.get``/``.post`` 装饰器协议）。"""
+    """记录路由的假 app（``.get``/``.post`` 装饰器协议 + ``state`` 注入接缝）。
 
-    def __init__(self):
+    ``state`` 对应真实 FastAPI 的 ``app.state``：``v3_analytics._route_sentiment_fetch``
+    从 ``state.v3_sentiment_live_fetch`` 取实时资讯取数。这里**缺省装离线替身**，因此
+    任何路由级用例都不会因为「情绪实时兜底」触网；要测实时行为的用例自己覆盖它。
+    """
+
+    def __init__(self, state=None):
         self.routes = {}
+        self.state = (state if state is not None
+                      else types.SimpleNamespace(v3_sentiment_live_fetch=offline_news_fetch))
 
     def _register(self, method, path):
         def decorator(function):
@@ -109,6 +118,32 @@ class FakeApp:
 
     def post(self, path):
         return self._register("POST", path)
+
+
+def news_envelope(rows=None, source="test/akshare-offline", ok=True, error=None):
+    """假资讯信封（``v3_sources.fetch_news`` 的形状）：**不联网**。"""
+    payload = {"ok": ok, "as_of": "2026-09-21T00:00:00Z", "source": source,
+               "rows": list(rows or []), "attempts": []}
+    if error is not None:
+        payload["error"] = error
+    return payload
+
+
+def offline_news_fetch(home, ticker, limit):
+    """路由级用例缺省注入的实时资讯取数：不联网、零文档（``(取数函数, note)``）。"""
+    return (lambda: news_envelope()), "test/offline（不联网）"
+
+
+def news_fetch_factory(by_ticker, calls=None):
+    """按标的返回假资讯的取数工厂（``(home, ticker, limit) -> (fetch, note)``）。"""
+    def factory(home, ticker, limit):
+        if calls is not None:
+            calls.append(ticker)
+        value = by_ticker.get(ticker, [])
+        if isinstance(value, dict):
+            return (lambda: value), f"test/{ticker}"
+        return (lambda: news_envelope(rows=value)), f"test/{ticker}"
+    return factory
 
 
 class FakeRequest:
@@ -622,6 +657,28 @@ class TestRiskAnalyticsRoute(RouteCase):
         self.assertEqual(set(first), {"t", "v"})
         self.assertEqual(result["analytics"]["window"]["from"], "2026-01-01")
 
+    def test_equity_curve_is_input_length_with_a_null_warmup_row(self):
+        """FR-TOOLS-002 等长 null 对齐：曲线长度 = 对齐交易日数（= observations + 1）。"""
+        run, _ = self._risk_run(ticker_count=2, days=60)
+        result = v3_analytics.risk_analytics(run, self.home, limit=250,
+                                             weights_raw='{"T0": 1, "T1": 1}')
+        self.assertTrue(result["ok"], result)
+        analytics = result["analytics"]
+        curve = analytics["equityCurve"]
+        self.assertEqual(len(curve), analytics["observations"] + 1)
+        self.assertEqual(len(curve), 60, "60 根日 K → 60 个对齐交易日 → 60 个点")
+        # 首行是预热位：时间戳 = 对齐区间起点，取值不可知 → null（不是 0）
+        self.assertEqual(curve[0], {"t": analytics["window"]["from"], "v": None})
+        self.assertTrue(all(point["v"] is not None for point in curve[1:]))
+        self.assertEqual(analytics["alignment"], "input-length-null-padded")
+        self.assertIn("等长对齐", analytics["alignmentNote"])
+        # 数值口径不变：去掉预热位后与 v3_math 的原序列逐位相同（只是整体后移一行）
+        bars = make_bars(closes_from([0.01 if index % 2 == 0 else -0.008
+                                      for index in range(59)]))
+        legacy = v3_math.portfolio_risk({"T0": bars, "T1": bars}, None,
+                                        {"T0": 0.5, "T1": 0.5}, 0.95, None)
+        self.assertEqual(curve[1:], legacy["equityCurve"])
+
     def test_frozen_plan_is_used_before_the_watchlist(self):
         plan = {"ok": True, "value": {"plans": [
             {"plan_id": "PLN-1", "status": "frozen", "target": {"T0": 1, "T1": 1}}]}}
@@ -746,6 +803,29 @@ class TestFactorsMatrixRoute(RouteCase):
         self.assertEqual(result["ic"]["factor"], "mom_20")
         self.assertEqual(result["ic"]["points"],
                          [{"t": "2026-09-01", "ic": 0.5}, {"t": "2026-09-08", "ic": -0.2}])
+        self.assertEqual(result["ic"]["alignment"], "input-length-null-padded")
+        self.assertEqual(matrix["alignment"], "input-length")
+        self.assertIn("等长对齐", matrix["alignmentNote"])
+
+    def test_ic_points_are_input_length_with_nulls_and_without_the_40_cap(self):
+        """FR-TOOLS-002：一行输入一行输出——不再截尾 40 期、不再丢弃非数值行。"""
+        points = [{"t": f"2026-{1 + index // 28:02d}-{1 + index % 28:02d}",
+                   "ic": (None if index == 3 else 0.01 * index)} for index in range(45)]
+        points.append({"t": "2026-12-31", "ic": "not-a-number"})
+        points.append("not-a-dict")
+        run = FakeRun({"factors": {"ok": True, "value": {"rows": self.ROWS}},
+                       "ic": {"ok": True, "value": {"factor": "mom_20", "points": points}}})
+        result = v3_analytics.factors_matrix_data(run, self.home, tickers_raw="A,B,C")
+        self.assertTrue(result["ok"], result)
+        ic = result["ic"]
+        self.assertEqual(len(ic["points"]), len(points), "长度 = 输入期数（45 + 2）")
+        self.assertIsNone(ic["points"][3]["ic"], "取不到的期是 null，不是 0")
+        self.assertIsNone(ic["points"][-2]["ic"])
+        self.assertEqual(ic["points"][-1], {"t": None, "ic": None}, "畸形元素照样占位")
+        self.assertEqual(ic["points"][0]["t"], points[0]["t"], "原序不动（按索引对齐）")
+        # 统计量仍只按**有值**的期数算（口径不变）
+        self.assertEqual(ic["observations"], 44)
+        self.assertEqual(ic["latestIc"], round(0.01 * 44, 4))
 
     def test_ic_tool_field_is_named_forward(self):
         run = FakeRun({"factors": {"ok": True, "value": {"rows": self.ROWS}},
@@ -1027,13 +1107,31 @@ class TestMlRoutes(RouteCase):
                          {"sharpe", "annReturnPct", "maxDrawdownPct", "signalFlips",
                           "heldDays", "flatDays", "days", "winRatePct"})
         self.assertEqual(result["metrics"]["days"], 119)
-        self.assertEqual(len(result["equity"]), 119)
+        # FR-TOOLS-002 等长 null 对齐：equity 一行 = 一根可用 K 线（120），首行是预热位
+        self.assertEqual(len(result["equity"]), 120)
+        self.assertEqual(len(result["equity"]), result["metrics"]["days"] + 1)
         self.assertEqual(set(result["equity"][0]), {"t", "value"})
+        self.assertIsNone(result["equity"][0]["value"], "预热位是 null，不是 0")
+        self.assertEqual(result["equity"][0]["t"], self._bars(120)[0]["t"])
+        self.assertTrue(all(point["value"] is not None for point in result["equity"][1:]),
+                        "只有预热位是 null，其余位都是真实净值（补位不吞行）")
+        self.assertEqual(result["alignment"], "input-length-null-padded")
+        self.assertIn("预热位", result["alignmentNote"])
         # market 回显（新增字段，不改既有字段）：标的带市场前缀 → 取前缀
         self.assertEqual(result["market"], "SH")
         self.assertIn("market=SH", result["marketNote"])
-        for key in ("ok", "ticker", "metrics", "equity"):
+        for key in ("ok", "ticker", "metrics", "equity", "alignment", "alignmentNote"):
             self.assertIn(key, result)
+
+    def test_backtest_equity_second_row_matches_the_first_return_day(self):
+        """等长对齐不改变数值：第 2 行起的 value 与原实现逐位相同（只是整体后移一行）。"""
+        bars = self._bars(120)
+        run = FakeRun({"series": series_envelope(bars)})
+        result = v3_analytics.ml_backtest(run, {"ticker": "SH.600519", "window": 20,
+                                               "rebalanceDays": 5})
+        legacy = v3_math.backtest_momentum(bars, 20, 5)
+        self.assertEqual(result["equity"][1:], legacy["equity"])
+        self.assertEqual(result["metrics"], legacy["metrics"])
 
     def test_backtest_defaults_and_insufficient(self):
         run = FakeRun({"series": series_envelope(self._bars(120))})
@@ -2031,6 +2129,190 @@ class NewFactorClassTests(RouteCase):
         self.assertIn("reason", factor_registry["coverage"])
 
 
+class SentimentLiveFallbackTests(RouteCase):
+    """情绪列「快照 ∨ 实时」：**假资讯源注入**，全程不触网（真机口径见路由级验证）。"""
+
+    BASE_ROWS = [
+        {"ticker": "SH.600519", "as_of": "2026-09-18", "factors": {"mom_20": 0.04},
+         "z": {"mom_20": 1.0}},
+        {"ticker": "SH.600000", "as_of": "2026-09-18", "factors": {"mom_20": -0.02},
+         "z": {"mom_20": -1.0}},
+        {"ticker": "SH.600028", "as_of": "2026-09-18", "factors": {"mom_20": 0.01},
+         "z": {"mom_20": 0.0}},
+    ]
+
+    def _run(self):
+        # 显式 as_of 时价量列改走 data.cache 的 PIT 复算（经 series 工具取数），所以这里
+        # 也要给 series 替身，否则矩阵行会空——实时情绪用例考的是情绪列，价量列照常即可。
+        base = dt.date.fromisoformat("2026-09-18")
+        bars = [{"t": (base - dt.timedelta(days=139 - index)).isoformat(),
+                 "c": 10.0 * (1 + 0.01 * math.sin(index / 3.0)), "v": 1e6 + index}
+                for index in range(140)]
+        return FakeRun({"factors": {"ok": True, "value": {"rows": self.BASE_ROWS}},
+                        "ic": {"ok": True, "value": {"points": []}},
+                        "series": lambda payload: series_envelope(bars, ticker=payload["ticker"])})
+
+    @staticmethod
+    def _news(rows):
+        return news_envelope(rows=rows)
+
+    def test_snapshot_wins_and_the_live_fetch_is_not_even_called(self):
+        """快照有分就用快照——实时候选不取（省一次 akshare 往返，来源也不混）。"""
+        _make_trading_store(self.home, sentiments=[
+            {"date": "2026-09-18", "symbol": "SH.600519", "source": "fin_news",
+             "payload": {"items": [{"title": "公司业绩大幅增长，利好", "time": "2026-09-18"}]}}])
+        calls = []
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600519,SH.600000", classes="sentiment",
+            as_of="2026-09-20", live_sentiment=True, sentiment_fetch=news_fetch_factory({}, calls))
+        self.assertTrue(result["ok"], result)
+        sources = result["sentimentSources"]
+        self.assertEqual(sources["SH.600519"]["origin"], "snapshot")
+        self.assertGreater(sources["SH.600519"]["score"], 0)
+        self.assertEqual(sources["SH.600000"]["origin"], None)
+        self.assertIn("store.sentiment_snapshots", sources["SH.600000"]["source"])
+        self.assertIn("test/", sources["SH.600000"]["source"], "两条通道都失败时来源并列")
+        self.assertTrue(calls, "快照缺失的标的仍应尝试实时兜底")
+        self.assertNotIn("SH.600519", calls, "快照已覆盖的标的不再实时取数")
+
+    def test_live_nlp_fills_the_gap_and_labels_its_origin(self):
+        """快照 0 覆盖 → 实时打分补上，并逐标的标注 ``live:nlp-v1``。"""
+        _make_trading_store(self.home, sentiments=[])
+        news = {
+            "SH.600519": [{"title": "公司业绩大幅增长，超预期，利好", "published_at": "2026-09-19 10:00:00"}],
+            "SH.600000": [{"title": "净利润大幅下滑，业绩暴雷，利空", "published_at": "2026-09-19 11:00:00"}],
+            "SH.600028": [{"title": "股东大会决议公告", "published_at": "2026-09-19 12:00:00"}],
+        }
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home,
+            tickers_raw="SH.600519,SH.600000,SH.600028", classes="sentiment",
+            as_of="2026-09-20", live_sentiment=True,
+            sentiment_fetch=news_fetch_factory(news))
+        self.assertTrue(result["ok"], result)
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertGreater(raw["SH.600519"]["sentiment"], 0)
+        self.assertLess(raw["SH.600000"]["sentiment"], 0)
+        # 300 条词典里没有命中词的文档 → score=null + 原因（不是 0 分、也不并入矩阵）
+        self.assertNotIn("sentiment", raw["SH.600028"])
+        sources = result["sentimentSources"]
+        self.assertEqual(sources["SH.600519"]["origin"], "live:nlp-v1")
+        self.assertEqual(sources["SH.600000"]["origin"], "live:nlp-v1")
+        self.assertIsNone(sources["SH.600028"]["origin"])
+        self.assertIn("命中", sources["SH.600028"]["reason"])
+        coverage = {row["key"]: row for row in result["factors"]}
+        self.assertEqual(coverage["sentiment"]["covered"], 2)
+        self.assertIn("实时", result["sources"]["sentiment"])
+        self.assertIn("live:nlp-v1", str(result["sentimentSources"]))
+
+    def test_live_documents_are_pit_gated_by_explicit_as_of(self):
+        """晚于 as_of 的资讯被 ``data.cache`` 闸门挡掉并计数——不构成前视。"""
+        _make_trading_store(self.home, sentiments=[])
+        news = {"SH.600519": [
+            {"title": "业绩大幅增长，利好", "published_at": "2026-09-25 10:00:00"},   # 未来
+            {"title": "净利润增长，超预期", "published_at": "2026-09-19 10:00:00"},   # 窗口内
+            {"title": "无时间戳的利好消息"},                                          # 无法证明当时已知
+        ]}
+        calls = []
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600519,SH.600000", classes="sentiment",
+            as_of="2026-09-20", live_sentiment=True,
+            sentiment_fetch=news_fetch_factory(news, calls))
+        self.assertTrue(result["ok"], result)
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertGreater(raw["SH.600519"]["sentiment"], 0)
+        score, meta = v3_analytics.live_sentiment_factor_value(
+            self.home, "SH.600519", "2026-09-20",
+            fetch=(lambda: self._news(news["SH.600519"])))
+        self.assertGreater(score, 0)
+        self.assertEqual(meta["rejected"]["future"], 1, "as_of 之后的资讯必须被挡掉并计数")
+        self.assertEqual(meta["rejected"]["undated"], 1, "无时间戳的实时资讯不能进读数")
+        self.assertEqual(meta["origin"], "live:nlp-v1")
+        self.assertEqual(meta["as_of"], "2026-09-20")
+        self.assertEqual(meta["mode"], "inclusive")
+        self.assertIn("含 as_of 当日", meta["semantics"])
+
+    def test_live_failure_is_null_with_the_upstream_reason(self):
+        """取数失败 = ``null`` + 真实错误原文（绝不填 0，也不把矩阵打成错误）。"""
+        _make_trading_store(self.home, sentiments=[])
+        failure = {"ok": False, "source": "akshare/stock_news_em",
+                   "error": {"code": "akshare/stock_news_em", "message": "连接超时（3 次重试后）"}}
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600519,SH.600000", classes="sentiment",
+            as_of="2026-09-20", live_sentiment=True,
+            sentiment_fetch=news_fetch_factory({"SH.600519": failure, "SH.600000": failure}))
+        self.assertTrue(result["ok"], result)
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertNotIn("sentiment", raw["SH.600519"])
+        self.assertNotIn("sentiment", raw["SH.600000"])
+        report = result["sentimentSources"]["SH.600519"]
+        self.assertIsNone(report["origin"])
+        self.assertIn("连接超时", report["reason"])
+        missing = {row["key"]: row["reason"] for row in result["factorsMissing"]}
+        self.assertIn("sentiment", missing)
+        self.assertIn("快照", missing["sentiment"])
+
+    def test_live_path_is_off_by_default_so_internal_callers_stay_offline(self):
+        """``live_sentiment`` 缺省关：内部流水线/单测不会因为情绪兜底而触网。"""
+        _make_trading_store(self.home, sentiments=[])
+        calls = []
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600519,SH.600000", classes="sentiment",
+            as_of="2026-09-20", sentiment_fetch=news_fetch_factory({"SH.600519": []}, calls))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(calls, [], "缺省不取实时资讯")
+        self.assertIsNone(result["sentimentSources"]["SH.600519"]["origin"])
+        self.assertNotIn("实时", result["sources"]["sentiment"])
+
+    def test_missing_v3_nlp_degrades_to_null_without_breaking_the_matrix(self):
+        """``v3_nlp`` 拿不到（ImportError 守卫）→ 情绪格 null + 原因，其余列照常。"""
+        import server as server_package
+
+        _make_trading_store(self.home, sentiments=[])
+        real_module = sys.modules.get("server.v3_nlp")
+        had_attr = hasattr(server_package, "v3_nlp")
+        real_attr = getattr(server_package, "v3_nlp", None)
+        # 模拟「v3_nlp 不可导入」：sys.modules 里置 None + 摘掉包属性（`from server import
+        # v3_nlp` 在这两种情况下都会走 ImportError 分支）。
+        sys.modules["server.v3_nlp"] = None
+        if had_attr:
+            delattr(server_package, "v3_nlp")
+        try:
+            score, meta = v3_analytics.live_sentiment_factor_value(
+                self.home, "SH.600519", "2026-09-20", fetch=(lambda: self._news([])))
+            self.assertIsNone(score)
+            self.assertIn("ImportError", meta["reason"])
+            result = v3_analytics.factors_matrix_data(
+                self._run(), self.home, tickers_raw="SH.600519,SH.600000", classes="sentiment",
+                as_of="2026-09-20", live_sentiment=True,
+                sentiment_fetch=news_fetch_factory({}))
+            self.assertTrue(result["ok"], result)
+            self.assertIsNone(result["sentimentSources"]["SH.600519"]["origin"])
+            self.assertIn("v3_nlp", result["sentimentSources"]["SH.600519"]["reason"])
+        finally:
+            if real_module is not None:
+                sys.modules["server.v3_nlp"] = real_module
+            else:
+                sys.modules.pop("server.v3_nlp", None)
+            if had_attr:
+                server_package.v3_nlp = real_attr
+
+    def test_route_wires_the_live_fallback_through_the_injected_fetch(self):
+        """路由级：``/api/v3/factors/matrix`` 打开实时兜底，取数走 ``app.state`` 的注入物。"""
+        _make_trading_store(self.home, sentiments=[])
+        news = {"SH.600519": [{"title": "业绩大幅增长，超预期，利好",
+                              "published_at": "2026-09-19 10:00:00"}]}
+        calls = []
+        app = FakeApp(state=types.SimpleNamespace(
+            v3_sentiment_live_fetch=news_fetch_factory(news, calls)))
+        v3_analytics.register(app, self._run(), self.home)
+        result = envelope_of(asyncio.run(app.routes[("GET", "/api/v3/factors/matrix")](
+            tickers="SH.600519,SH.600000", factor="mom_20", forward_days=None, forward=5,
+            market="SH", classes="sentiment", as_of="2026-09-20")))
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(result["sentimentSources"]["SH.600519"]["origin"], "live:nlp-v1")
+        self.assertIn("SH.600519", calls)
+
+
 class HistoricalFactorCorrectnessTests(RouteCase):
     def _run(self):
         def series(payload):
@@ -2077,7 +2359,7 @@ class HistoricalFactorCorrectnessTests(RouteCase):
         rows = [self._row("SH.600000", "roe", 12, announced=None),
                 self._row("SH.600000", "roa", 3, announced="2026-10-01")]
         _make_trading_store(self.home, fundamentals=rows)
-        extras, missing, _ = v3_analytics.local_factor_extras(
+        extras, missing, _, _sentiment_report = v3_analytics.local_factor_extras(
             self.home, ["SH.600000"], "2026-09-20", want_sentiment=False)
         for key in ("roe", "roa"):
             self.assertEqual(extras.get(key), {})

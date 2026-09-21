@@ -5,7 +5,7 @@
   * spot：上游常见的 ``RemoteDisconnected`` 必须原样进 error 信封，不返回空成功；
   * financials：form 过滤、按期末去重取最近 N 期、``stale`` 阈值、未申报标签进 missing、
     ticker→CIK 索引缓存落盘、statement 白名单；
-  * tushare：**无 token 时一次网络调用都不发**、``code!=0`` 透传 ``msg``、字段展开成对象；
+  * （tushare 小节已随 Tushare Pro 移除删除，2026-09-21 数据源政策：需要 token 的渠道一律不再引用）
   * openbb：未安装 → ``openbb/unavailable`` 且不发请求、结果对象只留叶子字段（不序列化活对象）；
   * ``register(app, v3_run, home)`` 的三个位置参数形态与路由注册。
 
@@ -51,25 +51,6 @@ class FakeFetch:
     @property
     def urls(self):
         return [call["url"] for call in self.calls]
-
-
-class FakePostFetch:
-    """假 POST 取数器：签名与 ``Deps.json_post`` 的注入契约一致（body 是命名参数）。"""
-
-    def __init__(self, response=None, error=None):
-        self.response = response
-        self.error = error
-        self.calls = []
-
-    def __call__(self, url, body=None, headers=None, timeout=None):
-        self.calls.append({"url": url, "body": body, "headers": dict(headers or {}), "timeout": timeout})
-        if self.error is not None:
-            raise self.error
-        return self.response if self.response is not None else {"ok": False, "error": {"code": "test/unrouted", "message": url}}
-
-    @property
-    def bodies(self):
-        return [call["body"] for call in self.calls]
 
 
 class FakeAkshare:
@@ -584,95 +565,6 @@ class FinancialsRouteTests(BlockRealNetwork):
         self.assertEqual(payload["lines"][0]["points"][0]["val"], 7)
 
 
-# ── /api/v3/tushare ────────────────────────────────────────────────────────────
-
-
-class TushareRouteTests(BlockRealNetwork):
-    def test_no_token_sends_no_request(self):
-        fetch = FakePostFetch()
-        self.build(v3_sources.Deps(fetch_post=fetch, env={}, home=self.tmp))
-        payload = self.call("/api/v3/tushare", api="daily", ts_code="600519.SH", period="", limit=60)
-        detail = self.assert_error(payload, "tushare/")
-        self.assertEqual(detail["code"], "tushare/no-token")
-        # 文案有意指向「页面可配置」（/api/v3/credentials），与 server/v3_sources.py 同步
-        self.assertEqual(detail["message"],
-                         "TUSHARE_TOKEN 未注入（可在「接入与授权」页配置，或用环境变量）")
-        self.assertEqual(fetch.calls, [], "无 token 时绝不能发请求")
-
-    def test_empty_token_string_also_counts_as_missing(self):
-        fetch = FakePostFetch()
-        self.build(v3_sources.Deps(fetch_post=fetch, env={"TUSHARE_TOKEN": ""}, home=self.tmp))
-        detail = self.assert_error(self.call("/api/v3/tushare", api="daily", ts_code="600519.SH"), "tushare/")
-        self.assertEqual(detail["code"], "tushare/no-token")
-        self.assertEqual(fetch.calls, [])
-
-    def test_success_expands_fields_into_objects(self):
-        body = {
-            "code": 0,
-            "msg": None,
-            "data": {
-                "fields": ["ts_code", "end_date", "revenue", "n_income"],
-                "items": [["600519.SH", "20241231", 174144000000.0, 86228000000.0]],
-            },
-        }
-        fetch = FakePostFetch(response={"ok": True, "value": body})
-        self.build(v3_sources.Deps(fetch_post=fetch, env={"TUSHARE_TOKEN": "tok"}, home=self.tmp))
-        payload = self.call("/api/v3/tushare", api="income", ts_code="600519.SH", period="20241231", limit=8)
-        self.assertTrue(payload["ok"], payload)
-        self.assertEqual(payload["api"], "income")
-        self.assertEqual(payload["source"], "tushare/income")
-        self.assertEqual(
-            payload["rows"],
-            [{"ts_code": "600519.SH", "end_date": "20241231", "revenue": 174144000000.0, "n_income": 86228000000.0}],
-        )
-        call = fetch.calls[0]
-        self.assertEqual(call["url"], v3_sources.TUSHARE_ENDPOINT)
-        self.assertIsNotNone(call["timeout"], "外部调用必须带超时")
-        sent = call["body"]
-        self.assertEqual(sent["api_name"], "income")
-        self.assertEqual(sent["token"], "tok")
-        self.assertEqual(sent["params"]["ts_code"], "600519.SH")
-        self.assertEqual(sent["params"]["period"], "20241231")
-        self.assertIn("n_income", sent["fields"])
-
-    def test_upstream_error_code_passes_msg_through(self):
-        body = {"code": 2002, "msg": "抱歉，您没有接口访问权限", "data": None}
-        fetch = FakePostFetch(response={"ok": True, "value": body})
-        self.build(v3_sources.Deps(fetch_post=fetch, env={"TUSHARE_TOKEN": "tok"}, home=self.tmp))
-        detail = self.assert_error(self.call("/api/v3/tushare", api="income", ts_code="600519.SH"), "tushare/")
-        self.assertEqual(detail["code"], "tushare/api")
-        self.assertEqual(detail["message"], "抱歉，您没有接口访问权限")
-
-    def test_http_failure_and_timeout_are_reported(self):
-        fetch = FakePostFetch(response={"ok": False, "error": {"code": "tushare/http-500", "message": "HTTP 500"}})
-        self.build(v3_sources.Deps(fetch_post=fetch, env={"TUSHARE_TOKEN": "tok"}, home=self.tmp))
-        detail = self.assert_error(self.call("/api/v3/tushare", api="daily", ts_code="600519.SH"), "tushare/")
-        self.assertEqual(detail["code"], "tushare/http-500")
-
-        raiser = FakePostFetch(error=TimeoutError("read timeout"))
-        self.build(v3_sources.Deps(fetch_post=raiser, env={"TUSHARE_TOKEN": "tok"}, home=self.tmp))
-        detail = self.assert_error(self.call("/api/v3/tushare", api="daily", ts_code="600519.SH"), "tushare/")
-        self.assertEqual(detail["code"], "tushare/network")
-        self.assertIn("read timeout", detail["message"])
-
-    def test_unknown_api_and_missing_ts_code(self):
-        fetch = FakePostFetch(response={"ok": True, "value": {"code": 0, "data": {"fields": [], "items": []}}})
-        self.build(v3_sources.Deps(fetch_post=fetch, env={"TUSHARE_TOKEN": "tok"}, home=self.tmp))
-        detail = self.assert_error(self.call("/api/v3/tushare", api="nope", ts_code="600519.SH"), "tushare/")
-        self.assertEqual(detail["code"], "tushare/unknown-api")
-        detail = self.assert_error(self.call("/api/v3/tushare", api="income", ts_code=""), "tushare/")
-        self.assertEqual(detail["code"], "tushare/bad-args")
-        self.assertEqual(fetch.calls, [])
-
-    def test_stock_basic_has_no_ts_code_requirement(self):
-        body = {"code": 0, "data": {"fields": ["ts_code", "name"], "items": [["600519.SH", "贵州茅台"]]}}
-        fetch = FakePostFetch(response={"ok": True, "value": body})
-        self.build(v3_sources.Deps(fetch_post=fetch, env={"TUSHARE_TOKEN": "tok"}, home=self.tmp))
-        payload = self.call("/api/v3/tushare", api="stock_basic", ts_code="", period="", limit=20)
-        self.assertTrue(payload["ok"], payload)
-        self.assertEqual(payload["rows"], [{"ts_code": "600519.SH", "name": "贵州茅台"}])
-
-
 # ── /api/v3/openbb ─────────────────────────────────────────────────────────────
 
 
@@ -737,21 +629,25 @@ class OpenbbRouteTests(BlockRealNetwork):
 
 
 class RegisterContractTests(BlockRealNetwork):
-    def test_registers_all_five_routes_and_exposes_state(self):
+    def test_registers_all_routes_and_exposes_state(self):
         app = FakeApp()
         deps = v3_sources.Deps(home=self.tmp)
         returned = v3_sources.register(app, FakeV3Run(), self.tmp, deps)
         self.assertIs(returned, deps)
+        # 2026-09-21：/api/v3/tushare 随 Tushare Pro 移除（数据源政策：需要 token 的渠道
+        # 一律删除）；v3_sources_ext（北向/宏观）经同一 register 追加装配。
         self.assertEqual(
             sorted(app.routes),
             [
                 "/api/v3/financials",
+                "/api/v3/macro",
                 "/api/v3/news",
+                "/api/v3/northbound",
                 "/api/v3/openbb",
                 "/api/v3/spot",
-                "/api/v3/tushare",
             ],
         )
+        self.assertNotIn("/api/v3/tushare", app.routes, "tushare 路由必须已移除")
         self.assertEqual(app.state.v3_sources["deps"], deps)
         self.assertIsInstance(app.state.v3_sources["sec"], v3_sources.SecSource)
 

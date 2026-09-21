@@ -21,6 +21,7 @@ import { ProCard } from "@ant-design/pro-components";
 import { useV3, fmt, noSourceText } from "../services/api.js";
 import { MarketNote, envelopeError, marketLabel, marketTicker, tickerMarket, useMarket } from "../services/marketContext.jsx";
 import { LineChart, Heatmap } from "../components/charts.jsx";
+import { isMissingValue } from "../lib/stat-core.js";
 
 const { Text, Paragraph, Link } = Typography;
 
@@ -504,7 +505,9 @@ function BacktestCard({ result, busy, onRun, candidate, ticker }) {
   const env = result && result.env ? result.env : null;
   const metrics = OK(env) ? env.metrics : null;
   const equity = asArray(OK(env) && env.equity);
-  const points = equity.map((point) => ({ t: String(point.t || ""), v: Number(point.value) })).filter((point) => fin(point.v));
+  // 2026-09-21 修：预热位是**字面 null**（等长对齐），`Number(null) === 0` 会造出假的 0 起点
+  // → 缺失值一律 NaN，由 `fin()`（有限性）过滤；响应里位置仍保留，模型按索引对齐。
+  const points = equity.map((point) => ({ t: String(point.t || ""), v: isMissingValue(point.value) ? Number.NaN : Number(point.value) })).filter((point) => fin(point.v));
   const values = points.map((point) => point.v);
   const startEquity = values.length ? values[0] : null;
   const rebased = startEquity && startEquity !== 0 ? values.map((value) => (value / startEquity) * 100) : values;

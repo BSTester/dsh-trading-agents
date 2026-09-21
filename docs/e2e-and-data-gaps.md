@@ -3015,3 +3015,252 @@ Ran 80 tests in 8.9s   OK          # 既有 56 例 + 新增 24 例（目录契�
    供其自行取舍）。教训：共享工作树上不再用 stash 做基线。
 3. **误判/漏报样例**（25.5 的 1、2）未修：修法要么扩词条（出售→减持类）要么上模型，
    属后续迭代。
+
+---
+
+# 二十六、数据源政策收尾：缺口补齐前后对照 + 真机证据（2026-09-21）
+
+本轮是**窄范围收尾**：只做「读代码核对 + 只读真机验证 + 写文档」，**未改任何代码、未重启服务**。
+数据源政策文本见 `docs/v3-source-policy.md`（逐源清单 / Tushare 移除记录 / OpenBB 处置 /
+新增免密源步骤）。
+
+## 26.1 部署状态先说清楚：线上 8397 是**改动前**进程
+
+| 事实 | 证据 |
+|---|---|
+| 线上进程启动于 **17:20:44** | `ps -o lstart -p 40654` → `Mon Sep 21 17:20:44 2026`（`python -m server.run`，LISTEN 127.0.0.1:8397） |
+| 本轮代码文件 mtime **18:20–18:26** | `platform/server/v3_sources_ext.py` 18:20:15、`v3_fallback.py` 18:20:48、`futu_data.py` 18:21:00、`v3_sources.py` 18:26:41 |
+| ∴ 线上**不可能**有本轮改动 | `curl -D - "http://127.0.0.1:8397/api/v3/northbound?limit=2"` → `HTTP/1.1 200 OK` + `content-type: text/html; charset=utf-8`，body 是 SPA `index.html`（路由不存在 → 静态兜底）；`/api/v3/macro` 同 |
+
+**∴ 新端点的真机验证改用「进程内 `create_app` + `TestClient`（临时 home）」**；
+`roe/roa` 与另类因子覆盖率**用线上 8397 只读 GET**（这部分的代码路径不在本轮 diff 里，
+且数据在真实 home 的 `trading-data/trading.sqlite` 里，临时 home 会得出假的 0 覆盖）。
+两处口径差异在下面每段证据里逐条标注。
+
+> 行号说明：本节的 `platform/server/*.py` 行号取自 2026-09-21 19:20 的工作树。
+> 会话期间 `platform/server/v3_analytics.py` **正被并发改动**（19:16 仍在写，157KB → 184KB），
+> 因此该文件的引用一律**以符号名为准**；其余文件（`v3_sources_ext.py` 18:20、
+> `v3_sources.py` 18:26、`v3_fallback.py` 18:20、`futu_data.py` 18:21）本轮未再变动。
+> 另：线上 8397 加载的是 **16:13 版** `v3_analytics.py`（进程启动于 17:20），
+> 所以 26.3-4 的覆盖率读数来自该版本 + 真实 store 数据。
+
+## 26.2 缺口补齐前后对照表
+
+| # | 缺口（改前） | 改后能力 | 实现位置 | 真机状态（本轮实测） |
+|---|---|---|---|---|
+| 1 | **A 股实时行情/盘口**：富途 `-9`（无实时权限），A 股看不到实时价与盘口 | 免密公开三源降级链 东财 `push2` → 腾讯 `qt.gtimg.cn` → 新浪 `hq.sinajs.cn`；**只在 -9 且全是沪/深时**启用，HK/US 一字不变 | `v3_sources_ext.py:242/281/326/402/438`；钩子 `:458-511` + `futu_data.py:87-108/948-969` | ✅ **可用**（见 26.3-1） |
+| 2 | **TUSHARE_TOKEN 未注入**（A 股财务/行情走不通） | Tushare Pro **整体移除**；能力由富途 `f10_detail/statements` → AKShare，roe/roa 走 Yahoo 离线落库，宏观/北向走 AKShare | `v3_sources.py:98`、`v3_credentials.py:23`、能力映射表见 `v3-source-policy.md` §3.3 | ✅ 政策落地（路由/凭据/设置行/工具文档全删） |
+| 3 | **北向资金无通道** | AKShare `stock_hsgt_fund_flow_summary_em`（当日四方板块）+ `stock_hsgt_hist_em`（沪深股通历史）；北向当日净买自 2024-08-19 起不披露 → `net_buy_disclosed:false` 标注 | `v3_sources_ext.py:527/567/601`，路由 `:995` | ⛔ **不可用**：`_head` 未导入（见 26.3-2 / 26.5-1） |
+| 4 | **宏观无通道**（CPI/PPI/PMI/社融/M2） | 主源 AKShare 五函数（NBS/央行口径）+ OpenBB OECD 第二源（仅 CPI 有中国同口径序列） | `v3_sources_ext.py:660/721/765/821`，路由 `:1007` | 🟡 主源 ✅ 5/5；**第二源 ⛔ `openbb/no-rows`**（见 26.3-3 / 26.5-4） |
+| 5 | **roe/roa 矩阵 0 覆盖** | 离线落库通道：Yahoo（yfinance）季度净利/权益 + 东财 `RPT_LICO_FN_CPD` 的 `NOTICE_DATE` 作披露日（含法定披露窗口闸门） | `v3_fundamentals_sync.py:65-67/155-245`；矩阵只读 PIT（`v3_analytics.py` 的 `quality_growth_factors` / `_read_pit_fundamentals`） | 🟡 **3/5**（目标 ≥4/5 未达，卡点见 26.3-4） |
+| 6 | **另类因子覆盖不明**（capital_flow / short_interest） | `classes=all` 时实时取富途：`capital_flow_history`（近 20 交易日主力净流入占比）、`short_interest`（空头占比，仅 HK/US） | `v3_analytics.py` 的 `FACTOR_REGISTRY`（capital_flow / short_interest 两条）+ 取数实现（`call capital_flow_history`） | 🟡 `capital_flow` **5/5**；`short_interest` **0/5**（上游官方 `-8`：A 股无卖空数据，如实报原因） |
+
+## 26.3 真机输出（四组证据）
+
+### 26.3-1 A 股实时行情 / 盘口降级链（本机实网只读；腾讯命中）
+
+```
+$ python -B（进程内）  fetch_a_share_quote(deps, "SH.600519")
+{"ok": true,
+ "source": "tencent/qt.gtimg.cn",
+ "delay": "实时（免费 L1 快照；腾讯 qt.gtimg.cn，字段内含行情时间）",
+ "as_of": "2026-09-21T11:09:25.935081+00:00",
+ "quote_time": "2026-09-21T16:14:37+08:00",
+ "name": "贵州茅台",
+ "quote": {"price": 1252.57, "prev_close": 1257.12, "open": 1259.0, "high": 1259.95, "low": 1250.8,
+           "volume": 25017.0, "turnover": 3135910000.0, "change": -4.55, "change_pct": -0.36,
+           "pe_ttm": 19.23, "pb": 6.23, "volume_ratio": 1.26, "market_cap": 15658.15},
+ "book": {"bid": [[1252.57,1.0],[1252.56,15.0],[1252.55,110.0],[1252.5,24.0],[1252.45,1.0]],
+          "ask": [[1252.86,57.0],[1252.97,1.0],[1253.0,3.0],[1253.12,1.0],[1253.13,5.0]],
+          "depth": 5, "volume_unit": "手"},
+ "chain": [{"source": "eastmoney/push2", "ok": false, "ms": 794,
+            "error": {"code": "sec/network",
+                      "message": "...push2.eastmoney.com/api/qt/stock/get?secid=1.600519... → RemoteProtocolError: Server disconnected without sending a response."}},
+           {"source": "tencent/qt.gtimg.cn", "ok": true, "ms": 228}],
+ "used_source": "tencent/qt.gtimg.cn"}
+```
+
+* **降级链真的在工作**：东财 push2 本次被上游断连（`RemoteProtocolError`，与模块 docstring
+  记的「突发即断连」一致），链**自动**降到腾讯并命中（228ms）；整条 `chain` 逐级留痕。
+* 三只标的都通过：`SH.600519` 1026ms、`SH.600000` 214ms、`SZ.000001` 227ms（均 `source=tencent`）。
+* 盘口：`depth=5`，`depth_note` 写明「公开源仅五档（档量单位：手）；富途 HK 10 档 / US 60 档
+  与逐笔本源无此能力，不伪造档位」。
+* 覆盖边界如实拒绝：`HK.00700` / `US.AAPL` / `BJ.430047` → `quote/unsupported-market`（不猜前缀映射）。
+* 冷却生效证据：同一进程内第二次请求东财那一级 `ms=0` + `quote/cooldown`（`skipped`，不假装试过）。
+
+### 26.3-2 北向资金（⛔ 路由级失败；部件本身可用）
+
+```
+$ GET /api/v3/northbound?limit=3     （进程内 TestClient，临时 home）
+{"ok": false, "error": {"code": "northbound/internal",
+                        "message": "NameError: name '_head' is not defined"}}
+```
+
+部件**单独**调用是好的（同一份 deps，实拉 AKShare）：
+
+```
+_northbound_summary(deps) → ok=True  source=akshare/stock_hsgt_fund_flow_summary_em
+  {trade_date:2026-09-21, board:沪股通,     direction:北向, net_buy:0.0,       net_buy_disclosed:false, up_count:1235, down_count:374, index:上证指数, index_change_pct:0.97}
+  {trade_date:2026-09-21, board:港股通(沪), direction:南向, net_buy:31.176925, net_buy_disclosed:true,  index:恒生指数, index_change_pct:1.18}
+  {trade_date:2026-09-21, board:深股通,     direction:北向, net_buy:0.0,       net_buy_disclosed:false, up_count:1494, down_count:361, index:深证成指, index_change_pct:0.65}
+  {trade_date:2026-09-21, board:港股通(深), direction:南向, net_buy:9.561412,  net_buy_disclosed:true,  index:恒生指数, index_change_pct:1.18}
+
+_northbound_hist(deps, "沪股通", 2) → RAISED NameError: name '_head' is not defined
+```
+
+披露事实独立复核（绕开本模块，直接调 akshare 1.18.96）：
+
+```
+沪股通 rows: 2757，tail: 2026-09-17 NaN / 2026-09-18 NaN / 2026-09-21 NaN
+深股通 rows: 2281，tail 同上；last non-null net_buy date: 2024-08-16（沪深一致）
+```
+
+→ 北向板块的 `net_buy: 0.0` 确认是**上游占位值**，代码用 `net_buy_disclosed:false` 标注，
+**没有**把 0 当真实净买额（政策 §一.3 的正面样例）；但整条路由因 `_head` 取不到数。
+
+### 26.3-3 宏观（主源 5/5 可用；第二源口径**未**并列成功）
+
+```
+$ GET /api/v3/macro?indicator=<X>&limit=2        （进程内 TestClient）
+cpi    → ok  source=akshare/macro_china_cpi            latest={period:2026-08, value:0.8,  index:100.8}           total_periods=224
+ppi    → ok  source=akshare/macro_china_ppi            latest={period:2026-08, value:3.8,  index:103.8}           total_periods=248
+pmi    → ok  source=akshare/macro_china_pmi            latest={period:2026-08, value:49.8, non_manufacturing:49.0} total_periods=224
+shrzgm → ok  source=akshare/macro_china_shrzgm         latest={period:2026-04, value:6245.0, rmb_loans:-4006.0}   total_periods=136
+m2     → ok  source=akshare/macro_china_money_supply   latest={period:2026-08, value:7.5, m2:3568083.6, m1:1157741.43,
+                                                              m1_yoy:4.1, m0:148311.98, m0_yoy:11.2}            total_periods=224
+   caliber 一律标注「国家统计局/央行口径（经金十数据，AKShare 免密钥公开端点）」，数值原样透传
+```
+
+`compare=oecd`（**双口径并列的证据 —— 本轮没拿到**）：
+
+```
+$ GET /api/v3/macro?indicator=cpi&limit=3&compare=oecd
+nbs : ok=True source=akshare/macro_china_cpi latest={period:2026-08, value:0.8, index:100.8}
+calibers = {"nbs": "国家统计局/央行口径（…AKShare 免密钥公开端点）", "oecd": null}
+oecd: ok=False error={"code":"openbb/no-rows",
+                      "message":"economy.cpi(oecd, china) 未返回可解析的月度序列"}
+
+$ GET /api/v3/macro?indicator=pmi&limit=2&compare=oecd
+oecd: error={"code":"oecd/no-series","message":"免密 OECD/IMF 面（OpenBB 4.7.2 实测）没有该指标的中国同口径序列：
+              money_measures 仅支持 federal_reserve（美国）、composite_leading_indicator 是 OECD CLI（非 PMI 口径，不冒充）——该指标无第二源"}
+```
+
+→ **非 CPI 指标的 `oecd/no-series` 是预期行为**（如实说没有，不冒充）；但 **CPI 的 OECD 腿本该有
+数据却报 `no-rows`**，根因见 26.5-4。**所以「两口径并列」这句目前不能对外宣称。**
+
+### 26.3-4 roe/roa 与另类因子覆盖率（线上 8397 只读 GET，真实 home/store）
+
+标的：`SH.600519,SH.600000,SH.600009,SH.600010,SH.600028`
+
+```
+$ GET /api/v3/factors/matrix?tickers=…              （缺省 classes=quality,growth,sentiment）
+key            covered/total   missingTickers
+roe            3/5 (60.0%)     ["SH.600028","SH.600519"]        ← 目标 ≥4/5 **未达**
+roa            3/5 (60.0%)     ["SH.600028","SH.600519"]
+gross_margin   4/5 (80.0%)     ["SH.600519"]
+net_margin     4/5 (80.0%)     ["SH.600519"]
+revenue_yoy    4/5 (80.0%)     ["SH.600519"]
+net_profit_yoy 4/5 (80.0%)     ["SH.600519"]
+capital_flow   0/5             （缺省类别不含 alternative 实时取数，故未取）
+short_interest 0/5             （同上）
+sources.quality = "trading-data/fundamentals（PIT announced_at ≤ 2026-09-21；4/5 只有可用财报；…）"
+
+$ GET /api/v3/factors/matrix?tickers=…&classes=all  （实时另类）
+capital_flow   5/5             []                                ← 富途 capital_flow_history 实拉成功
+short_interest 0/5             [全部 5 只]  reason: "short_interest 未给出空头占比：
+                                            卖空数据仅支持 HK/US 可卖空证券（官方 -8）"
+sources.alternative = "futu/capital_flow_history + futu/short_interest（实时，受全局限流器约束）"
+```
+
+**roe/roa 卡在哪（store 层逐票核对，`trading-data/trading.sqlite` 只读查询）**：
+
+| 标的 | `fundamentals` 里有什么 | 为什么缺 roe/roa |
+|---|---|---|
+| SH.600000 | roe/roa×5 期、equity、total_assets、net_income（`yahoo/yfinance`）+ gross_profit/revenue/net_profit（`futu/statements`） | ✅ 有值 |
+| SH.600009 | 同上 | ✅ 有值 |
+| SH.600010 | 同上 | ✅ 有值 |
+| **SH.600028** | 只有 equity/total_assets（yahoo，3 期）+ gross_profit/revenue/net_profit（futu） | ❌ **没有 `net_income`，也没有 `roe`/`roa` 行**——离线通道对该票只落了资产负债表侧科目，回报侧没落 |
+| **SH.600519** | **一行都没有**（gross_profit/revenue 也没有） | ❌ 该票**从未进过 `fundamentals` 表**：既没跑 roe/roa 落库通道，也没合并过财报科目 |
+
+→ 结论：**不是矩阵算不出，是库里没有**。要达到 ≥4/5，最小动作是给 `SH.600519` 跑一次
+`server/v3_fundamentals_sync`（并补 `SH.600028` 的 net_income 侧），属离线作业，不涉及本轮代码。
+
+**交叉复核**（把 `trading.sqlite` **复制**到临时 home，用当前工作树代码——`v3_analytics.py`
+19:16 版——再跑一次，真实 `~/.dsh` 全程只读）：`roe/roa` 仍是 **3/5**、`gross_margin/net_margin/
+revenue_yoy` 仍是 **4/5**、missing 集合逐字相同 → 这两组覆盖率是 **store 数据决定的**，
+与 `v3_analytics.py` 的版本无关（该轮 concurrent 改动没有改变它们）。
+该次复核里 `capital_flow` 显示 0/5 是**夹具效应**：复核用的进程注入的是 `futu=object()`
+（无真实富途通道），与线上 8397 的 `classes=all → 5/5`（真富途）不矛盾。
+
+## 26.4 HK/US 行为未变（降级不是替换）的验证
+
+代码判据（可逐行核对）：`futu_data.py:948-959` `_is_public_fallback_eligible` 要求
+`details.ret_code/errcode == -9` **且** `all(_is_sha_sz_ticker(code))`（`SH.`/`SZ.` + 6 位数字）；
+`v3_sources_ext.py:414` 对非沪深标的直接 `quote/unsupported-market`。
+
+实测（真 `futu_data.rt_quote` / `rt_order_book` 代码路径 + 通道替身只改 `_fetch` 的返回）：
+
+```
+public_fallback_active() = True（create_app 装配后确实装上了钩子）
+rt_quote SH.600519    → 走公开链降级：source=tencent/qt.gtimg.cn、as_of 有值、
+                        futu_fallback={"reason":"futu 返回 -9（A 股无实时权限）→ 已降级到免密公开源",
+                                       "policy":"降级不是替换：仅当富途返回 -9…且请求全是沪/深标的时才启用公开源；HK/US 行为一字不变",
+                                       "upstream_error":{"code":"trading/futu-error","message":"A 股实时行情无权限（ret_code=-9）"}}
+rt_quote HK.00700     → futu 原样返回（无 futu_fallback 字段）
+rt_quote US.AAPL      → futu 原样返回
+rt_quote [SH.600519, HK.00700]（混合） → futu 原样返回（混合列表**不**降级）
+通道调用计数：5 次（A 股 2 次、HK/US/混合各 1 次）——即 HK/US 每次都真的走了富途
+```
+
+线上 8397（改动前进程）未提供对照：`/api/wb/rt_quote` 只接受 POST，本轮按「只读 GET」约束未打；
+HK/US 的线上行为要等主 agent 重启后用同一次请求复测（预期逐字不变）。
+
+## 26.5 代码事实核对：与任务转述**不符**的地方（按重要性排序）
+
+| # | 转述 | 代码/实测事实 |
+|---|---|---|
+| 1 | 北向（AKShare HSGT）已落盘 | **代码在，但跑不通**：`_northbound_hist` 调 `_head`（`v3_sources_ext.py:583`），模块 import 清单（`:45-57`）里没有它（定义在 `v3_sources.py:547`）→ 整条路由 `northbound/internal`。**一行可修** |
+| 2 | 扩展链「仅 `?keys=` 显式请求时探测」即已接好 | **传参名不匹配**：`v3_fallback.py:606` 以 `sources_deps=` 调 `v3_sources_ext.build_ext_probes`，而签名是 `(v3_run, home, *, deps=None)`（`:922`）→ 任何 `?keys=rt_quote\|rt_order_book\|northbound\|macro` 都回 `sources/internal: TypeError`。**缺省 8 条链不受影响**（实测 `chains=8` 正常返回） |
+| 3 | 富途 -9 盘口降级响应带盘口说明 | `rt_order_book` 降级响应里 `book_depth` 与 `depth_note` 实测为 **`null`**：钩子调的是 `fetch_a_share_quote(...)`（`:471`），而 `book_depth`/`depth_note` 只在 `fetch_a_share_order_book`（`:438-448`）里设置 → 直连函数有、钩子路径没有。`book` 本身正常（五档齐全） |
+| 4 | 宏观「AKShare 主源 + OpenBB OECD 第二源口径并列」 | 主源 ✅；**OECD 腿实测 `openbb/no-rows`**。根因已定位：`obb.economy.cpi(country="china", provider="oecd").to_dataframe()` 把报告期放在 **index**（`index.name="date"`，columns=`country/value/expenditure`），而 `_rows_from_frame` 用 `to_dict("records")`（`v3_sources.py:521`）**丢 index** → `raw.get("date")` 恒 `None` → 全行跳过。改用 `df.reset_index()` 或 `res.results`（元素带 `date=…`）即可 |
+| 5 | `v3_fundamentals_sync.py` 改用东财免密源 | 只对了一半：**数值仍是 Yahoo/yfinance**（`SOURCE_YAHOO="yahoo/yfinance"`，`:65`），东财免密端点只提供**披露日**（`RPT_LICO_FN_CPD` 的 `NOTICE_DATE`，`:67/:167`）。且该文件**本轮未改动**（`git diff HEAD` 为空，最后一次改动在 b92da3c） |
+| 6 | roe/roa 覆盖目标 ≥4/5 | 实测 **3/5**（`SH.600028`/`SH.600519` 缺，卡点在 store 而非矩阵，见 26.3-4） |
+| 7 | 前端 `dataDomain.jsx` / `market.jsx` 仍有 tushare 引用 | 这两个文件**已清理干净**（`dataDomain.jsx:116-118` 只剩一个无调用的 `TushareBlockRemoved()` 占位与说明注释；`market.jsx:1283` 注释已无 tushare 字样）。**真正的残留**在 `settings.jsx`（6 处：`:8/:46/:508/:1076/:1275/:1497`）、`overview.jsx`（2 处：`:11/:1105`）、`platform/tools/e2e_probe.py`（4 处：`:50/57/95/125`），**另有一处后端漏网**：`platform/server/v3_mcp.py:378` 的凭据参数文档仍写「缺省 tushare_token」。全量 20 文件清单 + 逐条保留理由见 `v3-source-policy.md` §3.4 |
+| 8 | 相关测试 57 例 OK | 数字对（`test_v3_sources` 51 + `test_v3_credentials` 6 = 57，实测 9.4s OK），**但 57 例里没有一例覆盖 `v3_sources_ext.py`**（全仓库 grep 只在 `test_v3_sources.py:638/645` 见到它，且那是路由清单断言）——本轮新增的 A 股链/北向/宏观**零单测** |
+
+## 26.6 测试（真实输出）
+
+```
+$ cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_sources tests.test_v3_credentials
+Ran 57 tests in 9.429s
+OK
+```
+
+补充（本轮临时脚本，不落仓库）：`/api/v3/sources/status`（无 keys）→ `ok=true, chains=8`，
+key 列表 `[kline, snapshot, financials_cn, financials_us, news, industry, quality, spot]`
+（`available` 逐条真实探测，`snapshot/industry/spot` 三链当前不可用）——**证明扩展链接线没有
+污染缺省探测集**。
+
+## 26.7 未解决项（如实登记，按建议修法排序）
+
+1. **北向路由整条失败**（一行）：`v3_sources_ext.py:583` 的 `_head` 未导入 → 补 import 或改用切片。
+   在修好之前，`/api/v3/northbound` 不能对外宣称可用。
+2. **扩展链探测全部 500**（一行）：`v3_fallback.py:606` 的 `sources_deps=` → 改 `deps=`（或把
+   `build_ext_probes` 形参改名），否则 `/api/v3/sources/status?keys=…` 永远拿不到扩展链状态。
+3. **`rt_order_book` 降级响应的 `book_depth`/`depth_note` 为 null**：钩子路径应改调
+   `fetch_a_share_order_book`（或就地补 `depth_note`），否则前端拿不到「只有五档」的说明。
+4. **OECD 第二源 `openbb/no-rows`**：`_macro_oecd` 的取行路径需 `reset_index()` 或用
+   `res.results`；修好之前「两口径并列」不可宣称（非 CPI 的 `oecd/no-series` 是预期行为，无需改）。
+5. **roe/roa 3/5**：库里缺 `SH.600519`（无任何 fundamentals 行）与 `SH.600028` 的回报侧科目；
+   需离线跑 `server/v3_fundamentals_sync`（Yahoo 单标的 10~16s，建议季报披露后手动跑）。
+6. **线上 8397 未生效**：需主 agent 重启；重启前线上 `/api/v3/northbound`、`/api/v3/macro` 返回
+   SPA HTML，`/api/wb/rt_quote` 也仍是纯富途行为（A 股仍 `-9`）。
+7. **新模块零单测**：建议补 `platform/tests/test_v3_sources_ext.py`（假 fetch/假 akshare 封网络：
+   三源顺序、五档与 `"-"` 不填 0、冷却与预算、`net_buy_disclosed` 标注、宏观白名单与口径换标、
+   `-9` 钩子在 HK/US/混合下必须不生效）。
+8. **东财 `push2` 断连是上游行为**（非缺陷）：链已正确降级到腾讯；但 60s 冷却是**进程内**的，
+   高频请求会长期走腾讯（`source` 字段会如实标注，不会冒充东财）。
+9. **文档与实现的口径差**：`v3_sources_ext.py:681-684` 的 `MACRO_OECD_CALIBER` 写着
+   「2026-09-21 与 NBS 同比逐月核对一致（0.008↔0.8%）」——本机复核确认 OECD 原始数据确实是
+   0.008/0.010/0.005（小数口径），但**本模块的取行路径拿不到它**（26.5-4），
+   即「手工核对过」≠「接口能返回」。修 4 之后此注释才与实现一致。

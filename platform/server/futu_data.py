@@ -83,6 +83,30 @@ AUTH_HINT = "（富途 token 缺失或已失效：运行 scripts/futu_auth.py �
 # openapi 凭据缺失的固定指引（trading/openapi-unavailable 的消息必须指向授权入口）。
 OPENAPI_AUTH_HINT = "（运行 scripts/futu_auth.py --openapi 完成 OAuth/AppKey 配置）"
 
+# ── A 股公开降级源钩子（2026-09-21 数据源政策：免密钥公开端点补充）─────────────
+# v3_sources_ext.register 在装配期安装（生产路径自动生效）；未安装时（既有单测直接构造
+# FutuData、或扩展模块缺席）这里保持 None，rt_quote/rt_order_book 的行为与历史逐字一致。
+# 钩子语义：handler(endpoint, codes, error) → value | None；返回 None 表示「公开链也没
+# 拿到」，由调用方把**原始 -9 错误**原样上抛（降级失败不编造、不吞错）。
+_PUBLIC_FALLBACK = None
+
+
+def install_public_fallback(handler):
+    """安装 A 股公开降级源 handler（幂等覆盖；测试可用 uninstall_public_fallback 撤销）。"""
+    global _PUBLIC_FALLBACK  # noqa: PLW0603 —— 进程级单例钩子，与 FutuData 实例解耦
+    _PUBLIC_FALLBACK = handler
+
+
+def uninstall_public_fallback():
+    """撤销钩子（测试隔离用；生产不需要）。"""
+    global _PUBLIC_FALLBACK  # noqa: PLW0603
+    _PUBLIC_FALLBACK = None
+
+
+def public_fallback_active():
+    """钩子是否已安装（只读探针；诊断/测试用）。"""
+    return _PUBLIC_FALLBACK is not None
+
 DEFAULT_TIMEOUT_SECONDS = 30
 
 # 端点 → 富途 MCP 工具名（mcp 后端）。键集 ≡ store_access.FUTU_ENDPOINTS ∪
@@ -526,6 +550,15 @@ def _param_error(message):
     return FutuDataError(message, kind="parameter")
 
 
+def _is_sha_sz_ticker(value):
+    """沪/深 A 股标的（``SH.600519`` / ``SZ.000001``）；北交所/港股/美股 → False（不降级）。
+
+    北交所（BJ.）不在公开行情链覆盖内（免密源前缀未实测核实，不猜映射），同样不降级。
+    """
+    text = str(value or "").upper()
+    return len(text) == 9 and text[:3] in ("SH.", "SZ.") and text[3:].isdigit()
+
+
 def _normalize_code(value, field):
     """code 归一：同 series 的 ticker 规则（to_futu_symbol），归不出合法形状即拒绝。
 
@@ -911,6 +944,30 @@ class FutuData:
             return {"news_list": []}
         return value
 
+    def _is_public_fallback_eligible(self, codes, error):
+        """-9（A 股无实时权限）且请求**全部**是沪/深标的 → 才允许公开降级源。
+
+        HK/US（或混合列表）一字不变——降级不是替换；非 -9 的业务错误同样不降级
+        （-9 是「权限缺口」这一数据事实，其它错误另有含义，不能被降级掩盖）。
+        """
+        details = getattr(error, "details", None) or {}
+        if not any(details.get(key) == -9 for key in ("ret_code", "errcode")):
+            return False
+        codes = list(codes or [])
+        if not codes:
+            return False
+        return all(_is_sha_sz_ticker(code) for code in codes)
+
+    def _public_fallback_value(self, endpoint, codes, error):
+        """试一次公开降级源；未安装/不适用/降级自身异常 → ``None``（原错误原样上抛）。"""
+        handler = _PUBLIC_FALLBACK
+        if handler is None or not self._is_public_fallback_eligible(codes, error):
+            return None
+        try:
+            return handler(endpoint, list(codes), error)
+        except Exception:  # noqa: BLE001 —— 降级层的意外不能覆盖上游真实错误
+            return None
+
     # ---- 数据方法（参数白名单 + 必填/类型校验，坏参数零通道调用）----
     def rt_quote(self, payload):
         """实时报价快照：codes 1..10 个 → 上游 code_list。
@@ -919,6 +976,9 @@ class FutuData:
         （TTL 语义由 ``QuoteSnapshotCache`` 承担）；命中即返回推送数据并标注
         ``source: "push"``（与 REST 取的形状不同——推送帧的字段面由上游决定，
         调用方可据 ``source`` 判别）。未命中一律走通道取数，行为与既有逐字一致。
+        例外（2026-09-21）：通道返回 -9（A 股无实时权限）且请求全是沪/深标的时，
+        若公开降级钩子已安装则试一次免密公开源（响应带 ``source``/``delay``/
+        ``futu_fallback`` 如实标注）；降级失败时原始 -9 错误**原样**上抛。
         """
         codes = payload.get("codes")
         if not isinstance(codes, list) or not 1 <= len(codes) <= 10:
@@ -927,7 +987,13 @@ class FutuData:
         hit = self._push_lookup(normalized)
         if hit is not None:
             return hit
-        return self._fetch("rt_quote", {"code_list": normalized})
+        try:
+            return self._fetch("rt_quote", {"code_list": normalized})
+        except FutuDataError as error:
+            value = self._public_fallback_value("rt_quote", normalized, error)
+            if value is not None:
+                return value
+            raise
 
     def _push_lookup(self, codes):
         """推送快照命中 → value（``source: "push"``）；未接线/未命中/过期 → None。"""
@@ -947,8 +1013,19 @@ class FutuData:
                 "ttl_ms": getattr(self._push, "ttl_ms", None)}
 
     def rt_order_book(self, payload):
-        """实时盘口：档数随行情权限（HK 10 / US 60 / A 股不可用），不假定固定档数。"""
-        return self._fetch("rt_order_book", {"code": _required_code(payload)})
+        """实时盘口：档数随行情权限（HK 10 / US 60 / A 股不可用），不假定固定档数。
+
+        例外（2026-09-21）：A 股 -9 时同 rt_quote 走公开降级钩子；公开源只有五档，
+        响应 ``depth_note`` 写明「该源无十档/逐笔能力」，不伪造档位。
+        """
+        code = _required_code(payload)
+        try:
+            return self._fetch("rt_order_book", {"code": code})
+        except FutuDataError as error:
+            value = self._public_fallback_value("rt_order_book", [code], error)
+            if value is not None:
+                return value
+            raise
 
     def capital_flow(self, payload):
         """分钟级资金流（A 股实测可用——A 股实时报价的替代路径之一）。"""

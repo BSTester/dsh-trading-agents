@@ -25,6 +25,7 @@ import { ProCard } from "@ant-design/pro-components";
 import { useV3, fmt, noSourceText } from "../services/api.js";
 import { MarketNote, envelopeError, marketLabel, marketTicker, useMarket } from "../services/marketContext.jsx";
 import { industryGateView, isBlockedStage, probeAgeText, ruleLabel, stageLabel, stageTone } from "../lib/risk-labels.js";
+import { isMissingValue } from "../lib/stat-core.js";
 import { LineChart, BarList } from "../components/charts.jsx";
 
 const { Text, Link } = Typography;
@@ -393,7 +394,10 @@ function IndustryExposureCard({ env }) {
 /** 净值曲线统计：峰值/谷底/最大回撤/修复天数（全部由 analytics.equityCurve 实数推导）。 */
 function curveStats(curve) {
   const points = asArray(curve)
-    .map((point) => ({ t: String((point && point.t) || ""), v: Number(point && point.v) }))
+    // 2026-09-21 修：预热位是**字面 null**（FR-TOOLS-002 等长对齐），而 `Number(null) === 0`
+    // → 会被画成一个假的 0 起点、并把首值/点数标签带偏。`null/undefined/""` 一律 NaN，
+    // 由下面的 `Number.isFinite` 过滤掉（位置仍保留在响应里，模型按索引对齐）。
+    .map((point) => ({ t: String((point && point.t) || ""), v: isMissingValue(point && point.v) ? Number.NaN : Number(point.v) }))
     .filter((point) => point.t && Number.isFinite(point.v));
   if (points.length < 2) return null;
   let running = points[0];

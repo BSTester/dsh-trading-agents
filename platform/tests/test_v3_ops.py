@@ -387,7 +387,6 @@ class ToolsTests(V3OpsTestCase):
 class SettingsTests(V3OpsTestCase):
     SECRET_KEY_PEM = "-----BEGIN PRIVATE KEY-----SUPERSECRETPEM-----END PRIVATE KEY-----"
     SECRET_API_KEY = "sk-deepseek-must-never-leak"
-    SECRET_TUSHARE = "tushare-token-must-never-leak"
     SECRET_BEARER = "futu-mcp-bearer-must-never-leak"
 
     def prepare(self):
@@ -402,7 +401,8 @@ class SettingsTests(V3OpsTestCase):
 
     def test_settings_never_leaks_secret_values(self):
         self.prepare()
-        environ = {"DEEPSEEK_API_KEY": self.SECRET_API_KEY, "TUSHARE_TOKEN": self.SECRET_TUSHARE}
+        environ = {"DEEPSEEK_API_KEY": self.SECRET_API_KEY,
+                   "TUSHARE_TOKEN": "tushare-token-must-never-leak"}
         with unittest.mock.patch.dict(os.environ, environ, clear=True):
             response = self.client.get("/api/v3/settings")
             self.assertEqual(response.status_code, 200)
@@ -410,7 +410,7 @@ class SettingsTests(V3OpsTestCase):
             text = response.text
         self.assertTrue(body["ok"])
 
-        for secret in (self.SECRET_KEY_PEM, self.SECRET_API_KEY, self.SECRET_TUSHARE,
+        for secret in (self.SECRET_KEY_PEM, self.SECRET_API_KEY, environ["TUSHARE_TOKEN"],
                        self.SECRET_BEARER, "APPKEY-VALUE-MUST-NOT-LEAK", "svc-secret"):
             self.assertNotIn(secret, text)
 
@@ -425,6 +425,8 @@ class SettingsTests(V3OpsTestCase):
 
         # env：只有 key/injected/source 三个字段，没有值字段
         self.assertEqual([row["key"] for row in body["env"]], list(v3_ops.ENV_KEYS))
+        # 2026-09-21 数据源政策：TUSHARE_TOKEN 不在设置页环境变量清单里（Tushare 已移除）
+        self.assertNotIn("TUSHARE_TOKEN", v3_ops.ENV_KEYS)
         for row in body["env"]:
             self.assertEqual(sorted(row.keys()), ["injected", "key", "source"])
             self.assertIsInstance(row["injected"], bool)
@@ -444,8 +446,10 @@ class SettingsTests(V3OpsTestCase):
         self.assertEqual(body["trading_mode"], "sim")  # 模式文件缺失 = sim（服务口径）
         self.assertIn("switch_mode", body["mode_note"])
         names = [row["name"] for row in body["data_sources"]]
-        self.assertEqual(len(names), 5)
+        # 2026-09-21 数据源政策：Tushare Pro 行随能力一并移除（5 → 4 行）
+        self.assertEqual(len(names), 4)
         self.assertTrue(any("workbench" in name for name in names))
+        self.assertFalse(any("Tushare" in name for name in names), "tushare 行必须已移除")
         # 每一行都必须自带证据来源与时间（口径可追，不允许「写死的可用性」）
         for row in body["data_sources"]:
             self.assertIn("source", row, row["name"])
@@ -525,48 +529,6 @@ class SettingsTests(V3OpsTestCase):
         self.assertIn("connection reset by peer", edgar["detail"])
         self.assertIn(DAY, edgar["detail"])
         self.assertIn("重跑", edgar["detail"])
-
-    def test_tushare_availability_is_token_times_reachability(self):
-        """Tushare 判据 = 凭据就绪 × 端点 HTTP 可达；**与 tushare 包能否 import 无关**。"""
-        def tushare_row(body):
-            return [row for row in body["data_sources"] if row["name"] == "Tushare Pro"][0]
-
-        # 1) 未配置凭据 → 不发任何请求（如实说明「未探测」）
-        with unittest.mock.patch.dict(os.environ, {}, clear=True):
-            body = self.get("/api/v3/settings")
-        row = tushare_row(body)
-        self.assertFalse(row["available"])
-        self.assertIn("未注入", row["detail"])
-        self.assertEqual(row["source"], "credentials:未配置")
-        self.assertEqual([call for call in self.http_probe.calls
-                          if "tushare" in call["url"]], [],
-                         "没有凭据就不该对 tushare 发任何请求")
-
-        # 2) 凭据就绪 + 端点可达 → 可用；且**包不可导入也照样可用**（这正是修掉的那条错判据）
-        self.http_probe.reachable = True
-        v3_ops.reset_source_probes()
-        with unittest.mock.patch.dict(os.environ, {"TUSHARE_TOKEN": "t" * 32}, clear=True):
-            with unittest.mock.patch.object(v3_ops, "_module_available", return_value=False):
-                body = self.get("/api/v3/settings")
-        row = tushare_row(body)
-        self.assertTrue(row["available"], "实现走 HTTP，不需要 tushare 包")
-        self.assertEqual(row["source"], "http-probe:api.tushare.pro + credentials")
-        self.assertEqual(row["as_of"], PROBE_AS_OF)
-        self.assertIn("环境变量 TUSHARE_TOKEN", row["detail"])
-        self.assertIn("未做真实取数验证", row["detail"])
-        self.assertEqual([call["url"] for call in self.http_probe.calls
-                          if "tushare" in call["url"]], [v3_ops.TUSHARE_PROBE_URL])
-        self.assertNotIn("包", row["detail"])
-
-        # 3) 凭据就绪但端点不可达 → 如实报失败原因
-        v3_ops.reset_source_probes()
-        self.http_probe.reachable = False
-        with unittest.mock.patch.dict(os.environ, {"TUSHARE_TOKEN": "t" * 32}, clear=True):
-            body = self.get("/api/v3/settings")
-        row = tushare_row(body)
-        self.assertFalse(row["available"])
-        self.assertIn("不可达", row["detail"])
-        self.assertIn("name resolution", row["detail"])
 
     def test_data_source_probe_is_cached_within_ttl(self):
         """设置页会被反复打开：TTL 内复用同一份探测结果（as_of 也不刷新），不重复打上游。"""

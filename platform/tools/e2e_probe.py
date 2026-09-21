@@ -47,14 +47,14 @@ DEFAULTS = {
     "is_contain_ba": False, "is_contain_overnight": False, "extended_time": 0,
     "user_stock_list_mode": 0, "holding_stock_ids": [], "watchlist_stock_ids": [],
     "id": "", "decision": "approved", "plan_hash": "", "expected_mode": "sim",
-    "action": "status", "key": "tushare_token", "value": "", "no_probe": True,
+    "action": "status", "key": "futu_appkey", "value": "", "no_probe": True,
     "confirmation": "", "older_than_minutes": 120, "run_id": "",
 }
 V3_GET = [
     "overview", "metrics", "brain", "market", "market/watchlist", "plates", "orderbook",
     "factors/matrix", "strategy", "risk", "risk/analytics", "execution", "oms/orders",
     "gateway", "tools", "settings", "events", "audit", "credentials", "research",
-    "research/tasks", "news", "spot", "financials", "tushare", "openbb", "ml/sweep",
+    "research/tasks", "news", "spot", "financials", "openbb", "ml/sweep",
 ]
 #: 已知重端点（给更长超时）
 HEAVY = {"factors/matrix", "risk/analytics", "ml/sweep", "openbb", "spot"}
@@ -92,7 +92,6 @@ V3_PARAMS = {
     "financials": {"ticker": "AAPL", "statement": "income", "periods": 2},
     "news": {"symbol": "600519", "limit": 3},
     "openbb": {"symbol": "AAPL"},
-    "tushare": {"api": "income", "ts_code": "600519.SH", "period": "20260630"},
     "events": {"ticker": "SH.600000", "window": 180},
     "audit": {"window": 120},
     "ml/sweep": {"ticker": "SH.600519", "windows": "10,20", "rebalance": "5,10"},
@@ -122,7 +121,7 @@ def probe_v3(base, path, method="GET"):
     if path == "oms/sync":
         return {"skipped": "写动作（台账对账），按只读纪律跳过"}
     if path == "credentials":
-        return call(url, {"action": "status", "key": "tushare_token"}, timeout=30)
+        return call(url, {"action": "status", "key": "futu_appkey"}, timeout=30)
     return {"skipped": "未纳入探针"}
 
 

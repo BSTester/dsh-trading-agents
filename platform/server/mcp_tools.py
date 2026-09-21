@@ -1205,6 +1205,265 @@ TOOL_NAMES = frozenset(definition.name for definition in TOOLS)
 ENDPOINT_TOOL_ENDPOINTS = {tool.name: tool.endpoint for tool in TOOLS if tool.endpoint}
 
 
+# ---------------------------------------------------------------------------
+# FR-TOOLS-002 子规范③：isConcurrencySafe（全工具面并发安全标注）
+# ---------------------------------------------------------------------------
+# 判定标准（写入 docs/v3-integration.md §1.7，与 v3_mcp/mcp_discovery 两处同一份谓词）：
+#   * ``true``  = 只读（调用不改变任何服务端状态）+ 无共享可变状态被本调用修改 + 可并行
+#     （多路同时调用各自得到正确结果，结果与调用顺序无关）；
+#   * ``false`` = 写类（改台账/队列/订阅意图/模式文件/研究落盘）、有副作用、或占用/改变
+#     独占共享资源（交易链路、WS 订阅、维护删除）；
+#   * **不确定一律 false**（保守口径：宁可少标 true，不冒充安全）。
+# 基础 77 件的逐件判定（FR-TOOLS-002 补齐任务，2026-09-21）：只读件=true；
+# ``plan_execute`` / ``trade_*`` / ``push_*`` / ``admin_*`` 家族与 ``switch_mode`` /
+# ``research_tasks_*`` =false（写类/副作用/共享可变状态；``push_status`` 虽是读，但它读的
+# 是活动中的 WS 连接可变状态，按「不确定一律 false」保守判 false）。上游取数经全局限流器
+# 的只读件（``series`` 等）仍判 true：限流器是读路径的节流器（并发调用排队串行、结果
+# 正确），不构成「不安全」；桥接件（``v3_*``）在 ``v3_mcp`` 按 ``readOnlyHint`` 映射。
+CONCURRENCY_META_KEY = "quantwb.isConcurrencySafe"
+
+#: 基础面**不是**并发安全的工具（判定理由见上注释与 docs/v3-integration.md §1.7 逐件表）。
+CONCURRENCY_UNSAFE_TOOLS = frozenset({
+    "switch_mode",                                # 写账户模式文件（共享状态）
+    "plan_execute",                               # 执行/取消计划、风控总开关（写 + 副作用）
+    "trade_place", "trade_modify", "trade_cancel", "trade_max_qty",
+    # trade_* 家族：交易链路（下单/改单/撤单是写；max_qty 虽是读数，仍按家族保守 false）
+    "push_status", "push_subscribe", "push_unsubscribe",
+    # push_* 家族：订阅意图/连接状态是共享可变状态（status 读的是活动连接，保守 false）
+    "research_tasks_claim", "research_tasks_report",
+    # 值班队列状态机：领取/回报都是写（pending→running / 终态落库）
+    "admin_status", "admin_runs", "admin_cancel_run", "admin_cancel_stale",
+    "admin_prune_runs",
+    # admin_* 维护面：cancel/stale/prune 是删除类写；status/runs 虽读，按家族保守 false
+})
+
+
+def is_concurrency_safe(name):
+    """基础面工具的并发安全判定（基础 77 件的唯一谓词；bridge/discovery 皆引用它）。"""
+    return str(name) not in CONCURRENCY_UNSAFE_TOOLS
+
+
+def concurrency_meta(safe):
+    """``tools/list`` 的 ``_meta`` 体：``{"quantwb.isConcurrencySafe": bool}``。
+
+    基础面（本模块 ``register``）与桥接面（``v3_mcp.register``）都用它——同一份键名，
+    两处不可能各写各的。
+    """
+    return {CONCURRENCY_META_KEY: bool(safe)}
+
+
+# ---------------------------------------------------------------------------
+# FR-TOOLS-002 子规范②：规范 JSON + render 分离
+# ---------------------------------------------------------------------------
+# 工具响应**保持规范 JSON 信封不变**；``format:"text"`` 是一层**人类渲染**视图：
+#   * 直连面：renderable 工具的签名里有 ``format`` 参数（缺省 json；schema 里声明）；
+#   * 发现代理：``call_tool(name, arguments)`` 的 ``arguments.format="text"`` 同样生效
+#     （非 renderable 工具没有这个字段，传了按未知参数拒绝——与直连 schema 同一后果）；
+#   * per-tool ``render(args, value) -> text`` 是**纯函数**：同一输入恒同一输出，无时钟、
+#     无 I/O、无随机；空数据渲染成「无数据源·原因」而不是空串；
+#   * ``tools/list`` 卡片（mcp_discovery.ToolCard）用 ``renderable`` 标注。
+#: renderable 工具签名里的响应形态参数（缺省 json = 规范信封，历史行为零改动）。
+FORMAT_FIELD = "format"
+FORMAT_JSON = "json"
+FORMAT_TEXT = "text"
+FORMAT_PARAM_DOC = ("响应形态：json=规范 JSON 信封（缺省，机器读）；text=人类可读散文渲染"
+                    "（本工具支持 renderable）。其他取值按 json 处理")
+
+#: 工具名 → ``render(args, value) -> str`` 纯函数（本模块登记基础面；``v3_mcp`` 登记
+#: 桥接面。dict 本身就是注册表，无第二份清单）。
+TOOL_RENDERERS = {}
+
+
+def register_renderer(name):
+    """``@register_renderer("snapshot")``：把渲染纯函数登记进 :data:`TOOL_RENDERERS`。"""
+    def deco(fn):
+        TOOL_RENDERERS[name] = fn
+        return fn
+    return deco
+
+
+def is_renderable(name):
+    """该工具是否支持 ``format:"text"`` 人类渲染（cards/_meta/签名三处同一谓词）。"""
+    return str(name) in TOOL_RENDERERS
+
+
+def format_param():
+    """renderable 工具签名里的 ``format`` 字段（可选，缺省 json）。"""
+    return opt(FORMAT_FIELD, "str", FORMAT_PARAM_DOC)
+
+
+def render_value(name, args, value):
+    """``render(args, value) -> text``；无渲染器返回 ``None``（调用方回退 JSON）。"""
+    fn = TOOL_RENDERERS.get(str(name))
+    if fn is None:
+        return None
+    return fn(dict(args or {}), value)
+
+
+def render_tool_result(name, args, envelope, is_error):
+    """``format:"text"`` 的 ``CallToolResult``：文本是人类渲染（不是 JSON）。
+
+    无渲染器（不该发生：``format`` 字段只在 renderable 工具的签名/卡片上声明）时回退
+    规范 JSON，绝不渲染出空串。
+    """
+    text = render_value(name, args, envelope)
+    if not str(text or "").strip():
+        text = json.dumps(envelope, ensure_ascii=False, separators=(",", ":"))
+    return CallToolResult(content=[TextContent(type="text", text=text)], isError=is_error)
+
+
+def _num(value, digits=4):
+    """数值 → 定长小数文本；``None``/非有限 → ``null``（渲染层不编数）。"""
+    number = value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+    if number is None:
+        return "null"
+    number = float(number)
+    if number != number or number in (float("inf"), float("-inf")):
+        return "null"
+    return f"{number:.{digits}f}"
+
+
+def _no_data(reason):
+    """空数据的渲染口径：必须是「无数据源·原因」，绝不是空串/裸 null。"""
+    text = str(reason or "").strip() or "原因未给出"
+    return f"无数据源·{text}"
+
+
+def _error_of(envelope):
+    """信封里的错误（业务失败或程序异常）→ ``code: message`` 文本。"""
+    error = envelope.get("error") if isinstance(envelope, dict) else None
+    if not isinstance(error, dict):
+        return "响应不是标准信封"
+    code = str(error.get("code") or "unknown").strip()
+    message = str(error.get("message") or "").strip()
+    return f"{code}: {message}" if message else code
+
+
+@register_renderer("snapshot")
+def _render_snapshot(args, value):
+    """工作台快照：模式 + 研报/研究 run/预览计数 + 在途与缺口。"""
+    if not isinstance(value, dict) or not value.get("ok"):
+        return _no_data(_error_of(value) if isinstance(value, dict) else "响应不是标准信封")
+    data = value.get("value") if isinstance(value.get("value"), dict) else {}
+    if not data:
+        return _no_data("快照无内容（value 为空）")
+    lines = [f"工作台快照（mode={data.get('mode') or '未知'}，"
+             f"generated_at={data.get('generated_at') or '未知'}）"]
+    for key, label in (("reports", "研报"), ("runs", "研究 run"), ("previews", "量化预览")):
+        items = data.get(key)
+        if isinstance(items, list):
+            lines.append(f"- {label}：{len(items)} 条")
+    summary = data.get("trade_summary")
+    if isinstance(summary, dict) and summary:
+        lines.append(f"- 交易事实（trade_summary）：{json.dumps(summary, ensure_ascii=False)[:200]}")
+    pending = data.get("confirmation")
+    if isinstance(pending, dict):
+        lines.append(f"- 待确认：{len(pending.get('pending') or [])} 条")
+    missing = data.get("endpoints")
+    if isinstance(missing, list) and missing:
+        lines.append(f"- 缺失端点：{len(missing)} 个（{', '.join(map(str, missing[:5]))}"
+                     + ("…" if len(missing) > 5 else "") + "）")
+    return "\n".join(lines)
+
+
+@register_renderer("series")
+def _render_series(args, value):
+    """K 线序列：首尾两根 + 根数与来源（等长窗口的散文视图）。"""
+    if not isinstance(value, dict) or not value.get("ok"):
+        return _no_data(_error_of(value) if isinstance(value, dict) else "响应不是标准信封")
+    data = value.get("value") if isinstance(value.get("value"), dict) else {}
+    bars = data.get("bars") if isinstance(data.get("bars"), list) else []
+    if not bars:
+        return _no_data(str(data.get("ticker") or args.get("ticker") or "该标的")
+                        + " 取不到 K 线（bars 为空；来源：" + str(data.get("source") or "未知")
+                        + "）")
+    ticker = data.get("ticker") or args.get("ticker") or "?"
+    period = data.get("period") or args.get("period") or "?"
+    head, tail = bars[0], bars[-1]
+    lines = [f"{ticker} {period} K 线：共 {data.get('count', len(bars))} 根"
+             f"（{head.get('t')} → {tail.get('t')}；来源 {data.get('source') or '未知'}）",
+             f"- 最新一根：t={tail.get('t')} O={_num(tail.get('o'))} H={_num(tail.get('h'))} "
+             f"L={_num(tail.get('l'))} C={_num(tail.get('c'))} V={_num(tail.get('v'), 0)}",
+             f"- 窗口首根：t={head.get('t')} C={_num(head.get('c'))}"]
+    closes = [bar.get("c") for bar in bars if isinstance(bar, dict)]
+    numbers = [c for c in closes if isinstance(c, (int, float)) and not isinstance(c, bool)]
+    if len(numbers) >= 2 and numbers[0]:
+        change = (numbers[-1] / numbers[0] - 1) * 100
+        lines.append(f"- 窗口累计涨跌：{_num(change, 2)}%（首→尾收盘）")
+    return "\n".join(lines)
+
+
+@register_renderer("factors")
+def _render_factors(args, value):
+    """横截面因子打分表：逐标的综合 z（mom_20/mom_60/trend 均值口径的散文视图）。"""
+    if not isinstance(value, dict) or not value.get("ok"):
+        return _no_data(_error_of(value) if isinstance(value, dict) else "响应不是标准信封")
+    data = value.get("value") if isinstance(value.get("value"), dict) else {}
+    rows = data.get("rows") if isinstance(data.get("rows"), list) else []
+    if not rows:
+        return _no_data("因子打分表为空（rows=[]；请求标的 "
+                        + str(args.get("tickers") or "未指定") + "）")
+    lines = [f"横截面因子打分：{len(rows)} 个标的"
+             + (f"（as_of={data.get('as_of')}）" if data.get("as_of") else "")]
+    for row in rows[:8]:
+        if not isinstance(row, dict):
+            continue
+        zs = row.get("z") if isinstance(row.get("z"), dict) else {}
+        picks = ["mom_20", "mom_60", "trend"]
+        text = ", ".join(f"{key}={_num(zs.get(key), 2)}" for key in picks if key in zs)
+        lines.append(f"- {row.get('ticker')}: {text or '无 z 分数'}")
+    if len(rows) > 8:
+        lines.append(f"- …其余 {len(rows) - 8} 个标的略（结构化信封里有全量）")
+    return "\n".join(lines)
+
+
+@register_renderer("ic")
+def _render_ic(args, value):
+    """因子 RankIC 序列：均值/最新值 + 最近点（等长展示窗，未知位置 null）。"""
+    if not isinstance(value, dict) or not value.get("ok"):
+        return _no_data(_error_of(value) if isinstance(value, dict) else "响应不是标准信封")
+    data = value.get("value") if isinstance(value.get("value"), dict) else {}
+    points = data.get("points") if isinstance(data.get("points"), list) else []
+    if not points:
+        return _no_data("IC 序列为空（points=[]；标的 "
+                        + str(args.get("tickers") or "未指定") + "）")
+    numbers = [p.get("ic") for p in points
+               if isinstance(p, dict) and isinstance(p.get("ic"), (int, float))
+               and not isinstance(p.get("ic"), bool)]
+    average = sum(numbers) / len(numbers) if numbers else None
+    lines = [f"因子 RankIC（factor={data.get('factor') or args.get('factor') or '缺省'}，"
+             f"forward={data.get('forward') if data.get('forward') is not None else args.get('forward', '?')}）："
+             f"{len(points)} 个点，有效 {len(numbers)} 个"
+             + (f"，均值 {_num(average)}" if average is not None else "，均值 null（无有效点）"),
+             f"- 最新点：{points[-1].get('t')} ic={_num(points[-1].get('ic'))}"
+             if isinstance(points[-1], dict) else "- 最新点：无"]
+    tail = points[-3:]
+    lines.append("- 最近点："
+                 + ", ".join(f"{p.get('t')}={_num(p.get('ic'))}" for p in tail if isinstance(p, dict)))
+    return "\n".join(lines)
+
+
+@register_renderer("risk")
+def _render_risk(args, value):
+    """风控配置与当前指标：逐键列出 config（阈值以结构化信封为准）。"""
+    if not isinstance(value, dict) or not value.get("ok"):
+        return _no_data(_error_of(value) if isinstance(value, dict) else "响应不是标准信封")
+    data = value.get("value") if isinstance(value.get("value"), dict) else {}
+    config = data.get("config") if isinstance(data.get("config"), dict) else {}
+    if not data:
+        return _no_data("风控读数为空（value 为空）")
+    lines = [f"风控读数（来源 {data.get('source') or '未知'}"
+             + (f"，as_of={data.get('as_of')}" if data.get("as_of") else "") + "）"]
+    for key in sorted(config):
+        lines.append(f"- {key}={_num(config.get(key), 2)}")
+    metrics = data.get("metrics") if isinstance(data.get("metrics"), dict) else {}
+    for key in sorted(metrics):
+        lines.append(f"- {key}={_num(metrics.get(key), 2)}")
+    if len(lines) == 1:
+        lines.append("- config/metrics 均为空（上游未给出阈值读数）")
+    return "\n".join(lines)
+
+
 class StoreApi:
     """``store_access`` 的 home 绑定门面：5 个维护工具的**唯一**入口。
 
@@ -1333,12 +1592,23 @@ class BoundTool:
         return dispatch(self.definition, self.handle, self.store_api, arguments)
 
     def call(self, arguments=None):
-        """SDK 工具函数体：业务失败/程序异常在这里分流（规格 §3.2 错误语义）。"""
+        """SDK 工具函数体：业务失败/程序异常在这里分流（规格 §3.2 错误语义）。
+
+        FR-TOOLS-002 render 分离：``format:"text"``（仅 renderable 工具的签名里有该字段）
+        把**同一份信封**渲染成人类可读文本——JSON 信封的产出路径一字不动，渲染只发生在
+        信封之后（``render`` 是纯函数，空数据渲染成「无数据源·原因」而非空串）。
+        """
         provided = {key: value for key, value in (arguments or {}).items() if value is not UNSET}
+        want_text = str(provided.pop(FORMAT_FIELD, None) or "") == FORMAT_TEXT
         try:
             envelope = self.run(provided)
         except Exception as error:  # noqa: BLE001 —— handler 之外的程序异常 → isError=true
-            return tool_result(failure(TOOL_FAILED_CODE, _message(error)), is_error=True)
+            envelope = failure(TOOL_FAILED_CODE, _message(error))
+            if want_text:
+                return render_tool_result(self.name, provided, envelope, is_error=True)
+            return tool_result(envelope, is_error=True)
+        if want_text:
+            return render_tool_result(self.name, provided, envelope, is_error=False)
         return tool_result(envelope, is_error=False)
 
 
@@ -1355,15 +1625,22 @@ def _bind(definition, handle, store_api):
 
     签名里参数名 = schema 字段名，值类型/必填/描述/区间全部来自 ``ToolDefinition.params``，
     因此「注解即契约」，没有第二处需要同步的地方。
+
+    FR-TOOLS-002 render 分离：renderable 工具的签名**追加** ``format`` 字段（可选，缺省
+    json）——这是 ``TOOLS`` 清单之外唯一的动态字段，且只在 :data:`TOOL_RENDERERS` 里有
+    渲染器的工具上出现（schema 诚实：不可渲染的工具没有这个字段，传了按超集字段拒绝）。
     """
     tool = BoundTool(definition=definition, handle=handle, store_api=store_api)
+    parameters = [param.parameter() for param in definition.params]
+    if is_renderable(definition.name):
+        parameters.append(format_param().parameter())
 
     def fn(**kwargs):
         return tool.call(kwargs)
 
     fn.__name__ = definition.name
     fn.__doc__ = definition.description
-    fn.__signature__ = inspect.Signature([param.parameter() for param in definition.params])
+    fn.__signature__ = inspect.Signature(parameters)
     tool.fn = fn
     return tool
 
@@ -1391,6 +1668,7 @@ def register(server: MCPServer, handle, store_api=None):
     with schema_warning_filter():
         for tool in bound:
             server.add_tool(tool.fn, name=tool.name, description=tool.description,
+                            meta=concurrency_meta(is_concurrency_safe(tool.name)),
                             structured_output=False)
         forbid_extra_fields(server)
     return bound
@@ -1424,10 +1702,16 @@ def forbid_extra_fields(server, own_names=TOOL_NAMES):
 
 
 __all__ = [
-    "ENDPOINT_TOOL_ENDPOINTS", "INVALID_OPERATION_CODE", "LIVE_SWITCH_CODE", "LIVE_SWITCH_MESSAGE",
+    "ENDPOINT_TOOL_ENDPOINTS", "FORMAT_FIELD", "FORMAT_JSON", "FORMAT_PARAM_DOC", "FORMAT_TEXT",
+    "INVALID_OPERATION_CODE", "LIVE_SWITCH_CODE", "LIVE_SWITCH_MESSAGE",
     "MCP_EXCLUDED_ENDPOINTS", "MESSAGE_LIMIT", "SERVER_NAME", "SERVER_VERSION", "StoreApi",
-    "TOOLS", "TOOL_COUNT", "TOOL_FAILED_CODE", "TOOL_NAME_BLACKLIST", "TOOL_NAMES", "UNSET",
-    "BoundTool", "Param", "ToolDefinition", "build_tools", "dispatch", "failure",
-    "forbid_extra_fields", "is_blacklisted", "payload_of", "register", "result_payload",
+    "CONCURRENCY_META_KEY", "CONCURRENCY_UNSAFE_TOOLS",
+    "TOOLS", "TOOL_COUNT", "TOOL_FAILED_CODE", "TOOL_NAME_BLACKLIST", "TOOL_NAMES", "TOOL_RENDERERS",
+    "UNSET",
+    "BoundTool", "Param", "ToolDefinition", "build_tools", "concurrency_meta", "dispatch",
+    "failure", "format_param",
+    "forbid_extra_fields", "is_blacklisted", "is_concurrency_safe", "is_renderable",
+    "payload_of", "register", "register_renderer", "render_tool_result", "render_value",
+    "result_payload",
     "schema_warning_filter", "tool_result",
 ]

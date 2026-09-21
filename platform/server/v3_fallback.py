@@ -595,11 +595,59 @@ def build_probes(v3_run, home, *, sources_deps=None):
     }
 
 
+def _ext_chain_rows(v3_run, home, keys, *, timeout=PROBE_CHAIN_TIMEOUT, sources_deps=None):
+    """扩展链（``server.v3_sources_ext.EXT_CHAIN_SPECS``）的探测行（字段与既有链同形）。
+
+    惰性 import：只有 ``keys=`` **显式**请求扩展链时才会加载扩展模块；缺省探测集
+    保持既有 8 条不变（既有单测锁定），``/metrics`` 与告警语义按链名天然复用。
+    """
+    from server import v3_sources_ext  # noqa: PLC0415 —— 惰性：避免装配期拉起扩展依赖
+
+    # 2026-09-21 修：扩展模块的签名是 ``build_ext_probes(v3_run, home, *, deps=None)``，
+    # 且它要的是 ``ExtDeps``（``Deps`` + 文本取数口；腾讯/新浪是 GBK 文本端点）。
+    # 此前传 ``sources_deps=`` → 任何 ``?keys=<扩展链>`` 都回
+    # ``sources/internal: TypeError: build_ext_probes() got an unexpected keyword argument``。
+    # 缺省 8 条链不走这里，故当时未被发现。
+    ext_deps = None if sources_deps is None else v3_sources_ext.ExtDeps(sources_deps)
+    probes = v3_sources_ext.build_ext_probes(v3_run, home, deps=ext_deps)
+    rows = []
+    for key in keys:
+        spec = v3_sources_ext.EXT_SPEC_BY_KEY.get(key)
+        if spec is None:
+            continue
+        chain = probes.get(key) or []
+        value, used_source, attempts = run_chain(chain, timeout=timeout)
+        checked_at = now_iso()
+        last = attempts[-1] if attempts else {}
+        rows.append({
+            "key": spec["key"],
+            "label": spec["label"],
+            "primary": spec["primary"],
+            "fallback": spec["fallback"],
+            "available": used_source is not None,
+            "last_source": used_source or last.get("source") or spec["primary"],
+            "last_ok": used_source is not None,
+            "checked_at": checked_at,
+            "attempts": attempts_chain(attempts),
+            "probe": (value or {}).get("probe") if isinstance(value, dict) else None,
+            "rows": (value or {}).get("rows") if isinstance(value, dict) else None,
+            "as_of": (value or {}).get("as_of") if isinstance(value, dict) else None,
+            "error": None if used_source is not None else last_error(attempts),
+            "chain_size": len(chain),
+            "ext": True,
+        })
+    return rows
+
+
 def probe_chains(v3_run, home, *, keys=None, timeout=PROBE_CHAIN_TIMEOUT, sources_deps=None):
     """逐链探测并返回 ``chains`` 列表（契约字段齐全，另附 ``attempts``/``probe``）。
 
     ``available`` = 链里**至少一级**真的取到了数据；``last_source``/``last_ok`` 是实际命中
     （或最后尝试）的那一级；全失败时 ``error`` 保留最后一个上游错误原文。
+
+    ``keys`` 里出现扩展链名（``server.v3_sources_ext.EXT_CHAIN_SPECS``：rt_quote /
+    rt_order_book / northbound / macro）时追加对应扩展链的探测行（``ext:true``）；
+    **缺省探测集仍是既有 8 条**（既有单测锁定），扩展链只被显式请求时探测。
     """
     probes = build_probes(v3_run, home, sources_deps=sources_deps)
     wanted = [key for key in (keys or [spec["key"] for spec in CHAIN_SPECS]) if key in SPEC_BY_KEY]
@@ -627,7 +675,22 @@ def probe_chains(v3_run, home, *, keys=None, timeout=PROBE_CHAIN_TIMEOUT, source
         }
         row["chain_size"] = len(chain)
         rows.append(row)
+    ext_keys = [key for key in (keys or [])
+                if key not in SPEC_BY_KEY and key in _EXT_SPEC_KEYS(home)]
+    if ext_keys:
+        rows.extend(_ext_chain_rows(v3_run, home, ext_keys, timeout=timeout,
+                                    sources_deps=sources_deps))
     return rows
+
+
+def _EXT_SPEC_KEYS(home):
+    """扩展链 key 集（惰性读；扩展模块缺席时返回空集，不影响既有 8 条链）。"""
+    try:
+        from server import v3_sources_ext  # noqa: PLC0415
+
+        return set(v3_sources_ext.EXT_SPEC_BY_KEY)
+    except Exception:  # noqa: BLE001 —— 扩展模块缺席/损坏：扩展链按「不存在」处理
+        return set()
 
 
 # ── 路由注册 ────────────────────────────────────────────────────────────────────

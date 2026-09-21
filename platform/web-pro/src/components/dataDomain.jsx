@@ -1,7 +1,6 @@
 // 数据域模块（工作台共用）：把后端「外部数据源」端点全部对到界面上——
 //   * news      AKShare 个股资讯（免密钥）
 //   * financials SEC EDGAR 美股三表（公开 XBRL，含 latestEnd/ageDays/stale 新鲜度）
-//   * tushare   A 股财务/行情（需要 TUSHARE_TOKEN：未配置时后端返回 tushare/no-token，如实展示）
 //   * openbb    美股基本面（可选依赖；未安装时 openbb/unavailable；冷启动较慢）
 //   * spot      A 股全市场快照（上游可能不可达 → 如实展示错误原文）
 // 全部**按需加载**（点击按钮才请求）：这些是外部慢接口，不应在页面加载时阻塞首屏。
@@ -115,28 +114,11 @@ function FinancialsBlock() {
 }
 
 /** Tushare A 股财务（token 门控） */
-function TushareBlock() {
-  const state = useOnDemand();
-  const [code, setCode] = React.useState("600519.SH");
-  return (
-    <Space direction="vertical" size={8} style={{ width: "100%" }}>
-      <Space size={8} wrap>
-        <Input size="small" style={{ width: 150 }} value={code} onChange={(event) => setCode(event.target.value)} placeholder="如 600519.SH" />
-        <Button size="small" loading={state.loading} onClick={() => state.load("tushare", { api: "income", ts_code: code })}>拉取 A 股利润表</Button>
-        <Text type="secondary" style={{ fontSize: 11 }}>
-          需要 TUSHARE_TOKEN：可在「接入与授权」页填写；未配置时后端不发请求，直接返回 no-token
-        </Text>
-      </Space>
-      <Result state={state} empty="未加载（Tushare Pro，token 门控）">
-        {(value) => (
-          <Table size="small" pagination={false} dataSource={value.rows ?? []}
-            rowKey={(row) => `${row.end_date ?? row.trade_date ?? ""}-${row.revenue ?? row.close ?? ""}`}
-            locale={{ emptyText: "无返回行" }}
-            columns={Object.keys((value.rows ?? [])[0] ?? {}).map((key) => ({ title: key, dataIndex: key }))} />
-        )}
-      </Result>
-    </Space>
-  );
+function TushareBlockRemoved() {
+  // 2026-09-21 数据源政策：除富途授权外全部免密钥公开端点 → Tushare（需 TUSHARE_TOKEN）已从
+  // 后端移除（路由/降级链/凭据解析全删）。A 股财务改走**免密离线通道**（东财 yjbb →
+  // store，`server/v3_fundamentals_sync.py`），并由因子矩阵（roe/roa/gross_margin/净利率…）
+  // 呈现，不再有按需的 A 股财报表端点。此占位函数仅为保留历史位置说明，无任何调用。
 }
 
 /** OpenBB 美股基本面（可选依赖） */
@@ -205,8 +187,11 @@ export default function DataDomainCard() {
           <FinancialsBlock />
         </div>
         <div>
-          <Text strong style={{ fontSize: 12 }}>③ Tushare A 股财务</Text>
-          <TushareBlock />
+          <Text strong style={{ fontSize: 12 }}>③ A 股财务（免密离线通道：东财 yjbb → 本地库）</Text>
+          <Text type="secondary" style={{ fontSize: 11 }}>
+            无按需端点：数据由 `server/v3_fundamentals_sync.py` 落库（公告日 PIT），在「策略与因子」页的
+            因子矩阵里以 roe / roa / gross_margin / net_margin 等列呈现；取不到即 null + 原因
+          </Text>
         </div>
         <div>
           <Text strong style={{ fontSize: 12 }}>④ OpenBB 美股基本面</Text>
