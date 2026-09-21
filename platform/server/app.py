@@ -799,11 +799,24 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         """
         return error_envelope("trading/internal", str(error)[:300], 500)
 
-    def check_auth(authorization):
+    def check_auth(authorization, query_token=None, cookie_token=None):
+        """令牌校验：``Authorization: Bearer`` > ``?token=`` > ``trading_token`` Cookie。
+
+        2026-09-21 增补（局域网访问）：支持**一次性链接** ``…/?token=<t>``——方便在手机/
+        另一台机器直接打开工作台（前端会在加载后立刻把令牌写进 localStorage 并用
+        ``history.replaceState`` 从地址栏抹掉，见 ``services/api.js``）。
+        查询串令牌的**已知代价**（如实写在这里，不假装没有）：首次请求的 URL 可能落入
+        反向代理/访问日志，也可能在抹除前被截图或分享。故只作"一次性入口"，长期使用请
+        在页面右上角填写（走 localStorage + Authorization 头）；不在 URL 里放长期令牌。
+        """
         token = config.get("token")
         if not token:
             return True
-        return authorization == f"Bearer {token}"  # Node 原实现（已退役）的 authorized
+        if authorization == f"Bearer {token}":  # Node 原实现（已退役）的 authorized
+            return True
+        if isinstance(query_token, str) and query_token == token:
+            return True
+        return cookie_token == token
 
     @app.middleware("http")
     async def guard(request, call_next):
@@ -816,10 +829,17 @@ def create_app(home=None, dist=None, config=None, analytics=None, series=None, c
         # ``/mcp`` 的判定必须是「等值或前缀」：SDK 目前只注册裸 ``/mcp``，但将来若挂到
         # ``/mcp/<sub>`` 子路径，纯等值判定会让那些请求绕过鉴权直接落到路由层。
         protected = route.startswith("/api/") or route == "/mcp" or route.startswith("/mcp/")
-        if protected and not check_auth(request.headers.get("authorization")):
+        if protected and not check_auth(request.headers.get("authorization"),
+                                        request.query_params.get("token"),
+                                        request.cookies.get("trading_token")):
             # Node 原实现（已退役）：token 缺失/不匹配 → 401 trading/unauthorized
             return error_envelope("trading/unauthorized", "需要 Bearer token", 401)
-        return await call_next(request)
+        response = await call_next(request)
+        # 令牌可能出现在 URL（一次性链接）→ 禁止把带令牌的地址经 Referer 泄给任何第三方；
+        # 同时禁止被中间缓存留存。两行头对正常使用无影响。
+        response.headers.setdefault("Referrer-Policy", "no-referrer")
+        response.headers.setdefault("Cache-Control", "no-store")
+        return response
 
     @app.api_route("/healthz", methods=list(ALL_METHODS))
     async def healthz():

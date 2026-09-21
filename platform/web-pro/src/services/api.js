@@ -12,6 +12,25 @@ import React from "react";
 
 const TOKEN_KEY = "trading_token";
 
+// 一次性链接带令牌（2026-09-21，局域网访问）：``…/?token=<t>`` —— 页面加载时把令牌收进
+// localStorage，并**立刻**用 replaceState 从地址栏与当前历史条目里抹掉，避免它留在
+// 浏览器历史 / 截图 / 复制分享里。之后所有取数走 Authorization 头（不再依赖 URL）。
+// 服务端对 ``?token=`` 与 Cookie 同样放行（见 server/app.py::check_auth），并回
+// ``Referrer-Policy: no-referrer`` 防止带令牌的地址经 Referer 外泄。
+(function consumeUrlToken() {
+  try {
+    const url = new URL(window.location.href);
+    const fromUrl = url.searchParams.get("token");
+    if (!fromUrl) return;
+    localStorage.setItem(TOKEN_KEY, fromUrl);
+    url.searchParams.delete("token");
+    const query = url.searchParams.toString();
+    window.history.replaceState({}, "", `${url.pathname}${query ? `?${query}` : ""}${url.hash}`);
+  } catch {
+    /* 无 URL/localStorage 能力时按原样继续（页面会提示填令牌） */
+  }
+})();
+
 function authHeaders(extra = {}) {
   const headers = { ...extra };
   try {
