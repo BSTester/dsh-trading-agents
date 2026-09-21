@@ -12,7 +12,7 @@
 路径                                          方法    策略族
 ===========================================  ======  ==============================
 ``/api/v3/strategies/event-study``           GET     事件驱动（公告后漂移/事件窗）
-``/api/v3/strategies/stat-arb``              GET     统计套利（协整价差回归）
+``/api/v3/strategies/stat-arb``              GET     统计套利（启发式残差筛选）
 ===========================================  ======  ==============================
 
 两条都是**只读研究端点**：输出统计与研究结论，不产生任何订单/提案执行——执行仍走工作台
@@ -26,8 +26,8 @@
 ① 富途 ``events`` 工具链（公告/事件时间线，既有）：分红/除权除息事件带 ``announced``
    （公告日 ``pub_date``/公告日期）；**没有 ``announced`` 的事件（如财报披露预约的
    「预约日」不是公告时点）一律不入样**，逐源计数（``droppedNoAnnounceTime``）。
-② ``server.v3_nlp.classify_events``（NLP 事件识别，另一工作流在建）：**守卫导入**——
-   缺席/失败 = 该源 0 事件 + 原因如实写进响应（``sources.nlp``），绝不硬凑。
+② ``server.v3_nlp.sentiment_payload`` → ``doc_events``：逐标的取逐文档事件，否定不入样。
+   缺席/失败原文见 ``sources.nlpClassifyEvents``；新闻历史覆盖有限，不冒充完整公告档案。
 
 PIT 纪律（与 FR-DATA-003 一致）：
 
@@ -40,24 +40,24 @@ PIT 纪律（与 FR-DATA-003 一致）：
 * 事件窗内数据不足（公告晚于最后一根 K 线 / 前瞻不足 ``H`` 根）→ 该事件按
   ``noForwardWindow`` 排除并计数，**不截短窗口硬算**。
 
-统计套利方法（numpy 实现；venv 无 statsmodels，``impl`` 字段如实标注）：
+统计套利方法（标准库实现，``impl`` 字段如实标注）：
 
-同市场标的对 → 训练窗 OLS 对冲比率（对数价格，无截距）→ 残差 DF/ADF 平稳性检验
-（t 统计 + MacKinnon(1994) 响应面**近似** p 值，见 ``v3_math.ADF_IMPL_NOTE``）→
-候选对按 p 升序；**p ≥ 0.05 的对一律不入选**——检验就是检验，没有协整对就如实说
-「无协整对」，绝不把检验写死成恒通过。入选对在**样本外测试窗**回测：价差 z-score
-（滚动 ``z_window``、只用 ≤ t-1 的价差）``|z| ≥ z_in`` 进、``|z| ≤ z_out`` 平，
-双腿按 ``Δpos`` 计双边成本。半衰期为 AR(1) 口径。
+同市场标的对 → 训练窗 OLS 对冲比率（对数价格，无截距）→ 单序列 DF 启发式残差筛选
+（MacKinnon(1994) c/N=1 近似 p 值），不是校准的 Engle-Granger 协整检验。
+候选对按未舍入 p 升序；p ≥ 0.05 或不可计算均不入选，无通过者不硬选。
+入选对在样本外测试窗回测：滚动 z-score 只用 ≤ t-1 的价差，双腿按 Δpos 计成本。
 """
 
 import asyncio
+import datetime as dt
 import itertools
 import math
 from typing import Optional
+from zoneinfo import ZoneInfo
 
 from starlette.responses import JSONResponse
 
-from server import v3_math, v3_universe
+from server import v3_math, v3_sources, v3_universe
 from server.data import cache as pit_cache
 
 # v3_analytics 只在本模块**函数内**延迟使用其信封小工具（_call/_error/...）：
@@ -71,7 +71,7 @@ MIN_ALIGNED_DAYS = 80
 #: 训练窗下限（ADF 在更短的窗上没有意义）与测试窗下限（少于 20 天的样本外无说服力）。
 MIN_TRAIN_DAYS = 60
 MIN_TEST_DAYS = 20
-#: ADF 显著性门槛（协整入选线）；检验不显著就是「无协整对」，不放宽。
+#: 单序列 DF 启发式残差筛选门槛，不是协整显著性门槛。
 ADF_PASS_P = 0.05
 #: 事件驱动策略的缺省参数（写进响应，可被查询参数覆盖）。
 DEFAULT_EVENT_DAYS = 730
@@ -135,18 +135,48 @@ def _ok(content):
     return JSONResponse(status_code=200, content=content)
 
 
-def _parse_day(value):
-    """``YYYY-MM-DD`` 前缀的严格解析（公告时点必须可核验）；解析不了 → ``None``。"""
+def _parse_day(value, ticker="", market=""):
     if value in (None, ""):
         return None
-    text = str(value).strip()[:10]
     try:
-        import datetime as _dt
-
-        _dt.datetime.strptime(text, "%Y-%m-%d")
-    except ValueError:
+        moment = dt.datetime.fromisoformat(str(value).strip().replace("Z", "+00:00"))
+        zone = v3_sources.MARKET_TZ.get(v3_sources.detect_market(ticker) or market)
+        if moment.tzinfo is not None and zone:
+            moment = moment.astimezone(ZoneInfo(zone))
+        return moment.date().isoformat()
+    except (ValueError, OverflowError):
         return None
-    return text
+
+
+def _filter_events(events, tickers, days, as_of, market):
+    counts = dict.fromkeys(("droppedTicker", "droppedNoAnnounceTime", "droppedFuture",
+                            "droppedOutsideWindow", "droppedNegated", "droppedMalformed"), 0)
+    kept = []
+    for item in events:
+        if not isinstance(item, dict):
+            counts["droppedMalformed"] += 1
+            continue
+        ticker = v3_sources.normalize_futu_code(item.get("ticker") or "")
+        announced = _parse_day(item.get("announced"), ticker, market)
+        end = _parse_day(as_of, ticker, market)
+        start = (dt.date.fromisoformat(end) - dt.timedelta(days=days - 1)).isoformat()
+        reason = None
+        if ticker not in tickers:
+            reason = "droppedTicker"
+        elif announced is None:
+            reason = "droppedNoAnnounceTime"
+        elif announced > end:
+            reason = "droppedFuture"
+        elif announced < start:
+            reason = "droppedOutsideWindow"
+        elif item.get("negated"):
+            reason = "droppedNegated"
+        if reason:
+            counts[reason] += 1
+        else:
+            kept.append({**item, "ticker": ticker, "announced": announced,
+                         "negated": bool(item.get("negated"))})
+    return kept, counts
 
 
 # ---------------------------------------------------------------------------
@@ -160,86 +190,100 @@ def _load_pit_bars(v3_run, tickers, limit, *, as_of=None, mode=None):
 # ---------------------------------------------------------------------------
 # 事件源
 # ---------------------------------------------------------------------------
-def collect_futu_events(v3_run, tickers, days):
-    """事件源①：富途 ``events`` 工具链。返回 ``(events, sources_report)``。
-
-    只有带**可核验公告时点**（``announced`` 能解析成 ``YYYY-MM-DD``）的事件才入样；
-    缺时点的逐标的计数（``droppedNoAnnounceTime``）——披露预约的「预约日」不是公告时点，
-    不能假装它是。
-    """
+def collect_futu_events(v3_run, tickers, days, *, market="", as_of=None):
     events = []
     report = {}
+    as_of = as_of or _analytics()._series_as_of()
     for ticker in tickers:
         envelope = _call(v3_run, "events", {"ticker": ticker, "days": days})
         if not envelope.get("ok"):
-            report[ticker] = {"ok": False, "error": _tool_error(envelope)}
+            report[ticker] = {"ok": False, "events": 0, "error": _tool_error(envelope)}
             continue
-        value = _value_of(envelope) or {}
-        kept = 0
-        dropped = 0
-        for item in (value.get("events") or []):
+        value = _value_of(envelope)
+        if value is None or not isinstance(value.get("events"), list):
+            report[ticker] = {"ok": False, "events": 0,
+                              "error": {"code": "event/bad-envelope", "message": "events 列表缺失"}}
+            continue
+        raw = []
+        for item in value["events"]:
             if not isinstance(item, dict):
+                raw.append(item)
                 continue
-            announced = _parse_day(item.get("announced"))
-            if announced is None:
-                dropped += 1
-                continue
-            events.append({
-                "ticker": ticker,
-                "announced": announced,
+            raw.append({
+                "ticker": item.get("ticker") or item.get("symbol")
+                          or value.get("ticker") or value.get("symbol") or ticker,
+                "announced": item.get("announced"),
+                "published_at": item.get("announced"),
                 "type": str(item.get("type") or "未分类"),
                 "detail": str(item.get("detail") or "")[:120],
                 "source": str(item.get("source") or "futu/events"),
+                "negated": item.get("negated", False),
             })
-            kept += 1
-        report[ticker] = {"ok": True, "events": kept, "droppedNoAnnounceTime": dropped,
+        kept, counts = _filter_events(raw, tickers, days, as_of, market)
+        events.extend(kept)
+        report[ticker] = {"ok": True, "events": len(kept), **counts,
                           "upstreamStatus": value.get("sources_status")}
     return events, report
 
 
-def collect_nlp_events(home):
-    """事件源②：``server.v3_nlp.classify_events``（**守卫导入**；缺席 = 0 事件 + 说明）。
-
-    该工具由另一工作流在建，签名尚未冻结：这里做**防御性调用**——返回列表或
-    ``{"events": [...]}`` 都认，条目按 ``ticker/symbol`` + ``announced/published_at/
-    time/date`` + ``type/label`` 归一；任何失败（缺属性/TypeError/字段缺时点）都只
-    记原因，不拖垮事件研究。
-    """
+def collect_nlp_events(home, tickers, *, market, days, as_of, deps=None):
     try:
         from server import v3_nlp
-    except Exception as error:  # pragma: no cover —— v3_nlp 常在，防御性保留
+    except Exception as error:  # pragma: no cover
         return [], {"ok": False, "events": 0, "note": f"导入 server.v3_nlp 失败：{error}"}
-    classify = getattr(v3_nlp, "classify_events", None)
-    if not callable(classify):
-        return [], {"ok": False, "events": 0,
-                    "note": "server.v3_nlp.classify_events 尚未实现（另一工作流在建），"
-                            "本源不产生事件——如实说明，不硬凑"}
-    try:
-        raw = classify()
-    except Exception as error:
-        return [], {"ok": False, "events": 0,
-                    "note": f"classify_events 调用失败：{type(error).__name__}: {error}"}
-    if isinstance(raw, dict):
-        raw = raw.get("events")
+    if deps is None:
+        deps = v3_sources.Deps(home=home)
     events = []
-    dropped = 0
-    for item in (raw if isinstance(raw, list) else []):
-        if not isinstance(item, dict):
-            continue
-        ticker = str(item.get("ticker") or item.get("symbol") or item.get("code") or "").strip()
-        announced = _parse_day(item.get("announced") or item.get("published_at")
-                               or item.get("time") or item.get("date"))
-        if not ticker or announced is None:
-            dropped += 1
-            continue
-        events.append({"ticker": ticker, "announced": announced,
-                       "type": str(item.get("type") or item.get("label") or "nlp_event"),
-                       "detail": str(item.get("detail") or item.get("title") or "")[:120],
-                       "source": "v3_nlp/classify_events"})
-    note = None
-    if dropped:
-        note = f"{dropped} 条缺标的或缺可核验时点，未入样"
-    return events, {"ok": True, "events": len(events), "note": note}
+    report = {}
+    # 上游按当前时刻滚动过滤；扩宽取数窗，避免历史 as_of/市场日界的有效文档被提前删掉。
+    age = (dt.datetime.now(dt.timezone.utc).date() - dt.date.fromisoformat(_parse_day(as_of))).days
+    fetch_days = days + max(0, age) + 2
+    for ticker in tickers:
+        ticker_market = v3_sources.detect_market(ticker) or market
+        try:
+            payload = v3_nlp.sentiment_payload(deps, ticker, market=ticker_market,
+                                               days=fetch_days, include_docs=True)
+            if not isinstance(payload, dict):
+                raise ValueError("sentiment_payload 返回非信封对象")
+            if not payload.get("ok"):
+                report[ticker] = {"ok": False, "events": 0, "error": payload.get("error"),
+                                  "chain": payload.get("chain"), "notes": payload.get("notes")}
+                continue
+            docs = payload.get("doc_events")
+            if not isinstance(docs, list):
+                raise ValueError("sentiment_payload 缺少 doc_events 列表")
+            raw = []
+            for doc in docs:
+                if not isinstance(doc, dict) or not isinstance(doc.get("events"), list):
+                    raise ValueError("doc_events 文档形状错误")
+                for item in doc["events"]:
+                    if not isinstance(item, dict) or not item.get("type"):
+                        raise ValueError("doc_events 事件缺少 type")
+                    published = doc.get("published_at") if doc.get("dated") is not False else None
+                    raw.append({**item,
+                                "ticker": doc.get("ticker") or doc.get("symbol"),
+                                "announced": published, "published_at": published,
+                                "source": doc.get("source"),
+                                "documentIndex": doc.get("index"),
+                                "detail": str(doc.get("title") or item.get("matched") or "")[:120]})
+            kept, counts = _filter_events(raw, tickers, days, as_of, market)
+            chain = payload.get("chain") or []
+            report[ticker] = {"ok": True, "events": len(kept), "documents": len(docs), **counts,
+                              "source": payload.get("source"), "chain": chain,
+                              "notes": payload.get("notes"), "fetchDays": fetch_days,
+                              "droppedUpstreamWindowDocuments": sum(
+                                  max(0, row["rows"] - row["in_window"]) for row in chain
+                                  if "rows" in row and "in_window" in row)}
+            events.extend(kept)
+        except Exception as error:
+            report[ticker] = {"ok": False, "events": 0,
+                              "error": {"code": "event/nlp-failed",
+                                        "message": f"{type(error).__name__}: {error}"}}
+    return events, {"ok": all(item["ok"] for item in report.values()),
+                    "events": len(events), "byTicker": report,
+                    "note": "新闻返回的历史覆盖有限，非完整公告档案；仅统计返回的逐文档事件。"
+                            "上游未提供逐文档标的归属的新闻会被排除，计入 droppedTicker；"
+                            "不以检索关键字推定归属。source 仅保留原文出版社，缺失不回填取数源。"}
 
 
 def _dedupe_events(events):
@@ -268,9 +312,8 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
         {ok, market, universeSource, params, sources, pit,
          events: [{ticker, type, announced, detail, source, status,
                    entryDate?, exitDate?, retPct?, entryClose?, exitClose?}],
-         summary: {sampled, measured, excluded, meanRetPct, winRatePct,
-                   caarPct, byType: [...]},
-         carCurve: [{offset, aarPct, carPct, n}],
+         summary: {sampled, measured, excluded, meanRetPct, winRatePct, byType: [...]},
+         returnCurve: [{offset, meanDailyRetPct, meanCumulativeRetPct, n}],
          equityCurve: [{t, value, active}],
          sample: {minEvents, sufficient, note}}
 
@@ -278,8 +321,8 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
 
       * 事件日 ``t`` = 公告日（PIT：``t`` 当日收盘后可知）⇒ 次日收盘建仓、持有 ``H``
         个交易日平仓；``retPct = close[exit]/close[entry] - 1``。
-      * ``carCurve``：经典等权 CAR——``AAR(k)`` = 各事件第 k 日累计收益的均值，
-        ``CAR(k) = Σ AAR``（未做市场调整，无基准模型——``method`` 如实标注）。
+      * ``returnCurve``：分别平均各事件第 k 日的当日收益与买入持有累计收益；
+        无基准模型，不是超额收益，不将累计收益再次相加。
       * ``equityCurve``：等权组合口径——每个交易日对**活跃事件**（已建仓未平仓）的当日
         收益取平均并复利；无活跃事件的交易日净值持平。
       * 样本不足（实测事件数 < ``min_events``，缺省 5）→ ``sample.sufficient=false`` +
@@ -289,7 +332,7 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
     """
     v3_analytics = _analytics()
     try:
-        days = _clamp_int(days, DEFAULT_EVENT_DAYS, 30, 2000)
+        days = _clamp_int(days, DEFAULT_EVENT_DAYS, 1, 2000)
         horizon = _clamp_int(horizon, DEFAULT_HORIZON, 1, 60)
         min_events = _clamp_int(min_events, DEFAULT_MIN_EVENTS, 1, 500)
         limit = _clamp_int(limit, 500, 60, 2000)
@@ -319,16 +362,17 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
             names = list(universe.get("tickers") or [])[:EVENT_UNIVERSE_LIMIT]
         else:
             names = v3_analytics.read_watchlist(home)[:EVENT_UNIVERSE_LIMIT]
+        names = list(dict.fromkeys(v3_sources.normalize_futu_code(name) for name in names))
         if not names:
             return _error("event/no-universe",
                           "事件研究需要至少一个标的（请求未给 tickers，自选池也为空）",
                           market=code)
 
-        futu_events, futu_report = collect_futu_events(v3_run, names, days)
-        nlp_events, nlp_report = collect_nlp_events(home)
+        as_of = v3_analytics._series_as_of()
+        futu_events, futu_report = collect_futu_events(v3_run, names, days, market=code, as_of=as_of)
+        nlp_events, nlp_report = collect_nlp_events(home, names, market=code, days=days, as_of=as_of)
         events = _dedupe_events(futu_events + nlp_events)
 
-        as_of = v3_analytics._series_as_of()
         envelopes, load_errors = _load_pit_bars(v3_run, names, limit, as_of=as_of)
         bars_by_ticker = {ticker: list(envelope.get("bars") or [])
                           for ticker, envelope in envelopes.items()}
@@ -367,7 +411,8 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
                 continue
             entry_close = closes[entry]
             exit_close = closes[entry + horizon]
-            if not entry_close or exit_close is None:
+            # to_float 已排除非有限值；完整持有路径缺价或非正都不计入实测样本。
+            if any(close is None or close <= 0 for close in closes[entry:entry + horizon + 1]):
                 excluded["noForwardWindow"] += 1
                 row["status"] = "noForwardWindow"
                 rows.append(row)
@@ -381,44 +426,44 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
                 "exitClose": v3_math.round_half_up(exit_close, 4),
                 "retPct": v3_math.round_half_up(ret_pct, 2),
             })
-            measured.append({**row, "_entryIndex": entry})
+            measured.append({**row, "_entryIndex": entry, "_retPct": ret_pct})
             rows.append(row)
 
-        car_curve = []
+        return_curve = []
         for offset in range(1, horizon + 1):
-            values = []
+            daily = []
+            cumulative = []
             for item in measured:
                 bars = bars_by_ticker[item["ticker"]]
                 entry = item["_entryIndex"]
-                exit_close = v3_math.to_float(bars[entry + offset].get("c"))
+                current = v3_math.to_float(bars[entry + offset].get("c"))
+                previous = v3_math.to_float(bars[entry + offset - 1].get("c"))
                 entry_close = v3_math.to_float(bars[entry].get("c"))
-                if exit_close is None or not entry_close:
+                if current is None or not previous or not entry_close:
                     continue
-                values.append((exit_close / entry_close - 1) * 100)
-            aar = v3_math.mean(values) if values else None
-            car_curve.append({
+                daily.append((current / previous - 1) * 100)
+                cumulative.append((current / entry_close - 1) * 100)
+            return_curve.append({
                 "offset": offset,
-                "aarPct": None if aar is None else v3_math.round_half_up(aar, 3),
-                "n": len(values),
+                "meanDailyRetPct": v3_math.round_half_up(v3_math.mean(daily), 3) if daily else None,
+                "meanCumulativeRetPct": (v3_math.round_half_up(v3_math.mean(cumulative), 3)
+                                         if cumulative else None),
+                "n": len(cumulative),
             })
-        running = 0.0
-        for point in car_curve:
-            running += point["aarPct"] or 0.0
-            point["carPct"] = v3_math.round_half_up(running, 3)
 
         equity_curve = _event_daily_returns(measured, bars_by_ticker)
-        returns = [item["retPct"] for item in measured]
+        returns = [item["_retPct"] for item in measured]
         wins = sum(1 for value in returns if value > 0)
         by_type = {}
         for item in measured:
-            bucket = by_type.setdefault(item["type"], {"type": item["type"], "measured": 0,
-                                                       "returns": []})
-            bucket["returns"].append(item["retPct"])
+            bucket = by_type.setdefault(item["type"], {"type": item["type"], "returns": []})
+            bucket["returns"].append(item["_retPct"])
         type_rows = []
         for bucket in sorted(by_type.values(), key=lambda item: item["type"]):
             values = bucket.pop("returns")
             bucket.update({
                 "events": len(values),
+                "measured": len(values),
                 "meanRetPct": v3_math.round_half_up(v3_math.mean(values), 2),
                 "winRatePct": v3_math.round_half_up(
                     (sum(1 for value in values if value > 0) / len(values)) * 100, 1),
@@ -427,15 +472,14 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
 
         measured_count = len(measured)
         sufficient = measured_count >= min_events
-        caar = car_curve[-1]["carPct"] if car_curve else None
         summary = {
             "sampled": len(events),
+            "deduplicated": len(futu_events) + len(nlp_events) - len(events),
             "measured": measured_count,
             "excluded": excluded,
             "meanRetPct": v3_math.round_half_up(v3_math.mean(returns), 2) if returns else None,
             "winRatePct": (v3_math.round_half_up(wins / measured_count * 100, 1)
                            if measured_count else None),
-            "caarPct": caar,
             "byType": type_rows,
         }
         sample = {
@@ -451,9 +495,11 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
             "universeSource": universe_source,
             "params": {"days": days, "horizon": horizon, "minEvents": min_events,
                        "limit": limit},
-            "method": ("公告日 t 收盘后可知 → 次日收盘建仓、持有 H 个交易日平仓；"
-                       "CAR 未做市场调整（无基准模型），等权口径"),
-            "sources": {"futuEvents": {"ok": True, "byTicker": futu_report},
+            "method": ("公告日 t 收盘后可知 → 首个后续交易日收盘建仓、持有 H 个交易日平仓；"
+                       "无基准，不计算超额收益；returnCurve 按事件等权，分别平均当日与买入持有收益。"
+                       "equityCurve 按日对活跃事件当日收益等权复利，非事件末期收益均值"),
+            "sources": {"futuEvents": {"ok": all(item["ok"] for item in futu_report.values()),
+                                       "byTicker": futu_report},
                         "nlpClassifyEvents": nlp_report},
             "pit": {"asOf": as_of, "mode": pit_cache.AS_OF_INCLUSIVE,
                     "semantics": pit_cache.semantics_text(pit_cache.AS_OF_INCLUSIVE, as_of),
@@ -462,7 +508,7 @@ def event_study(v3_run, home=None, *, tickers_raw=None, market="SH", days=DEFAUL
             "seriesErrors": load_errors or None,
             "events": rows,
             "summary": summary,
-            "carCurve": car_curve,
+            "returnCurve": return_curve,
             "equityCurve": equity_curve,
             "sample": sample,
             **({} if sufficient else {"note": sample["note"]}),
@@ -522,32 +568,22 @@ def _event_daily_returns(measured, bars_by_ticker, horizon=DEFAULT_HORIZON):
 # ---------------------------------------------------------------------------
 def stat_arb(v3_run, home=None, *, market="SH", tickers_raw=None, limit=500,
              train_ratio=0.7, z_window=60, z_in=2.0, z_out=0.5, cost_bps=5.0):
-    """统计套利策略（协整价差回归）——只读研究，不出订单。
+    """统计套利：训练窗单序列 DF 启发式残差筛选 + 样本外价差回测，只读研究。
 
     契约::
 
         {ok, market, universeSource, impl, params, pit, aligned,
          candidates: [{pair, hedgeRatio, adfTStat, adfPValue, adfPass,
                        halfLifeDays, trainCorr, observations}],
-         cointegrated: bool, selected: {...} | null,
-         backtest: {window, metrics, equityCurve, turnover, trades, roundTrips,
+         screenPassed: bool, selected: {...} | null,
+         backtest: {window, metrics, equityCurve, turnover, entries, roundTrips,
                     winRatePct, exposurePct, costPaidPct} | null,
          sample: {sufficient, note}, note?}
 
-    方法（``impl`` 如实标注 numpy 自实现；venv 无 statsmodels）：
-
-      1. 同市场标的对（显式 ``tickers`` 优先，否则该市场宇宙前 8 只）；
-      2. 训练窗（前 ``train_ratio``）对数价格 OLS 对冲比率（无截距）；
-      3. 训练窗残差 DF/ADF 检验：t 统计 + MacKinnon(1994) **近似** p 值
-         （``v3_math.ADF_IMPL_NOTE``）；半衰期 = AR(1)；
-      4. ``adfPValue < 0.05`` 才算协整候选；**一个都没有 → ``cointegrated: false``**
-         + 说明（检验不显著就如实说，绝不硬选）；
-      5. 入选对在**样本外测试窗**回测：价差 z-score（滚动 ``z_window``，只用 ≤ t-1 的
-         价差——PIT：决策不含当日）``|z| ≥ z_in`` 进（反向），``|z| ≤ z_out`` 平；
-         双腿成本按 ``|Δpos| × (1+|β|) × cost_bps`` 计。
-
-    选对在训练窗完成（in-sample），权益曲线在测试窗（out-of-sample）；多重比较
-    （28 对里挑 1）的偏差在 ``note`` 如实声明。
+    同市场配对；训练窗无截距 OLS 后对残差做单序列 DF，p < 0.05 才通过启发式筛选。
+    不是校准 Engle-Granger 协整检验；无通过者 selected/backtest 为 null。
+    测试窗 z-score 只用 ≤ t-1，双腿按 |Δpos| × (1+|β|) × cost_bps 计成本。
+    选对在训练窗完成；多重比较偏差在 note 如实声明。
     """
     v3_analytics = _analytics()
     try:
@@ -663,8 +699,8 @@ def stat_arb(v3_run, home=None, *, market="SH", tickers_raw=None, limit=500,
             "ok": True,
             "market": code,
             "universeSource": universe_source,
-            "impl": ("numpy 自实现（venv 无 statsmodels/scipy）；p 值为 MacKinnon(1994) "
-                     "响应面近似口径，非精确分布"),
+            "impl": ("标准库单序列 DF 启发式残差筛选，非校准 Engle-Granger 协整检验；"
+                     "MacKinnon(1994) c/N=1 左尾响应面近似 p 值"),
             "params": {"trainRatio": train_ratio, "zWindow": z_window, "zIn": z_in,
                        "zOut": z_out, "costBps": cost_bps, "adfPassP": ADF_PASS_P,
                        "trainDays": train_n, "testDays": test_n},
@@ -673,14 +709,15 @@ def stat_arb(v3_run, home=None, *, market="SH", tickers_raw=None, limit=500,
             "aligned": {"days": total, "from": dates[0], "to": dates[-1],
                         "pairsConsidered": len(pairs)},
             "candidates": candidates,
-            "cointegrated": bool(passing),
+            "screenPassed": bool(passing),
         }
         if not passing:
             base["selected"] = None
             base["backtest"] = None
             base["sample"] = {"sufficient": True}
-            base["note"] = (f"无协整对：{len(candidates)} 个候选对的近似 p 值全部 ≥ "
-                            f"{ADF_PASS_P}——检验不显著就如实说明，不硬凑价差策略")
+            base["note"] = (f"无候选通过：{len(candidates)} 对的单序列 DF 近似 p 值 ≥ "
+                            f"{ADF_PASS_P} 或不可计算；这是启发式残差筛选，非校准 "
+                            "Engle-Granger 协整检验，不硬选")
             return base
 
         selected = passing[0]
@@ -692,7 +729,8 @@ def stat_arb(v3_run, home=None, *, market="SH", tickers_raw=None, limit=500,
                              "trainCorr", "observations")}
         base["backtest"] = backtest
         base["sample"] = {"sufficient": True}
-        base["note"] = ("对选取用训练窗 ADF（in-sample），权益曲线在样本外测试窗（out-of-sample）；"
+        base["note"] = ("选对仅用训练窗单序列 DF 启发式残差筛选，非校准 Engle-Granger 协整检验；"
+                        "权益曲线在样本外测试窗（out-of-sample）；"
                         "从多个候选对里挑 1 个存在多重比较偏差，样本外表现不代表未来")
         return base
     except Exception as error:  # noqa: BLE001
@@ -819,7 +857,7 @@ def register(app, v3_run, home):
                                         horizon: int = DEFAULT_HORIZON,
                                         min_events: int = DEFAULT_MIN_EVENTS,
                                         limit: int = 500):
-        """事件驱动策略（公告后漂移/事件窗口）：真实公告事件 + 每事件收益 + CAR + 等权曲线。
+        """事件驱动策略：逐文档公告事件 + 当日/累计收益均值 + 活跃事件等权净值。
 
         事件必须带可核验公告时点（缺时点不入样）；样本 < ``min_events`` 时如实返回
         「样本不足」。``market`` 缺省 SH；``tickers`` 显式给出时优先（cap 8 只）。
@@ -835,11 +873,7 @@ def register(app, v3_run, home):
                                      limit: int = 500, train_ratio: float = 0.7,
                                      z_window: int = 60, z_in: float = 2.0,
                                      z_out: float = 0.5, cost_bps: float = 5.0):
-        """统计套利策略（协整价差回归）：OLS 对冲比率 + ADF（近似 p）+ 价差 z 回测。
-
-        无协整对时如实返回 ``cointegrated=false``（检验不显著不硬选）；权益曲线在
-        样本外测试窗。``impl`` 如实标注 numpy 自实现与近似口径。
-        """
+        """单序列 DF 启发式残差筛选，非校准协整检验；screenPassed=false 时不硬选。"""
         def work():
             return stat_arb(v3_run, home, market=market, tickers_raw=tickers, limit=limit,
                             train_ratio=train_ratio, z_window=z_window, z_in=z_in,

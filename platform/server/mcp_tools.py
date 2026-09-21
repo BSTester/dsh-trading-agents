@@ -380,6 +380,7 @@ TOOLS = (
         (
             req("tickers", "str_list", "标的列表"),
             opt("window", "int", "窗口长度（根）"),
+            opt("as_of", "str", "历史上界（严格 YYYY-MM-DD）；仅可见价量，不含实时估值，空值保持最新口径"),
             REFRESH,
         ),
     ),

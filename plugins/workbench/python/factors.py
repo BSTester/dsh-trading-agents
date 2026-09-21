@@ -15,8 +15,10 @@
 输出: JSON
 """
 import argparse
+from datetime import date
 import json
 import math
+import re
 import sys
 from pathlib import Path
 
@@ -31,6 +33,19 @@ FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
                # 估值历史分位（富途）：分位越低越便宜 → 负向
                "pe_ttm_pct": -1, "pb_pct": -1, "ps_pct": -1}
 TRADING_DAYS = 252
+
+
+def _as_of_date(value):
+    """完整日历日或未指定；子进程只依赖标准库，不截断、不默认为今天。"""
+    if value is None or value == "":
+        return None
+    if not isinstance(value, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", value) is None:
+        raise ValueError("Invalid as_of date (YYYY-MM-DD)")
+    try:
+        date.fromisoformat(value)
+    except ValueError as error:
+        raise ValueError("Invalid as_of date (YYYY-MM-DD)") from error
+    return value
 
 
 def pit_gate(bars, as_of):
@@ -158,8 +173,8 @@ def composite(rows, keys):
 
 
 def snapshot(tickers, window, as_of=None):
+    as_of = _as_of_date(as_of)
     rows, sources, failures = [], set(), {}
-    rejected_future = 0
     for ticker in tickers:
         try:
             bars, source = closes_volumes(ticker, window, as_of=as_of)
@@ -167,28 +182,33 @@ def snapshot(tickers, window, as_of=None):
             if values is None:
                 raise RuntimeError("样本不足")
             sources.add(source)
-            try:
-                valuation, valuation_source = valuation_values(ticker)
-                values.update({k: v for k, v in valuation.items() if v is not None})
-                if valuation_source:
-                    sources.add(valuation_source)
-            except Exception:
-                pass  # 估值缺失不影响价量因子
+            # 估值源只有实时口径；显式历史查询必须在调用前隔离，不能取完再丢弃。
+            if as_of is None:
+                try:
+                    valuation, valuation_source = valuation_values(ticker)
+                    values.update({k: v for k, v in valuation.items() if v is not None})
+                    if valuation_source:
+                        sources.add(valuation_source)
+                except Exception:
+                    pass  # 估值缺失不影响价量因子
             rows.append({"ticker": ticker, "factors": values, "as_of": bars[-1]["t"]})
         except Exception as error:
             failures[ticker] = str(error)[:80]
     if len(rows) < 2:
-        raise RuntimeError("有效标的不足 2 个，无法做横截面比较")
+        detail = (f"；仅获取最近 {min(max(window, 80), 900)} 根日线，历史缺失不回填；{failures}"
+                  if as_of else "")
+        raise RuntimeError("有效标的不足 2 个，无法做横截面比较" + detail)
     keys = list(FACTOR_SIGN)
     zscores(rows, keys)
     ranked = composite(rows, keys)
     for row in rows:
         row["factors"] = {k: (round(v, 5) if isinstance(v, float) else v) for k, v in row["factors"].items()}
     if as_of:
-        # as_of 模式的口径披露：价量列只由该时点可见序列算出；逐标的最后一根可见 bar
-        # 就是 rows[].as_of（因停牌可能早于 as_of——缺的就是缺，不向后填补）。
-        note = ("价量 + 估值因子横截面 z-score 合成打分；估值优先富途 MCP（PE/PB/PS + 历史分位），失败回退同花顺；缺失时自动跳过估值维度。"
-                f" PIT：价量因子只由 t <= {as_of} 的可见日线算出（INCLUSIVE）。")
+        # rows[].as_of 是最后一根可见日线日期（停牌可能早于上界，不向后填补）。
+        note = (f"PIT：价量因子只由 t <= {as_of} 的可见日线算出（INCLUSIVE），横截面 z-score 合成。"
+                "估值无 PIT 数据，未并入原始值、z-score 或合成权重。"
+                f"仅从 load_bars 返回的最近 {min(max(window, 80), 900)} 根日线中筛选，"
+                "不保证任意历史都能重建；可见日线不足 65 根的标的报不足，不回填。")
     else:
         note = "价量 + 估值因子横截面 z-score 合成打分；估值优先富途 MCP（PE/PB/PS + 历史分位），失败回退同花顺；缺失时自动跳过估值维度。"
     out = {"tickers": [r["ticker"] for r in ranked], "rows": ranked, "factors": keys,
@@ -261,6 +281,7 @@ def main():
     args = ap.parse_args()
 
     try:
+        args.as_of = _as_of_date(args.as_of)
         tickers = [t.strip().upper() for t in args.tickers.split(",") if t.strip()][:8]
         if len(tickers) < 2:
             raise RuntimeError("至少两个标的")

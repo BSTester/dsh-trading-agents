@@ -223,15 +223,17 @@ TOOL_DOCS = {
                     "**不伪造、不返回空 rows**。"
                     + _READ_NOTE,
     "/api/v3/strategies/event-study": "事件驱动策略（FR-STRAT-002，只读研究、不出订单）：真实公告事件"
-                                       "（必须带可核验公告时点，缺时点不入样）+ 每事件收益 + 平均 CAR + "
-                                       "分类型分组 + 等权权益曲线。事件日 t 公告收盘后可知 → 次日建仓、"
-                                       "持有 H 个交易日平仓。样本 < min_events 如实返回「样本不足」。"
-                                       "K 线全量经 data.cache PIT 闸门。"
+                                       "（必须带可核验公告时点，缺时点不入样）+ 每事件收益 + returnCurve "
+                                       "（无基准，分别平均每日与买入持有累计收益）+ 分类型统计。"
+                                       "equityCurve 按日对活跃事件收益等权复利，非事件末期收益均值。"
+                                       "公告日收盘后可知 → 首个后续交易日收盘建仓，持有 H 日。"
+                                       "样本 < min_events 如实返回不足；K 线经 data.cache PIT 闸门。"
                                        + _READ_NOTE,
     "/api/v3/strategies/stat-arb": "统计套利策略（FR-STRAT-002，只读研究、不出订单）：同市场标的对 → 训练窗 "
-                                    "OLS 对冲比率 → 残差 ADF（numpy 自实现，p 为 MacKinnon(1994) 近似口径，"
-                                    "impl 如实标注）→ 价差 z（|z|≥z_in 进、|z|≤z_out 平）样本外双腿回测"
-                                    "（含成本）。无协整对时如实返回 cointegrated=false，检验不显著不硬选。"
+                                    "OLS 对冲比率 → 单序列 DF 启发式残差筛选（标准库实现，MacKinnon(1994) "
+                                    "c/N=1 左尾近似 p，非校准 Engle-Granger 协整检验）→ 样本外双腿回测"
+                                    "（含成本，z 信号仅用 t-1 及之前）。无通过者 screenPassed=false，"
+                                    "selected/backtest=null，不硬选，不据此证明协整。"
                                     + _READ_NOTE,
     "/api/v3/strategy": "最近一轮研究流水线（PDAT→PET）结果；从未运行过 → run=null 并说明。"
                         + _READ_NOTE,
@@ -288,8 +290,11 @@ PARAM_DOCS = {
     "api": "Tushare 接口名（需在服务端受支持清单内）",
     "ts_code": "Tushare 标的代码，如 600519.SH",
     "classes": "因子类别选择（quality,growth,sentiment 缺省；all 含实时另类；none 只要价量/估值列）",
-    "as_of": "PIT 上界（YYYY-MM-DD），缺省今天（UTC）。/api/v3/factors/matrix 显式给出时价量列"
-             "只由该时点可见数据算出（经 data.cache PIT 闸门），实时估值/另类列与 IC 不并入",
+    "as_of": "PIT 上界（严格完整 YYYY-MM-DD 日历日）。工作台 factors 未指定/空值保持最新口径；"
+             "显式给出时仅用 t <= as_of 的价量日线，估值无 PIT 数据，未并入原始值、z-score 或合成权重。"
+             "仅筛选最近 window 根（最多 900 根），不足 65 根报不足，不保证任意历史可重建。"
+             "/api/v3/factors/matrix 显式给出时价量列经 data.cache PIT 闸门，实时估值/另类列与 IC "
+             "不并入；未指定保持最新口径。其他端点缺省今天（UTC）",
     "session": "会话 id（缺省聚合全部会话）",
     "offset": "分页起点（缺省 0）",
     "success": "只看成功/失败（true|false；非法值不过滤）",

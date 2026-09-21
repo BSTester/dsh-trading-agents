@@ -35,6 +35,7 @@ import subprocess
 import sys
 import threading
 import time
+from datetime import date
 from pathlib import Path
 
 # 脚本目录：analytics.js:8 / series.js:8 的 `new URL("../python/", import.meta.url)`。
@@ -272,21 +273,22 @@ def _events_args(payload, force):
 def _factors_args(payload, force):
     """analytics.js:133-142：``snapshot --tickers a,b --window <window>``（2..8 标的，80..1000）。
 
-    FR-DATA-003（2026-09-21 任务 4）：链路接受可选 ``as_of``（``YYYY-MM-DD``）——
-    CLI 侧在取数后按 ``t <= as_of`` 做 PIT 闸门（INCLUSIVE，与 ``server.data.cache``
-    的字符串比较逐字同口径）。既有调用零改动：不传 ``as_of`` 时参数列表与迁移前逐字一致。
-    注意：``app.ANALYTICS_ENDPOINTS`` 的字段白名单目前只放行 ``tickers``/``window``，
-    工具面调用要带 ``as_of`` 需先在该白名单登记（本任务范围外，见 docs/e2e-and-data-gaps.md）。
+    可选 ``as_of`` 必须是完整合法日历日（``YYYY-MM-DD``），不截断、不转换类型。
+    CLI 侧按 ``t <= as_of`` 做 PIT 闸门，且不读取实时估值；最近日线窗口不足时如实报错。
+    不传/None/空串时参数列表与迁移前逐字一致，保持最新口径。
     """
     tickers = _ticker_list(payload.get("tickers"), 2, "tickers must list 2..8 symbols")
     window = _int_in_range(payload.get("window"), 250, 80, 1000, "window")
     args = ["snapshot", "--tickers", ",".join(tickers), "--window", str(window)]
     as_of = payload.get("as_of")
     if as_of not in (None, ""):
-        text = str(as_of).strip()[:10]
-        if re.match(r"^\d{4}-\d{2}-\d{2}$", text) is None:
-            raise PayloadError("Invalid as_of date")
-        args.extend(["--as-of", text])
+        if not isinstance(as_of, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", as_of) is None:
+            raise PayloadError("Invalid as_of date (YYYY-MM-DD)")
+        try:
+            date.fromisoformat(as_of)
+        except ValueError as error:
+            raise PayloadError("Invalid as_of date (YYYY-MM-DD)") from error
+        args.extend(["--as-of", as_of])
     return args
 
 

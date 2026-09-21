@@ -898,6 +898,8 @@ def classify_events(docs, *, now=None):
         ``published_at=null``（策略侧据此剔除，不猜时间）；``events`` 聚合里
         ``count`` 含这类文档，``latest_at`` / ``first_seen`` 只用时间可解析的文档算，
         全部不可解析时为 ``null``；
+      * **归属诚实**：``doc_events`` 仅透传原文已有的 ``ticker`` / ``symbol``、
+        ``source``、``title``，不以检索关键字推定公司归属，缺失字段不猜填；
       * **排序**：``events`` 按 ``count`` 降序 → 有新近时间者在前 → ``type`` 字典序
         （稳定可复现）；``doc_events`` 保持输入顺序（``index`` 对位）。
     """
@@ -913,6 +915,8 @@ def classify_events(docs, *, now=None):
             "dated": dated,
             "published_at": published.isoformat() if dated else None,
             "events": events,
+            **({key: doc[key] for key in ("ticker", "symbol", "source", "title") if key in doc}
+               if isinstance(doc, dict) else {}),
         })
         for event in events:
             entry = tally.get(event["type"])

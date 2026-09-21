@@ -41,7 +41,7 @@
 ``/api/v3/ml/backtest``          POST    单标的动量 long/flat 回测（PIT）
 ``/api/v3/ml/models``            GET     ML 策略族（Lasso/GBDT/MLP）与动量基线同口径评估
 ``/api/v3/strategies/event-study`` GET   事件驱动策略（FR-STRAT-002；由本模块代挂
-                                         ``server.v3_strategies``，真实公告事件 + CAR）
+                                         ``server.v3_strategies``，真实公告事件 + 持有收益）
 ``/api/v3/strategies/stat-arb``  GET     统计套利策略（FR-STRAT-002；OLS 对冲比率 +
                                          ADF 近似 p + 价差 z 双腿回测）
 ===============================  ======  ================================================
@@ -63,9 +63,11 @@ SQL 过滤，也不再自己开只读连接；「哪些路径有意不走 TTL」
 """
 
 import asyncio
+import copy
 import json
 import math
 import os
+import re
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -877,8 +879,7 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
     :data:`FACTOR_REGISTRY` 的 ``direction`` 参与 ``strategy_run`` 的扩展综合分；
     ``as_of`` 显式给出时用它做 PIT 上界（缺省 = 今天，UTC）。
 
-    **as_of 模式（2026-09-21，任务 4）**：``as_of`` 显式给出时，价量列不再来自工作台
-    ``factors`` 工具（其 payload 白名单不接受 ``as_of``，返回的是最新口径），而是：
+    **as_of 模式**：``as_of`` 显式给出时，价量列保留独立 PIT 复算路径：
     K 线经 ``server.data.cache``（显式 ``as_of`` + INCLUSIVE）读取 →
     ``v3_math.price_volume_factor_values``（与 workbench factors.py 同公式）本地复算 →
     横截面 z 同口径打分。响应里 ``matrix.as_of`` 是**价量列实际日期**，
@@ -891,7 +892,10 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
             factor = "mom_20"
         factor = str(factor).strip()
         forward_days = _clamp_int(forward_days, 5, 1, 250)
-        pit_date = _pit_date(as_of)
+        try:
+            pit_date = _pit_date(as_of)
+        except pit_cache.PitError as error:
+            return _error("factors/bad-as-of", str(error))
 
         wanted = _factor_classes(classes)
         code = None
@@ -929,12 +933,6 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
 
         explicit_as_of = as_of not in (None, "")
         if explicit_as_of:
-            # 任务 4（FR-DATA-003 收尾）：as_of 显式给出 ⇒ 价量列**必须**是该时点可见的
-            # 数据。工作台 ``factors`` 工具面的 payload 白名单在 app.ANALYTICS_ENDPOINTS
-            #（本任务不改），as_of 无法透传给子进程；因此这里改为：K 线经
-            # ``server.data.cache``（PIT 唯一入口，显式 as_of + INCLUSIVE）读取后，
-            # 用与 workbench factors.py **同一份公式**（v3_math.price_volume_factor_values）
-            # 本地复算，横截面 z 与工作台同口径（n-1 样本 std、截断 ±3）。
             price_volume = _price_volume_rows_pit(v3_run, names, pit_date)
             base_rows = price_volume["rows"]
             price_volume_pit = price_volume["pit"]
@@ -946,7 +944,7 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
                 return {"ok": False, "error": _tool_error(envelope), "market": code}
             value = _value_of(envelope) or {}
             rows = value.get("rows")
-            base_rows = [row for row in (rows if isinstance(rows, list) else [])
+            base_rows = [copy.deepcopy(row) for row in (rows if isinstance(rows, list) else [])
                          if isinstance(row, dict)]
             price_volume_pit = None
             failures = value.get("failures") if isinstance(value.get("failures"), dict) else {}
@@ -1073,8 +1071,7 @@ def _price_volume_rows_pit(v3_run, names, pit_date):
         raw = {ticker: value for ticker, value in raw.items() if value is not None}
         if len(raw) < 2:
             continue
-        zs = v3_math.cross_sectional_z(list(raw.values()))
-        by_ticker = {ticker: z for ticker, z in zip(sorted(raw), zs)}
+        by_ticker = _cross_sectional_z_map(raw)
         for row in rows:
             z = by_ticker.get(row["ticker"])
             if z is not None:
@@ -1109,15 +1106,11 @@ def _factor_classes(raw):
 
 
 def _pit_date(as_of):
-    """PIT 上界（``YYYY-MM-DD``）：显式 ``as_of`` → 归一；缺省 = 今天（UTC）。"""
-    if as_of not in (None, ""):
-        text = str(as_of).strip()[:10]
-        try:
-            datetime.strptime(text, "%Y-%m-%d")
-            return text
-        except ValueError:
-            pass
-    return datetime.now(timezone.utc).date().isoformat()
+    if as_of in (None, ""):
+        return datetime.now(timezone.utc).date().isoformat()
+    if not isinstance(as_of, str) or re.fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", as_of) is None:
+        raise pit_cache.PitError("as_of 需为完整有效的 YYYY-MM-DD")
+    return pit_cache.normalize_as_of(as_of)
 
 
 def _factor_extras(v3_run, home, names, base_rows, wanted, pit_date, market, *,
@@ -1127,7 +1120,7 @@ def _factor_extras(v3_run, home, names, base_rows, wanted, pit_date, market, *,
     ``extras`` 形状 ``{factor_key: {ticker: raw_value}}``；取不到的标的**不出现在**该字典里
     （不是 0，也不是均值）；每个因子的缺失原因汇总进 ``missing``。
     """
-    extras = {key: {} for key in ("gross_margin", "net_margin", "revenue_yoy",
+    extras = {key: {} for key in ("gross_margin", "net_margin", "roe", "roa", "revenue_yoy",
                                   "net_profit_yoy", "sentiment", "capital_flow",
                                   "short_interest")}
     missing = []
@@ -1138,11 +1131,13 @@ def _factor_extras(v3_run, home, names, base_rows, wanted, pit_date, market, *,
             home, names, pit_date,
             want_quality=bool(wanted & {"quality", "growth"}),
             want_sentiment=bool(include_sentiment and "sentiment" in wanted))
+        classes_by_key = {entry["key"]: entry["class"] for entry in FACTOR_REGISTRY}
         for key, values in local.items():
-            extras[key].update(values)
-        missing.extend(local_missing)
+            if classes_by_key[key] in wanted:
+                extras[key].update(values)
+        missing.extend(item for item in local_missing if classes_by_key[item["key"]] in wanted)
         for key, value in local_sources.items():
-            if value:
+            if value and key in wanted:
                 sources[key] = value
 
     if "alternative" in wanted:
@@ -1170,7 +1165,7 @@ def local_factor_extras(home, names, pit_date, *, want_quality=True, want_sentim
     一次打开交易库、逐标的读数；交易库缺失时全部返回空 + 原因（绝不用均值/0 顶替）。
     返回 ``(extras, missing, sources)``，形状与 :func:`_factor_extras` 一致。
     """
-    extras = {key: {} for key in ("gross_margin", "net_margin", "revenue_yoy",
+    extras = {key: {} for key in ("gross_margin", "net_margin", "roe", "roa", "revenue_yoy",
                                   "net_profit_yoy", "sentiment")}
     missing = []
     sources = {"quality": None, "growth": None, "sentiment": None}
@@ -1178,7 +1173,7 @@ def local_factor_extras(home, names, pit_date, *, want_quality=True, want_sentim
     if want_quality:
         if conn is None:
             reason = f"交易库 {_trading_store_path(home)} 不存在或不可只读打开"
-            for key in ("gross_margin", "net_margin", "revenue_yoy", "net_profit_yoy"):
+            for key in ("gross_margin", "net_margin", "roe", "roa", "revenue_yoy", "net_profit_yoy"):
                 missing.append({"key": key, "reason": reason})
             sources["quality"] = f"trading-data/fundamentals 不可读（{reason}）"
             sources["growth"] = sources["quality"]
@@ -1196,9 +1191,11 @@ def local_factor_extras(home, names, pit_date, *, want_quality=True, want_sentim
                     reasons.setdefault(key, []).append(f"{ticker}：{reason}")
             conn.close()
             sources["quality"] = (f"trading-data/fundamentals（PIT announced_at ≤ {pit_date}；"
-                                  f"{records}/{len(names)} 只有可用财报）")
-            sources["growth"] = sources["quality"]
-            for key in ("gross_margin", "net_margin", "revenue_yoy", "net_profit_yoy"):
+                                  f"{records}/{len(names)} 只有可用财报；毛利/净利率来自财报科目，"
+                                  "ROE/ROA 只读离线同步的百分数，不年化、不跨期补值）")
+            sources["growth"] = (f"trading-data/fundamentals（PIT announced_at ≤ {pit_date}；"
+                                 "同报告期同比）")
+            for key in ("gross_margin", "net_margin", "roe", "roa", "revenue_yoy", "net_profit_yoy"):
                 if not extras[key]:
                     entry = next(item for item in FACTOR_REGISTRY if item["key"] == key)
                     detail = reasons.get(key) or [str(entry["pit"])]
@@ -1383,8 +1380,9 @@ def _strategy_analysis(v3_run, universe_list, klines, window, home=None):
         "classes": {
             "price": {"covered": sum(1 for item in analysis if item["compositeZ"] is not None),
                       "total": len(analysis), "source": score_source},
-            "quality": {"covered": sum(1 for item in analysis if item["extras"].get("gross_margin") is not None
-                                       or item["extras"].get("net_margin") is not None),
+            "quality": {"covered": sum(1 for item in analysis if any(
+                item["extras"].get(key) is not None
+                for key in ("gross_margin", "net_margin", "roe", "roa"))),
                         "total": len(analysis), "source": extras_sources.get("quality")},
             "growth": {"covered": sum(1 for item in analysis if item["extras"].get("revenue_yoy") is not None
                                       or item["extras"].get("net_profit_yoy") is not None),
@@ -1881,7 +1879,7 @@ def _ratio_pct(numerator, denominator):
 
 
 def quality_growth_factors(rows, ticker, as_of):
-    """质量（``gross_margin``/``net_margin``）+ 成长（``revenue_yoy``/``net_profit_yoy``）。
+    """质量（毛利率/净利率/ROE/ROA）+ 成长（``revenue_yoy``/``net_profit_yoy``）。
 
     ``rows`` 是 :func:`_read_pit_fundamentals` 的 PIT 行；**只用 ≤ ``as_of`` 的公告**。
     返回 ``(values, meta)``：``values`` 里缺的键**不出现**（调用方按 no-data 记原因），
@@ -1893,7 +1891,7 @@ def quality_growth_factors(rows, ticker, as_of):
     if not period:
         reason = (f"无 PIT 财报：{ticker} 在 trading-data/fundamentals 里没有公告日 ≤ {as_of}"
                   f" 的记录（该表只收录已合并公告日的行；无公告日 = 无法证明当时已知）")
-        for key in ("gross_margin", "net_margin", "revenue_yoy", "net_profit_yoy"):
+        for key in ("gross_margin", "net_margin", "roe", "roa", "revenue_yoy", "net_profit_yoy"):
             reasons[key] = reason
         return values, {"ticker": ticker, "period_end": None, "announced_at": None,
                         "source": None, "reasons": reasons}
@@ -1912,6 +1910,13 @@ def quality_growth_factors(rows, ticker, as_of):
                                  f"revenue={fields.get('revenue')}）")
     else:
         values["net_margin"] = net_margin
+
+    for key in ("roe", "roa"):
+        value = fields.get(key)
+        if value is None:
+            reasons[key] = f"报告期 {period} 缺已公告的 {key}（本地存储百分数口径，不跨期补值）"
+        else:
+            values[key] = value
 
     # 成长：与**同报告期口径**的上一年比（``2026-06-30`` ↔ ``2025-06-30``）。
     # 库里没有上一年同期的 PIT 行 → null + 原因，绝不拿相邻期或全年数硬算同比。
@@ -2685,13 +2690,11 @@ FACTOR_REGISTRY = tuple([
      "source": "trading-data/fundamentals（futu/statements 净利/营收）",
      "pit": "同上"},
     {"key": "roe", "class": "quality", "direction": 1,
-     "source": "plugins/workbench/python/quality.py → trading_datasource.fundamentals.load_returns"
-               "（Yahoo/AKShare 资产负债表，富途无此接口）",
-     "pit": "备用源返回最近报告期，须按 announced_at 截断；本矩阵当前**不联网取**，列为 null",
-     "live_source": "GET /api/v3/sentiment 同级的在线取数（本版未接线到矩阵）"},
+     "source": "trading-data/fundamentals.roe（v3_fundamentals_sync，Yahoo 季度净利/权益，%）",
+     "pit": "最新可见报告期，announced_at 非空且 ≤t；A 股真实公告日，非 A 股同步日保守可得；不跨期补值、不年化"},
     {"key": "roa", "class": "quality", "direction": 1,
-     "source": "同上（总资产口径）", "pit": "同上",
-     "live_source": "同上"},
+     "source": "trading-data/fundamentals.roa（v3_fundamentals_sync，Yahoo 季度净利/总资产，%）",
+     "pit": "最新可见报告期，announced_at 非空且 ≤t；A 股真实公告日，非 A 股同步日保守可得；不跨期补值、不年化"},
     # ── 成长（缺失类 ②）──
     {"key": "revenue_yoy", "class": "growth", "direction": 1,
      "source": "trading-data/fundamentals（同报告期同比，2026-06-30 ↔ 2025-06-30）",

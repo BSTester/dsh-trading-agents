@@ -766,32 +766,44 @@ def watchlist_equal_weights(watchlist, limit=8):
 # ---------------------------------------------------------------------------
 # 统计套利内核（FR-STRAT-002）：OLS 对冲比率 / ADF / 半衰期 / 相关
 # ---------------------------------------------------------------------------
-#: DF 检验的**近似 p 值**系数（MacKinnon 1994 响应面，带常数项、N=1，无趋势）。
-#: 验证锚点：τ=-2.86 → p≈0.050、τ=-3.43 → p≈0.010（DF 常数项情形的临界值反算一致）。
+# statsmodels v0.14.5 tsa/adfvalues.py: MacKinnon(1994), c, N=1，系数已缩放。
 MACKINNON_C_N1 = (2.1659, 1.4412, 0.038269)
-#: 右尾分支的分界（与 statsmodels ``mackinnonp`` 的 ``tau_star`` 同值）：τ 大于它时
-#: 退化为 ``1 - Φ(τ)`` 的正态近似（该区间远离 DF 分布主体，只是粗略上界——如实声明）。
-MACKINNON_TAU_STAR = -1.95
+MACKINNON_C_N1_LARGE = (1.7339, 0.93202, -0.12745, -0.010368)
+MACKINNON_TAU_MIN = -18.83
+MACKINNON_TAU_MAX = 2.74
+MACKINNON_TAU_STAR = -1.61
 #: ADF 的最小样本：对齐观测（差分后回归）少于它 → 统计量为 ``None``（不硬算）。
 MIN_ADF_OBS = 40
 
-ADF_IMPL_NOTE = ("DF 检验（带常数项、0 阶滞后）+ MacKinnon(1994) 响应面近似 p 值；"
-                 "venv 无 statsmodels，p 值是**近似口径**（临界值锚点 τ=-2.86→0.050、"
-                 "τ=-3.43→0.010），非精确分布")
+ADF_IMPL_NOTE = ("单序列 DF 检验（带常数项、0 阶滞后）；MacKinnon(1994) c/N=1 "
+                 "完整左尾响应面近似 p 值，标准库实现，非精确分布；"
+                 "训练残差筛选不等同校准的 Engle-Granger 协整检验")
 
 
 def _norm_cdf(value):
-    """标准正态分布函数（``math.erf`` 实现；scipy/statsmodels 均不可用）。"""
-    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+    """erfc 避免左尾概率被 1 + erf 的相消截成零。"""
+    return 0.5 * math.erfc(-value / math.sqrt(2.0))
+
+
+def mackinnon_pvalue(t_stat):
+    if t_stat > MACKINNON_TAU_MAX:
+        return 1.0
+    if t_stat < MACKINNON_TAU_MIN:
+        return 0.0
+    coefficients = MACKINNON_C_N1 if t_stat <= MACKINNON_TAU_STAR else MACKINNON_C_N1_LARGE
+    value = 0.0
+    for coefficient in reversed(coefficients):
+        value = value * t_stat + coefficient
+    return _norm_cdf(value)
 
 
 def adf_test(values):
     """ADF（DF，带常数项、0 阶滞后）单位根检验 → ``{tStat, pValue, n, approx, note}``。
 
     回归：``Δs_t = a + γ·s_{t-1} + e``；``t = γ / se(γ)``。p 值为
-    :data:`MACKINNON_C_N1` 的响应面近似（**明确标注近似口径**，见 :data:`ADF_IMPL_NOTE`）。
+    :func:`mackinnon_pvalue` 的两段响应面近似；保留未舍入概率供筛选。
 
-    样本 < :data:`MIN_ADF_OBS`、或 ``s_{t-1}`` 零方差 → ``tStat``/``pValue`` 为 ``None``
+    差分后样本 < :data:`MIN_ADF_OBS`、或 ``s_{t-1}`` 零方差 → ``tStat``/``pValue`` 为 ``None``
     （检验就是检验：算不出就如实说算不出，绝不「恒通过」）。
     """
     items = [value for value in (to_float(item) for item in (values or []))
@@ -821,12 +833,8 @@ def adf_test(values):
         return {**base, "note": f"{ADF_IMPL_NOTE}；残差零方差，t 统计量不可计算"}
     se = math.sqrt(variance / sxx)
     t_stat = gamma / se
-    if t_stat > MACKINNON_TAU_STAR:
-        p_value = 1.0 - _norm_cdf(t_stat)
-    else:
-        c0, c1, c2 = MACKINNON_C_N1
-        p_value = _norm_cdf(c0 + c1 * t_stat + c2 * t_stat * t_stat)
-    return {"tStat": round_half_up(t_stat, 4), "pValue": round_half_up(p_value, 4),
+    p_value = mackinnon_pvalue(t_stat)
+    return {"tStat": round_half_up(t_stat, 4), "pValue": p_value,
             "n": n, "lags": 0, "approx": True, "note": ADF_IMPL_NOTE}
 
 
@@ -853,11 +861,7 @@ def half_life(values):
 
 
 def ols_slope(x_values, y_values):
-    """无截距 OLS 斜率 ``Σxy/Σx²``（对数价差对冲比率的常用口径）；``Σx² ≤ 0`` → ``None``。
-
-    无截距是有意选择：对数价格尺度下截距无经济含义，且残差 ``y - βx`` 的平稳性检验
-    （Engle-Granger 第一步）惯例如此。样本不一致/不足 2 → ``None``。
-    """
+    """无截距 OLS 斜率 Σxy/Σx²；仅用于启发式对冲，非校准协整检验。"""
     xs = [value for value in (to_float(item) for item in (x_values or []))
           if value is not None]
     ys = [value for value in (to_float(item) for item in (y_values or []))

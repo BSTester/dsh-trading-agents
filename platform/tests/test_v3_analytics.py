@@ -2031,6 +2031,135 @@ class NewFactorClassTests(RouteCase):
         self.assertIn("reason", factor_registry["coverage"])
 
 
+class HistoricalFactorCorrectnessTests(RouteCase):
+    def _run(self):
+        def series(payload):
+            rate = 0.01 if payload["ticker"] == "SH.600009" else -0.002
+            bars = make_bars([100 * (1 + rate) ** i for i in range(100)], "2026-05-01")
+            for bar in bars:
+                bar["v"] = 1000
+            return series_envelope(bars, ticker=payload["ticker"])
+        return FakeRun({"series": series})
+
+    @staticmethod
+    def _row(symbol, field, value, period="2026-06-30", announced="2026-08-01"):
+        return {"symbol": symbol, "field": field, "value": value,
+                "period_end": period, "announced_at": announced}
+
+    def test_price_z_follows_ticker_not_sorted_position(self):
+        names = ["SH.600009", "SH.600000"]
+        first = v3_analytics._price_volume_rows_pit(self._run(), names, "2026-09-20")
+        second = v3_analytics._price_volume_rows_pit(self._run(), names[::-1], "2026-09-20")
+        rows = {row["ticker"]: row for row in first["rows"]}
+        self.assertGreater(rows[names[0]]["factors"]["mom_20"], rows[names[1]]["factors"]["mom_20"])
+        self.assertGreater(rows[names[0]]["z"]["mom_20"], rows[names[1]]["z"]["mom_20"])
+        self.assertEqual({row["ticker"]: row["z"] for row in first["rows"]},
+                         {row["ticker"]: row["z"] for row in second["rows"]})
+
+    def test_returns_are_stored_percentages_including_zero_and_negative(self):
+        rows = [self._row("SH.600000", "roe", 0), self._row("SH.600000", "roa", -2.5)]
+        values, meta = v3_analytics.quality_growth_factors(rows, "SH.600000", "2026-09-20")
+        self.assertEqual(values.get("roe"), 0)
+        self.assertEqual(values.get("roa"), -2.5)
+        self.assertNotIn("roe", meta["reasons"])
+
+    def test_returns_do_not_backfill_from_an_older_report(self):
+        rows = [self._row("SH.600000", "roe", 12, "2026-03-31", "2026-04-20"),
+                self._row("SH.600000", "roa", 3, "2026-03-31", "2026-04-20"),
+                self._row("SH.600000", "revenue", 1000)]
+        values, meta = v3_analytics.quality_growth_factors(rows, "SH.600000", "2026-09-20")
+        self.assertNotIn("roe", values)
+        self.assertNotIn("roa", values)
+        for key in ("roe", "roa"):
+            self.assertIn("2026-06-30", meta["reasons"].get(key, ""))
+
+    def test_returns_require_visible_announcements(self):
+        rows = [self._row("SH.600000", "roe", 12, announced=None),
+                self._row("SH.600000", "roa", 3, announced="2026-10-01")]
+        _make_trading_store(self.home, fundamentals=rows)
+        extras, missing, _ = v3_analytics.local_factor_extras(
+            self.home, ["SH.600000"], "2026-09-20", want_sentiment=False)
+        for key in ("roe", "roa"):
+            self.assertEqual(extras.get(key), {})
+            self.assertIn(key, {entry["key"] for entry in missing})
+
+    def test_matrix_reports_real_return_coverage_and_quality_class(self):
+        rows = [self._row("SH.600009", "roe", 12.5),
+                self._row("SH.600009", "roa", 0),
+                self._row("SH.600000", "roe", -4),
+                self._row("SH.600000", "roa", 99, announced="2026-10-01")]
+        _make_trading_store(self.home, fundamentals=rows)
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600009,SH.600000",
+            classes="quality", as_of="2026-09-20")
+        self.assertTrue(result["ok"], result)
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertEqual(raw["SH.600009"].get("roe"), 12.5)
+        self.assertEqual(raw["SH.600009"].get("roa"), 0)
+        self.assertNotIn("roa", raw["SH.600000"])
+        coverage = {row["key"]: row for row in result["factors"]}
+        self.assertEqual(coverage["roe"]["covered"], 2)
+        self.assertEqual(coverage["roa"]["covered"], 1)
+        self.assertEqual(coverage["roa"]["missingTickers"], ["SH.600000"])
+        for key in ("roe", "roa"):
+            self.assertEqual(coverage[key]["class"], "quality")
+            self.assertIn("fundamentals", coverage[key]["source"])
+            self.assertNotIn("null", coverage[key]["pit"])
+        growth = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600009,SH.600000",
+            classes="growth", as_of="2026-09-20")
+        self.assertNotIn("roe", growth["matrix"]["factors"])
+        self.assertNotIn("roa", growth["matrix"]["factors"])
+
+    def test_latest_class_queries_do_not_mutate_cached_factor_rows(self):
+        names = ["SH.600009", "SH.600000"]
+        _make_trading_store(self.home, fundamentals=[
+            self._row(names[0], "roe", 12.5), self._row(names[1], "roe", 0)])
+        cached = {"ok": True, "value": {"rows": [
+            {"ticker": name, "factors": {"mom_20": 1}, "z": {"mom_20": 0}}
+            for name in names]}}
+        original = copy.deepcopy(cached)
+        run = FakeRun({"factors": cached})
+        quality = v3_analytics.factors_matrix_data(
+            run, self.home, tickers_raw=names, classes="quality")
+        self.assertTrue(quality["ok"], quality)
+        self.assertIn("roe", quality["matrix"]["factors"])
+        for classes in ("growth", "none"):
+            result = v3_analytics.factors_matrix_data(
+                run, self.home, tickers_raw=names, classes=classes)
+            self.assertTrue(result["ok"], result)
+            self.assertNotIn("roe", result["matrix"]["factors"])
+            self.assertTrue(all("roe" not in row["factors"] for row in result["matrix"]["raw"]))
+            coverage = {row["key"]: row for row in result["factors"]}
+            self.assertEqual(coverage["roe"]["covered"], 0)
+        self.assertEqual(cached, original)
+
+    def test_strategy_counts_returns_as_quality_and_uses_their_scores(self):
+        _make_trading_store(self.home, fundamentals=[
+            self._row("SH.600009", "roe", 12.5), self._row("SH.600000", "roe", 0)])
+        names = ["SH.600009", "SH.600000"]
+        rows = [{"ticker": name, "z": {"mom_20": 0, "mom_60": 0, "trend": 0}}
+                for name in names]
+        run = FakeRun({"factors": {"ok": True, "value": {"rows": rows}}})
+        analysis, stage = v3_analytics._strategy_analysis(
+            run, names, {name: make_bars([100] * 80) for name in names}, 20, self.home)
+        coverage = stage["factorCoverage"]["classes"]
+        self.assertEqual(coverage["quality"]["covered"], 2)
+        self.assertEqual(coverage["growth"]["covered"], 0)
+        scores = {row["ticker"]: row["extendedZ"] for row in analysis}
+        self.assertGreater(scores[names[0]], scores[names[1]])
+
+    def test_bad_explicit_date_is_rejected_before_fetch(self):
+        for value in ("2026-02-30", "2026-09-20junk", "2026-9-2", 20260920,
+                      "2026-09-20T00:00:00Z", " 2026-09-20 "):
+            with self.subTest(value=value):
+                run = self._run()
+                result = v3_analytics.factors_matrix_data(
+                    run, self.home, tickers_raw="SH.600009,SH.600000", as_of=value)
+                self.assertError(result, "factors/bad-as-of")
+                self.assertEqual(run.calls, [])
+
+
 class StrategyExtendedScoreTests(RouteCase):
     """五阶段流水线真的用上新因子（``PAAT.factorCoverage`` + ``PCPT.rankBy``）。"""
 

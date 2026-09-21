@@ -98,7 +98,7 @@ ANALYTICS_ENDPOINTS = {
     "risk": (),
     "trades": ("mode", "limit"),
     "events": ("ticker", "days"),
-    "factors": ("tickers", "window"),
+    "factors": ("tickers", "window", "as_of"),
     "ic": ("tickers", "factor", "forward", "window"),
     "sources": ("no_probe",),
     "instrument": ("ticker",),

@@ -99,7 +99,7 @@ SPEC_FIELDS = {
     "risk": ((), ("refresh",)),
     "trades": ((), ("mode", "limit", "refresh")),
     "events": (("ticker",), ("days", "refresh")),
-    "factors": (("tickers",), ("window", "refresh")),
+    "factors": (("tickers",), ("window", "refresh", "as_of")),
     "ic": (("tickers",), ("factor", "forward", "window", "refresh")),
     "audit": ((), ("refresh",)),
     "sources": ((), ("no_probe", "refresh")),
