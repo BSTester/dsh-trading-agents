@@ -186,6 +186,10 @@
     serverName: quantwb
     transport: streamable-http
     url: http://127.0.0.1:8397/mcp
+    # 服务已启用访问令牌（局域网暴露）：Authorization 从 ~/.dsh/trading-token 读，
+    # 与富途 token 同一模式（不把令牌写进配置文件/仓库）。
+    headers:
+      Authorization: !!js "(() => { try { const om = process.getBuiltinModule('node:os'); const fs = process.getBuiltinModule('node:fs'); const home = process.env.DSH_HOME || om.homedir() + '/.dsh'; const t = fs.readFileSync(home + '/trading-token', 'utf8').trim(); return 'Bearer ' + t; } catch (e) { if (e.code !== 'ENOENT') throw e; } return 'Bearer '; })()"
     failOnStartupError: false
     # trade_place/trade_modify/trade_cancel（WP7 任务 3）在 live 下会阻塞到确认 TTL
     # 120s，超时自动拒绝（fail-closed）。本行 180000 = 确认 TTL 120s + 子进程取数余量：
