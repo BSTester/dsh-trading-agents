@@ -212,12 +212,22 @@ class McpClient:
         text = result["content"][0]["text"]
         return result.get("isError"), json.loads(text)
 
+    async def raw_tool_result(self, name, arguments=None):
+        """不 ``json.loads`` 的原始线格式：``format:"text"`` 的渲染不是 JSON。"""
+        result = await self._request("tools/call", {"name": name,
+                                                    "arguments": arguments or {}})
+        return result.get("isError"), result["content"][0]["text"]
 
-async def _inproc(work, surface):
-    """在真 lifespan 下跑一段异步工作（MCP session manager 必须有 lifespan）。"""
+
+async def _inproc(work, surface, raw=None):
+    """在真 lifespan 下跑一段异步工作（MCP session manager 必须有 lifespan）。
+
+    ``raw``：假 handle 的信封表（缺省 = ``fake_raw()``）——渲染用例需要 ``series`` 之类的
+    上游读数时传一份自洽的假信封。
+    """
     home = Path(tempfile.mkdtemp(prefix="v3-mcp-parity-"))
     try:
-        app, calls = build_offline_app(home, surface=surface)
+        app, calls = build_offline_app(home, raw=raw, surface=surface)
         async with app.router.lifespan_context(app):
             # ASGITransport 走 SDK transport 的 Host 校验：用允许的 host 头。
             transport = httpx.ASGITransport(app=app)
@@ -321,6 +331,53 @@ class RouteParityTests(unittest.TestCase):
         for name in self.bridge.names:
             tool = manager._tools[name]  # noqa: SLF001
             self.assertIs(tool.parameters.get("additionalProperties"), False, name)
+
+    def test_format_field_follows_the_renderer_registry(self):
+        """FR-TOOLS-002 子规范②（桥接面）：``format`` 的**三个落点**同源、逐件同真同假。
+
+        ``v3_mcp._bind`` 在签名末尾追加 ``format`` 的口子与发现代理卡片补列 ``format`` 的口子
+        必须共用 ``mcp_tools.is_renderable``（同一份 ``TOOL_RENDERERS``）：落点一 = 直连
+        ``inputSchema.properties``，落点二 = 代理卡片 ``required ∪ optional``。两者与注册表
+        逐件对齐，否则「代理白名单比 schema 更窄/更宽」这类真缺陷会静默复发。
+        """
+        manager = self.app.state.mcp._tool_manager  # noqa: SLF001
+        cards = mcp_discovery.build_catalog(mcp_tools.TOOLS, self.bridge)
+        renderable = [name for name in self.bridge.names if mcp_tools.is_renderable(name)]
+        self.assertGreaterEqual(len(renderable), 8, "桥接面渲染覆盖不该退化到 8 件以下")
+        for name in self.bridge.names:
+            tool = manager._tools[name]  # noqa: SLF001
+            props = set((tool.parameters or {}).get("properties", {}))
+            card = cards[name]
+            if mcp_tools.is_renderable(name):
+                self.assertIn(mcp_tools.FORMAT_FIELD, props, name)
+                self.assertIn(mcp_tools.FORMAT_FIELD, card.optional, name)
+                self.assertIs(card.as_dict().get("renderable"), True, name)
+                self.assertEqual(card.as_dict().get("formats"),
+                                 [mcp_tools.FORMAT_JSON, mcp_tools.FORMAT_TEXT], name)
+            else:
+                self.assertNotIn(mcp_tools.FORMAT_FIELD, props, name)
+                self.assertNotIn(mcp_tools.FORMAT_FIELD, card.optional, name)
+                self.assertNotIn("renderable", card.as_dict(), name)
+            self.assertEqual(set(card.required) | set(card.optional), props, name)
+
+    def test_renderable_bridge_schemas_stay_closed_and_bijective(self):
+        """``format`` 进 schema 之后：封闭性（``additionalProperties:false``）与双射都还在。
+
+        单独再断言一次的理由：``format`` 是**绑定期**加进 schema 的唯一动态字段，加它的那次
+        ``model_rebuild(force=True)`` 正好是封闭性最容易被顺手破坏的时机。
+        """
+        manager = self.app.state.mcp._tool_manager  # noqa: SLF001
+        renderable = sorted(name for name in self.bridge.names if mcp_tools.is_renderable(name))
+        self.assertTrue(renderable, "没有 renderable 件时这条用例恒真，等于没测")
+        for name in renderable:
+            tool = manager._tools[name]  # noqa: SLF001
+            self.assertIs(tool.parameters.get("additionalProperties"), False, name)
+            self.assertIn(mcp_tools.FORMAT_FIELD, tool.parameters.get("properties", {}), name)
+        route_paths = sorted({route.path for route in self.app.routes
+                              if getattr(route, "path", "").startswith("/api/v3/")})
+        report = assert_parity(route_paths, [d.endpoint for d in self.bridge.definitions])
+        self.assertEqual(report, {"missing_tools": [], "orphan_tools": []})
+        self.assertEqual(len(self.bridge.definitions), len(route_paths))
 
 
 # ---------------------------------------------------------------------------
@@ -519,6 +576,76 @@ class ProtocolCallTests(unittest.TestCase):
         out = asyncio.run(_inproc(work, mcp_discovery.DISCOVERY))
         self.assertTrue(out["direct"]["ok"], out["direct"])
         self.assertEqual(out["proxy"], out["direct"])
+
+    def test_renderable_bridge_tool_answers_in_both_formats_on_both_planes(self):
+        """同一实参两种形态、两个面：direct 的签名与 discovery 的代理转发同一后果。
+
+        * renderable 件（``v3_market``）：``format`` 缺省 → 规范 JSON；``format="text"`` →
+          人类散文（不是 JSON）；
+        * 非 renderable 件（``v3_plates``）：``format`` 是野字段，两个面都拒
+          （direct = pydantic ``extra_forbidden``；discovery = ``mcp/bad-arguments``）。
+        """
+        raw = dict(fake_raw())
+        raw["series"] = {"ok": True, "value": {
+            "ticker": "SH.600519", "period": "1d", "count": 2,
+            "source": "futu/quote_history_kline", "as_of": DAY,
+            "bars": [{"t": "2026-09-18", "o": 1180.0, "h": 1190.0, "l": 1176.0,
+                      "c": 1185.49, "v": 3960779},
+                     {"t": "2026-09-19", "o": 1185.49, "h": 1195.67, "l": 1180.0,
+                      "c": 1190.1, "v": 4100000}]}}
+
+        async def work(client, app, calls):
+            out = {}
+            out["json"] = await client.raw_tool_result(
+                "v3_market", {"ticker": "SH.600519", "period": "1d"})
+            out["text"] = await client.raw_tool_result(
+                "v3_market", {"ticker": "SH.600519", "period": "1d",
+                              "format": mcp_tools.FORMAT_TEXT})
+            out["refused"] = await client.raw_tool_result(
+                "v3_plates", {"market": "SH", "format": mcp_tools.FORMAT_TEXT})
+            names = [tool["name"] for tool in await client.list_tools()]
+            out["direct_planes"] = ("v3_market" in names, "call_tool" in names)
+            return out
+
+        direct = asyncio.run(_inproc(work, mcp_discovery.DIRECT, raw))
+
+        async def proxy_work(client, app, calls):
+            out = {}
+            out["text"] = await client.raw_tool_result(
+                "call_tool", {"name": "v3_market",
+                              "arguments": {"ticker": "SH.600519", "period": "1d",
+                                            "format": mcp_tools.FORMAT_TEXT}})
+            out["refused"] = await client.raw_tool_result(
+                "call_tool", {"name": "v3_plates",
+                              "arguments": {"market": "SH",
+                                            "format": mcp_tools.FORMAT_TEXT}})
+            page = app.state.mcp_discovery.search(keyword="v3_market")
+            card = [item for item in page["cards"] if item["name"] == "v3_market"][0]
+            out["card"] = card
+            return out
+
+        discovery = asyncio.run(_inproc(proxy_work, mcp_discovery.DISCOVERY, raw))
+
+        # direct：JSON 信封 vs text 散文（同一实参、同一份数据）
+        self.assertFalse(direct["json"][0])
+        self.assertTrue(json.loads(direct["json"][1])["ok"])
+        self.assertFalse(direct["text"][0], "text 形态仍是正常工具结果")
+        self.assertIn("SH.600519 1d K 线：共 2 根", direct["text"][1])
+        self.assertNotEqual(direct["text"][1], direct["json"][1])
+        # direct：非 renderable 件传 format → schema 层拒绝（extra_forbidden）
+        self.assertTrue(direct["refused"][0], "直连面应把野字段判成 isError")
+        self.assertIn(mcp_tools.FORMAT_FIELD, direct["refused"][1])
+        self.assertIn("extra_forbidden", direct["refused"][1])
+        # discovery：代理面同一实参同一后果（散文 / 野字段拒绝）
+        self.assertFalse(discovery["text"][0])
+        self.assertEqual(discovery["text"][1], direct["text"][1],
+                         "同一工具在两面必须给出同一份渲染（同一实现、同一 renderer）")
+        refused = json.loads(discovery["refused"][1])
+        self.assertEqual(refused["error"]["code"], "mcp/bad-arguments")
+        self.assertIn(mcp_tools.FORMAT_FIELD, refused["error"]["message"])
+        # discovery：卡片把 format 列进可选参数（导航面与 schema 同集合）
+        self.assertIs(discovery["card"]["renderable"], True)
+        self.assertIn(mcp_tools.FORMAT_FIELD, discovery["card"]["optional"])
 
     def test_live_service_when_available(self):
         """本地已启动服务可用时，用**它**跑一遍只读 tools/call（不可达/旧版本 → skip）。"""

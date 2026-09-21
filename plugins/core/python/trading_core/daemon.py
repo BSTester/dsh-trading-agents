@@ -279,12 +279,22 @@ def _last_json_object(text):
     CLI 用 ``json.dumps(..., indent=1)`` 打印**多行** JSON，故不能按行解析：从后往前
     逐个 ``{`` 起尝试解析到串尾，第一个成功的对象即为摘要（限 50 次尝试，避免长输出下
     的平方级开销）。
+
+    2026-09-21 修（真实缺陷，非测试问题）：截断窗口只取 ``starts[-50:]`` 时，**最外层**
+    ``{`` 会被挤到窗口外——实测 ``snapshot-schedule`` 输出含 55 个 ``{``，于是整份合法
+    单一 JSON 摘要解析不出来（返回 None）。后果不是"少个字段"：``_subprocess_runner``
+    据此把 ``summary`` 置 None → ``_report_job_outcome`` 读不到 ``summary["failed"]`` →
+    **「作业部分失败」告警静默丢失**。修法是**始终把首个 ``{`` 一并纳入候选**（多文档时
+    仍按"从后往前"取最后一个，语义不变）。
     """
     text = (text or "").strip()
     if not text:
         return None
     starts = [i for i, ch in enumerate(text) if ch == "{"]
-    for i in reversed(starts[-50:]):
+    candidates = starts[-50:]
+    if starts and (not candidates or candidates[0] != starts[0]):
+        candidates = [starts[0], *candidates]
+    for i in reversed(candidates):
         try:
             obj = json.loads(text[i:])
         except ValueError:

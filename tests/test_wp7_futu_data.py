@@ -8,6 +8,10 @@ capital_distribution/option_expiration/option_chain/option_screen）。
   ``trading/futu-error``（消息含 ret_code/errmsg 截断）；token 缺失 →
   ``trading/futu-unavailable`` + 指向 ``scripts/futu_auth.py``；网络故障 → unavailable；
   A 股实时 -9 → 错误消息附「A 股实时无权限：可用 capital_flow / history-kline 替代」；
+* A 股公开降级钩子（2026-09-21 数据源政策，``futu_data.install_public_fallback``）：
+  钩子**已安装**且全是沪/深标的且 -9 → 免密公开源接管（返回值原样成成功载荷）；
+  HK/US/混合列表/北交所/非 -9 一律不接管；钩子**未安装**（含本类 setUp 的显式隔离）
+  → 原始 -9 错误原样上抛。钩子是**进程级**单例，故本类 setUp 钉死其状态（见那里说明）；
 * 参数白名单/必填：code 归一同 series 的 ticker 规则（``to_futu_symbol``）；rt_quote
   codes 1..10；capital_flow_history days 1..1000（默认 30 → 上游 count）；option_screen
   必须带非空 ``field_filter``（缺省时上游只回 4 个默认字段、其余全 null，见
@@ -65,6 +69,26 @@ def make_futu(result=None, error=None):
 
 class ChannelPassthroughTest(unittest.TestCase):
     """通道注入：参数归一/白名单/必填 + 错误分类（业务/凭证/网络三分）。"""
+
+    def setUp(self):
+        """把 A 股公开降级钩子钉成**未安装**，用例结束后恢复原状（进程级单例必须显式隔离）。
+
+        ``futu_data._PUBLIC_FALLBACK`` 由 ``v3_sources_ext.register`` 在装配期安装，是
+        **进程级**单例：任何先建过 app 的测试模块都会把它留在进程里，于是「-9 → 原始错误
+        信封」这段代码会变成一次**真实联网取数**（实测：``tests.test_wp6_mcp`` 之后本类用例
+        打出 ``GET https://qt.gtimg.cn/q=sh600519``，-9 被免密源接管、``ok`` 由 false 翻成
+        true）。本类用的是**通道替身**（``FakeCall`` 恒抛 -9），要钉的是「通道错误分类」
+        这一层，所以显式置为未安装；新政策本身（钩子已安装 → 降级接管；HK/US/混合/非 -9
+        一律不接管）由本类下面三条用例注入替身单独钉住，不是靠放宽断言。
+        """
+        previous = futu_data._PUBLIC_FALLBACK  # noqa: SLF001 —— 单例只有 active() 读取口
+        futu_data.uninstall_public_fallback()
+
+        def restore():
+            if previous is not None:
+                futu_data.install_public_fallback(previous)
+
+        self.addCleanup(restore)
 
     def test_capital_flow_passthrough_arguments_and_result(self):
         futu = make_futu(result={"fl": [{"time": "09:30", "in": 1}]})
@@ -228,6 +252,11 @@ class ChannelPassthroughTest(unittest.TestCase):
         self.assertNotIn("futu-error", out["error"]["code"])
 
     def test_a_share_rt_error_message_carries_alternative_paths(self):
+        """降级钩子**缺席/未命中**时的口径：原始 -9 错误原样上抛（文案带替代路径）。
+
+        钩子状态由本类 ``setUp`` 显式钉成「未安装」——见那里的说明：``_PUBLIC_FALLBACK``
+        是**进程级**单例，任何先建过 app 的模块都会把它留在进程里。
+        """
         futu = make_futu(error=FutuUnavailable(
             "quote_stock_quote: ret=-9 realtime quote permission required"))
         out = futu.handle("rt_quote", {"codes": ["SH.600519"]})
@@ -236,6 +265,64 @@ class ChannelPassthroughTest(unittest.TestCase):
         self.assertIn("A 股实时无权限：可用 capital_flow / history-kline 替代",
                       out["error"]["message"])
         self.assertEqual(out["error"]["details"], {"ret_code": -9})
+
+    def test_a_share_rt_uses_public_fallback_when_hook_installed(self):
+        """2026-09-21 数据源政策：钩子已安装 + 全是沪/深标的 + -9 → 免密公开源接管。
+
+        钩子由 ``v3_sources_ext.register`` 在装配期安装（生产路径自动生效）。这里注入
+        计数替身，钉住三件事：调用签名 ``(endpoint, codes, error)``、返回值**原样**成为
+        成功载荷（不再有 error 信封）、以及**只问一次**。
+        """
+        seen = []
+
+        def hook(endpoint, codes, error):
+            seen.append((endpoint, list(codes), error.__class__.__name__,
+                         getattr(error, "details", None)))
+            return {"ok": True, "source": "eastmoney/push2", "code_list": ["600519"],
+                    "futu_fallback": {"reason": "futu 返回 -9（A 股无实时权限）→ 已降级到免密公开源"}}
+
+        futu_data.install_public_fallback(hook)
+        self.addCleanup(futu_data.uninstall_public_fallback)
+        futu = make_futu(error=FutuUnavailable(
+            "quote_stock_quote: ret=-9 realtime quote permission required"))
+        out = futu.handle("rt_quote", {"codes": ["SH.600519"]})
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["value"]["source"], "eastmoney/push2")
+        self.assertEqual(seen, [("rt_quote", ["SH.600519"], "FutuDataError", {"ret_code": -9})])
+
+    def test_a_share_order_book_uses_the_same_fallback_hook(self):
+        futu_data.install_public_fallback(
+            lambda endpoint, codes, error: {"ok": True, "source": "tencent/qt.gtimg.cn",
+                                            "book_depth": 5})
+        self.addCleanup(futu_data.uninstall_public_fallback)
+        futu = make_futu(error=FutuUnavailable("quote_order_book: ret=-9 无权限"))
+        out = futu.handle("rt_order_book", {"code": "SH.600519"})
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["value"]["book_depth"], 5)
+
+    def test_fallback_never_takes_over_hk_us_mixed_or_non_minus9(self):
+        """降级是**补充**不是替换：HK/US/混合列表/非 -9 业务错误一律走原错误路径。
+
+        这是「HK/US 行为不变」这一条政策承诺的可执行断言——钩子装了也不许动它们。
+        """
+        calls = []
+        futu_data.install_public_fallback(
+            lambda endpoint, codes, error: calls.append((endpoint, list(codes))) or {"ok": True})
+        self.addCleanup(futu_data.uninstall_public_fallback)
+        cases = [
+            ("rt_quote", {"codes": ["HK.00700"]}, -9),           # 港股
+            ("rt_quote", {"codes": ["US.AAPL"]}, -9),            # 美股
+            ("rt_quote", {"codes": ["SH.600519", "HK.00700"]}, -9),   # 混合列表
+            ("rt_quote", {"codes": ["BJ.430047"]}, -9),          # 北交所：公开链未覆盖
+            ("rt_quote", {"codes": ["SH.600519"]}, -3),          # 非 -9 业务错误
+            ("rt_order_book", {"code": "HK.00700"}, -9),
+        ]
+        for endpoint, payload, ret in cases:
+            futu = make_futu(error=FutuUnavailable(f"{endpoint}: ret={ret} 业务错误"))
+            out = futu.handle(endpoint, payload)
+            self.assertFalse(out["ok"], (endpoint, payload))
+            self.assertEqual(out["error"]["code"], "trading/futu-error", (endpoint, payload))
+        self.assertEqual(calls, [], "不该有任一次降级尝试")
 
     def test_unknown_endpoint_rejected(self):
         futu = make_futu()

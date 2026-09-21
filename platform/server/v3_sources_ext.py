@@ -96,7 +96,16 @@ def _mark_cool(source):
 
 
 def a_share_public_code(ticker):
-    """``SH.600519`` / ``600519.SH`` / ``sh600519`` → ``("SH", "600519")``；公开链不支持 → ``None``。"""
+    """``SH.600519`` / ``600519.SH`` / ``sh600519`` → ``("SH", "600519")``；公开链不支持 → ``None``。
+
+    2026-09-21 修：docstring 一直声称支持紧凑形态 ``sh600519``，但 ``v3_sources.detect_market``
+    对它返回 ``""``（实测）→ 此前统一回 ``None``（路由报 ``quote/unsupported-market``，不会写错
+    数据，但能力与文档不符）。这里**先补紧凑前缀映射**（``sh``/``sz`` + 6 位数字，大小写不敏感），
+    其余形态仍交 ``detect_market``，行为对既有形态零变化。
+    """
+    text = v3_sources.as_text(ticker).strip().lower()
+    if len(text) == 8 and text[:2] in ("sh", "sz") and text[2:].isdigit():
+        return text[:2].upper(), text[2:]
     market = v3_sources.detect_market(ticker)
     if market not in A_SHARE_PUBLIC_MARKETS:
         return None

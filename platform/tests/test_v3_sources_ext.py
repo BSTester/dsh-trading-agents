@@ -705,10 +705,13 @@ class HookBoundaryTests(SourcesExtTestBase):
         self.assertEqual(v3_sources_ext.a_share_public_code("000001"), ("SZ", "000001"))
         for ticker in ("HK.00700", "US.NVDA", "BJ.430047", "430047", "830799", "AAPL", ""):
             self.assertIsNone(v3_sources_ext.a_share_public_code(ticker), ticker)
-        # 紧凑形态 ``sh600519``：本模块 docstring 声称支持，实测 ``v3_sources.detect_market``
-        # 对无分隔符的 ``SH600519`` 返回 ""（既非纯数字也非纯字母）→ 这里如实返回 None。
-        # 影响面：调用方拿到 ``quote/unsupported-market``（不改写成错数据）；缺口已上报主 agent。
-        self.assertIsNone(v3_sources_ext.a_share_public_code("sh600519"))
+        # 紧凑形态 ``sh600519``：docstring 一直声称支持，但此前实测返回 None（缺口已上报）。
+        # 2026-09-21 主 agent 补齐：``sh``/``sz`` + 6 位数字（大小写不敏感）先做紧凑前缀映射，
+        # 其余形态仍交 ``detect_market``。这里是**契约变更**（能力补齐），不是放宽断言。
+        self.assertEqual(v3_sources_ext.a_share_public_code("sh600519"), ("SH", "600519"))
+        self.assertEqual(v3_sources_ext.a_share_public_code("SZ000001"), ("SZ", "000001"))
+        self.assertEqual(v3_sources_ext.a_share_public_code("sh60051"), None)   # 5 位不是合法代码
+        self.assertEqual(v3_sources_ext.a_share_public_code("bj430047"), None)  # 北交所不在免密链
 
     def test_hk_us_bj_are_reported_unsupported_without_requests(self):
         for ticker in ("HK.00700", "US.NVDA", "BJ.430047"):

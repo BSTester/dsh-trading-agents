@@ -91,6 +91,23 @@ def declared_readonly_bridge_names(app):
             if path not in v3_mcp.NON_READONLY_PATHS}
 
 
+def published_fields(definition):
+    """发布 ``inputSchema`` 的字段集 ≡ 定义字段集 ∪（renderable 件的 ``format``）。
+
+    ``format`` 是 FR-TOOLS-002 子规范②在**绑定期**追加到签名末尾的唯一动态字段
+    （``mcp_tools._bind`` 与 ``v3_mcp._bind`` 同形），**不在** ``ToolDefinition.fields``
+    里——后者是工具清单字段集（与规格 §3.2/§3.4 表逐项对平的那一份，见
+    ``test_wp6_service_approval.test_input_fields_match_the_spec_table``），发布面因此
+    比清单多且**仅多**这一个字段。两处由同一个谓词决定（``mcp_tools.is_renderable`` →
+    唯一注册表 ``TOOL_RENDERERS``），所以这里也用它推导：写死「哪些工具可渲染」的名单
+    等于把注册表抄成第二份清单。断言仍是**集合相等**（多一件、少一件都红），不放宽。
+    """
+    fields = set(definition.fields)
+    if mcp_tools.is_renderable(definition.name):
+        fields.add(mcp_tools.FORMAT_FIELD)
+    return fields
+
+
 def non_null_branch(schema):
     """取字段 schema 的「基类型分支」：可选字段是 ``anyOf: [基类型, null]``（见 S1 增补说明）。
 
@@ -298,6 +315,8 @@ class McpProtocolSmoke(McpHarness):
         # 逐件封闭：面里的每件工具都对**同一份定义**断言
         # additionalProperties:false + 字段集/必填集（基础层对 TOOLS、桥接层对 definitions、
         # 两个代理入口对 ``mcp_discovery`` 自己的签名——三份都是装配期同一份来源）。
+        # 字段集的期望值 = ``published_fields``（定义字段 ∪ renderable 的 ``format``），
+        # 与 ``mcp_discovery`` 卡片补列 ``format`` 用的是同一个 ``is_renderable`` 谓词。
         definitions = {definition.name: definition for definition in mcp_tools.TOOLS}
         definitions.update((definition.name, definition) for definition in bridge.definitions)
         for proxy_name in DISCOVERY_PROXY:
@@ -305,7 +324,7 @@ class McpProtocolSmoke(McpHarness):
         for tool in listing.tools:
             definition = definitions[tool.name]
             schema = tool.input_schema
-            self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
+            self.assertEqual(set(schema["properties"]), published_fields(definition), tool.name)
             self.assertEqual({param.name for param in definition.params if param.required},
                              set(schema.get("required", [])), tool.name)
             self.assertIs(schema.get("additionalProperties"), False, tool.name)

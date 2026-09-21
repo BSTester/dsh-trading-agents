@@ -1464,6 +1464,28 @@ def _render_risk(args, value):
     return "\n".join(lines)
 
 
+# ---------------------------------------------------------------------------
+# FR-TOOLS-002 子规范②（桥接面扩展，2026-09-21 新增段）：渲染层共用小工具
+# ---------------------------------------------------------------------------
+# ``v3_mcp`` 的 ``v3_*`` 渲染器与基础面渲染器必须**同一份口径**：数值定长、空数据
+# 「无数据源·原因」、信封错误 ``code: message``。下面三个是上面私有实现的**公开别名**
+# ——桥接面因此不必各写一份（也就不会与基础面各说各话）。本段**只新增导出**，
+# 不改任何既有判定表与既有渲染器。
+def render_number(value, digits=4):
+    """数值 → 定长小数文本（:func:`_num` 的公开别名；``None``/非有限 → ``null``）。"""
+    return _num(value, digits)
+
+
+def render_no_data(reason):
+    """空数据口径（:func:`_no_data` 的公开别名）：``无数据源·原因``，绝不是空串。"""
+    return _no_data(reason)
+
+
+def render_error_text(envelope):
+    """信封错误 → ``code: message``（:func:`_error_of` 的公开别名）。"""
+    return _error_of(envelope)
+
+
 class StoreApi:
     """``store_access`` 的 home 绑定门面：5 个维护工具的**唯一**入口。
 
@@ -1711,7 +1733,8 @@ __all__ = [
     "BoundTool", "Param", "ToolDefinition", "build_tools", "concurrency_meta", "dispatch",
     "failure", "format_param",
     "forbid_extra_fields", "is_blacklisted", "is_concurrency_safe", "is_renderable",
-    "payload_of", "register", "register_renderer", "render_tool_result", "render_value",
+    "payload_of", "register", "register_renderer", "render_error_text", "render_no_data",
+    "render_number", "render_tool_result", "render_value",
     "result_payload",
     "schema_warning_filter", "tool_result",
 ]

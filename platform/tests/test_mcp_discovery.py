@@ -20,10 +20,15 @@
    不是恒真断言。
 6. **元数据暴露**（2026-09-21 收尾）：``tools/list`` 的 ``_meta.quantwb.isConcurrencySafe``
    覆盖 ``/mcp`` 与 ``/mcp/ro`` 暴露的全部 6 件（此前只有基础面那 2 件有、``/mcp/ro`` 一件
-   都没有），卡片带 ``concurrencySafe``（128 件逐件）与 ``renderable``/``formats``（仅 5 件
-   渲染件）。期望值一律从注册表现推（``mcp_tools.is_concurrency_safe`` /
+   都没有），卡片带 ``concurrencySafe``（128 件逐件）与 ``renderable``/``formats``（14 件
+   渲染件 = 基础 5 + 桥接 9）。期望值一律从注册表现推（``mcp_tools.is_concurrency_safe`` /
    ``NON_READONLY_PATHS`` / ``TOOL_RENDERERS``），并用「临时登记一个渲染器 → 卡片必须跟着
    翻」证明这些字段是推导而非誊抄。
+7. **桥接面的 ``format:"text"``**（2026-09-21，``BridgeRenderTests``）：``format`` 原先只在
+   基础面 ``mcp_tools._bind`` 绑定期进 schema，桥接面 ``v3_mcp._bind`` 没有——于是
+   ``call_tool(name="v3_*", arguments={…,"format":"text"})`` 被判野字段。这一层把同一谓词
+   扩到桥接面：卡片/签名/渲染三处同源（``TOOL_RENDERERS``），散文、空数据「无数据源·原因」、
+   野字段拒绝、两面两门（direct/discovery × /mcp、/mcp/ro）逐条断言在线格式上。
 
 只读验证：所有真实调用只打只读工具（``v3_gateway`` / ``v3_tools`` / ``v3_risk`` /
 ``v3_credentials?action=status``），不触发 ``trade_*``/``sim_trade_*``/``plan-execute``/
@@ -1168,14 +1173,16 @@ class MetadataExposureTests(unittest.TestCase):
             else:
                 self.assertNotIn("renderable", wire, name)
                 self.assertNotIn("formats", wire, name)
-        # 抽查：snapshot（基础面可渲染）在卡片上说得清；桥接面当前无渲染器 → 一件都不带
+        # 抽查：snapshot（基础面可渲染）在卡片上说得清；桥接面的 renderable 集合
+        # **逐名等于** ``TOOL_RENDERERS ∩ v3 工具名``（不抄第二份清单）
         self.assertEqual(self.proxy.catalog["snapshot"].as_dict()["formats"], ["json", "text"])
-        self.assertEqual([name for name in renderable_names
-                          if name in self.bridge_paths], [])
+        self.assertEqual({name for name in renderable_names if name in self.bridge_paths},
+                         {name for name in self.bridge_paths
+                          if mcp_tools.is_renderable(name)})
 
     def test_card_facts_are_derived_not_hardcoded(self):
         """鉴别力：临时给一件桥接工具登记渲染器 → 卡片必须跟着翻（证明字段是**推导**的）。"""
-        victim = "v3_market"
+        victim = "v3_plates"  # 必须是**当前没有**渲染器的桥接件（有渲染器的件见 BridgeRenderTests）
         self.assertNotIn("renderable", self.proxy.catalog[victim].as_dict())
         self.assertFalse(mcp_tools.is_renderable(victim))
         mcp_tools.TOOL_RENDERERS[victim] = lambda args, value: "临时渲染器"
@@ -1271,6 +1278,369 @@ class MetadataExposureTests(unittest.TestCase):
         refusal = json.loads(refused)
         self.assertEqual(refusal["error"]["code"], "mcp/bad-arguments")
         self.assertIn(mcp_tools.FORMAT_FIELD, refusal["error"]["message"])
+
+
+# ---------------------------------------------------------------------------
+# 7. 桥接面的 format:"text"（2026-09-21）：schema ⇄ 卡片 ⇄ 渲染三处同源
+# ---------------------------------------------------------------------------
+#: 桥接面渲染用例的信封：**真实形状**（键名/单位/嵌套取自 8397 实测响应，只裁剪长度）。
+#: 渲染器读的是**扁平** v3 信封（``{ok:true, …}``），与基础面 ``{ok, value}`` 形态不同。
+V3_RENDER_FIXTURES = {
+    "v3_market": (
+        {"ticker": "SH.600519", "period": "1d"},
+        {"ok": True, "data": {"ticker": "SH.600519", "period": "1d", "count": 2,
+                              "source": "futu/quote_history_kline", "as_of": "2026-09-19",
+                              "bars": [{"t": "2026-09-18", "o": 1180.0, "h": 1190.0,
+                                        "l": 1176.0, "c": 1185.49, "v": 3960779},
+                                       {"t": "2026-09-19", "o": 1185.49, "h": 1195.67,
+                                        "l": 1180.0, "c": 1190.1, "v": 4100000}]}},
+        ("SH.600519 1d K 线：共 2 根", "来源 futu/quote_history_kline", "as_of 2026-09-19",
+         "窗口累计涨跌")),
+    "v3_orderbook": (
+        {"ticker": "HK.00700"},
+        {"ok": True, "ticker": "HK.00700",
+         "data": [{"books": [{"bid_list": [{"price": 430.0, "volume": 43700,
+                                            "order_count": 8}],
+                              "ask_list": [{"price": 430.2, "volume": 14400,
+                                            "order_count": 15}]}],
+                   "code": "HK.00700", "sc_name": "腾讯控股"}]},
+        ("HK.00700 腾讯控股 盘口", "来源 futu/rt_order_book", "买盘", "卖盘", "×")),
+    "v3_sentiment": (
+        {"symbol": "600519", "days": 14},
+        {"ok": True, "symbol": "600519", "market": "SH",
+         "as_of": "2026-09-21T11:47:25+00:00", "source": "akshare/stock_news_em", "days": 14,
+         "documents": 9, "scored": 7, "score": -0.171057, "coverage": 0.777778,
+         "positive": 2, "negative": 4, "neutral": 1, "half_life_hours": 48.0,
+         "latest_at": "2026-09-21T15:56:17+08:00",
+         "top_terms": [{"term": "被执行", "polarity": -0.7, "count": 3}],
+         "events": [{"type": "lawsuit", "label": "诉讼", "count": 1,
+                     "latest_at": "2026-09-16T21:17:00+08:00"}],
+         "event_method": "rule-v1", "event_version": 1, "notes": ["窗口 = 近 14 天"]},
+        ("600519 资讯情绪（近 14 天：9 篇", "score=-0.1711", "正 2 / 负 4 / 中性 1",
+         "来源 akshare/stock_news_em", "诉讼 1 条")),
+    "v3_factors_matrix": (
+        {"market": "SH"},
+        {"ok": True, "market": "SH", "asOf": "2026-09-21",
+         "matrix": {"as_of": "2026-09-21", "source": "workbench/factors(z)",
+                    "tickers": ["SH.600000", "SH.600009"], "factors": ["mom_20", "peg"],
+                    "matrix": [[0.5, None], [-0.25, None]], "failures": {}},
+         "factors": [{"key": "peg", "class": "value", "classLabel": "价值", "covered": 0,
+                      "total": 2, "coveragePct": 0.0, "missingTickers": ["SH.600000"]}],
+         "factorsMissing": [], "sources": {"kline": "futu/quote_history_kline"},
+         "ic": {"ok": True, "factor": "mom_20", "forwardDays": 5, "observations": 36,
+                "meanIc": -0.0958, "ir": -0.178, "latestIc": 0.1578,
+                "source": "workbench/ic"}},
+        ("横截面因子矩阵（market=SH", "标的 2 只：SH.600000, SH.600009",
+         "非空格 2/4", "IC（factor=mom_20", "meanIc=-0.0958", "覆盖不足：peg")),
+    "v3_risk_analytics": (
+        {"market": "SH"},
+        {"ok": True, "market": "SH", "portfolioSource": "工作台 frozen 计划 PLN-1",
+         "benchmarkTicker": "SH.000300", "benchmarkSource": "futu/quote_history_kline",
+         "nav": 998743.29,
+         "analytics": {"confidence": 0.95, "observations": 246,
+                       "window": {"from": "2025-09-10", "to": "2026-09-21"},
+                       "varDailyPct": 3.418, "cvarDailyPct": 4.713, "varAmount": 34133.27,
+                       "cvarAmount": 47066.33, "annVolPct": 36.11, "annReturnPct": 1.12,
+                       "maxDrawdownPct": -43.3, "beta": 0.593, "alphaAnnPct": -1.11,
+                       "ir": -0.075, "benchmarkAnnReturnPct": 3.76,
+                       "kupiec": {"lr": 0.1497, "pValue": 0.6988, "breaches": 11,
+                                  "observations": 246, "pass": True},
+                       "equityCurve": [{"t": "2025-09-10", "v": None}]},
+         "sources": {"kline": "futu/quote_history_kline", "errors": []},
+         "risk_detail": {"leverage": {"source": "futu/sim_trade_cash_info",
+                                      "as_of": "2026-09-21T11:47:35Z",
+                                      "leverage_ratio_pct": 93.3616,
+                                      "buying_power_ratio_pct": 6.6384,
+                                      "margin_debt_pct": None}}},
+        ("组合风险量（confidence=0.95，观察 246 个交易日", "组合：工作台 frozen 计划 PLN-1",
+         "基准：SH.000300", "VaR(日)=3.42%", "Beta=0.593", "Kupiec POF：突破 11/246",
+         "杠杆率：持仓市值/总资产=93.36%")),
+    "v3_risk_industry": (
+        {"market": "SH"},
+        {"ok": True, "as_of": "2026-09-21T11:47:37+00:00", "market": "SH", "limitPct": 20.0,
+         "breach": True,
+         "exposures": [{"industry": "基础建设", "weightPct": 25.0, "tickers": ["SH.600039"],
+                        "value": 249685.82}],
+         "top": {"industry": "基础建设", "weightPct": 25.0},
+         "sources": {"plate": "futu/info_owner_plate", "weights": "platform/portfolio"},
+         "missing": [{"ticker": "US.NVDA", "reason": "富途未返回所属板块"}],
+         "notes": ["value = 权重 × equity.current"]},
+        ("行业暴露（as_of=2026-09-21T11:47:37+00:00，market=SH，红线 20.0% → **超限**",
+         "最大暴露：基础建设 25.00%", "未取到行业 1 只：US.NVDA")),
+    "v3_strategy": (
+        {"market": "US"},
+        {"ok": True, "run": {"asOf": "2026-09-20T06:48:52.933Z", "market": "US",
+                             "universe": ["US.NVDA", "US.MSTR"],
+                             "universe_source": "futu/sim_trade_position_list#US",
+                             "proposals": [{"ticker": "US.MSTR", "action": "增持",
+                                            "targetWeightPct": 2.0, "riskLevel": "低",
+                                            "basis": "综合动量 z=0.7071"}],
+                             "stages": {"PDAT": {"bars": 240, "errors": []},
+                                        "PET": {"proposals": 1}}}},
+        ("研究流水线最近一轮（asOf=2026-09-20T06:48:52.933Z", "增持 US.MSTR → 目标 2.00%",
+         "PDAT bars=240", "执行走工作台受约束入口")),
+    "v3_research": (
+        {"market": "SH"},
+        {"ok": True, "mode": "sim", "generated_at": "2026-09-21T11:47:35.706Z",
+         "source": "workbench/snapshot",
+         "runs": [{"ticker": "SH.600000", "status": "completed",
+                   "started_at": "2026-09-19T02:33:26.105Z"}],
+         "reports": [{"ticker": "SH.600000", "rating_label": "持有",
+                      "report": "# 【字段验收种子】SH.600000 数据核对记录\n\n正文…",
+                      "published_at": "2026-09-19T02:33:26.126Z"}],
+         "previews": [{"at": "2026-09-19T02:31:47.489Z", "kind": "signal",
+                       "value": {"ticker": "US.NVDA", "signal_label": "观望",
+                                 "date": "2026-09-18"}}],
+         "activity": [{"kind": "research_published", "ticker": "SH.600000",
+                       "at": "2026-09-19T02:33:26.126Z"}]},
+        ("研究工作台视图（mode=sim", "研究 run 1 条 · 研报 1 条",
+         "《【字段验收种子】SH.600000 数据核对记录》", "评级 持有", "US.NVDA 观望")),
+    "v3_ops_alerts": (
+        {"state": "firing"},
+        {"ok": True, "as_of": "2026-09-21T11:47:35+00:00", "model_stale": False,
+         "rules_file": "/x/deploy/monitoring/alerts.yml",
+         "rules_file_policy": "与 Prometheus 读的是同一份文件",
+         "summary": {"firing": 1, "pending": 0, "no-data": 1, "unsupported": 0, "ok": 1,
+                     "total": 3},
+         "alerts": [{"rule": "RiskIndustryConcentrationBreached", "severity": "critical",
+                     "domain": "risk", "state": "firing", "metric": "quantwb_risk_industry_pct",
+                     "operator": ">", "threshold": 20.0, "value": 50.0, "for": "5m",
+                     "since": "2026-09-21T11:45:42+00:00"},
+                    {"rule": "QuantWorkbenchDown", "severity": "critical", "domain": "platform",
+                     "state": "no-data", "for": "2m", "since": "2026-09-21T11:40:39+00:00"}],
+         "evaluator": {"history_seconds": 7200.0, "series": 105, "points": 3036,
+                       "sample_seconds": 15.0}},
+        ("平台内告警三态（as_of=2026-09-21T11:47:35+00:00，模型 stale=False）：共 3 条规则",
+         "firing 1 / pending 0 / ok 1 / no-data 1 / unsupported 0",
+         "RiskIndustryConcentrationBreached", "实测 50.0000",
+         "规则源：/x/deploy/monitoring/alerts.yml")),
+}
+
+#: 每件的「空数据」信封（``ok=false`` 或空列表）——渲染必须是「无数据源·原因」，不是空串。
+V3_EMPTY_FIXTURES = {
+    "v3_market": {"ok": True, "data": {"ticker": "SH.600519", "period": "1d",
+                                       "source": "futu/quote_history_kline",
+                                       "as_of": "2026-09-19", "count": 0, "bars": []}},
+    "v3_orderbook": {"ok": False, "error": {"code": "market/orderbook-unavailable",
+                                            "message": "realtime quote permission required"}},
+    "v3_sentiment": {"ok": True, "symbol": "600519", "days": 7, "documents": 0, "scored": 0,
+                     "score": None, "source": "akshare/stock_news_em",
+                     "as_of": "2026-09-21T00:00:00+00:00", "notes": ["该标的近 7 天无资讯"]},
+    "v3_factors_matrix": {"ok": True, "market": "SH",
+                          "matrix": {"tickers": [], "factors": [], "matrix": []}},
+    "v3_risk_analytics": {"ok": False, "error": {"code": "risk/insufficient",
+                                                 "message": "对齐后不足 40 个交易日"}},
+    "v3_risk_industry": {"ok": True, "as_of": "2026-09-21", "exposures": [],
+                         "missing": [{"ticker": "US.NVDA", "reason": "富途未返回所属板块"}]},
+    "v3_strategy": {"ok": True, "run": None, "note": "尚未运行研究流水线"},
+    "v3_research": {"ok": True, "mode": "sim", "generated_at": "2026-09-19",
+                    "runs": [], "reports": [], "previews": [], "activity": []},
+    "v3_ops_alerts": {"ok": True, "as_of": "2026-09-21T00:00:00+00:00", "alerts": [],
+                      "summary": {"total": 0}},
+}
+
+#: 桥接面**必须**有渲染器的高频件（按真名核对：``v3_mcp`` 路由表里逐件存在）。
+V3_RENDER_REQUIRED = ("v3_sentiment", "v3_factors_matrix", "v3_risk_analytics",
+                      "v3_risk_industry", "v3_strategy", "v3_market", "v3_orderbook",
+                      "v3_research", "v3_ops_alerts")
+
+
+class BridgeRenderTests(unittest.TestCase):
+    """第 7 层：``v3_*`` 的 ``format:"text"``（卡片 / schema / 渲染三处同一谓词）。
+
+    只读：真实调用只打只读 v3 件（``v3_market`` / ``v3_orderbook`` / ``v3_strategy`` /
+    ``v3_research``），且都在**离线装配**（假 handle）里跑——不碰线上 8397、不碰写端点。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = build_offline_app(mcp_discovery.DISCOVERY)
+        cls.proxy = cls.app.state.mcp_discovery
+        cls.bridge = cls.app.state.v3_mcp_bridge
+        cls.bridge_names = set(cls.bridge.names)
+        _silence_loggers()
+
+    def test_every_renderable_bridge_tool_advertises_format_on_its_card(self):
+        """卡片：renderable 集合 **≡** ``TOOL_RENDERERS ∩ v3 工具名``，且逐件列出 ``format``。"""
+        expected = {name for name in self.bridge_names if mcp_tools.is_renderable(name)}
+        self.assertTrue(set(V3_RENDER_REQUIRED) <= expected,
+                        f"这些高频件的 renderer 不见了：{sorted(set(V3_RENDER_REQUIRED) - expected)}")
+        self.assertGreaterEqual(len(expected), 8)
+        cards = {name for name, card in self.proxy.catalog.items()
+                 if card.as_dict().get("renderable") and name in self.bridge_names}
+        self.assertEqual(cards, expected, "卡片上的 renderable 集合必须等于注册表现推的集合")
+        for name in sorted(expected):
+            card = self.proxy.catalog[name].as_dict()
+            self.assertEqual(card["formats"], [mcp_tools.FORMAT_JSON, mcp_tools.FORMAT_TEXT], name)
+            self.assertIn(mcp_tools.FORMAT_FIELD, card["optional"], name)
+        # 方向抽查：非 renderable 的桥接件不带这两个键，也不列 format
+        self.assertNotIn("renderable", self.proxy.catalog["v3_plates"].as_dict())
+        self.assertNotIn(mcp_tools.FORMAT_FIELD, self.proxy.catalog["v3_plates"].optional)
+
+    def test_direct_schema_carries_format_exactly_for_renderable_bridge_tools(self):
+        """direct 面：``format`` 在 schema 里出现 ⇔ ``is_renderable``（同一个谓词的两个落点）。"""
+        direct = build_offline_app(mcp_discovery.DIRECT)
+        tools = {tool.name: tool for tool in asyncio.run(direct.state.mcp.list_tools())}
+        for name in self.bridge_names:
+            props = set((tools[name].input_schema or {}).get("properties", {}))
+            if mcp_tools.is_renderable(name):
+                self.assertIn(mcp_tools.FORMAT_FIELD, props, name)
+            else:
+                self.assertNotIn(mcp_tools.FORMAT_FIELD, props, name)
+        self.assertIn(mcp_tools.FORMAT_FIELD,
+                      (tools["v3_market"].input_schema or {})["properties"])
+        self.assertNotIn(mcp_tools.FORMAT_FIELD,
+                         (tools["v3_plates"].input_schema or {})["properties"])
+
+    def test_call_tool_renders_prose_for_renderable_bridge_tools(self):
+        """线格式：``call_tool(name=v3_*, arguments={…,format:text})`` 真出散文（不是 JSON）。"""
+        raw = dict(fake_raw())
+        raw["series"] = {"ok": True, "value": {
+            "ticker": "SH.600519", "period": "1d", "count": 2,
+            "source": "futu/quote_history_kline", "as_of": "2026-09-19",
+            "bars": [{"t": "2026-09-18", "o": 1180.0, "h": 1190.0, "l": 1176.0, "c": 1185.49,
+                      "v": 3960779},
+                     {"t": "2026-09-19", "o": 1185.49, "h": 1195.67, "l": 1180.0, "c": 1190.1,
+                      "v": 4100000}]}}
+        raw["rt_order_book"] = {"ok": True, "value": [
+            {"books": [{"bid_list": [{"price": 430.0, "volume": 43700, "order_count": 8}],
+                        "ask_list": [{"price": 430.2, "volume": 14400, "order_count": 15}]}],
+             "code": "HK.00700", "sc_name": "腾讯控股"}]}
+
+        async def work(client, _app):
+            out = {}
+            out["market_text"] = await client.raw_tool_result(
+                "call_tool", {"name": "v3_market",
+                              "arguments": {"ticker": "SH.600519", "period": "1d",
+                                            "format": mcp_tools.FORMAT_TEXT}})
+            out["market_json"] = await client.raw_tool_result(
+                "call_tool", {"name": "v3_market",
+                              "arguments": {"ticker": "SH.600519", "period": "1d"}})
+            out["book_text"] = await client.raw_tool_result(
+                "call_tool", {"name": "v3_orderbook",
+                              "arguments": {"ticker": "HK.00700",
+                                            "format": mcp_tools.FORMAT_TEXT}})
+            return out
+
+        out = inproc(mcp_discovery.DISCOVERY, work, raw=raw)
+        is_error, text = out["market_text"]
+        self.assertFalse(is_error, "人类渲染是正常工具结果，不是 isError=true")
+        self.assertIn("SH.600519 1d K 线：共 2 根", text)
+        self.assertIn("来源 futu/quote_history_kline", text)
+        self.assertIn("as_of 2026-09-19", text)
+        self.assertNotIn('"bars"', text, "text 形态不该把 JSON 原样吐回来")
+        # 同一实参不带 format → 仍是规范 JSON 信封（机器读的那一份没被动过，逐字段可解析）
+        plain = json.loads(out["market_json"][1])
+        self.assertTrue(plain["ok"])
+        self.assertEqual(len(plain["data"]["bars"]), 2)
+        self.assertIn("HK.00700 腾讯控股 盘口", out["book_text"][1])
+        self.assertIn("买盘", out["book_text"][1])
+
+    def test_call_tool_renders_no_data_source_for_empty_bridge_data(self):
+        """空数据：经代理转发也必须出「无数据源·原因」，不是空串、不是裸 JSON。"""
+        async def work(client, _app):
+            return {"strategy": await client.raw_tool_result(
+                        "call_tool", {"name": "v3_strategy",
+                                      "arguments": {"format": mcp_tools.FORMAT_TEXT}}),
+                    "research": await client.raw_tool_result(
+                        "call_tool", {"name": "v3_research",
+                                      "arguments": {"format": mcp_tools.FORMAT_TEXT}})}
+
+        out = inproc(mcp_discovery.DISCOVERY, work)
+        # 离线 home 里从没跑过研究流水线 / 快照里没有记录 → 两条都是空数据
+        self.assertTrue(out["strategy"][1].startswith("无数据源·"), out["strategy"][1])
+        self.assertIn("尚未运行研究流水线", out["strategy"][1])
+        self.assertTrue(out["research"][1].startswith("无数据源·"), out["research"][1])
+        for _is_error, text in out.values():
+            self.assertTrue(text.strip(), "空数据绝不能渲染成空串")
+
+    def test_non_renderable_bridge_tool_still_refuses_format(self):
+        """非 renderable 的 v3 件传 ``format`` 仍按野字段拒（与直连 schema 层同一后果）。"""
+        async def work(client, _app):
+            return await client.raw_tool_result(
+                "call_tool", {"name": "v3_plates",
+                              "arguments": {"market": "SH",
+                                            "format": mcp_tools.FORMAT_TEXT}})
+
+        _is_error, text = inproc(mcp_discovery.DISCOVERY, work)
+        refusal = json.loads(text)
+        self.assertEqual(refusal["error"]["code"], "mcp/bad-arguments")
+        self.assertIn(mcp_tools.FORMAT_FIELD, refusal["error"]["message"])
+
+    def test_readonly_plane_renders_the_same_way(self):
+        """``/mcp/ro`` 的 ``call_tool``（只读闸门内）转发 renderable 件同样出散文。"""
+        raw = dict(fake_raw())
+        raw["series"] = {"ok": True, "value": {
+            "ticker": "SH.600519", "period": "1d", "count": 1,
+            "source": "futu/quote_history_kline", "as_of": "2026-09-19",
+            "bars": [{"t": "2026-09-19", "o": 1185.49, "h": 1195.67, "l": 1180.0,
+                      "c": 1190.1, "v": 4100000}]}}
+
+        async def work(client, _app):
+            return await client.raw_tool_result(
+                "call_tool", {"name": "v3_market",
+                              "arguments": {"ticker": "SH.600519", "period": "1d",
+                                            "format": mcp_tools.FORMAT_TEXT}})
+
+        is_error, text = inproc(mcp_discovery.DISCOVERY, work, raw=raw, base="/mcp/ro")
+        self.assertFalse(is_error)
+        self.assertIn("SH.600519 1d K 线：共 1 根", text)
+
+    def test_every_registered_bridge_renderer_is_pure_and_complete(self):
+        """九件渲染器：纯函数（同输入同输出）+ 空串零容忍 + 数值/单位/来源/as_of 要点齐全。"""
+        for name, (args, envelope, tokens) in V3_RENDER_FIXTURES.items():
+            self.assertTrue(mcp_tools.is_renderable(name), name)
+            first = mcp_tools.render_value(name, args, envelope)
+            second = mcp_tools.render_value(name, args, copy.deepcopy(envelope))
+            self.assertEqual(first, second, f"{name} 的渲染不是纯函数")
+            self.assertTrue(str(first or "").strip(), f"{name} 渲染出空串")
+            for token in tokens:
+                self.assertIn(token, first, f"{name} 缺要点：{token}")
+
+    def test_empty_envelopes_render_no_data_source_for_every_bridge_renderer(self):
+        """九件的空数据口径统一：``无数据源·原因``（既不是空串，也不是裸 JSON）。"""
+        self.assertEqual(set(V3_EMPTY_FIXTURES), set(V3_RENDER_REQUIRED))
+        for name, envelope in V3_EMPTY_FIXTURES.items():
+            text = mcp_tools.render_value(name, {}, envelope)
+            self.assertTrue(str(text).startswith("无数据源·"), (name, text))
+            self.assertGreater(len(text), len("无数据源·"), (name, text))
+
+    def test_renderer_registry_is_the_only_switch(self):
+        """鉴别力：临时摘掉一个桥接 renderer → 卡片与**绑定签名**同时失去 ``format``。
+
+        同一份断言在完整装配下必须通过（上面各条）——所以这不是恒真断言，而是真的由
+        ``TOOL_RENDERERS`` 驱动。第三点尤其重要：摘掉渲染器后 ``format:"text"`` **不会**
+        返回空串，而是回退规范 JSON（``render_tool_result`` 的兜底）。
+        """
+        victim = "v3_market"
+        definition = next(d for d in self.bridge.definitions if d.name == victim)
+        before = v3_mcp._bind(definition, self.bridge)  # noqa: SLF001 —— 断言的就是这个绑定期谓词
+        self.assertIn(mcp_tools.FORMAT_FIELD, before.__signature__.parameters)
+        saved = mcp_tools.TOOL_RENDERERS.pop(victim)
+        try:
+            self.assertFalse(mcp_tools.is_renderable(victim))
+            after = v3_mcp._bind(definition, self.bridge)  # noqa: SLF001
+            self.assertNotIn(mcp_tools.FORMAT_FIELD, after.__signature__.parameters)
+            rebuilt = mcp_discovery.build_catalog(mcp_tools.TOOLS, self.bridge)
+            self.assertNotIn("renderable", rebuilt[victim].as_dict())
+            self.assertNotIn(mcp_tools.FORMAT_FIELD, rebuilt[victim].optional)
+            # 装配期造好的那份绑定对象仍收得下 format（签名是装配时定的）；渲染器缺席 →
+            # ``render_tool_result`` 回退规范 JSON，**绝不**返回空串。
+            bound = self.bridge.bound[victim]
+            result = asyncio.run(bound(ticker="SH.600519", period="1d",
+                                       format=mcp_tools.FORMAT_TEXT))
+            body = json.loads(result.content[0].text)
+            self.assertIn("ok", body)
+            self.assertTrue(result.content[0].text.strip())
+        finally:
+            mcp_tools.TOOL_RENDERERS[victim] = saved
+        self.assertTrue(mcp_tools.is_renderable(victim))
+        # 还原之后同一份信封又回到散文（同一装配、同一谓词，变的只有注册表）
+        restored = mcp_tools.render_value(victim, {"ticker": "SH.600519"},
+                                          {"ok": True, "data": {"ticker": "SH.600519",
+                                                                "period": "1d", "count": 0,
+                                                                "bars": [], "source": "s"}})
+        self.assertIn("无数据源·", restored)
 
 
 if __name__ == "__main__":  # pragma: no cover

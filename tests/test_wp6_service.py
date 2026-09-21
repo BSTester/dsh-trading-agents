@@ -32,7 +32,20 @@ sys.path.insert(0, str(ROOT / "plugins" / "core" / "python"))
 from fastapi.testclient import TestClient  # noqa: E402
 
 from server import app as app_module  # noqa: E402
-from server import caches, compute, store_access  # noqa: E402
+from server import caches, compute, observability, store_access, v3_alerts  # noqa: E402
+
+#: 空探测读数：不触达工作台 handle（背景探针隔离用，见 ``Base.make_app``）。
+NO_PROBE_SNAPSHOT = {"probed_at": 0.0, "workbench_up": 0,
+                     "error": "测试隔离：探测缓存已置空，未触达工作台",
+                     "nav": None, "drawdown_pct": None, "drawdown_source": None}
+
+# 进程级告警采样线程关停（生产开关 ``QUANT_ALERTS_SAMPLER=0``，``start_sampler`` 自述的
+# 关闭口）：这条线程每 15s tick 一次，tick 经 ``build_metrics_text`` 读**进程级**探测缓存
+# 并真的去调「最新那个 app」的 handle（``schedule`` + ``equity``），会把注入替身之外的
+# 真实调用与缓存条目塞进正在跑的用例；而任何模块建过 app 都会把它启动（幂等、进程级）。
+# 关掉后本文件与后续模块都不再被它插话；采样器自身的行为由
+# ``platform/tests/test_v3_alerts.py`` 覆盖（本仓库级用例没有一条依赖它）。
+os.environ["QUANT_ALERTS_SAMPLER"] = "0"
 
 ENDPOINTS = [
     "snapshot", "switch-mode", "series", "equity", "positions", "correlation",
@@ -137,6 +150,10 @@ class Base(unittest.TestCase):
         # 缓存目录隔离：caches 默认写 $DSH_HOME/trading-workbench-cache，测试必须换成临时
         # home，否则会把用例数据写进真实用户缓存（磁盘层是补遗 C 新增的行为）。
         caches.configure(home=str(self.home))
+        # 见文件头：``QUANT_ALERTS_SAMPLER=0`` 只挡**新**线程，别的模块（如 test_wp6_mcp 的真
+        # uvicorn app）已经起过的那一个要显式停；``stop_sampler`` 幂等且对空实现安全。
+        v3_alerts.stop_sampler()
+        self.addCleanup(v3_alerts.stop_sampler)
 
     def make_app(self, **kwargs):
         kwargs.setdefault("home", str(self.home))
@@ -144,7 +161,22 @@ class Base(unittest.TestCase):
         # WP7：默认注入空转调度器——不进 lifespan 的用例本来就不会启动它，注入后连
         # 「构造真调度器（惰性导入 trading_core）」这一步也省掉，测试保持离线纯替身。
         kwargs.setdefault("scheduler", IdleScheduler())
-        return app_module.create_app(**kwargs)
+        app = app_module.create_app(**kwargs)
+        # 背景探针隔离（2026-09-21）：装配期 ``observability.register`` 会把**进程级**探测缓存
+        # 的 loader 指回「真探测这个 home 的工作台」（``schedule`` + ``equity``）。而告警采样
+        # 线程（``v3_alerts.start_sampler``，首个 app 装配时启动、幂等、进程级）每个
+        # ``sample_seconds`` 都会经 ``build_metrics_text`` 读**模块级** ``_CACHE`` 并真的调
+        # 这个 app 的 handle——于是被测 app 的注入替身会收到额外调用、``schedule|{}`` 等缓存
+        # 条目被提前写热。实测三处翻红：``DefaultWiringSmokeTests`` 的
+        # ``assertFalse(body["cached"])``（schedule 已被探针预热）、
+        # ``InnerAnalyticsCacheTests.test_audit_reuses_trades_subprocess`` 的 ``len(calls)==1``
+        # （探针的 equity 落进同一 runner）、``HandleDispatchTests`` 的
+        # ``recorder.calls`` 逐条断言（多出 ``("equity", {"window": 30}, False)``，栈顶是
+        # ``observability._probe_workbench``）。这里把装配后的探测缓存换成**不触达 handle**
+        # 的空 loader：断言口径一字未改，只是关掉「别的东西在后台偷偷调这个 app」。
+        # 探针自身的行为由 ``platform/tests/test_observability.py`` 覆盖。
+        observability.reset_probe_cache(loader=lambda: dict(NO_PROBE_SNAPSHOT))
+        return app
 
     def client(self, app):
         return TestClient(app, raise_server_exceptions=False)

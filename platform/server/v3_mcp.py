@@ -724,21 +724,568 @@ def _bind(definition, bridge):
 
     与 ``mcp_tools._bind`` 同形，唯一差别是 **async**——V3 endpoint 是协程，桥必须 await
     （业务侧仍然是各 handler 自己的 ``asyncio.to_thread``，不阻塞事件循环）。
+
+    FR-TOOLS-002 render 分离（2026-09-21 桥接面扩展）：``mcp_tools.is_renderable`` 为真的
+    v3 工具在签名**末尾追加**同一个 ``format`` 字段（复用 ``mcp_tools.format_param()``，
+    schema 与卡片因此共用同一个谓词）；响应侧交给**同一个**
+    ``mcp_tools.render_tool_result``——它读的也是同一份 ``TOOL_RENDERERS``，
+    桥接面**没有第二套渲染机制**。``format`` 在调 endpoint 前就被摘掉，绝不进业务载荷。
     """
     async def fn(**kwargs):
         provided = {key: value for key, value in kwargs.items() if value is not mcp_tools.UNSET}
+        want_text = (str(provided.pop(mcp_tools.FORMAT_FIELD, None) or "")
+                     == mcp_tools.FORMAT_TEXT)
         try:
             envelope = await bridge(definition.endpoint, provided)
         except Exception as error:  # noqa: BLE001 —— handler 之外的程序异常 → isError=true
             message = str(error)[:mcp_tools.MESSAGE_LIMIT] or error.__class__.__name__
-            return mcp_tools.tool_result(mcp_tools.failure(mcp_tools.TOOL_FAILED_CODE, message),
-                                         is_error=True)
+            envelope = mcp_tools.failure(mcp_tools.TOOL_FAILED_CODE, message)
+            if want_text:
+                return mcp_tools.render_tool_result(definition.name, provided, envelope,
+                                                    is_error=True)
+            return mcp_tools.tool_result(envelope, is_error=True)
+        if want_text:
+            return mcp_tools.render_tool_result(definition.name, provided, envelope,
+                                                is_error=False)
         return mcp_tools.tool_result(envelope, is_error=False)
 
     fn.__name__ = definition.name
     fn.__doc__ = definition.description
-    fn.__signature__ = inspect.Signature([param.parameter() for param in definition.params])
+    parameters = [param.parameter() for param in definition.params]
+    if mcp_tools.is_renderable(definition.name):
+        parameters.append(mcp_tools.format_param().parameter())
+    fn.__signature__ = inspect.Signature(parameters)
     return fn
+
+
+# ---------------------------------------------------------------------------
+# 渲染（FR-TOOLS-002 子规范②，桥接面 2026-09-21 扩展）：``format:"text"`` 的 v3_* 人类渲染
+# ---------------------------------------------------------------------------
+# 注册表**只有一份**（``mcp_tools.TOOL_RENDERERS``；基础面与桥接面共用同一个 dict、同一个
+# ``mcp_tools.render_tool_result`` 分发）。本段只往它里面**追加** v3_* 条目——没有第二套
+# 机制、没有第二份清单，``is_renderable`` 一个谓词统管 schema / 卡片 / 渲染三处。
+#
+# 每条都是 ``render(args, value) -> str`` **纯函数**：同一输入恒同一输出，无时钟、无 I/O、
+# 无随机（``as_of``/时间戳一律取自信封原文，渲染器自己不取当前时间）。空数据一律走
+# ``mcp_tools.render_no_data`` → 「无数据源·原因」，绝不放空串；``render_tool_result``
+# 另有兜底：渲染器返回空串时回退规范 JSON。
+#
+# 传进来的 ``value`` 是**桥原样透传的扁平 v3 信封**（``{ok:true, …}`` / ``{ok:false, error}``），
+# 与基础面 ``{ok, value}`` 的包装形态不同——因此本段只按扁平形态读键。
+def _v3_failure(value):
+    """``ok=false`` 的 v3 信封 → 失败原因文本（``code: message``）；``ok=true``/非信封 → None。"""
+    if not isinstance(value, dict):
+        return "响应不是标准信封"
+    if value.get("ok"):
+        return None
+    return mcp_tools.render_error_text(value)
+
+
+def _v3_tail(*parts):
+    """尾注「a · b · c」；全空 → ``来源未标注``（宁可说没有，不编一个）。"""
+    text = " · ".join(str(part) for part in parts if part not in (None, ""))
+    return text or "来源未标注"
+
+
+def _v3_rows(items, render, limit=6):
+    """列表条目：前 ``limit`` 条 + 「…其余 N 条略」（结构化信封里始终有全量）。"""
+    rows = list(items) if isinstance(items, list) else []
+    lines = [render(item) for item in rows[:limit]]
+    if len(rows) > limit:
+        lines.append(f"- …其余 {len(rows) - limit} 条略（结构化信封里有全量）")
+    return lines
+
+
+def _v3_reason(value, *keys):
+    """空数据的原因：取信封自带的 ``reason``/``note``/``notes``（第一条），都没有 → ``None``。"""
+    for key in keys:
+        item = value.get(key) if isinstance(value, dict) else None
+        if isinstance(item, list) and item:
+            item = item[0]
+        if item not in (None, ""):
+            return str(item)
+    return None
+
+
+@mcp_tools.register_renderer("v3_market")
+def _render_v3_market(args, value):
+    """``/api/v3/market``：K 线根数 + 首尾两根 + 窗口涨跌（与基础面 ``series`` 同一口径）。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    data = value.get("data") if isinstance(value.get("data"), dict) else {}
+    bars = data.get("bars") if isinstance(data.get("bars"), list) else []
+    ticker = data.get("ticker") or args.get("ticker") or "?"
+    period = data.get("period") or args.get("period") or "?"
+    source = data.get("source") or "未知"
+    as_of = data.get("as_of")
+    tail_note = _v3_tail(f"来源 {source}", as_of and f"as_of {as_of}")
+    if not bars:
+        return mcp_tools.render_no_data(f"{ticker} 取不到 K 线（bars 为空；{tail_note}）")
+    head, tail = bars[0], bars[-1]
+    lines = [f"{ticker} {period} K 线：共 {data.get('count', len(bars))} 根"
+             f"（{head.get('t')} → {tail.get('t')}；{tail_note}）",
+             f"- 最新一根：t={tail.get('t')} O={mcp_tools.render_number(tail.get('o'))} "
+             f"H={mcp_tools.render_number(tail.get('h'))} "
+             f"L={mcp_tools.render_number(tail.get('l'))} "
+             f"C={mcp_tools.render_number(tail.get('c'))} "
+             f"V={mcp_tools.render_number(tail.get('v'), 0)}",
+             f"- 窗口首根：t={head.get('t')} C={mcp_tools.render_number(head.get('c'))}"]
+    closes = [bar.get("c") for bar in bars if isinstance(bar, dict)]
+    numbers = [item for item in closes
+               if isinstance(item, (int, float)) and not isinstance(item, bool)]
+    if len(numbers) >= 2 and numbers[0]:
+        change = (numbers[-1] / numbers[0] - 1) * 100
+        lines.append(f"- 窗口累计涨跌：{mcp_tools.render_number(change, 2)}%（首→尾收盘）")
+    return "\n".join(lines)
+
+
+def _orderbook_side(rows, unit):
+    """单侧档位 → 一行文本；两种真实形态都认：``[[price, volume]]`` 与 ``[{price, …}]``。"""
+    parts = []
+    for row in rows if isinstance(rows, list) else []:
+        price = volume = count = None
+        if isinstance(row, (list, tuple)) and len(row) >= 2:
+            price, volume = row[0], row[1]
+        elif isinstance(row, dict):
+            price, volume, count = row.get("price"), row.get("volume"), row.get("order_count")
+        if price is None:
+            continue
+        text = (f"{mcp_tools.render_number(price, 3)}×"
+                f"{mcp_tools.render_number(volume, 0)}")
+        if count not in (None, ""):
+            text += f"（{count} 单）"
+        parts.append(text)
+    return f"{' / '.join(parts)} {unit}".strip() if parts else None
+
+
+@mcp_tools.register_renderer("v3_orderbook")
+def _render_v3_orderbook(args, value):
+    """``/api/v3/orderbook``：买卖档位（富途档位表 / 免密降级快照两种真实形态都认）。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    data = value.get("data")
+    ticker = value.get("ticker") or args.get("ticker") or "?"
+    book, name, source, as_of, unit, fallback = None, None, None, None, "股", None
+    if isinstance(data, list) and data:  # 富途原样档位表：[{books:[{bid_list, ask_list}], code, name}]
+        head = data[0] if isinstance(data[0], dict) else {}
+        books = head.get("books") if isinstance(head.get("books"), list) else []
+        book = books[0] if books and isinstance(books[0], dict) else None
+        name = head.get("sc_name") or head.get("name")
+        source = "futu/rt_order_book"
+    elif isinstance(data, dict):  # 免密降级快照：{book:{bid, ask, depth, volume_unit}, quote, source}
+        inner = data.get("book") if isinstance(data.get("book"), dict) else None
+        if inner:
+            book = {"bid_list": inner.get("bid"), "ask_list": inner.get("ask")}
+            unit = str(inner.get("volume_unit") or "股")
+        name = data.get("name")
+        source = data.get("source")
+        as_of = data.get("as_of")
+        chain = data.get("futu_fallback")
+        fallback = chain.get("reason") if isinstance(chain, dict) else None
+    if not isinstance(book, dict) or not (book.get("bid_list") or book.get("ask_list")):
+        return mcp_tools.render_no_data(
+            f"{ticker} 的盘口为空或形态不认识（data={type(data).__name__}）；不猜档位，"
+            "请核对上游行情权限与降级链说明")
+    source_text = source or "未知"
+    lines = [f"{ticker}{(' ' + str(name)) if name else ''} 盘口："
+             f"{_v3_tail(f'来源 {source_text}', as_of and f'as_of {as_of}')}"]
+    bids = _orderbook_side(book.get("bid_list"), unit)
+    asks = _orderbook_side(book.get("ask_list"), unit)
+    if bids:
+        lines.append(f"- 买盘：{bids}")
+    if asks:
+        lines.append(f"- 卖盘：{asks}")
+    if fallback:
+        lines.append(f"- 降级说明：{fallback}")
+    return "\n".join(lines)
+
+
+@mcp_tools.register_renderer("v3_sentiment")
+def _render_v3_sentiment(args, value):
+    """``/api/v3/sentiment``：可解释情绪分 + 正负中性计数 + 高频词 + 事件聚合。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    symbol = value.get("symbol") or args.get("symbol") or "?"
+    days = value.get("days")
+    source = value.get("source") or "未知"
+    as_of = value.get("as_of")
+    documents = value.get("documents") or 0
+    score = value.get("score")
+    if not documents or score is None:
+        reason = _v3_reason(value, "notes", "note")
+        if not reason:
+            reason = (f"{symbol} 近 {days} 天没有可打分的资讯"
+                      f"（documents={documents}，score={score}）——空窗不是 0 分")
+        return mcp_tools.render_no_data(f"{reason}；来源 {source}，as_of {as_of}")
+    lines = [f"{symbol} 资讯情绪（近 {days} 天：{documents} 篇，已打分 {value.get('scored')} 篇；"
+             f"{_v3_tail(f'来源 {source}', as_of and f'as_of {as_of}')}）",
+             f"- 综合分 score={mcp_tools.render_number(score)}"
+             f"（覆盖 {mcp_tools.render_number(value.get('coverage'), 3)}；"
+             f"正 {value.get('positive')} / 负 {value.get('negative')} / "
+             f"中性 {value.get('neutral')}；半衰 {mcp_tools.render_number(value.get('half_life_hours'), 1)}h）",
+             f"- 最新一条：{value.get('latest_at') or '未标注'}"
+             + (f"；无时间戳 {value.get('undated')} 条（保留但单列）"
+                if value.get("undated") else "")]
+    terms = [item for item in (value.get("top_terms") or []) if isinstance(item, dict)]
+    if terms:
+        lines.append("- 高频词：" + "、".join(
+            f"{item.get('term')}({mcp_tools.render_number(item.get('polarity'), 2)}×{item.get('count')})"
+            for item in terms[:6]))
+    events = [item for item in (value.get("events") or []) if isinstance(item, dict)]
+    if events:
+        lines.append("- 事件：" + "、".join(
+            f"{item.get('label') or item.get('type')} {item.get('count')} 条"
+            f"（最近 {item.get('latest_at')}）" for item in events[:5]))
+    else:
+        lines.append("- 事件：本窗口未识别到规则事件（引擎 "
+                     f"{value.get('event_method')}/{value.get('event_version')}）")
+    for note in (value.get("notes") or [])[:3]:
+        lines.append(f"- 备注：{note}")
+    return "\n".join(lines)
+
+
+@mcp_tools.register_renderer("v3_factors_matrix")
+def _render_v3_factors_matrix(args, value):
+    """``/api/v3/factors/matrix``：标的/因子列 + 非空格数 + IC 统计 + 逐因子覆盖率。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    matrix = value.get("matrix") if isinstance(value.get("matrix"), dict) else {}
+    tickers = matrix.get("tickers") if isinstance(matrix.get("tickers"), list) else []
+    factors = matrix.get("factors") if isinstance(matrix.get("factors"), list) else []
+    rows = matrix.get("matrix") if isinstance(matrix.get("matrix"), list) else []
+    if not tickers or not factors or not rows:
+        return mcp_tools.render_no_data(
+            f"因子矩阵为空（tickers={len(tickers)} / factors={len(factors)} / rows={len(rows)}；"
+            f"market={value.get('market') or args.get('market') or '未指定'}）")
+    filled = total = 0
+    for row in rows:
+        if not isinstance(row, list):
+            continue
+        total += len(row)
+        filled += sum(1 for cell in row
+                      if isinstance(cell, (int, float)) and not isinstance(cell, bool))
+    lines = [f"横截面因子矩阵（market={value.get('market') or args.get('market') or '未指定'}，"
+             f"asOf={value.get('asOf') or '未知'}，matrix.as_of={matrix.get('as_of') or '未知'}；"
+             f"来源 {matrix.get('source') or '未知'}）",
+             f"- 标的 {len(tickers)} 只：{', '.join(map(str, tickers))}",
+             f"- 因子列 {len(factors)} 列：{', '.join(map(str, factors[:12]))}"
+             + ("…" if len(factors) > 12 else ""),
+             f"- 非空格 {filled}/{total or (len(tickers) * len(factors))}"
+             "（缺的格是 null，不是 0）"]
+    ic = value.get("ic") if isinstance(value.get("ic"), dict) else {}
+    if ic.get("ok"):
+        lines.append(f"- IC（factor={ic.get('factor') or '缺省'}，"
+                     f"forward={ic.get('forwardDays')}）：{ic.get('observations')} 期，"
+                     f"meanIc={mcp_tools.render_number(ic.get('meanIc'))}，"
+                     f"ir={mcp_tools.render_number(ic.get('ir'))}，"
+                     f"latestIc={mcp_tools.render_number(ic.get('latestIc'))}"
+                     + (f"（来源 {ic.get('source')}）" if ic.get("source") else ""))
+    elif ic:
+        lines.append(f"- IC：不可用（{mcp_tools.render_error_text(ic)}）")
+    else:
+        lines.append("- IC：信封里没有 ic 块")
+    partial = [item for item in (value.get("factors") or [])
+               if isinstance(item, dict) and (item.get("coveragePct") or 0) < 100]
+    lines += _v3_rows(partial, lambda item: (
+        f"- 覆盖不足：{item.get('key')}（{item.get('classLabel') or item.get('class')}）"
+        f"{mcp_tools.render_number(item.get('coveragePct'), 1)}%"
+        f"（{item.get('covered')}/{item.get('total')}）"
+        + (f"；缺 {', '.join(map(str, (item.get('missingTickers') or [])[:4]))}"
+           if item.get("missingTickers") else "")), limit=4)
+    missing = [item for item in (value.get("factorsMissing") or []) if isinstance(item, dict)]
+    if missing:
+        lines.append(f"- 未并入的因子 {len(missing)} 项：" + "；".join(
+            f"{item.get('key')}（{str(item.get('reason') or '原因未给出')[:70]}）"
+            for item in missing[:3]))
+    else:
+        lines.append("- 未并入的因子：无（factorsMissing 为空）")
+    sources = value.get("sources") if isinstance(value.get("sources"), dict) else {}
+    lines.append("- 数据来源：" + "；".join(
+        f"{key}={str(sources[key])[:100] + ('…' if len(str(sources[key])) > 100 else '')}"
+        for key in sorted(sources) if sources.get(key)))
+    return "\n".join(lines)
+
+
+@mcp_tools.register_renderer("v3_risk_analytics")
+def _render_v3_risk_analytics(args, value):
+    """``/api/v3/risk/analytics``：VaR/CVaR/Beta/Alpha/IR/Kupiec + 组合与基准来源。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    analytics = value.get("analytics") if isinstance(value.get("analytics"), dict) else {}
+    if not analytics:
+        return mcp_tools.render_no_data(
+            "风险量块为空（analytics 缺失；组合 "
+            + str(value.get("portfolioSource") or "未标注") + "）")
+    window = analytics.get("window") if isinstance(analytics.get("window"), dict) else {}
+    kupiec = analytics.get("kupiec") if isinstance(analytics.get("kupiec"), dict) else {}
+    lines = [f"组合风险量（confidence={mcp_tools.render_number(analytics.get('confidence'), 2)}，"
+             f"观察 {analytics.get('observations')} 个交易日"
+             + (f"，{window.get('from')} → {window.get('to')}" if window else "")
+             + "）",
+             f"- 组合：{value.get('portfolioSource') or '未标注'}；"
+             f"nav={mcp_tools.render_number(value.get('nav'), 2)}"
+             + (f"（{value.get('navNote')}）" if value.get("navNote") else ""),
+             f"- 基准：{value.get('benchmarkTicker') or value.get('benchmark') or 'null（不可用）'}"
+             + (f"（来源 {value.get('benchmarkSource')}）" if value.get("benchmarkSource") else "")]
+    lines.append(f"- VaR(日)={mcp_tools.render_number(analytics.get('varDailyPct'), 2)}% · "
+                 f"CVaR(日)={mcp_tools.render_number(analytics.get('cvarDailyPct'), 2)}%"
+                 + (f" · 金额 VaR={mcp_tools.render_number(analytics.get('varAmount'), 2)} / "
+                    f"CVaR={mcp_tools.render_number(analytics.get('cvarAmount'), 2)}"
+                    if analytics.get("varAmount") is not None else ""))
+    lines.append(f"- 年化波动={mcp_tools.render_number(analytics.get('annVolPct'), 2)}% · "
+                 f"年化收益={mcp_tools.render_number(analytics.get('annReturnPct'), 2)}% · "
+                 f"最大回撤={mcp_tools.render_number(analytics.get('maxDrawdownPct'), 2)}% · "
+                 f"基准年化={mcp_tools.render_number(analytics.get('benchmarkAnnReturnPct'), 2)}%")
+    lines.append(f"- Beta={mcp_tools.render_number(analytics.get('beta'), 3)} · "
+                 f"Alpha(年化)={mcp_tools.render_number(analytics.get('alphaAnnPct'), 2)}% · "
+                 f"IR={mcp_tools.render_number(analytics.get('ir'), 3)}")
+    if kupiec:
+        lines.append(f"- Kupiec POF：突破 {kupiec.get('breaches')}/{kupiec.get('observations')} 次，"
+                     f"LR={mcp_tools.render_number(kupiec.get('lr'), 4)}，"
+                     f"p={mcp_tools.render_number(kupiec.get('pValue'), 4)} → "
+                     + ("通过" if kupiec.get("pass") else "未通过"))
+    curve = analytics.get("equityCurve") if isinstance(analytics.get("equityCurve"), list) else []
+    if curve:
+        lines.append(f"- 净值曲线：{len(curve)} 个点（{curve[0].get('t')} → {curve[-1].get('t')}）")
+    detail = value.get("risk_detail") if isinstance(value.get("risk_detail"), dict) else {}
+    leverage = detail.get("leverage") if isinstance(detail.get("leverage"), dict) else {}
+    if leverage:
+        lines.append(
+            f"- 杠杆率：持仓市值/总资产={mcp_tools.render_number(leverage.get('leverage_ratio_pct'), 2)}% · "
+            f"购买力/总资产={mcp_tools.render_number(leverage.get('buying_power_ratio_pct'), 2)}% · "
+            f"融资负债={mcp_tools.render_number(leverage.get('margin_debt_pct'), 2)}"
+            f"（来源 {leverage.get('source') or '未知'}，as_of {leverage.get('as_of') or '未知'}）")
+    liquidity = detail.get("liquidity") if isinstance(detail.get("liquidity"), dict) else {}
+    if liquidity:
+        lines.append(
+            f"- 流动性：名义单 {mcp_tools.render_number(liquidity.get('order_value'), 2)} / "
+            f"近 {liquidity.get('adv_window_days')} 日 ADV "
+            f"{mcp_tools.render_number(liquidity.get('adv_amount'), 2)} → 参与率 "
+            f"{mcp_tools.render_number(liquidity.get('participation_pct'), 4)}%（分级 "
+            f"{liquidity.get('grade') or '未给出'}）")
+    errors = (value.get("sources") or {}).get("errors") if isinstance(value.get("sources"), dict) else None
+    if errors:
+        lines.append(f"- 取数错误 {len(errors)} 条：" + "；".join(
+            str(item)[:80] for item in errors[:3]))
+    if detail.get("errors"):
+        lines.append(f"- risk_detail 子项失败 {len(detail['errors'])} 条（主区块不受影响）："
+                     + "；".join(str(item)[:80] for item in detail["errors"][:3]))
+    return "\n".join(lines)
+
+
+@mcp_tools.register_renderer("v3_risk_industry")
+def _render_v3_risk_industry(args, value):
+    """``/api/v3/risk/industry``：行业暴露排序 + 红线判定 + 未取到行业的标的。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    exposures = [item for item in (value.get("exposures") or []) if isinstance(item, dict)]
+    missing = [item for item in (value.get("missing") or []) if isinstance(item, dict)]
+    if not exposures:
+        reason = "；".join(f"{item.get('ticker')}：{item.get('reason')}" for item in missing[:3])
+        return mcp_tools.render_no_data(
+            "没有任何标的取到行业分类"
+            + (f"（{reason}）" if reason else f"（market={value.get('market') or '未过滤'}）"))
+    sources = value.get("sources") if isinstance(value.get("sources"), dict) else {}
+    top = value.get("top") if isinstance(value.get("top"), dict) else {}
+    lines = [f"行业暴露（as_of={value.get('as_of') or '未知'}，"
+             f"market={value.get('market') or '未过滤'}，红线 {mcp_tools.render_number(value.get('limitPct'), 1)}% → "
+             + ("**超限**" if value.get("breach") else "未超限") + "；"
+             + _v3_tail(f"板块来源 {sources.get('plate') or '未知'}",
+                        f"权重来源 {sources.get('weights') or '未知'}") + "）",
+             f"- 最大暴露：{top.get('industry')} {mcp_tools.render_number(top.get('weightPct'), 2)}%"]
+    lines += _v3_rows(exposures, lambda item: (
+        f"- {item.get('industry')}：{mcp_tools.render_number(item.get('weightPct'), 2)}%"
+        f"（标的 {len(item.get('tickers') or [])} 只"
+        + (f"，市值 {mcp_tools.render_number(item.get('value'), 2)}"
+           if item.get("value") is not None else "，市值 null（拿不到权益，不估算）")
+        + "）"), limit=8)
+    if missing:
+        lines.append(f"- 未取到行业 {len(missing)} 只：" + "；".join(
+            f"{item.get('ticker')}（{str(item.get('reason') or '原因未给出')[:60]}）"
+            for item in missing[:3]) + ("…" if len(missing) > 3 else ""))
+    for note in (value.get("notes") or [])[:3]:
+        lines.append(f"- 备注：{note}")
+    return "\n".join(lines)
+
+
+@mcp_tools.register_renderer("v3_strategy")
+def _render_v3_strategy(args, value):
+    """``/api/v3/strategy``：最近一轮研究流水线的阶段读数与调仓提案（只是提案）。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    run = value.get("run") if isinstance(value.get("run"), dict) else None
+    if run is None:
+        return mcp_tools.render_no_data(
+            str(value.get("note") or "尚未运行研究流水线")
+            + (f"（market={value.get('market')}）" if value.get("market") else ""))
+    universe = run.get("universe") if isinstance(run.get("universe"), list) else []
+    proposals = [item for item in (run.get("proposals") or []) if isinstance(item, dict)]
+    stages = run.get("stages") if isinstance(run.get("stages"), dict) else {}
+    lines = [f"研究流水线最近一轮（asOf={run.get('asOf') or '未知'}，"
+             f"market={run.get('market') or '未标注'}，宇宙 {len(universe)} 只"
+             + (f"：{', '.join(map(str, universe[:8]))}" if universe else "")
+             + f"；来源 {run.get('universe_source') or '未标注'}）"]
+    if proposals:
+        lines.append(f"- 调仓提案 {len(proposals)} 条（提案不是委托，执行走工作台受约束入口）：")
+        lines += _v3_rows(proposals, lambda item: (
+            f"  - {item.get('action')} {item.get('ticker')} → 目标 "
+            f"{mcp_tools.render_number(item.get('targetWeightPct'), 2)}%"
+            f"（风险 {item.get('riskLevel') or '未标注'}）｜依据：{str(item.get('basis') or '')[:90]}"),
+            limit=8)
+    else:
+        lines.append("- 调仓提案：0 条（本轮没有提案）")
+    order = ("PDAT", "PAAT", "PCPT", "PRT", "PET")
+    detail = []
+    pdat = stages.get("PDAT") if isinstance(stages.get("PDAT"), dict) else {}
+    if pdat:
+        detail.append(f"PDAT bars={pdat.get('bars')}（errors={len(pdat.get('errors') or [])}）")
+    paat = stages.get("PAAT") if isinstance(stages.get("PAAT"), dict) else {}
+    if paat:
+        detail.append(f"PAAT 分析 {paat.get('analyzed')}"
+                      f"（有因子 {paat.get('withFactors')}，scoreSource={paat.get('scoreSource') or '未标注'}）")
+    pcpt = stages.get("PCPT") if isinstance(stages.get("PCPT"), dict) else {}
+    if pcpt:
+        detail.append(f"PCPT 多头 {len(pcpt.get('longs') or [])} / 减仓 {len(pcpt.get('reduces') or [])}")
+    prt = stages.get("PRT") if isinstance(stages.get("PRT"), dict) else {}
+    if prt:
+        detail.append(f"PRT 单只权重 {mcp_tools.render_number(prt.get('weightPctPerName'), 2)}%"
+                      f"（capped={prt.get('capped')}）")
+    pet = stages.get("PET") if isinstance(stages.get("PET"), dict) else {}
+    if pet:
+        detail.append(f"PET 提案 {pet.get('proposals')}")
+    if detail:
+        lines.append("- 阶段：" + " · ".join(detail))
+    extra = [key for key in sorted(stages) if key not in order]
+    lines.append(("- 其余阶段键：" + ", ".join(extra)) if extra
+                 else "- 阶段键：PDAT→PET 五阶段齐全")
+    return "\n".join(lines)
+
+
+@mcp_tools.register_renderer("v3_research")
+def _render_v3_research(args, value):
+    """``/api/v3/research``：研报 / 研究 run / 量化预览 / 活动流的条数与最近几条。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    groups = [(key, label) for key, label in (("runs", "研究 run"), ("reports", "研报"),
+                                              ("previews", "量化预览"), ("activity", "活动"))]
+    counts = {key: len(value.get(key) or []) for key, _label in groups}
+    if not any(counts.values()):
+        return mcp_tools.render_no_data(
+            f"工作台快照里没有 runs/reports/previews/activity 记录"
+            f"（mode={value.get('mode') or '未知'}，generated_at={value.get('generated_at') or '未知'}"
+            + (f"，market={value.get('market')}" if value.get("market") else "") + "）")
+    lines = [f"研究工作台视图（mode={value.get('mode') or '未知'}，"
+             f"generated_at={value.get('generated_at') or '未知'}；"
+             f"来源 {value.get('source') or '未知'}）",
+             "- 计数：" + " · ".join(f"{label} {counts[key]} 条" for key, label in groups)]
+    reports = [item for item in (value.get("reports") or []) if isinstance(item, dict)]
+    if reports:
+        lines.append("- 最近研报：" + "；".join(
+            f"{item.get('ticker')}《{_headline(item.get('report'))}》"
+            f"评级 {item.get('rating_label') or item.get('rating') or '未标注'}"
+            f"（published_at={item.get('published_at') or '未知'}）" for item in reports[:3]))
+    runs = [item for item in (value.get("runs") or []) if isinstance(item, dict)]
+    if runs:
+        lines.append("- 最近研究 run：" + "；".join(
+            f"{item.get('ticker')} {item.get('status') or '未标注'}"
+            f"（started_at={item.get('started_at') or '未知'}）" for item in runs[:3]))
+    previews = [item for item in (value.get("previews") or []) if isinstance(item, dict)]
+    if previews:
+        lines.append("- 最近量化预览：" + "；".join(
+            f"{_preview_ticker(item)} {_preview_label(item)}"
+            f"（{_preview_date(item)}）" for item in previews[:3]))
+    activity = [item for item in (value.get("activity") or []) if isinstance(item, dict)]
+    if activity:
+        lines.append("- 活动流最近：" + "；".join(
+            f"{item.get('kind') or '未标注'} {item.get('ticker') or '—'}"
+            f"（at={item.get('at') or '未知'}）" for item in activity[:3]))
+    if value.get("filter") and isinstance(value.get("filter"), dict):
+        stats = value["filter"]
+        lines.append(f"- 市场过滤（market={value.get('market')}）：命中 {stats.get('keptRuns')} run / "
+                     f"{stats.get('keptReports')} 研报 / {stats.get('keptPreviews')} 预览 / "
+                     f"{stats.get('keptActivity')} 活动；无法归属 "
+                     f"{stats.get('unattributed')} 条" + (f"；{stats.get('note')}"
+                                                          if stats.get("note") else ""))
+    for key in ("notice", "recording_error"):
+        if value.get(key):
+            lines.append(f"- {key}：{value[key]}")
+    return "\n".join(lines)
+
+
+def _headline(markdown):
+    """研报正文 → 标题（首个非空行去掉 ``#``/引用标记，截断 60 字）；取不到 → ``无标题``。"""
+    for line in str(markdown or "").splitlines():
+        text = line.strip().lstrip("#").lstrip(">").strip()
+        if text:
+            return text[:60] + ("…" if len(text) > 60 else "")
+    return "无标题"
+
+
+def _preview_ticker(item):
+    """量化预览的标的（可能在 ``value`` 里）；取不到 → ``—``。"""
+    inner = item.get("value") if isinstance(item.get("value"), dict) else {}
+    return str(item.get("ticker") or inner.get("ticker") or "—")
+
+
+def _preview_label(item):
+    """量化预览的信号标签（``value.signal_label`` 优先）；取不到 → ``—``。"""
+    inner = item.get("value") if isinstance(item.get("value"), dict) else {}
+    return str(inner.get("signal_label") or inner.get("signal") or item.get("kind") or "—")
+
+
+def _preview_date(item):
+    """量化预览的时点（``value.date`` 优先）；取不到 → ``—``。"""
+    inner = item.get("value") if isinstance(item.get("value"), dict) else {}
+    return str(inner.get("date") or item.get("at") or "—")
+
+
+@mcp_tools.register_renderer("v3_ops_alerts")
+def _render_v3_ops_alerts(args, value):
+    """``/api/v3/ops/alerts``：平台内规则求值的三态（firing/pending/ok/no-data/unsupported）。"""
+    failed = _v3_failure(value)
+    if failed:
+        return mcp_tools.render_no_data(failed)
+    alerts = [item for item in (value.get("alerts") or []) if isinstance(item, dict)]
+    summary = value.get("summary") if isinstance(value.get("summary"), dict) else {}
+    if not alerts:
+        return mcp_tools.render_no_data(
+            f"规则求值结果为空（summary.total={summary.get('total')}；"
+            + (f"state={args.get('state')} 过滤后没有命中的规则" if args.get("state")
+               else "规则清单为空或采集未就绪") + "）")
+    lines = [f"平台内告警三态（as_of={value.get('as_of') or '未知'}，"
+             f"模型 stale={value.get('model_stale')}）：共 {summary.get('total', len(alerts))} 条规则 —— "
+             + " / ".join(f"{state} {summary.get(state, 0)}"
+                          for state in ("firing", "pending", "ok", "no-data", "unsupported")),
+             f"- 规则源：{value.get('rules_file') or '未知'}"
+             f"（{value.get('rules_file_policy') or '策略未标注'}）"]
+    for state in ("firing", "pending", "no-data", "unsupported"):
+        picked = [item for item in alerts if item.get("state") == state]
+        if not picked:
+            continue
+        lines.append(f"- {state}（{len(picked)} 条）：")
+        lines += _v3_rows(picked, lambda item: (
+            f"  - {item.get('rule')}［{item.get('severity') or '未标注'}/"
+            f"{item.get('domain') or '未标注'}］"
+            + (f" {item.get('metric')}{item.get('operator')}{mcp_tools.render_number(item.get('threshold'), 4)}"
+               f"，实测 {mcp_tools.render_number(item.get('value'), 4)}"
+               if item.get("metric") else "")
+            + f"；for={item.get('for') or '0'}，自 {item.get('since') or '未知'}"), limit=4)
+    evaluator = value.get("evaluator") if isinstance(value.get("evaluator"), dict) else {}
+    if evaluator:
+        lines.append(f"- 求值窗口：历史 {mcp_tools.render_number(evaluator.get('history_seconds'), 0)}s，"
+                     f"序列 {evaluator.get('series')} 条 / {evaluator.get('points')} 点，"
+                     f"采样间隔 {mcp_tools.render_number(evaluator.get('sample_seconds'), 1)}s")
+    if value.get("collect_error"):
+        lines.append(f"- 采集错误：{value['collect_error']}")
+    return "\n".join(lines)
 
 
 def register(server, app, bridge=None):

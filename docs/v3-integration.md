@@ -366,10 +366,13 @@ Error: dsh: plugin tree failed to load: failed to apply loader entry include (co
 
 ### 1.7 工具面元数据：`isConcurrencySafe`、`renderable` 与 `format:"text"`
 
-FR-TOOLS-002 的三条子规范落在**注册面**（`platform/server/mcp_tools.py`，本轮不改）：并发安全
+FR-TOOLS-002 的三条子规范落在**注册面**（`platform/server/mcp_tools.py`；判定表与既有渲染器
+此后未改，收窄补齐只往里**追加**）：并发安全
 判定表 `CONCURRENCY_UNSAFE_TOOLS`、渲染纯函数注册表 `TOOL_RENDERERS`、`format` 参数。
 本节记录的是它们**有没有到达调用方**——`tools/list` 的 `_meta` 与 `list_tools` 的卡片，
-以及 2026-09-21 补齐的那几处缺口（改动只在 `platform/server/mcp_discovery.py`）。
+以及 2026-09-21 补齐的那几处缺口（改动只在 `platform/server/mcp_discovery.py`；同日收窄补齐
+把渲染扩到桥接面 `v3_*`，那一轮的改动面见 §1.7.2 末段：`v3_mcp.py` + `mcp_tools.py` 的
+**追加段**）。
 
 复现命令（两种面各装配一次真应用，**只读**，不碰线上 8397）：
 
@@ -439,38 +442,67 @@ for server, label in ((app.state.mcp, '/mcp'), (app.state.mcp_ro, '/mcp/ro')):
 #### 1.7.2 `renderable` 与 `format:"text"`：同一工具，两种输出
 
 `format` 是**可选响应形态参数**（缺省 `"json"` = 规范 JSON 信封，机器读；`"text"` = 人类可读
-散文渲染）。它只出现在 renderable 工具的签名里——当前 **5 件**（`TOOL_RENDERERS`：
-`snapshot` / `series` / `factors` / `ic` / `risk`，全部是基础面工具；桥接面 `v3_*` 无渲染器）。
-非 renderable 工具**没有**这个字段，传了按未知参数拒绝（与 schema 封闭性同一后果）。
+散文渲染）。覆盖面就是 `TOOL_RENDERERS` 注册表的**逐名并集**——当前 **14 件**：
 
-同一实参的两种输出（离线装配 + fixture 数据，**渲染是生产代码**；`series` 经 discovery 面的
-`call_tool` 转发）：
+| 面 | 件数 | 逐名 |
+|---|---|---|
+| 基础面（`mcp_tools` 段内 `@register_renderer`） | 5 | `snapshot`、`series`、`factors`、`ic`、`risk` |
+| 桥接面（`v3_mcp` 2026-09-21 扩展，**同一个** `TOOL_RENDERERS`） | 9 | `v3_sentiment`、`v3_factors_matrix`、`v3_risk_analytics`、`v3_risk_industry`、`v3_strategy`、`v3_market`、`v3_orderbook`、`v3_research`、`v3_ops_alerts` |
+
+非 renderable 工具**没有**这个字段，传了按未知参数拒绝（与 schema 封闭性同一后果）。渲染器是
+`render(args, value) -> str` **纯函数**：同输入恒同输出，无时钟、无 I/O、无随机（`as_of`/时间戳
+一律取自信封原文）。
+
+**三处同源，没有第二套机制**：`v3_mcp._bind` 与 `mcp_tools._bind` 都只在
+`mcp_tools.is_renderable(name)` 为真时把 `mcp_tools.format_param()` 追加进签名，响应侧都交给
+`mcp_tools.render_tool_result`（它读的就是同一份 `TOOL_RENDERERS`）。因此
+**两面**（`direct` 直连签名 / `discovery` 经 `call_tool` 转发）与**两门**（`/mcp`、`/mcp/ro`）
+给出的是同一份渲染——`/mcp/ro` 的只读闸门只决定「能不能转发」，不改变渲染。
+
+同一实参的两种输出（**真机数据**：信封取自 8397 线上 `v3_market`，渲染走本 worktree 的生产
+渲染器；`format` 缺省 / `text` 两次调用只差这一个字段）：
 
 ```console
-# format 缺省（json）——规范信封，机器读
-$ call_tool(name="series", arguments={"ticker":"US.NVDA","period":"1d"})
-{"ok":true,"value":{"ticker":"US.NVDA","period":"1d","count":3,
- "source":"futu/quote_history_kline","as_of":"2026-09-19",
- "bars":[{"t":"2026-09-17","o":176.1,"h":178.4,"l":175.2,"c":177.9,"v":210340000}, …]}}
+# format 缺省（json）——规范信封，机器读（线上 call_tool 原样）
+$ call_tool(name="v3_market", arguments={"ticker":"SH.600519","period":"1d","limit":60})
+{"ok":true,"data":{"ticker":"SH.600519","period":"1d","source":"futu/quote_history_kline",
+ "as_of":"2026-09-21","count":60,"bars":[{"t":"2026-06-30","o":1187.0,"h":1195.67,…}, …]}}
 
 # format="text"——同一份数据的人类渲染（纯函数：同输入恒同输出，无时钟/无 I/O）
-$ call_tool(name="series", arguments={"ticker":"US.NVDA","period":"1d","format":"text"})
-US.NVDA 1d K 线：共 3 根（2026-09-17 → 2026-09-19；来源 futu/quote_history_kline）
-- 最新一根：t=2026-09-19 O=178.2000 H=181.0000 L=177.5000 C=180.4000 V=241900000
-- 窗口首根：t=2026-09-17 C=177.9000
-- 窗口累计涨跌：1.41%（首→尾收盘）
+$ call_tool(name="v3_market", arguments={"ticker":"SH.600519","period":"1d","format":"text"})
+SH.600519 1d K 线：共 60 根（2026-06-30 → 2026-09-21；来源 futu/quote_history_kline · as_of 2026-09-21）
+- 最新一根：t=2026-09-21 O=1259.0000 H=1259.9500 L=1250.8000 C=1252.5700 V=2501689
+- 窗口首根：t=2026-06-30 C=1185.4900
+- 窗口累计涨跌：5.66%（首→尾收盘）
+```
+
+薄的一层**适配**也在渲染里如实露出（同一 `/api/v3/orderbook` 的 A 股降级链形态）：档位单位、
+上游来源与降级原因都写进散文，不把降级说成原生读数：
+
+```console
+$ call_tool(name="v3_orderbook", arguments={"ticker":"SH.600519","format":"text"})
+SH.600519 贵州茅台 盘口：来源 tencent/qt.gtimg.cn · as_of 2026-09-21T11:59:30+00:00
+- 买盘：1252.570×1 / 1252.560×15 / 1252.550×110 / 1252.500×24 / 1252.450×1 手
+- 卖盘：1252.860×57 / 1252.970×1 / 1253.000×3 / 1253.120×1 / 1253.130×5 手
+- 降级说明：futu 返回 -9（A 股无实时权限）→ 已降级到免密公开源
 ```
 
 两条约定（都不靠「渲染器写得好不好」保证）：
 
-* **空数据渲染成「无数据源·原因」，不是空串**（`_no_data`）：渲染函数返回空串时回退规范 JSON，
-  绝不返回空内容；
-* **非 renderable 工具传 `format` 仍被拒**，措辞与直连 schema 层同一后果：
+* **空数据渲染成「无数据源·原因」，不是空串**（`render_no_data`）：九件桥接渲染器逐件覆盖
+  （空 `bars` / 无资讯 `documents=0` / 空矩阵 / `run=null` / 空 `exposures` / 空 `alerts` /
+  `ok=false` 信封），渲染函数返回空串时 `render_tool_result` 再回退规范 JSON，绝不返回空内容；
+* **非 renderable 工具传 `format` 仍被拒**，两面措辞不同、后果同一：
 
   ```console
-  $ call_tool(name="positions", arguments={"format":"text"})
+  $ call_tool(name="v3_plates", arguments={"market":"SH","format":"text"})   # discovery 面
   {"ok":false,"error":{"code":"mcp/bad-arguments",
-   "message":"call_tool('positions') 的实参不合法：不认识参数 ['format']。…"}}
+   "message":"call_tool('v3_plates') 的实参不合法：不认识参数 ['format']。…"}}
+
+  # direct 面同一实参 → schema 层拒绝（pydantic extra_forbidden），isError=true
+  Error executing tool v3_plates: 1 validation error for v3_platesArguments
+  format
+    Extra inputs are not permitted [type=extra_forbidden, input_value='text', input_type=str]
   ```
 
 **本轮修掉的一个真缺陷**：`format` 是 `mcp_tools._bind` 在**绑定期**追加进签名/schema 的，
@@ -478,6 +510,47 @@ US.NVDA 1d K 线：共 3 根（2026-09-17 → 2026-09-19；来源 futu/quote_his
 `call_tool(name="series", arguments={…,"format":"text"})` 一直被判野字段（直连面同一实参却是
 合法的）。修法是让卡片在 renderable 件上补列 `format`（与 schema 同一谓词），并加了两条测试钉死
 「卡片参数名集合 ≡ schema `properties` 集合（128 件逐件）」与「代理转发 `format:"text"` 真出散文」。
+
+**2026-09-21 收窄补齐（桥接面）**：上面那条修的是「卡片比 schema 窄」，但桥接面 `v3_mcp._bind`
+**根本没往 schema 里加 `format`**，所以 `v3_*` 一件都渲染不了——发现代理的卡片因此**正确地**
+标 `renderable=false`（没有假承诺），代价是模型在 discovery 模式下最常用的那批工具（`list_tools`
+检索出来的绝大多数是 `v3_*`）享受不到人类渲染。实测（本机 8397，**该进程仍是改动前的代码**，
+要重启才会带上本节的行为；重启不在本轮动作内）：
+
+```console
+$ call_tool(name="v3_market", arguments={"ticker":"SH.600519","period":"1d","format":"text"})
+{"ok":false,"error":{"code":"mcp/bad-arguments",
+ "message":"call_tool('v3_market') 的实参不合法：不认识参数 ['format']。…"}}
+
+$ list_tools(keyword="v3_market")   # 卡片：没有 renderable/formats，optional 里也没有 format
+{"name":"v3_market",…,"optional":["ticker","period","limit"],…,"readOnly":true,"concurrencySafe":true}
+```
+
+补齐后（**本 worktree 装配**：真路由表 / 真桥 / 真 MCP 注册，只有 handle 是假的；与线上进程走
+同一段 `v3_mcp._bind → render_tool_result` 代码路径）：
+
+```console
+$ call_tool(name="v3_market", arguments={"ticker":"SH.600519","period":"1d","format":"text"})
+SH.600519 1d K 线：共 60 根（2026-06-30 → 2026-09-21；来源 futu/quote_history_kline · as_of 2026-09-21）
+- 最新一根：t=2026-09-21 O=1259.0000 H=1259.9500 L=1250.8000 C=1252.5700 V=2501689
+- 窗口首根：t=2026-06-30 C=1185.4900
+- 窗口累计涨跌：5.66%（首→尾收盘）
+
+$ list_tools(keyword="v3_market")   # 卡片：多出 renderable/formats，optional 里多出 format
+{"name":"v3_market",…,"optional":["ticker","period","limit","format"],…,
+ "renderable":true,"formats":["json","text"]}
+```
+
+改动面（都在本轮归属范围内）：`v3_mcp._bind` 追加 `format` 字段 + 响应侧走同一个
+`render_tool_result`；`v3_mcp` 新增渲染段（9 条 + 若干共用小工具）；`mcp_tools` **只追加**三个
+公开别名（`render_number` / `render_no_data` / `render_error_text`——桥接面与基础面共用同一份
+数值/空数据/错误口径，不复制实现）。测试：`tests/test_mcp_discovery.py::BridgeRenderTests`
+（9 条：卡片、direct schema、代理散文、空数据、野字段拒绝、`/mcp/ro` 同渲染、纯函数、空串零容忍、
+鉴别力）与 `tests/test_mcp_parity.py::RouteParityTests`（`format` 三落点同源 + 封闭性/双射在
+`format` 进 schema 之后重测）。鉴别力（mutation）实测：临时摘掉 `v3_market` 的
+`@register_renderer` → `BridgeRenderTests` **7 条红**（卡片集合、direct schema、代理散文、
+`/mcp/ro`、空数据、纯函数、鉴别力自身），还原即绿；临时去掉 `_bind` 里的 `is_renderable` 闸门
+（`format` 无条件进 schema）→ 两个文件各红（`'format' unexpectedly found in … v3_audit`）。
 
 #### 1.7.3 卡片上的三个字段（`list_tools` 的导航面）
 
@@ -497,8 +570,10 @@ discovery 模式下 122/128 件**不在** `tools/list` 上、拿不到 `_meta`�
 
 **卡片变大的代价（如实测量）**：默认一页 20 张卡片的 `cards` 数组从 **4,609 → 5,114 字符**
 （+505，**+11.0%**；一页 payload 含 note 后为 5,750 字符），其中 `concurrencySafe` 约
-+26 字符/张；`renderable`/`formats`/`format` 只在 renderable 件上出现（一页 20 张里通常 0~1 件），
-几乎不占。全目录 128 件逐卡合计 **30,762 → 34,227 字符**（+3,465）。取舍：**保留**
++26 字符/张；`renderable`/`formats`/`format` 只在 renderable 件上出现，几乎不占（默认一页 20 张
+里当时 0~1 件；桥接面补齐后第一页仍恰好 0 件，**5,114 字符不变**）。全目录 128 件逐卡合计
+**30,762 → 34,227 → 35,014 字符**（+3,465 为 `concurrencySafe`+卡片补 `format` 那一轮，
++787 为 9 件桥接渲染器带来的 `renderable`/`formats`/`format`）。取舍：**保留**
 `concurrencySafe`（122 件工具的唯一元数据通道），**不给**非 renderable 件写
 `renderable:false`/`formats:["json"]`（那是 120+ 行冗余）。
 

@@ -1,7 +1,44 @@
 # V3.0 能力对齐审计（「其他能力都对齐了吗？」）
 
-> 🧭 **先读哪里**：**第四轮**（本节）→ 第三轮收口 → 第二轮核对 → §一~§八（第一轮归档）。
+> 🧭 **先读哪里**：**第五轮**（本节）→ 第四轮 → 第三轮收口 → 第二轮核对 → §一~§八（第一轮归档）。
 > 规格原文：`docs/v3-spec.md`（942 行，逐字提取，`grep -c '^#### FR-' = 21` ✅）。
+
+## 第五轮（2026-09-21，快照 `41bf75a` + 在途收尾——数据源补齐与工具面规范）
+
+**本轮主题**：数据来源补齐（用户政策：**除富途授权外全部免密钥公开端点**）+ FR-TOOLS-002 四条子规范。
+
+落地（真机证据见 `docs/v3-source-policy.md` 与 `docs/e2e-and-data-gaps.md` §26）：
+- **数据源政策**：Tushare 端到端移除（需 token；能力由东财/新浪/AKShare 免密替代）；
+  `/api/v3/tushare` 实测回落 SPA（路由确已不存在）。逐源清单与失败信封表见 `v3-source-policy.md`。
+- **A 股实时行情/盘口**：新增免密降级链（东财 push2 → 腾讯 qt.gtimg.cn → 新浪 hq.sinajs.cn），
+  富途 -9 时启用、**HK/US 行为一字不变**；实测腾讯命中 + 五档 `book_depth=5`、延迟口径如实标注。
+  → FR-DATA-001 的"A 股实时无权限"从**硬缺口**变为**已有免密替代路径**（权限限制本身仍在）。
+- **北向资金 / 宏观**：新端点 `/api/v3/northbound`、`/api/v3/macro`（含 OpenBB OECD 第二源，
+  两口径并列：NBS 0.8% ↔ OECD 0.008，逐月核对一致）。→ 补上规格附录 C 里富途没有的两格。
+- **因子覆盖**：roe/roa **3/5 → 5/5**（Yahoo + AKShare 财务指标免密兜底，逐行 `source` 区分口径）、
+  revenue_yoy/net_profit_yoy 4/5、情绪列 **0/5 → 4/5**（快照 ∨ v3_nlp 实时打分，经 `data.cache` PIT）、
+  capital_flow 5/5（`classes=all`）；short_interest A 股 0/5 是**上游事实**（仅 HK/US 有卖空数据）。
+- **FR-TOOLS-002 四条子规范全部落地**：`isConcurrencySafe`（fail-closed 判定，经 `tools/list` 的
+  `_meta` 两面暴露，direct 面 51 件 v3_\* 全覆盖 47 true/4 false）、`render` 分离（`format:"text"`
+  纯函数人类渲染）、**等长 null 对齐**（3 个不一致序列端口改齐，预热位字面 null + `alignment` 字段）、
+  `skills/quant-research/SKILL.md`（五阶段工作流，禁写边界，挂载三条实证）。
+- **修复 4 个运行时缺陷**（新端点曾完全不可用）：北向 500（漏 import `_head`）、扩展链探测
+  TypeError（传参名错）、盘口降级字段恒 null（调错函数）、宏观 OECD 第二源恒 no-rows（丢 index）。
+- **前端真缺陷**：`risk.jsx`/`strategy.jsx` 用 `Number(point.v)` 接字面 null（JS `Number(null)===0`）
+  会把预热位画成假的 0 起点 → 改用 `stat-core.isMissingValue` → NaN。
+
+**第五轮计数（31 条）**：**对齐 17 / 部分 12 / 缺失 0 / 不适用 1 / 未验证 1**
+（第四轮 16/13；本轮 FR-TOOLS-002 由部分→对齐）。
+- 完全对齐率 = 17/30 可评 ≈ **57%**；覆盖 = 100%；对齐+部分 = 97%。
+- 仍为"部分"的 12 条与限制：GATEWAY-001（命名口径与 outbound 豁免）、TOOLS-001（规格 13 个
+  方法名）、DATA-001（A 股仍无富途实时权限；live 往返未实测）、DATA-002（`dsh-quant-data-mcp`
+  未接入，Tushare 按政策移除）、STRAT-001（另类因子 A 股受上游限制）、STRAT-002（数千次回测
+  仍未达标：上限 64 格/次）、STRAT-003（多源情绪融合弱）、EXEC-001（live 未实测）、
+  EXEC-003（margin_debt/byFactor 上游缺字段）、MON-002（TradingView 未采用、会话状态待积累）、
+  §4.2（RBAC 0、私钥明文 PKCS8+0600）、§8.2（9 个环境变量仅 2 个功能性读取；传输走 HTTP /mcp）。
+- 未验证 1：NFR §4.1（用户已明确"性能不管"；已有口径的两项实测超标已登记）。
+
+---
 
 ## 第四轮（2026-09-21，快照 `a6c9032`——策略层 + 因子数据侧 + 研究正确性修复）
 

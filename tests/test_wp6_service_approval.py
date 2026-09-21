@@ -81,6 +81,23 @@ def declared_readonly_bridge_names(app):
     return {v3_mcp.tool_name(path) for path in v3_route_paths(app)
             if path not in v3_mcp.NON_READONLY_PATHS}
 
+
+def published_fields(definition):
+    """发布 ``inputSchema`` 的字段集 ≡ 定义字段集 ∪（renderable 件的 ``format``）。
+
+    ``format`` 是 FR-TOOLS-002 子规范②在**绑定期**追加到签名末尾的唯一动态字段
+    （``mcp_tools._bind`` / ``v3_mcp._bind`` 同形），**不在** ``ToolDefinition.fields``
+    里——``fields`` 是与规格 §3.2/§3.4 表逐项对平的那份清单（见本文件
+    ``test_input_fields_match_the_spec_table`` 与 ``SPEC_FIELDS``），发布面因此比清单多
+    且**仅多**这一个字段。两处由同一个谓词决定（``mcp_tools.is_renderable`` → 唯一注册表
+    ``TOOL_RENDERERS``），故此处同样用它推导，不另抄一份「哪些工具可渲染」的名单。
+    断言是**集合相等**（多一件、少一件都红），不放宽。
+    """
+    fields = set(definition.fields)
+    if mcp_tools.is_renderable(definition.name):
+        fields.add(mcp_tools.FORMAT_FIELD)
+    return fields
+
 # R4 的动作 → 指令类型（规格 §8.2 五种指令里服务面可达的四种）。
 ACTION_COMMANDS = {"execute": "execute_plan", "cancel": "cancel_plan",
                    "kill": "kill", "unkill": "unkill"}
@@ -814,7 +831,8 @@ class R5ToolSurfaceShapeTests(R5ToolSurfaceTests):
         * ``direct``    —— 基础 77 件对 ``mcp_tools.TOOLS``、全部桥接件对 ``bridge.definitions``；
         * ``discovery`` —— 面上的 6 件逐件对「基础 ``TOOLS`` / 桥接 ``definitions`` /
           代理自己的签名（``mcp_discovery.list_tools_signature|call_tool_signature``）」；
-        * 字段集漂一格就红（不放宽）。
+        * 字段集按 ``published_fields`` 推导（定义字段 ∪ renderable 的 ``format``）：
+          漂一格就红（不放宽）。
         """
         tools = self.registered()
         bridge = self.app.state.v3_mcp_bridge
@@ -827,7 +845,7 @@ class R5ToolSurfaceShapeTests(R5ToolSurfaceTests):
         for tool in tools:
             definition = registry[tool.name]
             schema = tool.input_schema
-            self.assertEqual(set(schema["properties"]), set(definition.fields), tool.name)
+            self.assertEqual(set(schema["properties"]), published_fields(definition), tool.name)
             self.assertIs(schema.get("additionalProperties"), False, tool.name)
             self.assertEqual({param.name for param in definition.params if param.required},
                              set(schema.get("required", [])), tool.name)

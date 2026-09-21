@@ -613,6 +613,26 @@ class ChannelConfigTest(unittest.TestCase):
 class RouteSwitchTest(CacheIsolatedTest):
     """8 既有端点后端切换（mock 两通道）+ 9 新端点双后端。"""
 
+    def setUp(self):
+        """把 A 股公开降级钩子钉成**未安装**（进程级单例，见 ``test_wp7_futu_data`` 同款说明）。
+
+        ``futu_data._PUBLIC_FALLBACK`` 由 ``v3_sources_ext.register`` 在装配期安装；只要此前
+        有模块建过 app，钩子就留在进程里，本类的 -9 用例会被免密公开源接管（实测：真实
+        ``GET https://qt.gtimg.cn/q=sh600519`` → ``ok`` 由 false 翻成 true）。本类断言的是
+        **两通道的错误分类**（-9 → ``trading/futu-error``），故显式置为未安装并在用例后
+        恢复；「钩子已安装时 -9 被降级接管」这一新政策由下面
+        ``test_minus9_falls_back_to_public_source_when_hook_installed`` 用注入替身单独钉住。
+        """
+        super().setUp()
+        previous = futu_data._PUBLIC_FALLBACK  # noqa: SLF001 —— 单例只有 active() 读取口
+        futu_data.uninstall_public_fallback()
+
+        def restore():
+            if previous is not None:
+                futu_data.install_public_fallback(previous)
+
+        self.addCleanup(restore)
+
     def test_default_channel_is_mcp_when_call_injected(self):
         futu = make_futu()
         self.assertEqual(futu.channel, "mcp", "注入 call 替身即钉住 MCP 通道（既有行为零变化）")
@@ -676,6 +696,7 @@ class RouteSwitchTest(CacheIsolatedTest):
                 self.assertIn("futu_auth.py", out["error"]["message"], endpoint)
 
     def test_openapi_business_error_maps_to_futu_error(self):
+        """OpenAPI 通道的业务错误 → ``trading/futu-error``（钩子未安装时的口径，见 ``setUp``）。"""
         futu = make_futu(channel="openapi",
                          market=RecordingMarket(error=OpenApiError(
                              "realtime quote permission required", errcode=-9)))
@@ -683,6 +704,30 @@ class RouteSwitchTest(CacheIsolatedTest):
         self.assertFalse(out["ok"])
         self.assertEqual(out["error"]["code"], "trading/futu-error")
         self.assertEqual(out["error"]["details"], {"errcode": -9})
+
+    def test_minus9_falls_back_to_public_source_when_hook_installed(self):
+        """同一条 -9 实参 + 钩子已安装 → 免密公开源接管（数据源政策，与通道无关）。
+
+        降级判据是「``details`` 里 ret_code/errcode == -9 **且**请求全是沪/深标的」
+        （``futu_data._is_public_fallback_eligible``）——它看的是**富途权限缺口**这一事实，
+        不看走的是 mcp 还是 openapi 后端。此处注入替身钉住：入参 ``(endpoint, codes, error)``
+        逐项可见、返回值原样成为成功载荷、只问一次。
+        """
+        seen = []
+
+        def hook(endpoint, codes, error):
+            seen.append((endpoint, list(codes), error.details))
+            return {"ok": True, "source": "tencent/qt.gtimg.cn", "code_list": ["600519"]}
+
+        futu_data.install_public_fallback(hook)
+        self.addCleanup(futu_data.uninstall_public_fallback)
+        futu = make_futu(channel="openapi",
+                         market=RecordingMarket(error=OpenApiError(
+                             "realtime quote permission required", errcode=-9)))
+        out = futu.handle("rt_quote", {"codes": ["SH.600519"]})
+        self.assertTrue(out["ok"], out)
+        self.assertEqual(out["value"]["source"], "tencent/qt.gtimg.cn")
+        self.assertEqual(seen, [("rt_quote", ["SH.600519"], {"errcode": -9})])
 
     def test_openapi_param_error_maps_to_invalid_operation(self):
         futu = make_futu(channel="openapi", market=RecordingMarket())

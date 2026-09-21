@@ -3118,10 +3118,10 @@ FACTOR_REGISTRY = tuple([
      "source": "trading-data/fundamentals（futu/statements 净利/营收）",
      "pit": "同上"},
     {"key": "roe", "class": "quality", "direction": 1,
-     "source": "trading-data/fundamentals.roe（v3_fundamentals_sync，Yahoo 季度净利/权益，%）",
+     "source": "trading-data/fundamentals.roe（v3_fundamentals_sync；Yahoo 季度净利/权益 或 AKShare 财务指标(东财/新浪)兜底——**逐行 source 列区分口径**，%）",
      "pit": "最新可见报告期，announced_at 非空且 ≤t；A 股真实公告日，非 A 股同步日保守可得；不跨期补值、不年化"},
     {"key": "roa", "class": "quality", "direction": 1,
-     "source": "trading-data/fundamentals.roa（v3_fundamentals_sync，Yahoo 季度净利/总资产，%）",
+     "source": "trading-data/fundamentals.roa（v3_fundamentals_sync；Yahoo 季度净利/总资产 或 AKShare 财务指标(东财/新浪)兜底——**逐行 source 列区分口径**，%）",
      "pit": "最新可见报告期，announced_at 非空且 ≤t；A 股真实公告日，非 A 股同步日保守可得；不跨期补值、不年化"},
     # ── 成长（缺失类 ②）──
     {"key": "revenue_yoy", "class": "growth", "direction": 1,
