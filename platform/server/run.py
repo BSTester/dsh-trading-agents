@@ -149,7 +149,9 @@ def main(argv=None):
     if warning is not None:
         print(json.dumps(warning, ensure_ascii=False), file=sys.stderr, flush=True)
     config = load_config(home)
-    app = create_app(home)
+    # 2026-09-21 修：此前不传 config → ``service.mcp_surface`` 等部署级配置在正常启动
+    # 路径上读不到（只有显式传 config= 的测试才生效）。这里把 load_config 的结果传进去。
+    app = create_app(home, config=config)
     server = build_server(app, config)
     try:
         server.run()

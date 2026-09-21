@@ -678,8 +678,14 @@ def _config_surface(config):
     但**拼错的值**不在这里吞掉——它交给 ``mcp_discovery.resolve_surface`` 判定，非法取值
     直接抛错（静默退回某个模式会让「切了没生效」变成查不出的运维事故）。
     """
-    service = config.get("service") if isinstance(config, dict) else None
-    value = service.get("mcp_surface") if isinstance(service, dict) else None
+    if not isinstance(config, dict):
+        return None
+    # 两种形状都接受：整份 ``trading-platform.json``（有 "service" 节）与
+    # ``config.load_config`` 的**扁平**返回（键直接是 mcp_surface）。2026-09-21 修。
+    service = config.get("service")
+    if not isinstance(service, dict):
+        service = config
+    value = service.get("mcp_surface")
     return value if isinstance(value, str) and value.strip() else None
 
 

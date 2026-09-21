@@ -13,7 +13,11 @@ from server.config import DEFAULTS, load_config  # noqa: E402
 
 class Wp6ServiceLocks(unittest.TestCase):
     def test_defaults_frozen_values(self):
-        self.assertEqual(DEFAULTS, {"port": 8397, "host": "127.0.0.1", "token": None})
+        # 2026-09-21：契约变更——``service.mcp_surface``（MCP 工具面模式，部署级缺省）现在是
+        # 受支持的配置键，默认 None（= 交 mcp_discovery.resolve_surface 走 discovery 缺省）。
+        # 该键此前在正常启动路径上读不到（run.py 不传 config + load_config 不搬运），已一并修复。
+        self.assertEqual(DEFAULTS, {"port": 8397, "host": "127.0.0.1", "token": None,
+                                    "mcp_surface": None})
 
     def test_env_overrides_without_file(self):
         """缺配置文件时 env 同样生效（冒烟测试的关键路径）。"""

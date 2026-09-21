@@ -10,7 +10,7 @@ import os
 import tempfile
 from pathlib import Path
 
-DEFAULTS = {"port": 8397, "host": "127.0.0.1", "token": None}
+DEFAULTS = {"port": 8397, "host": "127.0.0.1", "token": None, "mcp_surface": None}
 
 # 富途通道（WP8 任务 7：设置页保存凭据时联动更新；读取方是 futu_data.load_channel）
 FUTU_CHANNELS = ("openapi", "mcp")
@@ -46,6 +46,14 @@ def load_config(home=None):
         token = service.get("token")
         if isinstance(token, str) and token:
             merged["token"] = token
+        # 2026-09-21 修：``service.mcp_surface``（MCP 工具面模式，部署级缺省）此前**没有被
+        # 带出来**——``load_config`` 只搬 port/host/token，而 ``create_app`` 的
+        # ``_config_surface`` 又只认 ``config["service"][...]`` 形状，两边都不通 →
+        # 文档里承诺的"改配置就能切 direct/discovery"在正常启动路径上是死的。
+        # 这里如实搬出（非法取值不由本函数吞掉，交 ``mcp_discovery.resolve_surface`` 抛错）。
+        surface = service.get("mcp_surface")
+        if isinstance(surface, str) and surface.strip():
+            merged["mcp_surface"] = surface.strip()
     env = os.environ.get("TRADING_SERVICE_PORT")
     if env not in (None, ""):
         try:
