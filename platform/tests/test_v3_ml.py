@@ -597,6 +597,9 @@ ROUTES = {
     ("GET", "/api/v3/ml/sweep"),
     ("POST", "/api/v3/ml/backtest"),
     ("GET", "/api/v3/ml/models"),
+    # FR-STRAT-002 策略族补全（2026-09-21）：两条路由由 v3_analytics.register 代挂。
+    ("GET", "/api/v3/strategies/event-study"),
+    ("GET", "/api/v3/strategies/stat-arb"),
 }
 
 

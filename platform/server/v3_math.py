@@ -24,18 +24,24 @@ from server.data import cache as pit_cache
 
 __all__ = [
     "TRADING_DAYS",
+    "adf_test",
     "align_series",
     "backtest_momentum",
     "composite_z",
     "cross_sectional_z",
     "factor_matrix",
+    "half_life",
     "ic_stats",
     "kupiec_pof",
     "max_drawdown",
     "mean",
+    "ols_slope",
     "param_sweep",
+    "param_sweep_fast",
+    "pearson",
     "pick_frozen_plan_weights",
     "portfolio_risk",
+    "price_volume_factor_values",
     "returns_of",
     "round_half_up",
     "stdev",
@@ -488,6 +494,136 @@ def param_sweep(bars, windows=(10, 20, 30, 60), rebalance_days=(5, 10, 20)):
 
 
 # ---------------------------------------------------------------------------
+# 参数扫描（快速路径）：numpy 向量化 + 时间预算，数值与 param_sweep 逐格一致
+# ---------------------------------------------------------------------------
+def param_sweep_fast(bars, windows=(10, 20, 30, 60), rebalance_days=(5, 10, 20),
+                     *, deadline=None, clock=None):
+    """:func:`param_sweep` 的**快速路径**（FR-STRAT-002「数千次完整回测」）。
+
+    与参考实现的**逐格一致**由构造保证（差异只在不重算的东西上）：
+
+      * 信号 ``t`` 日动量 = ``c[t-1]/c[t-1-window] - 1``（``pit_prefix(lag=LAG_PREV_DAY)``
+        切片的标量等价——不再逐日复制可见前缀列表，只做两次下标）；
+      * 调仓日 = ``t ≡ 1 (mod rebalance)``（参考实现 ``days_since`` 计数的解析解）；
+      * 指标归约（mean/std/胜率）沿用与参考实现**同一份** Python 逐元素口径（求和顺序
+        一致，浮点逐位相同）；``maxDrawdown`` 仍在「6 位舍入后的净值」上算（同
+        ``backtest_momentum``），舍入用 ``floor(x·10⁶ + 0.5)/10⁶``——正值上与
+        :func:`round_half_up` 逐位一致。
+
+    ``deadline``（:func:`time.perf_counter` 时刻）给定时，超预算即停：``grid`` 只含**已执行**
+    的格，``planned``/``executed``/``truncated`` 如实上报——绝不把没跑的格子谎报成完成。
+    至少执行一格才允许截断（一格都不许欠的预算没有意义）。``clock`` 供测试注入
+    （缺省 ``time.perf_counter``）。
+
+    非有限收盘价（≤0 / NaN）会让参考实现抛 ``ZeroDivisionError``/``ValueError``：
+    这类输入本函数直接退回 :func:`param_sweep`（行为完全一致），不假装算出了指标。
+
+    返回 ``{grid, best, planned, executed, truncated}``；``grid`` 行形状与
+    :func:`param_sweep` 逐键一致（多出的预算三键在顶层，不动行——前端兼容）。
+    """
+    import time as _time
+
+    now = clock or _time.perf_counter
+    pairs = []
+    for bar in bars or []:
+        if not isinstance(bar, dict):
+            continue
+        close = to_float(bar.get("c"))
+        if close is None:
+            continue
+        pairs.append((bar.get("t"), close))
+    closes = [close for _, close in pairs]
+    n = len(closes)
+    rows = []
+    truncated = False
+
+    usable = n >= 3 and all(value > 0 for value in closes)
+    windows = [int(window) for window in windows]
+    rebalances = [int(value) for value in rebalance_days]
+    planned = len(windows) * len(rebalances)
+    if usable:
+        import numpy as np
+
+        close_array = np.asarray(closes, dtype=float)
+        # 日收益率 r[t] = c[t]/c[t-1] - 1（t = 1..n-1）——与参考实现同一份除法。
+        returns = close_array[1:] / close_array[:-1] - 1.0
+
+    executed = 0
+    for window in windows:
+        if truncated:
+            break
+        if not usable:
+            continue
+        if n < window + 2:
+            # 这一组 window 下所有 rebalance 格都是同一个「样本不足」——与参考实现同文案。
+            message = f"bars insufficient: need >= {window + 2}, got {n}"
+            for rebalance in rebalances:
+                rows.append({"window": window, "rebalanceDays": rebalance, "sharpe": None,
+                             "annReturnPct": None, "maxDrawdownPct": None, "error": message})
+                executed += 1
+            continue
+        # 每个窗口只算一次动量符号：mom[t] = c[t-1]/c[t-1-window] - 1（t ≥ window+1）。
+        t_indices = np.arange(window + 1, n)
+        momentum = close_array[t_indices - 1] / close_array[t_indices - 1 - window] - 1.0
+        sign_positive = momentum > 0
+        for rebalance in rebalances:
+            if deadline is not None and executed > 0 and now() >= deadline:
+                truncated = True
+                break
+            # 调仓日（参考实现 ``days_since`` 计数的解析解）：
+            #   * 首个可决策日 t0 = window+1（warmup 里 days 只增不减，一到可算即决策）；
+            #   * 之后每 **r+1** 天一次（决策置 0 → 次日判 0>=r 为假并 +1 → 第 r+1 天判中
+            #     ——参考实现的「先判后加」顺序，r=1 时实际隔天调仓，本快速路径**照实复刻**）。
+            # t0 之前仓位保持初值 0：在 t=0 处放一个「False 决策」哨兵，展开时不越界。
+            # 决策符号按动量数组下标 t-(window+1) 取（不是位置切片——调仓隔 r+1 天跳档）。
+            real_decisions = np.arange(window + 1, n, rebalance + 1)
+            decision_times = np.concatenate(([0], real_decisions))
+            decision_position = np.concatenate(
+                ([False], sign_positive[real_decisions - (window + 1)]))
+            # 展开到逐日：position[t] = 最后一个 ≤ t 的调仓日的决策。
+            day_index = np.searchsorted(decision_times, np.arange(1, n), side="right") - 1
+            position = decision_position[day_index].astype(float)
+            strat_list = (position * returns).tolist()
+            position_list = position.astype(int).tolist()
+
+            count = len(strat_list)
+            average = mean(strat_list)
+            deviation = math.sqrt(sum((value - average) ** 2 for value in strat_list)
+                                  / max(1, count - 1))
+            sharpe = (average / deviation) * math.sqrt(TRADING_DAYS) if deviation > 0 else 0.0
+            annual_return = average * TRADING_DAYS
+
+            # 净值与回撤：与参考实现一样在「6 位舍入后的净值」上算回撤（逐位一致）。
+            equity_value = 1.0
+            rounded_equity = []
+            for value in strat_list:
+                equity_value *= 1 + value
+                rounded_equity.append(math.floor(equity_value * 1e6 + 0.5) / 1e6)
+            drawdown = max_drawdown(rounded_equity)
+
+            rows.append({
+                "window": window,
+                "rebalanceDays": rebalance,
+                "sharpe": round_half_up(sharpe, 3),
+                "annReturnPct": round_half_up(annual_return * 100, 2),
+                "maxDrawdownPct": round_half_up(drawdown * 100, 2),
+            })
+            executed += 1
+        if truncated:
+            break
+
+    if not usable and executed == 0:
+        # 非法价格序列：退回参考实现拿逐格结果（行为完全一致，包括逐格错误）。
+        reference = param_sweep(bars, windows, rebalances)
+        return {**reference, "planned": planned,
+                "executed": len(reference.get("grid") or []), "truncated": False}
+    valid = [row for row in rows if row["sharpe"] is not None]
+    valid.sort(key=lambda row: row["sharpe"], reverse=True)
+    return {"grid": rows, "best": valid[0] if valid else None,
+            "planned": planned, "executed": executed, "truncated": truncated}
+
+
+# ---------------------------------------------------------------------------
 # 因子矩阵 / IC / 综合分
 # ---------------------------------------------------------------------------
 def _z_value(row, key):
@@ -625,3 +761,209 @@ def watchlist_equal_weights(watchlist, limit=8):
     if not names:
         return None, SOURCE_NO_PORTFOLIO
     return {name: 1.0 / len(names) for name in names}, f"自选池等权（{len(names)} 只）"
+
+
+# ---------------------------------------------------------------------------
+# 统计套利内核（FR-STRAT-002）：OLS 对冲比率 / ADF / 半衰期 / 相关
+# ---------------------------------------------------------------------------
+#: DF 检验的**近似 p 值**系数（MacKinnon 1994 响应面，带常数项、N=1，无趋势）。
+#: 验证锚点：τ=-2.86 → p≈0.050、τ=-3.43 → p≈0.010（DF 常数项情形的临界值反算一致）。
+MACKINNON_C_N1 = (2.1659, 1.4412, 0.038269)
+#: 右尾分支的分界（与 statsmodels ``mackinnonp`` 的 ``tau_star`` 同值）：τ 大于它时
+#: 退化为 ``1 - Φ(τ)`` 的正态近似（该区间远离 DF 分布主体，只是粗略上界——如实声明）。
+MACKINNON_TAU_STAR = -1.95
+#: ADF 的最小样本：对齐观测（差分后回归）少于它 → 统计量为 ``None``（不硬算）。
+MIN_ADF_OBS = 40
+
+ADF_IMPL_NOTE = ("DF 检验（带常数项、0 阶滞后）+ MacKinnon(1994) 响应面近似 p 值；"
+                 "venv 无 statsmodels，p 值是**近似口径**（临界值锚点 τ=-2.86→0.050、"
+                 "τ=-3.43→0.010），非精确分布")
+
+
+def _norm_cdf(value):
+    """标准正态分布函数（``math.erf`` 实现；scipy/statsmodels 均不可用）。"""
+    return 0.5 * (1.0 + math.erf(value / math.sqrt(2.0)))
+
+
+def adf_test(values):
+    """ADF（DF，带常数项、0 阶滞后）单位根检验 → ``{tStat, pValue, n, approx, note}``。
+
+    回归：``Δs_t = a + γ·s_{t-1} + e``；``t = γ / se(γ)``。p 值为
+    :data:`MACKINNON_C_N1` 的响应面近似（**明确标注近似口径**，见 :data:`ADF_IMPL_NOTE`）。
+
+    样本 < :data:`MIN_ADF_OBS`、或 ``s_{t-1}`` 零方差 → ``tStat``/``pValue`` 为 ``None``
+    （检验就是检验：算不出就如实说算不出，绝不「恒通过」）。
+    """
+    items = [value for value in (to_float(item) for item in (values or []))
+             if value is not None]
+    n = len(items)
+    base = {"tStat": None, "pValue": None, "n": n, "lags": 0, "approx": True,
+            "note": ADF_IMPL_NOTE}
+    if n < MIN_ADF_OBS + 1:
+        return {**base, "note": f"{ADF_IMPL_NOTE}；样本 {n} < {MIN_ADF_OBS + 1}，不检验"}
+    dy = [items[i] - items[i - 1] for i in range(1, n)]
+    lag = items[:-1]
+    count = len(dy)
+    mean_x = mean(lag)
+    mean_y = mean(dy)
+    sxx = sum((x - mean_x) ** 2 for x in lag)
+    if sxx <= 0:
+        return {**base, "note": f"{ADF_IMPL_NOTE}；滞后项零方差，t 统计量不可计算"}
+    sxy = sum((lag[i] - mean_x) * (dy[i] - mean_y) for i in range(count))
+    gamma = sxy / sxx
+    intercept = mean_y - gamma * mean_x
+    rss = sum((dy[i] - intercept - gamma * lag[i]) ** 2 for i in range(count))
+    if count <= 2:
+        return base
+    variance = rss / (count - 2)
+    if variance <= 0:
+        # 残差零方差 = 完美拟合（构造序列），t 统计量趋于无穷：如实给 None 而不是 inf。
+        return {**base, "note": f"{ADF_IMPL_NOTE}；残差零方差，t 统计量不可计算"}
+    se = math.sqrt(variance / sxx)
+    t_stat = gamma / se
+    if t_stat > MACKINNON_TAU_STAR:
+        p_value = 1.0 - _norm_cdf(t_stat)
+    else:
+        c0, c1, c2 = MACKINNON_C_N1
+        p_value = _norm_cdf(c0 + c1 * t_stat + c2 * t_stat * t_stat)
+    return {"tStat": round_half_up(t_stat, 4), "pValue": round_half_up(p_value, 4),
+            "n": n, "lags": 0, "approx": True, "note": ADF_IMPL_NOTE}
+
+
+def half_life(values):
+    """价差半衰期（AR(1)）：``Δs_t = b·s_{t-1} + e``，``HL = -ln2 / b``（交易日）。
+
+    ``b ≥ 0``（非均值回复）或样本不足（< 3）→ ``None``。未计常数项（价差已近零均值
+    是常用口径），如实在 ``note`` 说明。"""
+    items = [value for value in (to_float(item) for item in (values or []))
+             if value is not None]
+    if len(items) < 3:
+        return None
+    lag = items[:-1]
+    dy = [items[i] - items[i - 1] for i in range(1, len(items))]
+    mean_x = mean(lag)
+    mean_y = mean(dy)
+    sxx = sum((x - mean_x) ** 2 for x in lag)
+    if sxx <= 0:
+        return None
+    slope = sum((lag[i] - mean_x) * (dy[i] - mean_y) for i in range(len(dy))) / sxx
+    if slope >= 0:
+        return None
+    return round_half_up(-math.log(2.0) / slope, 1)
+
+
+def ols_slope(x_values, y_values):
+    """无截距 OLS 斜率 ``Σxy/Σx²``（对数价差对冲比率的常用口径）；``Σx² ≤ 0`` → ``None``。
+
+    无截距是有意选择：对数价格尺度下截距无经济含义，且残差 ``y - βx`` 的平稳性检验
+    （Engle-Granger 第一步）惯例如此。样本不一致/不足 2 → ``None``。
+    """
+    xs = [value for value in (to_float(item) for item in (x_values or []))
+          if value is not None]
+    ys = [value for value in (to_float(item) for item in (y_values or []))
+          if value is not None]
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    sxx = sum(value * value for value in xs)
+    if sxx <= 0:
+        return None
+    return sum(xs[i] * ys[i] for i in range(len(xs))) / sxx
+
+
+def pearson(x_values, y_values):
+    """皮尔逊相关；样本不一致/不足 2/零方差 → ``None``（不是 0）。"""
+    xs = [value for value in (to_float(item) for item in (x_values or []))
+          if value is not None]
+    ys = [value for value in (to_float(item) for item in (y_values or []))
+          if value is not None]
+    if len(xs) != len(ys) or len(xs) < 2:
+        return None
+    mean_x = mean(xs)
+    mean_y = mean(ys)
+    sxx = sum((value - mean_x) ** 2 for value in xs)
+    syy = sum((value - mean_y) ** 2 for value in ys)
+    if sxx <= 0 or syy <= 0:
+        return None
+    sxy = sum((xs[i] - mean_x) * (ys[i] - mean_y) for i in range(len(xs)))
+    return sxy / math.sqrt(sxx * syy)
+
+
+# ---------------------------------------------------------------------------
+# 价量因子（矩阵 as_of 路径的本地复算；公式与 workbench factors.py 逐行同源）
+# ---------------------------------------------------------------------------
+def price_volume_factor_values(closes, volumes=None):
+    """价量因子值（与 ``plugins/workbench/python/factors.py::factor_values`` 同公式）。
+
+    背景（FR-DATA-003 / 任务 4）：工作台 ``factors`` 工具面的 payload 白名单在
+    ``app.ANALYTICS_ENDPOINTS``（本任务不可改），``as_of`` 无法透传给子进程；因此
+    ``/api/v3/factors/matrix?as_of=`` 的价量列改为：K 线经 ``server.data.cache``
+    （PIT 唯一入口，显式 as_of + INCLUSIVE）读取后，**用同一份公式本地复算**。本函数
+    就是那份公式：``mom_20 / mom_60 / vol_20 / trend / rsi_14 / liq_ratio / mdd_60``
+    （外加展示用 ``close``；z 打分不含 close）。
+
+    与参考实现的差异只有防御性：分母为 0 / 样本不足的**单个因子**给 ``None``（参考实现
+    会抛异常导致整只标的失败）；整体样本 < 65 根 → ``None``（与参考实现的 65 根下限一致）。
+    ``volumes`` 缺失（bar 无 ``v``）→ ``liq_ratio`` 为 ``None``。
+    """
+    closes = [value for value in (to_float(item) for item in (closes or []))
+              if value is not None]
+    if len(closes) < 65:
+        return None
+
+    def ratio(numerator, denominator):
+        if numerator is None or denominator is None or denominator == 0:
+            return None
+        return numerator / denominator
+
+    latest = closes[-1]
+    mom_20 = ratio(latest, closes[-21])
+    mom_60 = ratio(latest, closes[-61])
+    mom_20 = None if mom_20 is None else mom_20 - 1
+    mom_60 = None if mom_60 is None else mom_60 - 1
+
+    rets = []
+    for index in range(len(closes) - 20, len(closes)):
+        if closes[index - 1] is not None and closes[index - 1] > 0:
+            rets.append(closes[index] / closes[index - 1] - 1)
+    average = mean(rets)
+    variance = (sum((value - average) ** 2 for value in rets) / (len(rets) - 1)
+                if len(rets) > 1 else 0.0)
+    vol_20 = math.sqrt(variance) * math.sqrt(TRADING_DAYS)
+
+    ma20_window = closes[-20:]
+    ma20 = sum(ma20_window) / len(ma20_window) if ma20_window else None
+    trend = ratio(latest, ma20)
+    trend = None if trend is None else trend - 1
+    rsi_14 = _rsi(closes)
+    liq_ratio = None
+    if volumes:
+        short = [value for value in (to_float(item) for item in volumes[-20:])
+                 if value is not None]
+        long_ = [value for value in (to_float(item) for item in volumes[-60:])
+                 if value is not None]
+        if len(short) == 20 and len(long_) == 60:
+            liq_ratio = ratio(mean(short), max(mean(long_), 1e-9))
+    peak = -math.inf
+    mdd_60 = 0.0
+    for price in closes[-60:]:
+        peak = max(peak, price)
+        if peak > 0:
+            mdd_60 = min(mdd_60, price / peak - 1)
+    return {"mom_20": mom_20, "mom_60": mom_60, "vol_20": vol_20, "trend": trend,
+            "rsi_14": rsi_14, "liq_ratio": liq_ratio, "mdd_60": mdd_60, "close": latest}
+
+
+def _rsi(values, n=14):
+    """RSI（与 workbench ``factors.py::rsi`` 同式）；样本 < n+1 → ``None``。"""
+    if len(values) < n + 1:
+        return None
+    gains, losses = [], []
+    for index in range(1, len(values)):
+        delta = values[index] - values[index - 1]
+        gains.append(max(delta, 0.0))
+        losses.append(max(-delta, 0.0))
+    avg_gain = sum(gains[-n:]) / n
+    avg_loss = sum(losses[-n:]) / n
+    if avg_loss == 0:
+        return 100.0
+    return 100 - 100 / (1 + avg_gain / avg_loss)

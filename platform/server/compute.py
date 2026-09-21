@@ -270,10 +270,24 @@ def _events_args(payload, force):
 
 
 def _factors_args(payload, force):
-    """analytics.js:133-142：``snapshot --tickers a,b --window <window>``（2..8 标的，80..1000）。"""
+    """analytics.js:133-142：``snapshot --tickers a,b --window <window>``（2..8 标的，80..1000）。
+
+    FR-DATA-003（2026-09-21 任务 4）：链路接受可选 ``as_of``（``YYYY-MM-DD``）——
+    CLI 侧在取数后按 ``t <= as_of`` 做 PIT 闸门（INCLUSIVE，与 ``server.data.cache``
+    的字符串比较逐字同口径）。既有调用零改动：不传 ``as_of`` 时参数列表与迁移前逐字一致。
+    注意：``app.ANALYTICS_ENDPOINTS`` 的字段白名单目前只放行 ``tickers``/``window``，
+    工具面调用要带 ``as_of`` 需先在该白名单登记（本任务范围外，见 docs/e2e-and-data-gaps.md）。
+    """
     tickers = _ticker_list(payload.get("tickers"), 2, "tickers must list 2..8 symbols")
     window = _int_in_range(payload.get("window"), 250, 80, 1000, "window")
-    return ["snapshot", "--tickers", ",".join(tickers), "--window", str(window)]
+    args = ["snapshot", "--tickers", ",".join(tickers), "--window", str(window)]
+    as_of = payload.get("as_of")
+    if as_of not in (None, ""):
+        text = str(as_of).strip()[:10]
+        if re.match(r"^\d{4}-\d{2}-\d{2}$", text) is None:
+            raise PayloadError("Invalid as_of date")
+        args.extend(["--as-of", text])
+    return args
 
 
 def _ic_args(payload, force):

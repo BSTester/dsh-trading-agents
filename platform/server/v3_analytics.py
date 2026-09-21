@@ -36,9 +36,14 @@
 ``/api/v3/risk/funding-check``   GET     事前风控·资金检查（只读）：订单金额 vs 真实购买力
 ``/api/v3/strategy``             GET     最近一轮研究流水线结果
 ``/api/v3/strategy/run``         POST    跑一轮 PDAT→PET 流水线（只出提案）
-``/api/v3/ml/sweep``             GET     动量策略参数网格扫描（真实回测）
+``/api/v3/ml/sweep``             GET     动量策略参数网格扫描（真实回测；组合硬上限 5000
+                                         + 时间预算，``plannedCombos``/``truncated`` 如实）
 ``/api/v3/ml/backtest``          POST    单标的动量 long/flat 回测（PIT）
 ``/api/v3/ml/models``            GET     ML 策略族（Lasso/GBDT/MLP）与动量基线同口径评估
+``/api/v3/strategies/event-study`` GET   事件驱动策略（FR-STRAT-002；由本模块代挂
+                                         ``server.v3_strategies``，真实公告事件 + CAR）
+``/api/v3/strategies/stat-arb``  GET     统计套利策略（FR-STRAT-002；OLS 对冲比率 +
+                                         ADF 近似 p + 价差 z 双腿回测）
 ===============================  ======  ================================================
 
 新增因子类别（FR-STRAT-001 补全，2026-09-20）与**真实数据源 / PIT 口径**见
@@ -82,6 +87,7 @@ __all__ = [
     "factors_matrix_data",
     "funding_check_data",
     "liquidity_risk",
+    "load_pit_bars",
     "ml_backtest",
     "ml_models",
     "ml_sweep",
@@ -362,24 +368,19 @@ def strategy_markets(home):
 # ---------------------------------------------------------------------------
 # 工作台取数
 # ---------------------------------------------------------------------------
-def _load_series(v3_run, tickers, limit, *, as_of=None, mode=None):
-    """并发取多标的日 K（参考实现用 ``Promise.all``；这里并发度上限 8）。
+def load_pit_bars(v3_run, tickers, limit, *, as_of=None, mode=None):
+    """并发取多标的日 K 的 **PIT 信封**（每个标的都过 ``pit_cache.read_bars`` 闸门）。
 
-    返回 ``(bars_by_ticker, errors, sources)``：
-      * ``bars_by_ticker``：每个标的都有键（失败给空列表），调用方按名取用；
-      * ``errors``：``[{"ticker": ..., "error": "<message>"}]``——失败就报，不静默补数；
-      * ``sources``：``{ticker: <source 字符串>}``，工具面自报的数据源（如
-        ``futu/quote_history_kline``），用于在响应里如实标注取数来源。
-
-    FR-DATA-003 迁移：取到的 K 线**必须**过 ``server.data.cache`` 的 PIT 闸门
-    （``as_of`` 缺省 = 今天 UTC，``AS_OF_INCLUSIVE``）。上游工具面的错误码/消息仍旧原样
-    带进 ``errors``（经 ``PitSourceError`` 透传），不因为多了一层就吞原因。
+    返回 ``(envelopes, errors)``：``envelopes`` 只含取数成功的标的（完整信封——
+    ``window``/``rows_used``/``rejected.future`` 可核验），``errors`` 逐标的带上游错误。
+    ``_load_series`` 在其上收窄成 ``(bars, errors, sources)`` 三元组；需要 rejected
+    证据的调用方（事件研究 / 统计套利 / 因子矩阵 as_of 路径）直接用本函数。
     """
-    bars_by_ticker = {}
+    envelopes = {}
     errors = []
-    sources = {}
-    if not tickers:
-        return bars_by_ticker, errors, sources
+    names = [str(item or "").strip() for item in (tickers or []) if str(item or "").strip()]
+    if not names:
+        return envelopes, errors
     as_of = as_of or _series_as_of()
     mode = mode or pit_cache.AS_OF_INCLUSIVE
 
@@ -392,8 +393,7 @@ def _load_series(v3_run, tickers, limit, *, as_of=None, mode=None):
                                            code=error.get("code") or "wb/error")
         value = _value_of(envelope) or {}
         bars = value.get("bars")
-        source = value.get("source")
-        return (bars if isinstance(bars, list) else []), (source or None)
+        return (bars if isinstance(bars, list) else []), (value.get("source") or None)
 
     def worker(ticker):
         try:
@@ -403,19 +403,38 @@ def _load_series(v3_run, tickers, limit, *, as_of=None, mode=None):
             return ticker, None, str(error)
         return ticker, envelope, None
 
-    workers = max(1, min(8, len(tickers)))
+    workers = max(1, min(8, len(names)))
     with ThreadPoolExecutor(max_workers=workers, thread_name_prefix="v3-series") as pool:
-        results = list(pool.map(worker, tickers))
+        results = list(pool.map(worker, names))
 
     for ticker, envelope, error in results:
         if envelope is None:
-            bars_by_ticker[ticker] = []
             errors.append({"ticker": ticker, "error": error})
             continue
-        bars_by_ticker[ticker] = list(envelope.get("bars") or [])
-        source = envelope.get("source")
-        if isinstance(source, str) and source:
-            sources[ticker] = source
+        envelopes[ticker] = envelope
+    return envelopes, errors
+
+
+def _load_series(v3_run, tickers, limit, *, as_of=None, mode=None):
+    """并发取多标的日 K（参考实现用 ``Promise.all``；这里并发度上限 8）。
+
+    返回 ``(bars_by_ticker, errors, sources)``：
+      * ``bars_by_ticker``：每个标的都有键（失败给空列表），调用方按名取用；
+      * ``errors``：``[{"ticker": ..., "error": "<message>"}]``——失败就报，不静默补数；
+      * ``sources``：``{ticker: <source 字符串>}``，工具面自报的数据源（如
+        ``futu/quote_history_kline``），用于在响应里如实标注取数来源。
+
+    FR-DATA-003 迁移：取到的 K 线**必须**过 ``server.data.cache`` 的 PIT 闸门
+    （``as_of`` 缺省 = 今天 UTC，``AS_OF_INCLUSIVE``）。上游工具面的错误码/消息仍旧原样
+    带进 ``errors``（经 ``PitSourceError`` 透传），不因为多了一层就吞原因。
+    取数本体在 :func:`load_pit_bars`（信封级原语），这里只做形状收窄。
+    """
+    envelopes, errors = load_pit_bars(v3_run, tickers, limit, as_of=as_of, mode=mode)
+    bars_by_ticker = {str(ticker): [] for ticker in (tickers or [])}
+    bars_by_ticker.update({ticker: list(envelope.get("bars") or [])
+                           for ticker, envelope in envelopes.items()})
+    sources = {ticker: envelope.get("source") for ticker, envelope in envelopes.items()
+               if isinstance(envelope.get("source"), str) and envelope.get("source")}
     return bars_by_ticker, errors, sources
 
 
@@ -857,6 +876,15 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
     新因子一律作为**横截面 z**（截断 ±3）并入 ``matrix.matrix``，并按
     :data:`FACTOR_REGISTRY` 的 ``direction`` 参与 ``strategy_run`` 的扩展综合分；
     ``as_of`` 显式给出时用它做 PIT 上界（缺省 = 今天，UTC）。
+
+    **as_of 模式（2026-09-21，任务 4）**：``as_of`` 显式给出时，价量列不再来自工作台
+    ``factors`` 工具（其 payload 白名单不接受 ``as_of``，返回的是最新口径），而是：
+    K 线经 ``server.data.cache``（显式 ``as_of`` + INCLUSIVE）读取 →
+    ``v3_math.price_volume_factor_values``（与 workbench factors.py 同公式）本地复算 →
+    横截面 z 同口径打分。响应里 ``matrix.as_of`` 是**价量列实际日期**，
+    ``asOf`` 是本地因子 PIT 上界，两者并列；不一致时 ``priceVolumePit.asOfNote``
+    解释。实时估值列与另类列在该模式**不并入**（不可 PIT，不冒充）；IC 同理跳过
+    （``ic.skipped`` + ``ic/as-of-unsupported``）。不传 ``as_of`` 时行为与历史逐字段一致。
     """
     try:
         if factor is None or str(factor).strip() == "":
@@ -899,19 +927,49 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
                       else "横截面矩阵需要 2..8 个标的（请求未给 tickers，自选池也不足 2 只）")
             return _error("factors/too-few", reason, market=code)
 
-        envelope = _call(v3_run, "factors", {"tickers": names})
-        if not envelope.get("ok"):
-            return {"ok": False, "error": _tool_error(envelope), "market": code}
-        value = _value_of(envelope) or {}
-        rows = value.get("rows")
-        base_rows = [row for row in (rows if isinstance(rows, list) else [])
-                     if isinstance(row, dict)]
+        explicit_as_of = as_of not in (None, "")
+        if explicit_as_of:
+            # 任务 4（FR-DATA-003 收尾）：as_of 显式给出 ⇒ 价量列**必须**是该时点可见的
+            # 数据。工作台 ``factors`` 工具面的 payload 白名单在 app.ANALYTICS_ENDPOINTS
+            #（本任务不改），as_of 无法透传给子进程；因此这里改为：K 线经
+            # ``server.data.cache``（PIT 唯一入口，显式 as_of + INCLUSIVE）读取后，
+            # 用与 workbench factors.py **同一份公式**（v3_math.price_volume_factor_values）
+            # 本地复算，横截面 z 与工作台同口径（n-1 样本 std、截断 ±3）。
+            price_volume = _price_volume_rows_pit(v3_run, names, pit_date)
+            base_rows = price_volume["rows"]
+            price_volume_pit = price_volume["pit"]
+            failures = price_volume["failures"]
+            kline_source = price_volume["source"]
+        else:
+            envelope = _call(v3_run, "factors", {"tickers": names})
+            if not envelope.get("ok"):
+                return {"ok": False, "error": _tool_error(envelope), "market": code}
+            value = _value_of(envelope) or {}
+            rows = value.get("rows")
+            base_rows = [row for row in (rows if isinstance(rows, list) else [])
+                         if isinstance(row, dict)]
+            price_volume_pit = None
+            failures = value.get("failures") if isinstance(value.get("failures"), dict) else {}
+            kline_source = _kline_source(value.get("sources"))
         matrix = v3_math.factor_matrix(base_rows)
         # 工具面逐标的的失败原因照样带出去（矩阵里那一行就是空的，原因不能丢）
-        matrix["failures"] = value.get("failures") if isinstance(value.get("failures"), dict) else {}
+        matrix["failures"] = failures if isinstance(failures, dict) else {}
+        if explicit_as_of:
+            matrix["source"] = (f"data.cache/pit-bars（as_of={pit_date}，INCLUSIVE）+ "
+                                "v3_math 价量公式本地复算 z")
+        wanted = _factor_classes(classes)
+        drop_alternative_note = None
+        if explicit_as_of and "alternative" in wanted:
+            # 实时另类因子在该模式下不可 PIT → 不并入（缺原因写清，不拿今天的实时数冒充）。
+            wanted.discard("alternative")
+            drop_alternative_note = ("as_of 模式下实时另类因子（capital_flow/short_interest）"
+                                     "没有 PIT 口径，未并入矩阵")
         extras, missing, sources = _factor_extras(v3_run, home, names, base_rows, wanted,
                                                   pit_date, code,
                                                   include_sentiment=include_sentiment)
+        if drop_alternative_note:
+            missing.append({"key": "capital_flow/short_interest",
+                            "reason": drop_alternative_note})
         # 只并入**真有读数**的因子的列：一个标的都没取到的因子不进矩阵（它照样出现在
         # 顶层 ``factors`` 覆盖率与 ``factorsMissing`` 里 —— 缺席，不是 0，也不是均值）。
         extras = {key: values for key, values in extras.items() if values}
@@ -924,16 +982,113 @@ def factors_matrix_data(v3_run, home, tickers_raw=None, factor="mom_20", forward
                           "factors": dict(row.get("factors") or {})}
                          for row in base_rows]
         registry = factor_registry_data(matrix)
-        return {"ok": True, "market": code, "universe_source": universe_source,
-                "market_filter": ("显式 tickers 优先，market 仅作标注" if explicit_universe
-                                  else "标的取该市场宇宙"),
-                "asOf": pit_date, "classes": sorted(wanted),
-                "matrix": matrix,
-                "factors": registry["coverage"]["factors"],
-                "factorsMissing": missing,
-                "sources": {**{"kline": _kline_source(value.get("sources"))}, **sources},                "ic": _factor_ic(v3_run, names, factor, forward_days)}
+        if explicit_as_of:
+            # 响应口径并列且诚实：``matrix.as_of`` = 价量列实际日期（逐标的最后一根可见
+            # bar 的最大值）；``asOf`` = 本地因子（质量/成长/情绪）PIT 上界。两者一致时
+            # 说明价量列就在该时点；不一致（停牌/缺数）时 asOfNote 解释差在哪。
+            price_volume_date = matrix.get("as_of")
+            as_of_note = None
+            if price_volume_date != pit_date:
+                as_of_note = (f"价量列实际日期 {price_volume_date} 早于 PIT 上界 {pit_date}"
+                              "（部分标的在该时点没有可见 bar：停牌/缺数——缺的就是缺，"
+                              "不向后填补）")
+        else:
+            price_volume_date = matrix.get("as_of")
+            as_of_note = None
+        if explicit_as_of:
+            # IC 工具面同样不接受 as_of（同一白名单约束）：该模式下不返回用未来数据算的
+            # IC，如实给 skipped + 原因，而不是冒充。
+            ic_block = {"ok": False, "factor": factor, "forwardDays": forward_days,
+                        "skipped": True,
+                        "error": {"code": "ic/as-of-unsupported",
+                                  "message": "显式 as_of 下不返回 IC：工作台 ic 工具面"
+                                             "不支持 as_of（payload 白名单在 app.py），"
+                                             "返回最新数据口径的 IC 会构成前视"}}
+        else:
+            ic_block = _factor_ic(v3_run, names, factor, forward_days)
+        response = {"ok": True, "market": code, "universe_source": universe_source,
+                    "market_filter": ("显式 tickers 优先，market 仅作标注" if explicit_universe
+                                      else "标的取该市场宇宙"),
+                    "asOf": pit_date, "classes": sorted(wanted),
+                    "matrix": matrix,
+                    "factors": registry["coverage"]["factors"],
+                    "factorsMissing": missing,
+                    "sources": {**{"kline": kline_source}, **sources},
+                    "ic": ic_block}
+        if explicit_as_of:
+            response["priceVolumePit"] = {**price_volume_pit,
+                                          "actualDate": price_volume_date,
+                                          "asOfNote": as_of_note}
+        return response
     except Exception as error:  # noqa: BLE001
         return _error("v3/internal", error)
+
+
+#: 价量列 as_of 复算的取数根数（65 根下限 + 富余，够 mom_60/mdd_60）。
+PRICE_VOLUME_BARS = 260
+
+
+def _price_volume_rows_pit(v3_run, names, pit_date):
+    """as_of 模式的价量因子行：K 线过 ``data.cache`` PIT 闸门后按工作台同公式复算。
+
+    返回 ``{rows, failures, pit, source}``：``rows`` 与工作台 ``factors`` 工具的行同形
+    （``{ticker, factors, as_of}``，z 由调用方按横截面补），``pit`` 带被闸门挡掉的
+    未来行计数（可核验的「没有未来数据」证据）。
+    """
+    envelopes, errors = load_pit_bars(v3_run, names, PRICE_VOLUME_BARS,
+                                      as_of=pit_date, mode=pit_cache.AS_OF_INCLUSIVE)
+    rows = []
+    failures = {}
+    rejected_future = 0
+    rejected_undated = 0
+    windows = {}
+    for ticker in names:
+        envelope = envelopes.get(ticker)
+        if envelope is None:
+            detail = next((item.get("error") for item in errors
+                           if item.get("ticker") == ticker), None)
+            failures[ticker] = f"K 线取数失败：{detail}"
+            continue
+        rejected_future += int((envelope.get("rejected") or {}).get("future") or 0)
+        rejected_undated += int((envelope.get("rejected") or {}).get("undated") or 0)
+        bars = list(envelope.get("bars") or [])
+        if not bars:
+            failures[ticker] = (envelope.get("missing") or {}).get("reason") or "无可见 bar"
+            continue
+        windows[ticker] = envelope.get("window")
+        closes = [v3_math.to_float(bar.get("c")) for bar in bars]
+        volumes = [v3_math.to_float(bar.get("v")) for bar in bars]
+        values = v3_math.price_volume_factor_values(closes, volumes)
+        if values is None:
+            failures[ticker] = f"可见 bar 不足 65 根（{len([c for c in closes if c])}）"
+            continue
+        rows.append({"ticker": ticker,
+                     "factors": {key: (v3_math.round_half_up(value, 5)
+                                       if isinstance(value, float) else value)
+                                 for key, value in values.items()},
+                     "as_of": bars[-1].get("t")})
+    # 横截面 z（n-1 样本 std、截断 ±3）——与工作台 zscores / _cross_sectional_z_map 同口径。
+    for key in ("mom_20", "mom_60", "vol_20", "trend", "rsi_14", "liq_ratio", "mdd_60"):
+        raw = {row["ticker"]: v3_math.to_float(row["factors"].get(key)) for row in rows}
+        raw = {ticker: value for ticker, value in raw.items() if value is not None}
+        if len(raw) < 2:
+            continue
+        zs = v3_math.cross_sectional_z(list(raw.values()))
+        by_ticker = {ticker: z for ticker, z in zip(sorted(raw), zs)}
+        for row in rows:
+            z = by_ticker.get(row["ticker"])
+            if z is not None:
+                row["z"] = {**row.get("z", {}), key: z}
+    return {
+        "rows": rows,
+        "failures": failures,
+        "pit": {"mode": "pit-recompute", "asOfGate": pit_date,
+                "semantics": pit_cache.semantics_text(pit_cache.AS_OF_INCLUSIVE, pit_date),
+                "rejectedFuture": rejected_future, "rejectedUndated": rejected_undated,
+                "windows": windows},
+        "source": (f"data.cache/pit-bars（as_of={pit_date}，INCLUSIVE）→ "
+                   "v3_math.price_volume_factor_values 本地复算"),
+    }
 
 
 #: 允许的因子类别（``classes=`` 参数取值）。``price`` 不是可选项——价量列恒定存在。
@@ -2610,6 +2765,10 @@ def register(app, v3_run, home):
 
     ``app.py`` 在静态兜底路由之前调用本函数；``v3_run`` 与 ``home`` 都是注入进来的，
     因此这里没有任何模块级全局状态，同一进程挂两次也不会互相污染（各自闭包独立）。
+
+    末尾**代挂** ``v3_strategies.register``（FR-STRAT-002 事件驱动 + 统计套利两条路由）：
+    ``app.py`` 的 V3 接线清单是固定模块列表（不在本任务改动范围），策略族与分析类同属
+    「V3 只读研究面」，由本函数代挂后同样先于静态兜底注册、同样进 MCP 桥的路由推导。
     """
 
     @app.get("/api/v3/risk/analytics")
@@ -2764,3 +2923,15 @@ def register(app, v3_run, home):
                              cost_bps=cost_bps)
 
         return _ok(await asyncio.to_thread(work))
+
+    # FR-STRAT-002 策略族补全（事件驱动 + 统计套利）：app.py 的接线清单不在本任务改动
+    # 范围，由分析类模块代挂（延迟 import，避免模块级环）。注册失败不该拖垮分析类路由。
+    try:
+        from server import v3_strategies
+
+        v3_strategies.register(app, v3_run, home)
+    except Exception as error:  # pragma: no cover —— 接线失败要可见，不能静默吞掉
+        import sys
+
+        print(f"v3_strategies register failed: {type(error).__name__}: {error}",
+              file=sys.stderr)

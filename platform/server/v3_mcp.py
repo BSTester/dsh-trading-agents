@@ -95,8 +95,11 @@ TOOL_DOCS = {
                                  "取不到就如实报错，不给估算的滑点。market=SH|HK|US，mode=sim|live。"
                                  + _READ_NOTE,
     "/api/v3/factors/matrix": "横截面因子 z 矩阵 + 因子 IC 序列 + 六类因子的真实覆盖率（未给 tickers 时取该市场宇宙；"
-                              "classes 选择并入的因子类别，as_of 是 PIT 上界；"
-                              "forward 与 forward_days 同义，缺省 5）。"
+                              "classes 选择并入的因子类别；forward 与 forward_days 同义，缺省 5）。"
+                              "as_of（YYYY-MM-DD）显式给出时：价量列只由该时点可见的日线算出"
+                              "（经 data.cache PIT 闸门），实时估值/另类列与 IC 不并入（不可 PIT，"
+                              "如实跳过）；matrix.as_of=价量列实际日期与 asOf（本地因子 PIT 上界）"
+                              "并列。不传 as_of = 最新口径（历史行为）。"
                               + _READ_NOTE,
     "/api/v3/factors/registry": "因子注册表（六类因子 + 真实数据源 + PIT 口径）+ 逐因子覆盖率；"
                                 "覆盖率与 /api/v3/factors/matrix **同一份计算**（不为页面另造一套统计）；"
@@ -140,6 +143,8 @@ TOOL_DOCS = {
                          "样本不足 → ml/insufficient-sample，该市场无宇宙 → market/no-universe。"
                          + _READ_NOTE,
     "/api/v3/ml/sweep": "动量参数网格扫描（窗口 × 调仓周期，真实日 K 回测），返回每格指标与 best。"
+                        "组合硬上限 5000（超限报 bad-args）；time_budget_ms 超预算如实截断，"
+                        "plannedCombos/combosExecuted/elapsedMs/truncated 如实上报。"
                         + _READ_NOTE,
     "/api/v3/news": "A 股个股资讯（AKShare 免密钥）。symbol 允许 SH.600519 形式；无数据时给出真实原因。"
                     + _READ_NOTE,
@@ -217,6 +222,17 @@ TOOL_DOCS = {
     "/api/v3/spot": "A 股实时快照（多接口降级 + 退避重试）；全失败时带试过的接口与真实错误原文，"
                     "**不伪造、不返回空 rows**。"
                     + _READ_NOTE,
+    "/api/v3/strategies/event-study": "事件驱动策略（FR-STRAT-002，只读研究、不出订单）：真实公告事件"
+                                       "（必须带可核验公告时点，缺时点不入样）+ 每事件收益 + 平均 CAR + "
+                                       "分类型分组 + 等权权益曲线。事件日 t 公告收盘后可知 → 次日建仓、"
+                                       "持有 H 个交易日平仓。样本 < min_events 如实返回「样本不足」。"
+                                       "K 线全量经 data.cache PIT 闸门。"
+                                       + _READ_NOTE,
+    "/api/v3/strategies/stat-arb": "统计套利策略（FR-STRAT-002，只读研究、不出订单）：同市场标的对 → 训练窗 "
+                                    "OLS 对冲比率 → 残差 ADF（numpy 自实现，p 为 MacKinnon(1994) 近似口径，"
+                                    "impl 如实标注）→ 价差 z（|z|≥z_in 进、|z|≤z_out 平）样本外双腿回测"
+                                    "（含成本）。无协整对时如实返回 cointegrated=false，检验不显著不硬选。"
+                                    + _READ_NOTE,
     "/api/v3/strategy": "最近一轮研究流水线（PDAT→PET）结果；从未运行过 → run=null 并说明。"
                         + _READ_NOTE,
     "/api/v3/strategy/run": "跑一轮 PDAT→PAAT→PCPT→PRT→PET 研究流水线并落盘（topN/window/universe/market）；"
@@ -248,6 +264,14 @@ PARAM_DOCS = {
     "limit_pct": "行业集中度红线（百分比，缺省 20）",
     "windows": "动量窗口网格（逗号分隔，如 10,20,30,60）",
     "rebalance": "调仓周期网格（逗号分隔，如 5,10,20）",
+    "time_budget_ms": "扫参时间预算（毫秒）：超预算如实截断并报告 plannedCombos/combosExecuted/truncated；"
+                      "0 表示不限时（缺省 120000）",
+    "min_events": "事件研究的最小样本数（实测事件数少于此值时如实返回「样本不足」，缺省 5）",
+    "train_ratio": "训练窗占比（0.3..0.9，缺省 0.7；其余为样本外测试窗）",
+    "z_window": "价差 z-score 的滚动窗口（交易日，5..250，缺省 60）",
+    "z_in": "开仓阈值：|z| ≥ z_in 进（缺省 2.0）",
+    "z_out": "平仓阈值：|z| ≤ z_out 平（缺省 0.5）",
+    "include_docs": "true 时附带每文档明细（doc_events）；缺省 false（避免响应膨胀）",
     "window": "回看窗口长度（根）",
     "days": "时间窗天数（按发布时间过滤资讯；缺时间戳的记录保留并单独计数）",
     "horizon": "预测前瞻期数",
@@ -264,7 +288,8 @@ PARAM_DOCS = {
     "api": "Tushare 接口名（需在服务端受支持清单内）",
     "ts_code": "Tushare 标的代码，如 600519.SH",
     "classes": "因子类别选择（quality,growth,sentiment 缺省；all 含实时另类；none 只要价量/估值列）",
-    "as_of": "PIT 上界（YYYY-MM-DD），缺省今天（UTC）",
+    "as_of": "PIT 上界（YYYY-MM-DD），缺省今天（UTC）。/api/v3/factors/matrix 显式给出时价量列"
+             "只由该时点可见数据算出（经 data.cache PIT 闸门），实时估值/另类列与 IC 不并入",
     "session": "会话 id（缺省聚合全部会话）",
     "offset": "分页起点（缺省 0）",
     "success": "只看成功/失败（true|false；非法值不过滤）",
@@ -278,6 +303,15 @@ PARAM_DOCS = {
 }
 #: 同名不同义的少数端点在此写清（键为 (路径, 参数名)）。
 PARAM_DOCS_OVERRIDES = {
+    ("/api/v3/strategies/event-study", "days"): "事件公告回看天数（30..2000，缺省 730；"
+                                                "只有带公告时点的事件入样）",
+    ("/api/v3/strategies/event-study", "horizon"): "事件持有期 H（交易日，1..60，缺省 5）："
+                                                    "次日建仓、持有 H 日平仓",
+    ("/api/v3/strategies/event-study", "limit"): "K 线取数根数（60..2000，缺省 500；"
+                                                  "事件前瞻不足 H 的事件被如实排除）",
+    ("/api/v3/strategies/stat-arb", "cost_bps"): "双腿单边成本（基点）：按 |Δpos|×(1+|β|) 计，缺省 5",
+    ("/api/v3/strategies/stat-arb", "limit"): "K 线取数根数（60..2000，缺省 500；"
+                                               "对齐后不足 80 天报 statarb/insufficient）",
     ("/api/v3/research/report.pdf", "ticker"): "按标的筛选一篇已发布研报（与 id 二选一）",
     ("/api/v3/financials", "ticker"): "标的代码：美股如 AAPL，A 股如 SH.600000/600519.SH，港股如 HK.00700",
     ("/api/v3/tushare", "period"): "报告期，如 20260630",

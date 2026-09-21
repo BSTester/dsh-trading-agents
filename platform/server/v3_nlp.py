@@ -1,6 +1,6 @@
-"""NLP 情绪引擎（规格 **FR-STRAT-003**）：把资讯变成可用的情绪因子。
+"""NLP 情绪引擎（规格 **FR-STRAT-003**）：把资讯变成可用的情绪因子与事件标签。
 
-本模块是平台**唯一**的中文金融情绪实现（纯标准库 + 无三方依赖）。它做四件事：
+本模块是平台**唯一**的中文金融情绪实现（纯标准库 + 无三方依赖）。它做五件事：
 
   1. ``DEFAULT_LEXICON`` / ``NEGATORS`` / ``INTENSIFIERS`` —— **自研**中文金融情绪词典、
      否定词表、程度副词表（不抓取任何未授权词典，全部人工按公开市场语义构造）；
@@ -8,12 +8,16 @@
      串**退化到字符 bigram**（不需要 jieba，不引入任何分词依赖）；
   3. ``score_text`` / ``score_documents`` / ``sentiment_factor`` —— 可解释打分：命中词、
      否定翻转、程度放大、按时间半衰加权；
-  4. ``sentiment_report`` + ``register`` —— 把上面三步接到一条资讯信封上，产出
-     ``GET /api/v3/sentiment`` 的响应体，并由本模块**自带 router** 注册该端点
-     （``server/app.py`` 的 V3 子模块自动装配循环会 ``import server.v3_nlp`` 并调用
-     ``register(app, v3_run, home)``）。取资讯只**惰性复用** ``server.v3_sources`` 的
-     公开函数（``detect_market`` / ``normalize_a_share_symbol`` / ``fetch_news`` / ``Deps``），
-     本模块**不**新增第二份取数实现、也**不**改 ``v3_sources`` 的结构。
+  4. ``classify_events`` / ``EVENT_RULES`` —— **事件识别**（FR-STRAT-003 的另一半）：
+     33 类资本市场事件的触发词条表 + 与打分同一套否定/程度修饰口径，输出
+     ``type/label/direction/matched/confidence``，零命中不硬造；
+  5. ``sentiment_report`` + ``register`` —— 把上面四步接到一条资讯信封上，产出
+     ``GET /api/v3/sentiment`` 的响应体（含 ``events`` 事件聚合与可选 ``doc_events``），
+     并由本模块**自带 router** 注册该端点（``server/app.py`` 的 V3 子模块自动装配循环
+     会 ``import server.v3_nlp`` 并调用 ``register(app, v3_run, home)``）。取资讯只
+     **惰性复用** ``server.v3_sources`` 的公开函数（``detect_market`` /
+     ``normalize_a_share_symbol`` / ``fetch_news`` / ``Deps``），本模块**不**新增第二份
+     取数实现、也**不**改 ``v3_sources`` 的结构。
 
 算法（口径逐条可核对，改口径必须同步改 ``docs/e2e-and-data-gaps.md`` 的 §十）::
 
@@ -654,6 +658,302 @@ def sentiment_factor(bars_by_ticker, docs_by_ticker, *, window=20,
     }
 
 
+# ── 事件识别（FR-STRAT-003 的另一半：极性之外，"这条新闻是什么事件"） ─────────────
+#
+# 与情绪打分**同一套机械**：复用 ``segment`` 的最大正向匹配与词典结构，把词典换成
+# "事件触发词条"，复合词整体收的原则不变——``立案调查`` / ``重大资产重组`` /
+# ``增持评级`` 都是整体词条，长词在切分里天然优先，所以 ``解除质押`` 不会被读成
+# ``质押``，``增持评级`` 不会被读成 ``增持``（策略侧的增持信号不被评级词污染）。
+#
+#   * ``EVENT_RULES`` —— 33 类资本市场事件：``type``（英文键，策略消费的稳定契约）、
+#     ``label``（中文）、``direction``（+1 利多 / -1 利空 / 0 中性）、``terms``
+#     （触发词条 → 基础置信 ∈ (0,1]：公告体明确词给高位，一词多义/口语词给低位；
+#     低位事件依然如实输出，置信高低留给策略侧取舍）；
+#   * 否定/程度修饰与 ``score_text`` **同词表、同窗口、同语义**（口径见
+#     ``classify_events`` 的 docstring）；
+#   * ``_EVENT_STOP_TERMS`` —— 货币市场/再融资同形词（``质押式回购``/``定增``…）以
+#     0 置信占位：先被整体切出，其内部的 ``质押``/``回购``/``增资`` 就不再是触发词
+#     （语境消歧靠"更长的整体词条先占位"，不靠黑名单正则）。
+
+#: 事件识别口径版本：进响应 ``event_method`` / ``event_version``；改规则表/口径必须同步改。
+EVENT_METHOD = "rule-v1"
+EVENT_VERSION = 1
+
+#: 33 类资本市场事件规则表（全部人工按 A 股公告/新闻常用语汇构造，无网络词典）。
+EVENT_RULES: tuple[dict, ...] = (
+    {"type": "buyback", "label": "回购", "direction": 1, "terms": {
+        "回购": 0.75, "股份回购": 0.85, "回购股份": 0.85, "回购方案": 0.8,
+        "回购计划": 0.8, "回购注销": 0.85, "回购金额": 0.7}},
+    {"type": "holder_increase", "label": "增持", "direction": 1, "terms": {
+        "增持": 0.7, "股东增持": 0.8, "高管增持": 0.8, "增持计划": 0.75,
+        "增持股份": 0.75, "举牌": 0.8, "被动增持": 0.55}},
+    {"type": "holder_reduction", "label": "减持", "direction": -1, "terms": {
+        "减持": 0.75, "股东减持": 0.8, "高管减持": 0.8, "减持计划": 0.8,
+        "减持股份": 0.75, "清仓式减持": 0.9, "董监高减持": 0.8, "套现": 0.6}},
+    {"type": "equity_pledge", "label": "股权质押", "direction": -1, "terms": {
+        "质押": 0.6, "股权质押": 0.75, "股票质押": 0.7, "质押股份": 0.7,
+        "补充质押": 0.7, "质押率": 0.6, "高比例质押": 0.8}},
+    {"type": "pledge_release", "label": "解除质押", "direction": 1, "terms": {
+        "解除质押": 0.65, "解除股权质押": 0.7, "解押": 0.6}},
+    {"type": "investigation", "label": "立案调查", "direction": -1, "terms": {
+        "立案调查": 0.95, "立案侦查": 0.9, "被立案": 0.9, "证监会立案": 0.9,
+        "遭立案": 0.85, "立案告知": 0.8, "立案": 0.7}},
+    {"type": "regulatory_penalty", "label": "监管处罚", "direction": -1, "terms": {
+        "行政处罚": 0.85, "处罚": 0.8, "罚款": 0.7, "环保处罚": 0.7, "监管函": 0.6,
+        "警示函": 0.65, "问询函": 0.6, "关注函": 0.5, "公开谴责": 0.75,
+        "通报批评": 0.7, "责令改正": 0.7, "纪律处分": 0.75, "监管关注": 0.5}},
+    {"type": "earnings_preincrease", "label": "业绩预增", "direction": 1, "terms": {
+        "业绩预增": 0.8, "预增": 0.7, "预计增长": 0.55, "预计上升": 0.5}},
+    {"type": "earnings_prereduce", "label": "业绩预减", "direction": -1, "terms": {
+        "业绩预减": 0.8, "预减": 0.7, "业绩预亏": 0.85, "预亏": 0.8, "首亏": 0.8,
+        "预计亏损": 0.75, "预计下降": 0.55, "由盈转亏": 0.85}},
+    {"type": "earnings_turnaround", "label": "业绩扭亏", "direction": 1, "terms": {
+        "扭亏为盈": 0.85, "扭亏": 0.75, "由亏转盈": 0.8, "预计扭亏": 0.75,
+        "预盈": 0.6, "实现盈利": 0.6, "摘帽": 0.7, "撤销退市风险警示": 0.7}},
+    {"type": "earnings_beat", "label": "业绩超预期", "direction": 1, "terms": {
+        "超市场预期": 0.8, "大超预期": 0.85, "超出预期": 0.8, "超预期": 0.75,
+        "好于预期": 0.75, "优于预期": 0.75, "高于预期": 0.7}},
+    {"type": "earnings_miss", "label": "业绩不及预期", "direction": -1, "terms": {
+        "差于预期": 0.75, "低于市场预期": 0.75, "不及预期": 0.75, "低于预期": 0.75,
+        "逊于预期": 0.7, "未达预期": 0.7, "不达预期": 0.7, "弱于预期": 0.7}},
+    {"type": "dividend", "label": "分红", "direction": 1, "terms": {
+        "现金分红": 0.75, "每10股派": 0.75, "10派": 0.7, "分红": 0.7, "派息": 0.7,
+        "派现": 0.7, "派发现金": 0.7, "分红方案": 0.7, "利润分配": 0.6, "股息": 0.55}},
+    {"type": "stock_split", "label": "送转", "direction": 1, "terms": {
+        "高送转": 0.7, "每10股转增": 0.65, "10转": 0.65, "送转": 0.6, "送股": 0.6,
+        "转增股本": 0.6, "转增": 0.55}},
+    {"type": "trading_halt", "label": "停牌", "direction": 0, "terms": {
+        "临时停牌": 0.8, "紧急停牌": 0.8, "停牌": 0.75, "申请停牌": 0.7}},
+    {"type": "trading_resume", "label": "复牌", "direction": 0, "terms": {
+        "复牌": 0.7, "复牌公告": 0.7, "恢复交易": 0.6}},
+    {"type": "ma_restructuring", "label": "并购重组", "direction": 1, "terms": {
+        "重大资产重组": 0.85, "发行股份购买资产": 0.8, "借壳上市": 0.8, "要约收购": 0.8,
+        "借壳": 0.75, "并购重组": 0.75, "并购": 0.7, "资产重组": 0.7, "重组": 0.65,
+        "兼并": 0.65, "收购": 0.6}},
+    {"type": "contract_win", "label": "中标", "direction": 1, "terms": {
+        "中标": 0.8, "中标公告": 0.8, "中标金额": 0.75, "预中标": 0.7, "竞得": 0.6}},
+    {"type": "major_contract", "label": "大额合同", "direction": 1, "terms": {
+        "重大合同": 0.8, "大额订单": 0.75, "获得订单": 0.65, "独家供应": 0.6,
+        "长期供货": 0.6, "签订合同": 0.6, "签署合同": 0.6, "签订协议": 0.5,
+        "签署协议": 0.5, "框架协议": 0.55, "战略合作": 0.55}},
+    {"type": "outbound_investment", "label": "对外投资", "direction": 1, "terms": {
+        "对外投资": 0.7, "战略投资": 0.65, "投资设立": 0.65, "出资设立": 0.65,
+        "设立子公司": 0.6, "增资扩股": 0.6, "产业投资": 0.55, "增资": 0.5}},
+    {"type": "asset_sale", "label": "资产出售", "direction": 0, "terms": {
+        "出售资产": 0.65, "资产出售": 0.65, "剥离资产": 0.65, "转让子公司": 0.65,
+        "出售子公司": 0.65, "转让股权": 0.6, "股权转让": 0.6, "出售股权": 0.6,
+        "挂牌转让": 0.6, "转让资产": 0.6}},
+    {"type": "debt_default", "label": "债务违约", "direction": -1, "terms": {
+        "债务违约": 0.9, "债券违约": 0.9, "交叉违约": 0.9, "资金链断裂": 0.9,
+        "未按期兑付": 0.85, "无法兑付": 0.85, "违约": 0.8, "债务逾期": 0.75,
+        "兑付风险": 0.75, "逾期": 0.6, "展期": 0.5}},
+    {"type": "lawsuit", "label": "诉讼", "direction": -1, "terms": {
+        "提起诉讼": 0.7, "被诉": 0.7, "法律纠纷": 0.55, "诉讼": 0.65, "起诉": 0.6,
+        "应诉": 0.6, "一审判决": 0.5, "二审判决": 0.5, "纠纷": 0.5}},
+    {"type": "arbitration", "label": "仲裁", "direction": -1, "terms": {
+        "仲裁裁决": 0.7, "申请仲裁": 0.7, "仲裁委员会": 0.55, "仲裁": 0.65}},
+    {"type": "management_change", "label": "高管变动", "direction": 0, "terms": {
+        "董事长辞职": 0.7, "总经理辞职": 0.7, "高管变动": 0.6, "辞职": 0.6,
+        "辞任": 0.6, "辞去": 0.6, "卸任": 0.6, "人事变动": 0.55, "离职": 0.5,
+        "聘任": 0.5, "接任": 0.5, "换届": 0.5, "任命": 0.45, "新聘": 0.45}},
+    {"type": "investor_relation", "label": "机构调研", "direction": 1, "terms": {
+        "机构调研": 0.7, "接受调研": 0.65, "投资者关系活动": 0.6, "调研活动": 0.6,
+        "接待机构": 0.6, "迎来调研": 0.6, "调研": 0.55}},
+    {"type": "rating_up", "label": "评级上调", "direction": 1, "terms": {
+        "上调评级": 0.85, "评级上调": 0.85, "调高评级": 0.8, "上调至买入": 0.8,
+        "上调至增持": 0.8, "上调目标价": 0.75, "上调盈利预测": 0.75, "买入评级": 0.55,
+        "增持评级": 0.5, "首次覆盖": 0.5, "推荐评级": 0.45}},
+    {"type": "rating_down", "label": "评级下调", "direction": -1, "terms": {
+        "下调评级": 0.85, "评级下调": 0.85, "调低评级": 0.8, "下调至卖出": 0.8,
+        "下调目标价": 0.7, "下调盈利预测": 0.7, "卖出评级": 0.7, "减持评级": 0.6}},
+    {"type": "lockup_expiry", "label": "限售解禁", "direction": -1, "terms": {
+        "限售解禁": 0.75, "首发解禁": 0.7, "定增解禁": 0.7, "解除限售": 0.7,
+        "解禁": 0.65, "解禁股": 0.65, "上市流通": 0.6}},
+    {"type": "external_guarantee", "label": "对外担保", "direction": -1, "terms": {
+        "对外担保": 0.7, "连带担保": 0.7, "提供担保": 0.65, "担保额度": 0.6,
+        "担保余额": 0.6, "保证担保": 0.6, "担保": 0.55}},
+    {"type": "fund_occupation", "label": "资金占用", "direction": -1, "terms": {
+        "资金占用": 0.85, "非经营性占用": 0.85, "占用上市公司资金": 0.85, "占用资金": 0.75}},
+    {"type": "clarification", "label": "新闻澄清", "direction": 0, "terms": {
+        "澄清公告": 0.7, "郑重澄清": 0.7, "澄清说明": 0.65, "澄清": 0.65,
+        "辟谣": 0.65, "不实报道": 0.55}},
+    {"type": "delisting_risk", "label": "退市风险", "direction": -1, "terms": {
+        "退市风险": 0.9, "面值退市": 0.9, "退市警示": 0.85, "暂停上市": 0.85,
+        "终止上市": 0.85, "退市整理期": 0.85, "退市": 0.8}},
+)
+
+#: 类型目录：``type → {label, direction}``（策略/前端做方向映射的稳定目录；顺序无意义）。
+EVENT_TYPES: dict[str, dict] = {
+    rule["type"]: {"label": rule["label"], "direction": rule["direction"]}
+    for rule in EVENT_RULES
+}
+
+#: 事件切分用词表 = 触发词条 ∪ 停用占位（``segment(lexicon=…)`` 会自动并入否定词/程度副词）。
+_EVENT_LEXICON: dict[str, float] = {}
+for _rule in EVENT_RULES:
+    _EVENT_LEXICON.update(_rule["terms"])
+
+#: 触发词条 → (type, label, direction)：识别期查表；导入期即校验词条不跨类型重复。
+_EVENT_TRIGGER_INFO: dict[str, tuple[str, str, int]] = {}
+for _rule in EVENT_RULES:
+    for _term in _rule["terms"]:
+        if _term in _EVENT_TRIGGER_INFO:
+            raise ValueError(
+                f"事件触发词条跨类型重复：{_term} → "
+                f"{_EVENT_TRIGGER_INFO[_term][0]} / {_rule['type']}"
+            )
+        _EVENT_TRIGGER_INFO[_term] = (_rule["type"], _rule["label"], _rule["direction"])
+
+#: 货币市场/再融资同形词占位（置信 0，**不是事件**）：整体收录后，其内部的
+#: ``质押``/``回购``/``增资`` 不会再被切出（``定增`` 压住 ``增资`` 的误切）。
+_EVENT_STOP_TERMS: dict[str, float] = {
+    "质押式回购": 0.0, "正回购": 0.0, "逆回购": 0.0, "回购协议": 0.0,
+    "回购利率": 0.0, "定增": 0.0,
+}
+for _stop in _EVENT_STOP_TERMS:
+    if _stop in _EVENT_LEXICON or _stop in _EVENT_TRIGGER_INFO:
+        raise ValueError(f"事件停用词与触发词冲突：{_stop}")
+_EVENT_LEXICON.update(_EVENT_STOP_TERMS)
+del _rule, _term, _stop
+
+
+def _events_from_text(text):
+    """一段文本 → 事件列表（每类取**最强触发**，confidence 降序；零命中 → ``[]``）。
+
+    识别 = ``segment(text, lexicon=_EVENT_LEXICON)`` 切分后，落在触发词条上的 token
+    记为事件；修饰语义与 ``score_text`` 完全一致（``MODIFIER_WINDOW`` 内、不跨标点/空白）：
+
+      * 否定词（``NEGATORS``）→ 事件**方向取反**，置信 × ``NEGATION_DECAY``；
+      * 程度副词（``INTENSIFIERS``）→ 置信 × 因子（``大幅`` 1.6 / ``小幅`` 0.7 …），
+        最后截到 (0.05, 1.0]；
+      * 置信 0 的停用占位（``质押式回购`` 等）不是事件，但会中断修饰窗口（与词典词一致）。
+    """
+    tokens = segment(text, lexicon=_EVENT_LEXICON)
+    best: dict[str, dict] = {}
+    for index, token in enumerate(tokens):
+        base = _EVENT_LEXICON.get(token)
+        if not base:  # 未登录 token 或停用占位（0.0）：都不是事件
+            continue
+        etype, elabel, edirection = _EVENT_TRIGGER_INFO[token]
+        factor = 1.0
+        flipped = False
+        for back in range(index - 1, max(-1, index - 1 - MODIFIER_WINDOW), -1):
+            previous = tokens[back]
+            if previous.isspace() or previous in PUNCTUATION:
+                break
+            if previous in _EVENT_LEXICON:
+                break
+            if previous in _NEGATOR_SET:
+                flipped = True
+                continue
+            value = INTENSIFIERS.get(previous)
+            if value is not None:
+                factor *= value
+        confidence = base * factor
+        direction = edirection
+        if flipped:
+            confidence *= NEGATION_DECAY
+            direction = -direction  # 0 取反仍是 0：中性事件的否定只降置信
+        candidate = {
+            "type": etype,
+            "label": elabel,
+            "direction": direction,
+            "matched": token,
+            "confidence": round(max(0.05, min(1.0, confidence)), 4),
+            "negated": flipped,
+        }
+        current = best.get(etype)
+        if current is None or (candidate["confidence"], len(candidate["matched"])) > (
+            current["confidence"],
+            len(current["matched"]),
+        ):
+            best[etype] = candidate
+    return sorted(best.values(), key=lambda item: (-item["confidence"], item["type"]))
+
+
+def classify_events(docs, *, now=None):
+    """文档列表 → 事件识别结果（FR-STRAT-003 事件识别出口，供策略侧守卫导入）。
+
+    ``docs`` 形状与 ``score_documents`` 一致：``[{"title":..., "summary":...,
+    "published_at":..., "source":...}, ...]``；纯字符串、缺字段、``None`` 字段都容忍
+    （文本取 ``_doc_text`` 同一套键，时间取 ``_doc_time`` 同一套键，解析失败不猜时间）。
+
+    返回（与 ``GET /api/v3/sentiment`` 的 ``events`` / ``doc_events`` 字段**同形**）::
+
+        {"as_of", "method": EVENT_METHOD, "version": EVENT_VERSION, "documents": N,
+         "events":    [ {type, label, direction, count, latest_at, first_seen}, ...],
+         "doc_events":[ {index, dated, published_at, events: [ {type, label,
+                        direction, matched, confidence, negated} ]}, ...]}
+
+    口径（每条都有单测）：
+
+      * **否定翻转**：``MODIFIER_WINDOW`` 内的否定词把事件方向取反并把置信 ×
+        ``NEGATION_DECAY``（0.65）——"未增持"不是增持利多（方向 -1 的弱证据），
+        "不存在减持"同理翻成 +1；这与情绪打分"翻转 + 衰减"同一口径。中性事件
+        （direction=0，如停牌/复牌/澄清）取反仍是 0，只降置信；``negated=true``
+        如实标注，策略侧可自行剔除；
+      * **一篇文档可命中多类**：全部如实给出，每类取最强触发，按 confidence 降序；
+      * **零命中 → ``events=[]``**：不硬造事件、不用"中性"占位；
+      * **时间诚实**：``published_at`` 缺失或解析失败 → 该文档事件 ``dated=False``、
+        ``published_at=null``（策略侧据此剔除，不猜时间）；``events`` 聚合里
+        ``count`` 含这类文档，``latest_at`` / ``first_seen`` 只用时间可解析的文档算，
+        全部不可解析时为 ``null``；
+      * **排序**：``events`` 按 ``count`` 降序 → 有新近时间者在前 → ``type`` 字典序
+        （稳定可复现）；``doc_events`` 保持输入顺序（``index`` 对位）。
+    """
+    moment = _as_aware(now) or datetime.now(timezone.utc)
+    doc_events: list[dict] = []
+    tally: dict[str, dict] = {}
+    for index, doc in enumerate(docs or []):
+        published = _doc_time(doc)
+        dated = published is not None
+        events = _events_from_text(_doc_text(doc))
+        doc_events.append({
+            "index": index,
+            "dated": dated,
+            "published_at": published.isoformat() if dated else None,
+            "events": events,
+        })
+        for event in events:
+            entry = tally.get(event["type"])
+            if entry is None:
+                entry = {"type": event["type"], "label": event["label"],
+                         "direction": event["direction"], "count": 0, "_times": []}
+                tally[event["type"]] = entry
+            entry["count"] += 1
+            if dated:
+                entry["_times"].append(published)
+
+    ranked = sorted(
+        tally.values(),
+        key=lambda entry: (
+            -entry["count"],
+            not entry["_times"],
+            -(max(entry["_times"]).timestamp() if entry["_times"] else 0.0),
+            entry["type"],
+        ),
+    )
+    events_out = []
+    for entry in ranked:
+        times = entry["_times"]
+        events_out.append({
+            "type": entry["type"],
+            "label": entry["label"],
+            "direction": entry["direction"],
+            "count": entry["count"],
+            "latest_at": max(times).isoformat() if times else None,
+            "first_seen": min(times).isoformat() if times else None,
+        })
+    return {
+        "as_of": moment.isoformat(),
+        "method": EVENT_METHOD,
+        "version": EVENT_VERSION,
+        "documents": len(doc_events),
+        "events": events_out,
+        "doc_events": doc_events,
+    }
+
+
 # ── 端点响应装配（取数由调用方注入，本模块不联网） ────────────────────────────────
 
 
@@ -684,7 +984,7 @@ def _day_key(published):
 
 def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
                      half_life_hours=DEFAULT_HALF_LIFE_HOURS, now=None,
-                     source="akshare/stock_news_em"):
+                     source="akshare/stock_news_em", include_docs=False):
     """``GET /api/v3/sentiment`` 的响应体：**取资讯 → 打分 → 组装可解释信封**。
 
     ``news_fetch`` 是零参可调用对象，返回既有资讯信封（``server.v3_sources.fetch_news``
@@ -695,13 +995,22 @@ def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
 
         命中：{ok, symbol, market, as_of, source, days, limit, documents, scored,
                score, coverage, positive, negative, neutral, top_terms, per_day,
-               latest_at, undated, method, notes, chain}
-        无资讯：{ok:true, score:null, documents:0, coverage:null, ...,
-                 notes:["该标的近 N 天无资讯"]}      ← **不是 0 分**
-        取数失败：{ok:false, error:{code,message}, chain:[...], score:null, documents:0}
+               latest_at, undated, method, notes, chain,
+               events, event_method, event_version[, doc_events]}
+        无资讯：{ok:true, score:null, documents:0, coverage:null, ..., events:[],
+                 event_method, event_version, notes:["该标的近 N 天无资讯"]}
+                                                                  ← **不是 0 分**
+        取数失败：{ok:false, error:{code,message}, chain:[...], score:null, documents:0,
+                   events:[], event_method, event_version}
 
     ``chain`` 是取数链留痕（数据源、是否成功、条数、AKShare 每次尝试），失败时同样带
     真实错误原文——前端可以逐级核对「为什么没有分」。
+
+    ``events`` / ``doc_events`` / ``event_method`` / ``event_version`` 来自
+    ``classify_events``（事件识别口径见其 docstring）：``events`` 是按类型的聚合
+    （type/label/direction/count/latest_at/first_seen，count 降序、新近优先）；
+    ``doc_events`` 是每文档明细，只在 ``include_docs=True`` 且 ``ok=true`` 时给出，
+    避免默认响应膨胀。
     """
     moment = _as_aware(now) or datetime.now(timezone.utc)
     try:
@@ -736,6 +1045,9 @@ def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
             "top_terms": [],
             "per_day": [],
             "latest_at": None,
+            "events": [],
+            "event_method": EVENT_METHOD,
+            "event_version": EVENT_VERSION,
             "error": {"code": "sentiment/news-fetch-failed", "message": detail},
             "chain": [{"source": source, "ok": False, "error": detail}],
             "notes": ["取资讯时抛异常，未做任何打分（score=null）"],
@@ -754,6 +1066,9 @@ def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
             "top_terms": [],
             "per_day": [],
             "latest_at": None,
+            "events": [],
+            "event_method": EVENT_METHOD,
+            "event_version": EVENT_VERSION,
             "error": {"code": "sentiment/news-fetch-failed", "message": detail},
             "chain": [{"source": source, "ok": False, "error": detail}],
             "notes": ["资讯源返回形状不合法，未做任何打分（score=null）"],
@@ -779,6 +1094,9 @@ def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
             "top_terms": [],
             "per_day": [],
             "latest_at": None,
+            "events": [],
+            "event_method": EVENT_METHOD,
+            "event_version": EVENT_VERSION,
             "error": error,
             "chain": [{"source": used_source, "ok": False, "rows": 0,
                        "error": error, "attempts": attempts}],
@@ -804,7 +1122,7 @@ def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
     }
 
     if not window_rows:
-        return {
+        payload = {
             **base,
             "source": used_source,
             "documents": 0,
@@ -816,12 +1134,18 @@ def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
             "per_day": [],
             "latest_at": None,
             "undated": 0,
+            "events": [],
+            "event_method": EVENT_METHOD,
+            "event_version": EVENT_VERSION,
             "method": METHOD,
             "chain": [chain_row],
             "notes": [f"该标的近 {span} 天无资讯"
                       + (f"（上游返回 {len(rows)} 条，全部早于 {cutoff.isoformat()}）"
                          if rows else "（上游返回 0 条）")],
         }
+        if include_docs:
+            payload["doc_events"] = []
+        return payload
 
     scored_payload = score_documents(window_rows, half_life_hours=half_life_hours,
                                      now=moment)
@@ -848,16 +1172,32 @@ def sentiment_report(news_fetch, symbol, *, market="", days=7, limit=20,
     notes = list(scored_payload["notes"])
     notes.insert(0, f"窗口 = 近 {span} 天（共 {len(window_rows)}/{len(rows)} 条资讯在窗口内）")
 
-    return {
+    events_payload = classify_events(window_rows, now=moment)
+    if events_payload["events"]:
+        summary = "、".join(
+            f"{item['label']}×{item['count']}" for item in events_payload["events"][:5]
+        )
+        notes.append(f"事件识别（{EVENT_METHOD}）：{summary}"
+                     + ("…" if len(events_payload["events"]) > 5 else ""))
+    else:
+        notes.append(f"事件识别（{EVENT_METHOD}）：零命中（events=[]，不硬造）")
+
+    payload = {
         **base,
         "source": used_source,
         **{key: scored_payload[key] for key in
            ("documents", "scored", "score", "coverage", "positive", "negative",
             "neutral", "undated", "top_terms", "latest_at", "method")},
         "per_day": days_out,
+        "events": events_payload["events"],
+        "event_method": EVENT_METHOD,
+        "event_version": EVENT_VERSION,
         "chain": [chain_row],
         "notes": notes,
     }
+    if include_docs:
+        payload["doc_events"] = events_payload["doc_events"]
+    return payload
 
 
 # ── 端点注册（本模块自带 router；由 app.py 的 V3 自动装配循环加载） ──────────────
@@ -899,11 +1239,13 @@ def news_keyword(ticker):
     return _text(ticker).upper()
 
 
-def sentiment_payload(deps, symbol, market="", days=7, limit=20, half_life_hours=None):
+def sentiment_payload(deps, symbol, market="", days=7, limit=20, half_life_hours=None,
+                      include_docs=False):
     """``GET /api/v3/sentiment`` 的同步实现：取资讯 → 打分 → 可解释信封。
 
     只读、不写盘、不触达任何交易端点。取数走 ``v3_sources.fetch_news``，因此自动继承
     ``retry_akshare`` 的退避重试与 ``attempts`` 留痕（含真实错误原文）。
+    ``include_docs`` 透传给 ``sentiment_report``：只控制 ``doc_events`` 明细是否随响应返回。
     """
     from server import v3_sources
 
@@ -917,6 +1259,7 @@ def sentiment_payload(deps, symbol, market="", days=7, limit=20, half_life_hours
         market=_text(market) or v3_sources.detect_market(symbol_text),
         days=days,
         limit=limit,
+        include_docs=include_docs,
         **options,
     )
 
@@ -934,29 +1277,36 @@ def register(app, v3_run, home, deps=None):
         deps = v3_sources.Deps(home=home)
 
     @app.get("/api/v3/sentiment")
-    async def v3_sentiment(symbol: str = "", market: str = "", days: int = 7, limit: int = 20):
-        """个股资讯情绪因子（规格 FR-STRAT-003）。**只读**：不写盘、不下单、不切模式。
+    async def v3_sentiment(symbol: str = "", market: str = "", days: int = 7, limit: int = 20,
+                           include_docs: bool = False):
+        """个股资讯情绪因子 + 事件识别（规格 FR-STRAT-003）。**只读**：不写盘、不下单、不切模式。
 
         链路：``news_keyword(symbol)`` → ``akshare.stock_news_em``（经 ``retry_akshare``
-        退避重试）→ ``sentiment_report`` 打分（自研词典 + 否定/程度修饰 + 时间半衰）。
+        退避重试）→ ``sentiment_report`` 打分（自研词典 + 否定/程度修饰 + 时间半衰）与
+        ``classify_events`` 事件识别（33 类触发词条 + 同一套否定/程度修饰口径）。
 
         ``days`` 是资讯时间窗（按发布时间过滤，缺时间戳的保留并计入 ``undated``）；
-        ``limit`` 是取数上限（``stock_news_em`` 实测每页 10 条，limit 只影响请求条数）。
+        ``limit`` 是取数上限（``stock_news_em`` 实测每页 10 条，limit 只影响请求条数）；
+        ``include_docs=true`` 才附带每文档事件明细 ``doc_events``（默认不给，避免响应膨胀）。
 
         诚实口径（每条都有单测）:
 
-          * 窗口内无资讯 → ``{ok:true, score:null, documents:0, notes:["该标的近 N 天无资讯"]}``
-            —— **不返回 0 分冒充中性**；
+          * 窗口内无资讯 → ``{ok:true, score:null, documents:0, events:[],
+            notes:["该标的近 N 天无资讯"]}`` —— **不返回 0 分冒充中性**；
           * 有资讯但无一命中词典 → ``score:null`` + ``coverage:0``（同样不是 0 分）；
+          * 事件零命中 → ``events:[]``（**不硬造事件**），``event_method``/``event_version``
+            始终在场；
           * 上游失败 → ``{ok:false, error:{code,message}, chain:[...]}``，``message`` 是
             **真实错误原文**，``chain`` 里带 AKShare 每次尝试（``attempts``）；
-          * ``top_terms`` + ``per_day`` + ``coverage`` 回答「这个分是怎么来的」。
+          * ``top_terms`` + ``per_day`` + ``coverage`` + ``events`` 回答「这个分/这些事件
+            是怎么来的」。
         """
         want_days = _clamp_int(days, 7, 1, 400)
         want_limit = _clamp_int(limit, 20, 1, 200)
         try:
             payload = await asyncio.to_thread(
-                sentiment_payload, deps, symbol, market, want_days, want_limit
+                sentiment_payload, deps, symbol, market, want_days, want_limit,
+                None, include_docs
             )
         except Exception as error:  # noqa: BLE001 —— 统一信封，不把栈透给前端
             detail = f"{type(error).__name__}: {error}"[:300]
@@ -974,6 +1324,9 @@ def register(app, v3_run, home, deps=None):
                 "coverage": None,
                 "top_terms": [],
                 "per_day": [],
+                "events": [],
+                "event_method": EVENT_METHOD,
+                "event_version": EVENT_VERSION,
                 "error": {"code": "sentiment/internal", "message": detail},
                 "chain": [{"source": "akshare/stock_news_em", "ok": False, "error": detail}],
                 "notes": ["情绪端点内部异常，未产出分数（score=null）"],

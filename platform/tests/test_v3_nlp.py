@@ -129,6 +129,16 @@ def hours_ago(hours):
     return (NOW - timedelta(hours=hours)).isoformat()
 
 
+def recent_iso(hours=1):
+    """真实墙钟近时（路由层测试专用）。
+
+    路由处理器不收 ``now``，时间窗按**墙钟**算；固定 ``NOW`` 造的发布时间会在墙钟越过
+    ``NOW + days`` 后落出窗外（``test_days_param_is_clamped_not_rejected`` 在
+    2026-09-21 11:00+08 就这样爆过）。凡断言「在窗口内」的路由用例一律用本函数造时间。
+    """
+    return (datetime.now(CN_TZ) - timedelta(hours=hours)).isoformat()
+
+
 # ── 词典与切分 ─────────────────────────────────────────────────────────────────
 
 
@@ -596,9 +606,9 @@ class SentimentRouteTests(BlockRealNetwork):
     def test_success_payload_shape(self):
         rows = [
             {"新闻标题": "贵州茅台净利润大幅增长", "新闻内容": "机构上调评级",
-             "发布时间": hours_ago(2), "文章来源": "测试源", "新闻链接": "http://x.invalid/1"},
+             "发布时间": recent_iso(2), "文章来源": "测试源", "新闻链接": "http://x.invalid/1"},
             {"新闻标题": "贵州茅台被立案调查", "新闻内容": "公司公告",
-             "发布时间": hours_ago(3), "文章来源": "测试源", "新闻链接": "http://x.invalid/2"},
+             "发布时间": recent_iso(3), "文章来源": "测试源", "新闻链接": "http://x.invalid/2"},
         ]
         self.build_akshare(news=fake_frame(rows))
         payload = self.call("/api/v3/sentiment", symbol="600519", market="", days=7, limit=20)
@@ -616,7 +626,7 @@ class SentimentRouteTests(BlockRealNetwork):
 
     def test_non_a_share_symbol_uses_bare_keyword(self):
         ak = FakeAkshare(news=[{"新闻标题": "英伟达高管减持", "新闻内容": "",
-                                "发布时间": hours_ago(2), "文章来源": "s", "新闻链接": "u"}])
+                                "发布时间": recent_iso(2), "文章来源": "s", "新闻链接": "u"}])
         self.build(v3_sources.Deps(akshare=ak, home=self.tmp))
         payload = self.call("/api/v3/sentiment", symbol="US.NVDA", market="", days=7, limit=20)
         self.assertTrue(payload["ok"], payload)
@@ -657,7 +667,7 @@ class SentimentRouteTests(BlockRealNetwork):
         self.assertEqual(payload["documents"], 0)
 
     def test_days_window_filters_old_rows(self):
-        rows = [{"新闻标题": "贵州茅台净利润增长", "新闻内容": "", "发布时间": hours_ago(1),
+        rows = [{"新闻标题": "贵州茅台净利润增长", "新闻内容": "", "发布时间": recent_iso(1),
                  "文章来源": "s", "新闻链接": "u"},
                 {"新闻标题": "贵州茅台净利润增长", "新闻内容": "",
                  "发布时间": (NOW - timedelta(days=20)).isoformat(),
@@ -669,7 +679,7 @@ class SentimentRouteTests(BlockRealNetwork):
         self.assertEqual(payload["chain"][0]["in_window"], 1)
 
     def test_days_param_is_clamped_not_rejected(self):
-        rows = [{"新闻标题": "贵州茅台净利润增长", "新闻内容": "", "发布时间": hours_ago(1),
+        rows = [{"新闻标题": "贵州茅台净利润增长", "新闻内容": "", "发布时间": recent_iso(1),
                  "文章来源": "s", "新闻链接": "u"}]
         self.build_akshare(news=fake_frame(rows))
         payload = self.call("/api/v3/sentiment", symbol="600519", market="", days=0, limit=0)
@@ -688,6 +698,343 @@ class SentimentRouteTests(BlockRealNetwork):
         self.assertEqual(payload["error"]["code"], "akshare/missing")
         self.assertIn("akshare", payload["error"]["message"])
         self.assertIsNone(payload["score"])
+
+
+# ── classify_events：事件识别（FR-STRAT-003 的另一半） ──────────────────────────
+
+
+class EventCatalogTests(unittest.TestCase):
+    """事件规则表本身的契约：≥25 类、字段合法、词条不跨类型、停用词不冲突。"""
+
+    def test_catalog_has_at_least_25_types_with_valid_fields(self):
+        self.assertGreaterEqual(len(v3_nlp.EVENT_RULES), 25,
+                                f"事件类型只有 {len(v3_nlp.EVENT_RULES)} 类，任务要求 ≥25")
+        for rule in v3_nlp.EVENT_RULES:
+            self.assertTrue(rule["type"], "type 键不能为空")
+            self.assertTrue(rule["label"], f"{rule['type']} 缺中文 label")
+            self.assertIn(rule["direction"], (1, -1, 0),
+                          f"{rule['type']} direction 非法：{rule['direction']}")
+            self.assertTrue(rule["terms"], f"{rule['type']} 没有任何触发词条")
+            for term, base in rule["terms"].items():
+                self.assertIsInstance(term, str)
+                self.assertTrue(term)
+                self.assertGreater(base, 0, f"{term} 基础置信必须 >0")
+                self.assertLessEqual(base, 1.0, f"{term} 基础置信越界：{base}")
+
+    def test_required_types_are_all_present(self):
+        """任务书点名的 30 类必须都在（缺一个说明规则表被误改）。"""
+        required = (
+            "buyback", "holder_increase", "holder_reduction", "equity_pledge",
+            "investigation", "regulatory_penalty", "earnings_preincrease",
+            "earnings_prereduce", "earnings_beat", "earnings_miss", "dividend",
+            "stock_split", "trading_halt", "trading_resume", "ma_restructuring",
+            "contract_win", "major_contract", "outbound_investment", "asset_sale",
+            "debt_default", "lawsuit", "arbitration", "management_change",
+            "investor_relation", "rating_up", "rating_down", "lockup_expiry",
+            "external_guarantee", "fund_occupation", "clarification",
+        )
+        for etype in required:
+            self.assertIn(etype, v3_nlp.EVENT_TYPES, f"事件目录缺 {etype}")
+
+    def test_triggers_map_to_exactly_one_type(self):
+        for term, (etype, label, direction) in v3_nlp._EVENT_TRIGGER_INFO.items():
+            catalog = v3_nlp.EVENT_TYPES[etype]
+            self.assertEqual(label, catalog["label"])
+            self.assertEqual(direction, catalog["direction"])
+            self.assertGreater(v3_nlp._EVENT_LEXICON[term], 0)
+
+    def test_stop_terms_are_zero_confidence_placeholders(self):
+        for term, base in v3_nlp._EVENT_STOP_TERMS.items():
+            self.assertEqual(base, 0.0)
+            self.assertEqual(v3_nlp._EVENT_LEXICON[term], 0.0)
+            self.assertNotIn(term, v3_nlp._EVENT_TRIGGER_INFO)
+
+
+# 每类至少 1 个**真实语境**正例（不是词条复读：句子里有量词、时间、语境噪音）。
+EVENT_EXAMPLES = {
+    "buyback": "公司拟以2亿元至4亿元回购股份并注销",
+    "holder_increase": "控股股东计划未来6个月内增持公司股份不低于1亿元",
+    "holder_reduction": "实控人计划减持不超过2%公司股份",
+    "equity_pledge": "控股股东将其所持5%股份办理了股权质押",
+    "pledge_release": "控股股东解除质押2000万股",
+    "investigation": "公司因涉嫌信息披露违法违规被证监会立案调查",
+    "regulatory_penalty": "公司收到行政处罚决定书，被罚款500万元",
+    "earnings_preincrease": "公司预计前三季度净利润同比增长80%左右，业绩预增",
+    "earnings_prereduce": "公司发布业绩预告，预计净利润同比下降50%，业绩预减",
+    "earnings_turnaround": "公司主营回暖，预计全年扭亏为盈",
+    "earnings_beat": "三季报业绩超预期，净利润高于预期",
+    "earnings_miss": "半年报不及预期，营收低于预期",
+    "dividend": "公司发布年度利润分配方案，每10股派发现金红利25元",
+    "stock_split": "公司披露高送转方案，每10股转增8股",
+    "trading_halt": "公司股票因重大事项临时停牌",
+    "trading_resume": "公司股票于今日复牌，恢复交易",
+    "ma_restructuring": "公司正在筹划重大资产重组，拟收购标的公司100%股权",
+    "contract_win": "公司中标某市地铁项目，中标金额约15亿元",
+    "major_contract": "公司与海外客户签署合同，合同金额折合人民币约30亿元",
+    "outbound_investment": "公司拟投资设立子公司，布局海外市场",
+    "asset_sale": "公司拟出售资产，转让子公司100%股权",
+    "debt_default": "公司公告，一笔5亿元债券未按期兑付，构成实质性违约",
+    "lawsuit": "公司因合同纠纷被供应商起诉，涉及金额8000万元",
+    "arbitration": "公司与合作方就技术转让协议提交仲裁",
+    "management_change": "公司董事长辞职，董事会将尽快补选",
+    "investor_relation": "公司上周接受多家机构调研，接待机构超50家",
+    "rating_up": "券商发布研报，上调评级至买入",
+    "rating_down": "外资投行下调评级至卖出，同时下调目标价",
+    "lockup_expiry": "公司首发限售股下周解禁，本次解禁数量占总股本30%",
+    "external_guarantee": "公司为参股公司银行贷款提供连带担保",
+    "fund_occupation": "控股股东非经营性占用上市公司资金，监管要求限期归还",
+    "clarification": "公司发布澄清公告，称媒体报道不实",
+    "delisting_risk": "公司股价连续低于1元，可能触及面值退市",
+}
+
+
+class ClassifyEventsTests(unittest.TestCase):
+    """``classify_events``：识别、否定口径、多事件、零命中、时间诚实、聚合排序。"""
+
+    def classify(self, docs, **kwargs):
+        return v3_nlp.classify_events(docs, **kwargs)
+
+    def test_every_type_has_real_context_positive_example(self):
+        for etype, sentence in EVENT_EXAMPLES.items():
+            with self.subTest(type=etype):
+                result = self.classify([{"title": sentence,
+                                         "published_at": hours_ago(1)}], now=NOW)
+                doc = result["doc_events"][0]
+                events = {event["type"]: event for event in doc["events"]}
+                self.assertIn(etype, events,
+                              f"{etype} 未被识别：{sentence} → {sorted(events)}")
+                event = events[etype]
+                self.assertEqual(event["direction"], v3_nlp.EVENT_TYPES[etype]["direction"])
+                self.assertTrue(event["matched"])
+                self.assertTrue(event["label"])
+                self.assertIn(event["matched"], v3_nlp._EVENT_TRIGGER_INFO)
+                self.assertGreater(event["confidence"], 0)
+                self.assertLessEqual(event["confidence"], 1.0)
+                self.assertFalse(event["negated"])
+
+    def test_negation_flips_direction_and_decays_confidence(self):
+        plain = self.classify([{"title": "控股股东增持公司股份"}])
+        negated = self.classify([{"title": "控股股东尚未增持公司股份"}])
+        base = next(e for e in plain["doc_events"][0]["events"]
+                    if e["type"] == "holder_increase")
+        flipped = next(e for e in negated["doc_events"][0]["events"]
+                       if e["type"] == "holder_increase")
+        self.assertEqual(base["direction"], 1)
+        self.assertFalse(base["negated"])
+        self.assertEqual(flipped["direction"], -1, "「尚未增持」不得判成增持利多")
+        self.assertTrue(flipped["negated"])
+        self.assertLess(flipped["confidence"], base["confidence"])
+
+    def test_negation_no_reduction_flips_to_positive(self):
+        result = self.classify([{"title": "公司澄清：不存在减持情形"}])
+        event = next(e for e in result["doc_events"][0]["events"]
+                     if e["type"] == "holder_reduction")
+        self.assertEqual(event["direction"], 1, "「不存在减持」应翻成正面弱证据")
+        self.assertTrue(event["negated"])
+
+    def test_negation_does_not_cross_punctuation(self):
+        result = self.classify([{"title": "传闻未获证实。股东增持股份"}])
+        event = next(e for e in result["doc_events"][0]["events"]
+                     if e["type"] == "holder_increase")
+        self.assertEqual(event["direction"], 1, "句号后的增持不该被前句否定词翻转")
+        self.assertFalse(event["negated"])
+
+    def test_neutral_event_negation_only_lowers_confidence(self):
+        plain = self.classify([{"title": "公司股票临时停牌"}])
+        negated = self.classify([{"title": "公司股票并未临时停牌"}])
+        base = next(e for e in plain["doc_events"][0]["events"] if e["type"] == "trading_halt")
+        flipped = next(e for e in negated["doc_events"][0]["events"]
+                       if e["type"] == "trading_halt")
+        self.assertEqual(flipped["direction"], 0, "中性事件取反仍是 0")
+        self.assertTrue(flipped["negated"])
+        self.assertLess(flipped["confidence"], base["confidence"])
+
+    def test_intensifier_scales_event_confidence(self):
+        plain = self.classify([{"title": "股东减持公司股份"}])
+        strong = self.classify([{"title": "股东大幅减持公司股份"}])
+        base = next(e for e in plain["doc_events"][0]["events"]
+                    if e["type"] == "holder_reduction")
+        boosted = next(e for e in strong["doc_events"][0]["events"]
+                       if e["type"] == "holder_reduction")
+        self.assertGreater(boosted["confidence"], base["confidence"])
+
+    def test_multiple_event_types_sorted_by_confidence(self):
+        result = self.classify(
+            [{"title": "公司公告回购方案，控股股东同步增持，但董事长辞职",
+              "published_at": hours_ago(1)}], now=NOW)
+        events = result["doc_events"][0]["events"]
+        self.assertEqual([event["type"] for event in events],
+                         ["buyback", "holder_increase", "management_change"],
+                         "多事件全给且按 confidence 降序")
+        confidences = [event["confidence"] for event in events]
+        self.assertEqual(confidences, sorted(confidences, reverse=True))
+
+    def test_zero_hit_yields_no_events(self):
+        result = self.classify([{"title": "公司召开股东大会审议季度报告",
+                                 "published_at": hours_ago(1)}], now=NOW)
+        self.assertEqual(result["doc_events"][0]["events"], [], "零命中不硬造")
+        self.assertEqual(result["events"], [])
+        empty = self.classify([])
+        self.assertEqual(empty["events"], [])
+        self.assertEqual(empty["doc_events"], [])
+        self.assertEqual(empty["documents"], 0)
+
+    def test_unparsable_time_marks_events_undated(self):
+        result = self.classify([{"title": "股东大幅减持", "published_at": "昨天下午"}],
+                               now=NOW)
+        entry = result["doc_events"][0]
+        self.assertFalse(entry["dated"])
+        self.assertIsNone(entry["published_at"])
+        self.assertTrue(entry["events"])
+        agg = next(e for e in result["events"] if e["type"] == "holder_reduction")
+        self.assertEqual(agg["count"], 1, "count 含未定时间的文档")
+        self.assertIsNone(agg["latest_at"], "latest_at 只用可解析时间，不猜")
+        self.assertIsNone(agg["first_seen"])
+
+    def test_aggregation_counts_stamps_and_orders_by_count(self):
+        docs = [
+            {"title": "股东减持", "published_at": hours_ago(10)},
+            {"title": "公司中标", "published_at": hours_ago(8)},
+            {"title": "高管减持股份", "published_at": hours_ago(2)},
+        ]
+        result = self.classify(docs, now=NOW)
+        by_type = {entry["type"]: entry for entry in result["events"]}
+        reduction = by_type["holder_reduction"]
+        self.assertEqual(reduction["count"], 2)
+        self.assertEqual(reduction["first_seen"], (NOW - timedelta(hours=10)).isoformat())
+        self.assertEqual(reduction["latest_at"], (NOW - timedelta(hours=2)).isoformat())
+        self.assertEqual(result["events"][0]["type"], "holder_reduction",
+                         "count 最大的类型排最前")
+        self.assertEqual(result["events"][1]["count"], 1)
+
+    def test_aggregation_recency_tiebreak_on_equal_counts(self):
+        docs = [
+            {"title": "公司中标新项目", "published_at": hours_ago(9)},
+            {"title": "公司发布分红方案", "published_at": hours_ago(1)},
+        ]
+        result = self.classify(docs, now=NOW)
+        self.assertEqual([entry["count"] for entry in result["events"]], [1, 1])
+        self.assertEqual(result["events"][0]["type"], "dividend",
+                         "同 count 时新近的在前")
+
+    def test_missing_and_malformed_fields_are_tolerated(self):
+        result = self.classify([{}, {"summary": "控股股东增持股份"},
+                                "纯文本新闻", None], now=NOW)
+        self.assertEqual(result["documents"], 4)
+        self.assertEqual(len(result["doc_events"]), 4)
+        for entry in result["doc_events"]:
+            self.assertFalse(entry["dated"])
+            self.assertIsNone(entry["published_at"])
+        self.assertEqual(result["doc_events"][0]["events"], [])
+        self.assertTrue(any(event["type"] == "holder_increase"
+                            for event in result["doc_events"][1]["events"]))
+        self.assertTrue(any(entry["events"] for entry in result["doc_events"]))
+
+    def test_compound_terms_claim_before_substrings(self):
+        release = self.classify([{"title": "控股股东解除质押2000万股"}])
+        release_types = [e["type"] for e in release["doc_events"][0]["events"]]
+        self.assertIn("pledge_release", release_types)
+        self.assertNotIn("equity_pledge", release_types, "「解除质押」不是质押利空")
+
+        rating_up = self.classify([{"title": "券商给予公司增持评级"}])
+        up_types = [e["type"] for e in rating_up["doc_events"][0]["events"]]
+        self.assertIn("rating_up", up_types)
+        self.assertNotIn("holder_increase", up_types, "「增持评级」是评级词不是增持事件")
+
+        rating_down = self.classify([{"title": "机构把公司调入减持评级名单"}])
+        down_types = [e["type"] for e in rating_down["doc_events"][0]["events"]]
+        self.assertIn("rating_down", down_types)
+        self.assertNotIn("holder_reduction", down_types, "「减持评级」是评级词不是减持事件")
+
+    def test_money_market_stop_terms_do_not_fire_events(self):
+        result = self.classify([{"title": "央行开展质押式回购操作，利率持稳"}])
+        self.assertEqual(result["doc_events"][0]["events"], [], "货币市场术语不是公司事件")
+        result = self.classify([{"title": "公司定增资金到位，投入产线建设"}])
+        types = [e["type"] for e in result["doc_events"][0]["events"]]
+        self.assertNotIn("outbound_investment", types, "「定增」不该被切成「增资」")
+
+    def test_result_carries_method_version_and_as_of(self):
+        result = self.classify([{"title": "公司回购股份", "published_at": hours_ago(1)}],
+                               now=NOW)
+        self.assertEqual(result["method"], "rule-v1")
+        self.assertEqual(result["version"], v3_nlp.EVENT_VERSION)
+        self.assertEqual(result["as_of"], NOW.isoformat())
+        self.assertEqual(result["documents"], 1)
+        self.assertEqual(result["events"][0]["type"], "buyback")
+
+
+class SentimentEventsRouteTests(BlockRealNetwork):
+    """``/api/v3/sentiment`` 的事件字段：events 聚合常驻、doc_events 按 include_docs 给。"""
+
+    def build_akshare(self, news=None, news_error=None):
+        return self.build(v3_sources.Deps(akshare=FakeAkshare(news=news, news_error=news_error),
+                                          home=self.tmp))
+
+    def test_success_response_contains_events_aggregation(self):
+        t_buy, t_inc, t_none = recent_iso(2), recent_iso(3), recent_iso(4)
+        rows = [{"新闻标题": "贵州茅台回购股份", "新闻内容": "", "发布时间": t_buy,
+                 "文章来源": "s", "新闻链接": "u"},
+                {"新闻标题": "控股股东增持", "新闻内容": "", "发布时间": t_inc,
+                 "文章来源": "s", "新闻链接": "u"},
+                {"新闻标题": "公司召开股东大会", "新闻内容": "", "发布时间": t_none,
+                 "文章来源": "s", "新闻链接": "u"}]
+        self.build_akshare(news=fake_frame(rows))
+        payload = self.call("/api/v3/sentiment", symbol="600519", market="", days=7, limit=20)
+        self.assertTrue(payload["ok"], payload)
+        self.assertEqual(payload["event_method"], v3_nlp.EVENT_METHOD)
+        self.assertEqual(payload["event_version"], v3_nlp.EVENT_VERSION)
+        by_type = {entry["type"]: entry for entry in payload["events"]}
+        self.assertEqual(by_type["buyback"]["count"], 1)
+        self.assertEqual(by_type["buyback"]["label"], "回购")
+        self.assertEqual(by_type["buyback"]["direction"], 1)
+        self.assertEqual(by_type["buyback"]["latest_at"], t_buy)
+        self.assertEqual(by_type["buyback"]["first_seen"], t_buy)
+        self.assertNotIn("doc_events", payload, "默认响应不带每文档事件明细")
+
+    def test_include_docs_returns_per_document_events(self):
+        rows = [{"新闻标题": "贵州茅台回购股份", "新闻内容": "", "发布时间": recent_iso(2),
+                 "文章来源": "s", "新闻链接": "u"},
+                {"新闻标题": "公司召开股东大会", "新闻内容": "", "发布时间": recent_iso(3),
+                 "文章来源": "s", "新闻链接": "u"}]
+        self.build_akshare(news=fake_frame(rows))
+        payload = self.call("/api/v3/sentiment", symbol="600519", market="", days=7,
+                            limit=20, include_docs=True)
+        self.assertTrue(payload["ok"], payload)
+        doc_events = payload["doc_events"]
+        self.assertEqual(len(doc_events), payload["documents"])
+        self.assertEqual(doc_events[0]["index"], 0)
+        self.assertTrue(doc_events[0]["dated"])
+        self.assertTrue(any(event["type"] == "buyback" for event in doc_events[0]["events"]))
+        self.assertEqual(doc_events[1]["events"], [], "零命中文档如实给空列表")
+
+    def test_no_news_still_carries_event_envelope(self):
+        self.build_akshare(news=[])
+        payload = self.call("/api/v3/sentiment", symbol="600519", market="", days=7, limit=20)
+        self.assertTrue(payload["ok"])
+        self.assertIsNone(payload["score"])
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["event_method"], v3_nlp.EVENT_METHOD)
+        self.assertEqual(payload["event_version"], v3_nlp.EVENT_VERSION)
+
+    def test_upstream_failure_keeps_event_envelope_shape(self):
+        self.build_akshare(news_error=ConnectionError("boom"))
+        payload = self.call("/api/v3/sentiment", symbol="600519", market="", days=7, limit=20)
+        self.assertFalse(payload["ok"])
+        self.assertEqual(payload["events"], [])
+        self.assertEqual(payload["event_method"], v3_nlp.EVENT_METHOD)
+
+    def test_events_sorted_by_count_in_response(self):
+        rows = [{"新闻标题": "公司回购股份", "新闻内容": "", "发布时间": recent_iso(1),
+                 "文章来源": "s", "新闻链接": "u"},
+                {"新闻标题": "公司继续回购股份", "新闻内容": "", "发布时间": recent_iso(2),
+                 "文章来源": "s", "新闻链接": "u"},
+                {"新闻标题": "股东小幅减持", "新闻内容": "", "发布时间": recent_iso(3),
+                 "文章来源": "s", "新闻链接": "u"}]
+        self.build_akshare(news=fake_frame(rows))
+        payload = self.call("/api/v3/sentiment", symbol="600519", market="", days=7, limit=20)
+        counts = [entry["count"] for entry in payload["events"]]
+        self.assertEqual(counts, sorted(counts, reverse=True))
+        self.assertEqual(payload["events"][0]["type"], "buyback")
 
 
 if __name__ == "__main__":  # pragma: no cover

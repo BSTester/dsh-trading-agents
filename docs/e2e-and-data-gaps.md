@@ -2861,3 +2861,157 @@ python -B -m unittest test_wp6_service.HandleDispatchTests.test_core_endpoints_e
 **建议修法**：给 `Base`（或该类）做真正的隔离——`setUp` 深拷贝所有注入表、
 `addCleanup` 还原模块级可变状态；或用 `unittest` 的 `-b`+fixture 隔离工具定位具体污染字段。
 在定位前，判断平台行为请以**单用例结果**为准（产品路径已被证明正确）。
+
+# 二十五、FR-STRAT-003 补全另一半：NLP 事件识别（`classify_events` + `/api/v3/sentiment` 的 `events`）
+
+**2026-09-21。** 情绪引擎此前只有极性（"利好还是利空"），没有事件识别（"是什么事件"）。
+本轮在 `platform/server/v3_nlp.py`（本节改动只涉及该文件与其测试，均为独立文件）补上规则版
+事件分类器，并把结果接进既有 `GET /api/v3/sentiment` 响应（**只增字段、不新增路由**）。
+
+## 25.1 交付与契约
+
+* **模块级稳定出口**（供策略侧守卫导入）：
+
+  ```python
+  from server.v3_nlp import classify_events, EVENT_TYPES, EVENT_METHOD, EVENT_VERSION
+
+  result = classify_events(docs, *, now=None)
+  # docs: [{"title":..., "summary":..., "published_at":..., "source":...}, ...]
+  # → {"as_of", "method": "rule-v1", "version": 1, "documents": N,
+  #    "events":    [ {type, label, direction, count, latest_at, first_seen}, ...],   # 按类型聚合
+  #    "doc_events":[ {index, dated, published_at, events: [ {type, label, direction,
+  #                    matched, confidence, negated} ]}, ...]                          # 每文档明细
+  ```
+
+* **实现**：33 类资本市场事件（`EVENT_RULES`），词条 + 触发的纯规则，无网络、无新依赖；
+  复用既有 `segment` 最大正向匹配与词典结构，复合词整体收的原则不变——`立案调查`/
+  `重大资产重组`/`增持评级` 是整体词条，长词天然优先，因此 `解除质押` 不会被读成
+  `质押`、`增持评级` 不会被读成 `增持`（策略侧的增持信号不被评级词污染）。
+* **接线**（响应只增字段）：`events`（按类型聚合：`type/label/direction/count/latest_at/
+  first_seen`，count 降序 → 新近优先 → type 字典序）；`doc_events`（每文档明细，
+  **`include_docs=true` 查询参数才给**，默认不给以避免响应膨胀）；`event_method`
+  （`"rule-v1"`）与 `event_version`（`1`）恒在（含无资讯与失败信封，形状稳定）。
+  `notes` 里追加一行事件摘要（如 `事件识别（rule-v1）：回购×10`）。
+* **聚合口径**：`count` 是命中该类型的**文档数**（含否定翻转事件）；`latest_at`/
+  `first_seen` 只用时间可解析的文档算，全部不可解析时为 `null`。
+
+## 25.2 事件分类表（33 类；基础置信见 `EVENT_RULES`，公告体明确词 0.8~0.95、口语/多义词 0.45~0.6）
+
+| type | 中文 | direction | 示例触发词 |
+|---|---|---|---|
+| buyback | 回购 | 利多 | 回购/股份回购/回购注销 |
+| holder_increase | 增持 | 利多 | 增持/举牌/股东增持 |
+| holder_reduction | 减持 | 利空 | 减持/清仓式减持/套现 |
+| equity_pledge | 股权质押 | 利空 | 质押/股权质押/补充质押 |
+| pledge_release | 解除质押 | 利多 | 解除质押/解押 |
+| investigation | 立案调查 | 利空 | 立案调查/被立案/证监会立案 |
+| regulatory_penalty | 监管处罚 | 利空 | 行政处罚/罚款/问询函/公开谴责 |
+| earnings_preincrease | 业绩预增 | 利多 | 业绩预增/预增/预计增长 |
+| earnings_prereduce | 业绩预减 | 利空 | 业绩预减/预亏/由盈转亏 |
+| earnings_turnaround | 业绩扭亏 | 利多 | 扭亏为盈/预盈/摘帽 |
+| earnings_beat | 业绩超预期 | 利多 | 超预期/好于预期/大超预期 |
+| earnings_miss | 业绩不及预期 | 利空 | 不及预期/低于预期/逊于预期 |
+| dividend | 分红 | 利多 | 分红/派息/每10股派/10派 |
+| stock_split | 送转 | 利多 | 高送转/转增/10转/送股 |
+| trading_halt | 停牌 | 中性 | 停牌/临时停牌/紧急停牌 |
+| trading_resume | 复牌 | 中性 | 复牌/恢复交易 |
+| ma_restructuring | 并购重组 | 利多 | 重大资产重组/并购/收购/借壳/要约收购 |
+| contract_win | 中标 | 利多 | 中标/预中标/竞得 |
+| major_contract | 大额合同 | 利多 | 重大合同/大额订单/签订合同/战略合作 |
+| outbound_investment | 对外投资 | 利多 | 对外投资/投资设立/设立子公司/增资 |
+| asset_sale | 资产出售 | 中性 | 出售资产/转让股权/剥离资产 |
+| debt_default | 债务违约 | 利空 | 违约/债券违约/未按期兑付/逾期 |
+| lawsuit | 诉讼 | 利空 | 诉讼/被诉/起诉/纠纷 |
+| arbitration | 仲裁 | 利空 | 仲裁/申请仲裁/仲裁裁决 |
+| management_change | 高管变动 | 中性 | 辞职/辞任/聘任/换届/人事变动 |
+| investor_relation | 机构调研 | 利多 | 机构调研/接受调研/接待机构 |
+| rating_up | 评级上调 | 利多 | 上调评级/上调目标价/首次覆盖/增持评级 |
+| rating_down | 评级下调 | 利空 | 下调评级/下调目标价/卖出评级/减持评级 |
+| lockup_expiry | 限售解禁 | 利空 | 限售解禁/解禁/解除限售/上市流通 |
+| external_guarantee | 对外担保 | 利空 | 对外担保/连带担保/提供担保/担保额度 |
+| fund_occupation | 资金占用 | 利空 | 资金占用/非经营性占用/占用资金 |
+| clarification | 新闻澄清 | 中性 | 澄清/澄清公告/辟谣/不实报道 |
+| delisting_risk | 退市风险 | 利空 | 退市/退市风险/面值退市/暂停上市 |
+
+方向取**类型级固定值**（稳定契约）：停牌/复牌/资产出售/高管变动/新闻澄清是方向取决于语境的
+类型，如实标中性（0），宁缺毋错；辞职类子信号的偏空倾向由情绪分（词典 `辞职` −0.45）表达，
+不混进事件方向。
+
+## 25.3 否定/程度修饰口径（与情绪打分同一套）
+
+* **同窗口**：只看触发词前方 `MODIFIER_WINDOW=3` 个 token，跨标点/空白即断开——与
+  `score_text` 完全一致；
+* **否定 → 方向取反 + 置信衰减**：命中 `NEGATORS`（未/不/没有/尚未/不再/无法…）时事件
+  `direction` 取反、`confidence × NEGATION_DECAY(0.65)`、`negated=true` 如实标注。
+  例：「未增持」→ holder_increase 方向 −1（不是增持利多）、「不存在减持」→
+  holder_reduction 方向 +1——与情绪打分「翻转 + 衰减」同口径；
+* **中性事件否定只降置信**：direction=0 取反仍是 0；
+* **程度副词 → 置信因子**：`大幅×1.6`/`连续×1.15`/`小幅×0.7`…（同一 `INTENSIFIERS` 表），
+  结果截到 (0.05, 1.0]。真机可见效果：「连续25日回购」conf=0.75×1.15=0.8625；
+* **词条优先级消歧**：`解除质押`（+1）压住 `质押`（−1）、`增持评级`/`减持评级` 归评级类
+  而非增减持、`未按期兑付` 整体收录（内部的 `未` 不触发否定）；货币市场同形词用 0 置信
+  占位词消歧（`质押式回购`/`正回购`/`逆回购`/`回购协议`/`回购利率`/`定增`），其内部的
+  `质押`/`回购`/`增资` 不再被切出；
+* **时间诚实**：`published_at` 缺失或解析失败 → 该文档事件 `dated=False`、
+  `published_at=null`（策略侧据此剔除，不猜时间）；零命中 → `events=[]`，**不硬造**。
+
+## 25.4 真机输出（2026-09-21，`akshare/stock_news_em` 实拉 10 条/标的，只读）
+
+* **600519**（10 条资讯 → 1 类事件）：
+  * `被执行158万元？贵州茅台：系第三方公司内部合同纠纷，法院认定公司不承担任何责任`
+    → `lawsuit/诉讼/dir=−1/conf=0.50（词:纠纷）`（误判样例，见 25.5）；
+  * 其余 9 条（中报净利润、资金流向、i茅台规则等）→ 零事件，`events=[]` 不硬造。
+* **HK.00700**（10 条 → 1 类）：
+  * `腾讯控股：连续25日回购，累计回购1017.60万股` → `buyback/回购/dir=+1/conf=0.8625`
+    （`连续` 程度因子生效）；10/10 条回购播报全部正确识别为回购利多。
+* **US.NVDA**（10 条 → 2 类）：
+  * `黄仁勋减持英伟达？被代扣4.57万股用于缴税 CFO套现765万美元`
+    → `holder_reduction/减持/dir=−1/conf=0.75（词:减持）`；
+  * `超声电子澄清：未向英伟达供货…` → `clarification/新闻澄清/dir=0/conf=0.65（词:澄清）`；
+  * `高管Colette Kress拟出售34918股` → **零事件**（漏报样例，见 25.5）。
+* 线上 8397 探测（只读）：`/api/v3/sentiment` 当前仍为改动前进程（响应无 `events`
+  字段）——**事件字段要等主 agent 统一重启后才在线上可见**，与 §二十三 的部署口径一致。
+
+## 25.5 限制（规则法的已知边界，含真机误判）
+
+1. **否认语境读不出（真机误判 1）**：茅台那条的下半句「法院认定公司不承担任何责任」是否认，
+   但否定词离触发词 `纠纷` 太远且隔了分句——规则只看触发词前 3 token，于是给出 lawsuit −1。
+   讽刺、反问、「A 说 B 否认 C 涉嫌 D」这类复杂句式同理读不出，需要序列模型才能解。
+2. **中文触发词覆盖边界（真机漏报）**：「高管 Colette Kress **拟出售** 34918 股」是典型减持，
+   但「出售」不在触发词表——词条法只认收进表的词形（「减持/套现/清仓」），同义改写会漏。
+3. **只覆盖中文**：英文标题（部分美股资讯）零事件，是诚实的零命中而非错误。
+4. **类型级方向是粗粒度**：高管变动/资产出售/停复牌标中性，策略侧若要细分需自行看
+   `matched` 词或等后续拆类型；「不排除增持」类句式因否定词不紧邻触发词不会被误翻。
+5. **count 是文档数不是次数**：一篇文档同类型多词命中只计 1（每类取最强触发）。
+
+## 25.6 测试（真实输出）
+
+```
+$ cd platform && ~/.dsh/trading-venv/bin/python -B -m unittest tests.test_v3_nlp
+Ran 80 tests in 8.9s   OK          # 既有 56 例 + 新增 24 例（目录契约/33 类正例/否定翻转/
+                                   # 多事件排序/零命中/dated=False/聚合排序/端点 events 字段）
+```
+
+**顺带拆了一颗既有测试的时间炸弹**：`test_days_param_is_clamped_not_rejected`（既有 56 例
+之一）用固定 `NOW`(2026-09-20) 造发布时间，但路由窗口按**墙钟**算——墙钟一过
+2026-09-21 11:00+08 该例必红（本轮会话中真实发生）。修法：路由层用例的「窗口内」时间改用
+新增的 `recent_iso()`（墙钟相对），断言同步改为捕获的同一时间串；直接调 `sentiment_report`
+并显式传 `now=NOW` 的用例本就确定，未动。
+
+新增测试封死网络（沿用 `BlockRealNetwork` 姿态）；每类事件至少 1 条**真实语境**正例
+（含量词/时间/噪音，不是词条复读）。**全量 `discover -s tests` 回归口径**：干净 HEAD 基线
+958 OK；本轮会话期间另一 agent 正在同树改 `v3_analytics/v3_ml/v3_strategies/compute`，
+其半成品使 `test_v3_analytics`/`test_v3_ml`/`test_v3_fundamentals_sync`/`test_mcp_parity`
+出现 12 例红——已验证这些用例**不含本轮改动也原样红**（单独运行同样失败），与
+`tests.test_v3_nlp`（80/80 绿）无关。
+
+## 25.7 未解决项（如实登记）
+
+1. **线上未生效**：8397 是改动前进程，`events`/`doc_events`/`event_method` 要等主 agent
+   统一重启（本轮按约束未重启）。
+2. **共享树并发改动**：本轮曾用 `git stash` 做干净基线，与并发 agent 的在途改动发生抢占；
+   已从 stash 恢复全部四份工作（我的 v3_nlp/测试 + 对方的 v3_math；对方的 v3_analytics
+   以树上较新版本为准），**stash 条目保留未删**（内含对方 v3_math/v3_analytics 的历史版本，
+   供其自行取舍）。教训：共享工作树上不再用 stash 做基线。
+3. **误判/漏报样例**（25.5 的 1、2）未修：修法要么扩词条（出售→减持类）要么上模型，
+   属后续迭代。

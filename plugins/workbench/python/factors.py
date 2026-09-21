@@ -33,10 +33,38 @@ FACTOR_SIGN = {"mom_20": 1, "mom_60": 1, "vol_20": -1, "trend": 1, "rsi_14": -1,
 TRADING_DAYS = 252
 
 
-def closes_volumes(ticker, window, period="1d"):
-    """日线序列（全市场：富途优先；A股长历史走新浪）。"""
+def pit_gate(bars, as_of):
+    """PIT 闸门（INCLUSIVE：``t <= as_of``，当日已收盘视角）。
+
+    与 ``server/data/cache.py`` 的 ``visible_at`` **逐字同口径**（``YYYY-MM-DD`` 字符串
+    比较）；这是同一约束在子进程侧的一份实现——两边比较规则一致，因此不可能给出不同
+    答案。返回 ``(visible, {"future": n, "undated": m})``：未来的行与没有时间戳的行
+    都被挡掉并计数（不静默丢弃）。
+    """
+    if as_of in (None, ""):
+        return bars, {"future": 0, "undated": 0}
+    visible, future, undated = [], 0, 0
+    for bar in bars or []:
+        stamp = bar.get("t") if isinstance(bar, dict) else None
+        if stamp in (None, ""):
+            undated += 1
+            continue
+        if str(stamp) <= as_of:
+            visible.append(bar)
+        else:
+            future += 1
+    return visible, {"future": future, "undated": undated}
+
+
+def closes_volumes(ticker, window, period="1d", as_of=None):
+    """日线序列（全市场：富途优先；A股长历史走新浪）。
+
+    ``as_of`` 给定时先过 :func:`pit_gate`（``t <= as_of``），因子只由该时点可见的
+    序列算出——「价量链路接受 as_of」的落点（FR-DATA-003，2026-09-21 任务 4）。
+    """
     limit = min(max(window, 80), 900)
     bars, source, stale = load_bars(ticker, period, limit)
+    bars, _gate = pit_gate(bars, as_of)
     if len(bars) < 65:
         raise RuntimeError(f"{ticker} 日线不足（{len(bars)} 根）")
     return bars, source + ("(缓存)" if stale else "")
@@ -129,11 +157,12 @@ def composite(rows, keys):
     return ranked
 
 
-def snapshot(tickers, window):
+def snapshot(tickers, window, as_of=None):
     rows, sources, failures = [], set(), {}
+    rejected_future = 0
     for ticker in tickers:
         try:
-            bars, source = closes_volumes(ticker, window)
+            bars, source = closes_volumes(ticker, window, as_of=as_of)
             values = factor_values(bars)
             if values is None:
                 raise RuntimeError("样本不足")
@@ -155,17 +184,27 @@ def snapshot(tickers, window):
     ranked = composite(rows, keys)
     for row in rows:
         row["factors"] = {k: (round(v, 5) if isinstance(v, float) else v) for k, v in row["factors"].items()}
-    return {"tickers": [r["ticker"] for r in ranked], "rows": ranked, "factors": keys,
-            "sources": sorted(sources), "failures": failures, "window": window,
-            "note": "价量 + 估值因子横截面 z-score 合成打分；估值优先富途 MCP（PE/PB/PS + 历史分位），失败回退同花顺；缺失时自动跳过估值维度。"}
+    if as_of:
+        # as_of 模式的口径披露：价量列只由该时点可见序列算出；逐标的最后一根可见 bar
+        # 就是 rows[].as_of（因停牌可能早于 as_of——缺的就是缺，不向后填补）。
+        note = ("价量 + 估值因子横截面 z-score 合成打分；估值优先富途 MCP（PE/PB/PS + 历史分位），失败回退同花顺；缺失时自动跳过估值维度。"
+                f" PIT：价量因子只由 t <= {as_of} 的可见日线算出（INCLUSIVE）。")
+    else:
+        note = "价量 + 估值因子横截面 z-score 合成打分；估值优先富途 MCP（PE/PB/PS + 历史分位），失败回退同花顺；缺失时自动跳过估值维度。"
+    out = {"tickers": [r["ticker"] for r in ranked], "rows": ranked, "factors": keys,
+           "sources": sorted(sources), "failures": failures, "window": window,
+           "note": note}
+    if as_of:
+        out["pit"] = {"asOf": as_of, "mode": "inclusive"}
+    return out
 
 
-def ic_series(tickers, factor, forward, window):
+def ic_series(tickers, factor, forward, window, as_of=None):
     if factor not in FACTOR_SIGN:
         raise RuntimeError(f"未知因子 {factor}")
     series = {}
     for ticker in tickers:
-        bars, _source = closes_volumes(ticker, window)
+        bars, _source = closes_volumes(ticker, window, as_of=as_of)
         series[ticker] = bars
     length = min(len(b) for b in series.values())
     step = max(forward, 5)
@@ -214,6 +253,8 @@ def main():
     for parser, with_factor in ((p1, False), (p2, True)):
         parser.add_argument("--tickers", required=True)
         parser.add_argument("--window", type=int, default=250)
+        parser.add_argument("--as-of", dest="as_of", default=None,
+                            help="PIT 上界（YYYY-MM-DD，INCLUSIVE）；缺省=最新")
         if with_factor:
             parser.add_argument("--factor", default="mom_20")
             parser.add_argument("--forward", type=int, default=5)
@@ -226,11 +267,12 @@ def main():
         if args.window < 80 or args.window > 1000:
             raise RuntimeError("window 需在 80..1000")
         if args.cmd == "snapshot":
-            print(json.dumps(snapshot(tickers, args.window), ensure_ascii=False))
+            print(json.dumps(snapshot(tickers, args.window, as_of=args.as_of), ensure_ascii=False))
         else:
             if not 1 <= args.forward <= 60:
                 raise RuntimeError("forward 需在 1..60")
-            print(json.dumps(ic_series(tickers, args.factor, args.forward, args.window), ensure_ascii=False))
+            print(json.dumps(ic_series(tickers, args.factor, args.forward, args.window,
+                                       as_of=args.as_of), ensure_ascii=False))
     except Exception as error:
         print(json.dumps({"error": str(error)[:300]}, ensure_ascii=False))
         return 1

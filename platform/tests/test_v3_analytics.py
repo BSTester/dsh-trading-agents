@@ -39,6 +39,10 @@ ROUTES = {
     ("GET", "/api/v3/ml/sweep"),
     ("POST", "/api/v3/ml/backtest"),
     ("GET", "/api/v3/ml/models"),
+    # FR-STRAT-002 策略族补全（2026-09-21）：两条路由由 v3_analytics.register 代挂
+    # ``server.v3_strategies``（app.py 的接线清单不在该任务范围）。
+    ("GET", "/api/v3/strategies/event-study"),
+    ("GET", "/api/v3/strategies/stat-arb"),
 }
 
 
@@ -1175,6 +1179,11 @@ class TestRegisterRoutes(RouteCase):
                                  "rebalance": "5", "limit": 500},
             "/api/v3/ml/models": {"market": "SH", "ticker": "SH.600519",
                                   "window": 20, "horizon": 1},
+            "/api/v3/strategies/event-study": {"tickers": "A,B", "market": "SH", "days": 400,
+                                               "horizon": 5, "min_events": 5, "limit": 500},
+            "/api/v3/strategies/stat-arb": {"market": "SH", "tickers": None, "limit": 500,
+                                            "train_ratio": 0.7, "z_window": 60, "z_in": 2.0,
+                                            "z_out": 0.5, "cost_bps": 5.0},
         }
         post_body = json.dumps({"ticker": "SH.600519", "universe": ["A", "B"]}).encode()
         for (method, path), function in app.routes.items():
@@ -1792,9 +1801,24 @@ class NewFactorClassTests(RouteCase):
          "factors": {"mom_20": -0.02}, "z": {"mom_20": -1.0}},
     ]
 
+    @staticmethod
+    def _pit_bars(count=140, end="2026-09-18"):
+        """价量列 as_of 模式（2026-09-21）需要的 series 替身：K 线止于 ``end``（≤ as_of）。"""
+        import math as _math
+
+        base = dt.date.fromisoformat(end)
+        return [{"t": (base - dt.timedelta(days=count - 1 - index)).isoformat(),
+                 "o": 10.0, "h": 10.5, "l": 9.5,
+                 "c": 10.0 * (1 + 0.01 * _math.sin(index / 3.0)), "v": 1e6 + index}
+                for index in range(count)]
+
     def _run(self, alternatives=None):
         handlers = {"factors": {"ok": True, "value": {"rows": copy.deepcopy(self.BASE_ROWS)}},
-                    "ic": {"ok": True, "value": {"points": [{"t": "2026-09-08", "ic": 0.4}]}}}
+                    "ic": {"ok": True, "value": {"points": [{"t": "2026-09-08", "ic": 0.4}]}},
+                    # as_of 显式给出时价量列改走 data.cache PIT（经 series 工具取数，
+                    # 由 pit_cache 闸门按请求的 as_of 截到可见前缀）
+                    "series": lambda payload: series_envelope(
+                        self._pit_bars(), ticker=payload["ticker"])}
         handlers.update(alternatives or {})
         return FakeRun(handlers)
 
@@ -1932,6 +1956,7 @@ class NewFactorClassTests(RouteCase):
                          "2026-09-10T10:20:01+00:00")
 
     def test_alternative_factors_use_existing_tools_and_admit_a_share_gap(self):
+        """无 as_of（最新口径）：实时另类因子照旧经既有工具并入，A 股卖空缺口如实登记。"""
         alternatives = {
             "capital_flow_history": {"ok": True, "value": {"flow_list": [
                 {"capital_flow_item_time": 1787500800000, "main_in_flow": 600, "in_flow": 600},
@@ -1940,7 +1965,7 @@ class NewFactorClassTests(RouteCase):
                                                        "message": "A 股无卖空数据"}}}
         result = v3_analytics.factors_matrix_data(
             self._run(alternatives), self.home, tickers_raw="SH.600000,SH.600009",
-            classes="alternative", as_of="2026-09-20")
+            classes="alternative")
         raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
         self.assertAlmostEqual(raw["SH.600000"]["capital_flow"], 1.0, places=6)
         self.assertNotIn("short_interest", raw["SH.600000"])
@@ -1948,6 +1973,19 @@ class NewFactorClassTests(RouteCase):
         self.assertIn("short_interest", missing)
         self.assertIn("A 股无卖空数据", missing["short_interest"])
         self.assertIn("capital_flow_history", result["sources"]["alternative"])
+
+    def test_alternative_realtime_factors_are_excluded_under_explicit_as_of(self):
+        """as_of 模式（2026-09-21）：实时另类因子没有 PIT 口径 → 不并入（不拿实时冒充历史）。"""
+        result = v3_analytics.factors_matrix_data(
+            self._run(), self.home, tickers_raw="SH.600000,SH.600009",
+            classes="alternative", as_of="2026-09-20")
+        raw = {row["ticker"]: row["factors"] for row in result["matrix"]["raw"]}
+        self.assertNotIn("capital_flow", raw["SH.600000"])
+        self.assertNotIn("short_interest", raw["SH.600000"])
+        missing = {row["key"]: row["reason"] for row in result["factorsMissing"]}
+        self.assertTrue(any("capital_flow" in key for key in missing), missing)
+        self.assertIn("PIT", missing.get("capital_flow/short_interest", ""))
+        self.assertNotIn("alternative", result["classes"])
 
     def test_alternative_is_opt_in_by_default(self):
         run = self._run()
@@ -1958,15 +1996,23 @@ class NewFactorClassTests(RouteCase):
         self.assertNotIn("short_interest", called)
 
     def test_matrix_columns_never_gain_a_factor_without_data(self):
-        """一个标的都没取到的因子不进列（它出现在覆盖率里）——缺数据不是 0。"""
+        """一个标的都没取到的因子不进列（它出现在覆盖率里）——缺数据不是 0。
+
+        as_of 模式（2026-09-21）下价量列来自本地 PIT 复算，所以「有数据的列」就是
+        价量 z 列本身；四类新因子一个都没取到 → 一列都不加。
+        """
         result = v3_analytics.factors_matrix_data(
             self._run(), self.home, tickers_raw="SH.600000,SH.600009", classes="all",
             as_of="2026-09-20")
-        self.assertEqual(result["matrix"]["factors"], ["mom_20"])
+        price_volume = {"liq_ratio", "mdd_60", "mom_20", "mom_60", "rsi_14", "trend",
+                        "vol_20"}
+        self.assertEqual(set(result["matrix"]["factors"]), price_volume)
         covered = {row["key"] for row in result["factors"]
                    if row["covered"] and row["class"] in ("quality", "growth", "sentiment",
                                                           "alternative")}
-        self.assertEqual(covered, set(), "临时 home 里没有 fundamentals/sentiment 数据")
+        # liq_ratio 是价量派生的流动性因子（PIT 可复算，故 covered）；
+        # fundamentals/sentiment/实时另类一个都没取到 → 其余新因子一列都不加。
+        self.assertEqual(covered, {"liq_ratio"})
 
     def test_registry_covers_the_six_required_classes(self):
         classes = {entry["class"] for entry in v3_analytics.FACTOR_REGISTRY}
